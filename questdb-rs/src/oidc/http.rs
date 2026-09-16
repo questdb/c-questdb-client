@@ -71,27 +71,46 @@ pub(crate) struct PostResult {
 
 impl Drop for PostResult {
     fn drop(&mut self) {
-        zeroize_json_strings(&mut self.body);
+        let _ = zeroize_json_strings(&mut self.body);
     }
 }
 
 /// Wipe every response-owned string before serde releases its allocation. POST
 /// bodies may carry device, access, ID, or refresh credentials, including in a
 /// proxy/WAF error response that reflects request data.
-fn zeroize_json_strings(value: &mut serde_json::Value) {
+///
+/// Returns how many strings were wiped. Dropping a buffer is not observable, so
+/// that count is what lets a test prove the walk reaches property NAMES as well
+/// as values — a silently skipped key would otherwise fail nothing anywhere.
+fn zeroize_json_strings(value: &mut serde_json::Value) -> usize {
     match value {
-        serde_json::Value::String(value) => value.zeroize(),
+        serde_json::Value::String(value) => {
+            value.zeroize();
+            1
+        }
         serde_json::Value::Array(values) => {
+            let mut wiped = 0;
             for value in values {
-                zeroize_json_strings(value);
+                wiped += zeroize_json_strings(value);
             }
+            wiped
         }
         serde_json::Value::Object(values) => {
-            for value in values.values_mut() {
-                zeroize_json_strings(value);
+            // Take the entries rather than iterating `values_mut()`: a key is a
+            // separate allocation that `values_mut()` cannot reach, and an IdP,
+            // proxy, or WAF that reflects the submitted form can put a
+            // credential in a property name. The map is left empty because a
+            // wiped key cannot be put back (every one would collide on ""),
+            // which is safe: this runs only from `Drop`.
+            let mut wiped = 0;
+            for (mut name, mut value) in std::mem::take(values) {
+                wiped += zeroize_json_strings(&mut value);
+                name.zeroize();
+                wiped += 1;
             }
+            wiped
         }
-        _ => {}
+        _ => 0,
     }
 }
 
@@ -279,11 +298,20 @@ impl HttpClient {
         // parsed strings below. Both otherwise survive in freed allocator pages.
         let body = Zeroizing::new(read_body(url, response)?);
         match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(value) => Ok(PostResult {
-                status,
-                body: value,
-                retry_after,
-            }),
+            Ok(mut value) => {
+                // Token-endpoint responses are untrusted and some IdPs, proxies,
+                // and WAFs reflect the submitted form. Scrub an exact raw or
+                // form-encoded credential before any caller can interpolate or
+                // retain a response field. The parsed response is already wiped
+                // by `PostResult::drop`; this also prevents a credential from
+                // escaping into OidcError, renderers, token metadata, or FFI.
+                redact_reflected_credentials(&mut value, form);
+                Ok(PostResult {
+                    status,
+                    body: value,
+                    retry_after,
+                })
+            }
             Err(_) => {
                 // A response from these POST endpoints can contain OAuth secrets,
                 // including when an IdP/proxy reflects the request body into an
@@ -304,6 +332,156 @@ impl HttpClient {
             }
         }
     }
+}
+
+const REDACTED_CREDENTIAL: &str = "[redacted credential]";
+
+/// The response fields that legitimately carry the credentials the IdP issued.
+/// They are never rewritten: a non-rotating refresh grant re-sends the
+/// submitted refresh token verbatim, so redacting these would destroy the very
+/// credential this client has to keep, and an access / ID token is an opaque
+/// value that must reach the wire byte-for-byte.
+const ISSUED_TOKEN_FIELDS: [&str; 3] = ["access_token", "id_token", "refresh_token"];
+
+/// Remove submitted token-endpoint credentials from every response field that is
+/// later surfaced outside this module, while retaining the non-secret parts of
+/// those diagnostics.
+///
+/// Deliberately not limited to `error` / `error_description`: a 200 response
+/// reaches the caller too, where an unsupported `token_type` is quoted into a
+/// public error and `scope` is retained in the public `TokenSet` (and printed
+/// by its `Debug`). Anything but the issued-token fields above is therefore
+/// scrubbed, at any depth.
+fn redact_reflected_credentials(value: &mut serde_json::Value, form: &[(&str, &str)]) {
+    let mut credentials: Vec<Zeroizing<String>> = Vec::new();
+    for (name, credential) in form {
+        if !matches!(*name, "device_code" | "refresh_token") || credential.is_empty() {
+            continue;
+        }
+        // Match ureq's application/x-www-form-urlencoded spelling. This
+        // allocation contains a credential too, so it must be wiped on drop.
+        let encoded = form_url_encode(credential);
+        if encoded.as_str() != *credential {
+            credentials.push(encoded);
+        }
+        credentials.push(Zeroizing::new((*credential).to_string()));
+    }
+    if credentials.is_empty() {
+        return;
+    }
+    redact_reflections(value, &credentials);
+}
+
+fn redact_reflections(value: &mut serde_json::Value, credentials: &[Zeroizing<String>]) {
+    match value {
+        serde_json::Value::String(text) => {
+            for credential in credentials {
+                redact_string(text, credential);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_reflections(value, credentials);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (name, value) in values.iter_mut() {
+                if ISSUED_TOKEN_FIELDS.contains(&name.as_str()) {
+                    continue;
+                }
+                redact_reflections(value, credentials);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace every exact occurrence without ever dropping an allocation that
+/// still contains the credential. `replacement` is non-secret, so the final
+/// allocation can safely remain in the parsed error body.
+fn redact_string(value: &mut String, credential: &str) {
+    if credential.is_empty() || !value.contains(credential) {
+        return;
+    }
+    // Only text from OUTSIDE the matches and the non-secret marker are ever
+    // pushed here, so unlike `form_url_encode` this buffer may grow safely: a
+    // reallocation cannot leave a copy of the credential behind.
+    let mut redacted = Zeroizing::new(String::with_capacity(value.len()));
+    let mut rest = value.as_str();
+    while let Some(index) = rest.find(credential) {
+        redacted.push_str(&rest[..index]);
+        redacted.push_str(REDACTED_CREDENTIAL);
+        rest = &rest[index + credential.len()..];
+    }
+    redacted.push_str(rest);
+    // Scrub the response-owned reflected credential before replacing it. The
+    // sanitized allocation is then transferred out of its temporary guard.
+    value.zeroize();
+    *value = std::mem::take(&mut *redacted);
+}
+
+/// Whether ureq 3.1's `send_form` percent-encodes this byte: its query
+/// percent-encode set. A space is the one byte it replaces with a single `+`
+/// instead, so it is not percent-encoded.
+fn form_percent_encodes(byte: u8) -> bool {
+    byte != b' '
+        && (!(0x20..0x7f).contains(&byte)
+            || matches!(
+                byte,
+                b'"' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'+'
+                    | b','
+                    | b'/'
+                    | b':'
+                    | b';'
+                    | b'<'
+                    | b'='
+                    | b'>'
+                    | b'?'
+                    | b'@'
+                    | b'['
+                    | b'\\'
+                    | b']'
+                    | b'^'
+                    | b'`'
+                    | b'{'
+                    | b'|'
+                    | b'}'
+            ))
+}
+
+/// Encode exactly as ureq 3.1's `send_form`: its query percent-encode set plus
+/// HTML-form spaces (`+`). Keeping this local avoids constructing the complete
+/// request body a second time merely to identify a reflected credential.
+fn form_url_encode(value: &str) -> Zeroizing<String> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    // Size the buffer before writing a single byte of the credential. Percent
+    // encoding expands a byte to three, so a buffer sized from the input length
+    // would grow mid-write: growth copies the partially encoded secret into a
+    // new allocation and frees the old one, which `Zeroizing` can no longer
+    // reach. `String` never reallocates while its length stays within the
+    // capacity requested here, and exactly `encoded_len` bytes are pushed below.
+    let mut encoded_len: usize = 0;
+    for byte in value.bytes() {
+        encoded_len = encoded_len.saturating_add(if form_percent_encodes(byte) { 3 } else { 1 });
+    }
+    let mut encoded = Zeroizing::new(String::with_capacity(encoded_len));
+    for byte in value.bytes() {
+        if byte == b' ' {
+            encoded.push('+');
+        } else if form_percent_encodes(byte) {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        } else {
+            encoded.push(byte as char);
+        }
+    }
+    encoded
 }
 
 /// True when a `ureq` send failure proves the HTTP request was never
@@ -1064,13 +1242,87 @@ mod tests {
             "expires_in": 300,
             "present": true,
         });
-        zeroize_json_strings(&mut body);
+        // Five property names (access_token, nested, expires_in, present,
+        // device_code) and three string values. Counting both is what makes
+        // this discriminating: a walk that skipped keys would report three.
+        assert_eq!(zeroize_json_strings(&mut body), 8);
+        assert!(
+            body.as_object().unwrap().is_empty(),
+            "object entries must be consumed so the key allocations are wiped too"
+        );
 
-        assert_eq!(body["access_token"], "");
-        assert_eq!(body["nested"][0], "");
-        assert_eq!(body["nested"][1]["device_code"], "");
-        assert_eq!(body["expires_in"], 300);
-        assert_eq!(body["present"], true);
+        // Array elements are wiped in place, so the value zeroization itself
+        // stays observable rather than only inferred from the count.
+        let mut arrayed = serde_json::json!(["RT-secret", {"k": "v"}]);
+        assert_eq!(zeroize_json_strings(&mut arrayed), 3);
+        assert_eq!(arrayed[0], "");
+    }
+
+    #[test]
+    fn post_response_json_object_keys_are_zeroized() {
+        // A reflecting IdP/proxy can put the submitted credential in a property
+        // NAME. `values_mut()` cannot reach that separate allocation, so a
+        // key-skipping walk would leave the credential in freed heap memory.
+        let mut body = serde_json::json!({"DEV-CODE-123": {"RT-1": 7}});
+        assert_eq!(zeroize_json_strings(&mut body), 2);
+        assert!(body.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn form_url_encoding_matches_the_submitted_spelling() {
+        assert_eq!(
+            form_url_encode("DEV +/% exact").as_str(),
+            "DEV+%2B%2F%25+exact"
+        );
+        assert_eq!(form_url_encode("plain-token_1").as_str(), "plain-token_1");
+    }
+
+    #[test]
+    fn form_url_encoding_never_reallocates_the_secret_buffer() {
+        // Every byte here expands to three, so a buffer sized from the input
+        // length would grow mid-write and free a partially encoded copy of the
+        // credential that `Zeroizing` can no longer wipe. `String::with_capacity`
+        // allocates exactly, so an exactly-sized buffer never grows.
+        let encoded = form_url_encode("%%%%%%%%");
+        assert_eq!(encoded.as_str(), "%25%25%25%25%25%25%25%25");
+        assert_eq!(
+            encoded.capacity(),
+            encoded.len(),
+            "the encoded credential buffer must be sized exactly once, up front"
+        );
+    }
+
+    #[test]
+    fn reflected_credentials_are_redacted_outside_the_issued_token_fields() {
+        // A 200 response reaches the caller too: `token_type` is quoted into a
+        // public error and `scope` is retained in the public `TokenSet`. Only
+        // the issued-token fields keep their exact bytes, because a
+        // non-rotating refresh grant re-sends the submitted refresh token.
+        const REFRESH_TOKEN: &str = "RT +/% exact";
+        const ENCODED: &str = "RT+%2B%2F%25+exact";
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", REFRESH_TOKEN),
+        ];
+        let mut body = serde_json::json!({
+            "access_token": "AT-1",
+            "refresh_token": REFRESH_TOKEN,
+            "id_token": REFRESH_TOKEN,
+            "token_type": REFRESH_TOKEN,
+            "scope": format!("openid {ENCODED}"),
+            "nested": {"detail": [format!("saw {REFRESH_TOKEN}")]},
+        });
+        redact_reflected_credentials(&mut body, &form);
+
+        assert_eq!(body["refresh_token"], REFRESH_TOKEN);
+        assert_eq!(body["id_token"], REFRESH_TOKEN);
+        assert_eq!(body["access_token"], "AT-1");
+        assert_eq!(body["token_type"], REDACTED_CREDENTIAL);
+        assert_eq!(body["scope"], format!("openid {REDACTED_CREDENTIAL}"));
+        assert_eq!(
+            body["nested"]["detail"][0],
+            format!("saw {REDACTED_CREDENTIAL}")
+        );
     }
 
     #[test]

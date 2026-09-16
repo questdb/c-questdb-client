@@ -2532,6 +2532,14 @@ impl OidcDeviceAuth {
             Some(value) => {
                 let display = match value {
                     Value::String(value) => strip_control_capped(value, MAX_IDP_FIELD_CHARS),
+                    // Report the shape of a container rather than serializing
+                    // it. `to_string()` would echo its nested strings AND its
+                    // property names, and a property name is the one place the
+                    // token-endpoint credential redaction deliberately cannot
+                    // rewrite (wiped keys would all collide on ""). A scalar
+                    // carries no reflected string, so it is still quoted.
+                    Value::Array(_) => "a JSON array".to_string(),
+                    Value::Object(_) => "a JSON object".to_string(),
                     value => strip_control_capped(&value.to_string(), MAX_IDP_FIELD_CHARS),
                 };
                 return Err(OidcError::config(format!(

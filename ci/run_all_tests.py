@@ -62,6 +62,9 @@ def run_cargo_tests():
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,oidc',
             '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=aws-lc-crypto,tls-native-certs,oidc',
+            '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
     run_cmd('cargo', 'test', '--features=arrow', cwd='questdb-rs-ffi')
 

@@ -840,6 +840,197 @@ fn initial_malformed_token_types_are_rejected() {
     }
 }
 
+/// A `/device` response carrying an exact, mutation-discriminating device code.
+fn device_response_with_code(device_code: &str) -> String {
+    serde_json::json!({
+        "device_code": device_code,
+        "user_code": "WXYZ-1234",
+        "verification_uri": "https://idp.example.com/activate",
+        "expires_in": 600,
+        "interval": 5
+    })
+    .to_string()
+}
+
+#[test]
+fn reflected_token_type_on_a_successful_grant_does_not_escape() {
+    // A 200 is not a safe response: `token_type` is quoted verbatim into a
+    // public config error, so an IdP/proxy that reflects the submitted device
+    // code there hands the live credential to every caller of `sign_in()`.
+    const DEVICE_CODE: &str = "TT +/% exact credential";
+    const ENCODED_DEVICE_CODE: &str = "TT+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/device") => (200, device_response_with_code(DEVICE_CODE)),
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("device_code={ENCODED_DEVICE_CODE}")),
+                "the mutation-discriminating credential was not submitted: {body}"
+            );
+            (
+                200,
+                serde_json::json!({
+                    "access_token": "AT-1",
+                    "token_type": DEVICE_CODE,
+                    "expires_in": 300
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    let error = auth.sign_in().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(
+        error
+            .message()
+            .contains("unsupported token_type \"[redacted credential]\""),
+        "{error}"
+    );
+    assert!(auth.token_set().is_none(), "unsupported token was cached");
+
+    let public_error: crate::Error = error.into();
+    for surface in [public_error.msg().to_string(), public_error.to_string()] {
+        assert!(!surface.contains(DEVICE_CODE), "raw reflection: {surface}");
+        assert!(
+            !surface.contains(ENCODED_DEVICE_CODE),
+            "encoded reflection: {surface}"
+        );
+    }
+}
+
+#[test]
+fn reflected_container_token_type_is_not_echoed_as_a_document() {
+    // Redaction rewrites string VALUES; a property name cannot be rewritten
+    // (wiped keys would all collide on ""). Serializing a container token_type
+    // would therefore echo a credential reflected as a key, so the error
+    // reports the shape instead of the document.
+    const DEVICE_CODE: &str = "KEY-REFLECTED-DEVICE-CODE";
+
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response_with_code(DEVICE_CODE)),
+        ("POST", "/token") => (
+            200,
+            serde_json::json!({
+                "access_token": "AT-1",
+                "token_type": {DEVICE_CODE: "reflected as a property name"},
+                "expires_in": 300
+            })
+            .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    let error = auth.sign_in().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(
+        error
+            .message()
+            .contains("unsupported token_type \"a JSON object\""),
+        "{error}"
+    );
+    assert!(!error.message().contains(DEVICE_CODE));
+    assert!(!error.to_string().contains(DEVICE_CODE));
+}
+
+#[test]
+fn reflected_scope_on_a_successful_grant_is_not_retained_in_token_metadata() {
+    // `scope` survives the request: it is kept in the public `TokenSet` and
+    // printed by its `Debug`, so a reflected device code would outlive the
+    // sign-in inside ordinary token metadata rather than in an error.
+    const DEVICE_CODE: &str = "SC +/% exact credential";
+    const ENCODED_DEVICE_CODE: &str = "SC+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/device") => (200, device_response_with_code(DEVICE_CODE)),
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("device_code={ENCODED_DEVICE_CODE}")),
+                "the mutation-discriminating credential was not submitted: {body}"
+            );
+            (
+                200,
+                serde_json::json!({
+                    "access_token": "AT-1",
+                    "token_type": "Bearer",
+                    "scope": format!("openid {DEVICE_CODE} {ENCODED_DEVICE_CODE}"),
+                    "expires_in": 300
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-1");
+    let cached = auth.token_set().expect("the grant must be cached");
+    assert_eq!(
+        cached.scope(),
+        Some("openid [redacted credential] [redacted credential]")
+    );
+    for surface in [
+        cached.scope().unwrap_or_default().to_string(),
+        format!("{cached:?}"),
+    ] {
+        assert!(!surface.contains(DEVICE_CODE), "raw reflection: {surface}");
+        assert!(
+            !surface.contains(ENCODED_DEVICE_CODE),
+            "encoded reflection: {surface}"
+        );
+    }
+}
+
+#[test]
+fn reflected_scope_on_a_successful_refresh_keeps_the_issued_credential_intact() {
+    // The refresh counterpart, and the boundary that keeps the redaction safe:
+    // a non-rotating IdP re-sends the SUBMITTED refresh token verbatim, so the
+    // issued-token fields must survive byte-for-byte while the reflected copy
+    // in `scope` is scrubbed.
+    const REFRESH_TOKEN: &str = "RS +/% exact credential";
+    const ENCODED_REFRESH_TOKEN: &str = "RS+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("refresh_token={ENCODED_REFRESH_TOKEN}")),
+                "the mutation-discriminating credential was not submitted: {body}"
+            );
+            (
+                200,
+                serde_json::json!({
+                    "access_token": "AT-2",
+                    "refresh_token": REFRESH_TOKEN,
+                    "token_type": "Bearer",
+                    "scope": format!("openid {REFRESH_TOKEN} {ENCODED_REFRESH_TOKEN}"),
+                    "expires_in": 300
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens(REFRESH_TOKEN));
+
+    assert_eq!(auth.token().unwrap(), "AT-2");
+    let cached = auth.token_set().expect("the refresh must be cached");
+    assert_eq!(
+        cached.refresh_token.as_deref(),
+        Some(REFRESH_TOKEN),
+        "redaction must never rewrite the credential the IdP issued"
+    );
+    assert_eq!(
+        cached.scope(),
+        Some("openid [redacted credential] [redacted credential]")
+    );
+    assert!(!format!("{cached:?}").contains(REFRESH_TOKEN));
+    assert!(!format!("{cached:?}").contains(ENCODED_REFRESH_TOKEN));
+}
+
 #[test]
 fn refreshed_non_bearer_token_type_is_rejected() {
     let token_calls = Arc::new(AtomicUsize::new(0));
@@ -1159,6 +1350,102 @@ fn access_denied_is_device_flow_error() {
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     assert_eq!(err.idp_error(), Some("access_denied"));
     assert_eq!(err.idp_error_description(), Some("user declined"));
+}
+
+#[test]
+fn reflected_device_code_is_redacted_from_renderer_and_converted_error() {
+    const DEVICE_CODE: &str = "DEV +/% exact credential";
+    const ENCODED_DEVICE_CODE: &str = "DEV+%2B%2F%25+exact+credential";
+
+    struct RecordFailures(Arc<Mutex<Vec<String>>>);
+    impl Renderer for RecordFailures {
+        fn on_failure(&self, message: &str) {
+            self.0.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            serde_json::json!({
+                "device_code": DEVICE_CODE,
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://idp.example.com/activate",
+                "expires_in": 300,
+                "interval": 5
+            })
+            .to_string(),
+        ),
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("device_code={ENCODED_DEVICE_CODE}")),
+                "the mutation-discriminating credential was not submitted as expected: {body}"
+            );
+            (
+                400,
+                serde_json::json!({
+                    "error": DEVICE_CODE,
+                    "error_description": format!(
+                        "safe diagnostic before {ENCODED_DEVICE_CODE} after"
+                    )
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .renderer(RecordFailures(Arc::clone(&failures)))
+        .build()
+        .expect("build auth");
+
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.idp_error(), Some("[redacted credential]"));
+    assert_eq!(
+        err.idp_error_description(),
+        Some("safe diagnostic before [redacted credential] after")
+    );
+    let displayed_error = err.to_string();
+    for rendered in [err.message(), displayed_error.as_str()] {
+        assert!(
+            !rendered.contains(DEVICE_CODE),
+            "raw reflection: {rendered}"
+        );
+        assert!(
+            !rendered.contains(ENCODED_DEVICE_CODE),
+            "encoded reflection: {rendered}"
+        );
+    }
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("safe diagnostic before"));
+    assert!(!failures[0].contains(DEVICE_CODE));
+    assert!(!failures[0].contains(ENCODED_DEVICE_CODE));
+    drop(failures);
+
+    // `questdb_error_oidc_get_view` reads these same structured fields, so the
+    // converted crate error pins both transport use and the eventual FFI view.
+    let public_error: crate::Error = err.into();
+    assert!(!public_error.msg().contains(DEVICE_CODE));
+    assert!(!public_error.msg().contains(ENCODED_DEVICE_CODE));
+    assert!(!public_error.to_string().contains(DEVICE_CODE));
+    assert!(!public_error.to_string().contains(ENCODED_DEVICE_CODE));
+    let structured = public_error.oidc_error().unwrap();
+    assert_eq!(structured.idp_error(), Some("[redacted credential]"));
+    assert_eq!(
+        structured.idp_error_description(),
+        Some("safe diagnostic before [redacted credential] after")
+    );
 }
 
 #[test]
@@ -2119,6 +2406,59 @@ fn refresh_transient_responses_preserve_structured_metadata() {
 }
 
 #[test]
+fn transient_refresh_reflection_is_redacted_from_converted_error() {
+    const REFRESH_TOKEN: &str = "RT +/% exact credential";
+    const ENCODED_REFRESH_TOKEN: &str = "RT+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start_with_retry_after(11, |method, path, body| match (method, path) {
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("refresh_token={ENCODED_REFRESH_TOKEN}")),
+                "the mutation-discriminating credential was not submitted as expected: {body}"
+            );
+            (
+                503,
+                serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": format!(
+                        "safe transient diagnostic: {REFRESH_TOKEN}; wire={ENCODED_REFRESH_TOKEN}"
+                    )
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens(REFRESH_TOKEN));
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(err.status(), Some(503));
+    assert_eq!(err.retry_after_secs(), Some(11));
+    assert_eq!(err.idp_error(), Some("temporarily_unavailable"));
+    assert_eq!(
+        err.idp_error_description(),
+        Some("safe transient diagnostic: [redacted credential]; wire=[redacted credential]")
+    );
+    assert!(!err.message().contains(REFRESH_TOKEN));
+    assert!(!err.to_string().contains(REFRESH_TOKEN));
+    assert!(!err.to_string().contains(ENCODED_REFRESH_TOKEN));
+
+    let public_error: crate::Error = err.into();
+    assert!(!public_error.msg().contains(REFRESH_TOKEN));
+    assert!(!public_error.msg().contains(ENCODED_REFRESH_TOKEN));
+    assert!(!public_error.to_string().contains(REFRESH_TOKEN));
+    assert!(!public_error.to_string().contains(ENCODED_REFRESH_TOKEN));
+    let structured = public_error.oidc_error().unwrap();
+    assert_eq!(structured.idp_error(), Some("temporarily_unavailable"));
+    assert_eq!(
+        structured.idp_error_description(),
+        Some("safe transient diagnostic: [redacted credential]; wire=[redacted credential]")
+    );
+}
+
+#[test]
 fn refresh_rejected_requires_explicit_device_flow() {
     // A 4xx (revoked / expired refresh token) is terminal. A token-provider call
     // must report that interaction is required without starting a device flow;
@@ -2394,6 +2734,61 @@ fn expired_token_error_returns_timeout() {
         Some("The device code is no longer valid.")
     );
     assert_eq!(err.status(), Some(400));
+}
+
+#[test]
+fn expired_token_reflection_does_not_escape_in_structured_error() {
+    const DEVICE_CODE: &str = "EXP +/% exact credential";
+    const ENCODED_DEVICE_CODE: &str = "EXP+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            serde_json::json!({
+                "device_code": DEVICE_CODE,
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://idp.example.com/activate",
+                "expires_in": 300,
+                "interval": 5
+            })
+            .to_string(),
+        ),
+        ("POST", "/token") => {
+            assert!(body.contains(&format!("device_code={ENCODED_DEVICE_CODE}")));
+            (
+                400,
+                serde_json::json!({
+                    "error": "expired_token",
+                    "error_description": format!(
+                        "expired {DEVICE_CODE}; submitted={ENCODED_DEVICE_CODE}"
+                    )
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    assert_eq!(
+        err.idp_error_description(),
+        Some("expired [redacted credential]; submitted=[redacted credential]")
+    );
+    assert!(!err.message().contains(DEVICE_CODE));
+    assert!(!err.to_string().contains(DEVICE_CODE));
+    assert!(!err.to_string().contains(ENCODED_DEVICE_CODE));
+
+    let public_error: crate::Error = err.into();
+    assert!(!public_error.msg().contains(DEVICE_CODE));
+    assert!(!public_error.msg().contains(ENCODED_DEVICE_CODE));
+    let structured = public_error.oidc_error().unwrap();
+    assert_eq!(structured.idp_error(), Some("expired_token"));
+    assert_eq!(
+        structured.idp_error_description(),
+        Some("expired [redacted credential]; submitted=[redacted credential]")
+    );
 }
 
 #[test]
