@@ -1345,6 +1345,10 @@ pub unsafe extern "C" fn questdb_oidc_builder_ca_bundle(
     let Some(path) = (unsafe { input_str(path, path_len, "OIDC CA-bundle path", err_out) }) else {
         return false;
     };
+    if let Err(err) = reject_unexpanded_home(path, "OIDC CA-bundle path") {
+        unsafe { set_err_out_from_error(err_out, err) };
+        return false;
+    }
     builder.config.ca_bundle = Some(PathBuf::from(path));
     true
 }
@@ -1380,7 +1384,7 @@ pub unsafe extern "C" fn questdb_oidc_builder_file_token_store(
     }) else {
         return false;
     };
-    if let Err(err) = reject_unexpanded_home(directory) {
+    if let Err(err) = reject_unexpanded_home(directory, "OIDC token-store directory") {
         unsafe { set_err_out_from_error(err_out, err) };
         return false;
     }
@@ -1388,25 +1392,20 @@ pub unsafe extern "C" fn questdb_oidc_builder_file_token_store(
     true
 }
 
-/// Refuse a token-store directory whose leading `~` nothing will expand.
+/// Refuse a public path argument whose leading `~` nothing will expand.
 ///
-/// A shell expands `~`, a runtime does not, so this client and the Java client
-/// both create a directory literally *named* `~` and write a long-lived
-/// plaintext refresh token into it -- usually under whatever directory the
-/// process happened to start in. The Python binding expands and absolutises the
-/// same argument at construction, so without this check one spelling means two
-/// different locations depending on which binding a user reached for. Fail
-/// loudly instead, matching `at_default_location`'s treatment of the shared
-/// environment override.
-fn reject_unexpanded_home(directory: &str) -> questdb::Result<()> {
-    if directory == "~" || directory.starts_with("~/") || directory.starts_with("~\\") {
+/// A shell expands `~`, these APIs do not. For a token-store directory the
+/// unchecked spelling creates a directory literally named `~` under the
+/// working directory and can leave a plaintext refresh token there; for a CA
+/// bundle it produces a misleading file-open failure. Fail at the builder
+/// boundary and make callers pass the path they actually intend.
+fn reject_unexpanded_home(path: &str, label: &str) -> questdb::Result<()> {
+    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
         return Err(Error::new(
             ErrorCode::ConfigError,
             format!(
-                "the OIDC token-store directory {directory:?} starts with `~`, which \
-                 shells expand but this client does not: it would create a directory \
-                 literally named `~` under the working directory and leave a plaintext \
-                 refresh token there. Pass an already-expanded absolute path."
+                "the {label} {path:?} starts with `~`, which shells expand but this \
+                 client does not. Pass an already-expanded absolute path."
             ),
         ));
     }
@@ -1988,25 +1987,26 @@ mod tests {
     use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
     #[test]
-    fn file_token_store_rejects_an_unexpanded_home_path() {
-        // A shell expands `~`; no runtime does. Left alone, this created a
-        // directory literally named `~` under the working directory and left a
-        // long-lived plaintext refresh token in it, while the same string
-        // handed to the Python binding landed in $HOME. Reject it here so one
-        // spelling cannot mean two locations.
-        for bad in ["~", "~/tokens", "~/.questdb/oidc-tokens"] {
-            assert!(
-                reject_unexpanded_home(bad).is_err(),
-                "{bad:?} must be rejected"
-            );
-        }
-        // An already-expanded path, a relative one, and a name that merely
-        // contains a tilde all stay acceptable.
-        for ok in ["/home/u/.questdb/oidc-tokens", "tokens", "./t", "a~b"] {
-            assert!(
-                reject_unexpanded_home(ok).is_ok(),
-                "{ok:?} must be accepted"
-            );
+    fn oidc_paths_reject_an_unexpanded_home_prefix() {
+        // A shell expands `~`; no runtime here does. For a token store this can
+        // leave a plaintext refresh token under an accidental working-directory
+        // path; for a CA bundle it produces a misleading file-open failure.
+        // Apply one spelling rule to both public path-taking builder methods.
+        for label in ["OIDC token-store directory", "OIDC CA-bundle path"] {
+            for bad in ["~", "~/tokens", "~/.questdb/oidc-tokens"] {
+                assert!(
+                    reject_unexpanded_home(bad, label).is_err(),
+                    "{label}: {bad:?} must be rejected"
+                );
+            }
+            // An already-expanded path, a relative one, and a name that merely
+            // contains a tilde all stay acceptable.
+            for ok in ["/home/u/.questdb/oidc-tokens", "tokens", "./t", "a~b"] {
+                assert!(
+                    reject_unexpanded_home(ok, label).is_ok(),
+                    "{label}: {ok:?} must be accepted"
+                );
+            }
         }
     }
 
@@ -4300,6 +4300,17 @@ mod header_abi {
                 Some((name.trim().to_string(), value.trim().parse::<i64>().ok()?))
             })
             .collect()
+    }
+
+    #[test]
+    fn oidc_input_cap_matches_the_public_header() {
+        let needle =
+            format!("#define QUESTDB_OIDC_MAX_INPUT_BYTES ((size_t){MAX_OIDC_INPUT_BYTES})");
+        assert!(
+            OIDC_H.contains(&needle),
+            "public C OIDC input cap drifted from Rust's {MAX_OIDC_INPUT_BYTES}-byte cap; \
+             expected `{needle}`"
+        );
     }
 
     #[test]

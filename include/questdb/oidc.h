@@ -21,6 +21,10 @@
 extern "C" {
 #endif
 
+/** Maximum accepted byte length for any single pointer-plus-length textual
+ *  OIDC builder input. The bound is applied before UTF-8 validation. */
+#define QUESTDB_OIDC_MAX_INPUT_BYTES ((size_t)1048576)
+
 #include <questdb/ingress/line_sender.h>
 
 /** Reusable device-flow builder, shared authentication state, and owned token.
@@ -307,7 +311,9 @@ bool questdb_oidc_builder_timeout_ms(
 /**
  * PEM CA bundle used to verify TLS for BOTH the QuestDB `/settings` discovery
  * request and every identity-provider request. Unset means the platform trust
- * store. The path is read at `questdb_oidc_builder_build` time, not here.
+ * store. The path is read at `questdb_oidc_builder_build` time, not here. No
+ * home-directory expansion is performed: a path beginning with `~`, `~/` or
+ * `~\\` is rejected; pass an already-expanded absolute path.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_ca_bundle(
@@ -695,7 +701,15 @@ typedef enum questdb_oidc_error_kind
  * Structured OIDC details borrowed from a live `questdb_error`. Zero-initialize
  * the struct and set `struct_size = sizeof(view)` before calling
  * `questdb_error_oidc_get_view`. On success `struct_size` is replaced with the
- * prefix written by the library.
+ * prefix written by the library; consumers that can load an older shared
+ * library must re-read it before accessing fields beyond that prefix.
+ *
+ * Token-endpoint diagnostics are untrusted. If an identity provider reflects
+ * the submitted device code or refresh token in any non-issued-token string,
+ * the library replaces that credential with `[redacted credential]` before it
+ * reaches `idp_error`, `idp_error_description`, a renderer, or a formatted
+ * error message. Issued `access_token`, `id_token`, and `refresh_token` fields
+ * remain byte-for-byte intact so a non-rotating refresh token stays usable.
  */
 typedef struct questdb_oidc_error_view
 {

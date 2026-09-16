@@ -104,6 +104,17 @@ fn persisted_token_zeroizes_every_secret_field() {
 }
 
 #[test]
+fn held_lock_scope_drop_is_infallible_when_marker_is_missing() {
+    // Drop runs on every token-store lock path. The FFI crate uses
+    // panic=abort, so a defensive invariant check here must never terminate an
+    // embedding Python/C process. A normally constructed scope still removes
+    // its marker; this deliberately malformed one simply has nothing to do.
+    drop(HeldLockScope {
+        lock: PathBuf::from("missing-lock-marker"),
+    });
+}
+
+#[test]
 fn cancellable_lock_wait_abandons_in_process_contention() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(FileTokenStore::at(dir.path()));

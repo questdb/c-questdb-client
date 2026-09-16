@@ -97,6 +97,32 @@ pub const TOKEN_STORE_DIR_ENV: &str = "QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR";
 const SCHEMA_VERSION: i64 = 1;
 const CANONICAL_PREFIX: &str = "questdb-oidc-token-v1";
 
+/// Count a JSON serialization without retaining any of its plaintext bytes.
+///
+/// `serde_json::to_vec` grows geometrically. When the value contains a token,
+/// every growth frees an allocation holding a plaintext prefix that wrapping
+/// only the final `Vec` in `Zeroizing` cannot reach. A counting pass lets the
+/// real buffer be allocated at its final size before the first credential byte
+/// is written.
+#[derive(Default)]
+struct JsonByteCount(usize);
+
+impl Write for JsonByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized OIDC token-store entry is too large",
+            )
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Cap on a token-store file. An id token with many group claims is a few KiB;
 /// 1 MiB is ample while refusing to persist or read an oversized file.
 const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -915,12 +941,30 @@ impl FileTokenStore {
             "token_ttl_millis".into(),
             Value::from(seconds_to_millis(token.token_ttl)),
         );
-        // serde_json escapes `"`, `\` and control chars, so an opaque token string
-        // round-trips safely. Wrap the write buffer in `Zeroizing` so the
-        // plaintext bytes are scrubbed once the caller has written them. Serialize
-        // `&map` (not a moved `Value::Object(map)`, byte-identical output) so the
-        // map survives the call and its cloned secret strings can be scrubbed too.
-        let bytes = Zeroizing::new(serde_json::to_vec(&map).unwrap_or_default());
+        // serde_json escapes `"`, `\` and control chars, so an opaque token
+        // string round-trips safely. Count first without storing bytes, then
+        // allocate the final plaintext buffer exactly once. Starting with an
+        // empty `Vec` (including `serde_json::to_vec`) lets geometric growth
+        // free superseded allocations containing credential prefixes that a
+        // `Zeroizing` wrapper around only the final allocation cannot scrub.
+        // Serialize `&map` rather than moving it so the cloned secret strings
+        // can be scrubbed below too.
+        let mut count = JsonByteCount::default();
+        let bytes = if serde_json::to_writer(&mut count, &map).is_ok() {
+            let mut plaintext = Vec::with_capacity(count.0);
+            if serde_json::to_writer(&mut plaintext, &map).is_ok() {
+                debug_assert_eq!(plaintext.len(), count.0);
+                Zeroizing::new(plaintext)
+            } else {
+                // `Vec<u8>` writes are infallible and the same `Value` was just
+                // serialized by the counting pass, but keep the old method's
+                // empty-on-error contract without leaving a partial credential.
+                plaintext.zeroize();
+                Zeroizing::new(Vec::new())
+            }
+        } else {
+            Zeroizing::new(Vec::new())
+        };
         for field in ["access_token", "id_token", "refresh_token"] {
             if let Some(Value::String(secret)) = map.get_mut(field) {
                 secret.zeroize();
@@ -1664,11 +1708,14 @@ impl Drop for HeldLockScope {
     fn drop(&mut self) {
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
-            let position = held
-                .iter()
-                .rposition(|candidate| candidate == &self.lock)
-                .expect("held OIDC token-store lock marker disappeared");
-            held.remove(position);
+            // Drop must be infallible: the FFI crate is built with
+            // `panic = "abort"`, so an invariant-only `expect` here could turn a
+            // future bookkeeping bug into an interpreter abort during lock
+            // teardown. Construction always pushes today; if that invariant is
+            // ever broken, leaving no marker is already the desired state.
+            if let Some(position) = held.iter().rposition(|candidate| candidate == &self.lock) {
+                held.remove(position);
+            }
         });
     }
 }
