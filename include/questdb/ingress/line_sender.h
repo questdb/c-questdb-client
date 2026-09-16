@@ -1039,6 +1039,10 @@ bool line_sender_buffer_column_dec_str(
 /**
  * Record a decimal value for the given column.
  *
+ * This row API accepts big-endian mantissas; the chunk APIs
+ * qwp_chunk_column_decimal128 and qwp_chunk_column_decimal256 require
+ * little-endian bytes.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] scale Number of digits after the decimal point

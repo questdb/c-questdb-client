@@ -54,6 +54,31 @@ pub use super::{OwnedDirectColumnSender, OwnedSender};
 #[cfg(feature = "_egress")]
 pub use super::{OwnedReader, ReaderPoolHandle};
 
+/// Append portable LE decimal128 bytes without imposing i128 alignment or a
+/// compiler-specific C integer type. The slice remains borrowed by the chunk.
+/// Unlike [`crate::ingress::Buffer::column_dec128`] with
+/// [`crate::ingress::DecimalView::Scaled`], which accepts big-endian mantissas,
+/// this function requires little-endian bytes.
+pub fn chunk_column_decimal128<'a, 'c>(
+    chunk: &'c mut crate::ingress::column_sender::Chunk<'a>,
+    name: &str,
+    data: &'a [[u8; 16]],
+    scale: u8,
+    validity: Option<&crate::ingress::column_sender::Validity<'a>>,
+) -> Result<&'c mut crate::ingress::column_sender::Chunk<'a>> {
+    // SAFETY: each row is exactly 16 little-endian mantissa bytes, with no
+    // padding or alignment requirement beyond u8, borrowed for the chunk's lifetime.
+    unsafe {
+        chunk.push_numpy_deferred(
+            name,
+            crate::ingress::column_sender::NumpyDtype::Decimal128 { scale },
+            data.as_ptr().cast(),
+            data.len(),
+            validity,
+        )
+    }
+}
+
 /// Borrow the store-and-forward QWP sender as an owned, lifetime-free handle.
 ///
 /// FFI counterpart to [`QuestDb::borrow_sender`]; backs the C ABI's

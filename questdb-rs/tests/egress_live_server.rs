@@ -698,9 +698,126 @@ fn date_round_trip() {
 // Decimals (require protocol V3 ILP for ingress, but server side is V3)
 // ---------------------------------------------------------------------------
 
-// QuestDB picks DECIMAL64 / DECIMAL128 / DECIMAL256 by precision:
-// <=18 -> 64, 19..=38 -> 128, 39..=76 -> 256. Inserts need an explicit
+// QWP uses DECIMAL64 / DECIMAL128 / DECIMAL256 wire types. SQL columns
+// with precision <=9 can use narrower storage. Inserts need an explicit
 // cast since DOUBLE -> DECIMAL is not auto-promoted.
+
+#[test]
+fn native_chunk_decimals_and_arrays_round_trip() {
+    use questdb::ingress::AckLevel;
+    use questdb::ingress::column_sender::{Chunk, Validity};
+
+    let srv = server();
+    let table = unique_table("native_columns");
+    assert_eq!(
+        srv.http_exec(&format!(
+            "CREATE TABLE {table} (d64 DECIMAL(18,9), d128 DECIMAL(38,9), \
+         d256 DECIMAL(76,38), book DOUBLE[][], ts TIMESTAMP_NS) \
+         TIMESTAMP(ts) PARTITION BY DAY WAL"
+        )),
+        200
+    );
+    let max64 = 10i64.pow(18) - 1;
+    let d64 = [max64, -max64, 0, 0];
+    let max128 = 10i128.pow(38) - 1;
+    let d128 = [max128, -max128, 0, 0];
+    // Build 10^76 - 1 without adding a big-integer dependency to the API.
+    let mut max256 = [0u8; 32];
+    for _ in 0..76 {
+        let mut carry = 9u16;
+        for byte in &mut max256 {
+            let next = u16::from(*byte) * 10 + carry;
+            *byte = next as u8;
+            carry = next >> 8;
+        }
+        assert_eq!(carry, 0);
+    }
+    let mut min256 = max256.map(|byte| !byte);
+    let mut carry = 1u16;
+    for byte in &mut min256 {
+        let next = u16::from(*byte) + carry;
+        *byte = next as u8;
+        carry = next >> 8;
+    }
+    let d256 = [max256, min256, [0; 32], [0; 32]];
+    let book: Vec<f64> = (0..4)
+        .flat_map(|_| [100.25, f64::NAN, 0.0, u32::MAX as f64])
+        .collect();
+    let bits = [0b0111];
+    let validity = Validity::from_bitmap(&bits, 4).unwrap();
+    let ts = [
+        1_726_401_600_123_456_789i64,
+        1_726_401_600_123_456_790,
+        1_726_401_600_123_456_791,
+        1_726_401_600_123_456_792,
+    ];
+    let db = questdb::QuestDb::connect(&srv.qwp_conf()).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let mut chunk = Chunk::new(&table);
+    chunk
+        .column_decimal64("d64", &d64, 9, Some(&validity))
+        .unwrap();
+    chunk
+        .column_decimal128("d128", &d128, 9, Some(&validity))
+        .unwrap();
+    chunk
+        .column_decimal256("d256", &d256, 38, Some(&validity))
+        .unwrap();
+    chunk
+        .column_f64_array("book", &book, 4, &[2, 2], Some(&validity))
+        .unwrap();
+    chunk.at_nanos(&ts).unwrap();
+    sender.flush_and_get_fsn(&mut chunk).unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(10)).unwrap();
+    wait_for_rows(srv, &table, 4);
+    select_one_batch(
+        srv,
+        &format!("SELECT d64,d128,d256,book,cast(ts as long) FROM {table} ORDER BY ts"),
+        |view| {
+            let ColumnView::Decimal64(c) = view.column(0).unwrap() else {
+                panic!("expected decimal64");
+            };
+            assert_eq!(c.scale(), 9);
+            for (row, expected) in d64[..3].iter().enumerate() {
+                assert_eq!(c.value(row), *expected);
+            }
+            assert!(c.is_null(3));
+            let ColumnView::Decimal128(c) = view.column(1).unwrap() else {
+                panic!("expected decimal128");
+            };
+            assert_eq!(c.scale(), 9);
+            for (row, expected) in d128[..3].iter().enumerate() {
+                assert_eq!(c.value(row), *expected);
+            }
+            assert!(c.is_null(3));
+            let ColumnView::Decimal256(c) = view.column(2).unwrap() else {
+                panic!("expected decimal256");
+            };
+            assert_eq!(c.scale(), 38);
+            for (row, expected) in d256[..3].iter().enumerate() {
+                assert_eq!(c.value(row), expected);
+            }
+            assert!(c.is_null(3));
+            let ColumnView::DoubleArray(c) = view.column(3).unwrap() else {
+                panic!("expected double array");
+            };
+            for row in 0..3 {
+                assert_eq!(c.shape(row), Some(&[2, 2][..]));
+                assert_eq!(c.element(row, 0), Some(100.25));
+                assert!(c.element(row, 1).unwrap().is_nan());
+                assert_eq!(c.element(row, 2), Some(0.0));
+                assert_eq!(c.element(row, 3), Some(u32::MAX as f64));
+            }
+            assert!(c.is_null(3));
+            let ColumnView::Long(c) = view.column(4).unwrap() else {
+                panic!("expected timestamp cast");
+            };
+            for (row, expected) in ts.iter().enumerate() {
+                assert_eq!(c.value(row), *expected);
+            }
+        },
+    );
+}
 
 #[test]
 fn decimal64_round_trip() {
