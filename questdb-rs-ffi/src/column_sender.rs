@@ -41,7 +41,7 @@ use questdb::QuestDb;
 use questdb::ffi_support::{OwnedDirectColumnSender, OwnedSender};
 #[cfg(feature = "arrow")]
 use questdb::ingress::column_sender::{ArrowColumnOverride, FlushFailure, ImportedArrowColumn};
-use questdb::ingress::column_sender::{Chunk, NumpyDtype, Validity};
+use questdb::ingress::column_sender::{Chunk, MAX_CHUNK_ROWS, NumpyDtype, Validity};
 use questdb::ingress::{AckLevel, TimestampUnit};
 #[cfg(feature = "arrow")]
 use questdb::ingress::{ColumnName, TableName};
@@ -1872,8 +1872,8 @@ macro_rules! decimal_column_fn {
                 Some(s) => s,
                 None => return false,
             };
-            // Byte-backed wide decimals require only byte alignment. The row
-            // count is bounded before constructing the borrowed Rust slice.
+            // Bound the row count before constructing the borrowed slice.
+            // Wide decimals use byte arrays, so they need only byte alignment.
             let data = match unsafe {
                 typed_slice(
                     data.cast::<$row_ty>(),
@@ -1952,6 +1952,20 @@ pub unsafe extern "C" fn qwp_chunk_column_f64_array(
         Some(s) => s,
         None => return false,
     };
+    if row_count > MAX_CHUNK_ROWS {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "array column row_count {row_count} exceeds MAX_CHUNK_ROWS ({MAX_CHUNK_ROWS})"
+                    ),
+                ),
+            );
+        }
+        return false;
+    }
     let shape = match unsafe {
         typed_slice_bounded(
             shape,
@@ -1965,7 +1979,7 @@ pub unsafe extern "C" fn qwp_chunk_column_f64_array(
         Some(s) => s,
         None => return false,
     };
-    let max_elements = questdb::ingress::column_sender::MAX_CHUNK_ROWS
+    let max_elements = MAX_CHUNK_ROWS
         .saturating_mul(MAX_NDARRAY_LEAF_ELEMS)
         .min(isize::MAX as usize / std::mem::size_of::<f64>());
     let data = match unsafe {

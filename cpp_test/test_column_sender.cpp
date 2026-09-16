@@ -25,10 +25,11 @@
 #include <questdb/ingress/qwp_sender.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
-#include <chrono>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
@@ -158,15 +159,46 @@ TEST_CASE("column_chunk native decimals and arrays flush through C ABI")
     conn.flush_and_wait(chunk);
     const auto frames = mock->captured_requests();
     REQUIRE_FALSE(frames.empty());
-    // Decimal256 body: null flag, bitmap, scale, +1 then -1 in LE bytes.
-    std::vector<uint8_t> body{1, 2, 76};
+    const auto check_body = [&](const char* column,
+                                const std::vector<uint8_t>& body) {
+        INFO("column: ", column);
+        CHECK(std::any_of(frames.begin(), frames.end(), [&](const auto& frame) {
+            return std::search(
+                       frame.begin(), frame.end(), body.begin(), body.end()) !=
+                   frame.end();
+        }));
+    };
+    const auto append_u64_le = [](std::vector<uint8_t>& body, uint64_t value) {
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            body.push_back(static_cast<uint8_t>(value >> shift));
+    };
+    // Null flag, bitmap, scale, then only the non-null mantissas in LE.
+    std::vector<uint8_t> body{1, 2, 2};
+    append_u64_le(body, 12345);
+    append_u64_le(body, static_cast<uint64_t>(-12345));
+    check_body("d64", body);
+    body = {1, 2, 9};
+    body.insert(body.end(), d128.begin(), d128.begin() + 16);
+    body.insert(body.end(), d128.begin() + 32, d128.end());
+    check_body("d128", body);
+    body = {1, 2, 76};
     body.insert(body.end(), d256.begin(), d256.begin() + 32);
     body.insert(body.end(), d256.begin() + 64, d256.end());
-    CHECK(std::any_of(frames.begin(), frames.end(), [&](const auto& frame) {
-        return std::search(
-                   frame.begin(), frame.end(), body.begin(), body.end()) !=
-               frame.end();
-    }));
+    check_body("d256", body);
+
+    body = {1, 2};
+    for (size_t row : {size_t{0}, size_t{2}})
+    {
+        // Each non-null array has ndim=2, shape=[2, 2], then four doubles.
+        body.insert(body.end(), {2, 2, 0, 0, 0, 2, 0, 0, 0});
+        for (size_t i = 0; i < 4; ++i)
+        {
+            uint64_t bits;
+            std::memcpy(&bits, &values[row * 4 + i], sizeof(bits));
+            append_u64_le(body, bits);
+        }
+    }
+    check_body("a", body);
     CHECK(chunk.row_count() == 0);
     conn.drop_on_return();
 }
@@ -178,7 +210,21 @@ TEST_CASE("column_chunk native columns report validation errors")
     const double values[] = {1, 2, 3, 4};
     const uint32_t shape[] = {2, 2};
     const uint32_t zero_shape[] = {0};
+    const uint8_t bits[] = {3};
+    const qdb::validity_view wrong_validity{bits, 2};
     qdb::column_chunk chunk{"t"};
+    CHECK_THROWS_AS(
+        chunk.column_decimal64("d64", d64, 1, 0, &wrong_validity),
+        qdb::line_sender_error);
+    CHECK_THROWS_AS(
+        chunk.column_decimal128("d128", wide, 1, 0, &wrong_validity),
+        qdb::line_sender_error);
+    CHECK_THROWS_AS(
+        chunk.column_decimal256("d256", wide, 1, 0, &wrong_validity),
+        qdb::line_sender_error);
+    CHECK_THROWS_AS(
+        chunk.column_f64_array("a", values, 4, 1, shape, 2, &wrong_validity),
+        qdb::line_sender_error);
     CHECK_THROWS_AS(
         chunk.column_decimal64("d64", d64, 1, 19), qdb::line_sender_error);
     CHECK_THROWS_AS(
@@ -198,6 +244,28 @@ TEST_CASE("column_chunk native columns report validation errors")
         qdb::line_sender_error);
     CHECK_THROWS_AS(
         chunk.column_decimal128("d64", wide, 1, 0), qdb::line_sender_error);
+}
+
+TEST_CASE("column_chunk native arrays enforce the row limit at append")
+{
+    constexpr size_t max_rows = 16 * 1024 * 1024;
+    const std::vector<double> data(max_rows + 1);
+    const uint32_t shape[] = {1};
+    qdb::column_chunk chunk{"t"};
+    // The FFI must check the row limit before borrowing the data buffer.
+    CHECK_THROWS_WITH_AS(
+        chunk.column_f64_array(
+            "a", nullptr, max_rows + 1, max_rows + 1, shape, 1),
+        doctest::Contains("MAX_CHUNK_ROWS"),
+        qdb::line_sender_error);
+    CHECK_THROWS_WITH_AS(
+        chunk.column_f64_array(
+            "a", data.data(), data.size(), max_rows + 1, shape, 1),
+        doctest::Contains("MAX_CHUNK_ROWS"),
+        qdb::line_sender_error);
+    CHECK(chunk.row_count() == 0);
+    chunk.column_f64_array("a", data.data(), max_rows, max_rows, shape, 1);
+    CHECK(chunk.row_count() == max_rows);
 }
 
 TEST_CASE("column_chunk fluent chaining returns the same chunk")

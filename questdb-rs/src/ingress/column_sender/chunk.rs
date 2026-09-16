@@ -42,12 +42,11 @@ use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
 use std::slice;
 
-use crate::ingress::TimestampUnit;
+use crate::ingress::{MAX_ARRAY_DIMS, TimestampUnit};
 use crate::{Result, error};
 
 #[cfg(feature = "arrow-ingress")]
 use super::arrow_batch;
-use super::numpy_wire;
 use super::validity::{Validity, check_row_count};
 use super::wire::{
     QWP_TYPE_BINARY, QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_DATE, QWP_TYPE_DOUBLE,
@@ -55,6 +54,7 @@ use super::wire::{
     QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, QWP_TYPE_VARCHAR,
     validate_column_name,
 };
+use super::{MAX_CHUNK_ROWS, numpy_wire};
 
 // ===========================================================================
 // Descriptors
@@ -278,7 +278,6 @@ pub(crate) enum ColumnKind {
         data: *const u8,
         byte_width: usize,
         scale: u8,
-        little_endian: bool,
     },
 
     // ---- Variable-width text (VARCHAR) ----
@@ -467,12 +466,10 @@ impl ColumnKind {
                     data,
                     byte_width,
                     scale,
-                    little_endian,
                 } => ColumnKind::Decimal {
                     data: data.add(row_offset * byte_width),
                     byte_width: *byte_width,
                     scale: *scale,
-                    little_endian: *little_endian,
                 },
                 // Offsets are absolute into `bytes`, so a sub-range of the
                 // offset table still indexes the full (unsliced) byte buffer.
@@ -871,7 +868,7 @@ impl<'a> Chunk<'a> {
         scale: u8,
         validity: Option<&Validity<'a>>,
     ) -> Result<&mut Self> {
-        self.push_decimal(name, data, scale, validity, cfg!(target_endian = "little"))
+        self.push_decimal(name, data, scale, validity)
     }
 
     /// Append a decimal column from signed 128-bit mantissas (QWP wire type
@@ -908,7 +905,7 @@ impl<'a> Chunk<'a> {
         scale: u8,
         validity: Option<&Validity<'a>>,
     ) -> Result<&mut Self> {
-        self.push_decimal(name, data, scale, validity, cfg!(target_endian = "little"))
+        self.push_decimal(name, data, scale, validity)
     }
 
     /// Append a decimal column from 32-byte, little-endian, two's-complement
@@ -918,6 +915,9 @@ impl<'a> Chunk<'a> {
     ///
     /// This byte representation matches the QWP decimal reader and avoids
     /// requiring a 256-bit integer crate. It is little-endian on every host.
+    /// Unlike [`crate::ingress::Buffer::column_dec`] with
+    /// [`crate::ingress::DecimalView::Scaled`], which accepts big-endian mantissas,
+    /// this method requires little-endian bytes.
     pub fn column_decimal256(
         &mut self,
         name: &str,
@@ -925,7 +925,7 @@ impl<'a> Chunk<'a> {
         scale: u8,
         validity: Option<&Validity<'a>>,
     ) -> Result<&mut Self> {
-        self.push_decimal(name, data, scale, validity, true)
+        self.push_decimal(name, data, scale, validity)
     }
 
     #[cfg(feature = "ffi-support")]
@@ -936,18 +936,17 @@ impl<'a> Chunk<'a> {
         scale: u8,
         validity: Option<&Validity<'a>>,
     ) -> Result<&mut Self> {
-        self.push_decimal(name, data, scale, validity, true)
+        self.push_decimal(name, data, scale, validity)
     }
 
     // Only instantiated with padding-free i64, i128, [u8; 16], and [u8; 32].
-    // Explicit byte order lets the C ABI use unaligned, portable LE byte rows.
+    // All supported hosts and byte-backed mantissas use little-endian encoding.
     fn push_decimal<T>(
         &mut self,
         name: &str,
         data: &'a [T],
         scale: u8,
         validity: Option<&Validity<'a>>,
-        little_endian: bool,
     ) -> Result<&mut Self> {
         let byte_width = std::mem::size_of::<T>();
         let dtype = match byte_width {
@@ -965,7 +964,6 @@ impl<'a> Chunk<'a> {
                 data: data.as_ptr().cast(),
                 byte_width,
                 scale,
-                little_endian,
             },
             validity,
             row_count,
@@ -977,10 +975,12 @@ impl<'a> Chunk<'a> {
     /// every row has the same shape. For example, `shape = [2, 10]` represents
     /// a `DOUBLE[][]` column with 20 values per row.
     ///
-    /// The shape must have 1 to [`crate::ingress::MAX_ARRAY_DIMS`] nonzero
-    /// dimensions within the SDK's array size limit. `data.len()` must equal
-    /// `row_count * product(shape)`, including space for null rows. A batch
-    /// with zero rows is allowed. `validity` marks null array rows; `f64::NAN`
+    /// The shape must have 1 to [`MAX_ARRAY_DIMS`] nonzero dimensions and at
+    /// most [`crate::ingress::MAX_NDARRAY_LEAF_ELEMS`] elements per row.
+    /// `row_count` must not exceed [`super::MAX_CHUNK_ROWS`]. `data.len()` must
+    /// equal `row_count * product(shape)`, including space for null rows.
+    /// A zero-row append locks the chunk to zero rows; call [`Self::clear`]
+    /// before reuse or flush. `validity` marks null array rows; `f64::NAN`
     /// represents a null array element. Ragged and empty arrays are not
     /// supported by this fixed-shape interface.
     ///
@@ -1014,15 +1014,23 @@ impl<'a> Chunk<'a> {
         shape: &[u32],
         validity: Option<&Validity<'a>>,
     ) -> Result<&mut Self> {
-        if shape.is_empty() || shape.len() > crate::ingress::MAX_ARRAY_DIMS {
+        if row_count > MAX_CHUNK_ROWS {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "array column row_count {} exceeds MAX_CHUNK_ROWS ({})",
+                row_count,
+                MAX_CHUNK_ROWS
+            ));
+        }
+        if shape.is_empty() || shape.len() > MAX_ARRAY_DIMS {
             return Err(error::fmt!(
                 InvalidApiCall,
                 "DOUBLE array dimensions must be in 1..={}, got {}",
-                crate::ingress::MAX_ARRAY_DIMS,
+                MAX_ARRAY_DIMS,
                 shape.len()
             ));
         }
-        let mut dims = [0; crate::ingress::MAX_ARRAY_DIMS];
+        let mut dims = [0; MAX_ARRAY_DIMS];
         dims[..shape.len()].copy_from_slice(shape);
         let dtype = numpy_wire::NumpyDtype::F64Ndarray {
             ndim: shape.len() as u8,
@@ -2009,7 +2017,7 @@ mod tests {
         }
         assert_eq!(chunk.row_count(), 2);
 
-        let too_many_dims = [1; crate::ingress::MAX_ARRAY_DIMS + 1];
+        let too_many_dims = [1; MAX_ARRAY_DIMS + 1];
         for shape in [
             &[][..],
             &[0],
@@ -2036,13 +2044,25 @@ mod tests {
             assert!(err.msg().contains("data length"));
             assert!(chunk.is_empty());
         }
+    }
+
+    #[test]
+    fn native_array_checks_row_limit_before_locking_chunk() {
+        let max_rows = MAX_CHUNK_ROWS;
+        let data = vec![0.0; max_rows + 1];
         let mut chunk = Chunk::new("t");
-        assert!(
-            chunk
-                .column_f64_array("v", &[], super::super::MAX_CHUNK_ROWS + 1, &[1], None)
-                .is_err()
-        );
+        let err = chunk
+            .column_f64_array("v", &data, max_rows + 1, &[1], None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("MAX_CHUNK_ROWS"), "{}", err.msg());
         assert!(chunk.is_empty());
+        assert_eq!(chunk.row_count(), 0);
+
+        chunk
+            .column_f64_array("v", &data[..max_rows], max_rows, &[1], None)
+            .unwrap();
+        assert_eq!(chunk.row_count(), max_rows);
     }
 
     #[test]

@@ -311,7 +311,9 @@ public:
         return *this;
     }
 
-    /** Decimal128: 16 LE two's-complement bytes per row, scale in 0..=38. */
+    /** Decimal128: 16 LE two's-complement bytes per row, scale in 0..=38.
+     * Unlike decimal::decimal_view, which accepts big-endian mantissas,
+     * this method requires little-endian bytes. */
     column_chunk& column_decimal128(
         std::string_view name,
         const uint8_t* data,
@@ -331,7 +333,9 @@ public:
         return *this;
     }
 
-    /** Decimal256: 32 LE two's-complement bytes per row, scale in 0..=76. */
+    /** Decimal256: 32 LE two's-complement bytes per row, scale in 0..=76.
+     * Unlike decimal::decimal_view, which accepts big-endian mantissas,
+     * this method requires little-endian bytes. */
     column_chunk& column_decimal256(
         std::string_view name,
         const uint8_t* data,

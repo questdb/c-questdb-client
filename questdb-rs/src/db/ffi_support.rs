@@ -56,6 +56,9 @@ pub use super::{OwnedReader, ReaderPoolHandle};
 
 /// Append portable LE decimal128 bytes without imposing i128 alignment or a
 /// compiler-specific C integer type. The slice remains borrowed by the chunk.
+/// Unlike [`crate::ingress::Buffer::column_dec128`] with
+/// [`crate::ingress::DecimalView::Scaled`], which accepts big-endian mantissas,
+/// this function requires little-endian bytes.
 pub fn chunk_column_decimal128<'a, 'c>(
     chunk: &'c mut crate::ingress::column_sender::Chunk<'a>,
     name: &str,

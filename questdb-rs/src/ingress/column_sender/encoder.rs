@@ -738,33 +738,11 @@ unsafe fn encode_column(
             data,
             byte_width,
             scale,
-            little_endian,
         } => unsafe {
             match byte_width {
-                8 => numpy_wire::emit_decimal::<8>(
-                    out,
-                    scale,
-                    data,
-                    row_count,
-                    validity,
-                    little_endian,
-                ),
-                16 => numpy_wire::emit_decimal::<16>(
-                    out,
-                    scale,
-                    data,
-                    row_count,
-                    validity,
-                    little_endian,
-                ),
-                32 => numpy_wire::emit_decimal::<32>(
-                    out,
-                    scale,
-                    data,
-                    row_count,
-                    validity,
-                    little_endian,
-                ),
+                8 => numpy_wire::emit_decimal::<8>(out, scale, data, row_count, validity),
+                16 => numpy_wire::emit_decimal::<16>(out, scale, data, row_count, validity),
+                32 => numpy_wire::emit_decimal::<32>(out, scale, data, row_count, validity),
                 _ => unreachable!("validated decimal width"),
             }
         },

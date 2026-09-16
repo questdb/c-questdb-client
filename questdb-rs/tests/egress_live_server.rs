@@ -707,7 +707,7 @@ fn native_chunk_decimals_and_arrays_round_trip() {
     use questdb::ingress::AckLevel;
     use questdb::ingress::column_sender::{Chunk, Validity};
 
-    let srv = QuestDbServer::start();
+    let srv = server();
     let table = unique_table("native_columns");
     assert_eq!(
         srv.http_exec(&format!(
@@ -769,9 +769,9 @@ fn native_chunk_decimals_and_arrays_round_trip() {
     chunk.at_nanos(&ts).unwrap();
     sender.flush_and_get_fsn(&mut chunk).unwrap();
     sender.wait(AckLevel::Ok, Duration::from_secs(10)).unwrap();
-    wait_for_rows(&srv, &table, 4);
+    wait_for_rows(srv, &table, 4);
     select_one_batch(
-        &srv,
+        srv,
         &format!("SELECT d64,d128,d256,book,cast(ts as long) FROM {table} ORDER BY ts"),
         |view| {
             let ColumnView::Decimal64(c) = view.column(0).unwrap() else {

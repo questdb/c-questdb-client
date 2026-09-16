@@ -574,7 +574,7 @@ bool qwp_chunk_column_f64(
     line_sender_error** err_out);
 
 /**
- * Decimal column from native int64_t mantissas. Each value is mantissa *
+ * `DECIMAL64` column from native int64_t mantissas. Each value is mantissa *
  * 10^(-scale); scale must be in 0..=18. Destination DECIMAL(p,s) determines
  * precision and storage width, including DECIMAL8/16/32. NULL rows are
  * specified by validity. Buffers stay live and unchanged through flush.
@@ -591,11 +591,14 @@ bool qwp_chunk_column_decimal64(
     line_sender_error** err_out);
 
 /**
- * Decimal column from row_count * 16 bytes of signed, two's-complement,
+ * `DECIMAL128` column from row_count * 16 bytes of signed, two's-complement,
  * little-endian mantissas. Only byte alignment is required; no compiler
  * int128 type is needed. scale must be in 0..=38. NULL rows use validity.
  * data includes 16 bytes for every row, including NULL rows, and remains
  * live and unchanged through flush. Destination DECIMAL(p,s) checks range.
+ * Unlike line_sender_buffer_column_dec and line_sender_buffer_column_dec128,
+ * which accept big-endian mantissas, this function requires little-endian
+ * bytes.
  */
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_decimal128(
@@ -609,8 +612,10 @@ bool qwp_chunk_column_decimal128(
     line_sender_error** err_out);
 
 /**
- * Like qwp_chunk_column_decimal128, with 32 LE bytes per mantissa and
- * scale in 0..=76. No big-integer or Arrow dependency is required.
+ * `DECIMAL256` column, like qwp_chunk_column_decimal128, with 32 LE bytes per
+ * mantissa and scale in 0..=76. No big-integer or Arrow dependency is required.
+ * Unlike line_sender_buffer_column_dec, which accepts big-endian mantissas,
+ * this function requires little-endian bytes.
  */
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_decimal256(
@@ -624,12 +629,14 @@ bool qwp_chunk_column_decimal256(
     line_sender_error** err_out);
 
 /**
- * Dense DOUBLE array column. shape[0..ndim] describes one row, excluding
+ * Dense `DOUBLE_ARRAY` column. shape[0..ndim] describes one row, excluding
  * row_count; every row shares the shape. ndim must be in 1..=32 and all
- * dimensions must be nonzero and within the SDK array size limit.
+ * dimensions must be nonzero. product(shape) must not exceed 16,777,216
+ * elements per row; row_count must not exceed 16,777,216 either.
  * data_len counts doubles and must equal row_count * product(shape),
- * including the storage occupied by NULL rows. Zero-row batches are valid;
- * ragged/empty arrays are not supported by this fixed-shape interface.
+ * including the storage occupied by NULL rows. A zero-row append locks the
+ * chunk to zero rows; clear it before reuse or flush. Ragged/empty arrays
+ * are not supported by this fixed-shape interface.
  * validity marks NULL array rows; NaN represents a NULL array element.
  * shape is copied during this call. data and validity stay live and
  * unchanged through flush. No Arrow or NumPy objects are required.
