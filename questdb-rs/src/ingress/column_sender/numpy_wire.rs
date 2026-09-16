@@ -1200,7 +1200,7 @@ pub(super) unsafe fn emit_decimal<const N: usize>(
                 if little_endian {
                     out.extend_from_slice(bytes);
                 } else {
-                    for row in bytes.chunks_exact(N) {
+                    for row in bytes.as_chunks::<N>().0 {
                         out.extend(row.iter().rev().copied());
                     }
                 }
