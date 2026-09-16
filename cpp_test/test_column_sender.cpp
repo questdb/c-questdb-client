@@ -129,8 +129,8 @@ TEST_CASE("column_chunk native decimals and arrays flush through C ABI")
     std::array<uint8_t, 96> d256{};
     d128[0] = 1;
     d256[0] = 1;
-    std::fill(d128.begin() + 32, d128.end(), 0xff);
-    std::fill(d256.begin() + 64, d256.end(), 0xff);
+    std::fill(d128.begin() + 32, d128.end(), uint8_t{0xff});
+    std::fill(d256.begin() + 64, d256.end(), uint8_t{0xff});
     const double values[] = {
         100.25,
         std::numeric_limits<double>::quiet_NaN(),
