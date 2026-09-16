@@ -66,7 +66,17 @@ pub fn chunk_column_decimal128<'a, 'c>(
     scale: u8,
     validity: Option<&crate::ingress::column_sender::Validity<'a>>,
 ) -> Result<&'c mut crate::ingress::column_sender::Chunk<'a>> {
-    chunk.column_decimal128_bytes(name, data, scale, validity)
+    // SAFETY: each row is exactly 16 little-endian mantissa bytes, with no
+    // padding or alignment requirement beyond u8, borrowed for the chunk's lifetime.
+    unsafe {
+        chunk.push_numpy_deferred(
+            name,
+            crate::ingress::column_sender::NumpyDtype::Decimal128 { scale },
+            data.as_ptr().cast(),
+            data.len(),
+            validity,
+        )
+    }
 }
 
 /// Borrow the store-and-forward QWP sender as an owned, lifetime-free handle.

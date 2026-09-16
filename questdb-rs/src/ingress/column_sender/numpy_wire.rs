@@ -1166,7 +1166,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// `data` must cover `row_count * N` bytes; any validity bitmap must cover
 /// `row_count` rows. `N` must be 8, 16, or 32.
 #[inline]
-pub(super) unsafe fn emit_decimal<const N: usize>(
+unsafe fn emit_decimal<const N: usize>(
     out: &mut Vec<u8>,
     scale: u8,
     data: *const u8,

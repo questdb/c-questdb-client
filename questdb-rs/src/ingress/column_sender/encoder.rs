@@ -461,7 +461,6 @@ fn estimate_frame_size(
             ColumnKind::Bool { .. } => bitmap_bytes,
             ColumnKind::Uuid { .. } => row_count.saturating_mul(16),
             ColumnKind::Long256 { .. } => row_count.saturating_mul(32),
-            ColumnKind::Decimal { byte_width, .. } => row_count.saturating_mul(byte_width),
             ColumnKind::Varchar { bytes_len, .. }
             | ColumnKind::VarcharLarge { bytes_len, .. }
             | ColumnKind::Binary { bytes_len, .. } => row_count
@@ -733,18 +732,6 @@ unsafe fn encode_column(
         },
         ColumnKind::Long256 { data } => unsafe {
             encode_fixed_width_bitmap::<32>(out, data as *const u8, row_count, validity);
-        },
-        ColumnKind::Decimal {
-            data,
-            byte_width,
-            scale,
-        } => unsafe {
-            match byte_width {
-                8 => numpy_wire::emit_decimal::<8>(out, scale, data, row_count, validity),
-                16 => numpy_wire::emit_decimal::<16>(out, scale, data, row_count, validity),
-                32 => numpy_wire::emit_decimal::<32>(out, scale, data, row_count, validity),
-                _ => unreachable!("validated decimal width"),
-            }
         },
         ColumnKind::Varchar {
             offsets,

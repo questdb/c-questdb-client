@@ -274,12 +274,6 @@ pub(crate) enum ColumnKind {
     Long256 {
         data: *const [u8; 32],
     },
-    Decimal {
-        data: *const u8,
-        byte_width: usize,
-        scale: u8,
-    },
-
     // ---- Variable-width text (VARCHAR) ----
     Varchar {
         offsets: *const i32,
@@ -461,15 +455,6 @@ impl ColumnKind {
                 },
                 ColumnKind::Long256 { data } => ColumnKind::Long256 {
                     data: data.add(row_offset),
-                },
-                ColumnKind::Decimal {
-                    data,
-                    byte_width,
-                    scale,
-                } => ColumnKind::Decimal {
-                    data: data.add(row_offset * byte_width),
-                    byte_width: *byte_width,
-                    scale: *scale,
                 },
                 // Offsets are absolute into `bytes`, so a sub-range of the
                 // offset table still indexes the full (unsliced) byte buffer.
@@ -928,19 +913,7 @@ impl<'a> Chunk<'a> {
         self.push_decimal(name, data, scale, validity)
     }
 
-    #[cfg(feature = "ffi-support")]
-    pub(crate) fn column_decimal128_bytes(
-        &mut self,
-        name: &str,
-        data: &'a [[u8; 16]],
-        scale: u8,
-        validity: Option<&Validity<'a>>,
-    ) -> Result<&mut Self> {
-        self.push_decimal(name, data, scale, validity)
-    }
-
-    // Only instantiated with padding-free i64, i128, [u8; 16], and [u8; 32].
-    // All supported hosts and byte-backed mantissas use little-endian encoding.
+    // Only instantiated with padding-free i64, i128, and [u8; 32].
     fn push_decimal<T>(
         &mut self,
         name: &str,
@@ -955,19 +928,9 @@ impl<'a> Chunk<'a> {
             32 => numpy_wire::NumpyDtype::Decimal256 { scale },
             _ => unreachable!("decimal mantissas have 8, 16, or 32 bytes"),
         };
-        dtype.validate()?;
-        let row_count = check_row_count(self.row_count, data.len(), validity)?;
-        self.push_column(
-            name,
-            dtype.wire_type(),
-            ColumnKind::Decimal {
-                data: data.as_ptr().cast(),
-                byte_width,
-                scale,
-            },
-            validity,
-            row_count,
-        )
+        // SAFETY: T is a padding-free mantissa matching the dtype's width and
+        // little-endian layout on supported hosts, borrowed for the chunk's lifetime.
+        unsafe { self.push_numpy_deferred(name, dtype, data.as_ptr().cast(), data.len(), validity) }
     }
 
     /// Append a `DOUBLE` array column from contiguous, row-major values.
