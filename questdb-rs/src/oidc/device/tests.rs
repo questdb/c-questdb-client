@@ -45,6 +45,12 @@ use crate::oidc::token_store::{
     FileTokenStore, PersistedToken, TokenStore, TokenStoreKey, TokenStoreResult,
 };
 
+/// Keep format/refresh tests running on non-Unix CI while production refuses
+/// file-store mutations there for lack of a durable metadata barrier.
+fn test_file_store(directory: impl AsRef<Path>) -> FileTokenStore {
+    FileTokenStore::at(directory.as_ref()).allow_unsafe_mutations_for_tests()
+}
+
 /// A tiny single-request-per-connection HTTP mock. The handler receives
 /// `(method, path, body)` and returns `(status, json_body)`.
 struct MockServer {
@@ -451,7 +457,7 @@ fn cancel_sign_in_aborts_only_the_current_device_flow() {
 #[test]
 fn close_cancels_file_store_lock_wait() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let auth = Arc::new(
         OidcDeviceAuth::builder()
             .client_id("questdb")
@@ -1704,7 +1710,7 @@ fn groups_mode_preserves_scope_and_loads_java_store_entry() {
         true,
         None,
     );
-    FileTokenStore::at(dir.path())
+    test_file_store(dir.path())
         .save(
             &java_key,
             &PersistedToken::new(
@@ -1725,7 +1731,7 @@ fn groups_mode_preserves_scope_and_loads_java_store_entry() {
         .groups_in_token(true)
         .interactive(true)
         .open_browser(false)
-        .token_store(FileTokenStore::at(dir.path()))
+        .token_store(test_file_store(dir.path()))
         .build()
         .unwrap();
 
@@ -3233,7 +3239,7 @@ fn auth_with_store(mock: &MockServer, dir: &Path) -> OidcDeviceAuth {
         .interactive(true)
         .open_browser(false)
         .sleep_hook(no_sleep())
-        .token_store(FileTokenStore::at(dir))
+        .token_store(test_file_store(dir))
         .build()
         .expect("build auth with store")
 }
@@ -3582,7 +3588,7 @@ fn persistence_mock(
 /// token), simulating a restart after the access token's lifetime elapsed — so a
 /// fresh instance must silently refresh rather than serve the on-disk token.
 fn expire_persisted(dir: &Path, key: &TokenStoreKey) {
-    let store = FileTokenStore::at(dir);
+    let store = test_file_store(dir);
     let p = store.load(key).unwrap().unwrap();
     let expired = PersistedToken::new(
         p.access_token().map(String::from),
@@ -3592,6 +3598,68 @@ fn expire_persisted(dir: &Path, key: &TokenStoreKey) {
         300.0,
     );
     store.save(key, &expired).unwrap();
+}
+
+#[cfg(not(unix))]
+#[test]
+fn persisted_refresh_is_rejected_before_submitting_the_parent() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    test_file_store(dir.path())
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT-expired".to_string()),
+                None,
+                Some("RT-parent".to_string()),
+                1.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .token_store(FileTokenStore::at(dir.path()))
+        .build()
+        .unwrap();
+
+    let error = auth
+        .token()
+        .expect_err("non-durable store must reject before refresh submission");
+    assert!(
+        error.message().contains("durable directory-entry"),
+        "unexpected error: {}",
+        error.message()
+    );
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -3619,7 +3687,7 @@ fn success_renderer_panic_keeps_token_cached_and_persisted() {
         .open_browser(false)
         .sleep_hook(no_sleep())
         .renderer(PanicOnSuccess)
-        .token_store(FileTokenStore::at(dir.path()))
+        .token_store(test_file_store(dir.path()))
         .build()
         .unwrap();
 
@@ -3634,7 +3702,7 @@ fn success_renderer_panic_keeps_token_cached_and_persisted() {
         "the authorized token was lost from memory"
     );
     assert_eq!(
-        FileTokenStore::at(dir.path())
+        test_file_store(dir.path())
             .load(&key)
             .unwrap()
             .unwrap()
@@ -3747,7 +3815,7 @@ fn persist_restores_non_rotating_refresh_token_after_consuming_parent() {
         r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
     });
     let dir = TempDir::new().unwrap();
-    let reader = FileTokenStore::at(dir.path());
+    let reader = test_file_store(dir.path());
     let key = key_for(&mock);
 
     let auth = auth_with_store(&mock, dir.path());
@@ -3831,7 +3899,7 @@ fn groups_mode_refresh_without_id_token_keeps_the_rotated_credential() {
             .interactive(false)
             .open_browser(false)
             .sleep_hook(no_sleep())
-            .token_store(FileTokenStore::at(dir))
+            .token_store(test_file_store(dir))
             .build()
             .expect("build groups-mode auth with store")
     };
@@ -3847,7 +3915,7 @@ fn groups_mode_refresh_without_id_token_keeps_the_rotated_credential() {
         .interactive(true)
         .open_browser(false)
         .sleep_hook(no_sleep())
-        .token_store(FileTokenStore::at(dir.path()))
+        .token_store(test_file_store(dir.path()))
         .build()
         .expect("build groups-mode auth");
     assert_eq!(sign_in_and_token(&first).unwrap(), "ID-1");
@@ -3875,7 +3943,7 @@ fn groups_mode_refresh_without_id_token_keeps_the_rotated_credential() {
     );
     drop(cached);
 
-    let reader = FileTokenStore::at(dir.path());
+    let reader = test_file_store(dir.path());
     let after = reader
         .load(&key)
         .unwrap()
@@ -4034,7 +4102,7 @@ fn a_device_grant_that_returns_an_expired_token_fails_the_sign_in() {
         .interactive(true)
         .open_browser(false)
         .sleep_hook(no_sleep())
-        .token_store(FileTokenStore::at(dir.path()))
+        .token_store(test_file_store(dir.path()))
         .renderer(RecordRenderer {
             failures: Arc::clone(&failures),
             successes: Arc::clone(&successes),
@@ -4062,7 +4130,7 @@ fn a_device_grant_that_returns_an_expired_token_fails_the_sign_in() {
 
     // Nothing dead was written to the store.
     assert!(
-        FileTokenStore::at(dir.path()).load(&key).unwrap().is_none(),
+        test_file_store(dir.path()).load(&key).unwrap().is_none(),
         "an expired credential was persisted"
     );
 }
@@ -4354,7 +4422,7 @@ fn clear_after_close_still_deletes_the_persisted_entry() {
         r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
     });
     let dir = TempDir::new().unwrap();
-    let reader = FileTokenStore::at(dir.path());
+    let reader = test_file_store(dir.path());
     let key = key_for(&mock);
 
     let auth = auth_with_store(&mock, dir.path());
@@ -4386,7 +4454,7 @@ fn persist_rewrites_when_refresh_token_rotates() {
         r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
     });
     let dir = TempDir::new().unwrap();
-    let reader = FileTokenStore::at(dir.path());
+    let reader = test_file_store(dir.path());
     let key = key_for(&mock);
 
     let auth = auth_with_store(&mock, dir.path());
@@ -4454,7 +4522,7 @@ fn replacement_without_refresh_token_clears_rejected_persisted_token() {
         })
     };
     let dir = TempDir::new().unwrap();
-    let reader = FileTokenStore::at(dir.path());
+    let reader = test_file_store(dir.path());
     let key = key_for(&mock);
 
     let auth = auth_with_store(&mock, dir.path());
@@ -4493,7 +4561,7 @@ fn clear_deletes_the_persisted_entry() {
         r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
     });
     let dir = TempDir::new().unwrap();
-    let reader = FileTokenStore::at(dir.path());
+    let reader = test_file_store(dir.path());
     let key = key_for(&mock);
 
     let auth = auth_with_store(&mock, dir.path());
@@ -4598,7 +4666,7 @@ fn tampered_persisted_token_is_rejected_on_load() {
         r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
     });
     let dir = TempDir::new().unwrap();
-    let writer = FileTokenStore::at(dir.path());
+    let writer = test_file_store(dir.path());
     let key = key_for(&mock);
 
     let now = crate::oidc::token::now_epoch();
@@ -4643,7 +4711,7 @@ fn tampered_persisted_refresh_token_is_dropped_on_load() {
         })
     };
     let dir = TempDir::new().unwrap();
-    let writer = FileTokenStore::at(dir.path());
+    let writer = test_file_store(dir.path());
     let key = key_for(&mock);
     let tampered = PersistedToken::new(
         Some("AT-expired".to_string()),
@@ -4705,7 +4773,7 @@ fn refresh_refuses_in_memory_fallback_when_persisted_entry_has_no_refresh_token(
     // served token, NO refresh token, and a long-past expiry — a state the load
     // path accepts (only the served token is required) but that must never reach
     // the refresh network call as the refresh source.
-    let writer = FileTokenStore::at(dir.path());
+    let writer = test_file_store(dir.path());
     writer
         .save(
             &key,
@@ -5477,7 +5545,7 @@ fn transient_store_load_error_is_retryable_and_retried() {
     let key = key_for(&mock);
     // Seed a valid persisted entry (a refresh token) via a plain store.
     let now = crate::oidc::token::now_epoch();
-    FileTokenStore::at(dir.path())
+    test_file_store(dir.path())
         .save(
             &key,
             &PersistedToken::new(
@@ -5500,7 +5568,7 @@ fn transient_store_load_error_is_retryable_and_retried() {
         .sleep_hook(no_sleep())
         .token_store(FlakyStore {
             loads: std::sync::atomic::AtomicUsize::new(0),
-            inner: FileTokenStore::at(dir.path()),
+            inner: test_file_store(dir.path()),
         })
         .build()
         .unwrap();

@@ -131,6 +131,9 @@
 //! protected by file permissions (`0600`/`0700`). **This writes a long-lived
 //! refresh token to disk in plaintext**, so persistence is opt-in; for at-rest
 //! encryption, implement [`TokenStore`] over an OS keychain or a secrets manager.
+//! The bundled file store currently rejects mutation on non-Unix platforms,
+//! where the durable directory-entry barrier required for token rotation is not
+//! available; reads remain available for migration to a custom store.
 //! A persisted file is treated as untrusted input on load (see [`FileTokenStore`]).
 //! A refresh is never attempted without owning the store's cross-process lock:
 //! contention returns a retryable network-class error, and an apparently stale

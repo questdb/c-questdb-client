@@ -50,6 +50,14 @@ fn test_token() -> PersistedToken {
     )
 }
 
+/// Most token-store unit tests exercise format, locking, and recovery logic on
+/// every CI platform. Non-Unix production rejects mutation before that logic
+/// because it cannot provide the promised metadata durability; this explicit
+/// test-only opt-in keeps the platform-independent layers covered there.
+fn test_file_store(directory: impl Into<PathBuf>) -> FileTokenStore {
+    FileTokenStore::at(directory).allow_unsafe_mutations_for_tests()
+}
+
 fn assert_lock_released(lock: &Path, message: &str) {
     assert_eq!(
         std::fs::read(lock).unwrap(),
@@ -117,7 +125,7 @@ fn held_lock_scope_drop_is_infallible_when_marker_is_missing() {
 #[test]
 fn cancellable_lock_wait_abandons_in_process_contention() {
     let dir = TempDir::new().unwrap();
-    let store = Arc::new(FileTokenStore::at(dir.path()));
+    let store = Arc::new(test_file_store(dir.path()));
     let key = test_key();
     let release = Arc::new(Barrier::new(2));
     let (locked_tx, locked_rx) = mpsc::sync_channel(1);
@@ -171,7 +179,7 @@ fn cancellable_lock_wait_abandons_in_process_contention() {
 #[test]
 fn cancellable_lock_wait_abandons_filesystem_contention() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     store.prepare_directory(&never_cancelled).unwrap();
     let lock = store.lock_file(&key);
@@ -203,10 +211,101 @@ fn cancellable_lock_wait_abandons_filesystem_contention() {
     let _ = std::fs::remove_file(lock);
 }
 
+#[cfg(not(unix))]
+#[test]
+fn file_store_mutations_fail_before_disk_changes_without_durable_metadata() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+
+    let preflight = store.preflight(&never_cancelled).unwrap_err();
+    assert_eq!(
+        preflight
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::Unsupported)
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "preflight changed the store before rejecting it"
+    );
+
+    let target = store.token_file(&key);
+    std::fs::write(&target, b"existing credential sentinel").unwrap();
+    let save = store.save(&key, &test_token()).unwrap_err();
+    assert_eq!(
+        save.downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::Unsupported)
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"existing credential sentinel",
+        "save changed the existing entry before rejecting it"
+    );
+
+    let clear = store.clear(&key).unwrap_err();
+    assert_eq!(
+        clear
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::Unsupported)
+    );
+    assert!(
+        target.exists(),
+        "clear removed the entry before reporting unsupported durability"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn delete_pending_permission_denied_is_retried_until_the_handle_closes() {
+    let dir = TempDir::new().unwrap();
+    let store =
+        test_file_store(dir.path()).with_lock_timings(Duration::from_secs(2), DEFAULT_LOCK_STALE);
+    let lock = dir.path().join("delete-pending.lock");
+    let stamp = holder_bytes().unwrap();
+    let departing = create_lock_file_handle(&lock, &stamp).unwrap();
+    std::fs::remove_file(&lock).unwrap();
+
+    let collision = create_lock_file_handle(&lock, &stamp).unwrap_err();
+    assert_eq!(
+        collision.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "the fixture did not create Windows delete-pending contention"
+    );
+
+    let started = Arc::new(Barrier::new(2));
+    let waiter_started = Arc::clone(&started);
+    let waiter = std::thread::spawn(move || {
+        waiter_started.wait();
+        store.acquire_lock(
+            &lock,
+            DEFAULT_LOCK_STALE,
+            EMPTY_LOCK_GRACE,
+            &never_cancelled,
+        )
+    });
+    started.wait();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !waiter.is_finished(),
+        "delete-pending contention surfaced instead of being retried"
+    );
+
+    drop(departing);
+    let acquired = waiter
+        .join()
+        .expect("delete-pending waiter panicked")
+        .expect("waiter did not acquire after the departing handle closed");
+    drop(acquired);
+}
+
 #[test]
 fn directory_lock_heartbeat_spawn_failure_aborts_action() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path()).with_heartbeat_spawn_failure();
+    let store = test_file_store(dir.path()).with_heartbeat_spawn_failure();
     let ran = AtomicBool::new(false);
 
     let error = store
@@ -223,7 +322,7 @@ fn directory_lock_heartbeat_spawn_failure_aborts_action() {
 #[test]
 fn directory_lock_heartbeat_reports_runtime_renewal_failure() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let lock = store.directory_lock_file();
 
     let error = store
@@ -245,7 +344,7 @@ fn directory_lock_heartbeat_reports_runtime_renewal_failure() {
 #[test]
 fn directory_lock_fence_prevents_mutation_after_ownership_loss() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let lock = store.directory_lock_file();
     let marker = dir.path().join("must-not-be-written");
     let successor = "successor-owner-stamp";
@@ -422,7 +521,7 @@ fn endpoint_path_and_query_isolate_store_entries() {
     assert_ne!(tenant_a.hash(), trailing_slash.hash());
 
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     store.save(&tenant_a, &test_token()).unwrap();
     assert!(store.load(&tenant_a).unwrap().is_some());
     assert!(store.load(&tenant_b).unwrap().is_none());
@@ -441,7 +540,7 @@ fn scope_order_matches_java_frozen_identity() {
 #[test]
 fn issuer_is_not_part_of_java_store_identity() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let pinned = TokenStoreKey::from_config(
         "questdb",
         EP_T,
@@ -466,7 +565,7 @@ fn issuer_is_not_part_of_java_store_identity() {
 #[test]
 fn java_and_native_multiscope_golden_files_are_bidirectional_with_an_issuer_pin() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let pinned = multiscope_key(Some("https://idp.example.com"));
     let unpinned = multiscope_key(None);
     // Generated by Java TokenStoreKey for this exact multi-scope identity. The
@@ -523,7 +622,7 @@ fn empty_and_absent_audience_share_java_identity() {
 #[test]
 fn round_trip_save_load() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let token = PersistedToken::new(
         Some("AT".to_string()),
@@ -545,7 +644,7 @@ fn round_trip_save_load() {
 #[test]
 fn null_fields_omitted_and_read_back_as_none() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     // No id_token, no refresh_token.
     let token = PersistedToken::new(Some("AT".to_string()), None, None, 1_700_000_000.0, 300.0);
@@ -565,14 +664,14 @@ fn null_fields_omitted_and_read_back_as_none() {
 #[test]
 fn missing_file_returns_none() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     assert!(store.load(&test_key()).unwrap().is_none());
 }
 
 #[test]
 fn fingerprint_mismatch_returns_none() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key_a = TokenStoreKey::from_config("client-a", EP_T, EP_D, "openid", None, false, None);
     let key_b = TokenStoreKey::from_config("client-b", EP_T, EP_D, "openid", None, false, None);
     store.save(&key_a, &test_token()).unwrap();
@@ -586,7 +685,7 @@ fn fingerprint_mismatch_returns_none() {
 #[test]
 fn oversized_file_ignored() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let big = vec![b'x'; (MAX_FILE_BYTES + 10) as usize];
     std::fs::write(store.token_file(&key), &big).unwrap();
@@ -596,7 +695,7 @@ fn oversized_file_ignored() {
 #[test]
 fn oversized_save_is_rejected_without_replacing_existing_token() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let existing = test_token();
     store.save(&key, &existing).unwrap();
@@ -622,7 +721,7 @@ fn oversized_save_is_rejected_without_replacing_existing_token() {
 #[test]
 fn corrupt_wrong_version_and_non_object_ignored() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let path = store.token_file(&key);
     for bad in [
@@ -644,7 +743,7 @@ fn corrupt_wrong_version_and_non_object_ignored() {
 #[test]
 fn nested_or_array_values_are_rejected() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     store.save(&key, &test_token()).unwrap();
     let path = store.token_file(&key);
@@ -661,7 +760,7 @@ fn nested_or_array_values_are_rejected() {
 #[test]
 fn java_refresh_only_golden_round_trips_at_the_file_store_layer() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
 
     // Java's FileTokenStore is a schema carrier and reads this shape; Java's
@@ -690,7 +789,7 @@ fn java_refresh_only_golden_round_trips_at_the_file_store_layer() {
 #[test]
 fn garbage_millis_field_reads_back_as_expired() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     // Start from a valid entry so the identity fingerprint still matches, then
     // corrupt only the numeric millis fields with non-numeric junk (a hand-edited
@@ -717,7 +816,7 @@ fn garbage_millis_field_reads_back_as_expired() {
 #[test]
 fn non_integer_millis_fields_read_back_as_expired() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     store.save(&key, &test_token()).unwrap();
     let path = store.token_file(&key);
@@ -737,7 +836,7 @@ fn non_integer_millis_fields_read_back_as_expired() {
 #[test]
 fn save_leaves_no_temp_file() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     store.save(&test_key(), &test_token()).unwrap();
     let leftover: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
@@ -754,7 +853,7 @@ fn file_and_dir_are_owner_only() {
     let base = TempDir::new().unwrap();
     // A not-yet-existing subdir, so the store creates it 0700 itself.
     let dir = base.path().join("oidc-tokens");
-    let store = FileTokenStore::at(&dir);
+    let store = test_file_store(&dir);
     let key = test_key();
     store.save(&key, &test_token()).unwrap();
     let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
@@ -775,7 +874,7 @@ fn refuses_a_symlinked_store_directory() {
     std::fs::create_dir(&real).unwrap();
     let link = base.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let store = FileTokenStore::at(&link);
+    let store = test_file_store(&link);
     // save must refuse to operate through the symlinked leaf (a redirect risk).
     assert!(store.save(&test_key(), &test_token()).is_err());
 }
@@ -786,7 +885,7 @@ fn non_regular_token_file_is_ignored_not_hung() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let path = store.token_file(&key);
     let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -816,8 +915,7 @@ fn a_far_future_lock_is_never_stolen() {
     // from an abandoned lock. Refresh-token exclusivity wins over automatic
     // recovery: the contender must fail closed and leave the lock untouched.
     let dir = TempDir::new().unwrap();
-    let store =
-        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let store = test_file_store(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
     let lock = store.directory_lock_file();
     create_lock_file(&lock, "1725048000000 live-peer").unwrap();
     set_mtime_offset_from_now(&lock, Duration::from_secs(20 * 60), true);
@@ -845,8 +943,8 @@ fn a_pre_epoch_lock_is_reclaimed_rather_than_wedging_the_store() {
     // attacker needed: a restored archive, some SMB/CIFS and FUSE mounts, a
     // clock stepped back, or `touch -t 196001010000` all produce it.
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path())
-        .with_lock_timings(Duration::from_secs(2), DEFAULT_LOCK_STALE);
+    let store =
+        test_file_store(dir.path()).with_lock_timings(Duration::from_secs(2), DEFAULT_LOCK_STALE);
     let key = test_key();
     let lock = store.directory_lock_file();
     create_lock_file(&lock, "1725048000000 abandoned-peer").unwrap();
@@ -865,8 +963,7 @@ fn a_slightly_future_lock_is_still_treated_as_live() {
     // a lock a peer is actively holding, so within the plausible-skew window a
     // future-dated lock still counts as fresh.
     let dir = TempDir::new().unwrap();
-    let store =
-        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let store = test_file_store(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
     let lock = store.directory_lock_file();
     create_lock_file(&lock, "1725048000000 live-peer").unwrap();
     set_mtime_offset_from_now(&lock, Duration::from_secs(60), true);
@@ -975,7 +1072,7 @@ fn preexisting_loose_permissions_directory_is_retightened() {
     let dir = TempDir::new().unwrap();
     // A pre-existing, world-accessible store directory...
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     store.save(&test_key(), &test_token()).unwrap();
     // ...is re-asserted to owner-only (0700) by ensure_directory, so a token file
     // is never left under a group/world-readable directory.
@@ -991,7 +1088,7 @@ fn preexisting_loose_permissions_directory_is_retightened() {
 fn insecure_directory_discards_java_golden_then_recovers_for_native_writes() {
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = multiscope_key(Some("https://idp.example.com"));
     std::fs::write(store.token_file(&key), JAVA_MULTISCOPE_GOLDEN).unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -1021,7 +1118,7 @@ fn insecure_directory_discards_java_golden_then_recovers_for_native_writes() {
 fn untrusted_recovery_skips_cross_language_lock_capture() {
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let identity_capture = dir
         .path()
@@ -1048,7 +1145,7 @@ fn untrusted_recovery_skips_cross_language_lock_capture() {
 #[test]
 fn stale_java_directory_lock_is_reclaimed() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let lock = store.directory_lock_file();
     create_lock_file(&lock, "1725048000000 java-uuid").unwrap();
     let file = OpenOptions::new().write(true).open(&lock).unwrap();
@@ -1063,7 +1160,7 @@ fn stale_java_directory_lock_is_reclaimed() {
 #[test]
 fn empty_java_directory_lock_is_reclaimed_after_the_shared_grace() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let lock = store.directory_lock_file();
     std::fs::write(&lock, b"").unwrap();
     let file = OpenOptions::new().write(true).open(&lock).unwrap();
@@ -1078,8 +1175,7 @@ fn empty_java_directory_lock_is_reclaimed_after_the_shared_grace() {
 #[test]
 fn fresh_java_directory_lock_is_required() {
     let dir = TempDir::new().unwrap();
-    let store =
-        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let store = test_file_store(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
     let key = test_key();
     let lock = store.directory_lock_file();
     create_lock_file(&lock, "1725048000000 java-uuid").unwrap();
@@ -1108,7 +1204,7 @@ fn in_process_lock_wait_is_bounded_by_the_acquire_budget() {
     // refresh POST. Two auth handles built from one configuration are explicitly
     // supported, so the per-instance acquisition mutex does not serialize them.
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path())
+    let store = test_file_store(dir.path())
         .with_lock_timings(Duration::from_millis(150), DEFAULT_LOCK_STALE);
     let key = test_key();
 
@@ -1141,7 +1237,7 @@ fn creates_missing_parent_chain() {
     // brand-new nested store path must still work.
     let base = TempDir::new().unwrap();
     let dir = base.path().join("a").join("b").join("oidc-tokens");
-    let store = FileTokenStore::at(&dir);
+    let store = test_file_store(&dir);
     store.save(&test_key(), &test_token()).unwrap();
     assert!(store.load(&test_key()).unwrap().is_some());
 }
@@ -1151,7 +1247,7 @@ fn with_lock_timings_clamps_acquire_budget() {
     // An unclamped near-`Duration::MAX` budget would overflow `Instant::now() +
     // budget`; it is clamped down to the 5-minute ceiling.
     let store =
-        FileTokenStore::at("/tmp/x").with_lock_timings(Duration::MAX, Duration::from_secs(600));
+        test_file_store("/tmp/x").with_lock_timings(Duration::MAX, Duration::from_secs(600));
     assert_eq!(store.lock_acquire_budget, MAX_LOCK_ACQUIRE_BUDGET);
 }
 
@@ -1240,7 +1336,7 @@ fn restore_without_hard_links_reserves_an_unclaimed_name() {
 #[test]
 fn clear_removes_file_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     store.save(&key, &test_token()).unwrap();
     assert!(store.load(&key).unwrap().is_some());
@@ -1252,7 +1348,7 @@ fn clear_removes_file_and_is_idempotent() {
 #[test]
 fn clear_removes_fresh_write_temp_but_preserves_lock_capture() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let orphan = temp_path(dir.path(), &key.hash());
     let capture = dir
@@ -1274,7 +1370,7 @@ fn clear_removes_fresh_write_temp_but_preserves_lock_capture() {
 #[test]
 fn java_lock_capture_temporaries_survive_concurrent_native_save_and_clear() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     store.prepare_directory(&never_cancelled).unwrap();
 
@@ -1318,7 +1414,7 @@ fn java_lock_capture_temporaries_survive_concurrent_native_save_and_clear() {
 #[test]
 fn save_sweeps_only_proven_stale_orphan_temps() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let stale = temp_path(dir.path(), &key.hash());
     let fresh = temp_path(dir.path(), &key.hash());
@@ -1343,7 +1439,7 @@ fn save_sweeps_only_proven_stale_orphan_temps() {
 #[test]
 fn in_lock_runs_action_and_releases() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let ran = Arc::new(AtomicBool::new(false));
     let r = Arc::clone(&ran);
@@ -1360,8 +1456,7 @@ fn in_lock_runs_action_and_releases() {
 #[test]
 fn save_reuses_a_lock_already_held_by_the_current_action() {
     let dir = TempDir::new().unwrap();
-    let store =
-        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let store = test_file_store(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
     let key = test_key();
 
     store
@@ -1375,8 +1470,7 @@ fn save_reuses_a_lock_already_held_by_the_current_action() {
 #[test]
 fn standalone_save_uses_atomic_layer_without_identity_lock() {
     let dir = TempDir::new().unwrap();
-    let store =
-        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let store = test_file_store(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
     let key = test_key();
     let lock = store.lock_file(&key);
     create_lock_file(&lock, "java-peer-stamp").unwrap();
@@ -1409,7 +1503,7 @@ fn in_lock_serialises_concurrent_holders() {
                  active: Arc<std::sync::Mutex<bool>>,
                  overlap: Arc<AtomicBool>| {
         std::thread::spawn(move || {
-            let store = FileTokenStore::at(dir);
+            let store = test_file_store(dir);
             store
                 .in_lock(&key, &mut || {
                     {
@@ -1453,7 +1547,7 @@ fn in_lock_refuses_to_run_after_acquire_timeout() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
     let store =
-        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, Duration::from_secs(600));
+        test_file_store(dir.path()).with_lock_timings(Duration::ZERO, Duration::from_secs(600));
     let lock = store.lock_file(&key);
     create_lock_file(&lock, "java-peer-stamp").unwrap();
 
@@ -1509,7 +1603,7 @@ fn stale_java_identity_lock_is_reclaimed() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
     let store =
-        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, Duration::from_secs(300));
+        test_file_store(dir.path()).with_lock_timings(Duration::ZERO, Duration::from_secs(300));
     // Plant a lock and backdate its mtime well past the staleness window.
     let lock = store.lock_file(&key);
     std::fs::write(&lock, b"crashed-holder").unwrap();
@@ -1535,7 +1629,7 @@ fn stale_java_identity_lock_is_reclaimed() {
 fn empty_java_identity_lock_is_reclaimed_after_the_shared_grace() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
-    let store = FileTokenStore::at(dir.path())
+    let store = test_file_store(dir.path())
         .with_lock_timings(Duration::from_millis(200), Duration::from_secs(600));
     let lock = store.lock_file(&key);
     std::fs::write(&lock, b"").unwrap();
@@ -1564,8 +1658,7 @@ fn empty_java_identity_lock_is_reclaimed_after_the_shared_grace() {
 fn fresh_empty_java_identity_lock_is_not_stolen() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
-    let store =
-        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let store = test_file_store(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
     let lock = store.lock_file(&key);
     std::fs::write(&lock, b"").unwrap();
 
@@ -1594,7 +1687,7 @@ fn fresh_empty_java_identity_lock_is_not_stolen() {
 #[test]
 fn in_lock_releases_during_unwind() {
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path());
+    let store = test_file_store(dir.path());
     let key = test_key();
     let lock = store.lock_file(&key);
 
@@ -1611,13 +1704,13 @@ fn in_lock_releases_during_unwind() {
 
 #[test]
 fn with_lock_timings_enforces_stale_floor() {
-    let store = FileTokenStore::at("/tmp/x")
-        .with_lock_timings(Duration::from_secs(1), Duration::from_secs(1));
+    let store =
+        test_file_store("/tmp/x").with_lock_timings(Duration::from_secs(1), Duration::from_secs(1));
     // A sub-floor staleness window is clamped up to the 5-minute minimum.
     assert_eq!(store.lock_stale, MIN_LOCK_STALE);
 }
 
-/// `FileTokenStore::at("~/...")` must fail loudly rather than create a
+/// `FileTokenStore::at("~/...")` must fail loudly on use rather than create a
 /// directory literally named `~`.
 ///
 /// The check existed only in the C binding (`reject_unexpanded_home`), and the
@@ -1630,7 +1723,7 @@ fn with_lock_timings_enforces_stale_floor() {
 #[test]
 fn unexpanded_home_directory_is_refused_on_use() {
     for bad in ["~/qdb-tokens", "~"] {
-        let store = FileTokenStore::at(bad);
+        let store = test_file_store(bad);
         let err = store
             .save(&test_key(), &test_token())
             .expect_err(&format!("{bad:?} must be refused"));
@@ -1661,7 +1754,7 @@ fn unexpanded_home_directory_is_refused_on_use() {
     // A path that merely *contains* a tilde is not the trap and still works.
     let dir = TempDir::new().unwrap();
     let ok = dir.path().join("has~tilde");
-    let store = FileTokenStore::at(&ok);
+    let store = test_file_store(&ok);
     store.save(&test_key(), &test_token()).unwrap();
     assert!(ok.is_dir());
 }

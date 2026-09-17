@@ -249,6 +249,10 @@ impl SharedOidcAuth {
         self.event_handler
             .as_deref()
             .is_some_and(CEventHandler::target_is_active)
+            || self
+                .diagnostic
+                .as_ref()
+                .is_some_and(CDiagnosticSink::target_is_active)
     }
 
     /// This thread is the one inside the callback: it already holds the
@@ -260,9 +264,10 @@ impl SharedOidcAuth {
     fn reentry_error() -> Error {
         Error::new(
             ErrorCode::InvalidApiCall,
-            "OIDC authentication cannot be re-entered from its event callback; return from \
-             the callback before calling sign_in, token, clear, or an attached transport. \
-             cancel_sign_in and close are exempt and may be called here."
+            "OIDC authentication cannot be re-entered from its event or persistence \
+             diagnostic callback; return from the callback before calling sign_in, token, \
+             clear, or an attached transport. cancel_sign_in and close are exempt and may \
+             be called here."
                 .to_string(),
         )
     }
@@ -273,9 +278,10 @@ impl SharedOidcAuth {
     fn callback_busy_error() -> Error {
         Error::new(
             ErrorCode::InvalidApiCall,
-            "OIDC authentication is busy: a sign-in prompt for this provider is being \
-             rendered on another thread and no valid cached token is available. Acquire a \
-             token before starting an interactive sign-in, or retry once it completes."
+            "OIDC authentication is busy: an event or persistence diagnostic callback for \
+             this provider is running on another thread and no valid cached token is \
+             available. Acquire a token before starting an interactive sign-in, or retry \
+             once the callback completes."
                 .to_string(),
         )
     }
@@ -306,10 +312,10 @@ impl SharedOidcAuth {
         // condition its documentation types as `OidcInteractionRequired`.
         // The retryable `SocketError` classification is unchanged.
         OidcError::retryable_interaction_required(
-            "OIDC authentication is busy: a sign-in prompt for this provider is being \
-             rendered on another thread and no valid cached token is available. The \
-             token will be requested again on the next attempt; acquire a token before \
-             starting an interactive sign-in to avoid the wait.",
+            "OIDC authentication is busy: an event or persistence diagnostic callback for \
+             this provider is running on another thread and no valid cached token is \
+             available. The token will be requested again on the next attempt; acquire a \
+             token before starting an interactive sign-in to avoid the wait.",
         )
     }
 
@@ -331,9 +337,10 @@ impl SharedOidcAuth {
     /// inside a retry budget can never succeed and must fail fast.
     fn token_reentry_error() -> Error {
         OidcError::reentrant_interaction_required(
-            "OIDC authentication cannot be re-entered from its event callback; return from \
-             the callback before calling sign_in, token, clear, or an attached transport. \
-             cancel_sign_in and close are exempt and may be called here."
+            "OIDC authentication cannot be re-entered from its event or persistence \
+             diagnostic callback; return from the callback before calling sign_in, token, \
+             clear, or an attached transport. cancel_sign_in and close are exempt and may \
+             be called here."
                 .to_string(),
         )
     }
@@ -341,19 +348,23 @@ impl SharedOidcAuth {
     /// Reject an operation that would take the acquisition lock while a
     /// callback holds it.
     ///
-    /// The guard is keyed on the handler's shared flag rather than this
-    /// thread's, and deliberately so: a callback may dispatch to a worker and
-    /// *wait* for it, so a blocking acquisition on that worker deadlocks just
-    /// as surely as one on the callback's own thread. Only the diagnostic is
-    /// thread-scoped, since a caller that never entered a callback should not
-    /// be told it re-entered one.
-    fn in_own_event_callback(&self) -> bool {
+    /// The guard is keyed on each callback target's shared flag rather than
+    /// only this auth's state, and deliberately so: a callback may dispatch to
+    /// a worker and *wait* for it, or a reusable-builder sibling may hold its
+    /// acquisition lock while waiting for the same serialized callback target.
+    /// A blocking acquisition in either case deadlocks. Thread-local target
+    /// identity supplies only the more precise re-entry versus busy message.
+    fn in_own_callback(&self) -> bool {
         in_event_callback_of_on_this_thread(self.event_handler.as_ref())
+            || self
+                .diagnostic
+                .as_ref()
+                .is_some_and(CDiagnosticSink::in_callback_on_this_thread)
     }
 
     fn reject_callback_reentry(&self) -> Result<(), Error> {
         if self.callback_is_active() {
-            return Err(if self.in_own_event_callback() {
+            return Err(if self.in_own_callback() {
                 Self::reentry_error()
             } else {
                 Self::callback_busy_error()
@@ -410,7 +421,7 @@ impl SharedOidcAuth {
             if let Some(cached) = self.inner.cached_token() {
                 return cached.map_err(Into::into);
             }
-            return Err(if self.in_own_event_callback() {
+            return Err(if self.in_own_callback() {
                 Self::token_reentry_error()
             } else {
                 Self::token_busy_error()
@@ -538,7 +549,16 @@ struct CDiagnosticTarget {
     callback: unsafe extern "C" fn(*mut c_void, *const questdb_oidc_diagnostic),
     user_data: usize,
     release: questdb_oidc_user_data_release_cb,
-    gate: std::sync::Mutex<()>,
+    /// Logical callback ownership. The mutex protects admission but is not held
+    /// across foreign code, so detach can cancel a sibling queued behind the
+    /// active callback instead of deadlocking with its acquisition lock.
+    callback_gate: std::sync::Mutex<CallbackGateState>,
+    callback_ready: std::sync::Condvar,
+    /// Whether any auth sharing this target is executing its callback. This is
+    /// separate from the per-auth state used by close: acquisition-taking
+    /// operations must also reject the sibling AB/BA case where one auth holds
+    /// its acquisition lock while waiting for this serialized target.
+    active: AtomicBool,
 }
 
 /// Per-auth diagnostic delivery state.
@@ -554,6 +574,10 @@ struct CDiagnosticState {
     /// serializes all siblings, while this per-auth bit lets close distinguish
     /// its own reentrant diagnostic from an unrelated sibling's callback.
     active: AtomicBool,
+    /// Test-only synchronization for the sibling-close regression: unlike a
+    /// sleep, this proves the sibling reached the cancellable gate wait.
+    #[cfg(test)]
+    waiting_for_target: AtomicBool,
 }
 
 std::thread_local! {
@@ -580,20 +604,59 @@ const DETACH_BOUNDED_DRAIN_ROUNDS: usize = 64;
 /// lives. Mirrors [`ActiveEventHandler`]'s stack discipline.
 struct InDiagnosticCallback(*const CDiagnosticTarget);
 
-struct ActiveDiagnosticState<'a>(&'a CDiagnosticState);
+struct ActiveDiagnosticState<'a> {
+    state: &'a CDiagnosticState,
+    target: &'a CDiagnosticTarget,
+}
 
 impl<'a> ActiveDiagnosticState<'a> {
-    fn enter(state: &'a CDiagnosticState) -> Self {
-        let was_active = state.active.swap(true, Ordering::AcqRel);
-        debug_assert!(!was_active, "one auth cannot overlap its diagnostics");
-        Self(state)
+    fn enter(state: &'a CDiagnosticState, target: &'a CDiagnosticTarget) -> Option<Self> {
+        let mut gate = target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while gate.held && !state.detached.load(Ordering::Acquire) {
+            #[cfg(test)]
+            state.waiting_for_target.store(true, Ordering::Release);
+            gate = target
+                .callback_ready
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        #[cfg(test)]
+        state.waiting_for_target.store(false, Ordering::Release);
+        if state.detached.load(Ordering::Acquire) {
+            return None;
+        }
+        gate.held = true;
+        let state_was_active = state.active.swap(true, Ordering::AcqRel);
+        let target_was_active = target.active.swap(true, Ordering::AcqRel);
+        debug_assert!(!state_was_active, "one auth cannot overlap its diagnostics");
+        debug_assert!(
+            !target_was_active,
+            "one serialized target cannot overlap its diagnostics"
+        );
+        drop(gate);
+        Some(Self { state, target })
     }
 }
 
 impl Drop for ActiveDiagnosticState<'_> {
     fn drop(&mut self) {
-        let was_active = self.0.active.swap(false, Ordering::AcqRel);
-        debug_assert!(was_active, "active diagnostic guard must be balanced");
+        let state_was_active = self.state.active.swap(false, Ordering::AcqRel);
+        let target_was_active = self.target.active.swap(false, Ordering::AcqRel);
+        debug_assert!(
+            state_was_active && target_was_active,
+            "active diagnostic guard must be balanced"
+        );
+        let mut gate = self
+            .target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(gate.held, "diagnostic callback gate must be held");
+        gate.held = false;
+        self.target.callback_ready.notify_all();
     }
 }
 
@@ -630,6 +693,15 @@ struct CDiagnosticSink {
 }
 
 impl CDiagnosticSink {
+    fn target_is_active(&self) -> bool {
+        self.target.active.load(Ordering::Acquire)
+    }
+
+    fn in_callback_on_this_thread(&self) -> bool {
+        let target = Arc::as_ptr(&self.target);
+        IN_DIAGNOSTIC_CALLBACK.with(|stack| stack.borrow().contains(&target))
+    }
+
     /// Stop delivering this auth's diagnostics, waiting out a callback already
     /// running.
     ///
@@ -694,31 +766,49 @@ impl CDiagnosticSink {
             let stack = stack.borrow();
             (stack.contains(&target), !stack.is_empty())
         });
-        // Publish before any waiting. An emitter that has not yet re-read the
-        // flag under the gate is already suppressed by this store, so the wait
-        // below only has to see out a callback that is genuinely mid-flight --
-        // and every path here leaves later callbacks suppressed even when it
-        // cannot safely wait.
-        self.state.detached.store(true, Ordering::Release);
+        {
+            // Serialize suppression with callback admission and wake this
+            // auth if it is queued behind a sibling callback. Without the wake,
+            // close(B) from A's shared callback can wait on B's acquisition
+            // lock while B waits for A to release this target.
+            let _gate = self
+                .target
+                .callback_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.state.detached.store(true, Ordering::Release);
+            self.target.callback_ready.notify_all();
+        }
         if reentrant {
             return;
         }
         if nested || !may_block {
             for _ in 0..DETACH_BOUNDED_DRAIN_ROUNDS {
-                match self.target.gate.try_lock() {
-                    // Acquired: no callback holds the gate, and the published
-                    // flag stops any that is waiting for it. Drained.
-                    Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return,
-                    Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+                let gate = self
+                    .target
+                    .callback_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !gate.held {
+                    return;
                 }
+                drop(gate);
+                std::thread::yield_now();
             }
             return;
         }
-        let _gate = self
+        let mut gate = self
             .target
-            .gate
+            .callback_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while gate.held {
+            gate = self
+                .target
+                .callback_ready
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -735,18 +825,9 @@ impl DiagnosticHandler for CDiagnosticSink {
             message,
             message_len,
         };
-        let _gate = self
-            .target
-            .gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Re-read under the gate. `detach` publishes the flag while holding it,
-        // so this cannot observe a stale `false` and then invoke a callback the
-        // caller has been told is finished with.
-        if self.state.detached.load(Ordering::Acquire) {
+        let Some(_active) = ActiveDiagnosticState::enter(&self.state, &self.target) else {
             return;
-        }
-        let _active = ActiveDiagnosticState::enter(&self.state);
+        };
         let _in_callback = InDiagnosticCallback::enter(&self.target);
         unsafe { (self.target.callback)(self.target.user_data as *mut c_void, &diagnostic) };
     }
@@ -1538,7 +1619,9 @@ pub unsafe extern "C" fn questdb_oidc_builder_diagnostic_handler(
             callback,
             user_data: user_data as usize,
             release,
-            gate: std::sync::Mutex::new(()),
+            callback_gate: std::sync::Mutex::new(CallbackGateState::default()),
+            callback_ready: std::sync::Condvar::new(),
+            active: AtomicBool::new(false),
         });
         builder.config.diagnostic.replace(replacement)
     };
@@ -2062,7 +2145,9 @@ mod tests {
             callback: record_diagnostic,
             user_data: (&messages as *const Mutex<Vec<String>>) as usize,
             release: None,
-            gate: Mutex::new(()),
+            callback_gate: Mutex::new(CallbackGateState::default()),
+            callback_ready: std::sync::Condvar::new(),
+            active: AtomicBool::new(false),
         });
         let sink = CDiagnosticSink {
             target,
@@ -2089,7 +2174,9 @@ mod tests {
             callback: record_diagnostic,
             user_data: (&messages as *const Mutex<Vec<String>>) as usize,
             release: None,
-            gate: Mutex::new(()),
+            callback_gate: Mutex::new(CallbackGateState::default()),
+            callback_ready: std::sync::Condvar::new(),
+            active: AtomicBool::new(false),
         });
         let detached = CDiagnosticSink {
             target: Arc::clone(&target),
@@ -2122,10 +2209,9 @@ mod tests {
     fn detaching_diagnostics_from_inside_the_callback_does_not_deadlock() {
         // A binding reaches this without anyone writing such a call: the
         // callback enters a managed runtime, and a collection there destroys a
-        // handle, whose teardown detaches. The gate is held across the
-        // callback, so re-acquiring it on this thread would wedge the emitting
-        // thread while still holding the gate -- blocking every later
-        // diagnostic and detach for the target too.
+        // handle, whose teardown detaches. Detach must recognize its own
+        // logical callback ownership rather than waiting for that invocation to
+        // return -- which cannot happen until detach itself returns.
         static SINK: Mutex<Option<CDiagnosticSink>> = Mutex::new(None);
         static DETACH_RETURNED: AtomicUsize = AtomicUsize::new(0);
 
@@ -2143,7 +2229,9 @@ mod tests {
                 callback: detach_from_within,
                 user_data: 0,
                 release: None,
-                gate: Mutex::new(()),
+                callback_gate: Mutex::new(CallbackGateState::default()),
+                callback_ready: std::sync::Condvar::new(),
+                active: AtomicBool::new(false),
             }),
             state: Arc::new(CDiagnosticState::default()),
         };
@@ -2174,12 +2262,11 @@ mod tests {
 
     #[test]
     fn cross_target_detach_from_inside_a_callback_cannot_deadlock() {
-        // Two providers, two independent gates. Each thread is inside its own
-        // target's callback (holding that gate) and detaches the OTHER one --
-        // which is what a binding does when the callback's managed code
-        // reclaims an unrelated handle. Blocking on the foreign gate here is
-        // an AB/BA inversion that parks both threads permanently, and under
-        // `panic = "abort"` neither guard is ever unwound.
+        // Two providers, two independent logical gates. Each thread is inside
+        // its own target's callback and detaches the OTHER one -- which is what
+        // a binding does when the callback's managed code reclaims an unrelated
+        // handle. Draining the foreign callback here is an AB/BA inversion that
+        // parks both threads permanently.
         static A_ENTERED: AtomicUsize = AtomicUsize::new(0);
         static B_ENTERED: AtomicUsize = AtomicUsize::new(0);
         static SINK_A: Mutex<Option<CDiagnosticSink>> = Mutex::new(None);
@@ -2218,7 +2305,9 @@ mod tests {
                     callback,
                     user_data: 0,
                     release: None,
-                    gate: Mutex::new(()),
+                    callback_gate: Mutex::new(CallbackGateState::default()),
+                    callback_ready: std::sync::Condvar::new(),
+                    active: AtomicBool::new(false),
                 }),
                 state: Arc::new(CDiagnosticState::default()),
             }
@@ -2269,9 +2358,9 @@ mod tests {
         // already hold a lock the callback needs -- in the Python client, a
         // `logging` handler lock taken by the very `emit` the collection ran
         // inside, which the callback then tries to take when it logs. Waiting
-        // for the gate there parks both threads forever, and releasing the
-        // GIL does not help because the GIL is not the lock in contention.
-        // So this form must return while the gate is held.
+        // for callback completion there parks both threads forever, and
+        // releasing the GIL does not help because the GIL is not the lock in
+        // contention. So this form must return while a callback is active.
         static NW_ENTERED: AtomicUsize = AtomicUsize::new(0);
         static NW_RELEASE: AtomicUsize = AtomicUsize::new(0);
         static NW_DELIVERED: AtomicUsize = AtomicUsize::new(0);
@@ -2292,12 +2381,14 @@ mod tests {
                 callback: holding_diagnostic,
                 user_data: 0,
                 release: None,
-                gate: Mutex::new(()),
+                callback_gate: Mutex::new(CallbackGateState::default()),
+                callback_ready: std::sync::Condvar::new(),
+                active: AtomicBool::new(false),
             }),
             state: Arc::new(CDiagnosticState::default()),
         };
 
-        // Park a callback inside the gate on another thread.
+        // Park a callback inside the logical gate on another thread.
         let emitter = std::thread::spawn({
             let sink = sink.clone();
             move || sink.on_persistence_warning("in flight")
@@ -2306,11 +2397,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        // The gate is held and stays held until this test releases it. The
-        // waiting form blocks here; this one must not. Run it off-thread so a
-        // regression fails this test instead of hanging the entire run: a
-        // parked `Mutex::lock` cannot be interrupted, and cargo applies no
-        // per-test timeout.
+        // The callback stays active until this test releases it. The waiting
+        // form blocks here; this one must not. Run it off-thread so a regression
+        // fails this test instead of hanging the entire run.
         let (tx, rx) = std::sync::mpsc::channel();
         let detacher = std::thread::spawn({
             let sink = sink.clone();
@@ -2359,7 +2448,9 @@ mod tests {
                 callback: blocking_diagnostic,
                 user_data: 0,
                 release: None,
-                gate: Mutex::new(()),
+                callback_gate: Mutex::new(CallbackGateState::default()),
+                callback_ready: std::sync::Condvar::new(),
+                active: AtomicBool::new(false),
             }),
             state: Arc::new(CDiagnosticState::default()),
         };
@@ -2990,6 +3081,39 @@ mod tests {
         }
     }
 
+    struct CoordinatedFailingSaveStore {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl TokenStore for CoordinatedFailingSaveStore {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            Ok(None)
+        }
+
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            Err(Box::new(std::io::Error::other(
+                "injected coordinated save failure",
+            )))
+        }
+
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            action()
+        }
+    }
+
     #[derive(Default)]
     struct DiagnosticCloseState {
         auth: Mutex<Option<SharedOidcAuth>>,
@@ -3008,6 +3132,74 @@ mod tests {
 
     unsafe extern "C" fn release_diagnostic_close_state(user_data: *mut c_void) {
         unsafe { drop(Box::from_raw(user_data as *mut Arc<DiagnosticCloseState>)) };
+    }
+
+    #[derive(Default)]
+    struct DiagnosticClearState {
+        auth: Mutex<Option<SharedOidcAuth>>,
+        clear_result: Mutex<Option<Result<(), (ErrorCode, String)>>>,
+    }
+
+    unsafe extern "C" fn clear_from_diagnostic(
+        user_data: *mut c_void,
+        _diagnostic: *const questdb_oidc_diagnostic,
+    ) {
+        let state = unsafe { &*(user_data as *const Arc<DiagnosticClearState>) };
+        let auth = state.auth.lock().unwrap().clone().expect("auth installed");
+        let result = auth
+            .clear()
+            .map_err(|err| (err.code(), err.msg().to_string()));
+        *state.clear_result.lock().unwrap() = Some(result);
+    }
+
+    unsafe extern "C" fn release_diagnostic_clear_state(user_data: *mut c_void) {
+        unsafe { drop(Box::from_raw(user_data as *mut Arc<DiagnosticClearState>)) };
+    }
+
+    struct DiagnosticSiblingCloseState {
+        auth: Mutex<Option<SharedOidcAuth>>,
+        queued_state: Arc<CDiagnosticState>,
+        release_save: Arc<AtomicBool>,
+        close_result: Mutex<Option<Result<(), String>>>,
+        callback_started: AtomicBool,
+    }
+
+    unsafe extern "C" fn close_queued_sibling_from_diagnostic(
+        user_data: *mut c_void,
+        _diagnostic: *const questdb_oidc_diagnostic,
+    ) {
+        let state = unsafe { &*(user_data as *const Arc<DiagnosticSiblingCloseState>) };
+        if state.callback_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let auth = state.auth.lock().unwrap().clone().expect("auth installed");
+        state.release_save.store(true, Ordering::Release);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state
+            .queued_state
+            .waiting_for_target
+            .load(Ordering::Acquire)
+        {
+            if std::time::Instant::now() >= deadline {
+                *state.close_result.lock().unwrap() =
+                    Some(Err("sibling never reached the diagnostic gate".to_string()));
+                return;
+            }
+            std::thread::yield_now();
+        }
+        *state.close_result.lock().unwrap() = Some(
+            auth.close()
+                .map_err(|err| format!("sibling close failed: {err}")),
+        );
+    }
+
+    unsafe extern "C" fn release_diagnostic_sibling_close_state(user_data: *mut c_void) {
+        unsafe {
+            drop(Box::from_raw(
+                user_data as *mut Arc<DiagnosticSiblingCloseState>,
+            ))
+        };
     }
 
     unsafe extern "C" fn release_counter(user_data: *mut c_void) {
@@ -4182,7 +4374,9 @@ mod tests {
                 callback: close_from_diagnostic,
                 user_data: user_data as usize,
                 release: Some(release_diagnostic_close_state),
-                gate: Mutex::new(()),
+                callback_gate: Mutex::new(CallbackGateState::default()),
+                callback_ready: std::sync::Condvar::new(),
+                active: AtomicBool::new(false),
             }),
             state: Arc::new(CDiagnosticState::default()),
         };
@@ -4230,6 +4424,258 @@ mod tests {
             Some(OidcErrorKind::Cancelled),
         );
         signer.join().unwrap();
+        *state.auth.lock().unwrap() = None; // break target -> state -> auth cycle
+        drop(auth);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn clear_from_persistence_diagnostic_is_rejected_without_deadlock() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (device, _) = listener.accept().unwrap();
+            write_json_response(
+                device,
+                r#"{"device_code":"DEV-CODE","user_code":"ABCD-1234","verification_uri":"https://idp.example.com/activate","expires_in":600,"interval":1}"#,
+            );
+            let (token, _) = listener.accept().unwrap();
+            write_json_response(
+                token,
+                r#"{"access_token":"short-lived","refresh_token":"refresh-secret","token_type":"Bearer","expires_in":300}"#,
+            );
+        });
+
+        let state = Arc::new(DiagnosticClearState::default());
+        let user_data = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
+        let sink = CDiagnosticSink {
+            target: Arc::new(CDiagnosticTarget {
+                callback: clear_from_diagnostic,
+                user_data: user_data as usize,
+                release: Some(release_diagnostic_clear_state),
+                callback_gate: Mutex::new(CallbackGateState::default()),
+                callback_ready: std::sync::Condvar::new(),
+                active: AtomicBool::new(false),
+            }),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        let inner = OidcDeviceAuth::builder()
+            .client_id("questdb-c")
+            .scope("openid")
+            .token_endpoint(format!("http://{address}/token"))
+            .device_authorization_endpoint(format!("http://{address}/device"))
+            .allow_insecure_transport(true)
+            .interactive(true)
+            .open_browser(false)
+            .token_store(FailingSaveStore)
+            .diagnostic_handler(sink.clone())
+            .build()
+            .unwrap();
+        let auth = SharedOidcAuth {
+            inner: Arc::new(inner),
+            event_handler: None,
+            diagnostic: Some(sink),
+            token_provider_isolation: TokenProviderIsolation::default(),
+        };
+        *state.auth.lock().unwrap() = Some(auth.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let signer = std::thread::spawn({
+            let auth = auth.clone();
+            move || {
+                let result = auth.sign_in();
+                let _ = tx.send(result);
+            }
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("diagnostic clear waited for its own acquisition stack")
+            .expect("failed persistence is best-effort after sign-in");
+        let result = state
+            .clear_result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("diagnostic did not call clear");
+        let (code, message) = result.expect_err("diagnostic clear unexpectedly succeeded");
+        assert_eq!(code, ErrorCode::InvalidApiCall);
+        assert!(
+            message.contains("persistence diagnostic callback"),
+            "unexpected re-entry diagnostic: {message}"
+        );
+
+        signer.join().unwrap();
+        *state.auth.lock().unwrap() = None; // break target -> state -> auth cycle
+        drop(auth);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn clear_on_sibling_sharing_persistence_target_is_rejected() {
+        let state = Arc::new(DiagnosticClearState::default());
+        let user_data = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
+        let target = Arc::new(CDiagnosticTarget {
+            callback: clear_from_diagnostic,
+            user_data: user_data as usize,
+            release: Some(release_diagnostic_clear_state),
+            callback_gate: Mutex::new(CallbackGateState::default()),
+            callback_ready: std::sync::Condvar::new(),
+            active: AtomicBool::new(false),
+        });
+        let emitting = CDiagnosticSink {
+            target: Arc::clone(&target),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        let sibling = CDiagnosticSink {
+            target,
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        let inner = OidcDeviceAuth::builder()
+            .client_id("questdb-c")
+            .scope("openid")
+            .token_endpoint("https://idp.example/token")
+            .device_authorization_endpoint("https://idp.example/device")
+            .diagnostic_handler(sibling.clone())
+            .build()
+            .unwrap();
+        let auth = SharedOidcAuth {
+            inner: Arc::new(inner),
+            event_handler: None,
+            diagnostic: Some(sibling),
+            token_provider_isolation: TokenProviderIsolation::default(),
+        };
+        *state.auth.lock().unwrap() = Some(auth.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let emitter = std::thread::spawn(move || {
+            emitting.on_persistence_warning("shared-target warning");
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("sibling clear waited on the shared diagnostic target");
+        emitter.join().unwrap();
+
+        let result = state
+            .clear_result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("diagnostic did not call sibling clear");
+        let (code, message) = result.expect_err("sibling clear unexpectedly succeeded");
+        assert_eq!(code, ErrorCode::InvalidApiCall);
+        assert!(
+            message.contains("persistence diagnostic callback"),
+            "unexpected shared-target diagnostic: {message}"
+        );
+
+        *state.auth.lock().unwrap() = None; // break target -> state -> auth cycle
+        drop(auth);
+    }
+
+    #[test]
+    fn close_wakes_a_sibling_queued_for_the_shared_persistence_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (device, _) = listener.accept().unwrap();
+            write_json_response(
+                device,
+                r#"{"device_code":"DEV-CODE","user_code":"ABCD-1234","verification_uri":"https://idp.example.com/activate","expires_in":600,"interval":1}"#,
+            );
+            let (token, _) = listener.accept().unwrap();
+            write_json_response(
+                token,
+                r#"{"access_token":"short-lived","refresh_token":"refresh-secret","token_type":"Bearer","expires_in":300}"#,
+            );
+        });
+
+        let queued_state = Arc::new(CDiagnosticState::default());
+        let save_entered = Arc::new(AtomicBool::new(false));
+        let release_save = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(DiagnosticSiblingCloseState {
+            auth: Mutex::new(None),
+            queued_state: Arc::clone(&queued_state),
+            release_save: Arc::clone(&release_save),
+            close_result: Mutex::new(None),
+            callback_started: AtomicBool::new(false),
+        });
+        let user_data = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
+        let target = Arc::new(CDiagnosticTarget {
+            callback: close_queued_sibling_from_diagnostic,
+            user_data: user_data as usize,
+            release: Some(release_diagnostic_sibling_close_state),
+            callback_gate: Mutex::new(CallbackGateState::default()),
+            callback_ready: std::sync::Condvar::new(),
+            active: AtomicBool::new(false),
+        });
+        let emitting = CDiagnosticSink {
+            target: Arc::clone(&target),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        let queued = CDiagnosticSink {
+            target,
+            state: queued_state,
+        };
+        let inner = OidcDeviceAuth::builder()
+            .client_id("questdb-c")
+            .scope("openid")
+            .token_endpoint(format!("http://{address}/token"))
+            .device_authorization_endpoint(format!("http://{address}/device"))
+            .allow_insecure_transport(true)
+            .interactive(true)
+            .open_browser(false)
+            .token_store(CoordinatedFailingSaveStore {
+                entered: Arc::clone(&save_entered),
+                release: release_save,
+            })
+            .diagnostic_handler(queued.clone())
+            .build()
+            .unwrap();
+        let auth = SharedOidcAuth {
+            inner: Arc::new(inner),
+            event_handler: None,
+            diagnostic: Some(queued),
+            token_provider_isolation: TokenProviderIsolation::default(),
+        };
+        *state.auth.lock().unwrap() = Some(auth.clone());
+
+        // Put the sibling inside token acquisition before the first callback
+        // takes the shared target. It will leave `save` only after that callback
+        // is active, then queue its own persistence warning behind the target.
+        let sibling_auth = auth.clone();
+        let sibling = std::thread::spawn(move || {
+            sibling_auth
+                .sign_in()
+                .map_err(|err| (err.code(), err.msg().to_string()))
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !save_entered.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sibling did not reach its coordinated store save"
+            );
+            std::thread::yield_now();
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let emitter = std::thread::spawn(move || {
+            emitting.on_persistence_warning("first sibling owns the target");
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("close waited for a sibling queued on its diagnostic target");
+        emitter.join().unwrap();
+        state
+            .close_result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("callback did not call sibling close")
+            .expect("sibling close did not complete");
+        sibling
+            .join()
+            .expect("sibling sign-in panicked")
+            .expect_err("close should cancel the sibling sign-in");
+
         *state.auth.lock().unwrap() = None; // break target -> state -> auth cycle
         drop(auth);
         server.join().unwrap();

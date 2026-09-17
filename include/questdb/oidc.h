@@ -160,9 +160,12 @@ typedef struct questdb_oidc_diagnostic
 
 /**
  * Persistence diagnostic callback. It may run on a token-provider or transport
- * thread during silent refresh. Invocations are serialized. Return promptly;
- * do not re-enter the auth or transport operation that emitted it, and never
- * throw, unwind, or perform a non-local jump across this boundary.
+ * thread during silent refresh. Invocations are serialized. Return promptly.
+ * Calling `sign_in`, uncached `token`, `clear`, or an attached transport that
+ * needs a token from a diagnostic callback sharing this target is rejected
+ * before it can wait on the acquisition lock; a valid cached `token` remains
+ * available. `cancel_sign_in` and `close` are callback-safe. Never throw,
+ * unwind, or perform a non-local jump across this boundary.
  */
 typedef void (*questdb_oidc_diagnostic_cb)(
     void* user_data, const questdb_oidc_diagnostic* diagnostic);
@@ -327,10 +330,13 @@ bool questdb_oidc_builder_ca_bundle(
  *
  * The store writes access, ID, and long-lived refresh tokens as unencrypted
  * JSON. On Unix, the library creates token files with mode `0600` and store
- * directories with mode `0700`; on other platforms protection depends on the
- * directory's default ACL. The caller must ensure that the directory is
- * accessible only to the intended account and accept the at-rest exposure.
- * Without this call, credentials remain in memory only.
+ * directories with mode `0700`. The bundled file store currently rejects
+ * persistence on non-Unix platforms before changing disk state because it
+ * cannot provide the durable directory-entry replacement/deletion required for
+ * rotating refresh tokens there. C callers should keep credentials in memory
+ * on those platforms; custom keychain-backed stores are currently available
+ * only through the Rust `TokenStore` API. Without this call, credentials remain
+ * in memory only.
  *
  * `directory` is used verbatim. Nothing here expands `~` -- a shell does that,
  * a runtime does not -- so a value starting with `~` is REJECTED rather than
@@ -353,9 +359,11 @@ bool questdb_oidc_builder_file_token_store(
  *
  * The store writes access, ID, and long-lived refresh tokens as unencrypted
  * JSON. On Unix, the library creates token files with mode `0600` and store
- * directories with mode `0700`; on other platforms protection depends on the
- * directory's default ACL. Use this only when that at-rest security tradeoff is
- * acceptable. Without this call, credentials remain in memory only.
+ * directories with mode `0700`. The bundled file store currently rejects
+ * persistence on non-Unix platforms before changing disk state because the
+ * required durable metadata barrier is unavailable. C callers should use
+ * memory-only authentication there; custom stores are currently Rust-only.
+ * Without this call, credentials remain in memory only.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_default_file_token_store(

@@ -454,8 +454,10 @@ impl OidcDeviceAuthBuilder {
     /// explicit [`sign_in`](OidcDeviceAuth::sign_in).
     ///
     /// The bundled [`FileTokenStore`](crate::oidc::FileTokenStore) writes a
-    /// plaintext file protected by permissions; **it persists a long-lived refresh
-    /// token to disk** — see the [`oidc::token_store`](crate::oidc) security notes.
+    /// plaintext file protected by permissions on Unix; **it persists a long-lived
+    /// refresh token to disk** — see the [`oidc::token_store`](crate::oidc) security
+    /// notes. It rejects mutation on non-Unix platforms until an equivalent durable
+    /// metadata barrier is available there.
     /// Persistence after a fresh sign-in is best-effort. A lazy-load failure is
     /// surfaced as retryable when there is no in-memory fallback. During a
     /// coordinated refresh, re-reading and removing the persisted parent must

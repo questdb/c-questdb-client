@@ -615,8 +615,12 @@ public:
     /**
      * Explicitly persist access, ID, and long-lived refresh tokens as
      * unencrypted JSON in `directory`. Unix uses `0600` token files and a
-     * `0700` store directory; other platforms depend on the directory's
-     * default ACL. Without this opt-in, credentials remain in memory only.
+     * `0700` store directory. Non-Unix platforms currently reject persistence
+     * before changing disk state because the durable metadata barrier required
+     * for rotating refresh tokens is unavailable. C++ callers should use
+     * memory-only authentication there; custom keychain-backed stores are
+     * currently available only through the Rust `TokenStore` API. Without this
+     * opt-in, credentials remain in memory only.
      *
      * `directory` is used verbatim: nothing expands `~`, so a value starting
      * with `~` throws rather than creating a directory literally named `~`
@@ -696,7 +700,10 @@ public:
      * unencrypted JSON under the directory named by the
      * `QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR` environment variable, or
      * `${HOME}/.questdb/oidc-tokens/` when unset. Unix uses owner-only modes;
-     * other platforms depend on the directory's default ACL.
+     * non-Unix platforms currently reject persistence before changing disk
+     * state because the required durable metadata barrier is unavailable. C++
+     * callers should use memory-only authentication there; custom stores are
+     * currently Rust-only.
      */
     builder& default_file_token_store()
     {
@@ -743,7 +750,10 @@ public:
     }
 
     /** Install a serialized persistence diagnostic handler. The callback may
-     * run on a background token-provider thread and must return promptly. */
+     * run on a background token-provider thread and must return promptly.
+     * Acquisition-taking auth/transport operations sharing this handler are
+     * rejected from the callback; cached token reads, cancellation and close
+     * remain safe. */
     builder& diagnostic_handler(
         std::function<void(const diagnostic_view&)> handler)
     {

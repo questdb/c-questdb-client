@@ -631,9 +631,15 @@ pub trait TokenStore: Send + Sync {
 /// encryption — matching `gcloud`, `aws` and `gh`. On Unix that is a `0600`
 /// file in a `0700` directory; on other platforms, and on any filesystem that
 /// cannot represent POSIX permissions, the mode is neither set nor verifiable
-/// and protection is whatever the directory's default ACL grants. For
-/// encryption at rest, supply a [`TokenStore`] backed by an OS keychain or a
-/// secrets manager instead.
+/// and protection is whatever the directory's default ACL grants for an
+/// existing file being read. For encryption at rest, Rust callers can supply a
+/// [`TokenStore`] backed by an OS keychain or a secrets manager instead.
+///
+/// Durable file mutation currently requires Unix directory fsync semantics.
+/// On Windows and other non-Unix targets, [`preflight`](TokenStore::preflight),
+/// [`save`](FileTokenStore::save), and [`clear`](FileTokenStore::clear) return
+/// `Unsupported` before changing the store. Reads remain available so an
+/// existing credential can be recovered or migrated to a custom store.
 ///
 /// A store that cannot enforce the mode warns once through `log`, which is
 /// silent unless the application installed a subscriber. On Unix the same
@@ -670,24 +676,23 @@ pub struct FileTokenStore {
     lock_stale: Duration,
     #[cfg(test)]
     fail_heartbeat_spawn: bool,
+    #[cfg(all(test, not(unix)))]
+    allow_unsafe_mutations_for_tests: bool,
 }
 
 impl FileTokenStore {
     /// A store rooted at the given directory.
     ///
-    /// The path is used **verbatim**. Nothing expands `~` — a shell does that,
-    /// a runtime does not — so `at("~/tokens")` creates a directory literally
-    /// named `~` under the process working directory and leaves a long-lived
-    /// plaintext refresh token in it. A relative path is resolved afresh at
-    /// every use, so a `chdir` moves the store and re-runs the device flow.
-    /// Pass an already-expanded absolute path, or use
-    /// [`at_default_location`](Self::at_default_location).
+    /// The path is used **verbatim** except that a leading `~` is rejected on
+    /// first use: a runtime does not expand it, and accepting it would create a
+    /// directory literally named `~` under the process working directory. A
+    /// relative path is resolved afresh at every use, so a `chdir` moves the
+    /// store and re-runs the device flow. Pass an already-expanded absolute
+    /// path, or use [`at_default_location`](Self::at_default_location).
     ///
-    /// Unlike that constructor and the shared environment override, this one
-    /// applies no restriction: it is the deliberate escape hatch for a caller
-    /// that has resolved the path itself. The C setter
-    /// `questdb_oidc_builder_file_token_store` does reject a leading `~`,
-    /// matching the Python binding, which expands and absolutises instead.
+    /// The C setter `questdb_oidc_builder_file_token_store` applies the same
+    /// leading-`~` rejection. The Python binding expands and absolutises its
+    /// path before it reaches this constructor.
     pub fn at(directory: impl Into<PathBuf>) -> Self {
         FileTokenStore {
             directory: directory.into(),
@@ -695,6 +700,22 @@ impl FileTokenStore {
             lock_stale: DEFAULT_LOCK_STALE,
             #[cfg(test)]
             fail_heartbeat_spawn: false,
+            #[cfg(all(test, not(unix)))]
+            allow_unsafe_mutations_for_tests: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allow_unsafe_mutations_for_tests(self) -> Self {
+        #[cfg(unix)]
+        {
+            self
+        }
+        #[cfg(not(unix))]
+        {
+            let mut store = self;
+            store.allow_unsafe_mutations_for_tests = true;
+            store
         }
     }
 
@@ -1241,6 +1262,36 @@ impl FileTokenStore {
         Ok(removed)
     }
 
+    fn ensure_durable_mutations_supported(&self) -> TokenStoreResult<()> {
+        #[cfg(unix)]
+        {
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            #[cfg(test)]
+            if self.allow_unsafe_mutations_for_tests {
+                return Ok(());
+            }
+            Err(Box::new(durable_mutations_unsupported_error()))
+        }
+    }
+
+    fn sync_directory(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            fsync_directory(&self.directory)
+        }
+        #[cfg(not(unix))]
+        {
+            #[cfg(test)]
+            if self.allow_unsafe_mutations_for_tests {
+                return Ok(());
+            }
+            Err(durable_mutations_unsupported_error())
+        }
+    }
+
     fn save_under_lock(
         &self,
         key: &TokenStoreKey,
@@ -1284,7 +1335,7 @@ impl FileTokenStore {
         // whole rotation protocol exists to avoid. Making the directory entry
         // durable is part of having saved it, not a nicety.
         heartbeat.check_owned()?;
-        fsync_directory(&self.directory)?;
+        self.sync_directory()?;
         Ok(())
     }
 
@@ -1294,6 +1345,10 @@ impl FileTokenStore {
     /// repairs a one-off loose directory to 0700, so a preflight that a save
     /// would have survived does not fail.
     fn preflight_store(&self, cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        self.ensure_durable_mutations_supported()?;
         self.with_directory_lock(cancelled, |trusted, _| {
             if may_persist(trusted, &self.directory, &self.untrusted_sentinel()) {
                 return Ok(());
@@ -1317,7 +1372,7 @@ impl FileTokenStore {
         let removed_orphans = self.sweep_orphan_temps(key, false, heartbeat)?;
         if removed || removed_orphans {
             heartbeat.check_owned()?;
-            fsync_directory(&self.directory)?; // make the refresh-parent tombstone durable
+            self.sync_directory()?; // make the refresh-parent tombstone durable
         }
         Ok(())
     }
@@ -1374,6 +1429,10 @@ impl TokenStore for FileTokenStore {
         token: &PersistedToken,
         cancelled: &dyn Fn() -> bool,
     ) -> TokenStoreResult<()> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        self.ensure_durable_mutations_supported()?;
         let content = self.serialize(key, token);
         if content.len() as u64 > MAX_FILE_BYTES {
             return Err(Box::new(std::io::Error::new(
@@ -1425,6 +1484,7 @@ impl TokenStore for FileTokenStore {
         if cancelled() {
             return Err(cancelled_error());
         }
+        self.ensure_durable_mutations_supported()?;
         // Only a DEFINITE absence is "nothing to clear". `Path::is_dir()`
         // reports false for EACCES, ELOOP and EIO just as it does for a missing
         // directory, so an unreadable store made `clear` report success with
@@ -2432,23 +2492,16 @@ fn fsync_directory(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// No-op off Unix, and NOT an equivalent.
-///
-/// There is no portable way to fsync a directory entry: Windows has no
-/// `O_DIRECTORY` handle to `sync_all`, and `fs::rename` there is not
-/// write-through. So on those platforms the barrier the callers above treat as
-/// mandatory does not exist.
-///
-/// What that costs, concretely: a power failure between the rename and this
-/// call can lose the directory entry for a freshly persisted ROTATED child
-/// token while the parent's tombstone survives, or vice versa. The next start
-/// then reads and submits a refresh token the IdP already consumed, which a
-/// rotation-detecting IdP answers by revoking the whole token family. The
-/// window is small and needs an unclean shutdown, but it is real, and callers
-/// on those platforms should not read the `Ok(())` here as durability.
 #[cfg(not(unix))]
-fn fsync_directory(_dir: &Path) -> std::io::Result<()> {
-    Ok(())
+fn durable_mutations_unsupported_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the bundled OIDC file token store cannot safely persist credentials on this \
+         platform because durable directory-entry replacement and deletion are not \
+         available; omit the file store to keep credentials in memory. Rust callers \
+         may instead supply a custom TokenStore backed by an OS keychain or another \
+         durable credential store",
+    )
 }
 
 #[cfg(not(unix))]
