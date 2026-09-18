@@ -113,8 +113,12 @@ may briefly apply normal publication backpressure while the current segment
 is checkpointed.
 
 Periodic durability covers the client's local store-and-forward files.
-`request_durable_ack=on` is an independent QuestDB Enterprise server-side
-durability barrier; configure both when end-to-end durability is required.
+`request_durable_ack` independently selects the server barrier: `local`
+protects against server power loss, `replicated` protects against server-disk
+loss through replication/object storage, and `local,replicated` requests both
+while trimming the replay log only at the replicated watermark. The legacy
+`on` value remains an alias for `replicated`; `off` remains the default.
+Unsupported or partially granted tier sets fail the connection.
 
 ## Getting Started
 

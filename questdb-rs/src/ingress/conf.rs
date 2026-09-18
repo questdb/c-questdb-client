@@ -255,6 +255,87 @@ pub(crate) enum QwpWsInitialConnectMode {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DurableAckTiers {
+    #[default]
+    Off,
+    /// Legacy `on`: replicated durability, sent as `true` and confirmed as
+    /// `enabled` for compatibility with servers predating explicit tiers.
+    LegacyReplicated,
+    Local,
+    Replicated,
+    LocalAndReplicated,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl From<bool> for DurableAckTiers {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::LegacyReplicated
+        } else {
+            Self::Off
+        }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl DurableAckTiers {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("off") {
+            Some(Self::Off)
+        } else if value.eq_ignore_ascii_case("on") {
+            Some(Self::LegacyReplicated)
+        } else if value.eq_ignore_ascii_case("local") {
+            Some(Self::Local)
+        } else if value.eq_ignore_ascii_case("replicated") {
+            Some(Self::Replicated)
+        } else if value.eq_ignore_ascii_case("local,replicated")
+            || value.eq_ignore_ascii_case("replicated,local")
+        {
+            Some(Self::LocalAndReplicated)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    pub(crate) fn has_replicated(self) -> bool {
+        matches!(
+            self,
+            Self::LegacyReplicated | Self::Replicated | Self::LocalAndReplicated
+        )
+    }
+
+    pub(crate) fn trims_on_local(self) -> bool {
+        self == Self::Local
+    }
+
+    pub(crate) fn request_header_value(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::LegacyReplicated => Some("true"),
+            Self::Local => Some("local"),
+            Self::Replicated => Some("replicated"),
+            Self::LocalAndReplicated => Some("local,replicated"),
+        }
+    }
+
+    pub(crate) fn confirmation_value(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::LegacyReplicated => Some("enabled"),
+            Self::Local => Some("local"),
+            Self::Replicated => Some("replicated"),
+            Self::LocalAndReplicated => Some("local,replicated"),
+        }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone)]
 pub(crate) struct QwpWsConfig {
     pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
@@ -271,7 +352,7 @@ pub(crate) struct QwpWsConfig {
     pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) client_id: ConfigSetting<Option<String>>,
     pub(crate) max_protocol_version: ConfigSetting<u32>,
-    pub(crate) request_durable_ack: ConfigSetting<bool>,
+    pub(crate) request_durable_ack: ConfigSetting<DurableAckTiers>,
     pub(crate) durable_ack_keepalive_interval: ConfigSetting<std::time::Duration>,
     /// Per-outage wall-clock budget for the reconnect loop.
     pub(crate) reconnect_max_duration: ConfigSetting<std::time::Duration>,
@@ -341,7 +422,7 @@ impl Default for QwpWsConfig {
             request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             client_id: ConfigSetting::new_default(None),
             max_protocol_version: ConfigSetting::new_default(1),
-            request_durable_ack: ConfigSetting::new_default(false),
+            request_durable_ack: ConfigSetting::new_default(DurableAckTiers::Off),
             durable_ack_keepalive_interval: ConfigSetting::new_default(
                 std::time::Duration::from_millis(200),
             ),
