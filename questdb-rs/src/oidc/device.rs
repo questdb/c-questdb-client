@@ -814,7 +814,7 @@ impl OidcDeviceAuth {
         if let Some(token) = self.cached_selected_if_valid() {
             return token;
         }
-        let tokens = self.obtain_tokens(false)?;
+        let tokens = self.obtain_tokens(false, None)?;
         self.select(&tokens)
     }
 
@@ -830,8 +830,42 @@ impl OidcDeviceAuth {
     /// [`cancel_sign_in`](Self::cancel_sign_in) aborts only a running device-flow
     /// attempt; the same provider may call `sign_in` again afterwards.
     pub fn sign_in(&self) -> Result<()> {
+        self.sign_in_inner(None)
+    }
+
+    /// Run interactive sign-in while allowing a binding to abort only the wait
+    /// for the acquisition mutex.
+    ///
+    /// This is an internal integration hook for callback-based bindings. A
+    /// callback is invoked while the provider owns the acquisition mutex, so a
+    /// binding operation that began just before callback admission must stop
+    /// waiting if that callback becomes active. Otherwise callback code that
+    /// joins the waiting thread forms a cycle. The callback is never consulted
+    /// after acquisition succeeds.
+    #[doc(hidden)]
+    pub fn sign_in_with_acquire_abort(
+        &self,
+        abort_wait: &dyn Fn() -> Option<crate::Error>,
+    ) -> crate::Result<()> {
+        let abort_error = std::cell::RefCell::new(None);
+        let should_abort = || {
+            if let Some(error) = abort_wait() {
+                *abort_error.borrow_mut() = Some(error);
+                true
+            } else {
+                false
+            }
+        };
+        let result = self.sign_in_inner(Some(&should_abort));
+        match abort_error.into_inner() {
+            Some(error) => Err(error),
+            None => result.map_err(Into::into),
+        }
+    }
+
+    fn sign_in_inner(&self, abort_wait: Option<&dyn Fn() -> bool>) -> Result<()> {
         self.ensure_open()?;
-        self.obtain_tokens(true).map(|_| ())
+        self.obtain_tokens(true, abort_wait).map(|_| ())
     }
 
     /// Best-effort form of [`try_clear`](Self::try_clear).
@@ -857,6 +891,33 @@ impl OidcDeviceAuth {
     /// This only deletes local client credentials; it does **not** revoke access,
     /// ID, or refresh tokens at the identity provider.
     pub fn try_clear(&self) -> Result<()> {
+        self.try_clear_inner(None)
+    }
+
+    /// Clear credentials while allowing a binding to abort only the wait for
+    /// the acquisition mutex. See [`sign_in_with_acquire_abort`](Self::sign_in_with_acquire_abort).
+    #[doc(hidden)]
+    pub fn try_clear_with_acquire_abort(
+        &self,
+        abort_wait: &dyn Fn() -> Option<crate::Error>,
+    ) -> crate::Result<()> {
+        let abort_error = std::cell::RefCell::new(None);
+        let should_abort = || {
+            if let Some(error) = abort_wait() {
+                *abort_error.borrow_mut() = Some(error);
+                true
+            } else {
+                false
+            }
+        };
+        let result = self.try_clear_inner(Some(&should_abort));
+        match abort_error.into_inner() {
+            Some(error) => Err(error),
+            None => result.map_err(Into::into),
+        }
+    }
+
+    fn try_clear_inner(&self, abort_wait: Option<&dyn Fn() -> bool>) -> Result<()> {
         // Clearing is pure teardown, so it must keep working after `close`.
         // `close` deliberately leaves the persisted entry alone -- it drops only
         // the in-memory copy -- so refusing here stranded a long-lived plaintext
@@ -867,7 +928,7 @@ impl OidcDeviceAuth {
         let _acq = if started_closed {
             self.acquire_for_teardown()
         } else {
-            self.acquire_for_operation()?
+            self.acquire_for_operation(abort_wait)?
         };
         if !started_closed {
             self.ensure_open()?;
@@ -1090,16 +1151,28 @@ impl OidcDeviceAuth {
         }
     }
 
-    fn acquire_for_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
-        loop {
+    fn acquire_for_operation(
+        &self,
+        abort_wait: Option<&dyn Fn() -> bool>,
+    ) -> Result<std::sync::MutexGuard<'_, ()>> {
+        let check_abort = || -> Result<()> {
             self.ensure_open()?;
+            if abort_wait.is_some_and(|abort| abort()) {
+                return Err(OidcError::cancelled(
+                    "The OIDC acquisition wait was aborted by the host binding.",
+                ));
+            }
+            Ok(())
+        };
+        loop {
+            check_abort()?;
             match self.acquire.try_lock() {
                 Ok(guard) => {
-                    self.ensure_open()?;
+                    check_abort()?;
                     return Ok(guard);
                 }
                 Err(TryLockError::Poisoned(error)) => {
-                    self.ensure_open()?;
+                    check_abort()?;
                     return Ok(error.into_inner());
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -1212,7 +1285,11 @@ impl OidcDeviceAuth {
         self.cached_selected_if_valid()
     }
 
-    fn obtain_tokens(&self, allow_interaction: bool) -> Result<TokenSet> {
+    fn obtain_tokens(
+        &self,
+        allow_interaction: bool,
+        abort_wait: Option<&dyn Fn() -> bool>,
+    ) -> Result<TokenSet> {
         self.ensure_open()?;
         // token() keeps the cache-hit path out of the acquisition critical
         // section. sign_in() is an explicit lifecycle operation and mirrors Java
@@ -1225,7 +1302,7 @@ impl OidcDeviceAuth {
         // refreshes or double-prompt. A transport-facing token lookup waits for a
         // bounded period behind a silent refresh, but never behind a device flow.
         let _acq = if allow_interaction {
-            self.acquire_for_operation()?
+            self.acquire_for_operation(abort_wait)?
         } else {
             self.acquire_for_token()?
         };

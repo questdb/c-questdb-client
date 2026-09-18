@@ -2628,6 +2628,12 @@ impl SenderBuilder {
     /// Set the cumulative duration spent in retries.
     /// The value is in milliseconds, and the default is 10 seconds.
     pub fn retry_timeout(mut self, value: Duration) -> Result<Self> {
+        if std::time::Instant::now().checked_add(value).is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "retry_timeout is too large for the platform monotonic clock."
+            ));
+        }
         if let Some(http) = &mut self.http {
             http.retry_timeout.set_specified("retry_timeout", value)?;
         } else {

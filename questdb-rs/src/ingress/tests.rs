@@ -1469,6 +1469,15 @@ fn http_retry_timeout() {
 
 #[cfg(feature = "sync-sender-http")]
 #[test]
+fn http_retry_timeout_rejects_unrepresentable_deadline() {
+    assert_conf_err(
+        SenderBuilder::new(Protocol::Http, "localhost", 9000).retry_timeout(Duration::MAX),
+        "retry_timeout is too large for the platform monotonic clock.",
+    );
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
 fn http_retry_max_backoff() {
     let builder =
         SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=250;").unwrap();

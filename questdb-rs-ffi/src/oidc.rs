@@ -362,15 +362,48 @@ impl SharedOidcAuth {
                 .is_some_and(CDiagnosticSink::in_callback_on_this_thread)
     }
 
-    fn reject_callback_reentry(&self) -> Result<(), Error> {
-        if self.callback_is_active() {
-            return Err(if self.in_own_callback() {
+    fn callback_reentry_error(&self) -> Option<Error> {
+        self.callback_is_active().then(|| {
+            if self.in_own_callback() {
                 Self::reentry_error()
             } else {
                 Self::callback_busy_error()
-            });
+            }
+        })
+    }
+
+    fn reject_callback_reentry(&self) -> Result<(), Error> {
+        match self.callback_reentry_error() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Acquire the per-auth sign-in gate without waiting through a callback
+    /// that the queued caller may be joined from. The callback and gate belong
+    /// to the same sign-in, so once this lock becomes available that callback
+    /// has returned; the second check closes the try-lock admission window.
+    fn lock_sign_in_gate<'a>(
+        &self,
+        handler: &'a CEventHandler,
+    ) -> Result<std::sync::MutexGuard<'a, ()>, Error> {
+        loop {
+            self.reject_callback_reentry()?;
+            match handler.sign_in_gate.try_lock() {
+                Ok(guard) => {
+                    self.reject_callback_reentry()?;
+                    return Ok(guard);
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    let guard = error.into_inner();
+                    self.reject_callback_reentry()?;
+                    return Ok(guard);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
     }
 
     fn sign_in(&self) -> Result<(), Error> {
@@ -378,46 +411,30 @@ impl SharedOidcAuth {
         // Mirror native's per-auth sign-in serialization at the callback layer.
         // This makes the handler generation below identify the invocation that
         // can actually render; a queued second caller cannot overwrite it.
-        let _sign_in_gate = self.event_handler.as_ref().map(|handler| {
-            handler
-                .sign_in_gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
+        let _sign_in_gate = match self.event_handler.as_deref() {
+            Some(handler) => Some(self.lock_sign_in_gate(handler)?),
+            None => None,
+        };
         let generation = self
             .event_handler
             .as_ref()
-            .map(|handler| handler.begin_sign_in());
-        let result = self.inner.sign_in().map_err(Into::into);
+            .map(|handler| handler.begin_sign_in_serialized());
+        // A callback can become active after the entry check while this call is
+        // waiting for the core acquisition mutex. Re-check from that wait loop
+        // so a callback which joins this thread cannot deadlock on itself.
+        let abort_wait = || self.callback_reentry_error();
+        let result = self.inner.sign_in_with_acquire_abort(&abort_wait);
         if let (Some(handler), Some(generation)) = (&self.event_handler, generation) {
-            handler.finish_sign_in(generation);
+            handler.finish_sign_in_serialized(generation);
         }
         result
     }
 
     fn cancel_sign_in(&self) -> Result<(), Error> {
-        // Publish callback cancellation before waking the native flow. Doing it
-        // afterwards lets the sign-in return and clear its attempt state first,
-        // so the late store suppresses the next sign-in. The generation makes
-        // both rollback and the rare post-publication race attempt-specific.
-        let pre_cancelled = self
-            .event_handler
-            .as_ref()
-            .and_then(|handler| handler.cancel_sign_in());
-        let cancelled = self.inner.cancel_sign_in();
         if let Some(handler) = &self.event_handler {
-            if cancelled {
-                if pre_cancelled.is_none() {
-                    // A sign-in started between the first publication and the
-                    // native check. Cancel it only if that exact attempt is
-                    // still active; never leave a latch for a future one.
-                    handler.cancel_sign_in();
-                }
-            } else if let Some(generation) = pre_cancelled {
-                // Native found no active device flow. Undo only our own
-                // speculative publication; a later generation is untouched.
-                handler.clear_sign_in_cancel(generation);
-            }
+            handler.cancel_sign_in_serialized(|| self.inner.cancel_sign_in());
+        } else {
+            self.inner.cancel_sign_in();
         }
         Ok(())
     }
@@ -458,7 +475,11 @@ impl SharedOidcAuth {
 
     fn clear(&self) -> Result<(), Error> {
         self.reject_callback_reentry()?;
-        self.inner.try_clear().map_err(Into::into)
+        // Close the admission race just as sign_in does: clear may already be
+        // waiting for the core acquisition mutex when a renderer or diagnostic
+        // callback becomes active and joins this thread.
+        let abort_wait = || self.callback_reentry_error();
+        self.inner.try_clear_with_acquire_abort(&abort_wait)
     }
 
     fn close(&self) -> Result<(), Error> {
@@ -885,6 +906,9 @@ struct CEventHandler {
     /// Serializes C-facing sign-in invocations so one active generation maps
     /// exactly to native's serialized interactive flow.
     sign_in_gate: std::sync::Mutex<()>,
+    /// Serializes begin/finish with cancellation's core attempt selection.
+    /// Never held while sign-in itself runs or while user code is invoked.
+    sign_in_generation_gate: std::sync::Mutex<()>,
     next_sign_in_generation: AtomicU64,
     active_sign_in_generation: AtomicU64,
     cancelled_sign_in_generation: AtomicU64,
@@ -1001,6 +1025,7 @@ impl CEventHandler {
             active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             sign_in_gate: std::sync::Mutex::new(()),
+            sign_in_generation_gate: std::sync::Mutex::new(()),
             next_sign_in_generation: AtomicU64::new(1),
             active_sign_in_generation: AtomicU64::new(0),
             cancelled_sign_in_generation: AtomicU64::new(0),
@@ -1033,6 +1058,14 @@ impl CEventHandler {
         generation
     }
 
+    fn begin_sign_in_serialized(&self) -> u64 {
+        let _state = self
+            .sign_in_generation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.begin_sign_in()
+    }
+
     fn finish_sign_in(&self, generation: u64) {
         let _ = self.active_sign_in_generation.compare_exchange(
             generation,
@@ -1041,6 +1074,36 @@ impl CEventHandler {
             Ordering::Acquire,
         );
         self.clear_sign_in_cancel(generation);
+    }
+
+    fn finish_sign_in_serialized(&self, generation: u64) {
+        let _state = self
+            .sign_in_generation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.finish_sign_in(generation);
+    }
+
+    /// Keep renderer-generation transitions fixed while the core chooses and
+    /// signals its active attempt. Without this gate, attempt A can finish and
+    /// B can publish between the native cancellation and the callback-layer
+    /// store, causing A's cancellation to mute B.
+    fn cancel_sign_in_serialized(&self, cancel_core: impl FnOnce() -> bool) {
+        let _state = self
+            .sign_in_generation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = self.cancel_sign_in();
+        let cancelled = cancel_core();
+        debug_assert!(
+            !cancelled || generation.is_some(),
+            "an interactive flow must have a renderer generation"
+        );
+        if !cancelled && let Some(generation) = generation {
+            // Native found no active device flow. Undo only our own
+            // speculative publication; a later generation is untouched.
+            self.clear_sign_in_cancel(generation);
+        }
     }
 
     /// Cancel the currently active renderer generation, if any, and return its
@@ -4260,6 +4323,54 @@ mod tests {
             "a late cancellation from the previous attempt muted this renderer"
         );
         handler.finish_sign_in(second);
+    }
+
+    #[test]
+    fn cancellation_selection_blocks_the_next_renderer_generation() {
+        let handler = Arc::new(CEventHandler::new(event_target(ignore_event, 0, None)));
+        let first = handler.begin_sign_in_serialized();
+
+        let (core_entered_tx, core_entered_rx) = std::sync::mpsc::channel();
+        let (release_core_tx, release_core_rx) = std::sync::mpsc::channel();
+        let cancelling_handler = Arc::clone(&handler);
+        let cancelling = std::thread::spawn(move || {
+            cancelling_handler.cancel_sign_in_serialized(|| {
+                core_entered_tx.send(()).unwrap();
+                release_core_rx.recv().unwrap();
+                true
+            });
+        });
+        core_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation never selected the first attempt");
+
+        let (transition_started_tx, transition_started_rx) = std::sync::mpsc::channel();
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let transitioning_handler = Arc::clone(&handler);
+        let transition = std::thread::spawn(move || {
+            transition_started_tx.send(()).unwrap();
+            transitioning_handler.finish_sign_in_serialized(first);
+            second_tx
+                .send(transitioning_handler.begin_sign_in_serialized())
+                .unwrap();
+        });
+        transition_started_rx.recv().unwrap();
+        assert!(
+            second_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the next renderer generation advanced while cancellation was selecting its attempt"
+        );
+
+        release_core_tx.send(()).unwrap();
+        cancelling.join().unwrap();
+        let second = second_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the next generation did not start after cancellation completed");
+        transition.join().unwrap();
+        assert!(
+            ActiveEventHandler::enter(&handler).is_some(),
+            "cancelling the first attempt muted the next renderer"
+        );
+        handler.finish_sign_in_serialized(second);
     }
 
     #[test]

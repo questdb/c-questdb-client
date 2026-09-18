@@ -239,6 +239,63 @@ fn sign_in_and_token(auth: &OidcDeviceAuth) -> Result<String> {
 }
 
 #[test]
+fn operation_wait_can_be_aborted_after_it_has_started() {
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example/device")
+            .token_endpoint("https://idp.example/token")
+            .interactive(false)
+            .open_browser(false)
+            .build()
+            .expect("build auth"),
+    );
+    let held = auth.lock_acquire();
+    let callback_active = Arc::new(AtomicBool::new(false));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let worker_auth = Arc::clone(&auth);
+    let worker_active = Arc::clone(&callback_active);
+    let worker_checks = Arc::clone(&checks);
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let error = worker_auth
+            .try_clear_with_acquire_abort(&|| {
+                worker_checks.fetch_add(1, Ordering::SeqCst);
+                worker_active.load(Ordering::SeqCst).then(|| {
+                    crate::Error::new(
+                        crate::ErrorCode::InvalidApiCall,
+                        "callback became active".to_string(),
+                    )
+                })
+            })
+            .expect_err("the waiter must observe callback admission");
+        result_tx.send(error.code()).unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while checks.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "clear never entered its wait loop"
+        );
+        std::thread::yield_now();
+    }
+    callback_active.store(true, Ordering::SeqCst);
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("clear did not abort after callback admission"),
+        crate::ErrorCode::InvalidApiCall
+    );
+    assert!(
+        checks.load(Ordering::SeqCst) >= 2,
+        "the abort predicate was not re-checked while waiting"
+    );
+    worker.join().expect("clear worker");
+    drop(held);
+}
+
+#[test]
 fn store_state_zeroizes_every_secret_field() {
     // Pins the FIELD LIST of `zeroize_secrets`, not the heap scrubbing itself,
     // which is not observable in safe Rust. `last_persisted_refresh` holds a

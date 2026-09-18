@@ -465,6 +465,21 @@ fn retry_http_send(
     }
 }
 
+/// Construct a retry deadline without allowing a public Rust `Duration` to
+/// panic `Instant` arithmetic. C and Python configure milliseconds through a
+/// `u64`, but the Rust builder accepts the wider `Duration` range directly.
+fn checked_retry_deadline(
+    start: std::time::Instant,
+    timeout: Duration,
+) -> crate::Result<std::time::Instant> {
+    start.checked_add(timeout).ok_or_else(|| {
+        error::fmt!(
+            ConfigError,
+            "retry_timeout is too large for the platform monotonic clock."
+        )
+    })
+}
+
 /// Clamp the user-configured retry backoff cap into the `i32` range the
 /// loop uses internally (saturating, so absurdly large values just pin
 /// at `i32::MAX` ms ≈ 24.8 days rather than overflowing).
@@ -592,16 +607,19 @@ fn resolve_auth_with_retries(
     Option<std::borrow::Cow<'_, str>>,
     Option<std::time::Instant>,
 )> {
-    // Start the wall-clock deadline before entering a fallible provider. The
+    // Start the wall-clock budget before entering a fallible provider. The
     // provider API is synchronous, so this cannot interrupt one resolution in
     // flight; it does prevent a resolution that already consumed the whole
-    // budget from being followed by a second full provider timeout. Immediate
-    // success still reports no retry deadline to the request path.
-    let retry_end = std::time::Instant::now() + retry_timeout;
+    // budget from being followed by a second full provider timeout. Construct
+    // the deadline only after failure: static/no-auth callers do not need one,
+    // and an unrepresentable public Rust `Duration` must return an error rather
+    // than panic before an otherwise infallible resolution.
+    let retry_started = std::time::Instant::now();
     let mut last = match state.auth.resolve() {
         Ok(auth) => return Ok((auth, None)),
         Err(e) => e,
     };
+    let retry_end = checked_retry_deadline(retry_started, retry_timeout)?;
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut rng = rand::rng();
     // Same ladder as the request loop: 10ms doubling to `retry_max_backoff`.
@@ -651,7 +669,10 @@ pub(super) fn http_send_with_retries(
         if !need_retry || retry_timeout.is_zero() {
             return finish_http_send(state, last_rep);
         }
-        let retry_end = retry_end.unwrap_or_else(|| std::time::Instant::now() + retry_timeout);
+        let retry_end = match retry_end {
+            Some(retry_end) => retry_end,
+            None => checked_retry_deadline(std::time::Instant::now(), retry_timeout)?,
+        };
         return retry_http_send(
             state,
             buf,
@@ -669,7 +690,10 @@ pub(super) fn http_send_with_retries(
         return finish_http_send(state, last_rep);
     }
 
-    let retry_end = retry_end.unwrap_or_else(|| std::time::Instant::now() + retry_timeout);
+    let retry_end = match retry_end {
+        Some(retry_end) => retry_end,
+        None => checked_retry_deadline(std::time::Instant::now(), retry_timeout)?,
+    };
     retry_http_send(
         state,
         buf,
@@ -804,7 +828,12 @@ fn retry_http_get(
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
-    let retry_end = std::time::Instant::now() + retry_timeout;
+    let Some(retry_end) = std::time::Instant::now().checked_add(retry_timeout) else {
+        // This helper preserves the original ureq error type. Treat an
+        // unrepresentable retry window as no additional retry; public builder
+        // paths reject it as ConfigError before reaching here.
+        return last_rep;
+    };
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut retry_interval_ms = 10i32;
     let mut need_retry;
@@ -880,6 +909,22 @@ mod tests {
             Ok::<_, crate::Error>("tok".to_string())
         }));
         assert_eq!(ok.resolve().unwrap().as_deref(), Some("Bearer tok"));
+    }
+
+    #[test]
+    fn static_auth_does_not_construct_an_unrepresentable_retry_deadline() {
+        let state = SyncHttpHandlerState {
+            agent: ureq::Agent::new_with_defaults(),
+            url: "http://127.0.0.1/write".to_string(),
+            auth: HttpAuth::None,
+            config: HttpConfig::default(),
+        };
+
+        let (auth, deadline) =
+            resolve_auth_with_retries(&state, Duration::MAX, Duration::from_millis(100))
+                .expect("infallible auth must not construct a retry deadline");
+        assert!(auth.is_none());
+        assert!(deadline.is_none());
     }
 
     #[test]
