@@ -92,8 +92,9 @@ extern "C" {
  *  cache. Use `sf_durability=periodic` to checkpoint the local replay log.
  *  `sf_sync_interval_millis` defaults to 5000; it is a target, not a maximum
  *  loss window. `sf_durability=flush` and `sf_durability=append` are not yet
- *  supported. End-to-end durability also requires
- *  `request_durable_ack=on` and a durable ACK from QuestDB Enterprise.
+ *  supported. Server durability is selected independently with
+ *  `request_durable_ack=local`, `replicated`, or `local,replicated`; legacy
+ *  `on` retains its replicated meaning.
  *
  *  A chunk too large for one frame is split into several frames and may be
  *  committed in more than one server transaction: always once per frame with
@@ -1454,8 +1455,8 @@ bool qwp_sender_flush_chunk(
  * `ack_level`.
  *
  * `ack_level` carries a `qwpws_ack_level_*` constant. It is validated before
- * `chunk` is encoded, so an out-of-range value, or the Enterprise-only
- * `qwpws_ack_level_durable` without `request_durable_ack=on`, returns
+ * `chunk` is encoded, so an out-of-range value, or a durable level without
+ * its matching `request_durable_ack` tier, returns
  * `line_sender_error_invalid_api_call` and leaves `chunk` untouched.
  *
  * Failure contract: if local publication fails, `chunk` is left untouched and

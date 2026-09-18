@@ -144,9 +144,18 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         }
         match key {
             "request_durable_ack" => {
-                // Syntactic check; the SenderBuilder also parses this
-                // for ColumnConn.
-                let _ = parse_on_off("request_durable_ack", value)?;
+                // Syntactic check; the SenderBuilder also parses and
+                // canonicalizes this for ColumnConn.
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(
+                    normalized.as_str(),
+                    "off" | "on" | "local" | "replicated" | "local,replicated" | "replicated,local"
+                ) {
+                    return Err(error::fmt!(
+                        ConfigError,
+                        "invalid request_durable_ack [value={value}, allowed-values=[on, off, local, replicated, local,replicated]]"
+                    ));
+                }
             }
             "qwp_ws_progress" if value != "background" => {
                 return Err(error::fmt!(
@@ -205,9 +214,8 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
                 // Java conf strings write true/false; accept on/off too,
                 // case-insensitively, matching initial_connect_retry's
                 // grammar. Deliberately NOT widened into parse_on_off:
-                // request_durable_ack must keep the builder's strict on/off
-                // grammar or the pool would accept values the builder then
-                // rejects.
+                // request_durable_ack has its own tier grammar and the pool
+                // must accept exactly what the builder accepts.
                 pool.lazy_connect = match value.to_ascii_lowercase().as_str() {
                     "on" | "true" => true,
                     "off" | "false" => false,
@@ -308,19 +316,6 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         pool,
         sf_disk: sf_dir_specified,
     })
-}
-
-fn parse_on_off(key: &str, value: &str) -> Result<bool> {
-    match value {
-        "on" => Ok(true),
-        "off" => Ok(false),
-        _ => Err(error::fmt!(
-            ConfigError,
-            "Invalid value for {:?} (expected 'on' or 'off'): {:?}",
-            key,
-            value
-        )),
-    }
 }
 
 fn is_qwp_ws_schema(service: &str) -> bool {
@@ -566,11 +561,21 @@ mod tests {
     #[test]
     fn parses_request_durable_ack() {
         // Syntactically valid values pass the pool config pre-check.
-        // The actual `durable_ack_opt_in` flag is sourced from the
-        // SenderBuilder inside `ColumnConn::connect`.
+        // The actual tier set is sourced from the SenderBuilder inside
+        // `ColumnConn::connect`.
         let _ = parse_ok("ws::addr=localhost:9000;");
-        let _ = parse_ok("ws::addr=localhost:9000;request_durable_ack=on;");
-        let _ = parse_ok("ws::addr=localhost:9000;request_durable_ack=off;");
+        for value in [
+            "on",
+            "off",
+            "local",
+            "replicated",
+            "local,replicated",
+            "replicated,local",
+        ] {
+            let _ = parse_ok(&format!(
+                "ws::addr=localhost:9000;request_durable_ack={value};"
+            ));
+        }
     }
 
     #[test]

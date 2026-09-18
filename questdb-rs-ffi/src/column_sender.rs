@@ -53,8 +53,8 @@ use crate::line_sender_column_name;
 use crate::{
     line_sender_buffer, line_sender_error, line_sender_error_code, line_sender_opts,
     line_sender_qwpws_error_cb, line_sender_qwpws_fsn, line_sender_table_name, questdb_error,
-    qwp_ws_sender_error_view, qwpws_ack_level_durable, qwpws_ack_level_ok, qwpws_buffer_ptr_mut,
-    qwpws_buffer_ptr_ref, set_err_out_from_error,
+    qwp_ws_sender_error_view, qwpws_ack_level_durable, qwpws_ack_level_local_durable,
+    qwpws_ack_level_ok, qwpws_buffer_ptr_mut, qwpws_buffer_ptr_ref, set_err_out_from_error,
 };
 
 // ===========================================================================
@@ -677,7 +677,8 @@ unsafe fn as_validity<'a>(
 // Ack level
 //
 // The C header exposes named constants (`qwpws_ack_level_ok = 0`,
-// `qwpws_ack_level_durable = 1`) but the FFI takes a `uint32_t`
+// `qwpws_ack_level_durable = 1`, `qwpws_ack_level_local_durable = 2`),
+// but the FFI takes a `uint32_t`
 // (not a `#[repr(C)] enum`) so an out-of-range value is a recoverable
 // `InvalidApiCall` error instead of immediate Rust UB.
 // ===========================================================================
@@ -686,13 +687,14 @@ fn ack_level_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Optio
     match value {
         value if value == qwpws_ack_level_ok => Some(AckLevel::Ok),
         value if value == qwpws_ack_level_durable => Some(AckLevel::Durable),
+        value if value == qwpws_ack_level_local_durable => Some(AckLevel::LocalDurable),
         other => {
             unsafe {
                 set_err_out_from_error(
                     err_out,
                     Error::new(
                         ErrorCode::InvalidApiCall,
-                        format!("ws ack_level: invalid value {other} (expected 0 or 1)"),
+                        format!("ws ack_level: invalid value {other} (expected 0, 1, or 2)"),
                     ),
                 );
             }
@@ -3985,9 +3987,8 @@ pub unsafe extern "C" fn qwp_direct_sender_flush(
 /// `qwp_sender_wait` for the level meanings and the no-progress timeout).
 ///
 /// `ack_level` carries a `qwpws_ack_level_*` constant; an out-of-range value,
-/// or the Enterprise-only `qwpws_ack_level_durable` without
-/// `request_durable_ack=on`, returns `line_sender_error_invalid_api_call`
-/// **before** `chunk` is touched.
+/// or a durable level without its matching `request_durable_ack` tier, returns
+/// `line_sender_error_invalid_api_call` **before** `chunk` is touched.
 ///
 /// Boundary: a successful return acknowledges all prior no-wait flushes plus
 /// this one. An empty `chunk` behaves like `qwp_direct_sender_commit`.
@@ -4340,9 +4341,9 @@ pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_scalar_nanos(
 ///
 /// `ack_level` carries a `qwpws_ack_level_*` constant. It is validated
 /// **before** the Arrow C Data Interface import consumes `array->release`, so a
-/// rejected level (out-of-range, or the Enterprise-only `durable` without
-/// `request_durable_ack=on`) returns `line_sender_error_invalid_api_call` and
-/// leaves `array` untouched.
+/// rejected level (out-of-range, or a durable level without its matching
+/// `request_durable_ack` tier) returns `line_sender_error_invalid_api_call`
+/// and leaves `array` untouched.
 ///
 /// Ownership differs from the publish-only flush on the failure path. On a
 /// failure that is provably **pre-publication** (validation, encode, size, or a
@@ -4877,8 +4878,8 @@ unsafe fn reexport_record_batch_into(
 /// committing frame's ack.
 ///
 /// `qwpws_ack_level_ok` waits for every in-flight frame's WAL-commit ack.
-/// `qwpws_ack_level_durable` requires QuestDB Enterprise and additionally
-/// waits for the server's object-store durability watermarks.
+/// `qwpws_ack_level_local_durable` waits for local-disk durability;
+/// `qwpws_ack_level_durable` waits for replicated/object-store durability.
 ///
 /// No-progress timeout: if the server stays connected but never advances the
 /// ack/durable watermark — a back-pressured WAL or stuck commit — the wait
@@ -6132,6 +6133,11 @@ mod tests {
         assert_eq!(
             ack_level_from_u32(qwpws_ack_level_durable, &mut err),
             Some(AckLevel::Durable)
+        );
+        assert!(err.is_null());
+        assert_eq!(
+            ack_level_from_u32(qwpws_ack_level_local_durable, &mut err),
+            Some(AckLevel::LocalDurable)
         );
         assert!(err.is_null());
     }

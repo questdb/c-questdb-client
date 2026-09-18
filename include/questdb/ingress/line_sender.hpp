@@ -1742,9 +1742,10 @@ enum class qwpws_ack_level : uint32_t
     /** Wait for the server to accept every published frame. */
     ok = ::qwpws_ack_level_ok,
 
-    /** Wait for durable-ACK coverage. This level requires QuestDB Enterprise;
-     * APIs accepting it also require the `request_durable_ack=on` opt-in. */
+    /** Wait for replicated/object-store durable-ACK coverage. */
     durable = ::qwpws_ack_level_durable,
+    /** Wait for local-disk durable-ACK coverage. */
+    local_durable = ::qwpws_ack_level_local_durable,
 };
 
 /**
@@ -2107,7 +2108,8 @@ public:
      * store-and-forward wait. `timeout` is a no-progress deadline (it fires
      * only if the ack watermark fails to advance for that long); the default
      * of zero waits indefinitely. `qwpws_ack_level::durable` requires QuestDB
-     * Enterprise and `request_durable_ack=on`; otherwise this throws
+     * `request_durable_ack=on`, `replicated`, or `local,replicated`; local
+     * durable waits require `request_durable_ack=local`; otherwise this throws
      * `invalid_api_call` even when nothing has been published. Throws on the
      * no-progress timeout, a server rejection, or a transport failure; returns
      * immediately when nothing has been published yet.

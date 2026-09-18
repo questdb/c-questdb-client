@@ -43,6 +43,7 @@ use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::ingress::RawQwpWsRoundStream;
+use crate::ingress::conf::DurableAckTiers;
 use crate::ingress::sender::qwp_ws::WsStream;
 use crate::ws::frame::{self, FrameError, FrameHeader, Opcode, encode_client_frame};
 use crate::ws::mask::{MaskKeySource, apply_mask};
@@ -63,6 +64,7 @@ pub(crate) const WS_HEADER_RESERVE: usize = 14;
 // into `crate::ingress::sender::qwp_ws_codec`.
 const QWP_STATUS_OK: u8 = 0x00;
 const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
+const QWP_STATUS_LOCAL_DURABLE_ACK: u8 = 0x0E;
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
 const QWP_STATUS_INTERNAL_ERROR: u8 = 0x06;
@@ -162,7 +164,7 @@ pub(crate) struct ColumnConn {
     endpoint_idx: usize,
     max_buf_size: usize,
     request_timeout: Duration,
-    durable_ack_opt_in: bool,
+    durable_ack_tiers: DurableAckTiers,
 }
 
 impl ColumnConn {
@@ -191,7 +193,7 @@ impl ColumnConn {
             endpoint_idx: raw.endpoint_idx,
             max_buf_size: raw.max_buf_size,
             request_timeout: raw.request_timeout,
-            durable_ack_opt_in: raw.durable_ack_opt_in,
+            durable_ack_tiers: raw.durable_ack_tiers,
         })
     }
 
@@ -201,6 +203,18 @@ impl ColumnConn {
     /// against a dummy connected pair.
     #[cfg(test)]
     pub(crate) fn for_test(stream: WsStream, durable_ack_opt_in: bool) -> Self {
+        Self::for_test_tiers(
+            stream,
+            if durable_ack_opt_in {
+                DurableAckTiers::LegacyReplicated
+            } else {
+                DurableAckTiers::Off
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_tiers(stream: WsStream, durable_ack_tiers: DurableAckTiers) -> Self {
         Self {
             stream,
             leftover: Vec::new(),
@@ -218,7 +232,7 @@ impl ColumnConn {
             endpoint_idx: 0,
             max_buf_size: 1 << 20,
             request_timeout: Duration::from_secs(30),
-            durable_ack_opt_in,
+            durable_ack_tiers,
         }
     }
 
@@ -390,11 +404,23 @@ impl ColumnConn {
     }
 
     pub(crate) fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
-        if ack_level == AckLevel::Durable && !self.durable_ack_opt_in {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "AckLevel::Durable requires `request_durable_ack=on` in the connect string."
-            ));
+        let supported = match ack_level {
+            AckLevel::Ok => true,
+            AckLevel::Durable => self.durable_ack_tiers.has_replicated(),
+            AckLevel::LocalDurable => self.durable_ack_tiers.trims_on_local(),
+        };
+        if !supported {
+            return Err(match ack_level {
+                AckLevel::Durable => error::fmt!(
+                    InvalidApiCall,
+                    "AckLevel::Durable requires `request_durable_ack=on`, `replicated`, or `local,replicated` in the connect string."
+                ),
+                AckLevel::LocalDurable => error::fmt!(
+                    InvalidApiCall,
+                    "AckLevel::LocalDurable requires `request_durable_ack=local` in the connect string."
+                ),
+                AckLevel::Ok => unreachable!(),
+            });
         }
         Ok(())
     }
@@ -481,7 +507,7 @@ impl ColumnConn {
             }
         }
 
-        if ack_level == AckLevel::Durable {
+        if matches!(ack_level, AckLevel::Durable | AckLevel::LocalDurable) {
             let mut deadline_anchor = Instant::now();
             let mut last_mark = self.durable_progress_mark();
             while !self.durability_satisfied() {
@@ -566,7 +592,7 @@ impl ColumnConn {
                 // only; otherwise `Durable` is rejected up front and the targets
                 // map is never pruned, so accumulating would leak one entry per
                 // table for the connection's life.
-                if self.durable_ack_opt_in {
+                if self.durable_ack_tiers.is_enabled() {
                     for (t, seq_txn) in tables {
                         self.pending_durable_targets
                             .entry(t)
@@ -593,16 +619,11 @@ impl ColumnConn {
                 Ok(())
             }
             QwpResponse::DurableAck { tables } => {
-                for (t, seq_txn) in tables {
-                    self.durable_watermarks
-                        .entry(t)
-                        .and_modify(|w| {
-                            if seq_txn > *w {
-                                *w = seq_txn;
-                            }
-                        })
-                        .or_insert(seq_txn);
-                }
+                self.apply_durable_watermarks(tables, false);
+                Ok(())
+            }
+            QwpResponse::LocalDurableAck { tables } => {
+                self.apply_durable_watermarks(tables, true);
                 Ok(())
             }
             QwpResponse::Error {
@@ -619,6 +640,22 @@ impl ColumnConn {
                     ),
                 )))
             }
+        }
+    }
+
+    fn apply_durable_watermarks(&mut self, tables: Vec<(String, i64)>, is_local: bool) {
+        if is_local != self.durable_ack_tiers.trims_on_local() {
+            return;
+        }
+        for (table, seq_txn) in tables {
+            self.durable_watermarks
+                .entry(table)
+                .and_modify(|watermark| {
+                    if seq_txn > *watermark {
+                        *watermark = seq_txn;
+                    }
+                })
+                .or_insert(seq_txn);
         }
     }
 
@@ -974,6 +1011,9 @@ enum QwpResponse {
     DurableAck {
         tables: Vec<(String, i64)>,
     },
+    LocalDurableAck {
+        tables: Vec<(String, i64)>,
+    },
     Error {
         sequence: u64,
         status: u8,
@@ -996,9 +1036,22 @@ fn parse_qwp_response(payload: &[u8]) -> Result<QwpResponse> {
             let tables = parse_table_entries(payload, 9, "QWP OK response")?;
             Ok(QwpResponse::Ok { sequence, tables })
         }
-        QWP_STATUS_DURABLE_ACK => {
-            let tables = parse_table_entries(payload, 1, "QWP durable ACK response")?;
-            Ok(QwpResponse::DurableAck { tables })
+        QWP_STATUS_DURABLE_ACK | QWP_STATUS_LOCAL_DURABLE_ACK => {
+            let is_local = status == QWP_STATUS_LOCAL_DURABLE_ACK;
+            let tables = parse_table_entries(
+                payload,
+                1,
+                if is_local {
+                    "QWP local durable ACK response"
+                } else {
+                    "QWP durable ACK response"
+                },
+            )?;
+            Ok(if is_local {
+                QwpResponse::LocalDurableAck { tables }
+            } else {
+                QwpResponse::DurableAck { tables }
+            })
         }
         _ => {
             let (sequence, message) = parse_error_body(payload)?;
@@ -1257,6 +1310,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_qwp_local_durable_ack_and_rejects_truncation() {
+        let mut payload = vec![QWP_STATUS_LOCAL_DURABLE_ACK];
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(b"tx");
+        payload.extend_from_slice(&9i64.to_le_bytes());
+        match parse_qwp_response(&payload).unwrap() {
+            QwpResponse::LocalDurableAck { tables } => {
+                assert_eq!(tables, vec![("tx".to_owned(), 9)]);
+            }
+            other => panic!("expected LocalDurableAck, got {other:?}"),
+        }
+        assert!(parse_qwp_response(&[QWP_STATUS_LOCAL_DURABLE_ACK]).is_err());
+    }
+
+    #[test]
     fn parse_qwp_error_truncated_rejected() {
         // status=PARSE_ERROR but only the status byte present
         let err = parse_qwp_response(&[QWP_STATUS_PARSE_ERROR]).unwrap_err();
@@ -1287,6 +1356,45 @@ mod tests {
         assert_eq!(conn.in_flight(), 0);
         assert_eq!(conn.pending_durable_target_count(), 1);
         assert!(!conn.must_close());
+    }
+
+    #[test]
+    fn direct_column_uses_only_configured_trim_tier() {
+        let mut local = ColumnConn::for_test_tiers(dummy_ws_stream(), DurableAckTiers::Local);
+        local.pending_durable_targets.insert("trades".to_owned(), 7);
+        local
+            .process_response(QwpResponse::DurableAck {
+                tables: vec![("trades".to_owned(), 7)],
+            })
+            .unwrap();
+        assert!(!local.durability_satisfied());
+        local
+            .process_response(QwpResponse::LocalDurableAck {
+                tables: vec![("trades".to_owned(), 7)],
+            })
+            .unwrap();
+        assert!(local.durability_satisfied());
+        assert!(local.validate_ack_level(AckLevel::LocalDurable).is_ok());
+        assert!(local.validate_ack_level(AckLevel::Durable).is_err());
+
+        let mut both =
+            ColumnConn::for_test_tiers(dummy_ws_stream(), DurableAckTiers::LocalAndReplicated);
+        both.pending_durable_targets.insert("trades".to_owned(), 7);
+        both.process_response(QwpResponse::LocalDurableAck {
+            tables: vec![("trades".to_owned(), 7)],
+        })
+        .unwrap();
+        assert!(
+            !both.durability_satisfied(),
+            "local progress must not satisfy a both-tier replicated barrier"
+        );
+        both.process_response(QwpResponse::DurableAck {
+            tables: vec![("trades".to_owned(), 7)],
+        })
+        .unwrap();
+        assert!(both.durability_satisfied());
+        assert!(both.validate_ack_level(AckLevel::Durable).is_ok());
+        assert!(both.validate_ack_level(AckLevel::LocalDurable).is_err());
     }
 
     #[test]
