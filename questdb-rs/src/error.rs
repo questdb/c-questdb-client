@@ -313,6 +313,10 @@ struct ErrorInner {
     code: ErrorCode,
     msg: String,
     in_doubt: bool,
+    /// Structured OIDC failure details retained across conversion into the
+    /// client-wide error type. OIDC-only.
+    #[cfg(feature = "_oidc")]
+    oidc_error: Option<Box<crate::oidc::OidcError>>,
     /// Structured QWP/WebSocket sender rejection diagnostic.
     /// Sender-only.
     #[cfg(feature = "_sender-qwp-ws")]
@@ -331,6 +335,11 @@ struct ErrorInner {
     /// mismatch. Query-only.
     #[cfg(feature = "_egress")]
     server_info: Option<crate::egress::server_event::ServerInfo>,
+    /// HTTP status from a WebSocket upgrade rejection. Kept structured so
+    /// rotating-auth callers can distinguish a replayable 401 from 403 and
+    /// other terminal errors without parsing diagnostic text.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    ws_http_status: Option<u16>,
 }
 
 impl Error {
@@ -340,6 +349,8 @@ impl Error {
             code,
             msg: msg.into(),
             in_doubt: false,
+            #[cfg(feature = "_oidc")]
+            oidc_error: None,
             #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_rejection: None,
             #[cfg(feature = "_sender-qwp-ws")]
@@ -348,6 +359,8 @@ impl Error {
             upgrade_reject: None,
             #[cfg(feature = "_egress")]
             server_info: None,
+            #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+            ws_http_status: None,
         }))
     }
 
@@ -358,7 +371,7 @@ impl Error {
     /// [`Error::in_doubt`]. See `PooledSenderCore::flush` and the `FlushFailure`
     /// delivery classification.
     #[must_use]
-    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[cfg(any(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
     pub(crate) fn with_in_doubt(mut self, in_doubt: bool) -> Self {
         self.0.in_doubt = in_doubt;
         self
@@ -378,6 +391,41 @@ impl Error {
     #[must_use]
     pub fn in_doubt(&self) -> bool {
         self.0.in_doubt
+    }
+
+    /// Attach the structured OIDC failure that produced this client-wide
+    /// error. This preserves device-flow diagnostics for FFI and other generic
+    /// error consumers without adding OIDC-specific variants to [`ErrorCode`].
+    #[cfg(feature = "_oidc")]
+    pub(crate) fn with_oidc_error(mut self, oidc_error: crate::oidc::OidcError) -> Self {
+        self.0.oidc_error = Some(Box::new(oidc_error));
+        self
+    }
+
+    /// Replace the broad error classification and user-facing context while
+    /// retaining every structured diagnostic attached by the original source.
+    ///
+    /// Transport adapters use this when an error must become retryable or gain
+    /// endpoint context. Constructing a fresh [`Error`] there would silently
+    /// discard OIDC, QWP, and query-side diagnostic payloads.
+    pub(crate) fn reclassified<S: Into<String>>(mut self, code: ErrorCode, msg: S) -> Self {
+        self.0.code = code;
+        self.0.msg = msg.into();
+        self
+    }
+
+    /// The structured OIDC failure in this error's causal chain, if any.
+    ///
+    /// `Some` means an OIDC failure *caused* this error, not that this error
+    /// is one: `reclassified` deliberately preserves the
+    /// payload, so a token-provider failure re-coded to a retryable
+    /// [`SocketError`](crate::ErrorCode::SocketError), or a failover that then
+    /// exhausted its budget, both still answer `Some` while [`code`](Self::code)
+    /// and [`msg`](Self::msg) describe the outer failure. Read this for the auth
+    /// detail; keep using `code`/`msg` for what actually went wrong.
+    #[cfg(feature = "_oidc")]
+    pub fn oidc_error(&self) -> Option<&crate::oidc::OidcError> {
+        self.0.oidc_error.as_deref()
     }
 
     /// Attach a structured QWP/WebSocket rejection to this error.
@@ -439,6 +487,17 @@ impl Error {
                 fmt!(SocketError, "Could not flush buffer: {}: {}", url, e)
             }
         }
+    }
+
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    pub(crate) fn with_ws_http_status(mut self, status: u16) -> Self {
+        self.0.ws_http_status = Some(status);
+        self
+    }
+
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    pub(crate) fn ws_http_status(&self) -> Option<u16> {
+        self.0.ws_http_status
     }
 
     /// Get the error code (category) of this error.
@@ -535,6 +594,21 @@ mod tests {
         let err = fmt!(ProtocolError, "bad code 0x{:02X}", 0xAB);
         assert_eq!(err.code(), ErrorCode::ProtocolError);
         assert_eq!(err.msg(), "bad code 0xAB");
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn reclassification_preserves_structured_oidc_error() {
+        let oidc = crate::oidc::OidcError::interaction_required("sign in");
+        let err = Error::from(oidc)
+            .reclassified(ErrorCode::SocketError, "Token provider failed: sign in");
+
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert_eq!(err.msg(), "Token provider failed: sign in");
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
     }
 
     #[cfg(feature = "_egress")]

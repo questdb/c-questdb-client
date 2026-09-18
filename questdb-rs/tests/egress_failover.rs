@@ -33,7 +33,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2793,6 +2793,195 @@ fn initial_connect_bails_immediately_on_auth_error() {
 }
 
 #[test]
+fn initial_connect_does_not_replay_a_401_with_an_unchanged_token() {
+    // The other half of `initial_connect_retries_same_endpoint_once_with_
+    // rotated_token`. Only the changed-token branch was covered, so replaying
+    // unconditionally failed nothing -- and a genuine rejection would cost a
+    // second full connect per endpoint on every walk.
+    let srv = MockServer::start(vec![
+        vec![Action::Reject401],
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = questdb::egress::ReaderConfig::from_conf(format!("ws::addr={}", srv.url()))
+        .unwrap()
+        .token_provider({
+            let calls = Arc::clone(&calls);
+            // Byte-identical every time, so the 401 is a real rejection rather
+            // than an expiry the provider can rotate out of.
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, questdb::Error>("same".to_string())
+            }
+        })
+        .unwrap();
+
+    let err = match Reader::from_config(&cfg) {
+        Err(err) => err,
+        Ok(_) => panic!("an unchanged token must not recover a 401"),
+    };
+    assert_eq!(err.code(), ErrorCode::AuthError, "{err}");
+    // The provider is re-asked once to learn whether the credential rotated; it
+    // is the replay, not the re-resolution, that the guard prevents. The second
+    // scripted script stays untouched.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        srv.accepts(),
+        1,
+        "the endpoint was replayed after a real reject"
+    );
+}
+
+#[test]
+fn initial_connect_retries_same_endpoint_once_with_rotated_token() {
+    let srv = MockServer::start(vec![
+        vec![Action::Reject401],
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = questdb::egress::ReaderConfig::from_conf(format!("ws::addr={}", srv.url()))
+        .unwrap()
+        .token_provider({
+            let calls = Arc::clone(&calls);
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, questdb::Error>(if n == 0 { "stale" } else { "fresh" }.to_string())
+            }
+        })
+        .unwrap();
+
+    let _reader = Reader::from_config(&cfg).expect("changed token should recover one 401");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(srv.accepts(), 2, "the same endpoint must be replayed once");
+}
+
+#[test]
+fn initial_provider_failure_does_not_dial_any_endpoint() {
+    let srv_a = MockServer::start(vec![happy_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!("ws::addr={}", build_addr_list(&[&srv_a, &srv_b]));
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                Err::<String, _>(questdb::Error::new(
+                    ErrorCode::SocketError,
+                    "provider unavailable",
+                ))
+            }
+        })
+        .unwrap();
+
+    let err = match Reader::from_config(&cfg) {
+        Err(err) => err,
+        Ok(_) => panic!("provider failure must abort the initial endpoint walk"),
+    };
+
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("provider unavailable"));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(srv_a.accepts(), 0, "provider failure must precede A's dial");
+    assert_eq!(srv_b.accepts(), 0, "provider failure must precede B's dial");
+}
+
+#[test]
+fn reconnect_provider_failure_is_resolved_once_per_walk_without_dials() {
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=3;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                let call = provider_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok("initial-token".to_string())
+                } else {
+                    Err(questdb::Error::new(
+                        ErrorCode::SocketError,
+                        "provider unavailable",
+                    ))
+                }
+            }
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("initial provider call succeeds");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    match cursor.next_batch() {
+        Err(_) => {}
+        Ok(_) => panic!("reconnect provider failures must exhaust the retry budget"),
+    }
+
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        3,
+        "one initial acquisition plus one for each of two reconnect walks"
+    );
+    assert_eq!(srv_a.accepts(), 1, "only the initial connection reaches A");
+    assert_eq!(
+        srv_b.accepts(),
+        0,
+        "failed reconnect acquisitions must not create sockets to B"
+    );
+}
+
+#[test]
+fn reconnect_deadline_abandons_blocked_provider_before_dial() {
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let blocked_provider_returned = Arc::new(AtomicBool::new(false));
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=3;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+         failover_max_duration_ms=40",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            let blocked_provider_returned = Arc::clone(&blocked_provider_returned);
+            move || {
+                if provider_calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                    std::thread::sleep(Duration::from_secs(1));
+                    blocked_provider_returned.store(true, Ordering::SeqCst);
+                }
+                Ok::<_, questdb::Error>("token".to_string())
+            }
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("initial provider call succeeds");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let error = match cursor.next_batch() {
+        Err(error) => error,
+        Ok(_) => panic!("blocked reconnect provider must exhaust the Execute deadline"),
+    };
+    assert!(
+        !blocked_provider_returned.load(Ordering::SeqCst),
+        "next_batch waited for the synchronous provider past its failover deadline"
+    );
+    assert!(
+        error.msg().contains("failover_max_duration_ms")
+            || error.msg().contains("wall-clock budget exhausted"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(srv_b.accepts(), 0, "deadline expiry must precede B's dial");
+}
+
+#[test]
 fn initial_connect_auth_terminal_regardless_of_position_in_addr_list() {
     // Counterpart pinning: the bail-on-AuthError invariant holds even
     // when a healthy endpoint precedes the auth-rejecting one in the
@@ -3077,11 +3266,7 @@ fn failover_duration_budget_spans_successful_resets() {
     };
     assert!(
         err.msg().contains("failover_max_duration_ms")
-            || err.msg().contains("wall-clock budget exhausted")
-            || matches!(
-                err.code(),
-                ErrorCode::SocketError | ErrorCode::ProtocolError
-            ),
+            || err.msg().contains("wall-clock budget exhausted"),
         "unexpected error: code={:?} msg={}",
         err.code(),
         err.msg()
@@ -4452,18 +4637,11 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
         Err(e) => e,
         Ok(_) => panic!("must fail"),
     };
-    // The deadline branch surfaces a specific message including the
-    // configured `failover_max_duration_ms` value. The `prefer_over_trigger`
-    // logic may pick the trigger over the deadline-error if the
-    // trigger is more diagnostic — but in this test the trigger is a
-    // plain SocketError, so the deadline message should win.
+    // The generated deadline diagnostic wins over the generic transport
+    // trigger and names the configured duration knob.
     assert!(
         err.msg().contains("failover_max_duration_ms")
-            || err.msg().contains("wall-clock budget exhausted")
-            || matches!(
-                err.code(),
-                ErrorCode::SocketError | ErrorCode::ProtocolError
-            ),
+            || err.msg().contains("wall-clock budget exhausted"),
         "unexpected error: code={:?} msg={}",
         err.code(),
         err.msg()
@@ -4498,31 +4676,27 @@ fn deadline_exhaustion_reports_actual_attempt_count_not_configured_cap() {
         Err(e) => e,
         Ok(_) => panic!("must fail"),
     };
-    // The `prefer_over_trigger` logic may still surface the trigger
-    // error instead of the deadline wrapper. Only enforce the
-    // count-accuracy invariant when we actually got the deadline
-    // message — otherwise the test's premise doesn't hold.
-    if err.msg().contains("wall-clock budget exhausted") {
-        // Extract the "after N attempt(s)" number.
-        let msg = err.msg();
-        let needle = "after ";
-        let start = msg.find(needle).expect("missing 'after N attempt' phrase");
-        let rest = &msg[start + needle.len()..];
-        let end = rest.find(' ').expect("malformed attempt-count phrase");
-        let n: u32 = rest[..end].parse().expect("attempt count not a u32");
-        // Hard upper bound: anything ≥ CONFIGURED_CAP would mean the
-        // bug is back (or the message is once again hard-coding the
-        // configured cap). A handful of attempts is plausible if the
-        // first walk and one retry both fired before the 50 ms budget
-        // expired; CONFIGURED_CAP itself must never appear here.
-        assert!(
-            n < CONFIGURED_CAP,
-            "attempt count {n} ≥ configured cap {CONFIGURED_CAP} — \
-             message is reporting the configured cap instead of \
-             the actual count. msg={msg}",
-        );
-        assert!(n >= 1, "attempt count must be ≥ 1, got {n}. msg={msg}");
-    }
+    // Extract the "after N attempt(s)" number from the surfaced deadline
+    // diagnostic. The generic transport trigger must not hide it.
+    let msg = err.msg();
+    assert!(msg.contains("wall-clock budget exhausted"), "msg={msg}");
+    let needle = "after ";
+    let start = msg.find(needle).expect("missing 'after N attempt' phrase");
+    let rest = &msg[start + needle.len()..];
+    let end = rest.find(' ').expect("malformed attempt-count phrase");
+    let n: u32 = rest[..end].parse().expect("attempt count not a u32");
+    // Hard upper bound: anything ≥ CONFIGURED_CAP would mean the
+    // bug is back (or the message is once again hard-coding the
+    // configured cap). A handful of attempts is plausible if the
+    // first walk and one retry both fired before the 50 ms budget
+    // expired; CONFIGURED_CAP itself must never appear here.
+    assert!(
+        n < CONFIGURED_CAP,
+        "attempt count {n} ≥ configured cap {CONFIGURED_CAP} — \
+         message is reporting the configured cap instead of \
+         the actual count. msg={msg}",
+    );
+    assert!(n >= 1, "attempt count must be ≥ 1, got {n}. msg={msg}");
 }
 
 // ---------------------------------------------------------------------------

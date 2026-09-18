@@ -60,7 +60,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "_egress")]
-use crate::egress::Reader;
+use crate::egress::{Reader, ReaderConfig};
 use crate::ingress::conn_events;
 use crate::ingress::rejection_events;
 use crate::ingress::sender::is_candidate_orphan;
@@ -223,11 +223,11 @@ impl Drop for SenderSlotRelease<'_> {
 pub struct ConnectHandlers {
     /// Connection lifecycle listener; see [`QuestDb::connect_with_listener`].
     pub connection_listener: Option<crate::ingress::ConnectionListener>,
-    /// Listener inbox capacity; `0` selects the default (64).
+    /// Listener inbox capacity; `0` selects the default (64), maximum 65,536.
     pub connection_event_inbox_capacity: usize,
     /// Server-rejection handler; without one every rejection is logged.
     pub error_handler: Option<crate::ingress::QwpWsErrorHandler>,
-    /// Handler inbox capacity; `0` selects the default (64).
+    /// Handler inbox capacity; `0` selects the default (64), maximum 65,536.
     pub error_inbox_capacity: usize,
 }
 
@@ -236,13 +236,36 @@ pub struct QuestDb {
     reaper: Option<JoinHandle<()>>,
 }
 
+/// Where a pooled reader's configuration comes from.
+///
+/// One connect string drives both the ingest and the query side, and the two
+/// parsers do not accept the same values: the sender treats the query-side keys
+/// as pass-through (see `QWP_WS_PORTABLE_CONFIG_KEYS`), while `ReaderConfig`
+/// range-checks them. Parsing the query side eagerly is what lets a rotating
+/// token provider be wired into every pooled reader, but making that parse
+/// fatal would refuse a connect string this pool accepted before the parse
+/// moved forward -- breaking an ingest-only deployment on upgrade, over a value
+/// its query side never used.
+#[cfg(feature = "_egress")]
+enum ReaderConfigSource {
+    /// Parsed at connect time, with any rotating token provider already wired
+    /// in and inherited by every pooled reader connection.
+    Ready(Box<ReaderConfig>),
+    /// The connect string carries a query-side value `ReaderConfig` rejects.
+    /// The pool still opens for ingest; the failure is reproduced from the
+    /// original string if and when a reader is actually asked for, which is the
+    /// same point, and the same error, a caller met before the parse was
+    /// hoisted to connect time. A token provider cannot be wired into a config
+    /// that does not parse, but nothing here can produce a reader anyway.
+    Deferred(String),
+}
+
 struct DbInner {
-    /// Original connect string. Kept verbatim so the reader pool
-    /// (`Reader::from_conf`) can spin up a new connection with the same
-    /// settings. The sender pools connect through pre-parsed builders so they
-    /// can override only the managed disk-SF slot id.
+    /// Reusable reader configuration. Kept as a resolved config rather than the
+    /// original connect string so programmatic state such as a rotating token
+    /// provider is inherited by every pooled reader connection.
     #[cfg(feature = "_egress")]
-    conf: String,
+    reader_config: ReaderConfigSource,
     /// Resolved, reusable QWP/WebSocket connect ingredients (endpoint list,
     /// TLS, auth, config). Every sender connection — first-borrow open,
     /// auto-grow, and failover re-borrow — opens through this connector so it rotates
@@ -797,6 +820,83 @@ impl QuestDb {
     /// producer-side abort logic belongs with the terminal error raised by
     /// the sender calls themselves.
     pub fn connect_with_handlers(conf: &str, handlers: ConnectHandlers) -> Result<Self> {
+        Self::connect_with_handlers_and_provider(conf, handlers, None)
+    }
+
+    /// [`Self::connect`] with one rotating Bearer-token provider shared by all
+    /// ingestion and query connections created by the pool. The callback is
+    /// pulled on every sender/reader connect and reconnect.
+    ///
+    /// Call an interactive provider once on the main thread before constructing
+    /// an eager pool. Otherwise initial sender/reader prewarming may invoke it
+    /// from connection setup, and lazy/background senders may invoke it from a
+    /// worker thread.
+    pub fn connect_with_token_provider<F, E>(conf: &str, provider: F) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        Self::connect_with_handlers_and_token_provider(conf, ConnectHandlers::default(), provider)
+    }
+
+    /// [`Self::connect_with_handlers`] with one rotating Bearer-token provider
+    /// shared by the sender and reader pools.
+    pub fn connect_with_handlers_and_token_provider<F, E>(
+        conf: &str,
+        handlers: ConnectHandlers,
+        provider: F,
+    ) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        Self::connect_with_handlers_and_provider(
+            conf,
+            handlers,
+            Some(crate::token_provider::TokenProvider::new(provider)),
+        )
+    }
+
+    /// Binding-only form that shares one authentication object's isolated QWP
+    /// acquisition across every sender and reader attachment in this pool.
+    #[doc(hidden)]
+    pub fn connect_with_handlers_and_token_provider_with_isolation<F, E>(
+        conf: &str,
+        handlers: ConnectHandlers,
+        provider: F,
+        isolation: crate::TokenProviderIsolation,
+    ) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        Self::connect_with_handlers_and_provider(
+            conf,
+            handlers,
+            Some(crate::token_provider::TokenProvider::new_with_isolation(
+                provider, isolation,
+            )),
+        )
+    }
+
+    fn connect_with_handlers_and_provider(
+        conf: &str,
+        handlers: ConnectHandlers,
+        token_provider: Option<crate::token_provider::TokenProvider>,
+    ) -> Result<Self> {
+        const MAX_CALLBACK_INBOX_CAPACITY: usize = 65_536;
+        if handlers.connection_event_inbox_capacity > MAX_CALLBACK_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "connection_event_inbox_capacity must be at most {MAX_CALLBACK_INBOX_CAPACITY}"
+            ));
+        }
+        if handlers.error_inbox_capacity > MAX_CALLBACK_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "error_inbox_capacity must be at most {MAX_CALLBACK_INBOX_CAPACITY}"
+            ));
+        }
         let conn_events = match handlers.connection_listener {
             Some(listener) => conn_events::ConnectionEventSource::new(
                 listener,
@@ -811,13 +911,14 @@ impl QuestDb {
             ),
             None => rejection_events::RejectionEventSource::logging_default(),
         };
-        Self::connect_impl(conf, conn_events, rejections)
+        Self::connect_impl(conf, conn_events, rejections, token_provider)
     }
 
     fn connect_impl(
         conf: &str,
         conn_events: conn_events::ConnectionEventSource,
         rejections: rejection_events::RejectionEventSource,
+        token_provider: Option<crate::token_provider::TokenProvider>,
     ) -> Result<Self> {
         let parsed = conf::parse(conf)?;
         // The public ingestion pool is always store-and-forward: in-memory
@@ -826,6 +927,37 @@ impl QuestDb {
         let pool_cfg = parsed.pool;
 
         let mut builder = SenderBuilder::from_conf(conf)?;
+        // Tolerated, not fatal: see `ReaderConfigSource`. The sender parser has
+        // already accepted this string, so a query-side rejection here is a
+        // value the ingest path passes through and never reads.
+        #[cfg(feature = "_egress")]
+        let mut reader_config = match ReaderConfig::from_conf(conf) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                log::warn!(
+                    "Ignoring the query-side configuration for this connection: {e}. \
+                     Ingestion is unaffected, and this is reported again if a reader \
+                     or query is requested."
+                );
+                None
+            }
+        };
+        if let Some(provider) = token_provider {
+            // Preserve one isolated-acquisition identity while sharing this
+            // provider across the pool's sender and reader factories. Reboxing
+            // `provide()` in each factory used to create an independent cell
+            // per attachment and defeated the global worker bound.
+            builder = builder.qwp_ws_token_provider_object(provider.clone())?;
+            #[cfg(feature = "_egress")]
+            if let Some(cfg) = reader_config.take() {
+                reader_config = Some(cfg.token_provider_object(provider)?);
+            }
+        }
+        #[cfg(feature = "_egress")]
+        let reader_config = match reader_config {
+            Some(cfg) => ReaderConfigSource::Ready(Box::new(cfg)),
+            None => ReaderConfigSource::Deferred(conf.to_string()),
+        };
         if pool_cfg.lazy_connect {
             // Java's lazy_connect injects an async initial connect into the
             // ingest config once; every pooled sender then inherits it.
@@ -869,7 +1001,7 @@ impl QuestDb {
 
         let inner = Arc::new(DbInner {
             #[cfg(feature = "_egress")]
-            conf: conf.to_owned(),
+            reader_config,
             connector,
             buffer_max_name_len,
             health: Mutex::new(health),
@@ -1402,7 +1534,12 @@ impl QuestDb {
                 armed: true,
             }
         };
-        let reader = Reader::from_conf(&self.inner.conf)?;
+        let reader = match &self.inner.reader_config {
+            ReaderConfigSource::Ready(cfg) => Reader::from_config(cfg)?,
+            // Reproduce the parse failure the pool tolerated at connect time,
+            // at the point a caller actually needs the query side.
+            ReaderConfigSource::Deferred(conf) => Reader::from_conf(conf)?,
+        };
         slot.commit();
         Ok(reader)
     }
@@ -2796,10 +2933,9 @@ fn connect_sfa_pool_with_recovery_candidates(
             force_async_initial_connect,
         )
         .map_err(|err| {
-            crate::Error::new(
-                err.code(),
-                format!("Failed to open store-and-forward sender: {}", err.msg()),
-            )
+            let code = err.code();
+            let msg = format!("Failed to open store-and-forward sender: {}", err.msg());
+            err.reclassified(code, msg)
         })?;
     PooledSenderCore::new_store_and_forward(
         state,
@@ -3323,15 +3459,80 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
     use tempfile::TempDir;
 
-    use super::{SlotReservations, managed_slot_recovery_scan_from};
+    use super::{ConnectHandlers, QuestDb, SlotReservations, managed_slot_recovery_scan_from};
 
     fn dirty_slot(root: &std::path::Path, name: &str) {
         let slot = root.join(name);
         fs::create_dir(&slot).unwrap();
         fs::write(slot.join("sf-0.sfa"), b"queued").unwrap();
+    }
+
+    /// Regression: hoisting `ReaderConfig::from_conf` to connect time made the
+    /// query-side parser a gate on opening the pool at all. One connect string
+    /// drives both sides and the sender treats the query-side keys as
+    /// pass-through, so values like `compression=none` or `max_version=2` had
+    /// always been accepted here and simply never read by the ingest path.
+    /// Making them fatal broke ingest-only deployments on upgrade over a query
+    /// side they do not use.
+    #[cfg(all(feature = "_egress", feature = "sync-sender-qwp-ws"))]
+    #[test]
+    fn pool_opens_when_only_the_query_side_config_is_rejected() {
+        for bad in [
+            "compression=none",
+            "max_version=2",
+            "connect_timeout=99999999",
+            "auth_timeout_ms=99999999",
+        ] {
+            let conf = format!("ws::addr=127.0.0.1:19009;lazy_connect=on;{bad};");
+            // The query side rejects it on its own.
+            assert!(
+                crate::egress::ReaderConfig::from_conf(&conf).is_err(),
+                "{bad} is no longer a query-side rejection; pick another value"
+            );
+            // The pool still opens, exactly as it did before the parse moved.
+            let db = crate::QuestDb::connect(&conf)
+                .unwrap_or_else(|e| panic!("{bad} must not block the pool: {e}"));
+            // And the failure is still reported when the query side is asked for.
+            let err = db.borrow_reader().unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::ConfigError, "{bad}");
+            db.close();
+        }
+    }
+
+    #[test]
+    fn callback_inbox_capacities_are_rejected_before_allocation() {
+        let conf = "ws::addr=127.0.0.1:19009;lazy_connect=on;";
+        let listener_err = match QuestDb::connect_with_handlers(
+            conf,
+            ConnectHandlers {
+                connection_listener: Some(Arc::new(|_| {})),
+                connection_event_inbox_capacity: 65_537,
+                ..ConnectHandlers::default()
+            },
+        ) {
+            Ok(_) => panic!("oversized connection event inbox was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(listener_err.code(), crate::ErrorCode::ConfigError);
+        assert!(listener_err.msg().contains("at most 65536"));
+
+        let rejection_err = match QuestDb::connect_with_handlers(
+            conf,
+            ConnectHandlers {
+                error_handler: Some(crate::ingress::QwpWsErrorHandler::new(|_| {})),
+                error_inbox_capacity: 65_537,
+                ..ConnectHandlers::default()
+            },
+        ) {
+            Ok(_) => panic!("oversized rejection inbox was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(rejection_err.code(), crate::ErrorCode::ConfigError);
+        assert!(rejection_err.msg().contains("at most 65536"));
     }
 
     #[test]

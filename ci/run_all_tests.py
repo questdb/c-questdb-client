@@ -53,6 +53,18 @@ def run_cargo_tests():
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',
             '--', '--nocapture', cwd='questdb-rs')
+    # The shape the `oidc` feature's own documentation recommends: the OIDC
+    # opt-in plus a TLS root source and a crypto provider, and nothing else.
+    # `almost-all-features` also covers oidc, but with the QWP/WS sender and
+    # the egress reader switched on, so it never compiles this cfg cut --
+    # where, for instance, the isolated-worker path in `token_provider` and
+    # its statics disappear.
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,oidc',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=aws-lc-crypto,tls-native-certs,oidc',
+            '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
     run_cmd('cargo', 'test', '--features=arrow', cwd='questdb-rs-ffi')
 
@@ -73,6 +85,7 @@ def run_cpp_tests():
         'test_arrow_egress',
         'test_arrow_ingress',
         'test_column_sender',
+        'test_oidc',
     ]
     # Each C++ target may also have a `_cxx20` twin (QUESTDB_TEST_CXX20_VARIANTS);
     # run it too when present so the C++20 header paths are exercised.

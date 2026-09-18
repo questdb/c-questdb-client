@@ -306,6 +306,7 @@ impl Reader {
                 ErrorCode::UnsupportedServer,
                 ErrorCode::AuthError,
             ],
+            None,
         )?;
         Ok(Reader {
             cfg,
@@ -332,22 +333,21 @@ impl Reader {
     /// error carrying the observed role + zone via `UpgradeReject` is
     /// surfaced so the tracker can classify identically to a `421`
     /// upgrade reject.
-    fn connect_endpoint(cfg: &ReaderConfig, idx: usize) -> Result<TransportSession> {
-        let mut transport = WsTransport::connect_to(cfg, idx).map_err(|e| {
+    fn connect_endpoint(
+        cfg: &ReaderConfig,
+        idx: usize,
+        upgrade_headers: &[(&'static str, String)],
+    ) -> Result<TransportSession> {
+        let mut transport = WsTransport::connect_to(cfg, idx, upgrade_headers).map_err(|e| {
             // Prepend the endpoint so a connect/handshake/auth failure
             // names the host it came from. Without this, aggregated
             // multi-endpoint diagnostics surface only the tungstenite
             // message ("HTTP error: 401") with no way to tell which
             // endpoint refused.
             let endpoint = &cfg.addrs[idx];
-            let mut annotated = Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
-            if let Some(r) = e.upgrade_reject() {
-                annotated = annotated.with_upgrade_reject(r.clone());
-            }
-            if let Some(info) = e.server_info() {
-                annotated = annotated.with_server_info(info.clone());
-            }
-            annotated
+            let code = e.code();
+            let msg = format!("endpoint {}: {}", endpoint, e.msg());
+            e.reclassified(code, msg)
         })?;
         let server_info = if transport.server_version() >= 1 {
             Some(read_server_info_frame(
@@ -498,7 +498,7 @@ impl Reader {
             // number; the caller already knows the trigger and start
             // time.
             on_attempt(attempts_made);
-            match walk_via_tracker(
+            let walk_result = walk_via_tracker(
                 &mut self.tracker,
                 &cfg,
                 // Per failover.md §11.9.3, the WalkTracker fall-through
@@ -515,7 +515,28 @@ impl Reader {
                     ErrorCode::UnsupportedServer,
                     ErrorCode::AuthError,
                 ],
-            ) {
+                budget.deadline,
+            );
+            // Re-check a failed walk immediately. The admitted round may have
+            // consumed the final reconnect-attempt slot; waiting until the next
+            // loop would report AttemptsExhausted before consulting the expired
+            // wall-clock budget. A successful admitted walk remains accepted,
+            // preserving the per-Execute semantics: its next mid-stream failure
+            // observes the already-spent deadline and gives up immediately.
+            if walk_result.is_err()
+                && budget
+                    .deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                deadline_exhausted = true;
+                match walk_result {
+                    Err(error) if !is_failover_eligible(error.code()) => return Err(error),
+                    Err(error) => last_err = Some(error),
+                    Ok(_) => unreachable!("walk_result was checked as Err"),
+                }
+                break;
+            }
+            match walk_result {
                 Ok(walk) => {
                     total_dials = total_dials.saturating_add(walk.dials);
                     // Splice the new transport state into self, keeping
@@ -544,16 +565,10 @@ impl Reader {
             }
         }
         if deadline_exhausted {
-            let last_msg = last_err
-                .as_ref()
-                .map(|e| e.msg().to_string())
-                .unwrap_or_else(|| "<no error captured>".to_string());
-            return Err(fmt!(
-                SocketError,
-                "failover wall-clock budget exhausted (failover_max_duration_ms={}) after {} attempt(s); last error: {}",
+            return Err(failover_deadline_exhausted_error(
                 cfg.failover_max_duration_ms,
                 attempts_made,
-                last_msg
+                last_err,
             ));
         }
         Err(last_err.unwrap_or_else(|| {
@@ -2415,11 +2430,13 @@ impl<'r> Cursor<'r> {
                     // mismatched on every endpoint, config-level issue —
                     // tells the user *what to fix* and should win over
                     // the original cause-of-death.
-                    return Err(if prefer_over_trigger(e.code()) {
-                        e
-                    } else {
-                        trigger
-                    });
+                    return Err(
+                        if prefer_over_trigger(&e) || is_failover_deadline_exhaustion(&e) {
+                            e
+                        } else {
+                            trigger
+                        },
+                    );
                 }
             };
             // Reset connection-scoped state. The new connection has its
@@ -2949,8 +2966,8 @@ fn warn_on_protocol_error_failover(err: &Error, context: &str) {
 /// failover loop surfaces one of these, the user should see *that*,
 /// not the original socket close — these tell the user *what to fix*
 /// (credentials, cluster topology, server version, config, TLS / WS
-/// handshake), whereas the trigger just says "the network broke at
-/// some point."
+/// handshake, or an attached OIDC recovery action), whereas the trigger
+/// just says "the network broke at some point."
 ///
 /// `HandshakeError` and `TlsError` are preferred for the same reason
 /// as `AuthError`: when every reachable endpoint rejects the WS
@@ -2958,16 +2975,48 @@ fn warn_on_protocol_error_failover(err: &Error, context: &str) {
 /// `SocketError` trigger ("connection dropped") is far less
 /// actionable than the handshake/cert message that actually names
 /// the problem.
-fn prefer_over_trigger(code: ErrorCode) -> bool {
+fn prefer_over_trigger(err: &Error) -> bool {
+    #[cfg(feature = "_oidc")]
+    if err.oidc_error().is_some() {
+        return true;
+    }
+
     matches!(
-        code,
-        ErrorCode::AuthError
+        err.code(),
+        ErrorCode::InvalidApiCall
+            | ErrorCode::AuthError
             | ErrorCode::RoleMismatch
             | ErrorCode::ConfigError
             | ErrorCode::UnsupportedServer
             | ErrorCode::HandshakeError
             | ErrorCode::TlsError
     )
+}
+
+/// Add wall-clock exhaustion context without replacing any structured
+/// diagnostics attached to the last reconnect error.
+fn is_failover_deadline_exhaustion(error: &Error) -> bool {
+    error
+        .msg()
+        .starts_with("failover wall-clock budget exhausted ")
+}
+
+fn failover_deadline_exhausted_error(
+    max_duration_ms: u64,
+    attempts: u32,
+    last_error: Option<Error>,
+) -> Error {
+    let last_msg = last_error
+        .as_ref()
+        .map_or("<no error captured>", |err| err.msg());
+    let msg = format!(
+        "failover wall-clock budget exhausted (failover_max_duration_ms={max_duration_ms}) after {attempts} attempt(s); last error: {last_msg}"
+    );
+
+    match last_error {
+        Some(err) => err.reclassified(ErrorCode::SocketError, msg),
+        None => Error::new(ErrorCode::SocketError, msg),
+    }
 }
 
 /// Splitmix64 PRNG state for failover backoff jitter. Lives on the
@@ -3065,6 +3114,34 @@ struct WalkOutcome {
     dials: u32,
 }
 
+/// The `Authorization` header value from an upgrade header set, if present.
+/// Used to tell a rotated credential from an unchanged one after a 401.
+fn authorization_header<'a>(headers: &'a [(&'static str, String)]) -> Option<&'a str> {
+    headers
+        .iter()
+        .find_map(|(name, value)| (*name == "Authorization").then_some(value.as_str()))
+}
+
+fn ensure_walk_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(fmt!(
+            SocketError,
+            "failover deadline expired during endpoint or credential resolution"
+        ));
+    }
+    Ok(())
+}
+
+fn upgrade_headers_for_walk(
+    cfg: &ReaderConfig,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<(&'static str, String)>> {
+    match deadline {
+        Some(deadline) => cfg.upgrade_headers_until(|| std::time::Instant::now() >= deadline),
+        None => cfg.upgrade_headers(),
+    }
+}
+
 /// Walk the tracker until either an endpoint accepts or the round is
 /// exhausted. Shared between [`Reader::from_config`] (initial connect)
 /// and [`Reader::reconnect_with_failover`] (mid-query failover).
@@ -3088,12 +3165,29 @@ fn walk_via_tracker(
     cfg: &Arc<ReaderConfig>,
     allow_reset_pass: bool,
     terminal_codes: &[ErrorCode],
+    deadline: Option<std::time::Instant>,
 ) -> Result<WalkOutcome> {
     // Reset the within-round attempted bits. Topology classifications
     // accumulated by prior Executes are preserved (the within-outage
     // reset per failover.md §11.9.2). The fall-through pass below is
     // what re-evaluates stale classifications.
     tracker.begin_round(false);
+    // Resolve the fallible token provider once for this whole endpoint walk,
+    // before DNS or TCP work. A successful token is cluster-wide and can be
+    // reused across endpoints in the walk; a failed provider must not create
+    // and immediately discard one socket per endpoint (or twice per endpoint
+    // when the reconnect fall-through pass runs). The next outer reconnect
+    // round calls this function again and therefore polls the provider afresh.
+    let mut upgrade_headers = upgrade_headers_for_walk(cfg, deadline)?;
+    // Provider resolution during failover is isolated and cancellation-aware.
+    // Re-check immediately afterwards so a result racing the deadline is never
+    // followed by endpoint dials or a second credential resolution. A static
+    // credential performs no blocking provider work and keeps the historical
+    // admitted-walk deadline semantics.
+    if cfg.token_provider.is_some() {
+        ensure_walk_deadline(deadline)?;
+    }
+    let mut auth_rotation_retry_used = false;
     let mut last_role_mismatch: Option<Error> = None;
     let mut last_transport_err: Option<Error> = None;
     let mut retried_after_reset = false;
@@ -3115,7 +3209,27 @@ fn walk_via_tracker(
             }
         };
         dials = dials.saturating_add(1);
-        match Reader::connect_endpoint(cfg.as_ref(), idx) {
+        let mut connected = Reader::connect_endpoint(cfg.as_ref(), idx, &upgrade_headers);
+        // A valid credential can expire during endpoint setup. On one definite
+        // 401, ask only a rotating provider for a fresh header and replay this
+        // same endpoint once when the value changed. Endpoint failover still
+        // reuses one cluster-wide credential and all other auth failures remain
+        // terminal.
+        if matches!(&connected, Err(err) if err.ws_http_status() == Some(401))
+            && !auth_rotation_retry_used
+            && cfg.token_provider.is_some()
+        {
+            auth_rotation_retry_used = true;
+            ensure_walk_deadline(deadline)?;
+            let rotated_headers = upgrade_headers_for_walk(cfg, deadline)?;
+            ensure_walk_deadline(deadline)?;
+            if authorization_header(&rotated_headers) != authorization_header(&upgrade_headers) {
+                upgrade_headers = rotated_headers;
+                dials = dials.saturating_add(1);
+                connected = Reader::connect_endpoint(cfg.as_ref(), idx, &upgrade_headers);
+            }
+        }
+        match connected {
             Ok(session) => {
                 // Update zone tier from `SERVER_INFO.zone_id` when the
                 // server advertised one (gated by `CAP_ZONE`). `record_zone`
@@ -3486,31 +3600,92 @@ mod tests {
             HandshakeError,
             TlsError,
         ] {
+            let err = Error::new(code, "test");
             assert!(
-                prefer_over_trigger(code),
+                prefer_over_trigger(&err),
                 "{:?} must be preferred over the trigger",
                 code
             );
         }
-        // Generic transport flops, decode failures, and client-side
-        // validation errors are NOT more diagnostic than the trigger
-        // — keep the original cause-of-death in those cases.
+        // Generic transport flops and decode failures are NOT more diagnostic
+        // than the trigger — keep the original cause-of-death in those cases.
         for code in [
             SocketError,
             ProtocolError,
             CouldNotResolveAddr,
-            InvalidApiCall,
             InvalidUtf8,
             InvalidBind,
             ServerInternalError,
             Cancelled,
         ] {
+            let err = Error::new(code, "test");
             assert!(
-                !prefer_over_trigger(code),
+                !prefer_over_trigger(&err),
                 "{:?} must NOT be preferred over the trigger",
                 code
             );
         }
+        let invalid_call = Error::new(InvalidApiCall, "provider callback contract violated");
+        assert!(prefer_over_trigger(&invalid_call));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn structured_oidc_socket_error_is_preferred_over_trigger() {
+        let err = Error::from(crate::oidc::OidcError::interaction_required("sign in"))
+            .reclassified(ErrorCode::SocketError, "token provider failed");
+
+        assert!(prefer_over_trigger(&err));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn failover_deadline_context_preserves_oidc_detail() {
+        let original = Error::from(crate::oidc::OidcError::interaction_required("sign in"))
+            .reclassified(ErrorCode::SocketError, "token provider failed");
+
+        let err = failover_deadline_exhausted_error(25, 2, Some(original));
+
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(err.msg().contains("wall-clock budget exhausted"));
+        assert!(err.msg().contains("last error: token provider failed"));
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
+    }
+
+    #[test]
+    fn failover_deadline_abandons_a_blocked_token_provider() {
+        let cfg = ReaderConfig::from_conf("ws::addr=localhost:9000;")
+            .unwrap()
+            .token_provider(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok::<_, Error>("token".to_string())
+            })
+            .unwrap();
+        let start = std::time::Instant::now();
+        let error = upgrade_headers_for_walk(
+            &cfg,
+            Some(std::time::Instant::now() + Duration::from_millis(20)),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SocketError);
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "failover waited for the synchronous provider past its deadline"
+        );
+    }
+
+    #[test]
+    fn tracker_walk_rejects_work_after_the_execute_deadline() {
+        let expired = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = ensure_walk_deadline(Some(expired)).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SocketError);
+        assert!(error.msg().contains("failover deadline expired"));
+        assert!(ensure_walk_deadline(None).is_ok());
     }
 
     /// Pin the exponential base schedule without measuring wall-clock

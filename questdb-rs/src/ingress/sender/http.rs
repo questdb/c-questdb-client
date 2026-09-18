@@ -51,11 +51,60 @@ pub(crate) struct SyncHttpHandlerState {
     /// The URL of the HTTP endpoint.
     pub(crate) url: String,
 
-    /// The content of the `Authorization` HTTP header.
-    pub(crate) auth: Option<String>,
+    /// How to produce the `Authorization` HTTP header.
+    pub(crate) auth: HttpAuth,
 
     /// HTTP params configured via the `SenderBuilder`.
     pub(crate) config: HttpConfig,
+}
+
+/// The source of the `Authorization` header value on each flush.
+///
+/// A static value (Basic / a fixed Bearer token) is precomputed once; a provider
+/// is called per flush so a rotating token (e.g. OIDC) stays fresh for a
+/// long-lived sender.
+#[cfg(feature = "sync-sender-http")]
+pub(crate) enum HttpAuth {
+    None,
+    Static(String),
+    Provider(crate::token_provider::TokenProvider),
+}
+
+#[cfg(feature = "sync-sender-http")]
+impl HttpAuth {
+    /// Resolve the `Authorization` header value for one flush, calling the token
+    /// provider if present. A `Static` value is borrowed (no per-flush
+    /// allocation on the hot path); only the `Provider` case allocates.
+    ///
+    /// The `Cow::Owned` value is dropped unwiped once the flush ends. That is a
+    /// known, accepted residual rather than an oversight -- see the "Known
+    /// residual" section on [`TokenProvider::bearer_header`](crate::token_provider::TokenProvider::bearer_header)
+    /// for why scrubbing here would not remove the exposure.
+    pub(crate) fn resolve(&self) -> Result<Option<std::borrow::Cow<'_, str>>, Error> {
+        use std::borrow::Cow;
+        match self {
+            HttpAuth::None => Ok(None),
+            HttpAuth::Static(value) => Ok(Some(Cow::Borrowed(value.as_str()))),
+            // Pull, validate, and classify through the shared `TokenProvider`
+            // gate — the same path the QWP/WebSocket sender and reader use — so a
+            // provider acquisition failure, a blank / non-printable-ASCII token (a
+            // decoded CR/LF is a header-injection vector), and a caller-closure
+            // panic (in unwind builds only -- see `TokenProvider::bearer_header`)
+            // surface as a retryable `SocketError`. The exceptions are the
+            // failures that cannot recover on the next invocation: a permanently
+            // closed provider and a misconfiguration stay as they are, and a
+            // caller contract violation is carried out as a terminal
+            // `ConfigError`. A server rejection of a successfully acquired token
+            // remains a separate terminal auth error.
+            HttpAuth::Provider(provider) => Ok(Some(Cow::Owned(provider.bearer_header()?))),
+        }
+    }
+
+    /// Whether the header can change between attempts, so a retry loop must
+    /// re-resolve rather than replay the value it started with.
+    pub(crate) fn is_rotating(&self) -> bool {
+        matches!(self, HttpAuth::Provider(_))
+    }
 }
 
 #[cfg(feature = "sync-sender-http")]
@@ -64,6 +113,7 @@ impl SyncHttpHandlerState {
         &self,
         buf: &[u8],
         request_timeout: Duration,
+        auth: Option<&str>,
     ) -> (bool, Result<Response<Body>, ureq::Error>) {
         let request = self
             .agent
@@ -74,7 +124,7 @@ impl SyncHttpHandlerState {
             .query_pairs([("precision", "n")])
             .content_type("text/plain; charset=utf-8");
 
-        let request = match self.auth.as_ref() {
+        let request = match auth {
             Some(auth) => request.header("Authorization", auth),
             None => request,
         };
@@ -332,25 +382,60 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
     }
 }
 
-#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
+// One more than clippy's default, following the same convention as the other
+// private connect/send plumbing in this module tree: these are the flush's
+// already-resolved knobs, not a design that wants a struct.
+#[allow(clippy::too_many_arguments)]
 fn retry_http_send(
     state: &SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
-    retry_timeout: Duration,
+    retry_end: std::time::Instant,
     retry_max_backoff: Duration,
+    auth: Option<&str>,
     mut last_rep: Result<Response<Body>, ureq::Error>,
-) -> Result<Response<Body>, ureq::Error> {
+    auth_already_rotated: bool,
+) -> crate::Result<Response<Body>> {
     let mut rng = rand::rng();
-    let retry_end = std::time::Instant::now() + retry_timeout;
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut retry_interval_ms = 10i32;
     let mut need_retry;
+    // The provider is resolved once per flush, before this loop, and stays that
+    // way: a caller's provider closure is arbitrary code, so pulling it on every
+    // attempt could be expensive or have side effects.
+    //
+    // The exception is an expiry that lands *inside* the retry window, which the
+    // caller sets and may set large. The header resolved before the first
+    // attempt then gets a 401, which `need_retry` does not cover, so the flush
+    // ended as a terminal AuthError -- exactly the outcome the provider path
+    // otherwise works to avoid. Re-resolve once in that case: if the provider
+    // hands back a *different* header the credential really had rotated and the
+    // attempt is worth repeating; if it is unchanged this is a genuine
+    // rejection and the 401 stands, with no extra request.
+    let mut refreshed: Option<String> = None;
+    // Carried in from `http_send_with_retries`: the rotation budget is one per
+    // FLUSH, not one per function. That caller may already have spent it on the
+    // pre-loop attempt and then handed control here, so starting this loop at
+    // `false` gave a single flush two rotated replays of the same buffer --
+    // twice what both this comment block and the C header promise.
+    let mut auth_retry_used = auth_already_rotated;
+    // Set for exactly one iteration by the credential-rotation branch below, so
+    // that retry goes out without a wait. It is a one-shot override rather than
+    // `retry_interval_ms = 0` because the interval is the *ladder*: zeroing it
+    // made every later `saturating_mul(2)` compute `0 * 2`, so a single
+    // rotation disabled backoff for the rest of the window and any genuinely
+    // retryable failure after it re-sent the whole buffer in a ~1 ms loop until
+    // `retry_end`.
+    let mut retry_now = false;
     loop {
         let jitter_ms = rng.random_range(-5i32..5);
-        let to_sleep = retry_sleep(retry_interval_ms, jitter_ms);
+        let to_sleep = if std::mem::take(&mut retry_now) {
+            Duration::ZERO
+        } else {
+            retry_sleep(retry_interval_ms, jitter_ms)
+        };
         if (std::time::Instant::now() + to_sleep) > retry_end {
-            return last_rep;
+            return finish_http_send(state, last_rep);
         }
         sleep(to_sleep);
         if let Ok(last_rep) = last_rep {
@@ -358,12 +443,41 @@ fn retry_http_send(
             // see https://github.com/algesten/ureq/issues/94
             _ = last_rep.into_body().read_to_vec();
         }
-        (need_retry, last_rep) = state.send_request(buf, request_timeout);
+        let attempt_auth = refreshed.as_deref().or(auth);
+        (need_retry, last_rep) = state.send_request(buf, request_timeout, attempt_auth);
         if !need_retry {
-            return last_rep;
+            if !auth_retry_used
+                && let Some(value) = rotated_auth_after_401(state, &last_rep, attempt_auth, true)?
+            {
+                auth_retry_used = true;
+                refreshed = Some(value);
+                // Retry immediately rather than backing off: nothing was
+                // overloaded, the credential had simply rotated. The backoff
+                // ladder is deliberately left where it is -- this attempt is
+                // free, but a later 5xx in the same window must still escalate
+                // from wherever congestion had already pushed it.
+                retry_now = true;
+                continue;
+            }
+            return finish_http_send(state, last_rep);
         }
         retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
     }
+}
+
+/// Construct a retry deadline without allowing a public Rust `Duration` to
+/// panic `Instant` arithmetic. C and Python configure milliseconds through a
+/// `u64`, but the Rust builder accepts the wider `Duration` range directly.
+fn checked_retry_deadline(
+    start: std::time::Instant,
+    timeout: Duration,
+) -> crate::Result<std::time::Instant> {
+    start.checked_add(timeout).ok_or_else(|| {
+        error::fmt!(
+            ConfigError,
+            "retry_timeout is too large for the platform monotonic clock."
+        )
+    })
 }
 
 /// Clamp the user-configured retry backoff cap into the `i32` range the
@@ -380,26 +494,216 @@ fn retry_sleep(retry_interval_ms: i32, jitter_ms: i32) -> Duration {
     Duration::from_millis(retry_interval_ms.saturating_add(jitter_ms).max(0) as u64)
 }
 
-#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
+/// A rotated credential worth one more attempt after a 401, if there is one.
+///
+/// `Ok(None)` means do not retry: the credential cannot rotate, the response
+/// was not a 401, or the provider handed back the very value that was just
+/// rejected. A provider failure is returned so its current classification and
+/// OIDC cause are not replaced by the stale 401.
+///
+/// `prior_attempt_in_doubt` says whether an earlier attempt in this flush may
+/// already have been applied server-side, and is what a provider failure
+/// raised here is marked with. It is NOT a property of reaching this function:
+/// the caller in `http_send_with_retries` gets here after exactly one request
+/// that completed with a definite 401, so nothing was applied and replaying is
+/// safe, while the caller inside `retry_http_send` may have had an earlier
+/// attempt time out -- `need_retry` classifies `ureq::Error::Timeout(_)` and
+/// `ConnectionFailed` as retryable -- and must stay conservative. Marking both
+/// in-doubt told callers a buffer the server had definitively rejected might
+/// have landed, and `Error::in_doubt` is what they use to decide whether a
+/// replay can duplicate rows.
+fn rotated_auth_after_401(
+    state: &SyncHttpHandlerState,
+    rep: &Result<Response<Body>, ureq::Error>,
+    used: Option<&str>,
+    prior_attempt_in_doubt: bool,
+) -> crate::Result<Option<String>> {
+    if !state.auth.is_rotating() || !matches!(rep, Ok(rep) if rep.status() == 401) {
+        return Ok(None);
+    }
+    let Some(value) = state.auth.resolve().map_err(|e| {
+        if prior_attempt_in_doubt {
+            e.with_in_doubt(true)
+        } else {
+            e
+        }
+    })?
+    else {
+        return Ok(None);
+    };
+    let value = value.into_owned();
+    Ok((Some(value.as_str()) != used).then_some(value))
+}
+
+fn finish_http_send(
+    state: &SyncHttpHandlerState,
+    response: Result<Response<Body>, ureq::Error>,
+) -> crate::Result<Response<Body>> {
+    response.map_err(|error| Error::from_ureq_error(error, &state.url))
+}
+
+/// Whether a token-provider failure can clear *on its own*, and so is worth
+/// re-resolving inside the flush's retry budget.
+///
+/// `token_provider::classify_provider_error` leaves the recoverable failures as
+/// `SocketError`. The ones that cannot recover on a later invocation -- a
+/// permanently closed provider, a misconfigured scope, a caller contract
+/// violation -- arrive as `AuthError` / `ConfigError` and must fail the flush at
+/// once rather than burn the whole window on state that never changes.
+///
+/// `InteractionRequired` is split rather than excluded wholesale, because the
+/// kind covers two conditions with opposite recovery stories:
+///
+/// * No credential exists and only a human can supply one. Nothing *this flush*
+///   waits for makes that clear, so it fails at once: spending the window would
+///   turn "nobody has signed in" from an immediate, actionable error into one
+///   `retry_timeout` late on every flush. The Python foreground gate makes the
+///   same split for `dataframe()`.
+/// * A peer holds the provider's acquisition lock -- a `sign_in()` on another
+///   thread, or a renderer callback mid-paint -- which
+///   [`OidcError::acquisition_busy`] marks. That clears on its own, typically in
+///   milliseconds, so it is retried like any other transient failure. Excluding
+///   it destroyed the batch instead: the C and Python bindings clear the
+///   sender-owned buffer on a flush failure, and the documented `SocketError`
+///   retry then re-flushed an empty buffer and reported success.
+fn provider_error_is_retryable(e: &Error) -> bool {
+    if e.code() != crate::ErrorCode::SocketError {
+        return false;
+    }
+    #[cfg(feature = "_oidc")]
+    if e.oidc_error().is_some_and(|oidc| {
+        oidc.kind() == crate::oidc::OidcErrorKind::InteractionRequired && !oidc.acquisition_busy()
+    }) {
+        return false;
+    }
+    true
+}
+
+/// Resolve the `Authorization` header for this flush, re-resolving a
+/// recoverable provider failure until the retry budget expires.
+///
+/// Resolution shares the flush's retry budget rather than sitting outside it. A
+/// failure here has sent nothing, so the batch is still intact and the usual
+/// causes clear in well under a second: a peer process holding the OIDC
+/// token-store lock across its own refresh, or a transient IdP blip. Returning
+/// such a failure straight to the caller destroyed the batch anyway, because the
+/// C and Python bindings clear the sender-owned buffer on any flush failure, and
+/// the retry those bindings document -- `SocketError` means "retry, exactly as
+/// you would any other" -- then re-flushed an empty buffer and reported success.
+/// The QWP/WebSocket transport already absorbs the same failure into its
+/// reconnect loop and keeps its queued frames; this brings ILP/HTTP into line.
+///
+/// The optional deadline in the return value is present when credential
+/// acquisition already entered the retry loop, so request retries can spend
+/// only the remainder of the same budget.
+///
+/// A `Static` or absent credential cannot fail, so this costs those senders one
+/// infallible call and no allocation.
+fn resolve_auth_with_retries(
+    state: &SyncHttpHandlerState,
+    retry_timeout: Duration,
+    retry_max_backoff: Duration,
+) -> crate::Result<(
+    Option<std::borrow::Cow<'_, str>>,
+    Option<std::time::Instant>,
+)> {
+    // Start the wall-clock budget before entering a fallible provider. The
+    // provider API is synchronous, so this cannot interrupt one resolution in
+    // flight; it does prevent a resolution that already consumed the whole
+    // budget from being followed by a second full provider timeout. Construct
+    // the deadline only after failure: static/no-auth callers do not need one,
+    // and an unrepresentable public Rust `Duration` must return an error rather
+    // than panic before an otherwise infallible resolution.
+    let retry_started = std::time::Instant::now();
+    let mut last = match state.auth.resolve() {
+        Ok(auth) => return Ok((auth, None)),
+        Err(e) => e,
+    };
+    let retry_end = checked_retry_deadline(retry_started, retry_timeout)?;
+    let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
+    let mut rng = rand::rng();
+    // Same ladder as the request loop: 10ms doubling to `retry_max_backoff`.
+    let mut retry_interval_ms = 10i32;
+    while provider_error_is_retryable(&last) {
+        let to_sleep = retry_sleep(retry_interval_ms, rng.random_range(-5i32..5));
+        if (std::time::Instant::now() + to_sleep) > retry_end {
+            break;
+        }
+        sleep(to_sleep);
+        match state.auth.resolve() {
+            Ok(auth) => return Ok((auth, Some(retry_end))),
+            Err(e) => last = e,
+        }
+        retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
+    }
+    Err(last)
+}
+
 pub(super) fn http_send_with_retries(
     state: &SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
     retry_max_backoff: Duration,
-) -> Result<Response<Body>, ureq::Error> {
-    let (need_retry, last_rep) = state.send_request(buf, request_timeout);
+) -> crate::Result<Response<Body>> {
+    // Credential acquisition provisionally starts its deadline before entering
+    // the synchronous provider, so a call that consumes the whole window is
+    // not followed by another full provider wait. If that initial resolution
+    // succeeds, no retry deadline is carried into the request path. Otherwise
+    // its retries and all later request retries share the same deadline.
+    let (auth, retry_end) = resolve_auth_with_retries(state, retry_timeout, retry_max_backoff)?;
+    let auth = auth.as_deref();
+    let (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
+    // A 401 is not retryable, so this is where a credential that expired
+    // between resolution and the request used to end the flush as a terminal
+    // AuthError. Give a rotated credential exactly one more attempt -- and only
+    // when the provider actually hands back a different value, so a genuine
+    // rejection still costs a single request.
+    if !need_retry && let Some(rotated) = rotated_auth_after_401(state, &last_rep, auth, false)? {
+        if let Ok(rep) = last_rep {
+            // Return the connection to the pool before reusing the agent.
+            _ = rep.into_body().read_to_vec();
+        }
+        let (need_retry, last_rep) =
+            state.send_request(buf, request_timeout, Some(rotated.as_str()));
+        if !need_retry || retry_timeout.is_zero() {
+            return finish_http_send(state, last_rep);
+        }
+        let retry_end = match retry_end {
+            Some(retry_end) => retry_end,
+            None => checked_retry_deadline(std::time::Instant::now(), retry_timeout)?,
+        };
+        return retry_http_send(
+            state,
+            buf,
+            request_timeout,
+            retry_end,
+            retry_max_backoff,
+            Some(rotated.as_str()),
+            last_rep,
+            // The rotation budget is spent: this call already replayed the
+            // buffer with a rotated credential.
+            true,
+        );
+    }
     if !need_retry || retry_timeout.is_zero() {
-        return last_rep;
+        return finish_http_send(state, last_rep);
     }
 
+    let retry_end = match retry_end {
+        Some(retry_end) => retry_end,
+        None => checked_retry_deadline(std::time::Instant::now(), retry_timeout)?,
+    };
     retry_http_send(
         state,
         buf,
         request_timeout,
-        retry_timeout,
+        retry_end,
         retry_max_backoff,
+        auth,
         last_rep,
+        // No 401 was seen before the loop, so the rotation budget is intact.
+        false,
     )
 }
 
@@ -524,7 +828,12 @@ fn retry_http_get(
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
-    let retry_end = std::time::Instant::now() + retry_timeout;
+    let Some(retry_end) = std::time::Instant::now().checked_add(retry_timeout) else {
+        // This helper preserves the original ureq error type. Treat an
+        // unrepresentable retry window as no additional retry; public builder
+        // paths reject it as ConfigError before reaching here.
+        return last_rep;
+    };
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut retry_interval_ms = 10i32;
     let mut need_retry;
@@ -584,6 +893,141 @@ mod tests {
         assert_eq!(
             retry_sleep(i32::MAX, 4),
             Duration::from_millis(i32::MAX as u64)
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_blank_provider_token() {
+        // A blank / all-whitespace provider token is refused (matching safe_token),
+        // never reaching the wire as "Bearer   ".
+        let blank = HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+            Ok::<_, crate::Error>("   ".to_string())
+        }));
+        assert!(blank.resolve().is_err());
+        // A normal token resolves to a Bearer header.
+        let ok = HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+            Ok::<_, crate::Error>("tok".to_string())
+        }));
+        assert_eq!(ok.resolve().unwrap().as_deref(), Some("Bearer tok"));
+    }
+
+    #[test]
+    fn static_auth_does_not_construct_an_unrepresentable_retry_deadline() {
+        let state = SyncHttpHandlerState {
+            agent: ureq::Agent::new_with_defaults(),
+            url: "http://127.0.0.1/write".to_string(),
+            auth: HttpAuth::None,
+            config: HttpConfig::default(),
+        };
+
+        let (auth, deadline) =
+            resolve_auth_with_retries(&state, Duration::MAX, Duration::from_millis(100))
+                .expect("infallible auth must not construct a retry deadline");
+        assert!(auth.is_none());
+        assert!(deadline.is_none());
+    }
+
+    #[test]
+    fn exhausted_budget_does_not_start_a_second_blocking_token_resolution() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&calls);
+        let state = SyncHttpHandlerState {
+            agent: ureq::Agent::new_with_defaults(),
+            url: "http://127.0.0.1/write".to_string(),
+            auth: HttpAuth::Provider(crate::token_provider::TokenProvider::new(move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                Err::<String, crate::Error>(crate::error::fmt!(
+                    SocketError,
+                    "slow provider failure"
+                ))
+            })),
+            config: HttpConfig::default(),
+        };
+
+        let error =
+            resolve_auth_with_retries(&state, Duration::from_millis(5), Duration::from_millis(100))
+                .expect_err("the provider must fail");
+        assert_eq!(error.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a provider call that consumed the deadline was followed by another full call"
+        );
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn rotation_preserves_provider_error_after_401() {
+        let state = SyncHttpHandlerState {
+            agent: ureq::Agent::new_with_defaults(),
+            url: "http://127.0.0.1/write".to_string(),
+            auth: HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+                Err::<String, crate::Error>(
+                    crate::oidc::OidcError::network("refresh failed").into(),
+                )
+            })),
+            config: HttpConfig::default(),
+        };
+        let response = Ok::<_, ureq::Error>(
+            Response::builder()
+                .status(401)
+                .body(Body::builder().data("unauthorized"))
+                .unwrap(),
+        );
+
+        let error = rotated_auth_after_401(&state, &response, Some("Bearer expired"), false)
+            .expect_err("the second provider failure was replaced by the stale 401");
+        assert_eq!(error.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            error.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::Network)
+        );
+        assert!(error.msg().contains("refresh failed"));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn rotation_marks_in_doubt_only_when_an_earlier_attempt_could_have_landed() {
+        // `in_doubt` is the flag callers read to decide whether replaying the
+        // buffer can duplicate rows, so it has to track what actually happened.
+        // Reaching this function is not itself evidence of delivery: after a
+        // single request that completed with a definite 401 the buffer was
+        // rejected outright, and reporting it in-doubt costs the caller a
+        // replay it could safely have made.
+        let state = SyncHttpHandlerState {
+            agent: ureq::Agent::new_with_defaults(),
+            url: "http://127.0.0.1/write".to_string(),
+            auth: HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+                Err::<String, crate::Error>(
+                    crate::oidc::OidcError::network("refresh failed").into(),
+                )
+            })),
+            config: HttpConfig::default(),
+        };
+        let unauthorized = || {
+            Ok::<_, ureq::Error>(
+                Response::builder()
+                    .status(401)
+                    .body(Body::builder().data("unauthorized"))
+                    .unwrap(),
+            )
+        };
+
+        let provably_unsent =
+            rotated_auth_after_401(&state, &unauthorized(), Some("Bearer expired"), false)
+                .expect_err("the provider failure must surface");
+        assert!(
+            !provably_unsent.in_doubt(),
+            "a definite 401 on the only request applied nothing"
+        );
+
+        let after_a_retry =
+            rotated_auth_after_401(&state, &unauthorized(), Some("Bearer expired"), true)
+                .expect_err("the provider failure must surface");
+        assert!(
+            after_a_retry.in_doubt(),
+            "an earlier attempt may have timed out after being applied"
         );
     }
 }
