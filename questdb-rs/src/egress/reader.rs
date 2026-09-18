@@ -306,6 +306,7 @@ impl Reader {
                 ErrorCode::UnsupportedServer,
                 ErrorCode::AuthError,
             ],
+            None,
         )?;
         Ok(Reader {
             cfg,
@@ -497,7 +498,7 @@ impl Reader {
             // number; the caller already knows the trigger and start
             // time.
             on_attempt(attempts_made);
-            match walk_via_tracker(
+            let walk_result = walk_via_tracker(
                 &mut self.tracker,
                 &cfg,
                 // Per failover.md §11.9.3, the WalkTracker fall-through
@@ -514,7 +515,28 @@ impl Reader {
                     ErrorCode::UnsupportedServer,
                     ErrorCode::AuthError,
                 ],
-            ) {
+                budget.deadline,
+            );
+            // Re-check a failed walk immediately. The admitted round may have
+            // consumed the final reconnect-attempt slot; waiting until the next
+            // loop would report AttemptsExhausted before consulting the expired
+            // wall-clock budget. A successful admitted walk remains accepted,
+            // preserving the per-Execute semantics: its next mid-stream failure
+            // observes the already-spent deadline and gives up immediately.
+            if walk_result.is_err()
+                && budget
+                    .deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                deadline_exhausted = true;
+                match walk_result {
+                    Err(error) if !is_failover_eligible(error.code()) => return Err(error),
+                    Err(error) => last_err = Some(error),
+                    Ok(_) => unreachable!("walk_result was checked as Err"),
+                }
+                break;
+            }
+            match walk_result {
                 Ok(walk) => {
                     total_dials = total_dials.saturating_add(walk.dials);
                     // Splice the new transport state into self, keeping
@@ -2408,7 +2430,13 @@ impl<'r> Cursor<'r> {
                     // mismatched on every endpoint, config-level issue —
                     // tells the user *what to fix* and should win over
                     // the original cause-of-death.
-                    return Err(if prefer_over_trigger(&e) { e } else { trigger });
+                    return Err(
+                        if prefer_over_trigger(&e) || is_failover_deadline_exhaustion(&e) {
+                            e
+                        } else {
+                            trigger
+                        },
+                    );
                 }
             };
             // Reset connection-scoped state. The new connection has its
@@ -2967,6 +2995,12 @@ fn prefer_over_trigger(err: &Error) -> bool {
 
 /// Add wall-clock exhaustion context without replacing any structured
 /// diagnostics attached to the last reconnect error.
+fn is_failover_deadline_exhaustion(error: &Error) -> bool {
+    error
+        .msg()
+        .starts_with("failover wall-clock budget exhausted ")
+}
+
 fn failover_deadline_exhausted_error(
     max_duration_ms: u64,
     attempts: u32,
@@ -3088,6 +3122,26 @@ fn authorization_header<'a>(headers: &'a [(&'static str, String)]) -> Option<&'a
         .find_map(|(name, value)| (*name == "Authorization").then_some(value.as_str()))
 }
 
+fn ensure_walk_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(fmt!(
+            SocketError,
+            "failover deadline expired during endpoint or credential resolution"
+        ));
+    }
+    Ok(())
+}
+
+fn upgrade_headers_for_walk(
+    cfg: &ReaderConfig,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<(&'static str, String)>> {
+    match deadline {
+        Some(deadline) => cfg.upgrade_headers_until(|| std::time::Instant::now() >= deadline),
+        None => cfg.upgrade_headers(),
+    }
+}
+
 /// Walk the tracker until either an endpoint accepts or the round is
 /// exhausted. Shared between [`Reader::from_config`] (initial connect)
 /// and [`Reader::reconnect_with_failover`] (mid-query failover).
@@ -3111,6 +3165,7 @@ fn walk_via_tracker(
     cfg: &Arc<ReaderConfig>,
     allow_reset_pass: bool,
     terminal_codes: &[ErrorCode],
+    deadline: Option<std::time::Instant>,
 ) -> Result<WalkOutcome> {
     // Reset the within-round attempted bits. Topology classifications
     // accumulated by prior Executes are preserved (the within-outage
@@ -3123,7 +3178,15 @@ fn walk_via_tracker(
     // and immediately discard one socket per endpoint (or twice per endpoint
     // when the reconnect fall-through pass runs). The next outer reconnect
     // round calls this function again and therefore polls the provider afresh.
-    let mut upgrade_headers = cfg.upgrade_headers()?;
+    let mut upgrade_headers = upgrade_headers_for_walk(cfg, deadline)?;
+    // Provider resolution during failover is isolated and cancellation-aware.
+    // Re-check immediately afterwards so a result racing the deadline is never
+    // followed by endpoint dials or a second credential resolution. A static
+    // credential performs no blocking provider work and keeps the historical
+    // admitted-walk deadline semantics.
+    if cfg.token_provider.is_some() {
+        ensure_walk_deadline(deadline)?;
+    }
     let mut auth_rotation_retry_used = false;
     let mut last_role_mismatch: Option<Error> = None;
     let mut last_transport_err: Option<Error> = None;
@@ -3157,7 +3220,9 @@ fn walk_via_tracker(
             && cfg.token_provider.is_some()
         {
             auth_rotation_retry_used = true;
-            let rotated_headers = cfg.upgrade_headers()?;
+            ensure_walk_deadline(deadline)?;
+            let rotated_headers = upgrade_headers_for_walk(cfg, deadline)?;
+            ensure_walk_deadline(deadline)?;
             if authorization_header(&rotated_headers) != authorization_header(&upgrade_headers) {
                 upgrade_headers = rotated_headers;
                 dials = dials.saturating_add(1);
@@ -3588,6 +3653,39 @@ mod tests {
             err.oidc_error().map(crate::oidc::OidcError::kind),
             Some(crate::oidc::OidcErrorKind::InteractionRequired)
         );
+    }
+
+    #[test]
+    fn failover_deadline_abandons_a_blocked_token_provider() {
+        let cfg = ReaderConfig::from_conf("ws::addr=localhost:9000;")
+            .unwrap()
+            .token_provider(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok::<_, Error>("token".to_string())
+            })
+            .unwrap();
+        let start = std::time::Instant::now();
+        let error = upgrade_headers_for_walk(
+            &cfg,
+            Some(std::time::Instant::now() + Duration::from_millis(20)),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SocketError);
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "failover waited for the synchronous provider past its deadline"
+        );
+    }
+
+    #[test]
+    fn tracker_walk_rejects_work_after_the_execute_deadline() {
+        let expired = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = ensure_walk_deadline(Some(expired)).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SocketError);
+        assert!(error.msg().contains("failover deadline expired"));
+        assert!(ensure_walk_deadline(None).is_ok());
     }
 
     /// Pin the exponential base schedule without measuring wall-clock

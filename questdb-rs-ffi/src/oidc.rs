@@ -35,7 +35,7 @@ use std::ptr;
 use std::slice;
 use std::str;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use libc::{c_char, c_void, size_t};
@@ -375,26 +375,49 @@ impl SharedOidcAuth {
 
     fn sign_in(&self) -> Result<(), Error> {
         self.reject_callback_reentry()?;
+        // Mirror native's per-auth sign-in serialization at the callback layer.
+        // This makes the handler generation below identify the invocation that
+        // can actually render; a queued second caller cannot overwrite it.
+        let _sign_in_gate = self.event_handler.as_ref().map(|handler| {
+            handler
+                .sign_in_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let generation = self
+            .event_handler
+            .as_ref()
+            .map(|handler| handler.begin_sign_in());
         let result = self.inner.sign_in().map_err(Into::into);
-        // Native serializes sign-ins on this auth. Clear an attempt-scoped
-        // callback cancellation only when the invocation it belongs to has
-        // returned; clearing it at entry lets a queued second sign-in undo the
-        // first one's cancellation while its callback is still blocked.
-        if let Some(handler) = &self.event_handler {
-            handler.finish_sign_in();
+        if let (Some(handler), Some(generation)) = (&self.event_handler, generation) {
+            handler.finish_sign_in(generation);
         }
         result
     }
 
     fn cancel_sign_in(&self) -> Result<(), Error> {
-        // First publish to the Rust flow. If it is currently blocked waiting to
-        // enter a callback shared with a sibling auth, wake that FFI-level wait
-        // too. Do not poison the handler when there is no active device flow:
-        // cancellation while idle must not suppress the next sign-in's events.
-        if self.inner.cancel_sign_in()
-            && let Some(handler) = &self.event_handler
-        {
-            handler.cancel_sign_in();
+        // Publish callback cancellation before waking the native flow. Doing it
+        // afterwards lets the sign-in return and clear its attempt state first,
+        // so the late store suppresses the next sign-in. The generation makes
+        // both rollback and the rare post-publication race attempt-specific.
+        let pre_cancelled = self
+            .event_handler
+            .as_ref()
+            .and_then(|handler| handler.cancel_sign_in());
+        let cancelled = self.inner.cancel_sign_in();
+        if let Some(handler) = &self.event_handler {
+            if cancelled {
+                if pre_cancelled.is_none() {
+                    // A sign-in started between the first publication and the
+                    // native check. Cancel it only if that exact attempt is
+                    // still active; never leave a latch for a future one.
+                    handler.cancel_sign_in();
+                }
+            } else if let Some(generation) = pre_cancelled {
+                // Native found no active device flow. Undo only our own
+                // speculative publication; a later generation is untouched.
+                handler.clear_sign_in_cancel(generation);
+            }
         }
         Ok(())
     }
@@ -762,10 +785,11 @@ impl CDiagnosticSink {
 
     fn detach_inner(&self, may_block: bool) {
         let target: *const CDiagnosticTarget = Arc::as_ptr(&self.target);
-        let (reentrant, nested) = IN_DIAGNOSTIC_CALLBACK.with(|stack| {
-            let stack = stack.borrow();
-            (stack.contains(&target), !stack.is_empty())
-        });
+        let reentrant = IN_DIAGNOSTIC_CALLBACK.with(|stack| stack.borrow().contains(&target));
+        // Holding either callback kind can form the same AB/BA inversion: an
+        // event callback may reclaim a diagnostic target while its diagnostic
+        // callback reclaims the event target, and vice versa.
+        let nested = in_any_oidc_callback_on_this_thread();
         {
             // Serialize suppression with callback admission and wake this
             // auth if it is queued behind a sibling callback. Without the wake,
@@ -858,8 +882,12 @@ struct CEventHandler {
     active: AtomicBool,
     /// Permanent callback cancellation, paired with provider close.
     closed: AtomicBool,
-    /// Cancellation scoped to the current `sign_in` invocation.
-    sign_in_cancelled: AtomicBool,
+    /// Serializes C-facing sign-in invocations so one active generation maps
+    /// exactly to native's serialized interactive flow.
+    sign_in_gate: std::sync::Mutex<()>,
+    next_sign_in_generation: AtomicU64,
+    active_sign_in_generation: AtomicU64,
+    cancelled_sign_in_generation: AtomicU64,
 }
 
 std::thread_local! {
@@ -892,6 +920,16 @@ fn in_event_callback_of_on_this_thread(handler: Option<&Arc<CEventHandler>>) -> 
     };
     let target: *const CEventHandler = Arc::as_ptr(handler);
     IN_EVENT_CALLBACK.with(|stack| stack.borrow().contains(&target))
+}
+
+/// Whether this thread currently owns any OIDC callback gate, regardless of
+/// callback kind. A detach reached from either stack must never perform an
+/// unbounded drain of the other kind: cross-kind callbacks can reclaim each
+/// other's handles and otherwise form the same AB/BA deadlock as two event or
+/// two diagnostic targets.
+fn in_any_oidc_callback_on_this_thread() -> bool {
+    IN_EVENT_CALLBACK.with(|stack| !stack.borrow().is_empty())
+        || IN_DIAGNOSTIC_CALLBACK.with(|stack| !stack.borrow().is_empty())
 }
 
 struct ActiveEventHandler<'a> {
@@ -962,7 +1000,10 @@ impl CEventHandler {
             target,
             active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            sign_in_cancelled: AtomicBool::new(false),
+            sign_in_gate: std::sync::Mutex::new(()),
+            next_sign_in_generation: AtomicU64::new(1),
+            active_sign_in_generation: AtomicU64::new(0),
+            cancelled_sign_in_generation: AtomicU64::new(0),
         }
     }
 
@@ -975,14 +1016,36 @@ impl CEventHandler {
     }
 
     fn callbacks_cancelled(&self) -> bool {
-        self.closed.load(Ordering::Acquire) || self.sign_in_cancelled.load(Ordering::Acquire)
+        if self.closed.load(Ordering::Acquire) {
+            return true;
+        }
+        let active = self.active_sign_in_generation.load(Ordering::Acquire);
+        active != 0 && self.cancelled_sign_in_generation.load(Ordering::Acquire) == active
     }
 
-    fn finish_sign_in(&self) {
-        self.sign_in_cancelled.store(false, Ordering::Release);
+    fn begin_sign_in(&self) -> u64 {
+        let generation = self.next_sign_in_generation.fetch_add(1, Ordering::AcqRel);
+        debug_assert_ne!(generation, 0, "sign-in generation wrapped");
+        let previous = self
+            .active_sign_in_generation
+            .swap(generation, Ordering::AcqRel);
+        debug_assert_eq!(previous, 0, "sign-in gate must serialize generations");
+        generation
     }
 
-    fn cancel_sign_in(&self) {
+    fn finish_sign_in(&self, generation: u64) {
+        let _ = self.active_sign_in_generation.compare_exchange(
+            generation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.clear_sign_in_cancel(generation);
+    }
+
+    /// Cancel the currently active renderer generation, if any, and return its
+    /// identity so a speculative publication can be rolled back precisely.
+    fn cancel_sign_in(&self) -> Option<u64> {
         // Serialize the cancellation predicate with callback admission so an
         // attempt cancellation cannot miss a waiter between its predicate
         // check and wait.
@@ -991,8 +1054,23 @@ impl CEventHandler {
             .callback_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.sign_in_cancelled.store(true, Ordering::Release);
+        let generation = self.active_sign_in_generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return None;
+        }
+        self.cancelled_sign_in_generation
+            .store(generation, Ordering::Release);
         self.target.callback_ready.notify_all();
+        Some(generation)
+    }
+
+    fn clear_sign_in_cancel(&self, generation: u64) {
+        let _ = self.cancelled_sign_in_generation.compare_exchange(
+            generation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn close(&self) {
@@ -1023,10 +1101,8 @@ impl CEventHandler {
 
     fn detach_inner(&self, may_block: bool) {
         let target: *const CEventHandler = self;
-        let (reentrant, nested) = IN_EVENT_CALLBACK.with(|stack| {
-            let stack = stack.borrow();
-            (stack.contains(&target), !stack.is_empty())
-        });
+        let reentrant = IN_EVENT_CALLBACK.with(|stack| stack.borrow().contains(&target));
+        let nested = in_any_oidc_callback_on_this_thread();
         {
             // Serialize suppression with callback admission. Once this store
             // completes, no callback that has not already entered can start.
@@ -1998,6 +2074,9 @@ pub struct questdb_oidc_error_view {
     pub status: u16,
     pub has_retry_after: bool,
     pub retry_after_seconds: u64,
+    /// True when InteractionRequired means a peer temporarily owns the
+    /// acquisition/callback path rather than that human sign-in is needed.
+    pub acquisition_busy: bool,
 }
 
 const QUESTDB_OIDC_ERROR_VIEW_V1_SIZE: usize =
@@ -2050,6 +2129,7 @@ pub unsafe extern "C" fn questdb_error_oidc_get_view(
     value.status = status.unwrap_or(0);
     value.has_retry_after = retry_after.is_some();
     value.retry_after_seconds = retry_after.unwrap_or(0);
+    value.acquisition_busy = oidc.acquisition_busy();
     unsafe { write_versioned_output(out, capacity, &value) };
     true
 }
@@ -2353,6 +2433,110 @@ mod tests {
     }
 
     #[test]
+    fn event_and_diagnostic_detach_each_other_without_deadlock() {
+        // Cross-kind variant of the AB/BA regression above. Each callback owns
+        // one logical target gate and reclaims the other kind of callback
+        // target. Looking only at the same-kind TLS stack makes both detach
+        // calls perform an unbounded drain and park forever.
+        static EVENT_ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static DIAGNOSTIC_ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static EVENT_HANDLER: Mutex<Option<Arc<CEventHandler>>> = Mutex::new(None);
+        static DIAGNOSTIC_SINK: Mutex<Option<CDiagnosticSink>> = Mutex::new(None);
+
+        unsafe extern "C" fn event_callback(
+            _user_data: *mut c_void,
+            _event: *const questdb_oidc_event,
+        ) {
+            EVENT_ENTERED.store(1, Ordering::SeqCst);
+            while DIAGNOSTIC_ENTERED.load(Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            DIAGNOSTIC_SINK
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("diagnostic sink installed")
+                .detach();
+        }
+
+        unsafe extern "C" fn diagnostic_callback(
+            _user_data: *mut c_void,
+            _diagnostic: *const questdb_oidc_diagnostic,
+        ) {
+            DIAGNOSTIC_ENTERED.store(1, Ordering::SeqCst);
+            while EVENT_ENTERED.load(Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            EVENT_HANDLER
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("event handler installed")
+                .detach();
+        }
+
+        EVENT_ENTERED.store(0, Ordering::SeqCst);
+        DIAGNOSTIC_ENTERED.store(0, Ordering::SeqCst);
+        let handler = Arc::new(CEventHandler::new(Arc::new(CEventTarget {
+            callback: event_callback,
+            user_data: 0,
+            release: None,
+            callback_gate: Mutex::new(CallbackGateState::default()),
+            callback_ready: std::sync::Condvar::new(),
+            active: AtomicBool::new(false),
+        })));
+        let sink = CDiagnosticSink {
+            target: Arc::new(CDiagnosticTarget {
+                callback: diagnostic_callback,
+                user_data: 0,
+                release: None,
+                callback_gate: Mutex::new(CallbackGateState::default()),
+                callback_ready: std::sync::Condvar::new(),
+                active: AtomicBool::new(false),
+            }),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        *EVENT_HANDLER.lock().unwrap() = Some(Arc::clone(&handler));
+        *DIAGNOSTIC_SINK.lock().unwrap() = Some(sink.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let event_thread = std::thread::spawn({
+            let renderer = CEventRenderer(Arc::clone(&handler));
+            let tx = tx.clone();
+            move || {
+                renderer.invoke(&empty_event(
+                    questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_WAITING,
+                ));
+                let _ = tx.send(());
+            }
+        });
+        let diagnostic_thread = std::thread::spawn({
+            let sink = sink.clone();
+            move || {
+                sink.on_persistence_warning("cross-kind");
+                let _ = tx.send(());
+            }
+        });
+        for _ in 0..2 {
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("cross-kind detach must not deadlock");
+        }
+        event_thread.join().unwrap();
+        diagnostic_thread.join().unwrap();
+
+        // Both detach publications remain exact even though their drains were
+        // downgraded to bounded best-effort.
+        CEventRenderer(Arc::clone(&handler)).invoke(&empty_event(
+            questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_WAITING,
+        ));
+        sink.on_persistence_warning("after");
+        assert_eq!(EVENT_ENTERED.load(Ordering::SeqCst), 1);
+        assert_eq!(DIAGNOSTIC_ENTERED.load(Ordering::SeqCst), 1);
+        *EVENT_HANDLER.lock().unwrap() = None;
+        *DIAGNOSTIC_SINK.lock().unwrap() = None;
+    }
+
+    #[test]
     fn nowait_detach_returns_while_a_callback_holds_the_gate() {
         // A finalizer reaches detach wherever a collection fired, so it can
         // already hold a lock the callback needs -- in the Python client, a
@@ -2510,6 +2694,10 @@ mod tests {
         assert_eq!(
             view.kind,
             questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED
+        );
+        assert!(
+            view.acquisition_busy,
+            "the C view must preserve the transient contention discriminator"
         );
         unsafe { drop(Box::from_raw(boxed)) };
     }
@@ -4029,6 +4217,7 @@ mod tests {
         let a = Arc::new(CEventHandler::new(Arc::clone(&target)));
         let b = Arc::new(CEventHandler::new(target));
         let in_a = ActiveEventHandler::enter(&a).expect("A callback enters");
+        let b_generation = b.begin_sign_in();
 
         // B waits behind the target shared with A. Attempt cancellation must
         // wake it without permanently disabling B's callback state.
@@ -4040,18 +4229,37 @@ mod tests {
             ActiveEventHandler::enter(&waiting_b).is_none()
         });
         started.wait();
-        b.cancel_sign_in();
+        assert_eq!(b.cancel_sign_in(), Some(b_generation));
         assert!(
             waiter.join().unwrap(),
             "attempt-cancelled sibling entered callback"
         );
         drop(in_a);
 
-        b.finish_sign_in();
+        b.finish_sign_in(b_generation);
         assert!(
             ActiveEventHandler::enter(&b).is_some(),
             "a later sign-in must be allowed to render"
         );
+    }
+
+    #[test]
+    fn late_attempt_cancellation_cannot_mute_the_next_renderer() {
+        let handler = Arc::new(CEventHandler::new(event_target(ignore_event, 0, None)));
+        let first = handler.begin_sign_in();
+        handler.finish_sign_in(first);
+
+        // Models cancel_sign_in observing native completion before it can
+        // publish at the callback layer. There is no active generation to
+        // mark, so the publication is rejected rather than latching a bool.
+        assert_eq!(handler.cancel_sign_in(), None);
+
+        let second = handler.begin_sign_in();
+        assert!(
+            ActiveEventHandler::enter(&handler).is_some(),
+            "a late cancellation from the previous attempt muted this renderer"
+        );
+        handler.finish_sign_in(second);
     }
 
     #[test]
@@ -5008,6 +5216,7 @@ mod header_abi {
                 status: _,
                 has_retry_after: _,
                 retry_after_seconds: _,
+                acquisition_busy: _,
             } = view;
         }
         assert_eq!(
@@ -5023,6 +5232,7 @@ mod header_abi {
                 "status",
                 "has_retry_after",
                 "retry_after_seconds",
+                "acquisition_busy",
             ]
         );
     }

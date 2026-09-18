@@ -327,7 +327,7 @@ impl OidcError {
     /// Such a failure clears on its own once the peer releases, with no human
     /// action, so a transport that is holding an intact batch should re-resolve
     /// within its retry budget instead of failing the flush.
-    pub(crate) fn acquisition_busy(&self) -> bool {
+    pub fn acquisition_busy(&self) -> bool {
         self.acquisition_busy
     }
 }

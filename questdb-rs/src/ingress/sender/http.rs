@@ -592,14 +592,16 @@ fn resolve_auth_with_retries(
     Option<std::borrow::Cow<'_, str>>,
     Option<std::time::Instant>,
 )> {
+    // Start the wall-clock deadline before entering a fallible provider. The
+    // provider API is synchronous, so this cannot interrupt one resolution in
+    // flight; it does prevent a resolution that already consumed the whole
+    // budget from being followed by a second full provider timeout. Immediate
+    // success still reports no retry deadline to the request path.
+    let retry_end = std::time::Instant::now() + retry_timeout;
     let mut last = match state.auth.resolve() {
         Ok(auth) => return Ok((auth, None)),
         Err(e) => e,
     };
-    // `retry_timeout` is a budget for retries, not for the initial attempt.
-    // Start it only after that attempt fails, then carry the same deadline into
-    // the request retry loop if credential acquisition eventually succeeds.
-    let retry_end = std::time::Instant::now() + retry_timeout;
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut rng = rand::rng();
     // Same ladder as the request loop: 10ms doubling to `retry_max_backoff`.
@@ -626,10 +628,11 @@ pub(super) fn http_send_with_retries(
     retry_timeout: Duration,
     retry_max_backoff: Duration,
 ) -> crate::Result<Response<Body>> {
-    // Start the retry deadline at the first retryable failure. If credential
-    // acquisition fails first, its retries and all later request retries share
-    // one deadline. If the initial credential and request attempts succeed,
-    // neither consumes the documented retry budget.
+    // Credential acquisition provisionally starts its deadline before entering
+    // the synchronous provider, so a call that consumes the whole window is
+    // not followed by another full provider wait. If that initial resolution
+    // succeeds, no retry deadline is carried into the request path. Otherwise
+    // its retries and all later request retries share the same deadline.
     let (auth, retry_end) = resolve_auth_with_retries(state, retry_timeout, retry_max_backoff)?;
     let auth = auth.as_deref();
     let (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
@@ -877,6 +880,35 @@ mod tests {
             Ok::<_, crate::Error>("tok".to_string())
         }));
         assert_eq!(ok.resolve().unwrap().as_deref(), Some("Bearer tok"));
+    }
+
+    #[test]
+    fn exhausted_budget_does_not_start_a_second_blocking_token_resolution() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&calls);
+        let state = SyncHttpHandlerState {
+            agent: ureq::Agent::new_with_defaults(),
+            url: "http://127.0.0.1/write".to_string(),
+            auth: HttpAuth::Provider(crate::token_provider::TokenProvider::new(move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                Err::<String, crate::Error>(crate::error::fmt!(
+                    SocketError,
+                    "slow provider failure"
+                ))
+            })),
+            config: HttpConfig::default(),
+        };
+
+        let error =
+            resolve_auth_with_retries(&state, Duration::from_millis(5), Duration::from_millis(100))
+                .expect_err("the provider must fail");
+        assert_eq!(error.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a provider call that consumed the deadline was followed by another full call"
+        );
     }
 
     #[cfg(feature = "_oidc")]

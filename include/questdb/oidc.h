@@ -747,6 +747,12 @@ typedef struct questdb_oidc_error_view
     uint16_t status;
     bool has_retry_after;
     uint64_t retry_after_seconds;
+    /**
+     * True only when `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` describes a
+     * transient acquisition/callback contention window. False means no
+     * credential is available and the caller must run `sign_in()`.
+     */
+    bool acquisition_busy;
 } questdb_oidc_error_view;
 
 /**

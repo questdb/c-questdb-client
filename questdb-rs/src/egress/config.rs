@@ -1119,10 +1119,10 @@ impl ReaderConfig {
     /// starts a fresh budget each round -- spawning a worker per attempt and
     /// never surfacing the cause.
     ///
-    /// Note the provider is also resolved at the top of a mid-query failover
-    /// walk, on the thread inside `next_batch`. That call is not cancellable
-    /// and `failover_max_duration_ms` is only checked between attempts, so a
-    /// slow provider stalls the reader for as long as it takes to return.
+    /// On initial connect the provider is resolved synchronously on the caller
+    /// thread. During a mid-query failover it runs on the provider's bounded,
+    /// single-flight isolation worker so `next_batch` can stop waiting when the
+    /// Execute-wide `failover_max_duration_ms` deadline expires.
     pub fn token_provider<F, E>(self, provider: F) -> Result<Self>
     where
         F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
@@ -1358,6 +1358,25 @@ impl ReaderConfig {
     /// with no token provider never returns `Err`. Add `?` (or `.unwrap()` on a
     /// static-credential config) at the callsite.
     pub fn upgrade_headers(&self) -> Result<Vec<(&'static str, String)>> {
+        self.upgrade_headers_with(|provider| provider.bearer_header())
+    }
+
+    /// Failover-only form: run a synchronous provider on the shared isolated
+    /// worker and abandon the wait once the Execute-wide deadline expires.
+    /// The provider itself may finish later, but single-flight isolation and
+    /// the process-wide worker cap prevent reconnect rounds from accumulating
+    /// one blocked thread apiece.
+    pub(crate) fn upgrade_headers_until(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<(&'static str, String)>> {
+        self.upgrade_headers_with(|provider| provider.bearer_header_isolated_until(cancelled))
+    }
+
+    fn upgrade_headers_with(
+        &self,
+        resolve_provider: impl FnOnce(&crate::token_provider::TokenProvider) -> Result<String>,
+    ) -> Result<Vec<(&'static str, String)>> {
         let mut headers = Vec::with_capacity(8);
         headers.push(("X-QWP-Max-Version", self.max_version.to_string()));
         if let Some(id) = &self.client_id {
@@ -1383,7 +1402,7 @@ impl ReaderConfig {
         // Server authentication rejection remains a separate terminal AuthError
         // produced by the handshake after header construction succeeds.
         if let Some(provider) = &self.token_provider {
-            let header = provider.bearer_header()?;
+            let header = resolve_provider(provider)?;
             headers.push(("Authorization", header));
         } else if let Some(v) = self.auth.header_value() {
             headers.push(("Authorization", v));

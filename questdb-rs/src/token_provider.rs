@@ -30,21 +30,21 @@
 //! long-lived client keeps working as the OIDC token silently rotates.
 
 use std::sync::Arc;
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 use std::time::Duration;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 const ISOLATED_PROVIDER_POLL: Duration = Duration::from_millis(5);
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 const MAX_ISOLATED_PROVIDER_WORKERS: usize = 16;
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 static ISOLATED_PROVIDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// The result of one isolated acquisition, shared by every caller that joined
 /// it.
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 #[derive(Default)]
 struct IsolatedResult {
     done: std::sync::Mutex<Option<crate::Result<String>>>,
@@ -56,17 +56,17 @@ struct IsolatedResult {
 /// Shared by every clone of a [`TokenProvider`], so the repeated reconnect
 /// attempts of one transport coalesce onto one worker instead of each taking
 /// its own slice of the process-global worker budget.
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 #[derive(Default)]
 struct IsolatedAcquisition {
     current: std::sync::Mutex<Option<Arc<IsolatedResult>>>,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 #[derive(Debug)]
 struct IsolatedProviderPermit<'a>(&'a AtomicUsize);
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 impl<'a> IsolatedProviderPermit<'a> {
     fn acquire(counter: &'a AtomicUsize, limit: usize) -> crate::Result<Self> {
         counter
@@ -83,7 +83,7 @@ impl<'a> IsolatedProviderPermit<'a> {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 impl Drop for IsolatedProviderPermit<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
@@ -121,7 +121,7 @@ pub(crate) type TokenProviderFn = Arc<dyn Fn() -> crate::Result<String> + Send +
 #[doc(hidden)]
 #[derive(Clone, Default)]
 pub struct TokenProviderIsolation {
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     isolated: Arc<IsolatedAcquisition>,
 }
 
@@ -132,7 +132,7 @@ pub(crate) struct TokenProvider {
     provide: TokenProviderFn,
     /// Shared by every clone so one provider never holds more than one
     /// isolated worker. See [`IsolatedAcquisition`].
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     isolated: Arc<IsolatedAcquisition>,
 }
 
@@ -153,7 +153,7 @@ impl TokenProvider {
     {
         TokenProvider {
             provide: Arc::new(move || provider().map_err(Into::into)),
-            #[cfg(feature = "_sender-qwp-ws")]
+            #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
             isolated: isolation.isolated,
         }
     }
@@ -247,7 +247,7 @@ impl TokenProvider {
     /// attempt until it held all of them, and an unrelated healthy provider --
     /// which would have returned a token immediately -- was refused one and
     /// failed its own connect before dialling an endpoint.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     pub(crate) fn bearer_header_isolated_until(
         &self,
         cancelled: impl Fn() -> bool,
@@ -298,7 +298,7 @@ impl TokenProvider {
     /// provider. Every failure is published to `slot` as well as returned, so a
     /// caller that joined it is never left waiting on a worker that will not
     /// run.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     fn spawn_isolated_worker(&self, slot: &Arc<IsolatedResult>) -> crate::Result<()> {
         // A blocked synchronous callback cannot be killed, but it must not
         // permit repeated sender teardown to grow process-global thread count
@@ -335,7 +335,7 @@ impl TokenProvider {
     }
 
     /// Retire the in-flight slot and wake everyone waiting on it.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     fn publish_isolated(&self, slot: &Arc<IsolatedResult>, result: crate::Result<String>) {
         // Clear the slot before publishing so the next acquisition starts a
         // fresh worker rather than joining -- and re-reading the result of --
@@ -365,7 +365,7 @@ impl TokenProvider {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 fn provider_shutdown_error() -> crate::Error {
     crate::error::fmt!(
         SocketError,
@@ -648,7 +648,7 @@ mod tests {
     /// a slow or blocking closure can never wedge sender shutdown. Only its
     /// success path was previously exercised (via the connect handshake tests);
     /// the cancellation branches — the whole reason the method exists — were not.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     mod isolated {
         use super::super::{
             IsolatedProviderPermit, MAX_ISOLATED_PROVIDER_WORKERS, TokenProvider,

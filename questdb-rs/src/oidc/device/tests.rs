@@ -3752,6 +3752,86 @@ fn restart_resumes_from_persisted_token_without_reprompt() {
 }
 
 #[test]
+fn close_during_successful_refresh_persists_the_rotated_child() {
+    // The parent is tombstoned before submission. If close wins after the IdP
+    // rotates it but before the response is parsed, neither close nor a final
+    // cancellation check may discard the only surviving child credential.
+    let request_entered = Arc::new(std::sync::Barrier::new(2));
+    let release_response = Arc::new(std::sync::Barrier::new(2));
+    let mock = {
+        let request_entered = Arc::clone(&request_entered);
+        let release_response = Arc::clone(&release_response);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                request_entered.wait();
+                release_response.wait();
+                (
+                    200,
+                    r#"{"access_token":"AT-child","refresh_token":"RT-child","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let store = test_file_store(dir.path());
+    store
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT-expired".to_string()),
+                None,
+                Some("RT-parent".to_string()),
+                1.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .token_store(test_file_store(dir.path()))
+            .build()
+            .unwrap(),
+    );
+
+    let token_thread = std::thread::spawn({
+        let auth = Arc::clone(&auth);
+        move || auth.token()
+    });
+    request_entered.wait();
+    let close_thread = std::thread::spawn({
+        let auth = Arc::clone(&auth);
+        move || auth.close()
+    });
+    while !auth.is_closed() {
+        std::thread::yield_now();
+    }
+    release_response.wait();
+
+    let error = token_thread
+        .join()
+        .unwrap()
+        .expect_err("close must still cancel the caller");
+    assert_eq!(error.kind(), OidcErrorKind::Cancelled);
+    close_thread.join().unwrap();
+    let persisted = store
+        .load(&key)
+        .unwrap()
+        .expect("close destroyed the rotated credential family");
+    assert_eq!(persisted.access_token(), Some("AT-child"));
+    assert_eq!(persisted.refresh_token(), Some("RT-child"));
+    assert!(auth.token_set().is_none(), "close must still scrub memory");
+}
+
+#[test]
 fn refresh_only_persisted_entry_is_rejected_in_both_token_modes() {
     for groups_in_token in [false, true] {
         let device_calls = Arc::new(AtomicUsize::new(0));
@@ -3798,6 +3878,10 @@ fn refresh_only_persisted_entry_is_rejected_in_both_token_modes() {
 
         let err = auth.token().unwrap_err();
         assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+        assert!(
+            !auth.store_state.lock().unwrap().load_attempted,
+            "an invalid refresh-only entry must not latch the one-shot loader"
+        );
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             device_calls.load(Ordering::SeqCst),
@@ -3805,6 +3889,86 @@ fn refresh_only_persisted_entry_is_rejected_in_both_token_modes() {
             "non-interactive auth unexpectedly started a device flow"
         );
     }
+}
+
+#[test]
+fn transient_refresh_failure_rearms_the_shared_store_loader() {
+    let mock = MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+            (503, r#"{"error":"temporarily_unavailable"}"#.to_string())
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    test_file_store(dir.path())
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT-expired".to_string()),
+                None,
+                Some("RT-parent".to_string()),
+                1.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+    let auth = auth_with_store(&mock, dir.path());
+
+    let error = auth.token().expect_err("transient refresh must surface");
+    assert_eq!(error.kind(), OidcErrorKind::Network);
+    let state = auth.store_state.lock().unwrap();
+    assert!(
+        !state.load_attempted,
+        "a consumed credential left the shared-store loader latched"
+    );
+    assert!(
+        state.next_empty_load_recheck.is_some(),
+        "the re-armed read must retain the normal anti-stampede throttle"
+    );
+}
+
+#[test]
+fn refresh_only_response_is_kept_in_memory_but_not_persisted() {
+    let mock = MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/token") if body.contains("grant_type=refresh_token") => (
+            200,
+            r#"{"refresh_token":"RT-child","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let store = test_file_store(dir.path());
+    store
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT-expired".to_string()),
+                None,
+                Some("RT-parent".to_string()),
+                1.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+    let auth = auth_with_store(&mock, dir.path());
+
+    let error = auth
+        .token()
+        .expect_err("refresh-only result is not servable");
+    assert_eq!(error.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(
+        auth.token_set()
+            .as_ref()
+            .and_then(|tokens| tokens.refresh_token.as_deref()),
+        Some("RT-child"),
+        "the live process should retain the rotated child for a later retry"
+    );
+    assert!(
+        store.load(&key).unwrap().is_none(),
+        "the client wrote a refresh-only record its own loader rejects"
+    );
 }
 
 #[test]

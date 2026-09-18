@@ -774,6 +774,103 @@ fn test_busy_interaction_required_is_retried_within_the_budget() -> TestResult {
 }
 
 #[test]
+fn test_initial_401_provider_failure_is_not_marked_in_doubt() -> TestResult {
+    // Exercise the production call site, not just rotated_auth_after_401's bool
+    // parameter: swapping the false/true constants at its two callers must make
+    // this test and its retry-loop counterpart fail.
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok("expired".to_string())
+            } else {
+                Err(crate::error::fmt!(SocketError, "rotation failed"))
+            }
+        })?
+        .retry_timeout(Duration::from_secs(5))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 1.0)?
+        .at(TimestampNanos::new(1))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let request = server.recv_http_q()?;
+        assert_eq!(request.header("authorization"), Some("Bearer expired"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        Ok(server)
+    });
+
+    let error = sender.flush_and_keep(&buffer).unwrap_err();
+    _ = server_thread.join().unwrap()?;
+    assert!(!error.in_doubt(), "a definite first 401 applied nothing");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[test]
+fn test_retry_loop_401_provider_failure_is_marked_in_doubt() -> TestResult {
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok("expired".to_string())
+            } else {
+                Err(crate::error::fmt!(SocketError, "rotation failed"))
+            }
+        })?
+        .retry_timeout(Duration::from_secs(5))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 1.0)?
+        .at(TimestampNanos::new(1))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let first = server.recv_http_q()?;
+        assert_eq!(first.header("authorization"), Some("Bearer expired"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("retry"),
+        )?;
+        let second = server.recv_http_q()?;
+        assert_eq!(second.header("authorization"), Some("Bearer expired"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        Ok(server)
+    });
+
+    let error = sender.flush_and_keep(&buffer).unwrap_err();
+    _ = server_thread.join().unwrap()?;
+    assert!(
+        error.in_doubt(),
+        "a provider failure after entering the request retry loop lost delivery uncertainty"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[test]
 fn test_credential_rotation_budget_is_one_per_flush() -> TestResult {
     // Regression: the rotation budget is one per FLUSH. `http_send_with_retries`
     // spends it on the pre-loop 401, then hands off to `retry_http_send`, which

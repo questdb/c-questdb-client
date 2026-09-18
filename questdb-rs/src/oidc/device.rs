@@ -1308,8 +1308,15 @@ impl OidcDeviceAuth {
                 // (stored or in-memory) may already have discarded an ambiguously
                 // consumed parent, leaving the next call to re-prompt.
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Network => {
-                    self.lock_store_state()
-                        .record_refresh_failure(Instant::now());
+                    let now = Instant::now();
+                    let mut state = self.lock_store_state();
+                    state.record_refresh_failure(now);
+                    // A transient refresh failure may have consumed the entry
+                    // this process adopted.  Re-arm the lazy read so a peer
+                    // that repairs the shared store can be observed after the
+                    // normal empty-load throttle instead of leaving this
+                    // provider latched to stale state forever.
+                    state.rearm_store_load(now);
                     return Err(e);
                 }
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Cancelled => {
@@ -1446,27 +1453,29 @@ impl OidcDeviceAuth {
                 if let Err(e) = lock_result {
                     self.warn_persistence("lock", &*e);
                 }
+                let found_entry = persisted.is_some();
+                let adopted = self.adopt(persisted).is_some();
                 let mut state = self.lock_store_state();
-                if persisted.is_some() {
-                    // An entry was found and is adopted below: the one-shot load
-                    // is done and must not run again.
+                if adopted {
+                    // Only a validated, adopted entry closes the one-shot load.
+                    // In particular a refresh-only entry is deliberately invalid
+                    // under the frozen store contract and must not latch this
+                    // process away from a later peer replacement.
                     state.load_attempted = true;
                     state.reset_store_load_backoff();
                 } else {
                     // A locked read that found nothing is authoritative against a
                     // peer *refresh*, but says nothing about a peer *sign-in*.
-                    // Latching it stranded a long-lived provider that started
-                    // before any credential existed: it returned
-                    // InteractionRequired for the life of the process even after
-                    // an operator signed in from another process, while the QWP
-                    // drainer retried forever on the human-fixable condition
-                    // `classify_provider_error` keeps retryable for exactly that
-                    // recovery. Re-check on an interval instead.
+                    // The same is true of an entry that failed validation: a peer
+                    // can replace it with a complete credential. Re-check on an
+                    // interval rather than latching either state for the life of
+                    // this provider.
                     state.reset_store_load_backoff();
                     state.record_store_load_empty(now);
+                    if found_entry {
+                        state.set_last_persisted_refresh(None);
+                    }
                 }
-                drop(state);
-                self.adopt(persisted);
                 Ok(())
             }
             None => {
@@ -1651,7 +1660,7 @@ impl OidcDeviceAuth {
         match self.refresh(existing) {
             Ok(refreshed) => Ok(refreshed),
             Err(e) => {
-                if refresh_preserves_token(&e) {
+                if refresh_preserves_token(&e) && !self.is_closed() {
                     *self.lock_tokens() = Some(existing.clone());
                 }
                 Err(e)
@@ -1742,23 +1751,29 @@ impl OidcDeviceAuth {
         // parent and its response was lost. Remove every cached copy before the
         // request so a later call cannot retry an ambiguous parent.
         self.discard_cached_refresh();
-        let refreshed = match self.refresh(&current) {
+        let refreshed = match self.refresh_for_durable_store(&current) {
             Ok(refreshed) => refreshed,
             Err(e) => {
                 // Restore the refresh token only when the failure proves the IdP
                 // never received it (see `refresh_preserves_token`): a pre-send
-                // connect / DNS / TLS failure. Restore it in memory, and back on
-                // disk if we consumed the persisted copy above, so a later retry
-                // can resume the silent refresh. The no-store path
-                // (`refresh_no_store`) makes the identical choice.
+                // connect / DNS / TLS failure. Cancellation is also safe here:
+                // this durable variant performs no cancellation check after the
+                // POST, so Cancelled can only come from its pre-submit check.
+                // Restore the parent on disk even when close already scrubbed the
+                // in-memory cache; otherwise close between tombstoning and the
+                // request would destroy the persisted credential family.
                 //
                 // Everything else stays discarded. Even a received transient
                 // status can be synthesized by an intermediary after the IdP
                 // consumed and rotated the parent, so it does not prove safety.
                 // A terminal rejection likewise means the parent must not be
                 // replayed.
-                if refresh_preserves_token(&e) {
-                    *self.lock_tokens() = Some(current.clone());
+                let safe_to_restore = refresh_preserves_token(&e)
+                    || e.kind() == crate::oidc::error::OidcErrorKind::Cancelled;
+                if safe_to_restore {
+                    if !self.is_closed() {
+                        *self.lock_tokens() = Some(current.clone());
+                    }
                     if current_is_persisted {
                         // Durable: we deleted the parent above, so this restore
                         // must land even if the failure that brought us here
@@ -1769,12 +1784,12 @@ impl OidcDeviceAuth {
                 return Err(e);
             }
         };
-        // Persist even when the response lacked the required token kind. The
-        // parent was consumed and deleted above, so skipping the write would
-        // leave nothing on disk and force an interactive re-sign-in that a
-        // headless caller cannot perform. `persist_if_changed` is a no-op when
-        // the refresh token did not rotate, and removes the entry when the IdP
-        // returned none at all.
+        // Persist the replacement whenever it contains a servable token kind.
+        // A refresh-only response remains useful to this process for a later
+        // retry, but the frozen store contract rejects refresh-only records, so
+        // `persist_if_changed_durable` deliberately leaves the entry absent
+        // rather than writing state this client cannot reload. It also removes
+        // the entry when the IdP returned no refresh token at all.
         // Durable, and deliberately BEFORE any `ensure_open()`: a `close()`
         // racing the token-endpoint POST used to make this write return
         // `Cancelled` with the parent already deleted, destroying the on-disk
@@ -1899,7 +1914,12 @@ impl OidcDeviceAuth {
         }
         // With no replacement refresh token there is nothing worth saving, but a
         // previously persisted one is now obsolete and must not survive restart.
-        if rt.is_none() {
+        // The frozen cross-client store contract also rejects refresh-only
+        // records as a possible silent credential swap. Never write a record
+        // that this client will reject on its next load: keep a rotated but
+        // presently unservable refresh token in this process, while leaving the
+        // durable entry absent for a peer sign-in to replace.
+        if rt.is_none() || (tokens.access_token.is_none() && tokens.id_token.is_none()) {
             let clear_result = store.clear_cancellable(key, &cancelled);
             if !durable {
                 self.ensure_open()?;
@@ -2409,6 +2429,19 @@ impl OidcDeviceAuth {
     }
 
     fn refresh(&self, tokens: &TokenSet) -> Result<TokenSet> {
+        self.refresh_inner(tokens, true)
+    }
+
+    /// Refresh for a caller that has already durably consumed the persisted
+    /// parent. Once the token endpoint returns a successful response, parse and
+    /// persist its child before allowing a concurrent `close()` to win. The
+    /// ordinary memory-only path remains cancellation-first because it has no
+    /// durable credential family to protect.
+    fn refresh_for_durable_store(&self, tokens: &TokenSet) -> Result<TokenSet> {
+        self.refresh_inner(tokens, false)
+    }
+
+    fn refresh_inner(&self, tokens: &TokenSet, cancel_after_response: bool) -> Result<TokenSet> {
         self.ensure_open()?;
         // Callers gate on a present refresh token, but a persisted entry
         // (untrusted input) can reach here without one; return an error rather
@@ -2439,7 +2472,9 @@ impl OidcDeviceAuth {
         let result = self
             .http
             .post_form(&self.config.token_endpoint, &form, false)?;
-        self.ensure_open()?;
+        if cancel_after_response {
+            self.ensure_open()?;
+        }
 
         if result.status == 200 {
             // Carry the prior refresh token forward (a non-rotating IdP omits it
