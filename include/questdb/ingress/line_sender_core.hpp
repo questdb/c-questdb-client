@@ -219,7 +219,7 @@ enum class error_kind : int
 /**
  * A QuestDB error carrying the structured OAuth/OIDC response detail
  * (`kind()`, `idp_error()`, `idp_error_description()`, `status()`,
- * `retry_after_seconds()`).
+ * `retry_after_seconds()`, `acquisition_busy()`).
  *
  * **Which exception type an OIDC failure throws depends on the surface that
  * raised it.** `questdb::oidc::error` and `questdb::ingress::line_sender_error`
@@ -250,13 +250,15 @@ public:
         std::string idp_error,
         std::string idp_error_description,
         std::optional<uint16_t> status,
-        std::optional<uint64_t> retry_after_seconds)
+        std::optional<uint64_t> retry_after_seconds,
+        bool acquisition_busy = false)
         : ::questdb::error{code, message}
         , _kind{kind}
         , _idp_error{std::move(idp_error)}
         , _idp_error_description{std::move(idp_error_description)}
         , _status{status}
         , _retry_after_seconds{retry_after_seconds}
+        , _acquisition_busy{acquisition_busy}
     {
     }
 
@@ -281,13 +283,57 @@ public:
         return _retry_after_seconds;
     }
 
+    /**
+     * True only when `kind() == error_kind::interaction_required` describes a
+     * transient acquisition/callback contention window rather than a missing
+     * credential: a retry can succeed without a new `sign_in()`. Mirrors
+     * `questdb_oidc_error_view::acquisition_busy` (and the Python binding's
+     * equivalent), so the same discriminator is available in every language.
+     */
+    bool acquisition_busy() const noexcept
+    {
+        return _acquisition_busy;
+    }
+
 private:
     error_kind _kind;
     std::string _idp_error;
     std::string _idp_error_description;
     std::optional<uint16_t> _status;
     std::optional<uint64_t> _retry_after_seconds;
+    bool _acquisition_busy;
 };
+
+/**
+ * Build the structured error a populated `questdb_oidc_error_view` describes.
+ *
+ * The single conversion point for every C++ surface that exposes OIDC detail:
+ * the device/reader path (`questdb::error::throw_from_c`) and the sender's
+ * `line_sender_error::oidc_diagnostic()`. Keeping one implementation is what
+ * stops a field present in the C view -- and in the Rust, C and Python
+ * surfaces -- from reaching one C++ surface and silently vanishing from the
+ * other. Mirrors `questdb::ingress::qwp_ws_error_from_view`.
+ */
+inline error error_from_view(
+    ::questdb::error_code code,
+    std::string message,
+    const ::questdb_oidc_error_view& view)
+{
+    const auto copy = [](const char* data, size_t size) {
+        return data ? std::string{data, size} : std::string{};
+    };
+    return error{
+        code,
+        std::move(message),
+        static_cast<error_kind>(static_cast<int>(view.kind)),
+        copy(view.idp_error, view.idp_error_len),
+        copy(view.idp_error_description, view.idp_error_description_len),
+        view.has_status ? std::optional<uint16_t>{view.status}
+                        : std::optional<uint16_t>{},
+        view.has_retry_after ? std::optional<uint64_t>{view.retry_after_seconds}
+                             : std::optional<uint64_t>{},
+        view.acquisition_busy};
+}
 
 } // namespace questdb::oidc
 
@@ -321,16 +367,8 @@ inline bool error::has_oidc_detail(const ::questdb_error* c_err) noexcept
         throw error{code, copy(message, message_len)};
     }
 
-    throw ::questdb::oidc::error{
-        code,
-        copy(message, message_len),
-        static_cast<::questdb::oidc::error_kind>(static_cast<int>(view.kind)),
-        copy(view.idp_error, view.idp_error_len),
-        copy(view.idp_error_description, view.idp_error_description_len),
-        view.has_status ? std::optional<uint16_t>{view.status}
-                        : std::optional<uint16_t>{},
-        view.has_retry_after ? std::optional<uint64_t>{view.retry_after_seconds}
-                             : std::optional<uint64_t>{}};
+    throw ::questdb::oidc::error_from_view(
+        code, copy(message, message_len), view);
 }
 
 } // namespace questdb
@@ -556,23 +594,8 @@ private:
         oidc_view.struct_size = sizeof oidc_view;
         if (::questdb_error_oidc_get_view(owned_err.get(), &oidc_view))
         {
-            const auto copy = [](const char* data, size_t size) {
-                return data ? std::string{data, size} : std::string{};
-            };
-            oidc_diagnostic.emplace(
-                code,
-                msg,
-                static_cast<::questdb::oidc::error_kind>(
-                    static_cast<int>(oidc_view.kind)),
-                copy(oidc_view.idp_error, oidc_view.idp_error_len),
-                copy(
-                    oidc_view.idp_error_description,
-                    oidc_view.idp_error_description_len),
-                oidc_view.has_status ? std::optional<uint16_t>{oidc_view.status}
-                                     : std::optional<uint16_t>{},
-                oidc_view.has_retry_after
-                    ? std::optional<uint64_t>{oidc_view.retry_after_seconds}
-                    : std::optional<uint64_t>{});
+            oidc_diagnostic =
+                ::questdb::oidc::error_from_view(code, msg, oidc_view);
         }
 
         return line_sender_error{

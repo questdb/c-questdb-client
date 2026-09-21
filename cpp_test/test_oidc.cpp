@@ -241,6 +241,9 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
             error.oidc_diagnostic()->kind() ==
             questdb::oidc::error_kind::interaction_required);
         CHECK(error.oidc_diagnostic()->code() == error.code());
+        // Nothing is contending here: this provider simply never signed in, so
+        // the discriminator must say "run sign_in()", not "retry shortly".
+        CHECK_FALSE(error.oidc_diagnostic()->acquisition_busy());
     }
     CHECK(attached_sender_saw_structured_error);
 
@@ -264,6 +267,7 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     {
         reader_reached_token_acquisition = true;
         CHECK(error.kind() == questdb::oidc::error_kind::interaction_required);
+        CHECK_FALSE(error.acquisition_busy());
     }
     CHECK(reader_reached_token_acquisition);
 
@@ -274,6 +278,57 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     CHECK_NOTHROW(shared_auth.detach_events());
     CHECK_NOTHROW(shared_auth.detach_diagnostics());
     CHECK_NOTHROW(shared_auth.detach_diagnostics_nowait());
+}
+
+TEST_CASE("OIDC C++ errors carry every field of the C error view")
+{
+    // `error_from_view` is the ONE conversion the device/reader throw path and
+    // the sender's `oidc_diagnostic()` both use. It is asserted field by field
+    // because a field the C view gained and this conversion dropped is
+    // invisible: the error still arrives, just without the detail a caller
+    // needs. `acquisition_busy` is exactly that case -- it separates transient
+    // acquisition/callback contention, where a retry succeeds on its own, from
+    // "no credential, run sign_in()".
+    constexpr char idp_error[] = "authorization_pending";
+    constexpr char idp_error_description[] = "still waiting for the user";
+
+    ::questdb_oidc_error_view view{};
+    view.struct_size = sizeof view;
+    view.kind = QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED;
+    view.idp_error = idp_error;
+    view.idp_error_len = sizeof(idp_error) - 1;
+    view.idp_error_description = idp_error_description;
+    view.idp_error_description_len = sizeof(idp_error_description) - 1;
+    view.has_status = true;
+    view.status = 429;
+    view.has_retry_after = true;
+    view.retry_after_seconds = 7;
+    view.acquisition_busy = true;
+
+    const auto busy = questdb::oidc::error_from_view(
+        questdb::error_code::socket_error, "busy", view);
+    CHECK(busy.code() == questdb::error_code::socket_error);
+    CHECK(std::string_view{busy.what()} == "busy");
+    CHECK(busy.kind() == questdb::oidc::error_kind::interaction_required);
+    CHECK(busy.idp_error() == idp_error);
+    CHECK(busy.idp_error_description() == idp_error_description);
+    REQUIRE(busy.status().has_value());
+    CHECK(*busy.status() == 429);
+    REQUIRE(busy.retry_after_seconds().has_value());
+    CHECK(*busy.retry_after_seconds() == 7);
+    CHECK(busy.acquisition_busy());
+
+    // The absent-optional and "interaction genuinely required" shape.
+    ::questdb_oidc_error_view bare{};
+    bare.struct_size = sizeof bare;
+    bare.kind = QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED;
+    const auto needs_sign_in = questdb::oidc::error_from_view(
+        questdb::error_code::auth_error, "sign in", bare);
+    CHECK(needs_sign_in.idp_error().empty());
+    CHECK(needs_sign_in.idp_error_description().empty());
+    CHECK_FALSE(needs_sign_in.status().has_value());
+    CHECK_FALSE(needs_sign_in.retry_after_seconds().has_value());
+    CHECK_FALSE(needs_sign_in.acquisition_busy());
 }
 
 TEST_CASE(

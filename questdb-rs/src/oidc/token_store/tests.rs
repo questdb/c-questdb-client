@@ -260,14 +260,51 @@ fn file_store_mutations_fail_before_disk_changes_without_durable_metadata() {
 
 #[cfg(windows)]
 #[test]
+fn windows_create_permission_denied_is_treated_as_transient_contention() {
+    // The classification the delete-pending retry rests on, asserted directly so
+    // it holds on every Windows host regardless of that host's delete semantics.
+    assert!(is_transient_create_contention(&std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied
+    )));
+    assert!(!is_transient_create_contention(&std::io::Error::from(
+        std::io::ErrorKind::NotFound
+    )));
+}
+
+#[cfg(windows)]
+#[test]
 fn delete_pending_permission_denied_is_retried_until_the_handle_closes() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // `FILE_FLAG_DELETE_ON_CLOSE`: the name stays in the directory carrying a
+    // delete-pending disposition for as long as this handle lives, and is gone
+    // once it closes. That is exactly the state a departing lock holder leaves
+    // behind -- a concurrent `create_new` on the same name fails with
+    // `ERROR_ACCESS_DENIED` (`PermissionDenied`) instead of `AlreadyExists`.
+    //
+    // It is constructed explicitly rather than by opening a handle and calling
+    // `remove_file`: current Windows deletes with POSIX semantics, so the name
+    // is unlinked immediately, the replacement `create_new` SUCCEEDS, and the
+    // fixture silently tests nothing (it fails at the assertion below).
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+
     let dir = TempDir::new().unwrap();
     let store =
         test_file_store(dir.path()).with_lock_timings(Duration::from_secs(2), DEFAULT_LOCK_STALE);
     let lock = dir.path().join("delete-pending.lock");
     let stamp = holder_bytes().unwrap();
-    let departing = create_lock_file_handle(&lock, &stamp).unwrap();
-    std::fs::remove_file(&lock).unwrap();
+    let departing = {
+        // Stamped like a real holder, so the contender cannot decide the lock is
+        // an abandoned empty one and steal it instead of waiting.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(&lock)
+            .unwrap();
+        file.write_all(stamp.as_bytes()).unwrap();
+        file
+    };
 
     let collision = create_lock_file_handle(&lock, &stamp).unwrap_err();
     assert_eq!(

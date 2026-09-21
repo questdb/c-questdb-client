@@ -1315,6 +1315,10 @@ impl OidcDeviceAuth {
         // Seed the cache from the persisted store once, so a restart resumes from
         // a saved refresh token instead of re-prompting (a no-op without a store).
         let load_result = self.maybe_load_from_store();
+        // The store read can run a persistence diagnostic, and that handler may
+        // close this auth. Closing is terminal, so re-check before serving
+        // anything the cache happens to hold at this point.
+        self.ensure_open()?;
         if let Some(tokens) = self.cached_if_valid() {
             return Ok(tokens);
         }
@@ -1530,6 +1534,17 @@ impl OidcDeviceAuth {
                 if let Err(e) = lock_result {
                     self.warn_persistence("lock", &*e);
                 }
+                // `close()` is documented as callback-safe and TERMINAL, and a
+                // persistence diagnostic handler is explicitly allowed to call
+                // it -- from inside the warning above, on this very stack. Close
+                // discards the in-memory credential, but the entry read a moment
+                // ago is still in hand here: adopting it would republish a live
+                // token into a closed provider and hand it back to the caller
+                // that close was meant to terminate. Re-check at the last point
+                // before the cache is written, exactly as the coordinated
+                // refresh does after its own lock/warn window; `persisted` is
+                // dropped (and zeroized) on this path instead of being cached.
+                self.ensure_open()?;
                 let found_entry = persisted.is_some();
                 let adopted = self.adopt(persisted).is_some();
                 let mut state = self.lock_store_state();

@@ -3365,6 +3365,117 @@ impl TokenStore for FailingSaveStore {
     }
 }
 
+/// A store whose locked READ succeeds but whose lock release then reports a
+/// lost lease. That is the one shape where the provider emits a persistence
+/// warning while still holding a fully loaded, valid credential.
+#[derive(Clone)]
+struct PostActionLockLossStore {
+    token: Arc<Mutex<Option<PersistedToken>>>,
+}
+
+impl TokenStore for PostActionLockLossStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(self.token.lock().unwrap().clone())
+    }
+
+    fn save(&self, _key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = Some(token.clone());
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        action()?;
+        Err(Box::new(std::io::Error::other(
+            "injected post-action lock loss",
+        )))
+    }
+}
+
+/// A diagnostic handler that closes its own auth, which the C API documents as
+/// callback-safe. It mirrors the FFI's non-draining close branch: the warning
+/// is emitted while the acquisition critical section is still owned by this
+/// stack, so close publishes and tears down credentials without waiting.
+struct ClosingDiagnostic {
+    auth: Arc<std::sync::OnceLock<std::sync::Weak<OidcDeviceAuth>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl DiagnosticHandler for ClosingDiagnostic {
+    fn on_persistence_warning(&self, _message: &str) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let auth = self
+            .auth
+            .get()
+            .expect("auth installed")
+            .upgrade()
+            .expect("auth alive");
+        auth.signal_close();
+        auth.discard_credentials();
+    }
+}
+
+#[test]
+fn a_close_from_a_persistence_warning_is_not_undone_by_the_loaded_entry() {
+    // Regression: the seed read warned about its lost lease, the handler closed
+    // the provider (documented as callback-safe and TERMINAL), and the entry
+    // read a moment earlier was then adopted anyway -- republishing a live
+    // credential into a closed provider and handing it to the very caller the
+    // close was meant to terminate.
+    let now = crate::oidc::token::now_epoch();
+    let store = PostActionLockLossStore {
+        token: Arc::new(Mutex::new(Some(PersistedToken::new(
+            Some("AT-persisted".to_string()),
+            None,
+            Some("RT-persisted".to_string()),
+            now + 300.0,
+            300.0,
+        )))),
+    };
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example.com/device")
+            .token_endpoint("https://idp.example.com/token")
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .diagnostic_handler(ClosingDiagnostic {
+                auth: Arc::clone(&handle),
+                calls: Arc::clone(&calls),
+            })
+            .build()
+            .expect("build auth with closing diagnostic handler"),
+    );
+    assert!(
+        handle.set(Arc::downgrade(&auth)).is_ok(),
+        "the auth handle must be installed exactly once"
+    );
+
+    let err = auth
+        .token()
+        .expect_err("a closed provider must not serve the entry it just read");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler must have run");
+    assert_eq!(err.kind(), OidcErrorKind::Cancelled);
+    assert!(auth.is_closed());
+    assert!(
+        auth.token_set().is_none(),
+        "close discarded the credential; the store read must not restore it"
+    );
+}
+
 /// `(entered, release)`: the store signals the first and then waits on the
 /// second, so a test can act while the write is parked.
 type LockGate = (Arc<Barrier>, Arc<Barrier>);
