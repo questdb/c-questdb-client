@@ -258,85 +258,81 @@ fn file_store_mutations_fail_before_disk_changes_without_durable_metadata() {
     );
 }
 
-#[cfg(windows)]
 #[test]
-fn windows_create_permission_denied_is_treated_as_transient_contention() {
-    // The classification the delete-pending retry rests on, asserted directly so
-    // it holds on every Windows host regardless of that host's delete semantics.
-    assert!(is_transient_create_contention(&std::io::Error::from(
-        std::io::ErrorKind::PermissionDenied
-    )));
+fn create_permission_denied_is_transient_contention_only_on_windows() {
+    // The classification the retry below rests on. Asserted for both platforms
+    // from one body: on Windows it is the delete-pending window and must be
+    // retried; elsewhere the same error means the store directory genuinely
+    // refuses the write, and retrying it until the budget expires would only
+    // delay the report.
+    assert_eq!(
+        is_transient_create_contention(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        cfg!(windows),
+        "only Windows reports delete-pending contention as PermissionDenied"
+    );
     assert!(!is_transient_create_contention(&std::io::Error::from(
         std::io::ErrorKind::NotFound
     )));
 }
 
-#[cfg(windows)]
 #[test]
-fn delete_pending_permission_denied_is_retried_until_the_handle_closes() {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    // `FILE_FLAG_DELETE_ON_CLOSE`: the name stays in the directory carrying a
-    // delete-pending disposition for as long as this handle lives, and is gone
-    // once it closes. That is exactly the state a departing lock holder leaves
-    // behind -- a concurrent `create_new` on the same name fails with
-    // `ERROR_ACCESS_DENIED` (`PermissionDenied`) instead of `AlreadyExists`.
+fn delete_pending_create_contention_is_retried_on_windows_and_surfaced_elsewhere() {
+    // Windows leaves a lock name its holder has just unlinked in a
+    // "delete pending" state, so a contender's `create_new` answers
+    // `PermissionDenied` rather than `AlreadyExists` until that holder's last
+    // handle closes. `acquire_lock` must keep polling through that window; on
+    // Unix the same error is a genuine directory-permission problem and must
+    // be surfaced at once, never retried until the budget expires.
     //
-    // It is constructed explicitly rather than by opening a handle and calling
-    // `remove_file`: current Windows deletes with POSIX semantics, so the name
-    // is unlinked immediately, the replacement `create_new` SUCCEEDS, and the
-    // fixture silently tests nothing (it fails at the assertion below).
-    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
-
+    // The collision is INJECTED (`with_create_contention`) instead of staged
+    // through the filesystem. A real delete-pending window cannot be produced
+    // portably -- current Windows unlinks with POSIX semantics, so the name
+    // disappears immediately and the replacement `create_new` succeeds -- and
+    // a fixture that quietly stages nothing asserts nothing about the retry.
     let dir = TempDir::new().unwrap();
-    let store =
-        test_file_store(dir.path()).with_lock_timings(Duration::from_secs(2), DEFAULT_LOCK_STALE);
+    let store = test_file_store(dir.path())
+        .with_lock_timings(Duration::from_secs(5), DEFAULT_LOCK_STALE)
+        .with_create_contention(3);
     let lock = dir.path().join("delete-pending.lock");
-    let stamp = holder_bytes().unwrap();
-    let departing = {
-        // Stamped like a real holder, so the contender cannot decide the lock is
-        // an abandoned empty one and steal it instead of waiting.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-            .open(&lock)
-            .unwrap();
-        file.write_all(stamp.as_bytes()).unwrap();
-        file
-    };
 
-    let collision = create_lock_file_handle(&lock, &stamp).unwrap_err();
-    assert_eq!(
-        collision.kind(),
-        std::io::ErrorKind::PermissionDenied,
-        "the fixture did not create Windows delete-pending contention"
+    let result = store.acquire_lock(
+        &lock,
+        DEFAULT_LOCK_STALE,
+        EMPTY_LOCK_GRACE,
+        &never_cancelled,
     );
 
-    let started = Arc::new(Barrier::new(2));
-    let waiter_started = Arc::clone(&started);
-    let waiter = std::thread::spawn(move || {
-        waiter_started.wait();
-        store.acquire_lock(
-            &lock,
-            DEFAULT_LOCK_STALE,
-            EMPTY_LOCK_GRACE,
-            &never_cancelled,
-        )
-    });
-    started.wait();
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(
-        !waiter.is_finished(),
-        "delete-pending contention surfaced instead of being retried"
-    );
-
-    drop(departing);
-    let acquired = waiter
-        .join()
-        .expect("delete-pending waiter panicked")
-        .expect("waiter did not acquire after the departing handle closed");
-    drop(acquired);
+    if cfg!(windows) {
+        let held = result.unwrap_or_else(|e| {
+            panic!("delete-pending contention must be retried, not surfaced: {e}")
+        });
+        assert!(
+            lock.exists(),
+            "the lock was reported as held without its file"
+        );
+        assert_eq!(
+            store.remaining_create_contention(),
+            0,
+            "acquire_lock stopped short of the injected contention window"
+        );
+        drop(held);
+    } else {
+        let error = result.err().expect(
+            "a create PermissionDenied is a real permission problem off Windows, not contention",
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "the permission failure must reach the caller unchanged"
+        );
+        assert_eq!(
+            store.remaining_create_contention(),
+            2,
+            "the first collision must end the attempt, with no retry"
+        );
+    }
 }
 
 #[test]

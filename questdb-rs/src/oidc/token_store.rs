@@ -72,6 +72,8 @@ use std::fmt;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -676,6 +678,10 @@ pub struct FileTokenStore {
     lock_stale: Duration,
     #[cfg(test)]
     fail_heartbeat_spawn: bool,
+    #[cfg(test)]
+    /// Remaining lock creations to answer with this platform's transient
+    /// create-contention error instead of touching the filesystem.
+    create_contention_remaining: Arc<AtomicUsize>,
     #[cfg(all(test, not(unix)))]
     allow_unsafe_mutations_for_tests: bool,
 }
@@ -700,6 +706,8 @@ impl FileTokenStore {
             lock_stale: DEFAULT_LOCK_STALE,
             #[cfg(test)]
             fail_heartbeat_spawn: false,
+            #[cfg(test)]
+            create_contention_remaining: Arc::new(AtomicUsize::new(0)),
             #[cfg(all(test, not(unix)))]
             allow_unsafe_mutations_for_tests: false,
         }
@@ -723,6 +731,43 @@ impl FileTokenStore {
     fn with_heartbeat_spawn_failure(mut self) -> Self {
         self.fail_heartbeat_spawn = true;
         self
+    }
+
+    /// Answer the next `count` lock creations with `PermissionDenied`, the
+    /// error a Windows lock name still pending deletion produces.
+    ///
+    /// Injected rather than staged on disk because that window cannot be
+    /// created portably: current Windows unlinks with POSIX semantics, so a
+    /// departing holder's name disappears at once and the replacement
+    /// `create_new` simply succeeds -- a fixture that stages nothing while
+    /// claiming to reproduce contention tests nothing.
+    #[cfg(test)]
+    fn with_create_contention(self, count: usize) -> Self {
+        self.create_contention_remaining
+            .store(count, Ordering::SeqCst);
+        self
+    }
+
+    /// Injected collisions not yet consumed, so a test can tell a retry loop
+    /// that ran from one that stopped at the first failure.
+    #[cfg(test)]
+    fn remaining_create_contention(&self) -> usize {
+        self.create_contention_remaining.load(Ordering::SeqCst)
+    }
+
+    /// [`create_lock_file_handle`] with a test-only injection seam.
+    fn create_lock_handle(&self, lock: &Path, stamp: &str) -> std::io::Result<File> {
+        #[cfg(test)]
+        if self
+            .create_contention_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        create_lock_file_handle(lock, stamp)
     }
 
     fn start_directory_lock_heartbeat(
@@ -1019,7 +1064,7 @@ impl FileTokenStore {
             if cancelled() {
                 return Err(cancelled_error());
             }
-            match create_lock_file_handle(lock, &stamp) {
+            match self.create_lock_handle(lock, &stamp) {
                 Ok(file) => {
                     return Ok(HeldLock { stamp, file });
                 }
