@@ -13795,7 +13795,8 @@ mod tests {
         }
 
         // Wrap the actual payload in a single-column datagram to use the
-        // existing independent decoder, including its no-bitmap sentinel rules.
+        // existing independent decoder, which transcribes the wire bytes
+        // without applying any sentinel interpretation of its own.
         let mut datagram = vec![0; QWP_MESSAGE_HEADER_SIZE];
         write_qwp_bytes(&mut datagram, b"t");
         write_qwp_varint(&mut datagram, values.len() as u64);
@@ -14157,6 +14158,11 @@ mod tests {
         buf.at_now().unwrap();
         let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
         let decoded = decode_datagram(&datagrams[0]).unwrap();
+        // The bitmap flag is what distinguishes the maximum value from the
+        // all-ones null sentinel on the wire. The decoder reports values
+        // straight from the payload, so the flag is the assertion that
+        // pins the fix; the decoded value alone looks the same either way.
+        assert!(decoded.table.columns[0].nullable);
         assert_eq!(
             decoded.table.rows[0][0],
             DecodedValue::Geohash {
