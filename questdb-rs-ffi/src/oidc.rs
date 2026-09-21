@@ -483,6 +483,18 @@ impl SharedOidcAuth {
     }
 
     fn close(&self) -> Result<(), Error> {
+        // Publish the close BEFORE waking anything. The wakes below release
+        // work that is parked mid-operation -- a sibling sign-in queued behind
+        // this auth's callback target resumes at its post-persistence
+        // `ensure_open()` -- and a wake issued first has no ordering against
+        // the publication, so that sibling could race past the check, complete,
+        // and cache a fresh credential into a provider the caller had already
+        // closed (after this call's own `discard_credentials` had run). Closing
+        // is documented as terminal and monotonic, so the flag a wake releases
+        // work against must already be set. `signal_close` takes only its own
+        // wait mutex -- never the acquisition lock or a callback gate -- so it
+        // cannot deadlock ahead of the wakes, including on a callback stack.
+        self.inner.signal_close();
         // Wake a callback for this auth that is queued behind a sibling built
         // from the same reusable builder. Without this, the sibling can hold
         // its acquisition lock while waiting for the shared callback gate, and
@@ -499,7 +511,6 @@ impl SharedOidcAuth {
             // per auth, so an unrelated sibling callback cannot weaken close.
             sink.detach_nowait();
         }
-        self.inner.signal_close();
         // A callback may delegate close to a worker and join that worker. The
         // worker is not in callback TLS, but draining there still deadlocks:
         // sign-in or persistence owns the acquisition lock until the callback
