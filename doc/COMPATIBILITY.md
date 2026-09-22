@@ -12,6 +12,14 @@ instead of inventing their own compatibility claims.
 | QWP over UDP (`udp::`) | A server release with QWP/UDP enabled | Best effort; no acknowledgement, authentication, or TLS |
 | ILP over HTTP/TCP | Unchanged from the 6.x client | Legacy compatibility transports; QWP additions do not change their server requirements |
 
+Store-and-forward without `sf_dir` splits an oversize chunk into
+deferred-commit frames and relies on the server withholding those frames'
+acknowledgements until the chunk commits, which first shipped in QuestDB
+10.0.0 ([questdb#7366](https://github.com/questdb/questdb/pull/7366)).
+QuestDB 9.4.1 through 9.4.3 accept the flag but acknowledge deferred frames,
+so a reconnect mid-chunk can silently drop the acknowledged prefix. Those
+releases are below the supported floor and must not be used with this client.
+
 HTTP Basic authentication and reconnect to one configured endpoint work with
 QuestDB Open Source and Enterprise. Bearer-token and OIDC authentication,
 multi-host failover, and durable acknowledgement require QuestDB Enterprise.

@@ -9,8 +9,9 @@
 //!   2. Read first batch from server #1.
 //!   3. Synchronise with the test harness via stdout/stdin (so Python
 //!      kills BOTH servers before we attempt the next batch).
-//!   4. Call `next_batch()` again — expect Err (the failover budget
-//!      exhausts because every reachable endpoint is now dead).
+//!   4. Call `next_batch()` until it returns Err (the failover budget
+//!      exhausts because every reachable endpoint is now dead). Complete
+//!      batches already buffered before the kill are tolerated.
 //!   5. Drop the cursor; the Reader is now "poisoned" (transport=None).
 //!   6. Call `reader.server_version()` — must return SocketError, not
 //!      panic.
@@ -93,20 +94,37 @@ fn main() {
             .read_line(&mut line)
             .expect("read stdin signal");
 
-        // Phase 3: next_batch must surface the exhaustion error. Any
-        // Ok variant means the failover machinery either silently
-        // succeeded (which it can't — every endpoint is dead) or
-        // returned a clean terminal (impossible without a healthy
-        // server delivering RESULT_END).
-        match cursor.next_batch() {
-            Ok(_) => die(
-                "exhaustion",
-                12,
-                "next_batch returned Ok after every endpoint was killed".into(),
-            ),
-            Err(e) => {
-                eprintln!("exhausted_code={:?} exhausted_msg={}", e.code(), e.msg());
-                e.code()
+        // Phase 3: next_batch must eventually surface the exhaustion
+        // error. The first post-kill read is allowed to return batches
+        // that were already received by the client or queued in the
+        // socket/WebSocket layer before the harness killed the servers.
+        // What must not happen is clean query completion: with every
+        // endpoint dead, `Ok(None)` means the test failed to interrupt
+        // the stream before the server delivered RESULT_END.
+        let mut post_kill_batches = 0usize;
+        loop {
+            match cursor.next_batch() {
+                Ok(Some(_)) => {
+                    post_kill_batches += 1;
+                }
+                Ok(None) => die(
+                    "exhaustion",
+                    12,
+                    format!(
+                        "query completed after every endpoint was killed \
+                         ({} post-kill batches drained)",
+                        post_kill_batches
+                    ),
+                ),
+                Err(e) => {
+                    eprintln!(
+                        "exhausted_code={:?} exhausted_msg={} post_kill_batches={}",
+                        e.code(),
+                        e.msg(),
+                        post_kill_batches
+                    );
+                    break e.code();
+                }
             }
         }
     };

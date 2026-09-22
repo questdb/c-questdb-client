@@ -261,7 +261,8 @@ pub enum line_sender_error_code {
     /// The host, port, or interface was incorrect.
     line_sender_error_could_not_resolve_addr = 0,
 
-    /// Called methods in the wrong order. E.g. `symbol` after `column`.
+    /// Called methods in the wrong order, such as writing a symbol after a
+    /// non-symbol column on an ILP buffer or calling `at` before any column.
     line_sender_error_invalid_api_call = 1,
 
     /// A network error connecting or flushing data out.
@@ -435,12 +436,12 @@ pub enum line_sender_error_code {
     /// matching on the message text.
     ///
     /// One exception to "that flush loses nothing", and it matters for resends: a chunk
-    /// too large for a single frame is split and each half published on its own,
-    /// so an earlier half can already be durably queued (store-and-forward is
-    /// at-least-once) when a later half hits the cap. The error is then
-    /// delivery-unknown rather than known-not-delivered — check
-    /// `line_sender_error_in_doubt` before resending, or the rows the committed
-    /// prefix already carried are duplicated.
+    /// too large for a single frame is split into several frames, published as
+    /// it goes, so earlier frames can already be durably queued
+    /// (store-and-forward is at-least-once) when a later frame hits the cap.
+    /// The error is then delivery-unknown rather than known-not-delivered —
+    /// check `line_sender_error_in_doubt` before resending, or the rows the
+    /// queued prefix already carried are duplicated.
     line_sender_error_symbol_dict_full = 37,
 }
 
@@ -1578,7 +1579,9 @@ pub unsafe extern "C" fn line_sender_buffer_table(
 }
 
 /// Record a symbol value for the given column.
-/// Make sure you record all the symbol columns before any other column type.
+/// For ILP buffers, record all symbol columns before any other column type.
+/// QWP buffers allow symbol and non-symbol columns in any order before the
+/// designated timestamp.
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
 /// @param[in] value Column value.

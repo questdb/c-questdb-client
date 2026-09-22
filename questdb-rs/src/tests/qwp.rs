@@ -172,6 +172,44 @@ fn qwp_udp_flushes_supported_rows_to_mock_receiver() -> TestResult {
 }
 
 #[test]
+fn qwp_udp_allows_symbols_after_non_symbol_columns() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_i64("qty", 4)?
+        .symbol("sym", "ETH-USD")?
+        .column_bool("active", true)?
+        .symbol("venue", "XNAS")?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["qty", "sym", "active", "venue"]
+    );
+    assert_eq!(
+        decoded.table.rows,
+        vec![vec![
+            DecodedValue::I64(4),
+            DecodedValue::Symbol("ETH-USD".to_owned()),
+            DecodedValue::Bool(true),
+            DecodedValue::Symbol("XNAS".to_owned()),
+        ]]
+    );
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_preserves_table_switch_order_for_batched_datagrams() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;
@@ -1825,7 +1863,7 @@ fn qwp_buffer_check_can_flush_tracks_public_state_machine() -> TestResult {
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert_eq!(
         err.msg(),
-        "State error: Bad call to `flush`, should have called `column` or `at` instead."
+        "State error: Bad call to `flush`, should have called `symbol`, `column` or `at` instead."
     );
 
     buffer.at_now()?;
@@ -2224,7 +2262,7 @@ fn qwp_buffer_rejects_flush_with_incomplete_row() -> TestResult {
     assert_err_contains(
         buffer.check_can_flush(),
         ErrorCode::InvalidApiCall,
-        "should have called `column` or `at` instead",
+        "should have called `symbol`, `column` or `at` instead",
     );
 
     // Complete the row — flush should now be allowed.

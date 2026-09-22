@@ -10,6 +10,7 @@ digraph line_sender_c_api {
   symbol -> column;
   symbol -> at;
   table -> column;
+  column -> symbol [label="QWP only"];
   column -> column;
   column -> at;
   at -> sender_flush;

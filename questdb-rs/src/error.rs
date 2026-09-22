@@ -48,7 +48,8 @@ pub enum ErrorCode {
     /// The host, port, or interface was incorrect.
     CouldNotResolveAddr,
 
-    /// Called methods in the wrong order. E.g. `symbol` after `column`.
+    /// Called methods in the wrong order, such as writing a symbol after a
+    /// non-symbol column on an ILP buffer or calling `at` before any column.
     InvalidApiCall,
 
     /// A network error connecting or flushing data out. **Transient** — obtain a
@@ -283,14 +284,13 @@ pub enum ErrorCode {
     ///   the plain return unless you mean to discard the tail.
     ///
     /// **One exception to "that flush loses nothing", and it matters for
-    /// resends.** A chunk too large for a
-    /// single frame is split, and each half is published on its own;
-    /// store-and-forward is at-least-once, so an earlier half can already be
-    /// durably queued when a later half hits the cap. Nothing is lost then
-    /// either, but the operation is no longer known-not-delivered: it is
-    /// reported as delivery-unknown, so **check [`in_doubt`](Error::in_doubt)
-    /// before resending** — a blind resend of the whole chunk duplicates the
-    /// rows the committed prefix already carried.
+    /// resends.** A chunk too large for a single frame is split into several
+    /// frames, published as it goes; store-and-forward is at-least-once, so
+    /// earlier frames can already be durably queued when a later frame hits
+    /// the cap. Nothing is lost then either, but the operation is no longer
+    /// known-not-delivered: it is reported as delivery-unknown, so **check
+    /// [`in_doubt`](Error::in_doubt) before resending** — a blind resend of
+    /// the whole chunk duplicates the rows the queued prefix already carried.
     ///
     /// Distinct from [`InvalidApiCall`](Self::InvalidApiCall) — a caller
     /// mistake with no recovery — so callers can recognise a full dictionary

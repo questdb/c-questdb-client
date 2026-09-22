@@ -389,7 +389,18 @@ enum BufferInner {
 /// A reusable row buffer.
 ///
 /// For ILP senders this exposes the existing byte-oriented buffer implementation.
-/// For QWP/UDP senders it dispatches to the QWP-specific row buffer.
+/// For QWP senders it dispatches to a QWP-specific row buffer.
+///
+/// # Sequential coupling
+///
+/// Each row starts with [`table`](Self::table), contains at least one
+/// [`symbol`](Self::symbol) or non-symbol column, and ends with [`at`](Self::at)
+/// or [`at_now`](Self::at_now). ILP buffers require all symbols before
+/// non-symbol columns. QWP buffers allow symbols and non-symbol columns in any
+/// order.
+///
+/// <img alt="Buffer sequential-coupling flowchart"
+/// src="https://raw.githubusercontent.com/questdb/c-questdb-client/main/api_seq/seq.svg">
 #[derive(Clone, Debug)]
 pub struct Buffer {
     inner: BufferInner,
@@ -755,7 +766,9 @@ impl Buffer {
 
     /// Adds a symbol column to the current row.
     ///
-    /// All symbol columns must be recorded before any non-symbol columns.
+    /// For ILP buffers, all symbol columns must be recorded before any
+    /// non-symbol columns. QWP buffers allow symbols and non-symbol columns in
+    /// any order before the designated timestamp.
     ///
     /// When the buffer is flushed over QWP/WebSocket, every distinct symbol
     /// recorded here is interned into the *same* connection-scoped dictionary

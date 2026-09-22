@@ -3471,7 +3471,10 @@ pub unsafe extern "C" fn qwp_sender_flush_buffer_and_keep_and_get_fsn(
 /// Deferred flushes keep one in-flight slot reserved for the later
 /// `qwp_direct_sender_commit` frame; if that reserve would be consumed, the
 /// call fails and the caller must sync before flushing more chunks. In SFA mode
-/// frames are non-deferred and `flush` success means local queue acceptance.
+/// `flush` success means local queue acceptance. A chunk too large for one
+/// frame is split: without `sf_dir` every frame but the last is deferred so
+/// the chunk commits once (earlier if the queue byte budget is tight); with
+/// `sf_dir` each frame commits on its own.
 ///
 /// On success, `chunk` is cleared and the call returns `true`. On failure,
 /// `chunk` is left untouched and `false` is returned (with `*err_out` set if
@@ -4869,8 +4872,9 @@ unsafe fn reexport_record_batch_into(
 
 /// Block until all in-flight frames are acknowledged at the requested
 /// `ack_level`. In direct mode this sends a commit-triggering frame first. In
-/// store-and-forward mode all data frames are already non-deferred, so sync
-/// waits for the local queue boundary published before the call.
+/// store-and-forward mode sync waits for the local queue boundary published
+/// before the call; a split chunk's deferred frames are covered by its
+/// committing frame's ack.
 ///
 /// `qwpws_ack_level_ok` waits for every in-flight frame's WAL-commit ack.
 /// `qwpws_ack_level_durable` requires QuestDB Enterprise and additionally
@@ -4880,9 +4884,11 @@ unsafe fn reexport_record_batch_into(
 /// ack/durable watermark — a back-pressured WAL or stuck commit — the wait
 /// returns `line_sender_error_failover_retry`. The deadline resets on every
 /// watermark advance, so a slow-but-progressing wait (e.g. a `durable` upload
-/// under pressure) is not cut off. The unacked frames are retained: drop the
-/// sender and re-borrow to replay (store-and-forward) or re-drive from source
-/// (direct).
+/// under pressure) is not cut off. Without `sf_dir`, an oversize chunk's split
+/// frames are acked only once its committing frame lands, so the watermark
+/// does not move mid-chunk; size the timeout for the largest chunk flushed.
+/// The unacked frames are retained: drop the sender and re-borrow to replay
+/// (store-and-forward) or re-drive from source (direct).
 ///
 /// `timeout` selects the bound: `Some` is the store-and-forward `wait`'s
 /// per-call no-progress deadline (`Duration::ZERO` waits forever); `None` is
