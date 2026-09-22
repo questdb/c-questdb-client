@@ -2710,6 +2710,46 @@ fn pop_value_cell_from<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, from: u32) -> Opt
     cells.pop_if(|cell| cell.row_idx >= from).map(|_| true)
 }
 
+/// Drops every fixed-width cell at row `from` or later.
+///
+/// Cells are stored in row order, and a row that wrote nothing has no cell,
+/// so the discarded tail starts at the first cell whose row number is at or
+/// past `from`. One discarded cell is popped. A longer tail is cut off in
+/// one step. Every such cell is a non-null value.
+#[cfg(feature = "_sender-qwp-ws")]
+fn discard_fixed_width_suffix<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, from: u32) -> u32 {
+    let len = cells.len();
+    if len == 0 || cells[len - 1].row_idx < from {
+        return 0;
+    }
+    if len == 1 || cells[len - 2].row_idx < from {
+        pop_value_cell_from(cells, from);
+        return 1;
+    }
+    let keep = cells.partition_point(|cell| cell.row_idx < from);
+    debug_assert!(keep < len);
+    debug_assert!(keep == 0 || cells[keep - 1].row_idx < from);
+    debug_assert!(cells[keep].row_idx >= from);
+    let removed = len - keep;
+    cells.truncate(keep);
+    u32::try_from(removed).expect("a column holds at most u32::MAX fixed-width cells")
+}
+
+/// Emptying the column unpins the precision this batch set, putting back
+/// the one it displaced. A rollback can only empty a column that was empty
+/// at the mark, so the displaced value is exactly the precision the column
+/// carried then.
+#[cfg(feature = "_sender-qwp-ws")]
+fn restore_displaced_geohash_precision(
+    cells_empty: bool,
+    precision_bits: &mut u8,
+    displaced_precision_bits: u8,
+) {
+    if cells_empty {
+        *precision_bits = displaced_precision_bits;
+    }
+}
+
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug)]
 pub(crate) struct QwpWsColumnarBuffer {
@@ -4090,9 +4130,13 @@ impl QwpWsColumnBuffer {
                 }
             }
         }
-        while let Some(non_null) = self.values.pop_cell_from(from) {
-            if non_null {
-                self.non_null_count -= 1;
+        if let Some(removed) = self.values.discard_fixed_width_from(from) {
+            self.non_null_count -= removed;
+        } else {
+            while let Some(non_null) = self.values.pop_cell_from(from) {
+                if non_null {
+                    self.non_null_count -= 1;
+                }
             }
         }
         // The scale is pinned by the first non-null value, so it only unpins
@@ -4707,6 +4751,45 @@ impl QwpWsColumnValues {
         }
     }
 
+    /// Drops fixed-width cells at row `from` or later.
+    ///
+    /// `None` means the column stores variable-width cells, which the caller
+    /// pops one by one. The count is the number of non-null values removed.
+    fn discard_fixed_width_from(&mut self, from: u32) -> Option<u32> {
+        let removed = match self {
+            Self::Bool { cells } => discard_fixed_width_suffix(cells, from),
+            Self::I8 { cells } => discard_fixed_width_suffix(cells, from),
+            Self::I16 { cells } => discard_fixed_width_suffix(cells, from),
+            Self::I32 { cells } => discard_fixed_width_suffix(cells, from),
+            Self::I64 { cells } => discard_fixed_width_suffix(cells, from),
+            Self::F32 { cells } => discard_fixed_width_suffix(cells, from),
+            Self::F64 { cells } => discard_fixed_width_suffix(cells, from),
+            Self::TimestampMicros { cells } => discard_fixed_width_suffix(cells, from),
+            Self::TimestampNanos { cells } => discard_fixed_width_suffix(cells, from),
+            Self::Uuid { cells } => discard_fixed_width_suffix(cells, from),
+            Self::Ipv4 { cells } => discard_fixed_width_suffix(cells, from),
+            Self::Date { cells } => discard_fixed_width_suffix(cells, from),
+            Self::Char { cells } => discard_fixed_width_suffix(cells, from),
+            Self::Geohash {
+                cells,
+                precision_bits,
+                displaced_precision_bits,
+            } => {
+                let removed = discard_fixed_width_suffix(cells, from);
+                if removed > 0 {
+                    restore_displaced_geohash_precision(
+                        cells.is_empty(),
+                        precision_bits,
+                        *displaced_precision_bits,
+                    );
+                }
+                removed
+            }
+            _ => return None,
+        };
+        Some(removed)
+    }
+
     /// Pops the tail cell if it belongs to row `from` or a later one, reporting
     /// whether it was non-null. `None` means no cell was popped.
     fn pop_cell_from(&mut self, from: u32) -> Option<bool> {
@@ -4739,13 +4822,11 @@ impl QwpWsColumnValues {
                 displaced_precision_bits,
             } => {
                 let popped = pop_value_cell_from(cells, from)?;
-                // Emptying the column unpins the precision this batch set,
-                // putting back the one it displaced. A rollback can only empty
-                // a column that was empty at the mark, so the displaced value
-                // is exactly the precision the column carried then.
-                if cells.is_empty() {
-                    *precision_bits = *displaced_precision_bits;
-                }
+                restore_displaced_geohash_precision(
+                    cells.is_empty(),
+                    precision_bits,
+                    *displaced_precision_bits,
+                );
                 Some(popped)
             }
             Self::Symbol {
