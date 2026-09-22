@@ -11560,6 +11560,29 @@ mod tests {
         );
     }
 
+    /// Symbol lookup for `table.column`. The column must be a symbol.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn symbol_lookup<'a>(
+        buf: &'a QwpWsColumnarBuffer,
+        table: &str,
+        column: &str,
+    ) -> &'a QwpWsLocalSymbolLookup {
+        let table_buf = buf
+            .tables
+            .iter()
+            .find(|candidate| candidate.table_name == table.as_bytes())
+            .unwrap_or_else(|| panic!("missing table {table}"));
+        let column_buf = table_buf
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == column.as_bytes())
+            .unwrap_or_else(|| panic!("missing column {column}"));
+        match &column_buf.values {
+            QwpWsColumnValues::Symbol { lookup, .. } => lookup,
+            _ => panic!("column {column} is not a symbol"),
+        }
+    }
+
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_rollback_removes_new_symbol_from_current_row() {
@@ -11575,13 +11598,33 @@ mod tests {
             .unwrap()
             .at_now()
             .unwrap();
+        // The committed symbol is the only value for its hash.
+        let buckets = &symbol_lookup(&buf, "trades", "sym").buckets;
+        assert_eq!(buckets.len(), 1);
+        assert!(matches!(
+            buckets.values().next(),
+            Some(QwpWsLocalSymbolBucket::One(_))
+        ));
 
-        buf.table("trades")
-            .unwrap()
-            .symbol("sym", "ROLLBACK")
-            .unwrap();
-        let err = buf.column_bool("qty", true).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        // Each rejected symbol is new, so it occupies its own singleton
+        // bucket. After the row is rejected only the committed symbol's
+        // bucket remains.
+        for i in 0..8 {
+            let symbol = format!("rejected-{i}");
+            buf.table("trades").unwrap().symbol("sym", &symbol).unwrap();
+            let err = buf.column_bool("qty", true).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+            let buckets = &symbol_lookup(&buf, "trades", "sym").buckets;
+            assert_eq!(
+                buckets.len(),
+                1,
+                "rejected symbol {symbol} left a lookup bucket behind"
+            );
+            assert!(matches!(
+                buckets.values().next(),
+                Some(QwpWsLocalSymbolBucket::One(_))
+            ));
+        }
 
         buf.table("trades")
             .unwrap()
@@ -11591,6 +11634,7 @@ mod tests {
             .unwrap()
             .at_now()
             .unwrap();
+        assert_eq!(symbol_lookup(&buf, "trades", "sym").buckets.len(), 2);
 
         buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
             .unwrap();
