@@ -512,6 +512,77 @@ fn cancel_sign_in_aborts_only_the_current_device_flow() {
 }
 
 #[test]
+fn clear_fails_fast_behind_an_interactive_sign_in() {
+    // A device flow holds the acquisition lock for up to the device-code
+    // lifetime. `try_clear` used to wait for all of it -- uninterruptibly, with
+    // only `close` as an escape -- which hung a binding that released its
+    // runtime lock (and with it signal delivery) around the call.
+    let (polling_tx, polling_rx) = mpsc::sync_channel(1);
+    let authorized = Arc::new(AtomicBool::new(false));
+    let mock = {
+        let authorized = Arc::clone(&authorized);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if authorized.load(Ordering::Acquire) => (
+                200,
+                r#"{"access_token":"AT-after-clear","expires_in":300}"#.to_string(),
+            ),
+            ("POST", "/token") => {
+                let _ = polling_tx.try_send(());
+                (400, r#"{"error":"authorization_pending"}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build auth"),
+    );
+    let worker_auth = Arc::clone(&auth);
+    let worker = std::thread::spawn(move || worker_auth.sign_in());
+    polling_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sign-in did not reach token polling");
+    assert!(auth.interactive_sign_in_in_progress());
+
+    let started = Instant::now();
+    let error = auth
+        .try_clear()
+        .expect_err("clear must not run behind a device flow");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "clear waited behind the interactive sign-in"
+    );
+    assert_eq!(error.kind(), OidcErrorKind::Cancelled);
+    assert!(error.message().contains("Nothing was cleared"));
+    assert!(!auth.is_closed(), "a refused clear must not close auth");
+
+    // The sign-in it refused to wait for is unaffected and completes.
+    authorized.store(true, Ordering::Release);
+    worker
+        .join()
+        .expect("sign-in thread panicked")
+        .expect("the sign-in must be unaffected by the refused clear");
+    assert!(!auth.interactive_sign_in_in_progress());
+    assert_eq!(auth.token().unwrap(), "AT-after-clear");
+
+    // With no device flow running, clear proceeds as before.
+    auth.try_clear().expect("clear after the sign-in");
+    assert_eq!(
+        auth.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+}
+
+#[test]
 fn close_cancels_file_store_lock_wait() {
     let dir = TempDir::new().unwrap();
     let store = test_file_store(dir.path());

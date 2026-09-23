@@ -1362,3 +1362,91 @@ fn test_buffer_protocol_version1_not_support_array() -> TestResult {
     );
     Ok(())
 }
+
+const PROXY_ENV_CHILD_TEST: &str = "tests::http::http_flush_ignores_proxy_env_child";
+const PROXY_ENV_CHILD_MARKER: &str = "QDB_TEST_HTTP_PROXY_ENV_CHILD";
+
+/// Child half of [`test_http_flush_ignores_proxy_env`]. It needs a proxy in
+/// its environment, and mutating the environment of the multi-threaded test
+/// harness is unsound, so the parent re-runs this binary with one set.
+#[test]
+#[ignore = "child process of test_http_flush_ignores_proxy_env"]
+fn http_flush_ignores_proxy_env_child() -> TestResult {
+    if std::env::var_os(PROXY_ENV_CHILD_MARKER).is_none() {
+        return Ok(());
+    }
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_http()
+        // Skip the /settings probe, which this mock does not answer.
+        .protocol_version(ProtocolVersion::V2)?
+        // A refused connection is retryable; fail on the first one instead of
+        // spending the default ten-second budget reporting it.
+        .retry_timeout(Duration::ZERO)?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body(), buffer2.as_bytes());
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+    // With the proxy honoured half-way the request never leaves the client,
+    // so the server thread would wait in accept() forever: report the flush
+    // failure without joining it.
+    sender.flush(&mut buffer)?;
+    _ = server_thread.join().unwrap()?;
+    assert!(buffer.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_http_flush_ignores_proxy_env() -> TestResult {
+    // Point every proxy variable ureq reads at a port nothing listens on.
+    // Honouring it would fail to connect; half-honouring it -- ureq's default
+    // proxy config with no proxy connector in the chain -- used to fail every
+    // flush with "Connection refused" without dialling anything at all.
+    let dead_proxy = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        format!("http://127.0.0.1:{}", listener.local_addr()?.port())
+    };
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .arg(PROXY_ENV_CHILD_TEST)
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(PROXY_ENV_CHILD_MARKER, "1")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
+    for name in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        command.env(name, &dead_proxy);
+    }
+    let output = command.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "flush failed with a proxy in the environment:\n{stdout}\n{stderr}"
+    );
+    // Guard against a filter that silently matches nothing.
+    assert!(
+        stdout.contains("1 passed"),
+        "the child test did not run:\n{stdout}\n{stderr}"
+    );
+    Ok(())
+}

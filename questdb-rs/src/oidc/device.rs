@@ -85,6 +85,22 @@ const DEFAULT_INTERVAL: u64 = 5;
 const ACQUIRE_WAIT_TIMEOUT_MULTIPLE: u32 = 6;
 const ACQUIRE_WAIT_POLL_SLICE: Duration = Duration::from_millis(50);
 
+/// What a lifecycle operation waiting for the acquisition lock does when the
+/// holder is an interactive device flow, which can keep it for the whole
+/// device-code lifetime.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InteractiveHolder {
+    /// Queue behind it (a second `sign_in`).
+    Wait,
+    /// Fail fast, as `token()` does (`clear`).
+    Fail,
+}
+
+const CLEAR_BEHIND_SIGN_IN_MESSAGE: &str = "OIDC clear() did not run: an interactive sign-in is in \
+     progress on another thread and holds this provider for up to the device \
+     code's lifetime. Nothing was cleared. Cancel the sign-in with cancel_sign_in(), \
+     or retry clear() once it completes.";
+
 // Stampede guards for token()'s transport-facing hot path. An explicit sign_in()
 // clears both so a user-initiated recovery is never throttled.
 const MIN_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -589,7 +605,8 @@ impl OidcDeviceAuthBuilder {
 /// valid cached token does not wait for that critical section; a
 /// [`token`](Self::token) call waits for a bounded period behind another caller's
 /// silent refresh, but fails fast with `InteractionRequired` behind an interactive
-/// sign-in. A custom [`Renderer`]'s
+/// sign-in; [`try_clear`](Self::try_clear) likewise fails fast rather than wait
+/// out a device flow. A custom [`Renderer`]'s
 /// callbacks (and the `sleep` hook) run while this lock is held. They must not
 /// re-enter [`sign_in`](Self::sign_in) or [`clear`](Self::clear) on the same
 /// instance because that lock is not re-entrant. Re-entrant `token()` calls fail
@@ -762,6 +779,17 @@ impl OidcDeviceAuth {
         self.closed.load(AtomicOrdering::Acquire)
     }
 
+    /// Whether an interactive device flow is currently running in
+    /// [`sign_in`](Self::sign_in) on some thread.
+    ///
+    /// An integration hook for bindings that must classify the fail-fast
+    /// [`try_clear`](Self::try_clear) refusal consistently with their own
+    /// busy errors. The answer is a snapshot and may change immediately.
+    #[doc(hidden)]
+    pub fn interactive_sign_in_in_progress(&self) -> bool {
+        self.interactive_in_progress.load(AtomicOrdering::Acquire)
+    }
+
     /// Cancel the interactive device flow currently running in [`sign_in`](Self::sign_in).
     ///
     /// Unlike [`close`](Self::close), this is attempt-scoped: it does not close
@@ -890,6 +918,13 @@ impl OidcDeviceAuth {
     ///
     /// This only deletes local client credentials; it does **not** revoke access,
     /// ID, or refresh tokens at the identity provider.
+    ///
+    /// It waits for a peer's short cache/store/refresh work, but never behind
+    /// an interactive [`sign_in`](Self::sign_in) on another thread, which can
+    /// hold this provider for the whole device-code lifetime. In that case it
+    /// returns a [`Cancelled`](crate::oidc::OidcErrorKind::Cancelled) error
+    /// immediately and clears nothing; cancel the sign-in with
+    /// [`cancel_sign_in`](Self::cancel_sign_in) or retry once it completes.
     pub fn try_clear(&self) -> Result<()> {
         self.try_clear_inner(None)
     }
@@ -928,7 +963,12 @@ impl OidcDeviceAuth {
         let _acq = if started_closed {
             self.acquire_for_teardown()
         } else {
-            self.acquire_for_operation(abort_wait)?
+            // Never behind a device flow: it holds the acquisition lock for up
+            // to the whole device-code lifetime (30 minutes), and a caller
+            // blocked here has no way out short of `close()`. A binding that
+            // released its runtime lock around this call (the GIL, say) would
+            // also have no signal delivery for all of it.
+            self.acquire_for_operation(abort_wait, InteractiveHolder::Fail)?
         };
         if !started_closed {
             self.ensure_open()?;
@@ -1154,6 +1194,7 @@ impl OidcDeviceAuth {
     fn acquire_for_operation(
         &self,
         abort_wait: Option<&dyn Fn() -> bool>,
+        interactive_holder: InteractiveHolder,
     ) -> Result<std::sync::MutexGuard<'_, ()>> {
         let check_abort = || -> Result<()> {
             self.ensure_open()?;
@@ -1161,6 +1202,11 @@ impl OidcDeviceAuth {
                 return Err(OidcError::cancelled(
                     "The OIDC acquisition wait was aborted by the host binding.",
                 ));
+            }
+            if interactive_holder == InteractiveHolder::Fail
+                && self.interactive_sign_in_in_progress()
+            {
+                return Err(OidcError::cancelled(CLEAR_BEHIND_SIGN_IN_MESSAGE));
             }
             Ok(())
         };
@@ -1302,7 +1348,10 @@ impl OidcDeviceAuth {
         // refreshes or double-prompt. A transport-facing token lookup waits for a
         // bounded period behind a silent refresh, but never behind a device flow.
         let _acq = if allow_interaction {
-            self.acquire_for_operation(abort_wait)?
+            // A second sign_in() queues behind the first, as Java's does: both
+            // want the same outcome, and the second is served from the cache
+            // the first one fills.
+            self.acquire_for_operation(abort_wait, InteractiveHolder::Wait)?
         } else {
             self.acquire_for_token()?
         };

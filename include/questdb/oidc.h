@@ -633,10 +633,18 @@ questdb_oidc_token* questdb_oidc_auth_token(
 
 /**
  * Clear the in-memory credential and delete its persisted local entry, if any.
- * The in-memory credential is always cleared. Returns false with an OIDC error
- * when persisted deletion fails, because the credential may remain usable by a
- * new auth object or after process restart. This does not revoke any token at
- * the identity provider.
+ * Once the call runs, the in-memory credential is always cleared. Returns false
+ * with an OIDC error when persisted deletion fails, because the credential may
+ * remain usable by a new auth object or after process restart. This does not
+ * revoke any token at the identity provider.
+ *
+ * Never waits behind an interactive sign-in. A device flow running in
+ * `questdb_oidc_auth_sign_in` on another thread holds the provider for up to
+ * the device code's lifetime (30 minutes), so this fails immediately with
+ * `questdb_error_invalid_api_call` and clears NOTHING -- the same class it gets
+ * while that sign-in's event callback is running. Cancel the sign-in with
+ * `questdb_oidc_auth_cancel_sign_in` first, or retry once it completes. A
+ * shorter silent refresh on another thread is waited out.
  *
  * Remains available after `questdb_oidc_auth_close`, which drops the in-memory
  * credential but leaves the persisted entry: clearing is the only way to remove

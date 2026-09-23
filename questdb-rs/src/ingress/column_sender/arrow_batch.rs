@@ -229,8 +229,9 @@ pub(crate) enum ColumnKind {
     LargeBinary,
     BinaryView,
     /// FixedSizeBinary with no declared QuestDB kind: opaque bytes,
-    /// forwarded verbatim as a BINARY (blob) column.
-    FsbToBinary,
+    /// forwarded verbatim as a BINARY (blob) column. Carries the element
+    /// width so the frame-size estimate can reserve the exact payload.
+    FsbToBinary(usize),
     Uuid,
     Long256,
     /// UUID claimed on a `Binary`/`LargeBinary`/`BinaryView` column (what
@@ -674,7 +675,15 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
                 }
                 ColumnKind::Long256
             } else {
-                ColumnKind::FsbToBinary
+                let width = usize::try_from(*w).map_err(|_| {
+                    fmt!(
+                        ArrowIngest,
+                        "column '{}': FixedSizeBinary width {} is negative",
+                        field.name(),
+                        w
+                    )
+                })?;
+                ColumnKind::FsbToBinary(width)
             }
         }
         (DataType::Dictionary(key, value), _, _)
@@ -811,7 +820,7 @@ pub(crate) fn wire_type_byte(kind: ColumnKind, _has_nulls: bool) -> u8 {
         | ColumnKind::SymbolDict { .. } => QWP_TYPE_SYMBOL,
         ColumnKind::Binary | ColumnKind::LargeBinary | ColumnKind::BinaryView => QWP_TYPE_BINARY,
         ColumnKind::Uuid | ColumnKind::UuidFromVarBinary => QWP_TYPE_UUID,
-        ColumnKind::FsbToBinary => QWP_TYPE_BINARY,
+        ColumnKind::FsbToBinary(_) => QWP_TYPE_BINARY,
         ColumnKind::Long256 | ColumnKind::Long256FromVarBinary => QWP_TYPE_LONG256,
         ColumnKind::Geohash(_) => QWP_TYPE_GEOHASH,
         ColumnKind::Decimal32WidenToDecimal64 | ColumnKind::Decimal64 => QWP_TYPE_DECIMAL64,
@@ -842,7 +851,7 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
             | ColumnKind::Binary
             | ColumnKind::LargeBinary
             | ColumnKind::BinaryView
-            | ColumnKind::FsbToBinary
+            | ColumnKind::FsbToBinary(_)
             | ColumnKind::Uuid
             | ColumnKind::Long256
             | ColumnKind::UuidFromVarBinary
@@ -1301,6 +1310,73 @@ where
             out.extend_from_slice(v);
         }
     }
+    Ok(())
+}
+
+/// Dense (no-null) unlabeled FixedSizeBinary as a QWP BINARY body: the
+/// offset table is an arithmetic progression, and the values are already
+/// contiguous, so both are written in bulk instead of row by row.
+fn write_fsb_binary_no_null(
+    out: &mut Vec<u8>,
+    arr: &FixedSizeBinaryArray,
+    elem: usize,
+) -> Result<()> {
+    const LABEL: &str = "FixedSizeBinary column";
+    let rows = arr.len();
+    let data_len = rows.checked_mul(elem).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{}: {} rows * width {} overflows usize",
+            LABEL,
+            rows,
+            elem
+        )
+    })?;
+    // Same bound the per-row path enforces through its checked cumulative
+    // offset: every offset, the last included, must fit the u32 wire field.
+    if u32::try_from(data_len).is_err() {
+        return Err(fmt!(
+            ArrowIngest,
+            "{}: cumulative offset overflow ({} rows * width {} bytes exceeds u32::MAX)",
+            LABEL,
+            rows,
+            elem
+        ));
+    }
+    // A sliced FixedSizeBinaryArray re-slices `value_data` itself, so row 0
+    // always starts at byte 0 -- exactly what `value(row)` reads.
+    let data = arr.value_data().get(..data_len).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{}: value buffer {} shorter than {} rows * width {}",
+            LABEL,
+            arr.value_data().len(),
+            rows,
+            elem
+        )
+    })?;
+    let offsets_bytes = 4usize.checked_mul(rows + 1).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{}: offset table size overflow ({} rows)",
+            LABEL,
+            rows
+        )
+    })?;
+    let total = offsets_bytes
+        .checked_add(data_len)
+        .ok_or_else(|| fmt!(ArrowIngest, "{}: offsets+bytes reservation overflow", LABEL))?;
+    try_reserve_bytes(out, total, LABEL)?;
+    let base = out.len();
+    out.resize(base + offsets_bytes, 0);
+    // `rows * elem` fits u32 (checked above), so neither the width nor any
+    // `i * width` with `i <= rows` can wrap. With zero rows the loop writes
+    // only the leading 0 and the width is never used.
+    let width = elem as u32;
+    for (i, slot) in out[base..].chunks_exact_mut(4).enumerate() {
+        slot.copy_from_slice(&((i as u32).wrapping_mul(width)).to_le_bytes());
+    }
+    out.extend_from_slice(data);
     Ok(())
 }
 
@@ -3669,24 +3745,28 @@ pub(crate) fn write_arrow_column_body(
         ColumnKind::Long256FromVarBinary => {
             write_fixed_from_var_binary_payload(out, arr, 32, false, "LONG256 column")
         }
-        ColumnKind::FsbToBinary => {
+        ColumnKind::FsbToBinary(_) => {
             let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
             let elem = a.value_length() as usize;
-            let bound = a.len().checked_mul(elem).ok_or_else(|| {
-                fmt!(
-                    ArrowIngest,
-                    "FixedSizeBinary column: {} rows * width {} overflows usize",
-                    a.len(),
-                    elem
+            if !use_bitmap {
+                write_fsb_binary_no_null(out, a, elem)
+            } else {
+                let bound = a.len().checked_mul(elem).ok_or_else(|| {
+                    fmt!(
+                        ArrowIngest,
+                        "FixedSizeBinary column: {} rows * width {} overflows usize",
+                        a.len(),
+                        elem
+                    )
+                })?;
+                write_varlen_u32_offsets_with_bitmap(
+                    out,
+                    arr,
+                    "FixedSizeBinary column",
+                    Some(bound),
+                    emit_bytes_row_no_reserve(|row| Ok(a.value(row))),
                 )
-            })?;
-            write_varlen_u32_offsets_with_bitmap(
-                out,
-                arr,
-                "FixedSizeBinary column",
-                Some(bound),
-                emit_bytes_row_no_reserve(|row| Ok(a.value(row))),
-            )
+            }
         }
         ColumnKind::Long256 => {
             let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
@@ -4253,10 +4333,14 @@ fn estimate_frame_size(
             | ColumnKind::LargeUtf8
             | ColumnKind::Utf8View
             | ColumnKind::DictToVarchar { .. } => 4 * (row_count + 1) + 16 * row_count,
-            ColumnKind::Binary
-            | ColumnKind::LargeBinary
-            | ColumnKind::BinaryView
-            | ColumnKind::FsbToBinary => 4 * (row_count + 1) + 16 * row_count,
+            ColumnKind::Binary | ColumnKind::LargeBinary | ColumnKind::BinaryView => {
+                4 * (row_count + 1) + 16 * row_count
+            }
+            // Exact for a dense column, an upper bound with nulls: the
+            // payload of a fixed-width column is known, unlike the generic
+            // 16-bytes-per-row guess above, which under-reserved any width
+            // over 16 by (width - 16) bytes per row.
+            ColumnKind::FsbToBinary(width) => 4 * (row_count + 1) + width.saturating_mul(row_count),
             ColumnKind::SymbolUtf8
             | ColumnKind::SymbolLargeUtf8
             | ColumnKind::SymbolUtf8View
@@ -6502,6 +6586,95 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(ty, QWP_TYPE_BINARY);
         assert_eq!(decode_binary_body(body, 1), vec![Some(vec![0xA5u8; 8])]);
+    }
+
+    fn fsb_rows(width: usize, rows: usize, null_every: Option<usize>) -> FixedSizeBinaryArray {
+        let mut b = FixedSizeBinaryBuilder::new(width as i32);
+        for row in 0..rows {
+            if null_every.is_some_and(|n| row % n == 0) {
+                b.append_null();
+            } else {
+                let value: Vec<u8> = (0..width).map(|i| (row * 31 + i) as u8).collect();
+                b.append_value(&value).unwrap();
+            }
+        }
+        b.finish()
+    }
+
+    fn expected_fsb_rows(arr: &FixedSizeBinaryArray) -> Vec<Option<Vec<u8>>> {
+        (0..arr.len())
+            .map(|row| (!arr.is_null(row)).then(|| arr.value(row).to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn unlabeled_fsb_dense_and_sparse_paths_round_trip() {
+        // The dense column takes the bulk path (progression offsets + one
+        // copy); the nullable one keeps the per-row bitmap path. Both must
+        // produce the same BINARY body a per-row encoder would.
+        for width in [1usize, 5, 16, 32, 100] {
+            for null_every in [None, Some(3)] {
+                let arr = fsb_rows(width, 17, null_every);
+                let expected = expected_fsb_rows(&arr);
+                let field = Field::new("c", DataType::FixedSizeBinary(width as i32), true);
+                let out = encode(&single_col_batch(field, arr));
+                let (n, ty, body) = decode_single_column(&out);
+                assert_eq!(n, 17);
+                assert_eq!(ty, QWP_TYPE_BINARY);
+                assert_eq!(
+                    decode_binary_body(body, n),
+                    expected,
+                    "width {width}, null_every {null_every:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unlabeled_fsb_dense_path_writes_progression_offsets() {
+        let arr = fsb_rows(32, 4, None);
+        let mut out = Vec::new();
+        write_fsb_binary_no_null(&mut out, &arr, 32).unwrap();
+        let offsets: Vec<u32> = out[..20]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(offsets, vec![0, 32, 64, 96, 128]);
+        assert_eq!(&out[20..], arr.value_data());
+    }
+
+    #[test]
+    fn unlabeled_fsb_estimate_covers_the_encoded_frame() {
+        // The generic BINARY estimate assumed 16 payload bytes per row, which
+        // under-reserved every wider FixedSizeBinary and forced a whole-frame
+        // reallocation mid-encode.
+        let rows = 1000;
+        for width in [8usize, 16, 32, 100] {
+            for null_every in [None, Some(4)] {
+                let arr = fsb_rows(width, rows, null_every);
+                let field = Field::new("c", DataType::FixedSizeBinary(width as i32), true);
+                let kind = classify(&field, &arr).unwrap();
+                assert!(matches!(kind, ColumnKind::FsbToBinary(w) if w == width));
+                let batch = single_col_batch(field, arr);
+                let encoded = encode(&batch).len();
+                let classified = [ClassifiedColumn {
+                    name: col_name("c"),
+                    kind,
+                    arr: batch.column(0).as_ref(),
+                }];
+                let resolution = ArrowSymbolResolution {
+                    delta_start: 0,
+                    new_symbols: Vec::new(),
+                    per_column: vec![None],
+                };
+                let estimated =
+                    estimate_frame_size(&classified, &resolution, false, rows, tbl("t"));
+                assert!(
+                    estimated >= encoded,
+                    "width {width}, null_every {null_every:?}: estimated {estimated} < encoded {encoded}"
+                );
+            }
+        }
     }
 
     #[test]

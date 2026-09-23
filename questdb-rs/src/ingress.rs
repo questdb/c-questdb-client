@@ -2988,6 +2988,16 @@ impl SenderBuilder {
 
                 let agent_builder = ureq::Agent::config_builder()
                     .user_agent(user_agent)
+                    // `Config::default()` sets `proxy: Proxy::try_from_env()`
+                    // (ALL_PROXY / HTTPS_PROXY / HTTP_PROXY, either case), but
+                    // the connector chain below is TcpConnector -> TlsConnector
+                    // with no proxy connector. With a proxy in the environment
+                    // ureq then hands TcpConnector an empty address list and
+                    // every flush fails with a bare "Connection refused"
+                    // without dialling anything -- neither QuestDB nor the
+                    // proxy. Ignore proxies explicitly, as the OIDC client
+                    // does (`oidc/http.rs`), rather than half-honour them.
+                    .proxy(None)
                     .no_delay(true);
 
                 let tls_config = match tls_settings {

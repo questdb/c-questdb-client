@@ -473,12 +473,37 @@ impl SharedOidcAuth {
         self.inner.token().map_err(Into::into)
     }
 
+    /// `clear` behind an interactive sign-in on another thread.
+    ///
+    /// The core already refuses this rather than wait out a device flow (up to
+    /// the whole device-code lifetime, with no escape short of `close`). It is
+    /// raised here first only to keep the C class uniform: the same sign-in
+    /// rejects `clear` with `InvalidApiCall` while its renderer is painting
+    /// (`callback_busy_error`), and a caller must not see a different code
+    /// depending on whether the flow was mid-paint or between polls.
+    fn clear_behind_sign_in_error() -> Error {
+        Error::new(
+            ErrorCode::InvalidApiCall,
+            "OIDC authentication is busy: an interactive sign-in is in progress on another \
+             thread, and clear would wait for up to the device code's lifetime. Nothing \
+             was cleared. Cancel the sign-in with cancel_sign_in, or retry clear once it \
+             completes."
+                .to_string(),
+        )
+    }
+
     fn clear(&self) -> Result<(), Error> {
         self.reject_callback_reentry()?;
         // Close the admission race just as sign_in does: clear may already be
         // waiting for the core acquisition mutex when a renderer or diagnostic
         // callback becomes active and joins this thread.
-        let abort_wait = || self.callback_reentry_error();
+        let abort_wait = || {
+            self.callback_reentry_error().or_else(|| {
+                self.inner
+                    .interactive_sign_in_in_progress()
+                    .then(Self::clear_behind_sign_in_error)
+            })
+        };
         self.inner.try_clear_with_acquire_abort(&abort_wait)
     }
 

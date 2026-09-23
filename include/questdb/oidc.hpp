@@ -368,6 +368,12 @@ public:
      * Throws oidc::error if persisted deletion fails; memory is still cleared.
      * This does not revoke any token at the identity provider.
      *
+     * Never waits behind an interactive sign_in() on another thread, which can
+     * hold the provider for up to the device code's lifetime: it throws
+     * `questdb::error` with `error_code::invalid_api_call` immediately and
+     * clears NOTHING. Call cancel_sign_in() first, or retry once the sign-in
+     * completes.
+     *
      * Affects the SHARED state, not just this handle: every handle from
      * `share()`, and every attached sender, reader and pool, loses the
      * credential too.
@@ -715,10 +721,29 @@ public:
     /**
      * Install a renderer event handler. It runs inside the foreground
      * `sign_in()` call; persistence warnings use `diagnostic_handler` instead.
-     * Calls are serialized across auth objects built by this builder. Starting
-     * another auth operation that shares this handler from inside the callback
-     * fails with invalid_api_call. Destruction of captured state may occur on
-     * whichever thread releases the final auth/transport reference.
+     * Calls are serialized across auth objects built by this builder.
+     *
+     * While the callback is running, auth operations that would need the
+     * acquisition lock fail rather than deadlock -- from the callback's own
+     * thread and from any other thread alike (see `questdb_oidc_event_cb` in
+     * `oidc.h`, which this mirrors). They do NOT all fail the same way:
+     *
+     * - `sign_in()` and `clear()` throw `questdb::error` with
+     *   `error_code::invalid_api_call`.
+     * - `token()`, and every token pull an attached sender, reader or pool
+     *   makes (including a background reconnect), fail with the RETRYABLE
+     *   `error_code::socket_error`, carrying OIDC kind `interaction_required`
+     *   -- unless a valid cached token is available, in which case `token()`
+     *   simply succeeds. `token()` throws `questdb::oidc::error`; a transport
+     *   reports it through its own error path. Do not treat it as terminal:
+     *   the condition clears as soon as the callback returns, and a terminal
+     *   class here would stop a background reconnect for good and strand a
+     *   store-and-forward queue behind a prompt that was still being painted.
+     * - `cancel_sign_in()` and `close()` are never rejected.
+     *
+     * Return from the callback before starting another auth operation.
+     * Destruction of captured state may occur on whichever thread releases the
+     * final auth/transport reference.
      *
      * An empty std::function is rejected synchronously. Exceptions thrown by
      * the handler are contained at the C boundary and ignored; handle callback
@@ -752,8 +777,10 @@ public:
     /** Install a serialized persistence diagnostic handler. The callback may
      * run on a background token-provider thread and must return promptly.
      * Acquisition-taking auth/transport operations sharing this handler are
-     * rejected from the callback; cached token reads, cancellation and close
-     * remain safe. */
+     * rejected while it runs, with the same per-operation error classes as
+     * `event_handler` documents (`invalid_api_call` for sign_in/clear, the
+     * retryable `socket_error` for token pulls); cached token reads,
+     * cancellation and close remain safe. */
     builder& diagnostic_handler(
         std::function<void(const diagnostic_view&)> handler)
     {

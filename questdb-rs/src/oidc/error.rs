@@ -71,8 +71,10 @@ pub enum OidcErrorKind {
 
     /// The current interactive sign-in was cancelled, or the authentication
     /// provider was permanently closed while an operation was waiting for
-    /// device authorization or token-store coordination. Inspect the operation
-    /// and message to distinguish attempt cancellation from provider closure.
+    /// device authorization or token-store coordination, or `try_clear` refused
+    /// to wait behind an interactive sign-in running on another thread (and
+    /// cleared nothing). Inspect the operation and message to distinguish
+    /// these.
     Cancelled,
 }
 
