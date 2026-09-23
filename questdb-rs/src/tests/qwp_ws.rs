@@ -1718,7 +1718,13 @@ fn spawn_blocked_background_orphan_send_server() -> (
             thread::yield_now();
         }
         send_started_tx.send(()).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        // Expiry invalidates the blocked-send premise; the test joins this
+        // thread to surface it. Disconnection is allowed for panic cleanup.
+        assert_ne!(
+            release_rx.recv_timeout(Duration::from_secs(10)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "blocked-send mock expired before explicit release"
+        );
     });
 
     (port, send_started_rx, release_tx, server)
