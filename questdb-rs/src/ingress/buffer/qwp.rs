@@ -2648,6 +2648,9 @@ enum QwpWsColumnValues {
         precision_bits: u8,
         /// The precision `precision_bits` displaced when the current batch
         /// pinned it, restored if a rollback empties the column again.
+        ///
+        /// Invariant: while `cells` is empty this equals `precision_bits`, so
+        /// restoring it on an empty column is a no-op.
         displaced_precision_bits: u8,
     },
     LongArray {
@@ -2738,7 +2741,8 @@ fn discard_fixed_width_suffix<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, from: u32)
 /// Emptying the column unpins the precision this batch set, putting back
 /// the one it displaced. A rollback can only empty a column that was empty
 /// at the mark, so the displaced value is exactly the precision the column
-/// carried then.
+/// carried then. A column that is already empty holds a displaced value equal
+/// to its precision, so calling this without removing a cell changes nothing.
 #[cfg(feature = "_sender-qwp-ws")]
 fn restore_displaced_geohash_precision(
     cells_empty: bool,
@@ -4670,13 +4674,21 @@ impl QwpWsColumnValues {
             Self::Ipv4 { cells } => cells.clear(),
             Self::Date { cells } => cells.clear(),
             Self::Char { cells } => cells.clear(),
-            Self::Geohash { cells, .. } => {
+            Self::Geohash {
+                cells,
+                precision_bits,
+                displaced_precision_bits,
+            } => {
                 // Keep the pinned precision across clears. The next batch's
                 // first value re-pins it (see `append_geohash`); if the reused
                 // column is omitted entirely, the retained precision keeps the
                 // all-null column's wire encoding valid (precision 0 is
                 // rejected by the server).
                 cells.clear();
+                // An empty column displaces nothing: sync the displaced value
+                // so a rollback that empties it can never restore a precision
+                // left over from an earlier batch.
+                *displaced_precision_bits = *precision_bits;
             }
             Self::Symbol {
                 cells,
@@ -11177,6 +11189,56 @@ mod tests {
                 ws_replay_bytes(&mut buf),
                 ws_replay_bytes(&mut reference),
                 "{api}: a row appended after the rewind must repin the precision"
+            );
+        }
+    }
+
+    /// A rewind that discards only rows without a geohash value must leave a
+    /// reused column's retained precision alone. Nothing repinned it in this
+    /// batch, so there is nothing to restore: resetting it to the value it
+    /// held before its first-ever batch would encode precision 0, which the
+    /// server rejects.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_without_geohash_rows_keeps_retained_precision() {
+        fn write_without_geohash(buf: &mut QwpWsColumnarBuffer) {
+            buf.table("trades")
+                .unwrap()
+                .column_i64("n", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        for api in ["marker", "bookmark"] {
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            buf.table("trades")
+                .unwrap()
+                .column_geohash("g", 7, 25)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            buf.clear();
+            write_without_geohash(&mut buf);
+
+            let bookmark = if api == "marker" {
+                buf.set_marker().unwrap();
+                None
+            } else {
+                Some(buf.bookmark().unwrap())
+            };
+            write_without_geohash(&mut buf);
+            match bookmark {
+                Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                None => buf.rewind_to_marker().unwrap(),
+            }
+
+            let (row_count, precision) = ws_first_geohash_precision(&ws_replay_bytes(&mut buf));
+            assert_eq!(row_count, 1, "{api}: the rewind must keep the first row");
+            assert_eq!(
+                precision, 25,
+                "{api}: a rewind that discards no geohash value must keep the \
+                 retained precision"
             );
         }
     }
