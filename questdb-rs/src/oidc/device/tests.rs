@@ -2061,22 +2061,55 @@ fn settings_advertising(token_ep: &str, device_ep: &str) -> String {
     .to_string()
 }
 
+/// A mock that serves `/settings` from `settings(base)` and, under
+/// `{base}{issuer_path}`, an IdP discovery document that is reachable but does
+/// NOT confirm the advertised endpoints. Keeps the pin tests offline and makes
+/// the rejection come from the pin itself rather than an unreachable IdP.
+fn non_confirming_idp_mock(
+    issuer_path: &'static str,
+    settings: impl Fn(&str) -> String + Send + Sync + 'static,
+) -> (MockServer, String) {
+    let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+    let well_known = format!("{issuer_path}/.well-known/openid-configuration");
+    let mock = {
+        let base = Arc::clone(&base);
+        MockServer::start(move |method, path, _body| {
+            let b = base.get().cloned().unwrap_or_default();
+            if method == "GET" && path == "/settings" {
+                (200, settings(&b))
+            } else if method == "GET" && path == well_known {
+                let iss = format!("{b}{issuer_path}");
+                (
+                    200,
+                    serde_json::json!({
+                        "issuer": iss,
+                        "token_endpoint": format!("{iss}/token"),
+                        "device_authorization_endpoint": format!("{iss}/device"),
+                    })
+                    .to_string(),
+                )
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+    };
+    base.set(mock.url("")).unwrap();
+    let issuer = format!("{}{issuer_path}", mock.url(""));
+    (mock, issuer)
+}
+
 #[test]
 fn settings_endpoint_off_issuer_origin_rejected() {
     // A tampered / misconfigured /settings advertises credential endpoints on an
     // origin other than the pinned issuer — must be refused before any POST.
-    let mock = MockServer::start(|method, path, _body| match (method, path) {
-        ("GET", "/settings") => (
-            200,
-            settings_advertising(
-                "https://evil.example.com/token",
-                "https://evil.example.com/device",
-            ),
-        ),
-        _ => (404, "{}".to_string()),
+    let (mock, issuer) = non_confirming_idp_mock("", |_| {
+        settings_advertising(
+            "https://evil.example.com/token",
+            "https://evil.example.com/device",
+        )
     });
     let err = OidcDeviceAuth::from_questdb(mock.url(""))
-        .issuer("https://idp.example.com")
+        .issuer(issuer)
         .allow_insecure_transport(true)
         .build()
         .unwrap_err();
@@ -2089,22 +2122,98 @@ fn settings_endpoint_off_issuer_origin_rejected() {
     );
 }
 
+/// Entra-style layout on the mock: issuer `{base}/tid/v2.0`, endpoints under
+/// `{base}/tid/oauth2/v2.0/`, both advertised by /settings. The pin accepts them
+/// only once the IdP discovery document confirms them.
+fn entra_layout_mock(well_known: fn(&str) -> (u16, String)) -> (MockServer, String) {
+    let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+    let mock = {
+        let base = Arc::clone(&base);
+        MockServer::start(move |method, path, _body| {
+            let b = base.get().cloned().unwrap_or_default();
+            match (method, path) {
+                ("GET", "/settings") => (
+                    200,
+                    settings_advertising(
+                        &format!("{b}/tid/oauth2/v2.0/token"),
+                        &format!("{b}/tid/oauth2/v2.0/devicecode"),
+                    ),
+                ),
+                ("GET", "/tid/v2.0/.well-known/openid-configuration") => well_known(&b),
+                _ => (404, "{}".to_string()),
+            }
+        })
+    };
+    base.set(mock.url("")).unwrap();
+    let issuer = format!("{}/tid/v2.0", mock.url(""));
+    (mock, issuer)
+}
+
+#[test]
+fn off_issuer_path_endpoints_confirmed_by_the_idp_build() {
+    let (mock, issuer) = entra_layout_mock(|b| {
+        (
+            200,
+            serde_json::json!({
+                "issuer": format!("{b}/tid/v2.0"),
+                "token_endpoint": format!("{b}/tid/oauth2/v2.0/token"),
+                "device_authorization_endpoint": format!("{b}/tid/oauth2/v2.0/devicecode"),
+            })
+            .to_string(),
+        )
+    });
+    OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(issuer)
+        .allow_insecure_transport(true)
+        .build()
+        .expect("IdP-confirmed endpoints must build");
+}
+
+#[test]
+fn transient_confirmation_failure_is_retryable_not_config() {
+    // The IdP is briefly unavailable (503). The pin cannot be confirmed, but the
+    // configuration is valid: the build must fail with a retryable Network
+    // error carrying the IdP status, not a terminal "reconfigure" Config error.
+    let (mock, issuer) = entra_layout_mock(|_| (503, "{}".to_string()));
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(issuer)
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network, "{}", err.message());
+    assert_eq!(err.status(), Some(503));
+    assert!(
+        err.message().contains("Could not confirm"),
+        "unexpected message: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn definitive_confirmation_failure_keeps_the_pin_rejection() {
+    // A 404 is a definitive answer, not a blip: the pin rejection stands.
+    let (mock, issuer) = entra_layout_mock(|_| (404, "{}".to_string()));
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(issuer)
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(err.message().contains("not under the pinned issuer"));
+}
+
 #[test]
 fn settings_endpoint_sibling_tenant_path_rejected() {
     // Same origin as the issuer, but a sibling tenant path (/realms/production
     // vs the pinned /realms/prod) — the path pin must reject it.
-    let mock = MockServer::start(|method, path, _body| match (method, path) {
-        ("GET", "/settings") => (
-            200,
-            settings_advertising(
-                "https://idp.example.com/realms/production/token",
-                "https://idp.example.com/realms/production/device",
-            ),
-        ),
-        _ => (404, "{}".to_string()),
+    let (mock, issuer) = non_confirming_idp_mock("/realms/prod", |b| {
+        settings_advertising(
+            &format!("{b}/realms/production/token"),
+            &format!("{b}/realms/production/device"),
+        )
     });
     let err = OidcDeviceAuth::from_questdb(mock.url(""))
-        .issuer("https://idp.example.com/realms/prod")
+        .issuer(issuer)
         .allow_insecure_transport(true)
         .build()
         .unwrap_err();
@@ -2120,16 +2229,14 @@ fn settings_endpoint_sibling_tenant_path_rejected() {
 #[test]
 fn settings_endpoint_semicolon_tenant_path_rejected() {
     for suffix in [";tenant=evil", "%3Btenant=evil"] {
-        let settings = settings_advertising(
-            &format!("https://idp.example.com/realms/prod{suffix}/token"),
-            &format!("https://idp.example.com/realms/prod{suffix}/device"),
-        );
-        let mock = MockServer::start(move |method, path, _body| match (method, path) {
-            ("GET", "/settings") => (200, settings.clone()),
-            _ => (404, "{}".to_string()),
+        let (mock, issuer) = non_confirming_idp_mock("/realms/prod", move |b| {
+            settings_advertising(
+                &format!("{b}/realms/prod{suffix}/token"),
+                &format!("{b}/realms/prod{suffix}/device"),
+            )
         });
         let err = OidcDeviceAuth::from_questdb(mock.url(""))
-            .issuer("https://idp.example.com/realms/prod")
+            .issuer(issuer)
             .allow_insecure_transport(true)
             .build()
             .unwrap_err();

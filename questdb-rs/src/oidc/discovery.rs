@@ -39,7 +39,7 @@
 
 use ureq::http::Uri;
 
-use crate::oidc::error::{OidcError, Result};
+use crate::oidc::error::{OidcError, OidcErrorKind, Result};
 use crate::oidc::http::HttpClient;
 
 // QuestDB /settings keys (see EntPropServerConfiguration.exportConfiguration()).
@@ -646,6 +646,10 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
 
     let mut doc_token_endpoint: Option<String> = None;
     let mut doc_device_endpoint: Option<String> = None;
+    // A transient failure of the confirmation-only fetch. Kept so that, if the
+    // pin below then refuses an endpoint the document would have confirmed, the
+    // caller sees a retryable Network error instead of a terminal Config one.
+    let mut transient_confirmation_error: Option<OidcError> = None;
 
     // Fall back to IdP discovery when QuestDB doesn't advertise an endpoint. The
     // IdP is always held to https/loopback (never the allow_insecure flag).
@@ -688,10 +692,17 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
             // it, so the failure is fatal. A confirmation-only fetch is best
             // effort: the pin below simply stays unconfirmed and applies as it
             // did before, so an unreachable `.well-known` cannot newly break a
-            // configuration that used to build.
+            // configuration that used to build. A transient (Network) failure
+            // is remembered, though: if the pin then refuses an endpoint, the
+            // refusal may be only because the IdP was briefly unreachable, and
+            // reporting it as a terminal Config error told users with a valid
+            // Entra/Google-style setup to reconfigure during an IdP blip.
             Err(err) => {
                 if needs_discovery {
                     return Err(err);
+                }
+                if err.kind() == OidcErrorKind::Network {
+                    transient_confirmation_error = Some(err);
                 }
             }
         }
@@ -736,7 +747,13 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
             if !from_settings || confirmed.as_deref() == Some(url.as_str()) {
                 continue;
             }
-            if normalized_origin(url)? != issuer_origin {
+            let off_origin = normalized_origin(url)? != issuer_origin;
+            if (off_origin || !endpoint_path_under_issuer(url, iss))
+                && let Some(err) = transient_confirmation_error.take()
+            {
+                return Err(unconfirmed_after_transient_error(label, url, iss, err));
+            }
+            if off_origin {
                 return Err(OidcError::config(format!(
                     "The OIDC {label} advertised by QuestDB /settings ({url:?}) is \
                      not on the pinned issuer origin ({}) and was not confirmed by \
@@ -770,6 +787,30 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
         audience,
         issuer,
     })
+}
+
+/// The pin refused a `/settings` endpoint that the IdP discovery document was
+/// supposed to confirm, but that document could not be fetched. Report the
+/// failure as the retryable network error it is, keeping the IdP response
+/// metadata, rather than as a terminal misconfiguration.
+fn unconfirmed_after_transient_error(
+    label: &str,
+    url: &str,
+    issuer: &str,
+    err: OidcError,
+) -> OidcError {
+    let status = err.status();
+    let retry_after = err.retry_after_secs();
+    OidcError::network(format!(
+        "Could not confirm the OIDC {label} advertised by QuestDB /settings \
+         ({url:?}) because the identity provider's discovery document for \
+         issuer {issuer:?} could not be fetched: {}. The endpoint is not under \
+         the pinned issuer, so it is only trusted once the IdP confirms it; \
+         retry once the IdP is reachable, or pass the endpoint(s) explicitly.",
+        err.message()
+    ))
+    .with_status(status)
+    .with_retry_after(retry_after)
 }
 
 #[cfg(test)]

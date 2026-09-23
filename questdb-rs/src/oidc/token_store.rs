@@ -154,6 +154,14 @@ const DEFAULT_LOCK_STALE: Duration = Duration::from_secs(600);
 /// A configured staleness window below this is clamped up — see
 /// [`FileTokenStore::with_lock_timings`].
 const MIN_LOCK_STALE: Duration = Duration::from_secs(300);
+/// A lock whose owner stamp names a process on THIS host that no longer exists
+/// is reclaimed once its mtime is this old, instead of after the full
+/// [`DEFAULT_LOCK_STALE`] window. A live native holder renews the mtime every
+/// [`DIRECTORY_LOCK_HEARTBEAT`], so twenty missed renewals plus a dead pid is
+/// proof of a crash (SIGKILL, OOM kill, container stop) rather than a slow
+/// refresh. Without this, a process killed mid-refresh locked every successor
+/// out of `token()` and `sign_in()` for ten minutes.
+const DEAD_HOLDER_GRACE: Duration = Duration::from_secs(10);
 
 /// The result of a [`TokenStore`] operation. Lazy-load and fresh-sign-in
 /// persistence is best-effort. Coordination and pre-refresh load/clear failures
@@ -2080,8 +2088,11 @@ fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> 
         Ok(Some(snapshot)) => snapshot,
         _ => return false,
     };
-    let threshold = match before.stamp {
+    let threshold = match &before.stamp {
         LockStamp::Readable(None) => empty_grace,
+        LockStamp::Readable(Some(stamp)) if holder_is_dead_on_this_host(stamp) => {
+            stale_after.min(DEAD_HOLDER_GRACE)
+        }
         _ => stale_after,
     };
     let now_millis = SystemTime::now()
@@ -2180,12 +2191,88 @@ fn home_dir() -> Option<PathBuf> {
     if path.is_absolute() { Some(path) } else { None }
 }
 
+/// The host name recorded in lock owner stamps. On Unix this is the kernel's
+/// `gethostname`, not `$HOSTNAME`: shells set that variable without exporting
+/// it, so most client processes (Python in particular) saw it unset and stamped
+/// every lock `localhost`, which made the host part useless for telling a local
+/// crashed holder from a live one elsewhere on a shared file system. Reading
+/// the kernel also avoids `getenv` on background token-store threads.
 fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|h| bounded_hostname(&h).to_string())
-        .unwrap_or_else(|| "localhost".to_string())
+    static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| {
+            kernel_hostname()
+                .or_else(|| std::env::var("HOSTNAME").ok())
+                .filter(|h| !h.is_empty())
+                .map(|h| bounded_hostname(&h).to_string())
+                .unwrap_or_else(|| "localhost".to_string())
+        })
+        .clone()
+}
+
+#[cfg(unix)]
+fn kernel_hostname() -> Option<String> {
+    let mut buf = [0_u8; MAX_LOCK_HOSTNAME_BYTES + 1];
+    // SAFETY: `buf` is valid for `buf.len()` bytes; gethostname writes at most
+    // that many and we NUL-bound the result ourselves below.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).ok().map(str::to_string)
+}
+
+#[cfg(not(unix))]
+fn kernel_hostname() -> Option<String> {
+    None
+}
+
+/// Whether a lock owner stamp (`"{nanos} {nonce} {pid}@{host}"`) names a
+/// process on this host that no longer exists. Anything that does not parse,
+/// names another host (or the uninformative `localhost` fallback), names this
+/// process, or whose liveness cannot be determined, answers `false` so the
+/// ordinary age-based rule applies.
+fn holder_is_dead_on_this_host(stamp: &[u8]) -> bool {
+    let Ok(stamp) = std::str::from_utf8(stamp) else {
+        return false;
+    };
+    let mut parts = stamp.split(' ');
+    let (Some(_nanos), Some(_nonce), Some(owner), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Some((pid, host)) = owner.split_once('@') else {
+        return false;
+    };
+    let Ok(pid) = pid.parse::<u32>() else {
+        return false;
+    };
+    let local = hostname();
+    if host != local || local == "localhost" || pid == std::process::id() {
+        return false;
+    }
+    process_is_gone(pid)
+}
+
+#[cfg(unix)]
+fn process_is_gone(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs only the existence/permission check.
+    let rc = unsafe { libc::kill(pid, 0) };
+    // EPERM means the process exists under another user: alive.
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_is_gone(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(unix)]

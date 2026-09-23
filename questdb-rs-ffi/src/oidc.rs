@@ -870,7 +870,7 @@ impl CDiagnosticSink {
                     .callback_gate
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !gate.held {
+                if !self.state.active.load(Ordering::Acquire) {
                     return;
                 }
                 drop(gate);
@@ -878,12 +878,19 @@ impl CDiagnosticSink {
             }
             return;
         }
+        // Wait for THIS auth's callback only. The gate serializes every auth
+        // built from one builder, so waiting on `gate.held` also waited out a
+        // sibling's callback -- unbounded, and a deadlock when that sibling's
+        // callback waits for the detaching thread -- although detaching one
+        // auth is documented not to affect its siblings. `state.active` is set
+        // under the gate on entry and cleared before the gate is released and
+        // `callback_ready` notified, so this predicate cannot miss a wakeup.
         let mut gate = self
             .target
             .callback_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while gate.held {
+        while self.state.active.load(Ordering::Acquire) {
             gate = self
                 .target
                 .callback_ready
@@ -1226,7 +1233,7 @@ impl CEventHandler {
                     .callback_gate
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !gate.held {
+                if !self.is_active() {
                     return;
                 }
                 drop(gate);
@@ -1234,12 +1241,16 @@ impl CEventHandler {
             }
             return;
         }
+        // Wait for THIS auth's callback only, not a sibling's sharing the
+        // target: see `CDiagnosticSink::detach_inner`. `active` is set under
+        // the gate on entry and cleared before the gate is released and
+        // `callback_ready` notified, so this predicate cannot miss a wakeup.
         let mut gate = self
             .target
             .callback_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while gate.held {
+        while self.is_active() {
             gate = self
                 .target
                 .callback_ready
@@ -3064,6 +3075,135 @@ mod tests {
         emitter.join().unwrap();
         detacher.join().unwrap();
         unsafe { questdb_oidc_auth_free(auth) };
+    }
+
+    #[test]
+    fn detach_events_does_not_wait_for_a_sibling_callback() {
+        // Auths built from one reusable builder share the serializing callback
+        // target. Detaching A must wait for A's callback only: waiting out B's
+        // blocked the caller indefinitely, and deadlocked it when B's callback
+        // waited for the detaching thread.
+        static ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn blocking_event(
+            _user_data: *mut c_void,
+            _event: *const questdb_oidc_event,
+        ) {
+            ENTERED.store(1, Ordering::SeqCst);
+            while RELEASE.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        ENTERED.store(0, Ordering::SeqCst);
+        RELEASE.store(0, Ordering::SeqCst);
+        let builder = unsafe { explicit_builder() };
+        let mut error = ptr::null_mut();
+        assert!(unsafe {
+            questdb_oidc_builder_event_handler(
+                builder,
+                Some(blocking_event),
+                ptr::null_mut(),
+                None,
+                &mut error,
+            )
+        });
+        let a = unsafe { questdb_oidc_builder_build(builder, &mut error) };
+        let b = unsafe { questdb_oidc_builder_build(builder, &mut error) };
+        assert!(!a.is_null() && !b.is_null());
+        let a_handler = Arc::clone(unsafe { (*a).shared.event_handler.as_ref().unwrap() });
+        let b_handler = Arc::clone(unsafe { (*b).shared.event_handler.as_ref().unwrap() });
+        assert!(Arc::ptr_eq(&a_handler.target, &b_handler.target));
+
+        let renderer = CEventRenderer(Arc::clone(&b_handler));
+        let emitter = std::thread::spawn(move || {
+            renderer.invoke(&empty_event(
+                questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_WAITING,
+            ));
+        });
+        while ENTERED.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a_addr = a as usize;
+        let detacher = std::thread::spawn(move || {
+            unsafe { questdb_oidc_auth_detach_events(a_addr as *const questdb_oidc_auth) };
+            let _ = tx.send(());
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Release before asserting so a regression reports instead of hanging.
+        RELEASE.store(1, Ordering::SeqCst);
+        outcome.expect("detaching A waited for sibling B's callback");
+        assert!(a_handler.closed.load(Ordering::Acquire));
+        assert!(!b_handler.closed.load(Ordering::Acquire));
+        emitter.join().unwrap();
+        detacher.join().unwrap();
+        unsafe {
+            questdb_oidc_auth_free(a);
+            questdb_oidc_auth_free(b);
+            questdb_oidc_builder_free(builder);
+        }
+    }
+
+    #[test]
+    fn detach_diagnostics_does_not_wait_for_a_sibling_callback() {
+        static ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn blocking_diagnostic(
+            _user_data: *mut c_void,
+            _diagnostic: *const questdb_oidc_diagnostic,
+        ) {
+            ENTERED.store(1, Ordering::SeqCst);
+            while RELEASE.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        ENTERED.store(0, Ordering::SeqCst);
+        RELEASE.store(0, Ordering::SeqCst);
+        let builder = unsafe { explicit_builder() };
+        let mut error = ptr::null_mut();
+        assert!(unsafe {
+            questdb_oidc_builder_diagnostic_handler(
+                builder,
+                Some(blocking_diagnostic),
+                ptr::null_mut(),
+                None,
+                &mut error,
+            )
+        });
+        let a = unsafe { questdb_oidc_builder_build(builder, &mut error) };
+        let b = unsafe { questdb_oidc_builder_build(builder, &mut error) };
+        assert!(!a.is_null() && !b.is_null());
+        let a_sink = unsafe { (*a).shared.diagnostic.clone().unwrap() };
+        let b_sink = unsafe { (*b).shared.diagnostic.clone().unwrap() };
+        assert!(Arc::ptr_eq(&a_sink.target, &b_sink.target));
+
+        let emitter = std::thread::spawn(move || {
+            b_sink.on_persistence_warning("sibling save failed");
+        });
+        while ENTERED.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a_addr = a as usize;
+        let detacher = std::thread::spawn(move || {
+            unsafe { questdb_oidc_auth_detach_diagnostics(a_addr as *const questdb_oidc_auth) };
+            let _ = tx.send(());
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+        RELEASE.store(1, Ordering::SeqCst);
+        outcome.expect("detaching A's diagnostics waited for sibling B's callback");
+        assert!(a_sink.state.detached.load(Ordering::Acquire));
+        emitter.join().unwrap();
+        detacher.join().unwrap();
+        unsafe {
+            questdb_oidc_auth_free(a);
+            questdb_oidc_auth_free(b);
+            questdb_oidc_builder_free(builder);
+        }
     }
 
     #[test]

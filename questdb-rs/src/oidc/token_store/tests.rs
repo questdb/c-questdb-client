@@ -1658,6 +1658,110 @@ fn stale_java_identity_lock_is_reclaimed() {
     assert_lock_released(&lock, "abandoned Java lock was not reclaimed");
 }
 
+/// Plant an identity lock owned by `pid` on this host, with its mtime `age` ago.
+#[cfg(unix)]
+fn plant_owned_lock(
+    store: &FileTokenStore,
+    key: &TokenStoreKey,
+    pid: u32,
+    age: Duration,
+) -> PathBuf {
+    let lock = store.lock_file(key);
+    std::fs::write(&lock, format!("1 00ff {pid}@{}", hostname())).unwrap();
+    let f = OpenOptions::new().write(true).open(&lock).unwrap();
+    f.set_modified(SystemTime::now() - age).unwrap();
+    drop(f);
+    lock
+}
+
+#[cfg(unix)]
+fn try_identity_lock(store: &FileTokenStore, key: &TokenStoreKey) -> bool {
+    store.in_lock(key, &mut || Ok(())).is_ok()
+}
+
+#[cfg(unix)]
+fn exited_child_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+#[cfg(unix)]
+#[test]
+fn crashed_local_holder_lock_is_reclaimed_without_the_full_stale_window() {
+    if hostname() == "localhost" {
+        return; // No distinguishing host name: the age rule alone applies.
+    }
+    let dir = TempDir::new().unwrap();
+    let key = test_key();
+    let store = test_file_store(dir.path())
+        .with_lock_timings(Duration::from_millis(500), DEFAULT_LOCK_STALE);
+    let lock = plant_owned_lock(
+        &store,
+        &key,
+        exited_child_pid(),
+        DEAD_HOLDER_GRACE + Duration::from_secs(5),
+    );
+    assert!(
+        try_identity_lock(&store, &key),
+        "a lock left by a dead local process must not block for {DEFAULT_LOCK_STALE:?}"
+    );
+    assert_lock_released(&lock, "crashed holder lock was not reclaimed");
+}
+
+#[cfg(unix)]
+#[test]
+fn dead_holder_lock_within_the_heartbeat_grace_is_kept() {
+    if hostname() == "localhost" {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let key = test_key();
+    let store = test_file_store(dir.path())
+        .with_lock_timings(Duration::from_millis(300), DEFAULT_LOCK_STALE);
+    plant_owned_lock(&store, &key, exited_child_pid(), Duration::from_secs(1));
+    assert!(!try_identity_lock(&store, &key));
+}
+
+#[cfg(unix)]
+#[test]
+fn live_local_holder_lock_is_not_reclaimed_early() {
+    let dir = TempDir::new().unwrap();
+    let key = test_key();
+    let store = test_file_store(dir.path())
+        .with_lock_timings(Duration::from_millis(300), DEFAULT_LOCK_STALE);
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    plant_owned_lock(&store, &key, child.id(), Duration::from_secs(60));
+    let acquired = try_identity_lock(&store, &key);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        !acquired,
+        "a live holder's lock was reclaimed before the stale window"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dead_holder_on_another_host_uses_the_age_rule() {
+    let dir = TempDir::new().unwrap();
+    let key = test_key();
+    let store = test_file_store(dir.path())
+        .with_lock_timings(Duration::from_millis(300), DEFAULT_LOCK_STALE);
+    let lock = store.lock_file(&key);
+    let pid = exited_child_pid();
+    std::fs::write(&lock, format!("1 00ff {pid}@not-{}", hostname())).unwrap();
+    let f = OpenOptions::new().write(true).open(&lock).unwrap();
+    f.set_modified(SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+    drop(f);
+    assert!(!try_identity_lock(&store, &key));
+}
+
 #[test]
 fn empty_java_identity_lock_is_reclaimed_after_the_shared_grace() {
     let dir = TempDir::new().unwrap();

@@ -1112,12 +1112,21 @@ impl ReaderConfig {
     /// reason.
     ///
     /// To signal a failure that retrying can never clear, return
-    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall). That is
-    /// the one terminal channel: it is carried out as a terminal `ConfigError`,
-    /// so the reconnect loop stops and reports it. Without it a permanently
-    /// broken provider reconnects forever -- `next_after_retryable_terminal`
-    /// starts a fresh budget each round -- spawning a worker per attempt and
-    /// never surfacing the cause.
+    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall): it is
+    /// carried out as a terminal `ConfigError`, so the reconnect loop stops and
+    /// reports it. Without it a permanently broken provider reconnects forever
+    /// -- `next_after_retryable_terminal` starts a fresh budget each round --
+    /// spawning a worker per attempt and never surfacing the cause.
+    ///
+    /// An error from an `oidc::OidcDeviceAuth` (for
+    /// example `move || auth.token()`) is classified by its OIDC kind instead
+    /// of its code. Two kinds are **terminal** and are not reclassified:
+    /// `OidcErrorKind::Cancelled` (the provider was
+    /// closed; stays `AuthError`) and
+    /// `OidcErrorKind::Config` (stays `ConfigError`).
+    /// Closing the provider therefore stops the reconnect loop and terminalizes
+    /// a reader's failover walk. Every other OIDC kind,
+    /// including `InteractionRequired`, stays retryable.
     ///
     /// On initial connect the provider is resolved synchronously on the caller
     /// thread. During a mid-query failover it runs on the provider's bounded,

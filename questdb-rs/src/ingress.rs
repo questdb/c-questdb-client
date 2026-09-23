@@ -1592,7 +1592,14 @@ impl SenderBuilder {
     /// that flush as a retryable [`SocketError`](crate::ErrorCode::SocketError) —
     /// the same classification the QWP/WebSocket sender and reader apply — because
     /// the callback may recover on the next flush; the buffer is left intact for a
-    /// retry. In unwind-enabled builds a callback panic is contained and treated
+    /// retry. The exceptions are the failures that can never recover inside this
+    /// process, which keep their terminal code: an
+    /// [`InvalidApiCall`](crate::ErrorCode::InvalidApiCall) from the closure
+    /// (carried as `ConfigError`) and, from an
+    /// `oidc::OidcDeviceAuth` provider, a closed provider
+    /// (`OidcErrorKind::Cancelled`, `AuthError`) or a
+    /// misconfiguration (`OidcErrorKind::Config`,
+    /// `ConfigError`). In unwind-enabled builds a callback panic is contained and treated
     /// as such a retryable failure (a `panic = "abort"` build cannot contain
     /// panics). A server rejection of a successfully acquired token is a separate
     /// terminal authentication error. Mutually exclusive with
@@ -1728,12 +1735,21 @@ impl SenderBuilder {
     /// reason.
     ///
     /// To signal a failure that retrying can never clear, return
-    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall). That is
-    /// the one terminal channel: it is carried out as a terminal `ConfigError`,
-    /// so the reconnect loop stops and reports it. Without it a permanently
-    /// broken provider reconnects forever -- `next_after_retryable_terminal`
-    /// starts a fresh budget each round -- spawning a worker per attempt and
-    /// never surfacing the cause.
+    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall): it is
+    /// carried out as a terminal `ConfigError`, so the reconnect loop stops and
+    /// reports it. Without it a permanently broken provider reconnects forever
+    /// -- `next_after_retryable_terminal` starts a fresh budget each round --
+    /// spawning a worker per attempt and never surfacing the cause.
+    ///
+    /// An error from an `oidc::OidcDeviceAuth` (for
+    /// example `move || auth.token()`) is classified by its OIDC kind instead
+    /// of its code. Two kinds are **terminal** and are not reclassified:
+    /// `OidcErrorKind::Cancelled` (the provider was
+    /// closed; stays `AuthError`) and
+    /// `OidcErrorKind::Config` (stays `ConfigError`).
+    /// Closing the provider therefore stops the reconnect loop and terminalizes
+    /// a store-and-forward sender's publication store. Every other OIDC kind,
+    /// including `InteractionRequired`, stays retryable.
     #[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
     pub fn bearer_token_provider<F, E>(self, provider: F) -> Result<Self>
     where

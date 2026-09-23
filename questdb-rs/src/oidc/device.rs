@@ -896,12 +896,18 @@ impl OidcDeviceAuth {
         self.obtain_tokens(true, abort_wait).map(|_| ())
     }
 
-    /// Best-effort form of [`try_clear`](Self::try_clear).
+    /// Best-effort form of [`try_clear`](Self::try_clear): every failure is
+    /// logged rather than returned.
     ///
-    /// This always forgets the in-memory token. A persisted-store deletion
-    /// failure is logged because this compatibility method cannot report it;
-    /// use [`try_clear`](Self::try_clear) when the caller must know whether the
-    /// persisted credential was actually deleted.
+    /// It forgets the in-memory token even when deleting the persisted entry
+    /// fails. It clears **nothing** while an interactive
+    /// [`sign_in`](Self::sign_in) runs on another thread -- that sign-in then
+    /// caches and persists a fresh credential -- because it will not wait
+    /// behind a device flow. The C, C++ and Python bindings report that case as
+    /// an error; use [`try_clear`](Self::try_clear) whenever the caller must know
+    /// whether anything was cleared, and call
+    /// [`cancel_sign_in`](Self::cancel_sign_in) first to sign out during a
+    /// sign-in.
     pub fn clear(&self) {
         if let Err(error) = self.try_clear() {
             log::warn!("questdb oidc: {error}");

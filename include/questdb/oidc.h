@@ -458,7 +458,8 @@ questdb_oidc_auth* questdb_oidc_auth_clone(
  * drain is bounded and best-effort, because an exact cross-target drain can
  * deadlock two threads against each other's callback gates; suppression remains
  * exact. Idempotent, NULL-tolerant, and callable from any thread. Auths built
- * from the same reusable builder are unaffected.
+ * from the same reusable builder are unaffected: they keep delivering, and this
+ * call waits only for THIS auth's callback, never for a sibling's.
  *
  * Use this form only when the caller can wait for arbitrary user callback
  * code to return. The caller must not delegate this call to another thread and
@@ -519,7 +520,8 @@ void questdb_oidc_auth_detach_events_nowait(const questdb_oidc_auth* auth);
  * background token-provider or transport thread may still hold a clone of this
  * auth and reach a store write.
  *
- * Auths built from the same builder are unaffected and keep delivering.
+ * Auths built from the same builder are unaffected and keep delivering; this
+ * call waits only for THIS auth's diagnostic callback, never for a sibling's.
  */
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_detach_diagnostics(const questdb_oidc_auth* auth);

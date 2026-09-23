@@ -2933,6 +2933,11 @@ fn connect_sfa_pool_with_recovery_candidates(
             force_async_initial_connect,
         )
         .map_err(|err| {
+            // `reclassified` keeps the whole payload, including a role reject:
+            // `reconnect_pick` then retries an all-endpoints role rejection
+            // (every node a replica) until the caller's budget, as it already
+            // did for direct senders, instead of failing on the first round.
+            // A promotion can clear it; see `questdb_db_borrow_sender_with_retry`.
             let code = err.code();
             let msg = format!("Failed to open store-and-forward sender: {}", err.msg());
             err.reclassified(code, msg)
