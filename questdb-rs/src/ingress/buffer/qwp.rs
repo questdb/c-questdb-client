@@ -4806,15 +4806,22 @@ impl QwpWsColumnValues {
     /// whether it was non-null. `None` means no cell was popped.
     fn pop_cell_from(&mut self, from: u32) -> Option<bool> {
         match self {
-            Self::Bool { cells } => pop_value_cell_from(cells, from),
-            Self::I8 { cells } => pop_value_cell_from(cells, from),
-            Self::I16 { cells } => pop_value_cell_from(cells, from),
-            Self::I32 { cells } => pop_value_cell_from(cells, from),
-            Self::I64 { cells } => pop_value_cell_from(cells, from),
-            Self::F32 { cells } => pop_value_cell_from(cells, from),
-            Self::F64 { cells } => pop_value_cell_from(cells, from),
-            Self::TimestampMicros { cells } => pop_value_cell_from(cells, from),
-            Self::TimestampNanos { cells } => pop_value_cell_from(cells, from),
+            // Fixed-width columns are rolled back by `discard_fixed_width_from`;
+            // `rollback_rows_from` never calls this for them.
+            Self::Bool { .. }
+            | Self::I8 { .. }
+            | Self::I16 { .. }
+            | Self::I32 { .. }
+            | Self::I64 { .. }
+            | Self::F32 { .. }
+            | Self::F64 { .. }
+            | Self::TimestampMicros { .. }
+            | Self::TimestampNanos { .. }
+            | Self::Uuid { .. }
+            | Self::Ipv4 { .. }
+            | Self::Date { .. }
+            | Self::Char { .. }
+            | Self::Geohash { .. } => None,
             Self::String { cells, data }
             | Self::DoubleArray { cells, data }
             | Self::Long256 { cells, data }
@@ -4823,23 +4830,6 @@ impl QwpWsColumnValues {
                 let cell = cells.pop_if(|cell| cell.row_idx >= from)?;
                 data.truncate(cell.offset as usize);
                 Some(true)
-            }
-            Self::Uuid { cells } => pop_value_cell_from(cells, from),
-            Self::Ipv4 { cells } => pop_value_cell_from(cells, from),
-            Self::Date { cells } => pop_value_cell_from(cells, from),
-            Self::Char { cells } => pop_value_cell_from(cells, from),
-            Self::Geohash {
-                cells,
-                precision_bits,
-                displaced_precision_bits,
-            } => {
-                let popped = pop_value_cell_from(cells, from)?;
-                restore_displaced_geohash_precision(
-                    cells.is_empty(),
-                    precision_bits,
-                    *displaced_precision_bits,
-                );
-                Some(popped)
             }
             Self::Symbol {
                 cells,
