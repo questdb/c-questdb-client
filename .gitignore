@@ -8,6 +8,7 @@ cmake-build-release
 .vscode
 .idea
 .cache
+.pi-subagents/
 questdb-rs/Cargo.lock
 include/questdb/ingress/line_sender.gen.h
 cython/questdb/ingress/line_sender.pxd
