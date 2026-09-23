@@ -1160,6 +1160,11 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// `N`-byte mantissas (only non-nulls when bitmap present, full row
 /// count otherwise). Reproduces the arrow-side `write_decimal*_payload`
 /// shape exactly: the scale byte is written **after** the bitmap.
+/// `data` holds little-endian mantissas, matching all supported hosts.
+///
+/// # Safety
+/// `data` must cover `row_count * N` bytes; any validity bitmap must cover
+/// `row_count` rows. `N` must be 8, 16, or 32.
 #[inline]
 unsafe fn emit_decimal<const N: usize>(
     out: &mut Vec<u8>,
