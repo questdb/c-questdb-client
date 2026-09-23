@@ -621,16 +621,12 @@ fn test_clone_preserves_marker_rewind_state() -> TestResult {
     Ok(())
 }
 
-/// A rewind must unwind every table the bookmark spanned, not only the one
-/// being written when it was taken.
+/// Rewinding a bookmark spanning interleaved tables restores the reported row
+/// count and allows further writes.
 ///
-/// The rewind records the row and column counts each table had and truncates
-/// back to them, rather than copying what it would discard. That makes the
-/// interesting case several tables interleaved across the bookmark: tables
-/// written before it must keep exactly their earlier rows, tables created after
-/// it must disappear, and a table written both before and after must keep only
-/// the earlier rows. Columns introduced after the bookmark must go too, so
-/// reusing the table afterwards must not see them.
+/// This is an API smoke test with tables and columns introduced after the
+/// bookmark. The byte-level QWP/WS rewind tests verify that discarded rows,
+/// tables and columns are removed; `row_count()` alone cannot establish that.
 #[cfg(feature = "_sender-qwp-ws")]
 #[test]
 fn test_bookmark_rewinds_every_table_it_spans() -> TestResult {
@@ -659,12 +655,11 @@ fn test_bookmark_rewinds_every_table_it_spans() -> TestResult {
     buffer.rewind_to_bookmark(bookmark)?;
     assert_eq!(buffer.row_count(), 2, "only the pre-bookmark rows survive");
 
-    // The buffer stays usable, and the column added after the bookmark is gone:
-    // writing "alpha" again without it must still produce a coherent row.
+    // A pre-bookmark table remains writable without the extra column.
     buffer.table("alpha")?.symbol("sym", "a3")?.at_now()?;
     assert_eq!(buffer.row_count(), 3);
 
-    // A table that only existed after the bookmark can be created afresh.
+    // A table name introduced after the bookmark also remains writable.
     buffer.table("gamma")?.symbol("sym", "g2")?.at_now()?;
     assert_eq!(buffer.row_count(), 4);
 
