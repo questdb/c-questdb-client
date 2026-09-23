@@ -4899,18 +4899,23 @@ fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
 
     // The close bound alone cannot tell an interrupted worker from one the
     // pool gave up on and detached, which would still hold the slot lock.
-    // Reopening the stalled slot proves the worker actually exited.
-    let reopen_port = spawn_upgrade_only_server();
-    let reopen_conf = format!(
-        "ws::addr=127.0.0.1:{reopen_port};qwp_ws_progress=manual;\
-         sf_dir={};sender_id=orphan-a;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
-        sf_dir.path().display()
-    );
-    let reopened = SenderBuilder::from_conf(&reopen_conf)
-        .unwrap()
-        .build()
-        .expect("stalled orphan worker retained the slot lock after close");
-    drop(reopened);
+    // Which slot stalled depends on unsorted `read_dir` order, so reopen
+    // both: every slot lock must be free once the worker has exited.
+    for slot in ["orphan-a", "orphan-b"] {
+        let reopen_port = spawn_upgrade_only_server();
+        let reopen_conf = format!(
+            "ws::addr=127.0.0.1:{reopen_port};qwp_ws_progress=manual;\
+             sf_dir={};sender_id={slot};sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+            sf_dir.path().display()
+        );
+        let reopened = SenderBuilder::from_conf(&reopen_conf)
+            .unwrap()
+            .build()
+            .unwrap_or_else(|err| {
+                panic!("stalled orphan worker retained the {slot} slot lock after close: {err}")
+            });
+        drop(reopened);
+    }
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-a")));
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-b")));
 
