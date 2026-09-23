@@ -1373,8 +1373,9 @@ fn write_fsb_binary_no_null(
     // `i * width` with `i <= rows` can wrap. With zero rows the loop writes
     // only the leading 0 and the width is never used.
     let width = elem as u32;
-    for (i, slot) in out[base..].chunks_exact_mut(4).enumerate() {
-        slot.copy_from_slice(&((i as u32).wrapping_mul(width)).to_le_bytes());
+    let (slots, _) = out[base..].as_chunks_mut::<4>();
+    for (i, slot) in slots.iter_mut().enumerate() {
+        *slot = ((i as u32).wrapping_mul(width)).to_le_bytes();
     }
     out.extend_from_slice(data);
     Ok(())
@@ -6636,8 +6637,10 @@ mod tests {
         let mut out = Vec::new();
         write_fsb_binary_no_null(&mut out, &arr, 32).unwrap();
         let offsets: Vec<u32> = out[..20]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         assert_eq!(offsets, vec![0, 32, 64, 96, 128]);
         assert_eq!(&out[20..], arr.value_data());
