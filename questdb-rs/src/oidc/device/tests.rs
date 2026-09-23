@@ -260,8 +260,15 @@ fn operation_wait_can_be_aborted_after_it_has_started() {
     let worker = std::thread::spawn(move || {
         let error = worker_auth
             .try_clear_with_acquire_abort(&|| {
+                // Read the flag BEFORE publishing the check. The main thread
+                // sets the flag only once it has seen a check, so ordering it
+                // the other way round leaves a window in which the very first
+                // check increments the counter, is observed, and only then
+                // loads a flag the main thread has already set -- aborting
+                // after one check and failing the re-check assertion below.
+                let active = worker_active.load(Ordering::SeqCst);
                 worker_checks.fetch_add(1, Ordering::SeqCst);
-                worker_active.load(Ordering::SeqCst).then(|| {
+                active.then(|| {
                     crate::Error::new(
                         crate::ErrorCode::InvalidApiCall,
                         "callback became active".to_string(),
