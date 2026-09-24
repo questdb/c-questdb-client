@@ -5643,6 +5643,12 @@ fn final_round_role_mismatch_past_deadline_surfaces_role_mismatch() {
 /// keep the role reject exactly as a static-auth reader's does.
 #[test]
 fn provider_reader_keeps_role_mismatch_when_deadline_cuts_off_a_round() {
+    // The budget starts at `execute()`, so the first round has to dial well
+    // before the deadline even on a slow CI agent; with 100ms, a stall of a
+    // few tens of ms cut off round one before it recorded any RoleMismatch.
+    // A short, doubling full-jitter backoff means the run still usually ends
+    // on a sleep clamped to the deadline, which leaves the next admitted
+    // round's provider acquisition to be cut off -- the regression here.
     for _ in 0..5 {
         let a = MockServer::start(vec![
             drop_after_query_script(ServerRole::Primary, "a-primary"),
@@ -5654,8 +5660,8 @@ fn provider_reader_keeps_role_mismatch_when_deadline_cuts_off_a_round() {
         let b = slow_421_replica_server(Duration::ZERO);
         let conf = format!(
             "ws::addr={},{};target=primary;failover_max_attempts=20;\
-             failover_backoff_initial_ms=50;failover_backoff_max_ms=5000;\
-             failover_max_duration_ms=100",
+             failover_backoff_initial_ms=10;failover_backoff_max_ms=5000;\
+             failover_max_duration_ms=500",
             a.url(),
             b
         );

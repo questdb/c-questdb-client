@@ -1201,32 +1201,39 @@ fn test_post_401_provider_retries_and_request_retries_share_one_deadline() -> Te
         .column_f64("f1", 1.0)?
         .at(TimestampNanos::new(1))?;
 
-    let server_thread = std::thread::spawn(move || -> io::Result<(MockServer, usize)> {
-        server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
-        server.send_http_response_q(
-            HttpResponse::empty()
-                .with_status(401, "Unauthorized")
-                .with_body_str("Unauthorized"),
-        )?;
-        let mut rotated_requests = 0;
-        while let Ok(req) = server.recv_http(3.0) {
-            assert_eq!(req.header("authorization"), Some("Bearer tok1"));
-            rotated_requests += 1;
+    // The shared deadline starts at the 401, so time the flush from there.
+    // Timing from before `flush_and_keep` also counted the first connect,
+    // which on Windows costs ~2s: the mock listens on 127.0.0.1 only and
+    // `localhost` tries `::1` first, where a refused connect is retried.
+    let server_thread = std::thread::spawn(
+        move || -> io::Result<(MockServer, usize, std::time::Instant)> {
+            server.accept()?;
+            let req = server.recv_http_q()?;
+            assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+            let unauthorized_sent = std::time::Instant::now();
             server.send_http_response_q(
                 HttpResponse::empty()
-                    .with_status(503, "Service Unavailable")
-                    .with_body_str("busy"),
+                    .with_status(401, "Unauthorized")
+                    .with_body_str("Unauthorized"),
             )?;
-        }
-        Ok((server, rotated_requests))
-    });
+            let mut rotated_requests = 0;
+            while let Ok(req) = server.recv_http(3.0) {
+                assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+                rotated_requests += 1;
+                server.send_http_response_q(
+                    HttpResponse::empty()
+                        .with_status(503, "Service Unavailable")
+                        .with_body_str("busy"),
+                )?;
+            }
+            Ok((server, rotated_requests, unauthorized_sent))
+        },
+    );
 
-    let started = std::time::Instant::now();
     let res = sender.flush_and_keep(&buffer);
-    let elapsed = started.elapsed();
-    let (_server, rotated_requests) = server_thread.join().unwrap()?;
+    let finished = std::time::Instant::now();
+    let (_server, rotated_requests, unauthorized_sent) = server_thread.join().unwrap()?;
+    let elapsed = finished.duration_since(unauthorized_sent);
     assert!(res.is_err(), "the server never accepts the rotated request");
     assert!(
         rotated_requests >= 1,
@@ -1234,7 +1241,7 @@ fn test_post_401_provider_retries_and_request_retries_share_one_deadline() -> Te
     );
     assert!(
         elapsed < retry_timeout + Duration::from_millis(700),
-        "flush took {elapsed:?}, beyond one retry_timeout of {retry_timeout:?}"
+        "flush took {elapsed:?} after the 401, beyond one retry_timeout of {retry_timeout:?}"
     );
     Ok(())
 }
