@@ -1168,6 +1168,10 @@ TEST_CASE(
             const int32_t one = 1;
             const int32_t megabyte = 1024 * 1024;
             std::memcpy(oversized_metadata.data(), &one, 4);
+            // A record batch's own schema-level metadata is never read, so the
+            // malformed metadata goes on the column in every route.
+            ArrowSchema* metadata_owner =
+                route == 0 ? input.schema()->children[0] : input.schema();
             std::string expected_message;
             if (invalid == "buffers")
             {
@@ -1194,7 +1198,7 @@ TEST_CASE(
             }
             else if (invalid == "metadata")
             {
-                input.schema()->metadata =
+                metadata_owner->metadata =
                     reinterpret_cast<const char*>(metadata);
                 expected_message = "key length -2 is negative";
             }
@@ -1208,7 +1212,7 @@ TEST_CASE(
                         (invalid == "metadata_key_budget" ? 4 : 8),
                     &megabyte,
                     4);
-                input.schema()->metadata =
+                metadata_owner->metadata =
                     reinterpret_cast<const char*>(oversized_metadata.data());
                 expected_message = "metadata blob exceeds";
             }

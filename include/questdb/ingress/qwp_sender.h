@@ -949,15 +949,18 @@ bool qwp_chunk_symbol_i32(
  * Buffer-size trust boundary: the struct is validated for structural
  * sanity (non-NULL mandatory pointers, non-negative length/offset/child
  * counts, bounded nesting depth and `row_count`) so that a malformed
- * struct returns an error rather than aborting. It is NOT possible to
- * validate the *sizes* of the producer's buffers — the Arrow C Data
- * Interface carries no buffer byte-length. A producer that declares a
- * `length`/offsets inconsistent with its actual buffer allocations, or a
- * `metadata` blob whose internal key/value lengths run past its
- * allocation, causes out-of-bounds reads (undefined behavior) inside
- * arrow-rs that no consumer can pre-detect. The caller is responsible for
- * passing arrays whose buffers and metadata match their declared sizes.
- * First-party producers (pyarrow, polars) always satisfy this.
+ * struct returns an error rather than aborting. Each field's `metadata`
+ * blob is limited to 1 MiB, and all field metadata in one schema to
+ * 64 MiB; a record batch's own schema-level metadata is not read. It is
+ * NOT possible to validate the *sizes* of the producer's buffers — the
+ * Arrow C Data Interface carries no buffer byte-length. A producer that
+ * declares a `length`/offsets inconsistent with its actual buffer
+ * allocations, or a `metadata` blob whose internal key/value lengths run
+ * past its allocation, causes out-of-bounds reads (undefined behavior)
+ * inside arrow-rs that no consumer can pre-detect. The caller is
+ * responsible for passing arrays whose buffers and metadata match their
+ * declared sizes. First-party producers (pyarrow, polars) always satisfy
+ * this.
  * ------------------------------------------------------------------------- */
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW

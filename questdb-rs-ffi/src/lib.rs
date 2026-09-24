@@ -4637,7 +4637,15 @@ unsafe fn validate_arrow_schema_depth_with_budget(
             }
             let format = arrow_format_str(s, &path)?;
             validate_name_str(s, &path)?;
-            validate_metadata_blob((*s).metadata, &path, metadata_budget)?;
+            // The record-batch envelope's own metadata is never parsed:
+            // `from_ffi` builds the Struct from its children's fields, and
+            // the RecordBatch schema is rebuilt from those fields alone.
+            let record_batch_envelope = depth == 0
+                && root_kind == ArrowImportRootKind::RecordBatchEnvelope
+                && format == "+s";
+            if !record_batch_envelope {
+                validate_metadata_blob((*s).metadata, &path, metadata_budget)?;
+            }
             let n = (*s).n_children;
             if n < 0 {
                 return Err(arrow_ingest_err(format!(
@@ -8195,6 +8203,61 @@ mod tests {
             unsafe {
                 assert_oversized_metadata_length_rejected(true);
                 assert_oversized_metadata_length_rejected(false);
+            }
+        }
+
+        #[test]
+        fn record_batch_envelope_metadata_is_not_charged() {
+            use arrow::array::{Array, ArrayRef, Int64Array, StructArray};
+            use arrow::datatypes::{DataType, Field, Schema};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+
+            // The value alone fills the per-blob limit; the key and length
+            // headers take the blob past it.
+            let oversized = HashMap::from([(
+                "pandas".to_string(),
+                "x".repeat(MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES as usize),
+            )]);
+            let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+            for on_envelope in [true, false] {
+                let field = Field::new("v", DataType::Int64, true);
+                let schema = if on_envelope {
+                    Schema::new(vec![field]).with_metadata(oversized.clone())
+                } else {
+                    Schema::new(vec![field.with_metadata(oversized.clone())])
+                };
+                let producer =
+                    StructArray::new(schema.fields().clone(), vec![values.clone()], None);
+                let ffi_schema = FFI_ArrowSchema::try_from(&schema).unwrap();
+                let mut ffi_array = FFI_ArrowArray::new(&producer.to_data());
+                let mut err = std::ptr::null_mut();
+                let batch = unsafe {
+                    arrow_ffi_import_record_batch(
+                        &mut ffi_array,
+                        &ffi_schema,
+                        "envelope_metadata_test",
+                        &mut err,
+                    )
+                };
+                if on_envelope {
+                    let batch = batch.expect("envelope metadata must not be charged");
+                    assert!(err.is_null());
+                    assert_eq!(batch.num_rows(), 2);
+                    assert!(batch.schema().metadata().is_empty());
+                } else {
+                    assert!(batch.is_none());
+                    assert!(
+                        ffi_array.release.is_some(),
+                        "field metadata is rejected before import"
+                    );
+                    assert_eq!(unsafe { (*err).error.code() }, ErrorCode::ArrowIngest);
+                    assert_eq!(
+                        unsafe { (*err).error.msg() },
+                        "Arrow schema root.children[0]: metadata blob exceeds 1048576 bytes"
+                    );
+                    unsafe { line_sender_error_free(err) };
+                }
             }
         }
 
