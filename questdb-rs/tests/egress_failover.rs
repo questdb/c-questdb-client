@@ -5635,3 +5635,66 @@ fn final_round_role_mismatch_past_deadline_surfaces_role_mismatch() {
         );
     }
 }
+
+fn slow_503_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
+}
+
+/// Regression: the `RoleMismatch` case above applies equally to the other
+/// diagnostic codes a final round can end on. When every endpoint rejects the
+/// WS upgrade on the last permitted round and the deadline expires during it,
+/// a static-auth reader must still see `HandshakeError`, as it did before the
+/// deadline was re-checked right after a failed walk.
+#[test]
+fn final_round_handshake_error_past_deadline_surfaces_handshake_error() {
+    for auth in ["", "username=u;password=p;"] {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Standalone, "a"),
+            vec![Action::Reject421 {
+                role: None,
+                zone: None,
+            }],
+        ]);
+        let b = slow_503_server(Duration::from_millis(300));
+        let conf = format!(
+            "ws::addr={},{};{auth}failover_max_attempts=2;\
+             failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+             failover_max_duration_ms=100",
+            a.url(),
+            b
+        );
+        let mut reader = Reader::from_conf(&conf).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::HandshakeError,
+            "auth={auth:?}: msg={}",
+            err.msg()
+        );
+        assert!(
+            err.msg().contains("HTTP 503"),
+            "the last handshake failure must stay in the message: {}",
+            err.msg()
+        );
+    }
+}

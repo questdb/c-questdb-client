@@ -47,8 +47,13 @@ def run_cargo_tests():
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
+    # `ffi-support` is not part of `almost-all-features`, but it gates the
+    # owned pool-borrow API the C ABI (and so the Python client) uses, plus
+    # its retry loop and tests. Only `questdb-rs-ffi` enables it, and that
+    # crate's `cargo test` does not compile questdb-rs's own unit tests, so
+    # enable it here or those tests never run.
     run_cmd('cargo', 'test',
-            '--features=almost-all-features,arrow,polars',
+            '--features=almost-all-features,arrow,polars,ffi-support',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',

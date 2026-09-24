@@ -2575,14 +2575,13 @@ fn qwp_ws_token_provider_rotates_across_reconnects() {
 #[test]
 fn qwp_ws_provider_failure_keeps_sf_frames_recoverable() {
     // The QWP/WebSocket ingress counterpart of the ILP/HTTP
-    // `provider_error_leaves_buffer_intact_for_retry`: a token-provider failure
-    // at the (background) connect handshake — resolved before any socket is
-    // opened in `connect_qwp_ws_endpoint_round` — must NOT terminalize the queued
-    // store-and-forward frame. A provider failure is a retryable `SocketError`,
-    // so the background drainer keeps reconnecting; once the provider recovers the
-    // frame drains against the real connect path and is durably acked, carrying
-    // the recovered token. If the failure had terminalized the slot, the `wait`
-    // below would return a terminal error instead of succeeding.
+    // `provider_error_leaves_buffer_intact_for_retry`, for the initial connect:
+    // the reconnect knobs below select the synchronous initial-connect retry, so
+    // the provider failure is absorbed inside `build()` -- before any frame is
+    // queued -- and must be retried rather than failing the build. The queued
+    // frame then drains against the real connect path carrying the recovered
+    // token. A provider failure on a *reconnect* with a frame already queued is
+    // `qwp_ws_reconnect_provider_failure_keeps_queued_frame_recoverable`.
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let (port, rx) = spawn_mock_server();
     let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
@@ -2616,15 +2615,13 @@ fn qwp_ws_provider_failure_keeps_sf_frames_recoverable() {
         .unwrap()
         .at_now()
         .unwrap();
-    // Background store-and-forward: the flush queues the frame locally and returns
-    // even though the first background connect round will fail at the provider.
+    // The failed provider round and its retry both ran inside `build()`.
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
     sender.flush_and_get_fsn(&mut buf).unwrap();
 
-    // Drains and durably acks only because the provider failure left the frame
-    // queued and recoverable (never `.failed`/terminal).
     sender
         .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
-        .expect("a provider failure must keep the queued frame recoverable and drain on recovery");
+        .expect("the frame must drain once the initial connect recovered");
 
     let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(
@@ -2651,6 +2648,105 @@ fn qwp_ws_provider_failure_keeps_sf_frames_recoverable() {
         provider_calls.load(Ordering::SeqCst) >= 2,
         "the provider must be re-pulled on the reconnect after a failed round"
     );
+}
+
+#[test]
+fn qwp_ws_reconnect_provider_failure_keeps_queued_frame_recoverable() {
+    // A token-provider failure on a real background *reconnect*, with a frame
+    // already sent and unacked, must NOT terminalize the queued
+    // store-and-forward frame: the provider failure is a retryable
+    // `SocketError`, so the drainer keeps reconnecting and replays the frame
+    // once the provider recovers. Connection 0 accepts the frame and drops it
+    // unacked; the reconnect's first provider pull fails; connection 1 receives
+    // the replayed frame and acks it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel::<(usize, Vec<String>, usize)>();
+    thread::spawn(move || {
+        for conn in 0..2usize {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let lines = perform_server_upgrade(&mut stream).unwrap();
+            let mut frames = 0;
+            if read_frame(&mut stream).is_ok() {
+                frames += 1;
+                if conn == 1 {
+                    let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+                }
+            }
+            let _ = tx.send((conn, lines, frames));
+            if conn == 0 {
+                // Unacked: forces a real mid-stream reconnect.
+                drop(stream);
+            } else {
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    });
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(5))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(10))
+        .unwrap()
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                // Call 0 is the initial connect; call 1 is the reconnect.
+                match provider_calls.fetch_add(1, Ordering::SeqCst) {
+                    1 => Err(crate::Error::new(
+                        crate::ErrorCode::AuthError,
+                        "reconnect-time provider outage",
+                    )),
+                    n => Ok::<_, crate::Error>(format!("tok-{n}")),
+                }
+            }
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush_and_get_fsn(&mut buf).unwrap();
+
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+        .expect("a reconnect-time provider failure must keep the queued frame recoverable");
+
+    let (conn0, _, frames0) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        (conn0, frames0),
+        (0, 1),
+        "the frame was sent before the drop"
+    );
+    let (conn1, lines1, frames1) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        (conn1, frames1),
+        (1, 1),
+        "the frame was replayed after recovery"
+    );
+    let auth = lines1
+        .iter()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| v.trim().to_string())
+        })
+        .expect("the recovered handshake must carry an Authorization header");
+    assert_eq!(auth, "Bearer tok-2", "the failed pull was retried");
 }
 
 #[test]

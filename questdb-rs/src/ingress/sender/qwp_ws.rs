@@ -3426,9 +3426,10 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // overriding the static basic/token header, so a long-lived sender keeps a
     // valid Bearer as the token rotates. Provider acquisition/validation failures
     // are normally retryable SocketErrors: the next invocation may recover, and
-    // accepted store-and-forward frames must remain drainable. InvalidApiCall is
-    // a terminal caller-contract violation. Server authentication rejections
-    // happen later in the handshake and remain terminal AuthErrors.
+    // accepted store-and-forward frames must remain drainable. An InvalidApiCall
+    // from the callback is a caller-contract violation and arrives re-coded as a
+    // terminal ConfigError (`classify_provider_error`). Server authentication
+    // rejections happen later in the handshake and remain terminal AuthErrors.
     let mut provided_header = match qwp_ws.token_provider.as_ref() {
         Some(provider) => {
             let acquired = acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate);

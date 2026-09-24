@@ -2985,8 +2985,7 @@ fn prefer_over_trigger(err: &Error) -> bool {
 
     matches!(
         err.code(),
-        ErrorCode::InvalidApiCall
-            | ErrorCode::AuthError
+        ErrorCode::AuthError
             | ErrorCode::RoleMismatch
             | ErrorCode::ConfigError
             | ErrorCode::UnsupportedServer
@@ -3015,20 +3014,28 @@ fn failover_deadline_exhausted_error(
         "failover wall-clock budget exhausted (failover_max_duration_ms={max_duration_ms}) after {attempts} attempt(s); last error: {last_msg}"
     );
 
-    // A wall-clock exhaustion is a retryable `SocketError` -- except when every
-    // endpoint the final walk reached rejected on role. Then the caller must see
-    // `RoleMismatch`: it is what the failover contract promises when the budget
-    // runs out on mismatching nodes, and what the reader reported before the
-    // deadline was checked immediately after a failed walk. A final round that
-    // both exhausted the attempts and overran the deadline used to surface
-    // `RoleMismatch`; re-coding it silently changed the error a caller branching
-    // on "no primary available" receives.
+    // A wall-clock exhaustion is a retryable `SocketError` -- except when the
+    // final walk ended on a diagnostic code that names what to fix. Before the
+    // deadline was checked immediately after a failed walk, a final round that
+    // both exhausted the attempts and overran the deadline surfaced its last
+    // error unchanged, so these codes are what existing callers branch on:
+    //
+    // * `RoleMismatch`: every endpoint rejected on role ("no primary
+    //   available"), which the failover contract promises when the budget runs
+    //   out on mismatching nodes.
+    // * `HandshakeError` / `TlsError`: every endpoint rejected the WS upgrade or
+    //   failed certificate validation (see `prefer_over_trigger`).
+    //
+    // Re-coding them as `SocketError` would silently change the error a
+    // static-auth reader receives. The message still carries the deadline
+    // context, so `is_failover_deadline_exhaustion` keeps recognising it.
     match last_error {
         Some(err) => {
-            let code = if err.code() == ErrorCode::RoleMismatch {
-                ErrorCode::RoleMismatch
-            } else {
-                ErrorCode::SocketError
+            let code = match err.code() {
+                code @ (ErrorCode::RoleMismatch
+                | ErrorCode::HandshakeError
+                | ErrorCode::TlsError) => code,
+                _ => ErrorCode::SocketError,
             };
             err.reclassified(code, msg)
         }
@@ -3624,12 +3631,14 @@ mod tests {
                 code
             );
         }
-        // Generic transport flops and decode failures are NOT more diagnostic
-        // than the trigger — keep the original cause-of-death in those cases.
+        // Generic transport flops, decode failures, and client-side
+        // validation errors are NOT more diagnostic than the trigger
+        // — keep the original cause-of-death in those cases.
         for code in [
             SocketError,
             ProtocolError,
             CouldNotResolveAddr,
+            InvalidApiCall,
             InvalidUtf8,
             InvalidBind,
             ServerInternalError,
@@ -3642,7 +3651,17 @@ mod tests {
                 code
             );
         }
-        let invalid_call = Error::new(InvalidApiCall, "provider callback contract violated");
+        // A provider contract violation never reaches the walk as
+        // `InvalidApiCall`: `classify_provider_error` re-codes it to a terminal
+        // `ConfigError`, which is preferred above.
+        let provider = crate::token_provider::TokenProvider::new(|| {
+            Err::<String, _>(Error::new(
+                InvalidApiCall,
+                "provider callback contract violated",
+            ))
+        });
+        let invalid_call = provider.bearer_header().unwrap_err();
+        assert_eq!(invalid_call.code(), ConfigError);
         assert!(prefer_over_trigger(&invalid_call));
     }
 
@@ -3685,6 +3704,22 @@ mod tests {
         let transport = Error::new(ErrorCode::ProtocolError, "peer closed");
         let err = failover_deadline_exhausted_error(25, 2, Some(transport));
         assert_eq!(err.code(), ErrorCode::SocketError);
+    }
+
+    #[test]
+    fn failover_deadline_context_keeps_handshake_and_tls_codes() {
+        for code in [ErrorCode::HandshakeError, ErrorCode::TlsError] {
+            let original = Error::new(code, "every endpoint rejected the upgrade");
+
+            let err = failover_deadline_exhausted_error(25, 2, Some(original));
+
+            assert_eq!(err.code(), code);
+            assert!(is_failover_deadline_exhaustion(&err));
+            assert!(
+                err.msg()
+                    .contains("last error: every endpoint rejected the upgrade")
+            );
+        }
     }
 
     #[test]

@@ -1405,9 +1405,10 @@ impl ReaderConfig {
         // A rotating token provider (e.g. OIDC), pulled fresh here once per
         // endpoint walk, overrides any static basic/token auth. `bearer_header`
         // classifies provider acquisition/validation failures as retryable when
-        // the callback can recover on its next invocation. InvalidApiCall stays
-        // terminal because it denotes a callback contract violation. Preserve
-        // that code across the crate→egress error boundary.
+        // the callback can recover on its next invocation. An InvalidApiCall
+        // from the callback denotes a contract violation and is re-coded to a
+        // terminal ConfigError (`classify_provider_error`), so the reconnect
+        // walk stops and reports it.
         // Server authentication rejection remains a separate terminal AuthError
         // produced by the handshake after header construction succeeds.
         if let Some(provider) = &self.token_provider {
