@@ -39,7 +39,9 @@ use rand::RngCore;
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
 use crate::ingress::buffer::QwpWsColumnarBuffer;
-use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability};
+use crate::ingress::conf::{
+    DurableAckTiers, QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability,
+};
 use crate::ingress::tls::{TlsSettings, configure_tls};
 use crate::ws::frame::{
     OPCODE_BINARY, OPCODE_CLOSE, OPCODE_CONTINUATION, OPCODE_PING, OPCODE_PONG, OPCODE_TEXT, Opcode,
@@ -449,7 +451,7 @@ pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     runner: SyncQwpWsRunner,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
-    pub(crate) request_durable_ack: bool,
+    pub(crate) request_durable_ack: DurableAckTiers,
     /// Hard cap on a single store-and-forward frame's payload: `sf_max_segment_bytes`
     /// minus the segment and frame headers. The queue rejects anything larger,
     /// so publishers must size-check and split against THIS bound —
@@ -510,7 +512,7 @@ pub(crate) struct ManualQwpWsHandlerState {
     store: QwpWsPublicationStore<SfaSlotQueue>,
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
-    pub(crate) request_durable_ack: bool,
+    pub(crate) request_durable_ack: DurableAckTiers,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
@@ -555,7 +557,7 @@ struct QwpWsPendingConnect {
     qwp_ws: QwpWsConfig,
     auth_header: Option<String>,
     reconnect_policy: ReconnectPolicy,
-    durable_ack: bool,
+    durable_ack: DurableAckTiers,
     server_max_batch_size: Arc<AtomicUsize>,
     traffic_gate: Arc<TrafficGate>,
     /// Whether the I/O thread enables its symbol-dict catch-up mirror once
@@ -1040,7 +1042,7 @@ impl QwpWsPendingConnect {
         tls_settings: Option<TlsSettings>,
         qwp_ws: &QwpWsConfig,
         auth_header: Option<String>,
-        durable_ack: bool,
+        durable_ack: DurableAckTiers,
         server_max_batch_size: Arc<AtomicUsize>,
         traffic_gate: Arc<TrafficGate>,
         delta_dict_enabled: bool,
@@ -1163,7 +1165,7 @@ impl SyncQwpWsPendingRunnerCore {
 
         match self.pending_connect.connect_with_retry(stop) {
             Ok(Some(transport)) => {
-                let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
+                let mut send_core = QwpWsSendCore::new_with_durable_ack_tiers_and_rejection_limit(
                     transport,
                     self.pending_connect.reconnect_policy,
                     self.pending_connect.durable_ack,
@@ -1409,10 +1411,21 @@ where
                 }
             }
             TransportResponse::DurableAck { table_seq_txns } => {
-                match self
-                    .send_core
-                    .finish_durable_ack_response_sfa(&self.progress, table_seq_txns)
-                {
+                match self.send_core.finish_durable_ack_response_sfa(
+                    &self.progress,
+                    table_seq_txns,
+                    false,
+                ) {
+                    Ok(progress) => self.finish_hot_response_progress(shared, progress),
+                    Err(err) => self.store_shared_driver_error(shared, err),
+                }
+            }
+            TransportResponse::LocalDurableAck { table_seq_txns } => {
+                match self.send_core.finish_durable_ack_response_sfa(
+                    &self.progress,
+                    table_seq_txns,
+                    true,
+                ) {
                     Ok(progress) => self.finish_hot_response_progress(shared, progress),
                     Err(err) => self.store_shared_driver_error(shared, err),
                 }
@@ -3376,7 +3389,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     {
         return Err(err);
     }
-    if *qwp_ws.request_durable_ack && role_reject_count == endpoints.len() {
+    if qwp_ws.request_durable_ack.is_enabled() && role_reject_count == endpoints.len() {
         let role_reject = last_role_mismatch
             .as_ref()
             .and_then(|err| err.qwp_ws_role_reject().cloned());
@@ -3740,7 +3753,7 @@ fn open_qwp_ws_parts(
     let persisted_symbol_dict = queue.take_persisted_symbol_dict();
     let mut store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
     store.set_rejection_sink(qwp_ws.rejection_sink.clone());
-    let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
+    let send_core = QwpWsSendCore::new_with_durable_ack_tiers_and_rejection_limit(
         transport,
         ReconnectPolicy::bounded(
             *qwp_ws.reconnect_max_duration,

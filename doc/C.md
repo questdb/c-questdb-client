@@ -68,8 +68,10 @@ closing its reader. The two error names are aliases of the same C ABI type.
 An `OK` acknowledgement means the server accepted a QWP frame. On a WAL table,
 query visibility follows asynchronously; applications that must read their own
 writes should poll with a bounded deadline or use their own WAL-apply policy.
-Durable acknowledgement requires QuestDB Enterprise. Enable
-`request_durable_ack=on` and wait for the durable level. See
+For local-disk durability, set `request_durable_ack=local` and wait for
+`qwpws_ack_level_local_durable`. For replicated/object-store durability, set
+`request_durable_ack=replicated` (or legacy `on`) and wait for
+`qwpws_ack_level_durable`. See
 [threading and delivery considerations](CONSIDERATIONS.md).
 
 ## More examples

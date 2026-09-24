@@ -2095,9 +2095,14 @@ typedef enum qwpws_ack_level
     /** Wait for the server to accept every published frame. */
     qwpws_ack_level_ok = 0,
 
-    /** Wait for durable-ACK coverage. This level requires QuestDB Enterprise;
-     * APIs accepting it also require the `request_durable_ack=on` opt-in. */
+    /** Wait for replicated/object-store durable-ACK coverage. APIs accepting
+     * it require `request_durable_ack=on`, `replicated`, or
+     * `local,replicated`. */
     qwpws_ack_level_durable = 1,
+    /** Wait for local-disk durable-ACK coverage. APIs accepting it require
+     * `request_durable_ack=local`. Local durability survives power loss, but
+     * not loss of the server's disk. */
+    qwpws_ack_level_local_durable = 2,
 } qwpws_ack_level;
 
 /**
@@ -2107,8 +2112,9 @@ typedef enum qwpws_ack_level
  *
  * `timeout_millis` is a no-progress deadline (it fires only if the ack
  * watermark fails to advance for that long); `0` waits indefinitely.
- * `qwpws_ack_level_durable` requires QuestDB Enterprise and
- * `request_durable_ack=on`; otherwise this returns
+ * `qwpws_ack_level_durable` requires `request_durable_ack=on`, `replicated`,
+ * or `local,replicated`; `qwpws_ack_level_local_durable` requires
+ * `request_durable_ack=local`. Otherwise this returns
  * `line_sender_error_invalid_api_call` even when nothing has been published.
  *
  * Returns `false` and sets `err_out` on the no-progress timeout
