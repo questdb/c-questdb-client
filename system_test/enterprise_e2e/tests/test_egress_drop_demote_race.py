@@ -35,6 +35,9 @@ The Rust ``Reader`` executes DDL through the same wire path the Java
 ``QUERY_ERROR`` frame carrying the read-only message (sidecar reply
 ``ERR ...``); an acked DROP surfaces as ``EXEC_DONE``
 (``Terminal::ExecDone`` -- reader.rs) and an ``OK 0 <ms> ...`` reply.
+Enterprise can also report a read-only error *after* dropping the table: its
+post-DROP DDL listener attempts to remove ACL permissions after the demote.
+That cleanup error does not roll back the already-replicating WAL DROP.
 ``failover=off`` pins the single-endpoint semantics of the original
 (``newPlainText``): the client must NOT retry the refused DROP against
 another node, which could otherwise execute it twice.
@@ -79,6 +82,62 @@ def _table_exists(pg_port: int, table: str) -> bool:
             return row is not None and int(row[0]) > 0
 
 
+def _assert_drop_outcome(present_a: bool, present_b: bool,
+                         drop_error: str | None) -> None:
+    assert present_a == present_b, (
+        "nodes A and B must agree on the QWP-egress DROP target after the "
+        "demote (no destructive divergence): the drop must either be "
+        "refused (present on both) or replicate (absent on both); got "
+        f"presentOnA={present_a} presentOnB={present_b} "
+        f"dropError={drop_error!r}"
+    )
+
+    if drop_error is None:
+        assert not present_a, "an acked DROP (EXEC_DONE) must have replicated"
+    elif "failed to remove permissions" in drop_error.lower():
+        # EntDdlListener runs *after* the engine drops the table. A demote may
+        # make its ACL cleanup read-only, returning QUERY_ERROR even though the
+        # drop has already committed and replicated. Do not confuse this with
+        # a pre-DROP, read-only refusal (or with client-side retry).
+        assert not present_a, (
+            "a post-DROP ACL cleanup error must not mask a refused DROP"
+        )
+    elif "read-only" in drop_error.lower():
+        assert present_a, (
+            "a read-only-refused DROP must leave the table present on both nodes"
+        )
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+@pytest.mark.parametrize("present_a,present_b,drop_error", [
+    (False, False, None),
+    (True, True, "[-1] replica access is read-only"),
+    (False, False, "[-1] Failed to remove permissions [table=qwp_dt~21, "
+                   "error=[-1] replica access is read-only"),
+])
+def test_drop_outcome_accepts_replicated_or_refused(
+    present_a: bool, present_b: bool, drop_error: str | None,
+) -> None:
+    _assert_drop_outcome(present_a, present_b, drop_error)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+@pytest.mark.parametrize("present_a,present_b,drop_error", [
+    (False, True, None),
+    (True, True, None),
+    (False, False, "[-1] replica access is read-only"),
+    (True, True, "[-1] Failed to remove permissions [table=qwp_dt~21, "
+                 "error=[-1] replica access is read-only"),
+])
+def test_drop_outcome_rejects_divergence_or_inconsistent_result(
+    present_a: bool, present_b: bool, drop_error: str | None,
+) -> None:
+    with pytest.raises(AssertionError):
+        _assert_drop_outcome(present_a, present_b, drop_error)
+
+
 @pytest.mark.c_client
 @pytest.mark.c_client_rust
 def test_qwp_egress_drop_table_during_demote_replicates_or_refuses_c_client_rust(
@@ -87,9 +146,8 @@ def test_qwp_egress_drop_table_during_demote_replicates_or_refuses_c_client_rust
 ) -> None:
     """See module docstring. Terminal oracle: A and B AGREE on the
     table's existence after both the demote cascade and the drop's
-    replication settle; a per-query error, when one surfaces with a
-    message, must be the read-only refusal (not some unrelated SQL
-    failure that would mask a fence bug)."""
+    replication settle; a per-query error may be a read-only refusal
+    *before* DROP or an ACL cleanup failure *after* a committed DROP."""
     p1 = server_factory("p1", role="primary")
     p1_ports = p1.start(min_http=True)
     r1 = server_factory("r1", role="replica")
@@ -136,12 +194,10 @@ def test_qwp_egress_drop_table_during_demote_replicates_or_refuses_c_client_rust
     assert await_role_quiet(p1_ports.min_http, "replica", SETTLE_S), \
         "node A must settle REPLICA after the accepted demote"
 
-    # A refusal, when it surfaces as a per-query error frame, must be
-    # the read-only refusal. Transport-flavored errors (the demote can
-    # tear the WebSocket down under the in-flight execute) don't drive
-    # the classification -- as in the JUnit original, only the A/B
-    # agreement does. But an unrelated SQL error (e.g. "table does not
-    # exist") would mean the race harness itself is broken -- fail loud.
+    # Transport-flavored errors (the demote can tear the WebSocket down
+    # under the in-flight execute) don't drive the classification -- as in
+    # the JUnit original, only A/B agreement does. An unrelated SQL error
+    # (e.g. "table does not exist") means the harness is broken -- fail loud.
     if drop_error is not None:
         LOG.info("QWP egress DROP surfaced an error during demote: %s", drop_error)
         assert "does not exist" not in drop_error.lower(), (
@@ -161,26 +217,9 @@ def test_qwp_egress_drop_table_during_demote_replicates_or_refuses_c_client_rust
         present_a = _table_exists(p1_ports.pg, TABLE)
         present_b = _table_exists(r1_ports.pg, TABLE)
 
-    assert present_a == present_b, (
-        "nodes A and B must agree on the QWP-egress DROP target after the "
-        "demote (no destructive divergence): the drop must either be "
-        "refused (present on both) or replicate (absent on both); got "
-        f"presentOnA={present_a} presentOnB={present_b} "
-        f"dropError={drop_error!r}"
-    )
-
-    # Consistency between the observed client-side outcome and the
-    # terminal state, where the outcome was unambiguous:
-    if drop_error is None:
-        assert not present_a and not present_b, (
-            "an acked DROP (EXEC_DONE) must have replicated -- table "
-            f"still present (A={present_a}, B={present_b})"
-        )
-    elif "read-only" in drop_error.lower():
-        assert present_a and present_b, (
-            "a read-only-refused DROP must leave the table present on "
-            f"both nodes (A={present_a}, B={present_b})"
-        )
+    # A post-commit ACL cleanup error is distinguishable from a read-only
+    # refusal even though both include the words "read-only".
+    _assert_drop_outcome(present_a, present_b, drop_error)
     LOG.info(
         "race outcome: %s (presentOnA=%s presentOnB=%s)",
         "replicated" if not present_a else "refused/held",
