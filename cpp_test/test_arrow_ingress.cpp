@@ -1161,13 +1161,12 @@ TEST_CASE(
             // rejected.
             const int32_t metadata[] = {1, -2, 0};
             const char invalid_name[] = "\xff";
-            // Allocate the full declared blob, even though the size guard must
-            // reject before reading its payload. Never test with fictitious
-            // memory.
-            std::vector<uint8_t> oversized_metadata(1024 * 1024 + 12, 0);
+            // The budget cases allocate the full declared blob, even though
+            // the size guard must reject before reading its payload. Never
+            // test with fictitious memory.
+            std::vector<uint8_t> oversized_metadata;
             const int32_t one = 1;
-            const int32_t megabyte = 1024 * 1024;
-            std::memcpy(oversized_metadata.data(), &one, 4);
+            const int32_t schema_budget = 64 * 1024 * 1024;
             // A record batch's own schema-level metadata is never read, so the
             // malformed metadata goes on the column in every route.
             ArrowSchema* metadata_owner =
@@ -1207,14 +1206,17 @@ TEST_CASE(
                 invalid == "metadata_value_budget")
             {
                 // An empty key precedes the oversized value in the second case.
+                oversized_metadata.assign(
+                    static_cast<size_t>(schema_budget) + 12, 0);
+                std::memcpy(oversized_metadata.data(), &one, 4);
                 std::memcpy(
                     oversized_metadata.data() +
                         (invalid == "metadata_key_budget" ? 4 : 8),
-                    &megabyte,
+                    &schema_budget,
                     4);
                 metadata_owner->metadata =
                     reinterpret_cast<const char*>(oversized_metadata.data());
-                expected_message = "metadata blob exceeds";
+                expected_message = "schema metadata exceeds";
             }
             else if (invalid == "name")
             {

@@ -4130,8 +4130,11 @@ const MAX_ARROW_ARRAY_LENGTH: i64 = questdb::ingress::column_sender::MAX_CHUNK_R
 // crate from ~4 bytes of input. Bound it before any node is converted.
 #[cfg(feature = "arrow")]
 const MAX_ARROW_SCHEMA_METADATA_ENTRIES: i32 = 65_536;
-#[cfg(feature = "arrow")]
-const MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES: i64 = 1024 * 1024;
+// `Field::try_from` copies every metadata key and value into owned strings,
+// once for each field whose schema node references the blob. Counting each
+// reference against one schema-wide budget bounds those copies, whether the
+// bytes sit in one large blob (polars stores every `Enum` category in its
+// field's metadata) or are spread across many fields.
 #[cfg(feature = "arrow")]
 const MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES: i64 = 64 * 1024 * 1024;
 
@@ -4253,17 +4256,13 @@ unsafe fn validate_name_str(
 
 #[cfg(feature = "arrow")]
 struct ArrowMetadataBudget {
-    charged_pointers: std::collections::HashSet<usize>,
     charged_bytes: i64,
 }
 
 #[cfg(feature = "arrow")]
 impl ArrowMetadataBudget {
     fn new() -> questdb::Result<Self> {
-        Ok(Self {
-            charged_pointers: std::collections::HashSet::new(),
-            charged_bytes: 0,
-        })
+        Ok(Self { charged_bytes: 0 })
     }
 
     fn charge_advance(
@@ -4277,12 +4276,6 @@ impl ArrowMetadataBudget {
                 "Arrow schema {path}: metadata cursor arithmetic overflows"
             ))
         })?;
-        if end > MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES {
-            return Err(arrow_ingest_err(format!(
-                "Arrow schema {path}: metadata blob exceeds {} bytes",
-                MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES
-            )));
-        }
         let total = self.charged_bytes.checked_add(amount).ok_or_else(|| {
             arrow_ingest_err(format!(
                 "Arrow schema {path}: schema metadata byte count overflows"
@@ -4303,7 +4296,7 @@ impl ArrowMetadataBudget {
 unsafe fn read_metadata_i32(metadata: *const u8, cursor: i64) -> i32 {
     unsafe {
         // RAW-READ AUDIT: every caller first charges this exact four-byte
-        // header against the per-blob and schema-wide bounds. The producer is
+        // header against the schema-wide bound. The producer is
         // still responsible for allocating the declared stable blob bytes.
         let p = metadata.add(cursor as usize);
         i32::from_ne_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
@@ -4317,13 +4310,6 @@ unsafe fn validate_metadata_blob(
     budget: &mut ArrowMetadataBudget,
 ) -> questdb::Result<()> {
     if metadata.is_null() {
-        return Ok(());
-    }
-    budget
-        .charged_pointers
-        .try_reserve(1)
-        .map_err(|_| arrow_ingest_err("Arrow schema metadata pointer-set reservation failed"))?;
-    if !budget.charged_pointers.insert(metadata as usize) {
         return Ok(());
     }
 
@@ -8192,7 +8178,7 @@ mod tests {
             assert_eq!(unsafe { (*err).error.code() }, ErrorCode::ArrowIngest);
             let message = unsafe { (*err).error.msg().to_string() };
             assert!(
-                message.contains("metadata blob exceeds 1048576 bytes"),
+                message.contains("schema metadata exceeds 67108864 bytes"),
                 "unexpected metadata diagnostic: {message}"
             );
             unsafe { line_sender_error_free(err) };
@@ -8213,11 +8199,11 @@ mod tests {
             use std::collections::HashMap;
             use std::sync::Arc;
 
-            // The value alone fills the per-blob limit; the key and length
+            // The value alone fills the schema budget; the key and length
             // headers take the blob past it.
             let oversized = HashMap::from([(
                 "pandas".to_string(),
-                "x".repeat(MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES as usize),
+                "x".repeat(MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES as usize),
             )]);
             let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
             for on_envelope in [true, false] {
@@ -8254,11 +8240,54 @@ mod tests {
                     assert_eq!(unsafe { (*err).error.code() }, ErrorCode::ArrowIngest);
                     assert_eq!(
                         unsafe { (*err).error.msg() },
-                        "Arrow schema root.children[0]: metadata blob exceeds 1048576 bytes"
+                        "Arrow schema root.children[0]: schema metadata exceeds 67108864 bytes"
                     );
                     unsafe { line_sender_error_free(err) };
                 }
             }
+        }
+
+        #[test]
+        fn polars_enum_field_metadata_above_one_mebibyte_is_imported() {
+            use arrow::array::UInt32Array;
+            use arrow::array::{Array, ArrayRef, DictionaryArray, StringViewArray, StructArray};
+            use arrow::datatypes::{Field, Schema};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+
+            // polars exports `pl.Enum` as Dictionary(UInt32, Utf8View) and
+            // lists every category, as `{len};{category}`, in this key.
+            let categories: String = (0..100_000).map(|i| format!("12;cat_{i:08}")).collect();
+            assert!(categories.len() > 1024 * 1024);
+            let dictionary = DictionaryArray::try_new(
+                UInt32Array::from(vec![0, 1, 0]),
+                Arc::new(StringViewArray::from(vec!["cat_00000000", "cat_00000001"])),
+            )
+            .unwrap();
+            let column: ArrayRef = Arc::new(dictionary);
+            let field = Field::new("e", column.data_type().clone(), true).with_metadata(
+                HashMap::from([("_PL_ENUM_VALUES2".to_string(), categories.clone())]),
+            );
+            let schema = Schema::new(vec![field]);
+            let producer = StructArray::new(schema.fields().clone(), vec![column], None);
+            let ffi_schema = FFI_ArrowSchema::try_from(&schema).unwrap();
+            let mut ffi_array = FFI_ArrowArray::new(&producer.to_data());
+            let mut err = std::ptr::null_mut();
+            let batch = unsafe {
+                arrow_ffi_import_record_batch(
+                    &mut ffi_array,
+                    &ffi_schema,
+                    "polars_enum_metadata_test",
+                    &mut err,
+                )
+            }
+            .expect("field metadata within the schema budget must import");
+            assert!(err.is_null());
+            assert_eq!(batch.num_rows(), 3);
+            assert_eq!(
+                batch.schema().field(0).metadata()["_PL_ENUM_VALUES2"],
+                categories
+            );
         }
 
         #[test]
@@ -8350,11 +8379,12 @@ mod tests {
         }
 
         #[test]
-        fn repeated_metadata_pointer_is_charged_once() {
-            unsafe {
+        fn shared_metadata_blob_is_charged_per_field() {
+            unsafe fn validate_shared(
+                metadata: &[u8],
+            ) -> (ArrowMetadataBudget, questdb::Result<()>) {
                 let root_format = CString::new("+s").unwrap();
                 let int_format = CString::new("i").unwrap();
-                let metadata = 0_i32.to_ne_bytes();
                 let mut root = Box::new(FFI_ArrowSchema::empty());
                 let mut left = Box::new(FFI_ArrowSchema::empty());
                 let mut right = Box::new(FFI_ArrowSchema::empty());
@@ -8371,14 +8401,41 @@ mod tests {
                 root.children = children.as_mut_ptr();
 
                 let mut budget = ArrowMetadataBudget::new().unwrap();
-                validate_arrow_schema_depth_with_budget(
-                    &*root,
-                    ArrowImportRootKind::RecordBatchEnvelope,
-                    &mut budget,
-                )
-                .unwrap();
-                assert_eq!(budget.charged_bytes, 4);
-                assert_eq!(budget.charged_pointers.len(), 1);
+                let result = unsafe {
+                    validate_arrow_schema_depth_with_budget(
+                        &*root,
+                        ArrowImportRootKind::RecordBatchEnvelope,
+                        &mut budget,
+                    )
+                };
+                (budget, result)
+            }
+
+            unsafe {
+                let (budget, result) = validate_shared(&0_i32.to_ne_bytes());
+                result.unwrap();
+                assert_eq!(budget.charged_bytes, 8);
+
+                // One entry with an empty key: each reference alone fits the
+                // budget, and the two together exceed it.
+                let value_len = MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES as usize / 2;
+                let mut metadata = Vec::with_capacity(12 + value_len);
+                metadata.extend_from_slice(&1_i32.to_ne_bytes());
+                metadata.extend_from_slice(&0_i32.to_ne_bytes());
+                metadata.extend_from_slice(&(value_len as i32).to_ne_bytes());
+                metadata.resize(12 + value_len, b'x');
+                let (_, result) = validate_shared(&metadata);
+                let err = result.unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                // The field charged second depends on the walk order.
+                assert!(
+                    err.msg().starts_with("Arrow schema root.children[")
+                        && err
+                            .msg()
+                            .ends_with("]: schema metadata exceeds 67108864 bytes"),
+                    "unexpected shared-blob diagnostic: {}",
+                    err.msg()
+                );
             }
         }
 
@@ -8455,7 +8512,7 @@ mod tests {
                 );
                 reject(
                     &[1_i32.to_ne_bytes(), i32::MAX.to_ne_bytes()].concat(),
-                    "metadata blob exceeds 1048576 bytes",
+                    "schema metadata exceeds 67108864 bytes",
                 );
             }
 
@@ -8764,18 +8821,18 @@ mod tests {
         }
 
         #[test]
-        fn metadata_blob_byte_boundary_is_inclusive() {
+        fn single_metadata_blob_may_fill_schema_budget() {
             unsafe {
-                let payload_len = MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES as usize - 12;
+                let payload_len = MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES as usize - 12;
                 let mut metadata =
-                    Vec::with_capacity(MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES as usize);
+                    Vec::with_capacity(MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES as usize);
                 metadata.extend_from_slice(&1_i32.to_ne_bytes());
                 metadata.extend_from_slice(&(payload_len as i32).to_ne_bytes());
                 metadata.resize(metadata.len() + payload_len, 0);
                 metadata.extend_from_slice(&0_i32.to_ne_bytes());
                 assert_eq!(
                     metadata.len(),
-                    MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES as usize
+                    MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES as usize
                 );
 
                 let mut budget = ArrowMetadataBudget::new().unwrap();
@@ -8785,25 +8842,22 @@ mod tests {
                     &mut budget,
                 )
                 .unwrap();
-                assert_eq!(budget.charged_bytes, MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES);
+                assert_eq!(budget.charged_bytes, MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES);
 
                 let mut budget = ArrowMetadataBudget::new().unwrap();
                 let err = budget
-                    .charge_advance("root", 0, MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES + 1)
+                    .charge_advance("root", 0, MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES + 1)
                     .unwrap_err();
-                assert!(err.msg().contains("metadata blob exceeds 1048576 bytes"));
+                assert!(err.msg().contains("schema metadata exceeds 67108864 bytes"));
             }
         }
 
         #[test]
         fn schema_metadata_byte_boundary_is_inclusive() {
             let mut budget = ArrowMetadataBudget::new().unwrap();
-            let blobs_at_limit =
-                MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES / MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES;
-            for _ in 0..blobs_at_limit {
-                budget
-                    .charge_advance("root", 0, MAX_ARROW_SCHEMA_METADATA_BLOB_BYTES)
-                    .unwrap();
+            let blob_bytes = 1024 * 1024;
+            for _ in 0..MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES / blob_bytes {
+                budget.charge_advance("root", 0, blob_bytes).unwrap();
             }
             assert_eq!(budget.charged_bytes, MAX_ARROW_SCHEMA_METADATA_TOTAL_BYTES);
             let err = budget.charge_advance("root", 0, 1).unwrap_err();
@@ -8885,7 +8939,7 @@ mod tests {
                 assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(
                     err.msg()
-                        .contains("root.children[0].children[0]: metadata blob exceeds"),
+                        .contains("root.children[0].children[0]: schema metadata exceeds"),
                     "unexpected precedence diagnostic: {}",
                     err.msg()
                 );
