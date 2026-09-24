@@ -282,6 +282,24 @@ impl TlsSettings {
     }
 }
 
+/// The rustls server name for a URI authority host.
+///
+/// `http::uri::Authority::host()` keeps the brackets of an IPv6 literal
+/// (`[::1]`), which rustls parses as neither a DNS name nor an IP address, so
+/// every HTTPS request to an IPv6-literal host failed before the handshake.
+/// Strip them so the certificate is verified against the IP address.
+#[cfg(any(feature = "_sender-http", feature = "_oidc"))]
+pub(crate) fn server_name_for_uri_host(
+    host: &str,
+) -> std::result::Result<rustls_pki_types::ServerName<'static>, rustls_pki_types::InvalidDnsNameError>
+{
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    rustls_pki_types::ServerName::try_from(host).map(|name| name.to_owned())
+}
+
 #[cfg(any(
     feature = "_sender-tcp",
     feature = "_sender-http",
@@ -338,4 +356,33 @@ pub(crate) fn configure_tls(tls: TlsSettings) -> Result<Arc<rustls::ClientConfig
     }
 
     Ok(Arc::new(config))
+}
+
+#[cfg(all(test, any(feature = "_sender-http", feature = "_oidc")))]
+mod tests {
+    use super::server_name_for_uri_host;
+    use rustls_pki_types::ServerName;
+    use std::net::{IpAddr, Ipv6Addr};
+
+    #[test]
+    fn server_name_strips_ipv6_literal_brackets() {
+        let name = server_name_for_uri_host("[::1]").unwrap();
+        assert_eq!(
+            name,
+            ServerName::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST).into())
+        );
+    }
+
+    #[test]
+    fn server_name_keeps_dns_and_ipv4_hosts() {
+        assert!(matches!(
+            server_name_for_uri_host("localhost").unwrap(),
+            ServerName::DnsName(_)
+        ));
+        assert!(matches!(
+            server_name_for_uri_host("127.0.0.1").unwrap(),
+            ServerName::IpAddress(_)
+        ));
+        assert!(server_name_for_uri_host("[not an ip]").is_err());
+    }
 }

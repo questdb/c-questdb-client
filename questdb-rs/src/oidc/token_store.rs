@@ -1994,13 +1994,31 @@ fn bounded_hostname(raw: &str) -> &str {
     &raw[..end]
 }
 
+fn unix_nanos_now() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// The wall-clock time, as stamp nanos, from which this process may have
+/// written lock owner stamps. It is fixed the first time this process writes a
+/// stamp or inspects one naming its own pid, so every stamp this process wrote
+/// carries nanos at or after it. A stamp naming this pid with earlier nanos was
+/// written by an earlier process that had the same pid -- typically the
+/// previous incarnation of a container whose entrypoint runs as PID 1.
+fn process_stamp_epoch_nanos() -> u128 {
+    static EPOCH: OnceLock<u128> = OnceLock::new();
+    *EPOCH.get_or_init(unix_nanos_now)
+}
+
 fn holder_bytes() -> std::io::Result<String> {
     let mut nonce = [0_u8; 16];
     fill_random_lock_nonce(&mut nonce)?;
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    // Fix the epoch before reading the clock for this stamp, so the stamp's
+    // own nanos can never precede it.
+    let _ = process_stamp_epoch_nanos();
+    let nanos = unix_nanos_now();
     let stamp = format!(
         "{nanos} {} {}@{}",
         to_hex(&nonce),
@@ -2364,15 +2382,23 @@ fn kernel_hostname() -> Option<String> {
 
 /// Whether a lock owner stamp (`"{nanos} {nonce} {pid}@{host}"`) names a
 /// process on this host that no longer exists. Anything that does not parse,
-/// names another host (or the uninformative `localhost` fallback), names this
-/// process, or whose liveness cannot be determined, answers `false` so the
-/// ordinary age-based rule applies.
+/// names another host (or the uninformative `localhost` fallback), or whose
+/// liveness cannot be determined, answers `false` so the ordinary age-based
+/// rule applies.
+///
+/// A stamp naming this process's own pid is dead only when it predates every
+/// stamp this process can have written (see [`process_stamp_epoch_nanos`]):
+/// a pid probe cannot tell this process from an earlier one that had the same
+/// pid, and a container restarted with its entrypoint as PID 1 is exactly the
+/// crash this grace exists for. A stamp this process did write stays live, and
+/// even a misjudged live holder is safe here: its heartbeat keeps the mtime far
+/// younger than [`DEAD_HOLDER_GRACE`].
 fn holder_is_dead_on_this_host(stamp: &[u8]) -> bool {
     let Ok(stamp) = std::str::from_utf8(stamp) else {
         return false;
     };
     let mut parts = stamp.split(' ');
-    let (Some(_nanos), Some(_nonce), Some(owner), None) =
+    let (Some(nanos), Some(_nonce), Some(owner), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return false;
@@ -2384,8 +2410,13 @@ fn holder_is_dead_on_this_host(stamp: &[u8]) -> bool {
         return false;
     };
     let local = hostname();
-    if host != local || local == "localhost" || pid == std::process::id() {
+    if host != local || local == "localhost" {
         return false;
+    }
+    if pid == std::process::id() {
+        return nanos
+            .parse::<u128>()
+            .is_ok_and(|nanos| nanos < process_stamp_epoch_nanos());
     }
     process_is_gone(pid)
 }

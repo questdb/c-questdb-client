@@ -37,7 +37,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
-use rustls_pki_types::ServerName;
 use rustls_pki_types::pem::PemObject;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
@@ -296,7 +295,10 @@ impl HttpClient {
         let retry_after = parse_retry_after(response.headers());
         // Keep the raw response allocation under RAII zeroization as well as the
         // parsed strings below. Both otherwise survive in freed allocator pages.
-        let body = Zeroizing::new(read_body(url, response)?);
+        // `read_body_zeroizing` also wipes every buffer it outgrows; ureq's own
+        // transport buffers are outside this crate's control (see
+        // `token_provider.rs`, "Known residual").
+        let body = read_body_zeroizing(url, response)?;
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(mut value) => {
                 // Token-endpoint responses are untrusted and some IdPs, proxies,
@@ -550,6 +552,68 @@ fn read_body(url: &str, response: ureq::http::Response<ureq::Body>) -> Result<Ve
         })
 }
 
+/// Read a credential-bearing response body, bounded by [`MAX_RESPONSE_BYTES`],
+/// without leaving plaintext copies behind.
+///
+/// [`read_body`] goes through ureq's `read_to_vec`, which grows a `Vec` from
+/// empty: every buffer a geometric growth leaves behind is freed holding a
+/// plaintext prefix of the token response, and wrapping only the final `Vec` in
+/// `Zeroizing` cannot reach those. Here each outgrown buffer is itself a
+/// `Zeroizing` and is wiped as it is replaced, and the first one is sized from
+/// `Content-Length` so a typical response never grows at all.
+fn read_body_zeroizing(
+    url: &str,
+    response: ureq::http::Response<ureq::Body>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+
+    const INITIAL_CAPACITY: usize = 4096;
+    const CHUNK: usize = 8192;
+
+    let read_error = |e: std::io::Error| {
+        let e = ureq::Error::from(e);
+        let timed_out = request_timed_out(&e);
+        OidcError::network(format!("Failed to read response body from {url}: {e}"))
+            .with_request_timed_out(timed_out)
+    };
+    let initial = response
+        .headers()
+        .get(ureq::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(INITIAL_CAPACITY, |len| {
+            // One byte of headroom lets the terminating zero-length read land
+            // without forcing a growth.
+            usize::try_from(len.min(MAX_RESPONSE_BYTES)).unwrap_or(INITIAL_CAPACITY) + 1
+        });
+    let mut reader = response
+        .into_body()
+        .into_with_config()
+        .limit(MAX_RESPONSE_BYTES)
+        .reader();
+    let mut body = Zeroizing::new(Vec::with_capacity(initial));
+    let mut chunk = Zeroizing::new([0_u8; CHUNK]);
+    loop {
+        let n = match reader.read(&mut chunk[..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(read_error(e)),
+        };
+        if body.capacity() - body.len() < n {
+            let needed = body.len() + n;
+            let mut grown = Zeroizing::new(Vec::with_capacity(
+                needed.max(body.capacity().saturating_mul(2)),
+            ));
+            grown.extend_from_slice(&body);
+            // The outgrown buffer is wiped (whole capacity) as it is dropped.
+            body = grown;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Ok(body)
+}
+
 /// A short, printable snippet of a (possibly binary / error-page) body for a
 /// diagnostic message.
 fn body_snippet(body: &[u8]) -> String {
@@ -733,14 +797,14 @@ impl<In: Transport> Connector<In> for TlsConnector {
         // A URI without an authority is already rejected upstream
         // (`require_secure` + `reject_confusable_authority`); return a TLS error
         // as a local safety net rather than relying on that.
-        let name_borrowed: ServerName<'_> = details
-            .uri
-            .authority()
-            .ok_or(ureq::Error::Tls("tls uri has no authority"))?
-            .host()
-            .try_into()
-            .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
-        let name = name_borrowed.to_owned();
+        let name = crate::ingress::tls::server_name_for_uri_host(
+            details
+                .uri
+                .authority()
+                .ok_or(ureq::Error::Tls("tls uri has no authority"))?
+                .host(),
+        )
+        .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
         let conn = ClientConnection::new(self.tls_config.clone(), name)
             .map_err(|_e| ureq::Error::Tls("tls client connection error"))?;
         let stream = StreamOwned {
@@ -1098,6 +1162,34 @@ mod tests {
         };
 
         assert_tls_network_error(err);
+        assert_eq!(server.accepts(), 1);
+        assert!(server.request_bodies().is_empty());
+    }
+
+    #[test]
+    fn https_to_an_ipv6_literal_reaches_certificate_verification() {
+        // Regression: the bracketed `[::1]` authority host was handed to rustls
+        // as the server name and failed to parse, so every HTTPS request to an
+        // IPv6-literal host failed before the handshake, whatever the
+        // certificate. The repository certificate names only DNS:localhost, so
+        // the handshake must now run and fail certificate verification instead.
+        if TcpListener::bind("[::1]:0").is_err() {
+            return; // No IPv6 loopback on this host.
+        }
+        let server = TlsJsonServer::start("[::1]:0", "[::1]");
+        let client = HttpClient::new(Some(&root_ca_path()), Duration::from_secs(5)).unwrap();
+        let err = match client.post_form(&server.url("/token"), &[("client_id", "questdb")], false)
+        {
+            Err(err) => err,
+            Ok(_) => panic!("the certificate does not name ::1"),
+        };
+
+        let message = err.message().to_string();
+        assert_tls_network_error(err);
+        assert!(
+            !message.contains("invalid dns name"),
+            "the IPv6 literal must reach the handshake: {message}"
+        );
         assert_eq!(server.accepts(), 1);
         assert!(server.request_bodies().is_empty());
     }

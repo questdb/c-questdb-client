@@ -366,11 +366,21 @@ impl TokenProvider {
 }
 
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+const PROVIDER_SHUTDOWN_MSG: &str =
+    "Token-provider acquisition was abandoned because the transport is shutting down";
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 fn provider_shutdown_error() -> crate::Error {
-    crate::error::fmt!(
-        SocketError,
-        "Token-provider acquisition was abandoned because the transport is shutting down"
-    )
+    crate::Error::new(crate::ErrorCode::SocketError, PROVIDER_SHUTDOWN_MSG)
+}
+
+/// Whether `err` is the error [`TokenProvider::bearer_header_isolated_until`]
+/// returns when its cancellation predicate fired before the provider answered.
+/// It says nothing about the provider or the server, so a caller that
+/// cancelled on a deadline can prefer the diagnostic it already holds.
+#[cfg(feature = "_egress")]
+pub(crate) fn is_provider_shutdown_error(err: &crate::Error) -> bool {
+    err.code() == crate::ErrorCode::SocketError && err.msg() == PROVIDER_SHUTDOWN_MSG
 }
 
 /// Classify a token-provider acquisition error separately from a server
@@ -414,24 +424,7 @@ fn classify_provider_error(e: crate::Error) -> crate::Error {
         let msg = format!("Token provider failed: {}", e.msg());
         return e.reclassified(crate::ErrorCode::ConfigError, msg);
     }
-    #[cfg(feature = "_oidc")]
-    if e.oidc_error().is_some_and(|oidc| {
-        matches!(
-            oidc.kind(),
-            // `close()` is monotonic: `token()` returns this for the rest of
-            // the process.
-            crate::oidc::OidcErrorKind::Cancelled
-                // A misconfiguration is fixed at build time, so `token()`
-                // cannot resolve it either: `select()` raises this when the
-                // configured scope cannot yield the required token kind (no
-                // `id_token` in groups mode, or no `access_token`), and it
-                // recurs identically on every invocation. Retrying it forever
-                // is the same trap the `Cancelled` carve-out exists to avoid,
-                // and unlike an expired credential no human action inside this
-                // process can clear it.
-                | crate::oidc::OidcErrorKind::Config
-        )
-    }) {
+    if is_terminal_oidc_provider_error(&e) {
         return e;
     }
     if e.code() == crate::ErrorCode::SocketError {
@@ -439,6 +432,39 @@ fn classify_provider_error(e: crate::Error) -> crate::Error {
     } else {
         let msg = format!("Token provider failed: {}", e.msg());
         e.reclassified(crate::ErrorCode::SocketError, msg)
+    }
+}
+
+/// Whether `e` is an OIDC provider failure that no later invocation can
+/// resolve: a closed provider (`close()` is monotonic) or a misconfiguration.
+/// [`classify_provider_error`] keeps these terminal, and every reconnect loop
+/// that pulls a token -- including background orphan drainers -- must stop on
+/// them rather than retry.
+pub(crate) fn is_terminal_oidc_provider_error(e: &crate::Error) -> bool {
+    #[cfg(feature = "_oidc")]
+    {
+        e.oidc_error().is_some_and(|oidc| {
+            matches!(
+                oidc.kind(),
+                // `close()` is monotonic: `token()` returns this for the rest
+                // of the process.
+                crate::oidc::OidcErrorKind::Cancelled
+                    // A misconfiguration is fixed at build time, so `token()`
+                    // cannot resolve it either: `select()` raises this when the
+                    // configured scope cannot yield the required token kind (no
+                    // `id_token` in groups mode, or no `access_token`), and it
+                    // recurs identically on every invocation. Retrying it
+                    // forever is the same trap the `Cancelled` carve-out exists
+                    // to avoid, and unlike an expired credential no human action
+                    // inside this process can clear it.
+                    | crate::oidc::OidcErrorKind::Config
+            )
+        })
+    }
+    #[cfg(not(feature = "_oidc"))]
+    {
+        let _ = e;
+        false
     }
 }
 

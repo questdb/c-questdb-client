@@ -1712,6 +1712,54 @@ fn crashed_local_holder_lock_is_reclaimed_without_the_full_stale_window() {
 
 #[cfg(unix)]
 #[test]
+fn earlier_process_with_this_pid_is_reclaimed_without_the_full_stale_window() {
+    if hostname() == "localhost" {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let key = test_key();
+    let store = test_file_store(dir.path())
+        .with_lock_timings(Duration::from_millis(500), DEFAULT_LOCK_STALE);
+    // `plant_owned_lock` stamps creation nanos `1`, long before this process
+    // could have written any stamp: a container restarted as the same PID.
+    let lock = plant_owned_lock(
+        &store,
+        &key,
+        std::process::id(),
+        DEAD_HOLDER_GRACE + Duration::from_secs(5),
+    );
+    assert!(
+        try_identity_lock(&store, &key),
+        "a lock left by an earlier process with this pid must not block for \
+         {DEFAULT_LOCK_STALE:?}"
+    );
+    assert_lock_released(&lock, "same-pid crashed holder lock was not reclaimed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stamp_written_by_this_process_is_not_treated_as_dead() {
+    if hostname() == "localhost" {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let key = test_key();
+    let store = test_file_store(dir.path())
+        .with_lock_timings(Duration::from_millis(300), DEFAULT_LOCK_STALE);
+    let lock = store.lock_file(&key);
+    std::fs::write(&lock, holder_bytes().unwrap()).unwrap();
+    let f = OpenOptions::new().write(true).open(&lock).unwrap();
+    f.set_modified(SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+    drop(f);
+    assert!(
+        !try_identity_lock(&store, &key),
+        "this process's own stamp must keep the full stale window"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn dead_holder_lock_within_the_heartbeat_grace_is_kept() {
     if hostname() == "localhost" {
         return;

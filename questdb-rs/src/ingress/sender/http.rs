@@ -26,7 +26,6 @@ use crate::error::fmt;
 use crate::{Error, error};
 use rand::Rng;
 use rustls::{ClientConnection, StreamOwned};
-use rustls_pki_types::ServerName;
 use std::fmt;
 use std::fmt::{Debug, Write};
 use std::io::{Read, Write as IoWrite};
@@ -179,15 +178,15 @@ impl<In: Transport> Connector<In> for TlsConnector {
 
         match self.tls_config.as_ref() {
             Some(config) => {
-                let name_borrowed: ServerName<'_> = details
-                    .uri
-                    .authority()
-                    .expect("uri authority for tls")
-                    .host()
-                    .try_into()
-                    .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
+                let name = crate::ingress::tls::server_name_for_uri_host(
+                    details
+                        .uri
+                        .authority()
+                        .expect("uri authority for tls")
+                        .host(),
+                )
+                .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
 
-                let name = name_borrowed.to_owned();
                 let conn = ClientConnection::new(config.clone(), name)
                     .map_err(|_e| ureq::Error::Tls("tls client connection error"))?;
                 let stream = StreamOwned {
@@ -708,27 +707,25 @@ pub(super) fn http_send_with_retries(
     // rejection still costs a single request.
     //
     // A retryable provider failure on that re-resolution shares the flush's
-    // retry budget, so the deadline is needed there. It is built only on the
-    // 401 path: static and absent credentials never rotate and must not
-    // construct one (an unrepresentable public `Duration` is a ConfigError).
-    let rotation_deadline = || -> crate::Result<Option<std::time::Instant>> {
-        match retry_end {
-            Some(retry_end) => Ok(Some(retry_end)),
-            None if retry_timeout.is_zero() => Ok(None),
-            None => checked_retry_deadline(std::time::Instant::now(), retry_timeout).map(Some),
-        }
-    };
-    if !need_retry
+    // retry budget, so the deadline is needed there -- and it is the same
+    // deadline the request retries after the rotated attempt run against, so
+    // re-resolving and retrying together stay within one `retry_timeout`. It
+    // is built only on the 401 path: static and absent credentials never
+    // rotate and must not construct one (an unrepresentable public `Duration`
+    // is a ConfigError).
+    let rotation_candidate = !need_retry
         && state.auth.is_rotating()
-        && matches!(&last_rep, Ok(rep) if rep.status() == 401)
-        && let Some(rotated) = rotated_auth_after_401(
-            state,
-            &last_rep,
-            auth,
-            false,
-            rotation_deadline()?,
-            retry_max_backoff,
-        )?
+        && matches!(&last_rep, Ok(rep) if rep.status() == 401);
+    let retry_end = match retry_end {
+        None if rotation_candidate && !retry_timeout.is_zero() => Some(checked_retry_deadline(
+            std::time::Instant::now(),
+            retry_timeout,
+        )?),
+        retry_end => retry_end,
+    };
+    if rotation_candidate
+        && let Some(rotated) =
+            rotated_auth_after_401(state, &last_rep, auth, false, retry_end, retry_max_backoff)?
     {
         if let Ok(rep) = last_rep {
             // Return the connection to the pool before reusing the agent.

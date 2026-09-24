@@ -1164,6 +1164,81 @@ fn test_retryable_provider_failure_after_first_401_is_retried_within_budget() ->
     Ok(())
 }
 
+#[test]
+fn test_post_401_provider_retries_and_request_retries_share_one_deadline() -> TestResult {
+    // Regression: re-resolving the provider after a first-attempt 401 ran
+    // against one `retry_timeout` window and the request retries after the
+    // rotated attempt against a second, fresh one, so the flush could block
+    // for about twice `retry_timeout`.
+    let retry_timeout = Duration::from_millis(1500);
+    let provider_outage = Duration::from_millis(1300);
+    let mut server = MockServer::new()?;
+    let first_failure: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let failure_start = std::sync::Arc::clone(&first_failure);
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Ok("tok0".to_string());
+            }
+            let mut start = failure_start.lock().unwrap();
+            if start.get_or_insert_with(std::time::Instant::now).elapsed() < provider_outage {
+                Err(crate::error::fmt!(SocketError, "IdP unreachable"))
+            } else {
+                Ok("tok1".to_string())
+            }
+        })?
+        .retry_timeout(retry_timeout)?
+        .retry_max_backoff(Duration::from_millis(50))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 1.0)?
+        .at(TimestampNanos::new(1))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<(MockServer, usize)> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        let mut rotated_requests = 0;
+        while let Ok(req) = server.recv_http(3.0) {
+            assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+            rotated_requests += 1;
+            server.send_http_response_q(
+                HttpResponse::empty()
+                    .with_status(503, "Service Unavailable")
+                    .with_body_str("busy"),
+            )?;
+        }
+        Ok((server, rotated_requests))
+    });
+
+    let started = std::time::Instant::now();
+    let res = sender.flush_and_keep(&buffer);
+    let elapsed = started.elapsed();
+    let (_server, rotated_requests) = server_thread.join().unwrap()?;
+    assert!(res.is_err(), "the server never accepts the rotated request");
+    assert!(
+        rotated_requests >= 1,
+        "the rotated credential must be replayed"
+    );
+    assert!(
+        elapsed < retry_timeout + Duration::from_millis(700),
+        "flush took {elapsed:?}, beyond one retry_timeout of {retry_timeout:?}"
+    );
+    Ok(())
+}
+
 #[rstest]
 fn test_one_retry(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,

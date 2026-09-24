@@ -6826,6 +6826,51 @@ fn sign_in_refuses_a_token_store_that_cannot_persist() {
 }
 
 #[test]
+fn sign_in_reports_an_unusable_file_store_path_as_config() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let not_a_directory = dir.path().join("store-is-a-file");
+    std::fs::write(&not_a_directory, b"x").unwrap();
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(test_file_store(&not_a_directory))
+        .build()
+        .expect("build auth with an unusable store path");
+
+    for _ in 0..2 {
+        let err = auth
+            .sign_in()
+            .expect_err("a store path that is not a directory must fail the sign-in");
+        assert_eq!(err.kind(), OidcErrorKind::Config, "{err}");
+        assert!(
+            err.message().contains("not a directory"),
+            "the store's own reason must be carried through: {}",
+            err.message()
+        );
+    }
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        0,
+        "no device code may be shown for a store that can never persist it"
+    );
+
+    // A transport-facing token() keeps the retryable classification: the
+    // location may be repaired while the process runs.
+    let err = auth.token().expect_err("no credential is available");
+    assert_eq!(err.kind(), OidcErrorKind::Network, "{err}");
+}
+
+#[test]
 fn sign_in_is_unaffected_by_a_store_that_does_not_override_preflight() {
     let device_calls = Arc::new(AtomicUsize::new(0));
     let mock = persistence_mock(Arc::clone(&device_calls), || {

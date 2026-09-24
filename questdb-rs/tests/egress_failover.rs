@@ -5636,6 +5636,52 @@ fn final_round_role_mismatch_past_deadline_surfaces_role_mismatch() {
     }
 }
 
+/// Regression: a token-provider reader whose last reconnect round was admitted
+/// at the deadline had its provider acquisition cancelled before any dial, and
+/// that cancellation ("transport is shutting down") replaced the
+/// `RoleMismatch` the earlier rounds had recorded. The exhaustion error must
+/// keep the role reject exactly as a static-auth reader's does.
+#[test]
+fn provider_reader_keeps_role_mismatch_when_deadline_cuts_off_a_round() {
+    for _ in 0..5 {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Primary, "a-primary"),
+            vec![Action::Reject421 {
+                role: Some("REPLICA".into()),
+                zone: None,
+            }],
+        ]);
+        let b = slow_421_replica_server(Duration::ZERO);
+        let conf = format!(
+            "ws::addr={},{};target=primary;failover_max_attempts=20;\
+             failover_backoff_initial_ms=50;failover_backoff_max_ms=5000;\
+             failover_max_duration_ms=100",
+            a.url(),
+            b
+        );
+        let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+            .unwrap()
+            .token_provider(|| Ok::<_, questdb::Error>("tok".to_string()))
+            .unwrap();
+        let mut reader = Reader::from_config(&cfg).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(err.code(), ErrorCode::RoleMismatch, "msg={}", err.msg());
+        assert!(
+            err.upgrade_reject().is_some(),
+            "the role reject must stay attached"
+        );
+        assert!(
+            !err.msg().contains("shutting down"),
+            "a deadline cut-off must not be reported as a shutdown: {}",
+            err.msg()
+        );
+    }
+}
+
 fn slow_503_server(delay: Duration) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

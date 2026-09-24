@@ -531,6 +531,12 @@ impl Reader {
                 deadline_exhausted = true;
                 match walk_result {
                     Err(error) if !is_failover_eligible(error.code()) => return Err(error),
+                    // A walk the deadline cut off before it dialled anything
+                    // learned nothing about the cluster. Keep what the last
+                    // walk that did dial found -- a `RoleMismatch` above all,
+                    // which the exhaustion error must keep for a provider-
+                    // authenticated reader exactly as for a static one.
+                    Err(error) if is_walk_deadline_cutoff(&error) && last_err.is_some() => {}
                     Err(error) => last_err = Some(error),
                     Ok(_) => unreachable!("walk_result was checked as Err"),
                 }
@@ -3146,14 +3152,24 @@ fn authorization_header<'a>(headers: &'a [(&'static str, String)]) -> Option<&'a
         .find_map(|(name, value)| (*name == "Authorization").then_some(value.as_str()))
 }
 
+const WALK_DEADLINE_CUTOFF_MSG: &str =
+    "failover deadline expired during endpoint or credential resolution";
+
+fn walk_deadline_passed(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
+
 fn ensure_walk_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
-    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-        return Err(fmt!(
-            SocketError,
-            "failover deadline expired during endpoint or credential resolution"
-        ));
+    if walk_deadline_passed(deadline) {
+        return Err(Error::new(ErrorCode::SocketError, WALK_DEADLINE_CUTOFF_MSG));
     }
     Ok(())
+}
+
+/// Whether a walk failed only because the failover deadline stopped it before
+/// it dialled an endpoint (see [`ensure_walk_deadline`]).
+fn is_walk_deadline_cutoff(error: &Error) -> bool {
+    error.code() == ErrorCode::SocketError && error.msg() == WALK_DEADLINE_CUTOFF_MSG
 }
 
 fn upgrade_headers_for_walk(
@@ -3202,7 +3218,18 @@ fn walk_via_tracker(
     // and immediately discard one socket per endpoint (or twice per endpoint
     // when the reconnect fall-through pass runs). The next outer reconnect
     // round calls this function again and therefore polls the provider afresh.
-    let mut upgrade_headers = upgrade_headers_for_walk(cfg, deadline)?;
+    let mut upgrade_headers = match upgrade_headers_for_walk(cfg, deadline) {
+        Ok(headers) => headers,
+        // The deadline cancelled the acquisition before the provider answered.
+        // Report that as the cutoff it is, not as a transport "shutting down".
+        Err(error)
+            if crate::token_provider::is_provider_shutdown_error(&error)
+                && walk_deadline_passed(deadline) =>
+        {
+            return Err(Error::new(ErrorCode::SocketError, WALK_DEADLINE_CUTOFF_MSG));
+        }
+        Err(error) => return Err(error),
+    };
     // Provider resolution during failover is isolated and cancellation-aware.
     // Re-check immediately afterwards so a result racing the deadline is never
     // followed by endpoint dials or a second credential resolution. A static

@@ -1427,7 +1427,7 @@ impl OidcDeviceAuth {
         }
         // Seed the cache from the persisted store once, so a restart resumes from
         // a saved refresh token instead of re-prompting (a no-op without a store).
-        let load_result = self.maybe_load_from_store();
+        let load_result = self.maybe_load_from_store(allow_interaction);
         // The store read can run a persistence diagnostic, and that handler may
         // close this auth. Closing is terminal, so re-check before serving
         // anything the cache happens to hold at this point.
@@ -1607,7 +1607,14 @@ impl OidcDeviceAuth {
     /// acquire critical section. The read shares the store's per-identity lock
     /// with refresh so it cannot mistake a consumed parent awaiting replacement
     /// for a stable absence and permanently latch that temporary tombstone.
-    fn maybe_load_from_store(&self) -> Result<()> {
+    ///
+    /// A failed read is reported as retryable `Network`, except on the
+    /// interactive `sign_in()` path when the store failed for a reason that
+    /// cannot clear on its own (see [`store_error_is_permanent`]): that is a
+    /// misconfigured store, reported as `Config` while the user is present, as
+    /// `preflight_token_store` would have reported it had the read not failed
+    /// first.
+    fn maybe_load_from_store(&self, allow_interaction: bool) -> Result<()> {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
             return Ok(());
         };
@@ -1689,6 +1696,14 @@ impl OidcDeviceAuth {
                 // `load_attempted` unset so the next call retries.
                 self.lock_store_state().record_store_load_failure(now);
                 let message = match lock_result {
+                    Err(e) if allow_interaction && store_error_is_permanent(&*e) => {
+                        self.warn_persistence("load", &*e);
+                        return Err(OidcError::config(format!(
+                            "The configured OIDC token store cannot be used: {e}. Fix its \
+                             location or permissions, or omit the token store to keep \
+                             credentials in memory only."
+                        )));
+                    }
                     Err(e) => {
                         self.warn_persistence("load", &*e);
                         format!(
@@ -2901,6 +2916,28 @@ fn snapshot(tokens: &TokenSet) -> PersistedToken {
         tokens.expires_at,
         ttl,
     )
+}
+
+/// Whether a token-store failure is a standing condition of the configured
+/// location -- permission denied, a read-only filesystem, a path that is not a
+/// directory, or a path this client refuses to use -- rather than contention or
+/// a transient I/O error that a retry can clear.
+///
+/// Only errors the operating system reported are trusted for the permission
+/// kinds: the store also raises its own `PermissionDenied` for a lost or stolen
+/// lock, which is transient. On Windows a `PermissionDenied` from the OS can be
+/// a delete-pending lock file, so it stays transient there.
+fn store_error_is_permanent(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    let Some(io) = error.downcast_ref::<std::io::Error>() else {
+        return false;
+    };
+    match io.kind() {
+        std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::NotADirectory
+        | std::io::ErrorKind::ReadOnlyFilesystem => true,
+        std::io::ErrorKind::PermissionDenied => cfg!(unix) && io.raw_os_error().is_some(),
+        _ => false,
+    }
 }
 
 /// True when a failed [`refresh`](OidcDeviceAuth::refresh) proves the refresh
