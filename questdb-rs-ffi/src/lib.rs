@@ -8262,6 +8262,94 @@ mod tests {
         }
 
         #[test]
+        fn dictionary_presence_mismatch_is_rejected_before_import() {
+            use arrow::array::{Array, ArrayRef, DictionaryArray, StructArray};
+            use arrow::datatypes::{Field, Int32Type};
+            use std::sync::Arc;
+
+            let dictionary: DictionaryArray<Int32Type> = ["a", "b", "a"].into_iter().collect();
+            let column: ArrayRef = Arc::new(dictionary);
+            let batch = StructArray::new(
+                vec![Arc::new(Field::new("d", column.data_type().clone(), true))].into(),
+                vec![column.clone()],
+                None,
+            );
+            for record_batch in [true, false] {
+                // Remove the dictionary from the array (the schema still
+                // declares one), then from the schema (the array still has one).
+                for strip_array in [true, false] {
+                    let producer: &dyn Array = if record_batch {
+                        &batch
+                    } else {
+                        column.as_ref()
+                    };
+                    let mut ffi_schema = FFI_ArrowSchema::try_from(producer.data_type()).unwrap();
+                    let mut ffi_array = FFI_ArrowArray::new(&producer.to_data());
+                    let array = &raw mut ffi_array;
+                    let schema = &raw mut ffi_schema;
+                    let mut err = std::ptr::null_mut();
+                    unsafe {
+                        let (array_node, schema_node) = if record_batch {
+                            (*(*array).children, *(*schema).children)
+                        } else {
+                            (array, schema)
+                        };
+                        let array_dictionary = (*array_node).dictionary;
+                        let schema_dictionary = (*schema_node).dictionary;
+                        if strip_array {
+                            (*array_node).dictionary = std::ptr::null_mut();
+                        } else {
+                            (*schema_node).dictionary = std::ptr::null_mut();
+                        }
+                        let rejected = if record_batch {
+                            arrow_ffi_import_record_batch(
+                                array,
+                                schema,
+                                "dictionary_test",
+                                &mut err,
+                            )
+                            .is_none()
+                        } else {
+                            arrow_ffi_import_column(
+                                array,
+                                schema,
+                                None,
+                                "dictionary_test",
+                                &mut err,
+                            )
+                            .is_none()
+                        };
+                        // Restore the producer's tree so its release callbacks
+                        // free every node.
+                        (*array_node).dictionary = array_dictionary;
+                        (*schema_node).dictionary = schema_dictionary;
+                        assert!(
+                            rejected,
+                            "record_batch={record_batch}, strip_array={strip_array}"
+                        );
+                        assert!(
+                            (*array).release.is_some(),
+                            "the mismatch is rejected before import"
+                        );
+                        assert_eq!((*err).error.code(), ErrorCode::ArrowIngest);
+                        let path = if record_batch {
+                            "root.children[0]"
+                        } else {
+                            "root"
+                        };
+                        assert_eq!(
+                            (*err).error.msg(),
+                            format!(
+                                "Arrow array {path}: array/schema dictionary presence disagrees with the accepted datatype"
+                            )
+                        );
+                        line_sender_error_free(err);
+                    }
+                }
+            }
+        }
+
+        #[test]
         fn repeated_metadata_pointer_is_charged_once() {
             unsafe {
                 let root_format = CString::new("+s").unwrap();
