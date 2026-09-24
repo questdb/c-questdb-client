@@ -426,15 +426,24 @@ fn retry_http_send(
     // rotation disabled backoff for the rest of the window and any genuinely
     // retryable failure after it re-sent the whole buffer in a ~1 ms loop until
     // `retry_end`.
+    //
+    // The rotated attempt is also exempt from the deadline check. The provider
+    // has already been called and has handed back a fresh credential; if the
+    // 401 carrying the stale one merely arrived after `retry_end`, returning
+    // that 401 as a terminal AuthError threw the fresh credential away unsent.
+    // A 401 on the flush's very first request is replayed whatever the budget
+    // (`http_send_with_retries`), and one inside this loop now gets the same
+    // single replay. `auth_retry_used` still bounds it to one per flush.
     let mut retry_now = false;
     loop {
         let jitter_ms = rng.random_range(-5i32..5);
-        let to_sleep = if std::mem::take(&mut retry_now) {
+        let rotated_replay = std::mem::take(&mut retry_now);
+        let to_sleep = if rotated_replay {
             Duration::ZERO
         } else {
             retry_sleep(retry_interval_ms, jitter_ms)
         };
-        if (std::time::Instant::now() + to_sleep) > retry_end {
+        if !rotated_replay && (std::time::Instant::now() + to_sleep) > retry_end {
             return finish_http_send(state, last_rep);
         }
         sleep(to_sleep);
@@ -447,7 +456,14 @@ fn retry_http_send(
         (need_retry, last_rep) = state.send_request(buf, request_timeout, attempt_auth);
         if !need_retry {
             if !auth_retry_used
-                && let Some(value) = rotated_auth_after_401(state, &last_rep, attempt_auth, true)?
+                && let Some(value) = rotated_auth_after_401(
+                    state,
+                    &last_rep,
+                    attempt_auth,
+                    true,
+                    Some(retry_end),
+                    retry_max_backoff,
+                )?
             {
                 auth_retry_used = true;
                 refreshed = Some(value);
@@ -512,26 +528,53 @@ fn retry_sleep(retry_interval_ms: i32, jitter_ms: i32) -> Duration {
 /// in-doubt told callers a buffer the server had definitively rejected might
 /// have landed, and `Error::in_doubt` is what they use to decide whether a
 /// replay can duplicate rows.
+///
+/// A provider failure that can clear on its own (`provider_error_is_retryable`)
+/// is re-resolved on the flush's ordinary backoff ladder until `retry_end`,
+/// exactly as the same failure is before the first request
+/// (`resolve_auth_with_retries`). Nothing has been applied by a 401, so the
+/// batch is intact; failing at once instead ended the flush with most of its
+/// retry budget unspent, and the bindings that clear the sender-owned buffer on
+/// a failed flush (Python's `Sender.flush()`) then discarded the batch. With
+/// `retry_end` absent (a zero `retry_timeout`) the failure is returned at once.
 fn rotated_auth_after_401(
     state: &SyncHttpHandlerState,
     rep: &Result<Response<Body>, ureq::Error>,
     used: Option<&str>,
     prior_attempt_in_doubt: bool,
+    retry_end: Option<std::time::Instant>,
+    retry_max_backoff: Duration,
 ) -> crate::Result<Option<String>> {
     if !state.auth.is_rotating() || !matches!(rep, Ok(rep) if rep.status() == 401) {
         return Ok(None);
     }
-    let Some(value) = state.auth.resolve().map_err(|e| {
+    let mark = |e: Error| {
         if prior_attempt_in_doubt {
             e.with_in_doubt(true)
         } else {
             e
         }
-    })?
-    else {
-        return Ok(None);
     };
-    let value = value.into_owned();
+    let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
+    let mut retry_interval_ms = 10i32;
+    let mut rng = rand::rng();
+    let value = loop {
+        match state.auth.resolve() {
+            Ok(Some(value)) => break value.into_owned(),
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                let Some(end) = retry_end.filter(|_| provider_error_is_retryable(&e)) else {
+                    return Err(mark(e));
+                };
+                let to_sleep = retry_sleep(retry_interval_ms, rng.random_range(-5i32..5));
+                if (std::time::Instant::now() + to_sleep) > end {
+                    return Err(mark(e));
+                }
+                sleep(to_sleep);
+                retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
+            }
+        }
+    };
     Ok((Some(value.as_str()) != used).then_some(value))
 }
 
@@ -563,9 +606,11 @@ fn finish_http_send(
 ///   thread, or a renderer callback mid-paint -- which
 ///   [`OidcError::acquisition_busy`] marks. That clears on its own, typically in
 ///   milliseconds, so it is retried like any other transient failure. Excluding
-///   it destroyed the batch instead: the C and Python bindings clear the
-///   sender-owned buffer on a flush failure, and the documented `SocketError`
-///   retry then re-flushed an empty buffer and reported success.
+///   it destroyed the batch instead: the Python binding's `Sender.flush()`
+///   clears its sender-owned buffer on a flush failure, and the documented
+///   `SocketError` retry then re-flushed an empty buffer and reported success.
+///   (Rust `Sender::flush` and C `line_sender_flush` keep the caller's buffer
+///   on failure.)
 fn provider_error_is_retryable(e: &Error) -> bool {
     if e.code() != crate::ErrorCode::SocketError {
         return false;
@@ -587,9 +632,11 @@ fn provider_error_is_retryable(e: &Error) -> bool {
 /// causes clear in well under a second: a peer process holding the OIDC
 /// token-store lock across its own refresh, or a transient IdP blip. Returning
 /// such a failure straight to the caller destroyed the batch anyway, because the
-/// C and Python bindings clear the sender-owned buffer on any flush failure, and
-/// the retry those bindings document -- `SocketError` means "retry, exactly as
+/// Python binding's `Sender.flush()` clears its sender-owned buffer on any flush
+/// failure, and the retry it documents -- `SocketError` means "retry, exactly as
 /// you would any other" -- then re-flushed an empty buffer and reported success.
+/// Rust `Sender::flush` and C `line_sender_flush` keep the caller's buffer, but
+/// still fail a flush the retry budget was meant to cover.
 /// The QWP/WebSocket transport already absorbs the same failure into its
 /// reconnect loop and keeps its queued frames; this brings ILP/HTTP into line.
 ///
@@ -659,7 +706,30 @@ pub(super) fn http_send_with_retries(
     // AuthError. Give a rotated credential exactly one more attempt -- and only
     // when the provider actually hands back a different value, so a genuine
     // rejection still costs a single request.
-    if !need_retry && let Some(rotated) = rotated_auth_after_401(state, &last_rep, auth, false)? {
+    //
+    // A retryable provider failure on that re-resolution shares the flush's
+    // retry budget, so the deadline is needed there. It is built only on the
+    // 401 path: static and absent credentials never rotate and must not
+    // construct one (an unrepresentable public `Duration` is a ConfigError).
+    let rotation_deadline = || -> crate::Result<Option<std::time::Instant>> {
+        match retry_end {
+            Some(retry_end) => Ok(Some(retry_end)),
+            None if retry_timeout.is_zero() => Ok(None),
+            None => checked_retry_deadline(std::time::Instant::now(), retry_timeout).map(Some),
+        }
+    };
+    if !need_retry
+        && state.auth.is_rotating()
+        && matches!(&last_rep, Ok(rep) if rep.status() == 401)
+        && let Some(rotated) = rotated_auth_after_401(
+            state,
+            &last_rep,
+            auth,
+            false,
+            rotation_deadline()?,
+            retry_max_backoff,
+        )?
+    {
         if let Ok(rep) = last_rep {
             // Return the connection to the pool before reusing the agent.
             _ = rep.into_body().read_to_vec();
@@ -976,8 +1046,15 @@ mod tests {
                 .unwrap(),
         );
 
-        let error = rotated_auth_after_401(&state, &response, Some("Bearer expired"), false)
-            .expect_err("the second provider failure was replaced by the stale 401");
+        let error = rotated_auth_after_401(
+            &state,
+            &response,
+            Some("Bearer expired"),
+            false,
+            None,
+            Duration::from_millis(100),
+        )
+        .expect_err("the second provider failure was replaced by the stale 401");
         assert_eq!(error.code(), crate::ErrorCode::SocketError);
         assert_eq!(
             error.oidc_error().map(crate::oidc::OidcError::kind),
@@ -1014,17 +1091,29 @@ mod tests {
             )
         };
 
-        let provably_unsent =
-            rotated_auth_after_401(&state, &unauthorized(), Some("Bearer expired"), false)
-                .expect_err("the provider failure must surface");
+        let provably_unsent = rotated_auth_after_401(
+            &state,
+            &unauthorized(),
+            Some("Bearer expired"),
+            false,
+            None,
+            Duration::from_millis(100),
+        )
+        .expect_err("the provider failure must surface");
         assert!(
             !provably_unsent.in_doubt(),
             "a definite 401 on the only request applied nothing"
         );
 
-        let after_a_retry =
-            rotated_auth_after_401(&state, &unauthorized(), Some("Bearer expired"), true)
-                .expect_err("the provider failure must surface");
+        let after_a_retry = rotated_auth_after_401(
+            &state,
+            &unauthorized(),
+            Some("Bearer expired"),
+            true,
+            None,
+            Duration::from_millis(100),
+        )
+        .expect_err("the provider failure must surface");
         assert!(
             after_a_retry.in_doubt(),
             "an earlier attempt may have timed out after being applied"

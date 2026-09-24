@@ -499,9 +499,9 @@ impl Sender {
                 // called there, and a recoverable provider failure is
                 // re-resolved rather than ending the flush:
                 // resolving out here returned a `SocketError` after zero
-                // requests, and the bindings clear the sender-owned buffer on any
-                // flush failure, so the batch died on a transient the budget was
-                // meant to cover.
+                // requests, and the Python binding clears its sender-owned
+                // buffer on any flush failure, so the batch died on a transient
+                // the budget was meant to cover.
                 match http_send_with_retries(
                     state,
                     bytes,

@@ -791,7 +791,9 @@ fn test_initial_401_provider_failure_is_not_marked_in_doubt() -> TestResult {
                 Err(crate::error::fmt!(SocketError, "rotation failed"))
             }
         })?
-        .retry_timeout(Duration::from_secs(5))?
+        // Short: a retryable provider failure after a 401 is now re-resolved
+        // for the rest of the retry budget before it is returned.
+        .retry_timeout(Duration::from_millis(300))?
         .build()?;
     let mut buffer = sender.new_buffer();
     buffer
@@ -814,7 +816,7 @@ fn test_initial_401_provider_failure_is_not_marked_in_doubt() -> TestResult {
     let error = sender.flush_and_keep(&buffer).unwrap_err();
     _ = server_thread.join().unwrap()?;
     assert!(!error.in_doubt(), "a definite first 401 applied nothing");
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
     Ok(())
 }
 
@@ -833,7 +835,9 @@ fn test_retry_loop_401_provider_failure_is_marked_in_doubt() -> TestResult {
                 Err(crate::error::fmt!(SocketError, "rotation failed"))
             }
         })?
-        .retry_timeout(Duration::from_secs(5))?
+        // Short: a retryable provider failure after a 401 is now re-resolved
+        // for the rest of the retry budget before it is returned.
+        .retry_timeout(Duration::from_millis(300))?
         .build()?;
     let mut buffer = sender.new_buffer();
     buffer
@@ -866,7 +870,7 @@ fn test_retry_loop_401_provider_failure_is_marked_in_doubt() -> TestResult {
         error.in_doubt(),
         "a provider failure after entering the request retry loop lost delivery uncertainty"
     );
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
     Ok(())
 }
 
@@ -1051,6 +1055,112 @@ fn test_credential_rotation_keeps_retry_backoff() -> TestResult {
 
     res?;
 
+    Ok(())
+}
+
+#[test]
+fn test_retry_loop_401_after_deadline_still_sends_rotated_credential() -> TestResult {
+    // Regression: a 401 inside the retry loop whose response arrived after
+    // `retry_end` fetched a fresh credential from the provider and then
+    // returned the stale 401 as a terminal AuthError without ever sending it.
+    // A 401 on the first request is replayed whatever the budget; one inside
+    // the loop now gets the same single replay.
+    let mut server = MockServer::new()?;
+    let provider_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            Ok::<_, crate::Error>(format!(
+                "tok{}",
+                provider_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        })?
+        .retry_timeout(Duration::from_millis(300))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+        // Hold the 401 until the retry window has closed.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        std::thread::sleep(Duration::from_millis(600));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+    _ = server_thread.join().unwrap()?;
+    res?;
+    Ok(())
+}
+
+#[test]
+fn test_retryable_provider_failure_after_first_401_is_retried_within_budget() -> TestResult {
+    // Regression: a retryable provider failure while re-resolving after a
+    // first-attempt 401 failed the flush at once, with the retry budget
+    // unspent. The same failure before the first request is re-resolved
+    // inside `retry_timeout`; after a 401 -- which applied nothing -- it now is
+    // too.
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            match seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Ok("tok0".to_string()),
+                1 | 2 => Err(crate::error::fmt!(SocketError, "IdP unreachable")),
+                _ => Ok("tok1".to_string()),
+            }
+        })?
+        .retry_timeout(Duration::from_secs(10))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 1.0)?
+        .at(TimestampNanos::new(1))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+    _ = server_thread.join().unwrap()?;
+    res?;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     Ok(())
 }
 

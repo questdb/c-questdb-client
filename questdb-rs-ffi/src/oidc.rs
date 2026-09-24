@@ -355,7 +355,7 @@ impl SharedOidcAuth {
     /// A blocking acquisition in either case deadlocks. Thread-local target
     /// identity supplies only the more precise re-entry versus busy message.
     fn in_own_callback(&self) -> bool {
-        in_event_callback_of_on_this_thread(self.event_handler.as_ref())
+        in_event_callback_of_target_on_this_thread(self.event_handler.as_ref())
             || self
                 .diagnostic
                 .as_ref()
@@ -461,16 +461,48 @@ impl SharedOidcAuth {
             if let Some(cached) = self.inner.cached_token() {
                 return cached.map_err(Into::into);
             }
-            return Err(if self.in_own_callback() {
-                Self::token_reentry_error()
-            } else {
-                Self::token_busy_error()
-            });
+            return Err(self.token_callback_error());
         }
         // OidcDeviceAuth::token is deliberately non-interactive. Every attached
         // transport shares this path, so flush/connect/reconnect can refresh
         // silently but can never start a device-flow prompt.
-        self.inner.token().map_err(Into::into)
+        //
+        // The check above only covers a callback that is already running. A
+        // callback can also become active while this call waits behind a
+        // peer's silent refresh -- a persistence diagnostic runs while that
+        // refresh holds the acquisition lock -- and a callback that dispatches
+        // to this very thread and waits for it would then stall both until the
+        // bounded acquisition wait (6 x timeout) expired. Re-check from the
+        // wait loop, exactly as `sign_in` and `clear` do.
+        let abort_wait = || {
+            self.callback_is_active()
+                .then(|| self.token_callback_error())
+        };
+        match self.inner.token_with_acquire_abort(&abort_wait) {
+            Ok(token) => Ok(token),
+            Err(error) => {
+                // A callback that started after the entry check (a renderer's
+                // SUCCESS, say) may run after the token was committed: serve
+                // the cache when it can be served, as the entry path does.
+                if self.callback_is_active()
+                    && let Some(cached) = self.inner.cached_token()
+                {
+                    return cached.map_err(Into::into);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The `token()` rejection while a callback holds the acquisition lock:
+    /// fail-fast re-entry on the callback's own thread, retryable busy on any
+    /// other.
+    fn token_callback_error(&self) -> Error {
+        if self.in_own_callback() {
+            Self::token_reentry_error()
+        } else {
+            Self::token_busy_error()
+        }
     }
 
     /// `clear` behind an interactive sign-in on another thread.
@@ -497,10 +529,16 @@ impl SharedOidcAuth {
         // Close the admission race just as sign_in does: clear may already be
         // waiting for the core acquisition mutex when a renderer or diagnostic
         // callback becomes active and joins this thread.
+        //
+        // The same check guards the teardown wait a clear takes on a provider
+        // that is already closed: a callback that closed this auth and then
+        // joins the clearing thread must release it, not spin it forever. Only
+        // the callback part applies there -- a closed sign-in is already
+        // unwinding and releases the lock by itself, and refusing behind it
+        // would break the documented `close()` then `clear()` sequence.
         let abort_wait = || {
             self.callback_reentry_error().or_else(|| {
-                self.inner
-                    .interactive_sign_in_in_progress()
+                (!self.inner.is_closed() && self.inner.interactive_sign_in_in_progress())
                     .then(Self::clear_behind_sign_in_error)
             })
         };
@@ -974,6 +1012,31 @@ std::thread_local! {
     /// visible while it is held, or the outer one would be forgotten.
     static IN_EVENT_CALLBACK: RefCell<Vec<*const CEventHandler>> =
         const { RefCell::new(Vec::new()) };
+
+    /// The shared callback targets of the handlers in `IN_EVENT_CALLBACK`,
+    /// pushed and popped in lockstep with it.
+    ///
+    /// Per-handler identity answers "is this thread inside THIS auth's
+    /// callback", which detach needs. Re-entry classification needs the wider
+    /// question: auths built from one reusable builder share a target, and
+    /// while this thread is inside A's callback the shared target stays active
+    /// until this very thread returns. A sibling B's operation from here can
+    /// therefore never succeed by waiting, so it must fail fast as re-entry
+    /// rather than be reported as a busy callback "on another thread" and
+    /// retried for a transport's whole budget.
+    static IN_EVENT_CALLBACK_TARGET: RefCell<Vec<*const CEventTarget>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Whether this thread is executing inside a callback of the target `handler`
+/// shares -- its own or a reusable-builder sibling's. See
+/// `IN_EVENT_CALLBACK_TARGET`.
+fn in_event_callback_of_target_on_this_thread(handler: Option<&Arc<CEventHandler>>) -> bool {
+    let Some(handler) = handler else {
+        return false;
+    };
+    let target: *const CEventTarget = Arc::as_ptr(&handler.target);
+    IN_EVENT_CALLBACK_TARGET.with(|stack| stack.borrow().contains(&target))
 }
 
 /// Whether this thread is executing inside `handler`'s own callback — the only
@@ -981,6 +1044,7 @@ std::thread_local! {
 ///
 /// Borrows are short and never span a call into user code, so the `RefCell`
 /// cannot be re-entered.
+#[cfg(test)]
 fn in_event_callback_of_on_this_thread(handler: Option<&Arc<CEventHandler>>) -> bool {
     let Some(handler) = handler else {
         return false;
@@ -1030,6 +1094,8 @@ impl<'a> ActiveEventHandler<'a> {
         );
         drop(gate);
         IN_EVENT_CALLBACK.with(|stack| stack.borrow_mut().push(handler as *const _));
+        IN_EVENT_CALLBACK_TARGET
+            .with(|stack| stack.borrow_mut().push(Arc::as_ptr(&handler.target)));
         Some(Self { handler })
     }
 }
@@ -1043,6 +1109,14 @@ impl Drop for ActiveEventHandler<'_> {
                 popped,
                 Some(self.handler as *const _),
                 "callback handler stack must unwind in order"
+            );
+        });
+        IN_EVENT_CALLBACK_TARGET.with(|stack| {
+            let popped = stack.borrow_mut().pop();
+            debug_assert_eq!(
+                popped,
+                Some(Arc::as_ptr(&self.handler.target)),
+                "callback target stack must unwind in order"
             );
         });
         let was_active = self.handler.active.swap(false, Ordering::AcqRel);
@@ -1679,8 +1753,12 @@ pub unsafe extern "C" fn questdb_oidc_builder_file_token_store(
 /// working directory and can leave a plaintext refresh token there; for a CA
 /// bundle it produces a misleading file-open failure. Fail at the builder
 /// boundary and make callers pass the path they actually intend.
+///
+/// Every leading `~` is refused, not only `~` and `~/`: a shell also expands
+/// `~alice/...` to another user's home, and accepting that spelling created a
+/// directory literally named `~alice` under the working directory instead.
 fn reject_unexpanded_home(path: &str, label: &str) -> questdb::Result<()> {
-    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+    if path.starts_with('~') {
         return Err(Error::new(
             ErrorCode::ConfigError,
             format!(
@@ -2296,7 +2374,14 @@ mod tests {
         // path; for a CA bundle it produces a misleading file-open failure.
         // Apply one spelling rule to both public path-taking builder methods.
         for label in ["OIDC token-store directory", "OIDC CA-bundle path"] {
-            for bad in ["~", "~/tokens", "~/.questdb/oidc-tokens"] {
+            for bad in [
+                "~",
+                "~/tokens",
+                "~/.questdb/oidc-tokens",
+                "~alice/qdb",
+                "~alice",
+                "~\\tokens",
+            ] {
                 assert!(
                     reject_unexpanded_home(bad, label).is_err(),
                     "{label}: {bad:?} must be rejected"
@@ -5602,5 +5687,379 @@ mod header_abi {
             questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_CANCELLED as i64,
             5
         );
+    }
+}
+
+/// Regressions for callbacks becoming active while another thread is already
+/// waiting on, or holding, the acquisition critical section.
+#[cfg(test)]
+mod callback_wait_regressions {
+    use super::*;
+    use questdb::oidc::{PersistedToken, TokenStore, TokenStoreKey, TokenStoreResult};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicPtr};
+    use std::time::Instant;
+
+    // ---- token() waiter vs a diagnostic callback --------------------------
+
+    /// Store whose load blocks until released, then fails, so the refreshing
+    /// thread emits a persistence diagnostic while holding the acquisition lock.
+    struct GatedFailingLoadStore {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl TokenStore for GatedFailingLoadStore {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(Box::new(std::io::Error::other("injected load failure")))
+        }
+        fn save(&self, _k: &TokenStoreKey, _t: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+        fn clear(&self, _k: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+        fn in_lock(
+            &self,
+            _k: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            action()
+        }
+    }
+
+    #[derive(Default)]
+    struct DiagState {
+        callback_started_at: Mutex<Option<Instant>>,
+        waiter_done: AtomicBool,
+    }
+
+    /// A diagnostic callback that waits (bounded) for the already-waiting
+    /// thread: the "dispatch to a worker and wait for it" pattern oidc.h
+    /// anticipates.
+    unsafe extern "C" fn waiting_diag(user_data: *mut c_void, _d: *const questdb_oidc_diagnostic) {
+        let state = unsafe { &*(user_data as *const Arc<DiagState>) };
+        let start = Instant::now();
+        *state.callback_started_at.lock().unwrap() = Some(start);
+        while !state.waiter_done.load(Ordering::Acquire)
+            && start.elapsed() < Duration::from_secs(30)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    unsafe extern "C" fn release_diag_state(user_data: *mut c_void) {
+        unsafe { drop(Box::from_raw(user_data as *mut Arc<DiagState>)) };
+    }
+
+    #[test]
+    fn token_waiter_is_released_when_a_diagnostic_callback_starts() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(DiagState::default());
+        let user_data = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
+        let sink = CDiagnosticSink {
+            target: Arc::new(CDiagnosticTarget {
+                callback: waiting_diag,
+                user_data: user_data as usize,
+                release: Some(release_diag_state),
+                callback_gate: std::sync::Mutex::new(CallbackGateState::default()),
+                callback_ready: std::sync::Condvar::new(),
+                active: AtomicBool::new(false),
+            }),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        let inner = OidcDeviceAuth::builder()
+            .client_id("questdb-c")
+            .scope("openid")
+            .token_endpoint("http://127.0.0.1:9/token")
+            .device_authorization_endpoint("http://127.0.0.1:9/device")
+            .allow_insecure_transport(true)
+            .interactive(true)
+            .open_browser(false)
+            // A 6 s bounded acquisition wait: the regression held the waiter
+            // for all of it.
+            .timeout(Duration::from_millis(1000))
+            .token_store(GatedFailingLoadStore {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            })
+            .diagnostic_handler(sink.clone())
+            .build()
+            .unwrap();
+        let auth = SharedOidcAuth {
+            inner: Arc::new(inner),
+            event_handler: None,
+            diagnostic: Some(sink),
+            token_provider_isolation: TokenProviderIsolation::default(),
+        };
+
+        // R takes the acquisition lock and blocks inside the store read.
+        let refresher = std::thread::spawn({
+            let auth = auth.clone();
+            move || {
+                let _ = auth.token();
+            }
+        });
+        while !entered.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // W passes the entry check (no callback yet) and waits behind R.
+        let waiter = std::thread::spawn({
+            let auth = auth.clone();
+            let state = Arc::clone(&state);
+            move || {
+                let result = auth.token();
+                let returned_at = Instant::now();
+                state.waiter_done.store(true, Ordering::Release);
+                (returned_at, result.map_err(|e| e.msg().to_string()))
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must be parked behind the refresh before the callback"
+        );
+        release.store(true, Ordering::Release);
+        let (returned_at, result) = waiter.join().unwrap();
+        refresher.join().unwrap();
+        let callback_started = state
+            .callback_started_at
+            .lock()
+            .unwrap()
+            .expect("the diagnostic callback ran");
+        let released_after = returned_at.saturating_duration_since(callback_started);
+        assert!(
+            released_after < Duration::from_secs(2),
+            "the waiter stayed blocked {released_after:?} after the callback started"
+        );
+        let msg = result.expect_err("no token is available while the callback runs");
+        assert!(msg.contains("busy"), "unexpected error: {msg}");
+    }
+
+    // ---- sibling auth flushed from a shared-target event callback ---------
+
+    const DEVICE_JSON: &str = r#"{"device_code":"DEV-CODE","user_code":"ABCD-1234","verification_uri":"https://idp.example.com/activate","expires_in":600,"interval":5}"#;
+
+    fn respond(mut stream: TcpStream, body: &str) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut req = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            if n == 0 {
+                return;
+            }
+            req.extend_from_slice(&chunk[..n]);
+            if let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&req[..p]).to_lowercase();
+                let content_length = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while req.len() < p + 4 + content_length {
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&chunk[..n]);
+                }
+                break;
+            }
+        }
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+    }
+
+    fn device_only_idp() -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            respond(stream, DEVICE_JSON);
+        });
+        (format!("{addr}"), handle)
+    }
+
+    type StrSetter = unsafe extern "C" fn(
+        *mut questdb_oidc_builder,
+        *const c_char,
+        size_t,
+        *mut *mut questdb_error,
+    ) -> bool;
+
+    unsafe fn set_str(f: StrSetter, b: *mut questdb_oidc_builder, v: &str) {
+        let mut e = ptr::null_mut();
+        assert!(unsafe { f(b, v.as_ptr() as *const c_char, v.len(), &mut e) });
+    }
+
+    unsafe fn builder_for(addr: &str) -> *mut questdb_oidc_builder {
+        unsafe {
+            let b = questdb_oidc_builder_new();
+            set_str(questdb_oidc_builder_client_id, b, "questdb-c");
+            set_str(questdb_oidc_builder_scope, b, "openid");
+            set_str(
+                questdb_oidc_builder_device_authorization_endpoint,
+                b,
+                &format!("http://{addr}/device"),
+            );
+            set_str(
+                questdb_oidc_builder_token_endpoint,
+                b,
+                &format!("http://{addr}/token"),
+            );
+            let mut e = ptr::null_mut();
+            assert!(questdb_oidc_builder_interactive(b, true, &mut e));
+            assert!(questdb_oidc_builder_open_browser(b, false, &mut e));
+            b
+        }
+    }
+
+    unsafe fn error_msg(e: *mut questdb_error) -> String {
+        unsafe {
+            let mut len = 0;
+            let m = crate::questdb_error_msg(e, &mut len);
+            String::from_utf8_lossy(slice::from_raw_parts(m as *const u8, len)).to_string()
+        }
+    }
+
+    /// Flush a one-row ILP/HTTP batch through a sender attached to `auth`.
+    unsafe fn flush_with(auth: *const questdb_oidc_auth, retry_ms: u64) -> (Duration, String) {
+        unsafe {
+            let conf =
+                format!("http::addr=127.0.0.1:1;protocol_version=1;retry_timeout={retry_ms};");
+            let mut e = ptr::null_mut();
+            let conf_utf8 = crate::line_sender_utf8 {
+                len: conf.len(),
+                buf: conf.as_ptr() as *const c_char,
+            };
+            let opts = crate::line_sender_opts_from_conf(conf_utf8, &mut e);
+            assert!(!opts.is_null(), "{}", error_msg(e));
+            assert!(line_sender_opts_oidc_auth(opts, auth, &mut e));
+            let sender = crate::line_sender_build(opts, &mut e);
+            assert!(!sender.is_null(), "{}", error_msg(e));
+            crate::line_sender_opts_free(opts);
+            let buf = crate::line_sender_buffer_new_for_sender(sender);
+            let mut table = std::mem::zeroed::<crate::line_sender_table_name>();
+            assert!(crate::line_sender_table_name_init(
+                &mut table,
+                1,
+                c"t".as_ptr(),
+                &mut e
+            ));
+            let mut column = std::mem::zeroed::<crate::line_sender_column_name>();
+            assert!(crate::line_sender_column_name_init(
+                &mut column,
+                1,
+                c"x".as_ptr(),
+                &mut e
+            ));
+            assert!(crate::line_sender_buffer_table(buf, table, &mut e));
+            assert!(crate::line_sender_buffer_column_i64(buf, column, 1, &mut e));
+            assert!(crate::line_sender_buffer_at_now(buf, &mut e));
+            let started = Instant::now();
+            let ok = crate::line_sender_flush(sender, buf, &mut e);
+            let elapsed = started.elapsed();
+            let msg = if ok {
+                "ok".to_string()
+            } else {
+                let msg = error_msg(e);
+                crate::questdb_error_free(e);
+                msg
+            };
+            crate::line_sender_buffer_free(buf);
+            crate::line_sender_close(sender);
+            (elapsed, msg)
+        }
+    }
+
+    #[derive(Default)]
+    struct SiblingState {
+        a: AtomicPtr<questdb_oidc_auth>,
+        sibling: AtomicPtr<questdb_oidc_auth>,
+        fired: AtomicBool,
+        out: Mutex<Option<(Duration, String)>>,
+    }
+
+    unsafe extern "C" fn sibling_flush_cb(ud: *mut c_void, _ev: *const questdb_oidc_event) {
+        let state = unsafe { &*(ud as *const Arc<SiblingState>) };
+        if state.fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let out = unsafe { flush_with(state.sibling.load(Ordering::SeqCst), 3000) };
+        *state.out.lock().unwrap() = Some(out);
+        // End A's sign-in.
+        let mut e = ptr::null_mut();
+        unsafe { questdb_oidc_auth_close(state.a.load(Ordering::SeqCst), &mut e) };
+    }
+
+    unsafe extern "C" fn release_sibling_state(ud: *mut c_void) {
+        unsafe { drop(Box::from_raw(ud as *mut Arc<SiblingState>)) };
+    }
+
+    /// A reusable-builder sibling's transport, flushed from inside A's event
+    /// callback on the callback's own thread, can never obtain a token by
+    /// waiting: the shared target stays active until this very thread
+    /// returns. It must fail fast as re-entry (oidc.h), not retry as "busy on
+    /// another thread" for the sender's whole retry budget.
+    #[test]
+    fn sibling_transport_flushed_from_shared_target_callback_fails_fast() {
+        let (addr, idp) = device_only_idp();
+        unsafe {
+            let b = builder_for(&addr);
+            let state = Arc::new(SiblingState::default());
+            let ud = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
+            let mut e = ptr::null_mut();
+            assert!(questdb_oidc_builder_event_handler(
+                b,
+                Some(sibling_flush_cb),
+                ud,
+                Some(release_sibling_state),
+                &mut e
+            ));
+            let a = questdb_oidc_builder_build(b, &mut e);
+            let sibling = questdb_oidc_builder_build(b, &mut e);
+            assert!(!a.is_null() && !sibling.is_null());
+            state.a.store(a, Ordering::SeqCst);
+            state.sibling.store(sibling, Ordering::SeqCst);
+            let _ = questdb_oidc_auth_sign_in(a, &mut e);
+            if !e.is_null() {
+                crate::questdb_error_free(e);
+            }
+            let (elapsed, msg) = state
+                .out
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the renderer callback ran");
+            questdb_oidc_auth_free(a);
+            questdb_oidc_auth_free(sibling);
+            questdb_oidc_builder_free(b);
+            idp.join().unwrap();
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "the sibling flush spent {elapsed:?} of its retry budget: {msg}"
+            );
+            assert!(msg.contains("cannot be re-entered"), "unexpected: {msg}");
+        }
     }
 }

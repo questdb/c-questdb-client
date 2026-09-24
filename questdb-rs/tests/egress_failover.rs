@@ -5571,3 +5571,67 @@ fn failover_replay_resets_symbol_cache_to_new_node_values() {
         "B's RESULT_END must terminate the cursor"
     );
 }
+
+/// Answer every upgrade with 421 + `X-QuestDB-Role: REPLICA`, but only after
+/// `delay`, so a failover deadline can expire while a walk waits on it.
+fn slow_421_replica_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\n\
+                      Connection: close\r\nX-QuestDB-Role: REPLICA\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
+}
+
+/// Regression: when the final permitted reconnect round fails with a role
+/// mismatch on every endpoint AND the wall-clock deadline expires during that
+/// round, the caller must still see `RoleMismatch` -- the code it saw before
+/// the deadline was re-checked right after a failed walk. Re-coding it as a
+/// `SocketError` changed the error of existing static-auth readers.
+#[test]
+fn final_round_role_mismatch_past_deadline_surfaces_role_mismatch() {
+    for auth in ["", "username=u;password=p;"] {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Primary, "a-primary"),
+            vec![Action::Reject421 {
+                role: Some("REPLICA".into()),
+                zone: None,
+            }],
+        ]);
+        let b = slow_421_replica_server(Duration::from_millis(300));
+        let conf = format!(
+            "ws::addr={},{};target=primary;{auth}failover_max_attempts=2;\
+             failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+             failover_max_duration_ms=100",
+            a.url(),
+            b
+        );
+        let mut reader = Reader::from_conf(&conf).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::RoleMismatch,
+            "auth={auth:?}: msg={}",
+            err.msg()
+        );
+        assert!(
+            err.upgrade_reject().is_some(),
+            "the role reject must stay attached"
+        );
+    }
+}

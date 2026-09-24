@@ -44,7 +44,7 @@ use crate::oidc::render::{
     maybe_open_browser, sanitize_display_text, strip_control_capped,
 };
 use crate::oidc::token::{DEFAULT_SKEW_SECONDS, TokenSet, is_safe_token_str, now_epoch};
-use crate::oidc::token_store::{PersistedToken, TokenStore, TokenStoreKey};
+use crate::oidc::token_store::{self, PersistedToken, TokenStore, TokenStoreKey};
 
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const REFRESH_GRANT: &str = "refresh_token";
@@ -846,6 +846,42 @@ impl OidcDeviceAuth {
         self.select(&tokens)
     }
 
+    /// [`token`](Self::token), while allowing a binding to abort only the wait
+    /// for the acquisition mutex.
+    ///
+    /// A peer refresh holds that mutex while it runs persistence diagnostics.
+    /// A binding whose diagnostic callback may dispatch to -- and wait for --
+    /// the very thread that is already waiting here must be able to release
+    /// that waiter as soon as the callback becomes active; otherwise both
+    /// threads stall until the bounded acquisition wait expires. See
+    /// [`sign_in_with_acquire_abort`](Self::sign_in_with_acquire_abort).
+    #[doc(hidden)]
+    pub fn token_with_acquire_abort(
+        &self,
+        abort_wait: &dyn Fn() -> Option<crate::Error>,
+    ) -> crate::Result<String> {
+        self.ensure_open()?;
+        if let Some(token) = self.cached_selected_if_valid() {
+            return token.map_err(Into::into);
+        }
+        let abort_error = std::cell::RefCell::new(None);
+        let should_abort = || {
+            if let Some(error) = abort_wait() {
+                *abort_error.borrow_mut() = Some(error);
+                true
+            } else {
+                false
+            }
+        };
+        let result = self
+            .obtain_tokens(false, Some(&should_abort))
+            .and_then(|tokens| self.select(&tokens));
+        match abort_error.into_inner() {
+            Some(error) => Err(error),
+            None => result.map_err(Into::into),
+        }
+    }
+
     /// Return the full `Authorization` header value: `Bearer <token>`.
     pub fn authorization_header_value(&self) -> Result<String> {
         Ok(format!("Bearer {}", self.token()?))
@@ -967,7 +1003,7 @@ impl OidcDeviceAuth {
         // provider before a cleanup path can call `clear`.
         let started_closed = self.is_closed();
         let _acq = if started_closed {
-            self.acquire_for_teardown()
+            self.acquire_for_teardown(abort_wait)?
         } else {
             // Never behind a device flow: it holds the acquisition lock for up
             // to the whole device-code lifetime (30 minutes), and a caller
@@ -1185,12 +1221,26 @@ impl OidcDeviceAuth {
     /// it cannot wait on `close_wake`, which is already signalled. Any operation
     /// still holding the lock observes `closed` between its blocking steps and
     /// releases promptly, so this is a bounded spin, not an unbounded one.
-    fn acquire_for_teardown(&self) -> std::sync::MutexGuard<'_, ()> {
+    ///
+    /// The exception is a holder parked in user code -- a renderer or
+    /// diagnostic callback -- which observes nothing until it returns. If that
+    /// callback closed the provider and then joins the thread running this
+    /// teardown, neither can ever proceed. `abort_wait` is the binding's
+    /// callback-activity check, so such a wait ends with an error instead.
+    fn acquire_for_teardown(
+        &self,
+        abort_wait: Option<&dyn Fn() -> bool>,
+    ) -> Result<std::sync::MutexGuard<'_, ()>> {
         loop {
             match self.acquire.try_lock() {
-                Ok(guard) => return guard,
-                Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
                 Err(TryLockError::WouldBlock) => {
+                    if abort_wait.is_some_and(|abort| abort()) {
+                        return Err(OidcError::cancelled(
+                            "The OIDC acquisition wait was aborted by the host binding.",
+                        ));
+                    }
                     std::thread::sleep(ACQUIRE_WAIT_POLL_SLICE);
                 }
             }
@@ -1237,7 +1287,10 @@ impl OidcDeviceAuth {
     /// Wait briefly behind a peer's cache/store/refresh work, but never behind
     /// the interactive device flow. The short polling slice observes the marker
     /// without requiring the interactive thread to release the acquisition lock.
-    fn acquire_for_token(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+    fn acquire_for_token(
+        &self,
+        abort_wait: Option<&dyn Fn() -> bool>,
+    ) -> Result<std::sync::MutexGuard<'_, ()>> {
         self.ensure_open()?;
         match self.acquire.try_lock() {
             Ok(guard) => {
@@ -1263,6 +1316,11 @@ impl OidcDeviceAuth {
                 return Err(OidcError::interaction_required_busy(
                     "An interactive OIDC sign-in is in progress on another thread; no token \
                      is available without blocking. Retry once it completes.",
+                ));
+            }
+            if abort_wait.is_some_and(|abort| abort()) {
+                return Err(OidcError::cancelled(
+                    "The OIDC acquisition wait was aborted by the host binding.",
                 ));
             }
             let now = Instant::now();
@@ -1359,7 +1417,7 @@ impl OidcDeviceAuth {
             // the first one fills.
             self.acquire_for_operation(abort_wait, InteractiveHolder::Wait)?
         } else {
-            self.acquire_for_token()?
+            self.acquire_for_token(abort_wait)?
         };
         self.ensure_open()?;
         if allow_interaction {
@@ -2088,6 +2146,18 @@ impl OidcDeviceAuth {
                 // Move the secret out rather than cloning it: the guard is left
                 // holding `None`, and `set_last_persisted_refresh` scrubs
                 // whatever it replaces.
+                let taken = std::mem::take(&mut *rt);
+                self.lock_store_state().set_last_persisted_refresh(taken);
+            }
+            Err(e) if token_store::save_was_published(&*e) => {
+                // The entry reached disk (every peer can already read and
+                // consume it); only its crash durability is in doubt. Record
+                // it as persisted, exactly as for `Ok`: otherwise the
+                // anti-replay guard in `refresh_under_lock` treats our
+                // in-memory copy as an unpersisted child, and after a peer
+                // consumed the on-disk one and failed to save its successor we
+                // would submit an already-consumed refresh token.
+                self.warn_persistence("save", &*e);
                 let taken = std::mem::take(&mut *rt);
                 self.lock_store_state().set_last_persisted_refresh(taken);
             }

@@ -493,27 +493,37 @@ fn a_provider_failure_after_401_replaces_the_stale_rejection() {
         };
 
         let provider_calls = Arc::new(AtomicUsize::new(0));
-        let mut sender = sender_with_provider(&mock, {
-            let provider_calls = Arc::clone(&provider_calls);
-            move || {
-                if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Ok("stale".to_string())
-                } else {
-                    Err(questdb::Error::new(
-                        questdb::ErrorCode::AuthError,
-                        "refresh failed",
-                    ))
-                }
-            }
-        })
-        .expect("build sender");
+        let mut sender = SenderBuilder::new(Protocol::Http, mock.host(), mock.port())
+            .protocol_version(ProtocolVersion::V1)
+            .and_then(|b| {
+                b.http_token_provider({
+                    let provider_calls = Arc::clone(&provider_calls);
+                    move || {
+                        if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Ok("stale".to_string())
+                        } else {
+                            Err(questdb::Error::new(
+                                questdb::ErrorCode::AuthError,
+                                "refresh failed",
+                            ))
+                        }
+                    }
+                })
+            })
+            // Short: the retryable failure is re-resolved until this expires.
+            .and_then(|b| b.retry_timeout(std::time::Duration::from_millis(300)))
+            .and_then(|b| b.build())
+            .expect("build sender");
 
         let error =
             send_one_row(&mut sender).expect_err("the second provider failure must end the flush");
         assert_eq!(error.code(), questdb::ErrorCode::SocketError);
         assert!(error.msg().contains("refresh failed"), "{error}");
         assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
-        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        // A caller-closure failure is retryable, so after the 401 it is
+        // re-resolved for the rest of the retry budget -- no further request
+        // is sent -- before it replaces the stale rejection.
+        assert!(provider_calls.load(Ordering::SeqCst) >= 2);
     }
 }
 

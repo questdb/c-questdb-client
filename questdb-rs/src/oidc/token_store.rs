@@ -169,6 +169,54 @@ const DEAD_HOLDER_GRACE: Duration = Duration::from_secs(10);
 /// concurrently or reuses an ambiguously rotated parent.
 pub type TokenStoreResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// A [`FileTokenStore`] save that failed only AFTER the new entry had been
+/// atomically published (renamed into place): the directory fsync, the lock
+/// lease re-check, or the post-publish orphan sweep failed.
+///
+/// The entry is readable by every peer from the moment of the rename, so the
+/// caller must account for it exactly as it would for a successful save --
+/// most importantly, remember the refresh token it contains as persisted, so
+/// that a peer consuming it cannot make this process replay its in-memory
+/// copy. Only its durability across a crash is in doubt. `OidcDeviceAuth`
+/// recognises this type by downcast; it still reports the failure as a
+/// persistence warning.
+#[derive(Debug)]
+pub(crate) struct PublishedNotDurable(Box<dyn std::error::Error + Send + Sync>);
+
+impl PublishedNotDurable {
+    pub(crate) fn wrap(
+        err: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        if err.is::<PublishedNotDurable>() {
+            err
+        } else {
+            Box::new(PublishedNotDurable(err))
+        }
+    }
+}
+
+impl std::fmt::Display for PublishedNotDurable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (the new entry was already published, but may not survive a crash)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for PublishedNotDurable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+/// Whether a failed save had already published its entry. See
+/// [`PublishedNotDurable`].
+pub(crate) fn save_was_published(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    err.is::<PublishedNotDurable>()
+}
+
 fn cancelled_error() -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(std::io::Error::new(
         std::io::ErrorKind::Interrupted,
@@ -445,6 +493,14 @@ pub trait TokenStore: Send + Sync {
     fn load(&self, key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>>;
 
     /// Persist (atomically replace) the token for this identity.
+    ///
+    /// Return `Err` only when the new entry was NOT published. `OidcDeviceAuth`
+    /// treats an `Err` as "this refresh token exists only in memory" and may
+    /// keep submitting it; if a failing step ran after the entry became
+    /// visible to other processes, a peer can consume it meanwhile and this
+    /// process would then replay a consumed refresh token. A store whose
+    /// publication succeeded but whose durability step failed should log that
+    /// and return `Ok`.
     fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()>;
 
     /// Durably remove any persisted entry for this identity. A no-op when nothing
@@ -690,6 +746,12 @@ pub struct FileTokenStore {
     /// Remaining lock creations to answer with this platform's transient
     /// create-contention error instead of touching the filesystem.
     create_contention_remaining: Arc<AtomicUsize>,
+    #[cfg(test)]
+    /// Remaining directory fsyncs to fail instead of performing.
+    directory_sync_failures_remaining: Arc<AtomicUsize>,
+    #[cfg(test)]
+    /// Directory fsyncs that actually succeeded.
+    directory_syncs_succeeded: Arc<AtomicUsize>,
     #[cfg(all(test, not(unix)))]
     allow_unsafe_mutations_for_tests: bool,
 }
@@ -716,6 +778,10 @@ impl FileTokenStore {
             fail_heartbeat_spawn: false,
             #[cfg(test)]
             create_contention_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            directory_sync_failures_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            directory_syncs_succeeded: Arc::new(AtomicUsize::new(0)),
             #[cfg(all(test, not(unix)))]
             allow_unsafe_mutations_for_tests: false,
         }
@@ -754,6 +820,20 @@ impl FileTokenStore {
         self.create_contention_remaining
             .store(count, Ordering::SeqCst);
         self
+    }
+
+    /// Fail the next `count` directory fsyncs with an I/O error, standing in
+    /// for EIO/EMFILE from `fsync_directory`.
+    #[cfg(test)]
+    fn fail_next_directory_syncs(&self, count: usize) {
+        self.directory_sync_failures_remaining
+            .store(count, Ordering::SeqCst);
+    }
+
+    /// Directory fsyncs that actually succeeded so far.
+    #[cfg(test)]
+    fn successful_directory_syncs(&self) -> usize {
+        self.directory_syncs_succeeded.load(Ordering::SeqCst)
     }
 
     /// Injected collisions not yet consumed, so a test can tell a retry loop
@@ -864,8 +944,12 @@ impl FileTokenStore {
         // would mean two locations depending on the binding reached for. The C
         // setter rejects it at configuration time; this is the backstop for the
         // Rust API, and `preflight` surfaces it before a device flow starts.
+        //
+        // Any first component that starts with `~` is refused, not only a bare
+        // `~`: a shell expands `~alice/...` to another user's home, and
+        // accepting it created a directory literally named `~alice` here.
         if let Some(first) = self.directory.iter().next()
-            && first == std::ffi::OsStr::new("~")
+            && first.as_encoded_bytes().first() == Some(&b'~')
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1331,9 +1415,25 @@ impl FileTokenStore {
     }
 
     fn sync_directory(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self
+            .directory_sync_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(std::io::Error::other("injected directory fsync failure"));
+        }
         #[cfg(unix)]
         {
-            fsync_directory(&self.directory)
+            let result = fsync_directory(&self.directory);
+            #[cfg(test)]
+            if result.is_ok() {
+                self.directory_syncs_succeeded
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            result
         }
         #[cfg(not(unix))]
         {
@@ -1376,6 +1476,18 @@ impl FileTokenStore {
             let _ = fs::remove_file(&tmp); // clean up the temp on failure
         }
         write_result?;
+        // Everything below runs after the rename has PUBLISHED the entry, so a
+        // failure here must not read as "nothing was saved": see
+        // `PublishedNotDurable`.
+        self.after_publish(key, heartbeat)
+            .map_err(PublishedNotDurable::wrap)
+    }
+
+    fn after_publish(
+        &self,
+        key: &TokenStoreKey,
+        heartbeat: &DirectoryLockHeartbeat,
+    ) -> TokenStoreResult<()> {
         // A successful save is a recovery point for plaintext temps left by a
         // crashed predecessor. Fresh temps are retained until their age proves
         // they are not from a live cross-language writer.
@@ -1417,16 +1529,21 @@ impl FileTokenStore {
     ) -> TokenStoreResult<()> {
         debug_assert!(current_thread_holds(&self.directory_lock_file()));
         heartbeat.check_owned()?;
-        let removed = match fs::remove_file(self.token_file(key)) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        match fs::remove_file(self.token_file(key)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(Box::new(e)),
-        };
-        let removed_orphans = self.sweep_orphan_temps(key, false, heartbeat)?;
-        if removed || removed_orphans {
-            heartbeat.check_owned()?;
-            self.sync_directory()?; // make the refresh-parent tombstone durable
         }
+        self.sweep_orphan_temps(key, false, heartbeat)?;
+        // Make the refresh-parent tombstone durable -- unconditionally, not only
+        // when this call unlinked something. A previous `clear` may have
+        // removed the entry and then failed this very fsync; a retry then finds
+        // NotFound, and gating the fsync on its own unlink returned `Ok` with
+        // no successful directory fsync ever covering the deletion. Callers
+        // treat that `Ok` as a durable tombstone, so a crash could resurrect a
+        // consumed refresh token.
+        heartbeat.check_owned()?;
+        self.sync_directory()?;
         Ok(())
     }
 }
@@ -1496,6 +1613,7 @@ impl TokenStore for FileTokenStore {
                 ),
             )));
         }
+        let published = std::cell::Cell::new(false);
         self.with_directory_lock(cancelled, |trusted, heartbeat| {
             // `trusted` is the verdict on what the directory *contained* on
             // entry, which is what `load` must respect. For writing, the
@@ -1521,7 +1639,23 @@ impl TokenStore for FileTokenStore {
                 return Err(self.persist_refused_error());
             }
             self.sweep_orphan_temps(key, true, heartbeat)?;
-            self.save_under_lock(key, &content, heartbeat)
+            let saved = self.save_under_lock(key, &content, heartbeat);
+            match &saved {
+                Ok(()) => published.set(true),
+                Err(err) if save_was_published(&**err) => published.set(true),
+                Err(_) => {}
+            }
+            saved
+        })
+        .map_err(|err| {
+            // The directory lock's own teardown (`heartbeat.finish()`) can
+            // still fail after a successful rename; that entry is published
+            // too.
+            if published.get() {
+                PublishedNotDurable::wrap(err)
+            } else {
+                err
+            }
         })
     }
 

@@ -1859,7 +1859,9 @@ fn with_lock_timings_enforces_stale_floor() {
 /// reports it before a device flow starts.
 #[test]
 fn unexpanded_home_directory_is_refused_on_use() {
-    for bad in ["~/qdb-tokens", "~"] {
+    // `~alice/...` is a shell spelling too: another user's home, not a
+    // directory named `~alice` under the working directory.
+    for bad in ["~/qdb-tokens", "~", "~alice/qdb-tokens"] {
         let store = test_file_store(bad);
         let err = store
             .save(&test_key(), &test_token())
@@ -1894,4 +1896,57 @@ fn unexpanded_home_directory_is_refused_on_use() {
     let store = test_file_store(&ok);
     store.save(&test_key(), &test_token()).unwrap();
     assert!(ok.is_dir());
+}
+
+/// A retried `clear` after one whose directory fsync failed must still make the
+/// deletion durable: the retry finds the entry already unlinked, and gating the
+/// fsync on its own unlink returned `Ok` with no directory fsync ever covering
+/// the removal.
+#[cfg(unix)]
+#[test]
+fn retried_clear_after_a_failed_directory_fsync_still_syncs() {
+    let dir = TempDir::new().unwrap();
+    let store = test_file_store(dir.path().join("tokens"));
+    store.save(&test_key(), &test_token()).unwrap();
+
+    store.fail_next_directory_syncs(1);
+    let first = store.clear(&test_key());
+    assert!(first.is_err(), "the injected fsync failure must surface");
+    assert!(store.load(&test_key()).unwrap().is_none(), "the unlink ran");
+
+    let synced_before = store.successful_directory_syncs();
+    store
+        .clear(&test_key())
+        .expect("the retried clear succeeds");
+    assert!(
+        store.successful_directory_syncs() > synced_before,
+        "the retried clear returned Ok without a directory fsync"
+    );
+}
+
+/// A save whose failure happened only after the rename published the entry is
+/// reported as such, so the caller does not treat the refresh token it wrote as
+/// in-memory only.
+#[cfg(unix)]
+#[test]
+fn save_failing_after_publish_is_reported_as_published() {
+    let dir = TempDir::new().unwrap();
+    let store = test_file_store(dir.path().join("tokens"));
+    store.save(&test_key(), &test_token()).unwrap();
+
+    store.fail_next_directory_syncs(1);
+    let err = store
+        .save(&test_key(), &test_token())
+        .expect_err("the injected fsync failure must surface");
+    assert!(save_was_published(&*err), "got: {err}");
+    assert!(store.load(&test_key()).unwrap().is_some());
+
+    // A failure before anything was written is not.
+    let blocker = dir.path().join("not-a-directory");
+    std::fs::write(&blocker, b"x").unwrap();
+    let unwritable = test_file_store(blocker.join("tokens"));
+    let err = unwritable
+        .save(&test_key(), &test_token())
+        .expect_err("a store under a regular file cannot be written");
+    assert!(!save_was_published(&*err));
 }

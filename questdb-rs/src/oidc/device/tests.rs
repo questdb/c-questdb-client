@@ -302,6 +302,109 @@ fn operation_wait_can_be_aborted_after_it_has_started() {
     drop(held);
 }
 
+/// A token() already waiting behind a peer's silent refresh must be released
+/// when the binding's abort predicate starts reporting a callback, not held
+/// until the bounded acquisition wait (6 x timeout) expires.
+#[test]
+fn token_wait_can_be_aborted_after_it_has_started() {
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example/device")
+            .token_endpoint("https://idp.example/token")
+            .interactive(false)
+            .open_browser(false)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("build auth"),
+    );
+    let held = auth.lock_acquire();
+    let callback_active = Arc::new(AtomicBool::new(false));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let worker_auth = Arc::clone(&auth);
+    let worker_active = Arc::clone(&callback_active);
+    let worker_checks = Arc::clone(&checks);
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let error = worker_auth
+            .token_with_acquire_abort(&|| {
+                let active = worker_active.load(Ordering::SeqCst);
+                worker_checks.fetch_add(1, Ordering::SeqCst);
+                active.then(|| {
+                    crate::Error::new(
+                        crate::ErrorCode::SocketError,
+                        "callback became active".to_string(),
+                    )
+                })
+            })
+            .expect_err("the waiter must observe callback admission");
+        result_tx.send(error.msg().to_string()).unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while checks.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "token() never entered its wait loop"
+        );
+        std::thread::yield_now();
+    }
+    callback_active.store(true, Ordering::SeqCst);
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("token() did not abort after callback admission"),
+        "callback became active"
+    );
+    worker.join().expect("token worker");
+    drop(held);
+}
+
+/// Clearing an already-closed provider waits on the acquisition lock with a
+/// teardown spin. A holder parked in a callback never observes `closed`, so
+/// that spin must honour the binding's abort predicate too; otherwise a
+/// callback that closes the auth and then joins the clearing thread hangs both
+/// forever.
+#[test]
+fn closed_clear_teardown_wait_can_be_aborted() {
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example/device")
+            .token_endpoint("https://idp.example/token")
+            .interactive(false)
+            .open_browser(false)
+            .build()
+            .expect("build auth"),
+    );
+    let held = auth.lock_acquire();
+    auth.signal_close();
+    let worker_auth = Arc::clone(&auth);
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = worker_auth.try_clear_with_acquire_abort(&|| {
+            Some(crate::Error::new(
+                crate::ErrorCode::InvalidApiCall,
+                "callback is active".to_string(),
+            ))
+        });
+        result_tx.send(result.map_err(|e| e.code())).unwrap();
+    });
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("teardown wait ignored the abort predicate"),
+        Err(crate::ErrorCode::InvalidApiCall)
+    );
+    worker.join().expect("clear worker");
+    drop(held);
+
+    // Without an active callback the teardown path still clears a closed
+    // provider: `clear` outlives `close`.
+    auth.try_clear_with_acquire_abort(&|| None)
+        .expect("clear after close must still work");
+}
+
 #[test]
 fn store_state_zeroizes_every_secret_field() {
     // Pins the FIELD LIST of `zeroize_secrets`, not the heap scrubbing itself,
@@ -3493,6 +3596,8 @@ struct FailingSaveStore {
     token: Arc<std::sync::Mutex<Option<PersistedToken>>>,
     coordination: Arc<std::sync::Mutex<()>>,
     fail_save: Arc<AtomicBool>,
+    /// Publish the entry, then fail as if a post-publish durability step had.
+    publish_then_fail_save: Arc<AtomicBool>,
     fail_clear: Arc<AtomicBool>,
     operations: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
@@ -3528,6 +3633,11 @@ impl TokenStore for FailingSaveStore {
             return Err(Box::new(std::io::Error::other("injected save failure")));
         }
         *self.token.lock().unwrap() = Some(token.clone());
+        if self.publish_then_fail_save.load(Ordering::SeqCst) {
+            return Err(crate::oidc::token_store::PublishedNotDurable::wrap(
+                Box::new(std::io::Error::other("injected directory fsync failure")),
+            ));
+        }
         Ok(())
     }
 
@@ -5392,6 +5502,85 @@ fn failed_rotated_child_save_leaves_no_reusable_parent() {
         "the stale peer replayed a refresh-token parent"
     );
     assert_eq!(stale_peer.token_set().unwrap().refresh_token, None);
+}
+
+/// A save that failed only after publishing its entry must still record the
+/// refresh token as persisted. Otherwise, once a peer consumes that on-disk
+/// child and fails to save its successor, this process treats its in-memory
+/// copy as an unpersisted child and submits an already-consumed refresh token.
+#[test]
+fn published_but_not_durable_save_blocks_replay_of_the_consumed_child() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    store.publish_then_fail_save.store(true, Ordering::SeqCst);
+
+    let diagnostic = RecordingDiagnostic::default();
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(store.clone())
+        .diagnostic_handler(diagnostic.clone())
+        .build()
+        .expect("build auth");
+    assert_eq!(auth.token().unwrap(), "AT-2");
+    assert!(
+        diagnostic.0.lock().unwrap()[0].contains("token store save failed"),
+        "the durability failure is still reported"
+    );
+    assert_eq!(
+        store
+            .token()
+            .and_then(|t| t.refresh_token().map(str::to_string)),
+        Some("RT-2".to_string()),
+        "the child reached the store"
+    );
+    assert_eq!(
+        auth.store_state
+            .lock()
+            .unwrap()
+            .last_persisted_refresh
+            .as_deref(),
+        Some("RT-2"),
+        "a published child must be remembered as persisted"
+    );
+
+    // A peer consumes RT-2 from the store and fails before saving RT-3.
+    *store.token.lock().unwrap() = None;
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-2"));
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("removed by another refresh attempt"));
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        1,
+        "the consumed child was replayed"
+    );
 }
 
 #[test]

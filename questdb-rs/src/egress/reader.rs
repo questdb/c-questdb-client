@@ -2925,7 +2925,9 @@ fn is_failover_eligible(code: ErrorCode) -> bool {
             // RoleMismatch is "soft" for failover purposes: we just
             // skip this endpoint and try the next one (counting against
             // the budget). The eventual surfaced error is RoleMismatch
-            // if the budget exhausts entirely on mismatching nodes.
+            // if the budget -- attempts or wall-clock deadline -- exhausts
+            // entirely on mismatching nodes (see
+            // `failover_deadline_exhausted_error`).
             | ErrorCode::RoleMismatch
     )
 }
@@ -3013,8 +3015,23 @@ fn failover_deadline_exhausted_error(
         "failover wall-clock budget exhausted (failover_max_duration_ms={max_duration_ms}) after {attempts} attempt(s); last error: {last_msg}"
     );
 
+    // A wall-clock exhaustion is a retryable `SocketError` -- except when every
+    // endpoint the final walk reached rejected on role. Then the caller must see
+    // `RoleMismatch`: it is what the failover contract promises when the budget
+    // runs out on mismatching nodes, and what the reader reported before the
+    // deadline was checked immediately after a failed walk. A final round that
+    // both exhausted the attempts and overran the deadline used to surface
+    // `RoleMismatch`; re-coding it silently changed the error a caller branching
+    // on "no primary available" receives.
     match last_error {
-        Some(err) => err.reclassified(ErrorCode::SocketError, msg),
+        Some(err) => {
+            let code = if err.code() == ErrorCode::RoleMismatch {
+                ErrorCode::RoleMismatch
+            } else {
+                ErrorCode::SocketError
+            };
+            err.reclassified(code, msg)
+        }
         None => Error::new(ErrorCode::SocketError, msg),
     }
 }
@@ -3653,6 +3670,21 @@ mod tests {
             err.oidc_error().map(crate::oidc::OidcError::kind),
             Some(crate::oidc::OidcErrorKind::InteractionRequired)
         );
+    }
+
+    #[test]
+    fn failover_deadline_context_keeps_role_mismatch_code() {
+        let original = Error::new(ErrorCode::RoleMismatch, "all endpoints are replicas");
+
+        let err = failover_deadline_exhausted_error(25, 2, Some(original));
+
+        assert_eq!(err.code(), ErrorCode::RoleMismatch);
+        assert!(is_failover_deadline_exhaustion(&err));
+        assert!(err.msg().contains("last error: all endpoints are replicas"));
+
+        let transport = Error::new(ErrorCode::ProtocolError, "peer closed");
+        let err = failover_deadline_exhausted_error(25, 2, Some(transport));
+        assert_eq!(err.code(), ErrorCode::SocketError);
     }
 
     #[test]
