@@ -9545,6 +9545,73 @@ mod tests {
         }
 
         #[test]
+        fn nested_array_structural_defects_are_rejected_before_import() {
+            use arrow::array::{Array, ArrayRef, ListArray, StructArray};
+            use arrow::datatypes::{Field, Float64Type};
+            use std::sync::Arc;
+
+            // The root-header pass answers these defects on the envelope, so
+            // each one sits on the column to reach the per-node checks.
+            let column: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>([
+                Some(vec![Some(1.0)]),
+                Some(vec![Some(2.0), Some(3.0)]),
+            ]));
+            let batch = StructArray::new(
+                vec![Arc::new(Field::new("l", column.data_type().clone(), true))].into(),
+                vec![column],
+                None,
+            );
+            for (defect, expected) in [
+                (
+                    "n_children",
+                    "n_children 0 disagrees with schema n_children 1",
+                ),
+                ("length", "length -1 is negative"),
+                (
+                    "buffers",
+                    "declares 2 buffers but the buffer pointer is NULL",
+                ),
+            ] {
+                let ffi_schema = FFI_ArrowSchema::try_from(batch.data_type()).unwrap();
+                let mut ffi_array = FFI_ArrowArray::new(&batch.to_data());
+                let mut err = std::ptr::null_mut();
+                unsafe {
+                    let column = *ffi_array.children;
+                    let (n_children, length, buffers) =
+                        ((*column).n_children, (*column).length, (*column).buffers);
+                    match defect {
+                        "n_children" => (*column).n_children = 0,
+                        "length" => (*column).length = -1,
+                        "buffers" => (*column).buffers = std::ptr::null_mut(),
+                        _ => unreachable!(),
+                    }
+                    let imported = arrow_ffi_import_record_batch(
+                        &mut ffi_array,
+                        &ffi_schema,
+                        "nested_defect_test",
+                        &mut err,
+                    );
+                    // Restore the producer's tree so its release callbacks
+                    // free every node.
+                    (*column).n_children = n_children;
+                    (*column).length = length;
+                    (*column).buffers = buffers;
+                    assert!(imported.is_none(), "{defect}");
+                    assert!(
+                        ffi_array.release.is_some(),
+                        "{defect} is rejected before import"
+                    );
+                    assert_eq!((*err).error.code(), ErrorCode::ArrowIngest);
+                    assert_eq!(
+                        (*err).error.msg(),
+                        format!("Arrow array root.children[0]: {expected}")
+                    );
+                    line_sender_error_free(err);
+                }
+            }
+        }
+
+        #[test]
         fn array_negative_offset_rejected() {
             unsafe {
                 let format = CString::new("i").unwrap();
