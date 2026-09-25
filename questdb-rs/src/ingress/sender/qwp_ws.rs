@@ -3446,7 +3446,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
                     // walks deliberately do not, so as not to claim an outage
                     // against an endpoint the foreground may be using happily.
                     Some(events) => {
-                        events.token_provider_failed(&err, events.next_attempt());
+                        events.token_provider_failed(None, &err, events.next_attempt());
                         log::warn!(
                             "questdb: QWP/WebSocket token provider failed before \
                              dialling any endpoint; abandoning this connection \
@@ -3502,12 +3502,33 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
             && let Some(provider) = qwp_ws.token_provider.as_ref()
         {
             auth_rotation_retry_used = true;
-            let rotated = acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate)
-                .inspect_err(|err| {
+            let rotated = match acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate)
+            {
+                Ok(rotated) => rotated,
+                Err(err) => {
+                    // A credential was already presented to this endpoint. Keep
+                    // the provider's retryable/terminal classification and OIDC
+                    // detail, but do not report a pre-dial failure or lose the
+                    // server rejection that prompted the second acquisition.
+                    let code = err.code();
+                    let message = format!(
+                        "QWP/WebSocket credential rejected with HTTP 401 at {}:{}; \
+                         token provider failed to refresh it: {}",
+                        endpoint.host,
+                        endpoint.port,
+                        err.msg()
+                    );
+                    let err = err.reclassified(code, message);
                     if let Some(events) = events {
-                        events.token_provider_failed(err, events.next_attempt());
+                        events.token_provider_failed(
+                            Some((&endpoint.host, &endpoint.port)),
+                            &err,
+                            events.next_attempt(),
+                        );
                     }
-                })?;
+                    return Err(err);
+                }
+            };
             if Some(rotated.as_str()) != provided_header.as_deref() {
                 provided_header = Some(rotated);
                 connected = establish_connection(

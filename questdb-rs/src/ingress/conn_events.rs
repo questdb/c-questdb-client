@@ -55,23 +55,26 @@ pub enum ConnectionEventKind {
     /// Every configured endpoint was attempted and none accepted the
     /// connection in this sweep.
     AllEndpointsUnreachable,
-    /// The server rejected a credential the client presented.
+    /// A terminal server rejection of a credential the client presented.
     ///
-    /// Always terminal, and always a credential the client DID present and the
-    /// server rejected. `host` and `port` are set. A listener may page, tear
-    /// down the pool, or exit on this without further qualification.
-    ///
-    /// A credential the client could not OBTAIN is
-    /// [`CredentialUnavailable`](Self::CredentialUnavailable), never this.
+    /// `host` and `port` are set. A listener may page, tear down the pool,
+    /// or exit on this without further qualification. If the server first
+    /// returns HTTP 401 but acquiring a replacement credential then fails,
+    /// the provider error decides whether to retry: that is reported as
+    /// [`CredentialUnavailable`](Self::CredentialUnavailable) with the
+    /// rejected endpoint, not as an unconditional terminal `AuthFailed`.
     /// Mirrors the Java client, whose `AUTH_FAILED` is likewise unconditional
     /// and whose cause is always a `QwpAuthFailedException`, distinct from its
     /// `QwpCredentialUnavailableException`.
     AuthFailed,
 
-    /// The token provider failed, so no credential was ever offered to anyone
-    /// and the round ended without dialling an endpoint. `host` and `port` are
-    /// `None`; `cause_code` is the provider's classification, ordinarily
-    /// `SocketError`.
+    /// The token provider failed while acquiring a credential.
+    ///
+    /// Before the first dial, `host` and `port` are `None`. If an endpoint
+    /// rejected a previously offered token with HTTP 401 and acquisition of
+    /// its replacement failed, `host` and `port` identify that endpoint and
+    /// `cause_msg` includes the 401. `cause_code` still classifies the provider
+    /// failure (ordinarily `SocketError`), not the server's rejection.
     ///
     /// **Read `cause_code` to tell a retry from a stop.** This kind is emitted
     /// for every provider failure, and `classify_provider_error` does not treat
@@ -92,7 +95,7 @@ pub enum ConnectionEventKind {
     ///
     /// A listener that pages on a permanent stop must therefore qualify on
     /// `cause_code`, not on the kind alone. [`AuthFailed`](Self::AuthFailed)
-    /// stays the *server-rejected-a-credential* signal and is unaffected.
+    /// stays the *terminal* server-rejection signal.
     ///
     /// This is the counterpart of the Java client's
     /// `QwpCredentialUnavailableException`: "a credential the client cannot
@@ -516,27 +519,25 @@ impl ConnectionEventSource {
         );
     }
 
-    /// A token provider (e.g. OIDC) failed before any endpoint was dialled, so
-    /// the round ends without a connection.
-    ///
-    /// Reported as a `CredentialUnavailable` carrying no endpoint: the failure
-    /// is the credential, not a host, and nothing was contacted. Without an
-    /// event the whole round is silent — the provider is resolved above the
-    /// endpoint loop, so neither `auth_failed` nor `all_endpoints_unreachable`
-    /// is ever reached, and a listener sees nothing for a sender that is in
-    /// fact reconnecting indefinitely.
-    ///
-    /// It is NOT an `AuthFailed`. That kind is terminal and means the server
-    /// rejected a credential we presented; this one is retryable and means we
-    /// never had one to present. The Java client draws the same line with two
-    /// exception types.
-    pub(crate) fn token_provider_failed(&self, err: &crate::Error, attempt: u64) {
+    /// Report a provider failure before dial (`endpoint=None`) or after an
+    /// endpoint returned HTTP 401 and reacquisition failed. In the latter case
+    /// the rejected endpoint is retained for diagnostics, while `cause_code`
+    /// keeps the provider's retry/stop classification. A 401 alone cannot be
+    /// reported as terminal `AuthFailed`: a new token may still be obtainable.
+    pub(crate) fn token_provider_failed(
+        &self,
+        endpoint: Option<(&str, &str)>,
+        err: &crate::Error,
+        attempt: u64,
+    ) {
         self.failed_since_success.store(true, Ordering::Relaxed);
-        self.offer(
-            ConnectionEvent::new(ConnectionEventKind::CredentialUnavailable)
-                .attempt(attempt)
-                .caused_by(err),
-        );
+        let event = ConnectionEvent::new(ConnectionEventKind::CredentialUnavailable)
+            .attempt(attempt)
+            .caused_by(err);
+        self.offer(match endpoint {
+            Some((host, port)) => event.at(host, port),
+            None => event,
+        });
     }
 
     pub(crate) fn all_endpoints_unreachable(&self, err: &crate::Error) {

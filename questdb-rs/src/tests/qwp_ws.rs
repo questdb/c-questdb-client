@@ -2469,6 +2469,94 @@ fn qwp_ws_does_not_replay_a_401_with_an_unchanged_provider_token() {
 }
 
 #[test]
+fn qwp_ws_provider_failure_after_401_retains_rejected_endpoint() {
+    use crate::ingress::ConnectionEventKind;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = read_request_until_blank(&mut stream).unwrap();
+        assert!(
+            String::from_utf8_lossy(&request)
+                .to_ascii_lowercase()
+                .contains("authorization: bearer stale"),
+            "the rejected credential must have reached the server"
+        );
+        stream
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider_calls = Arc::clone(&calls);
+    let (tx, rx) = mpsc::channel();
+    let err = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider(move || {
+            if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok("stale".to_string())
+            } else {
+                Err(crate::Error::new(ErrorCode::SocketError, "refresh failed"))
+            }
+        })
+        .unwrap()
+        .connection_listener(Arc::new(move |event| tx.send(event.clone()).unwrap()), 0)
+        .unwrap()
+        .build()
+        .unwrap_err();
+    server.join().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("HTTP 401"), "{err}");
+    assert!(err.msg().contains("refresh failed"), "{err}");
+
+    let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(event.kind, ConnectionEventKind::CredentialUnavailable);
+    assert_eq!(event.host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(event.port.as_deref(), Some(port.to_string().as_str()));
+    assert_eq!(event.cause_code, Some(ErrorCode::SocketError));
+    assert!(event.cause_msg.as_deref().unwrap().contains("HTTP 401"));
+    assert!(
+        rx.try_iter()
+            .all(|event| event.kind != ConnectionEventKind::AuthFailed)
+    );
+}
+
+#[test]
+fn qwp_ws_provider_failure_before_dial_has_no_endpoint() {
+    use crate::ingress::ConnectionEventKind;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let err = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider(|| {
+            Err::<String, _>(crate::Error::new(ErrorCode::SocketError, "refresh failed"))
+        })
+        .unwrap()
+        .connection_listener(Arc::new(move |event| tx.send(event.clone()).unwrap()), 0)
+        .unwrap()
+        .build()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(!err.msg().contains("HTTP 401"), "{err}");
+    let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(event.kind, ConnectionEventKind::CredentialUnavailable);
+    assert_eq!(event.host, None);
+    assert_eq!(event.port, None);
+    assert_eq!(event.cause_code, Some(ErrorCode::SocketError));
+    listener.set_nonblocking(true).unwrap();
+    assert!(matches!(
+        listener.accept(),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
+#[test]
 fn qwp_ws_retries_one_401_with_a_changed_provider_token() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let (port, rx) = spawn_401_then_response_server();

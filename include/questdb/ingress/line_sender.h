@@ -2307,11 +2307,14 @@ int64_t line_sender_now_micros(void);
 #define questdb_connection_event_endpoint_attempt_failed 4u
 #define questdb_connection_event_all_endpoints_unreachable 5u
 /** Terminal: the server rejected a credential the client presented.
- *  `host` / `port` are set. */
+ *  `host` / `port` are set. A 401 followed by a failed replacement-token
+ *  acquisition is instead `credential_unavailable` with the endpoint set. */
 #define questdb_connection_event_auth_failed 6u
-/** The token provider failed, so no credential was ever offered and no
- *  endpoint was dialled. `host` / `port` are NULL. Read `cause_code` to
- *  tell a retry from a stop:
+/** The token provider failed while acquiring a credential. Before dialling,
+ *  `host` / `port` are NULL. If this follows a server HTTP 401, they identify
+ *  the endpoint that rejected the previous token and `cause_msg` includes the
+ *  401; `cause_code` still classifies the provider failure. Read `cause_code`
+ *  to tell a retry from a stop:
  *
  *  - `line_sender_error_socket_error` -- the ordinary case, retryable.
  *    The sender keeps reconnecting and store-and-forward keeps its queued
@@ -2325,7 +2328,7 @@ int64_t line_sender_now_micros(void);
  *
  *  A listener that pages on a permanent stop must qualify on `cause_code`,
  *  not on the kind alone. `questdb_connection_event_auth_failed` remains
- *  the server-rejected-a-credential signal and is unaffected. */
+ *  the terminal server-rejection signal. */
 #define questdb_connection_event_credential_unavailable 7u
 
 /** One connection-state transition. String fields are borrowed UTF-8
