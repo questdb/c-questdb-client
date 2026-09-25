@@ -128,6 +128,7 @@ impl OidcBuilderConfig {
         ),
         Error,
     > {
+        OidcDeviceAuth::ensure_builder_process()?;
         let mut builder = match &self.source {
             BuilderSource::Explicit => OidcDeviceAuth::builder(),
             BuilderSource::QuestDb(url) => OidcDeviceAuth::from_questdb(url.clone()),
@@ -407,6 +408,7 @@ impl SharedOidcAuth {
     }
 
     fn sign_in(&self) -> Result<(), Error> {
+        self.inner.ensure_current_process()?;
         self.reject_callback_reentry()?;
         // Mirror native's per-auth sign-in serialization at the callback layer.
         // This makes the handler generation below identify the invocation that
@@ -431,6 +433,7 @@ impl SharedOidcAuth {
     }
 
     fn cancel_sign_in(&self) -> Result<(), Error> {
+        self.inner.ensure_current_process()?;
         if let Some(handler) = &self.event_handler {
             handler.cancel_sign_in_serialized(|| self.inner.cancel_sign_in());
         } else {
@@ -444,6 +447,7 @@ impl SharedOidcAuth {
     }
 
     pub(crate) fn token(&self) -> Result<String, Error> {
+        self.inner.ensure_current_process()?;
         // Serve a valid cached token even while a callback runs -- on any
         // thread, including the callback's own. That path consults only the
         // token cache, never the acquisition lock, so it cannot block behind
@@ -525,6 +529,7 @@ impl SharedOidcAuth {
     }
 
     fn clear(&self) -> Result<(), Error> {
+        self.inner.ensure_current_process()?;
         self.reject_callback_reentry()?;
         // Close the admission race just as sign_in does: clear may already be
         // waiting for the core acquisition mutex when a renderer or diagnostic
@@ -546,6 +551,7 @@ impl SharedOidcAuth {
     }
 
     fn close(&self) -> Result<(), Error> {
+        self.inner.ensure_current_process()?;
         // Publish the close BEFORE waking anything. The wakes below release
         // work that is parked mid-operation -- a sibling sign-in queued behind
         // this auth's callback target resumes at its post-persistence
@@ -1537,7 +1543,12 @@ pub(crate) unsafe fn clone_auth(
         };
         None
     } else {
-        Some(unsafe { (*auth).shared.clone() })
+        let shared = unsafe { &(*auth).shared };
+        if let Err(err) = shared.inner.ensure_current_process() {
+            unsafe { set_err_out_from_error(err_out, err.into()) };
+            return None;
+        }
+        Some(shared.clone())
     }
 }
 
@@ -1947,7 +1958,7 @@ pub unsafe extern "C" fn questdb_oidc_auth_clone(
 /// Other auths built from the same reusable builder keep delivering events.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_auth_detach_events(auth: *const questdb_oidc_auth) {
-    if auth.is_null() {
+    if auth.is_null() || unsafe { (*auth).shared.inner.is_inherited() } {
         return;
     }
     if let Some(handler) = unsafe { &(*auth).shared.event_handler } {
@@ -1964,7 +1975,7 @@ pub unsafe extern "C" fn questdb_oidc_auth_detach_events(auth: *const questdb_oi
 /// context that must not wait for arbitrary user callback code.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_auth_detach_events_nowait(auth: *const questdb_oidc_auth) {
-    if auth.is_null() {
+    if auth.is_null() || unsafe { (*auth).shared.inner.is_inherited() } {
         return;
     }
     if let Some(handler) = unsafe { &(*auth).shared.event_handler } {
@@ -1992,7 +2003,7 @@ pub unsafe extern "C" fn questdb_oidc_auth_detach_events_nowait(auth: *const que
 /// Other auths built from the same builder keep delivering.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_auth_detach_diagnostics(auth: *const questdb_oidc_auth) {
-    if auth.is_null() {
+    if auth.is_null() || unsafe { (*auth).shared.inner.is_inherited() } {
         return;
     }
     if let Some(sink) = unsafe { &(*auth).shared.diagnostic } {
@@ -2013,7 +2024,7 @@ pub unsafe extern "C" fn questdb_oidc_auth_detach_diagnostics(auth: *const quest
 pub unsafe extern "C" fn questdb_oidc_auth_detach_diagnostics_nowait(
     auth: *const questdb_oidc_auth,
 ) {
-    if auth.is_null() {
+    if auth.is_null() || unsafe { (*auth).shared.inner.is_inherited() } {
         return;
     }
     if let Some(sink) = unsafe { &(*auth).shared.diagnostic } {
@@ -2024,7 +2035,15 @@ pub unsafe extern "C" fn questdb_oidc_auth_detach_diagnostics_nowait(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_auth_free(auth: *mut questdb_oidc_auth) {
     if !auth.is_null() {
-        unsafe { drop(Box::from_raw(auth)) };
+        let auth = unsafe { Box::from_raw(auth) };
+        if auth.shared.inner.is_inherited() {
+            // Dropping the final Arc may destroy a mutex still owned by a
+            // vanished parent thread or enter a callback release hook. Leak
+            // this copied handle in the child rather than invoking either.
+            std::mem::forget(auth);
+        } else {
+            drop(auth);
+        }
     }
 }
 
@@ -2202,7 +2221,7 @@ pub unsafe extern "C" fn questdb_oidc_auth_get_config(
     auth: *const questdb_oidc_auth,
     out: *mut questdb_oidc_config_view,
 ) -> bool {
-    if auth.is_null() {
+    if auth.is_null() || unsafe { (*auth).shared.inner.is_inherited() } {
         return false;
     }
     let Some(capacity) =

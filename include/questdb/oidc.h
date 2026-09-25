@@ -543,6 +543,17 @@ void questdb_oidc_auth_detach_diagnostics(const questdb_oidc_auth* auth);
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_detach_diagnostics_nowait(const questdb_oidc_auth* auth);
 
+/**
+ * An auth inherited by fork() cannot be used in the child: a vanished parent
+ * thread may still own one of its locks. Fallible auth operations and attaching
+ * it to a new transport return a configuration error without entering those
+ * locks; get_config returns false. Detach calls are no-ops. Freeing an inherited
+ * handle deliberately leaves its copied native state allocated in the child
+ * rather than running destructors or callback-release hooks on unsafe locks.
+ * The parent is unaffected. Creating even a NEW OIDC provider in that child
+ * is refused: HTTP/TLS initialization after fork is not safe if OIDC was used
+ * in the parent. Use fork+exec, then build a new provider and transports.
+ */
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_free(questdb_oidc_auth* auth);
 

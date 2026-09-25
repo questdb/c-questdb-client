@@ -280,6 +280,16 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     CHECK_NOTHROW(shared_auth.detach_diagnostics_nowait());
 }
 
+TEST_CASE("OIDC C++ moved-from token view has non-null empty data")
+{
+    auto original = questdb::oidc::token::test_empty();
+    auto moved = std::move(original);
+    const auto view = original.view();
+    CHECK(view.empty());
+    CHECK(view.data() != nullptr);
+    CHECK(moved.view().data() != nullptr);
+}
+
 TEST_CASE("OIDC C++ errors carry every field of the C error view")
 {
     // `error_from_view` is the ONE conversion the device/reader throw path and

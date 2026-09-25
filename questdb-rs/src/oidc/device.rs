@@ -25,7 +25,7 @@
 //! The OAuth 2.0 device authorization grant (RFC 8628) token manager.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,11 @@ use crate::oidc::render::{
 };
 use crate::oidc::token::{DEFAULT_SKEW_SECONDS, TokenSet, is_safe_token_str, now_epoch};
 use crate::oidc::token_store::{self, PersistedToken, TokenStore, TokenStoreKey};
+
+// Building a *new* provider after forking a process that used OIDC is unsafe
+// too: the HTTP/TLS runtime may retain state from vanished parent threads.
+// Set this before any builder reaches discovery or HTTP client initialization.
+static OIDC_INIT_PID: AtomicU32 = AtomicU32::new(0);
 
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const REFRESH_GRANT: &str = "refresh_token";
@@ -498,8 +503,10 @@ impl OidcDeviceAuthBuilder {
     }
 
     /// Resolve the configuration (running discovery if needed) and build the
-    /// [`OidcDeviceAuth`].
+    /// [`OidcDeviceAuth`]. If OIDC was used before `fork()`, a child must
+    /// `exec()` before building a provider; inherited HTTP/TLS state is unsafe.
     pub fn build(self) -> Result<OidcDeviceAuth> {
+        OidcDeviceAuth::ensure_builder_process()?;
         if self.timeout > MAX_TIMEOUT || self.timeout.is_zero() {
             return Err(OidcError::config(format!(
                 "timeout must be positive and must not exceed {}s.",
@@ -556,6 +563,7 @@ impl OidcDeviceAuthBuilder {
         let custom_sleep = self.sleep.is_some();
         let sleep = self.sleep.unwrap_or_else(|| Arc::new(std::thread::sleep));
         Ok(OidcDeviceAuth {
+            creator_pid: std::process::id(),
             config,
             http,
             renderer: self
@@ -616,6 +624,9 @@ impl OidcDeviceAuthBuilder {
 /// permanent operation: it wakes device-poll and bundled file-store lock waits,
 /// then waits for the operation to leave the acquisition critical section.
 pub struct OidcDeviceAuth {
+    // An acquisition lock may be held by a thread that disappears at fork.
+    // Never enter any of this instance's locks in a different process.
+    creator_pid: u32,
     config: OidcConfig,
     http: HttpClient,
     renderer: Box<dyn Renderer>,
@@ -667,6 +678,48 @@ impl std::fmt::Debug for OidcDeviceAuth {
 }
 
 impl OidcDeviceAuth {
+    /// Reject reinitialization after fork when OIDC was used in the parent.
+    /// This must run before discovery, TLS initialization or callback setup.
+    #[doc(hidden)]
+    pub fn ensure_builder_process() -> Result<()> {
+        let pid = std::process::id();
+        let recorded = OIDC_INIT_PID.load(AtomicOrdering::Acquire);
+        let recorded = if recorded == 0 {
+            OIDC_INIT_PID
+                .compare_exchange(0, pid, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                .unwrap_or_else(|seen| seen)
+        } else {
+            recorded
+        };
+        if recorded != 0 && recorded != pid {
+            return Err(OidcError::config(
+                "OIDC cannot be initialized after fork in a process that already used it; exec a fresh process first.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this handle was copied into a child by fork(). Inherited mutexes
+    /// may be permanently locked by vanished threads; exec a fresh process
+    /// before building a new provider.
+    #[doc(hidden)]
+    pub fn is_inherited(&self) -> bool {
+        self.creator_pid != std::process::id()
+    }
+
+    /// Check before touching any mutex, including the callback gates in an FFI
+    /// binding. Transport token pulls must reject an inherited provider too.
+    #[doc(hidden)]
+    pub fn ensure_current_process(&self) -> Result<()> {
+        if self.is_inherited() {
+            Err(OidcError::config(
+                "This OIDC provider was inherited across fork and cannot be reused; exec a fresh process before creating a new provider.",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn warn_persistence(&self, op: &str, err: &(dyn std::error::Error + Send + Sync)) {
         let raw = format!("token store {op} failed: {err}");
         let message = sanitize_display_text(&raw);
@@ -702,7 +755,10 @@ impl OidcDeviceAuth {
     /// The signal is permanent and shared by every `Arc`/FFI clone and attached
     /// transport. An HTTP request already in flight is not cancelled at the
     /// transport layer, so this waits for that bounded request to return.
-    /// Idempotent.
+    /// Idempotent. After `fork()`, an inherited provider cannot safely enter
+    /// any of its locks; this infallible method returns without draining it.
+    /// Fallible operations reject it, and a child must `exec()` before using
+    /// OIDC again.
     ///
     /// Do not call it from a [`Renderer`] callback on this same provider:
     /// callbacks run inside the acquisition critical section that `close` waits
@@ -715,6 +771,11 @@ impl OidcDeviceAuth {
     /// compose both calls, and their headers state the credential is dropped on
     /// every path including the skipped-drain one.
     pub fn close(&self) {
+        // This method predates the fallible API. Do not block forever (or even
+        // take close_wait) when the holder of acquire vanished at fork.
+        if self.is_inherited() {
+            return;
+        }
         self.signal_close();
 
         // Match the Java lifecycle: close does not return while token work can
@@ -741,6 +802,9 @@ impl OidcDeviceAuth {
     /// The persisted entry is deliberately untouched; removing that is
     /// [`try_clear`](Self::try_clear)'s job, which outlives close.
     pub fn discard_credentials(&self) {
+        if self.is_inherited() {
+            return;
+        }
         *self.lock_tokens() = None;
         self.lock_store_state().set_last_persisted_refresh(None);
     }
@@ -761,6 +825,9 @@ impl OidcDeviceAuth {
     /// leaves the tokens readable through [`token_set`](Self::token_set) and
     /// un-zeroized until the provider itself is dropped.
     pub fn signal_close(&self) {
+        if self.is_inherited() {
+            return;
+        }
         // Publish and notify under the same mutex `wait_or_cancel` parks on.
         // Storing outside it races that waiter's `is_closed()` re-check: the
         // notify can land after the check and before the wait registers, and is
@@ -804,6 +871,9 @@ impl OidcDeviceAuth {
     /// already in flight is not cancelled at the transport layer, so the flow
     /// stops after that bounded request returns.
     pub fn cancel_sign_in(&self) -> bool {
+        if self.is_inherited() {
+            return false;
+        }
         // Serialize predicate publication with the waiter's registration so a
         // cancellation cannot land between its check and condvar wait.
         let _guard = self
@@ -995,6 +1065,7 @@ impl OidcDeviceAuth {
     }
 
     fn try_clear_inner(&self, abort_wait: Option<&dyn Fn() -> bool>) -> Result<()> {
+        self.ensure_current_process()?;
         // Clearing is pure teardown, so it must keep working after `close`.
         // `close` deliberately leaves the persisted entry alone -- it drops only
         // the in-memory copy -- so refusing here stranded a long-lived plaintext
@@ -1076,6 +1147,9 @@ impl OidcDeviceAuth {
     /// # }
     /// ```
     pub fn token_set(&self) -> Option<TokenSet> {
+        if self.is_inherited() {
+            return None;
+        }
         self.lock_tokens().clone()
     }
 
@@ -1112,6 +1186,7 @@ impl OidcDeviceAuth {
     }
 
     fn ensure_open(&self) -> Result<()> {
+        self.ensure_current_process()?;
         if self.is_closed() {
             Err(OidcError::cancelled(
                 "The OIDC authentication provider is closed.",

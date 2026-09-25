@@ -208,15 +208,18 @@ public:
     }
 
     /** Borrowed bytes; valid only while this token object remains alive.
-     *  Empty (and never a null-pointer `string_view`) on a moved-from token,
-     *  matching `event_view::view` and `device_auth::view`. */
+     *  Empty with non-null `data()` on a moved-from token. */
     std::string_view view() const& noexcept
     {
         const char* const data = ::questdb_oidc_token_data(_raw);
         return data ? std::string_view{data, ::questdb_oidc_token_len(_raw)}
-                    : std::string_view{};
+                    : std::string_view{"", 0};
     }
     std::string_view view() const&& = delete;
+
+#if defined(QUESTDB_OIDC_CPP_TEST_HOOKS)
+    static token test_empty() noexcept { return token{nullptr}; }
+#endif
 
 private:
     explicit token(::questdb_oidc_token* raw) noexcept
@@ -253,6 +256,9 @@ struct config_view
  * `oidc::error` handler written for this API does not transfer to a sender.
  * Catch the common base `const questdb::error&` to handle both. See
  * `questdb::oidc::error` for the full cross-surface exception model.
+ *
+ * A handle inherited by `fork()` is invalid; rebuild the provider and its
+ * transports only after `exec()`, not within the forked child process.
  */
 class device_auth
 {

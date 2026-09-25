@@ -239,6 +239,39 @@ fn sign_in_and_token(auth: &OidcDeviceAuth) -> Result<String> {
 }
 
 #[test]
+fn inherited_provider_rejects_access_before_entering_any_lock() {
+    // Simulate the PID change without spawning a fork in Rust's parallel test
+    // harness. The Python subprocess test forks with an actual acquisition
+    // lock held by a vanished worker and bounds the child's exit time.
+    let mut auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("https://idp.example/device")
+        .token_endpoint("https://idp.example/token")
+        .interactive(false)
+        .open_browser(false)
+        .build()
+        .unwrap();
+    auth.creator_pid = auth.creator_pid.wrapping_add(1);
+    assert!(auth.is_inherited());
+    assert_eq!(
+        auth.ensure_current_process().unwrap_err().kind(),
+        OidcErrorKind::Config
+    );
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Config);
+    assert_eq!(
+        auth.cached_token().unwrap().unwrap_err().kind(),
+        OidcErrorKind::Config
+    );
+    assert_eq!(auth.try_clear().unwrap_err().kind(), OidcErrorKind::Config);
+    auth.close();
+    auth.signal_close();
+    auth.discard_credentials();
+    assert!(!auth.cancel_sign_in());
+    assert!(auth.token_set().is_none());
+    assert!(!auth.is_closed());
+}
+
+#[test]
 fn operation_wait_can_be_aborted_after_it_has_started() {
     let auth = Arc::new(
         OidcDeviceAuth::builder()
