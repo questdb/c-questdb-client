@@ -787,7 +787,8 @@ def test_orphan_drainer_durable_ack_survives_kill_c_client_rust(
         "drain_orphans=on;"
         "request_durable_ack=on;"
         "reconnect_max_duration_millis=60000;"
-        "close_flush_timeout_millis=5000;"
+        # Only the ghost published rows; the foreground needs no drain wait.
+        "close_flush_timeout_millis=0;"
     )
     c_client_rust_sidecar.connect(fg_cs)
 
@@ -801,6 +802,11 @@ def test_orphan_drainer_durable_ack_survives_kill_c_client_rust(
     if p1.db_root.exists():
         shutil.rmtree(p1.db_root)
     obj_store.wipe()
+
+    # Ensure the old orphan worker has stopped before P2 becomes writable.
+    # Otherwise a replay to P2 can land while CONNECT-replace is closing its
+    # pool, and the fresh scan can resend the un-acked frame (at-least-once).
+    c_client_rust_sidecar.close()
 
     p2 = server_factory("p2", db_root_name="p2-fresh")
     p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)

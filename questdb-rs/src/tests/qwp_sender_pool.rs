@@ -3340,21 +3340,21 @@ fn standalone_direct_sender_force_drop_discards_in_flight() {
         "deferred flush must be in-flight"
     );
 
+    // The second flush is asynchronous. Wait until the server has actually
+    // received its deferred frame before dropping; otherwise on a slow runner
+    // the last captured frame may still be the first (committed) flush.
+    let committed = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(committed[5] & FLAG_DEFER_COMMIT, 0);
+    let deferred = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(deferred[5] & FLAG_DEFER_COMMIT, 0);
+
     // `questdb_db_drop_direct_sender` sets must_close before dropping the
     // box (via `on_deferred_close`); replicate that to drive the discard arm.
     sender.mark_must_close();
     drop(sender);
-
-    let mut captured = Vec::new();
-    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
-        captured.push(frame);
-    }
-    let last = captured.last().expect("server must have received frames");
-    assert_ne!(
-        last[5] & FLAG_DEFER_COMMIT,
-        0,
-        "force-drop must leave the deferred tail uncommitted (discarded), \
-         not send a commit boundary"
+    assert!(
+        frames.recv_timeout(Duration::from_secs(2)).is_err(),
+        "force-drop must not send a commit boundary for the deferred tail"
     );
 }
 
@@ -9804,4 +9804,75 @@ mod sender_conn_event_tests {
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
+}
+
+/// Every connect answers `421` with `X-QuestDB-Role: REPLICA`, until `done`.
+#[cfg(feature = "ffi-support")]
+fn spawn_replica_role_rejector(done: Arc<AtomicBool>) -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let mut attempts = 0usize;
+        while !done.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    attempts += 1;
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte) {
+                            Ok(1) => request.push(byte[0]),
+                            _ => break,
+                        }
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\
+                          Content-Length: 0\r\nX-QuestDB-Role: REPLICA\r\n\r\n",
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        attempts
+    });
+    (port, handle)
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn sf_pool_borrow_with_retry_retries_an_all_replica_role_reject_until_budget() {
+    // A durable-ack (store-and-forward) pool whose nodes are all replicas is
+    // retried for the whole budget -- a failover can promote a primary -- the
+    // same as a direct sender, and the final error keeps the role payload.
+    let done = Arc::new(AtomicBool::new(false));
+    let (p1, h1) = spawn_replica_role_rejector(Arc::clone(&done));
+    let (p2, h2) = spawn_replica_role_rejector(Arc::clone(&done));
+    let conf = format!(
+        "ws::addr=127.0.0.1:{p1},127.0.0.1:{p2};request_durable_ack=on;\
+         reconnect_initial_backoff_millis=50;reconnect_max_backoff_millis=100;\
+         sender_pool_min=0;query_pool_min=0;"
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let budget = Duration::from_millis(800);
+    let started = Instant::now();
+    let err = match db.borrow_sender_owned_with_retry(budget) {
+        Ok(_) => panic!("an all-replica cluster must not yield a sender"),
+        Err(err) => err,
+    };
+    let elapsed = started.elapsed();
+    drop(db);
+    done.store(true, Ordering::Release);
+    let attempts = h1.join().unwrap() + h2.join().unwrap();
+    assert_eq!(err.code(), ErrorCode::ProtocolVersionError, "{}", err.msg());
+    assert!(err.qwp_ws_role_reject().is_some());
+    assert!(elapsed >= budget, "gave up after {elapsed:?}");
+    assert!(attempts > 2, "only {attempts} connect attempts");
 }

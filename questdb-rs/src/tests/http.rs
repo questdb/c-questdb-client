@@ -579,6 +579,673 @@ fn test_two_retries(
     Ok(())
 }
 
+#[test]
+fn test_retryable_provider_failure_is_retried_within_the_budget() -> TestResult {
+    // Regression: the auth header used to be resolved in `Sender::flush_impl`,
+    // outside `http_send_with_retries`, so a provider failure ended the flush
+    // after zero requests and zero milliseconds of `retry_timeout`. The C and
+    // Python bindings clear the sender-owned buffer on any flush failure, and
+    // the retry they document -- `SocketError` means "retry, exactly as you
+    // would any other" -- then re-flushed an empty buffer and reported success,
+    // so a peer holding the OIDC token-store lock for a few seconds destroyed
+    // the batch and the loss looked like a successful write.
+    //
+    // The provider fails twice with a retryable error and then succeeds. The
+    // assertion is that the flush completes, with the rows intact, on the
+    // budget the caller configured.
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                // The shape a token-store lock wait produces: recoverable, and
+                // classified `SocketError` by `classify_provider_error`.
+                return Err(crate::error::fmt!(
+                    SocketError,
+                    "could not acquire the OIDC token-store lock"
+                ));
+            }
+            Ok("tok".to_string())
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        // The rows survived the provider failures rather than being dropped.
+        assert_eq!(req.body(), buffer2.as_bytes());
+        assert_eq!(req.header("authorization"), Some("Bearer tok"));
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+
+    // Assert the flush before joining. On a regression the flush fails without
+    // ever sending, so the server thread is still parked in `accept()` and
+    // joining it first would hang CI instead of failing it.
+    sender.flush_and_keep(&buffer)?;
+    _ = server_thread.join().unwrap()?;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    Ok(())
+}
+
+#[test]
+fn test_terminal_provider_failure_does_not_spend_the_retry_budget() -> TestResult {
+    // The other half of the contract above: only the failures
+    // `classify_provider_error` leaves as `SocketError` are re-resolved. A
+    // caller contract violation arrives as a terminal `ConfigError` and must
+    // fail the flush at once -- retrying it would burn the whole window on
+    // state that no later invocation changes, and (unlike the retryable case)
+    // waiting cannot help.
+    let server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err::<String, _>(crate::error::fmt!(
+                InvalidApiCall,
+                "provider contract violation"
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let start = std::time::Instant::now();
+    let err = sender.flush_and_keep(&buffer).unwrap_err();
+    let elapsed = start.elapsed();
+
+    assert_eq!(err.code(), crate::ErrorCode::ConfigError);
+    // Resolved once, not on a ladder, and nowhere near the 30s budget.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
+    Ok(())
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn test_interaction_required_fails_the_flush_without_waiting() -> TestResult {
+    // `classify_provider_error` keeps `InteractionRequired` retryable so the QWP
+    // drainer does not abandon queued frames on a condition a human can fix. A
+    // single foreground flush has no such horizon: nothing it waits for produces
+    // a sign-in, so re-resolving would only make "nobody has signed in" arrive a
+    // whole `retry_timeout` late, on every flush.
+    let server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err::<String, _>(crate::Error::from(
+                crate::oidc::OidcError::interaction_required("no cached credential"),
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let start = std::time::Instant::now();
+    let err = sender.flush_and_keep(&buffer).unwrap_err();
+    let elapsed = start.elapsed();
+
+    // Still classified retryable for callers that key on the code.
+    assert_eq!(err.code(), crate::ErrorCode::SocketError);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
+    Ok(())
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn test_busy_interaction_required_is_retried_within_the_budget() -> TestResult {
+    // The counterpart to the test above, and the reason the fail-fast rule is
+    // keyed on `acquisition_busy` rather than on the kind. A peer `sign_in()`
+    // holding the acquisition lock -- or a renderer callback mid-paint -- also
+    // raises `InteractionRequired`, but it clears on its own the moment the peer
+    // releases, with no human involved. Failing the flush on it destroyed the
+    // batch: the bindings clear the sender-owned buffer on failure, and the
+    // `SocketError` retry they document then re-flushed an empty buffer and
+    // reported success.
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                return Err(crate::Error::from(
+                    crate::oidc::OidcError::interaction_required_busy(
+                        "An interactive OIDC sign-in is in progress on another thread",
+                    ),
+                ));
+            }
+            Ok("tok".to_string())
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        // The rows survived the peer's acquisition rather than being dropped.
+        assert_eq!(req.body(), buffer2.as_bytes());
+        assert_eq!(req.header("authorization"), Some("Bearer tok"));
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+
+    // Assert the flush before joining: on a regression it fails without ever
+    // sending, leaving the server parked in `accept()`.
+    sender.flush_and_keep(&buffer)?;
+    _ = server_thread.join().unwrap()?;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    Ok(())
+}
+
+#[test]
+fn test_initial_401_provider_failure_is_not_marked_in_doubt() -> TestResult {
+    // Exercise the production call site, not just rotated_auth_after_401's bool
+    // parameter: swapping the false/true constants at its two callers must make
+    // this test and its retry-loop counterpart fail.
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok("expired".to_string())
+            } else {
+                Err(crate::error::fmt!(SocketError, "rotation failed"))
+            }
+        })?
+        // Short: a retryable provider failure after a 401 is now re-resolved
+        // for the rest of the retry budget before it is returned.
+        .retry_timeout(Duration::from_millis(300))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 1.0)?
+        .at(TimestampNanos::new(1))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let request = server.recv_http_q()?;
+        assert_eq!(request.header("authorization"), Some("Bearer expired"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        Ok(server)
+    });
+
+    let error = sender.flush_and_keep(&buffer).unwrap_err();
+    _ = server_thread.join().unwrap()?;
+    assert!(!error.in_doubt(), "a definite first 401 applied nothing");
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    Ok(())
+}
+
+#[test]
+fn test_retry_loop_401_provider_failure_is_marked_in_doubt() -> TestResult {
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok("expired".to_string())
+            } else {
+                Err(crate::error::fmt!(SocketError, "rotation failed"))
+            }
+        })?
+        // Short: a retryable provider failure after a 401 is now re-resolved
+        // for the rest of the retry budget before it is returned.
+        .retry_timeout(Duration::from_millis(300))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 1.0)?
+        .at(TimestampNanos::new(1))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let first = server.recv_http_q()?;
+        assert_eq!(first.header("authorization"), Some("Bearer expired"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("retry"),
+        )?;
+        let second = server.recv_http_q()?;
+        assert_eq!(second.header("authorization"), Some("Bearer expired"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        Ok(server)
+    });
+
+    let error = sender.flush_and_keep(&buffer).unwrap_err();
+    _ = server_thread.join().unwrap()?;
+    assert!(
+        error.in_doubt(),
+        "a provider failure after entering the request retry loop lost delivery uncertainty"
+    );
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    Ok(())
+}
+
+#[test]
+fn test_credential_rotation_budget_is_one_per_flush() -> TestResult {
+    // Regression: the rotation budget is one per FLUSH. `http_send_with_retries`
+    // spends it on the pre-loop 401, then hands off to `retry_http_send`, which
+    // used to start its own `auth_retry_used` at `false` -- so a second 401 later
+    // in the same flush rotated again and replayed the whole buffer a second
+    // time, twice what the C header and this module both promise.
+    //
+    // Script: 401 (rotate) -> 500 (ladder) -> 401. The assertion is that the
+    // second 401 ends the flush instead of buying another replay.
+    let mut server = MockServer::new()?;
+    let provider_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            Ok::<_, crate::Error>(format!(
+                "tok{}",
+                provider_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<usize> {
+        server.accept()?;
+        let mut requests = 0usize;
+
+        // 1: the credential resolved for the flush. 401 spends the budget.
+        let req = server.recv_http_q()?;
+        requests += 1;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+
+        // 2: the one rotated replay, answered 5xx so the flush enters
+        // `retry_http_send` with the budget already spent.
+        let req = server.recv_http_q()?;
+        requests += 1;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+
+        // 3: a second 401 inside the retry loop. It must be reported, not
+        // rotated: the provider still has fresh values to hand out, so a
+        // surviving budget would show up as a fourth request bearing "tok2".
+        let req = server.recv_http_q()?;
+        requests += 1;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+
+        // Nothing further may arrive. Read with a short deadline so a
+        // regression fails on the `requests` assertion below rather than
+        // hanging the suite: without this read the count is always 3 and that
+        // assertion cannot fail, leaving the regression to surface only
+        // indirectly, as a SocketError from a fourth request hitting a dropped
+        // server.
+        if server.recv_http(1.0).is_ok() {
+            requests += 1;
+        }
+        Ok(requests)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+    let requests = server_thread.join().unwrap()?;
+
+    assert_eq!(
+        requests, 3,
+        "one flush must not spend the rotation budget twice"
+    );
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::AuthError);
+    Ok(())
+}
+
+#[test]
+fn test_credential_rotation_keeps_retry_backoff() -> TestResult {
+    // Regression: `retry_http_send`'s credential-rotation branch used to make
+    // the rotated retry immediate by setting `retry_interval_ms = 0`. That
+    // value is the backoff *ladder*, so every later
+    // `retry_interval_ms.saturating_mul(2)` computed `0 * 2` and a single 401
+    // disabled backoff for the rest of the window: any genuinely retryable
+    // failure after it re-sent the whole buffer with a sub-millisecond gap
+    // until `retry_end`.
+    //
+    // The script is 500 (ladder -> 10ms), 401 (rotate, retried with no wait),
+    // 500 (ladder -> 20ms); the wait before the fourth request is then the
+    // assertion -- with the bug it arrives in ~1ms.
+    let mut server = MockServer::new()?;
+    let provider_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        // A fresh value per call, so the 401 reads as an expiry the provider
+        // can rotate out of rather than a genuine rejection (which is what
+        // `rotated_auth_after_401` returning `None` would mean).
+        .http_token_provider(move || {
+            Ok::<_, crate::Error>(format!(
+                "tok{}",
+                provider_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+
+        // 1: the attempt made before the retry loop. A 5xx starts the ladder.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+
+        // 2: still the credential resolved for the flush. Answer 401 so the
+        // provider is consulted again and hands back a rotated value.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+
+        // 3: carries the rotated credential, which is what proves the
+        // rotation branch ran at all.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+
+        // 4: the ladder must have survived the rotation and be at ~20ms.
+        let start_time = std::time::Instant::now();
+        let req = server.recv_http_q()?;
+        let elapsed = std::time::Instant::now().duration_since(start_time);
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        assert!(
+            elapsed > Duration::from_millis(15),
+            "credential rotation disabled the retry backoff: \
+             the next attempt came after {elapsed:?}"
+        );
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(server)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+
+    _ = server_thread.join().unwrap()?;
+
+    res?;
+
+    Ok(())
+}
+
+#[test]
+fn test_retry_loop_401_after_deadline_still_sends_rotated_credential() -> TestResult {
+    // Regression: a 401 inside the retry loop whose response arrived after
+    // `retry_end` fetched a fresh credential from the provider and then
+    // returned the stale 401 as a terminal AuthError without ever sending it.
+    // A 401 on the first request is replayed whatever the budget; one inside
+    // the loop now gets the same single replay.
+    let mut server = MockServer::new()?;
+    let provider_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            Ok::<_, crate::Error>(format!(
+                "tok{}",
+                provider_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        })?
+        .retry_timeout(Duration::from_millis(300))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+        // Hold the 401 until the retry window has closed.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        std::thread::sleep(Duration::from_millis(600));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+    _ = server_thread.join().unwrap()?;
+    res?;
+    Ok(())
+}
+
+#[test]
+fn test_retryable_provider_failure_after_first_401_is_retried_within_budget() -> TestResult {
+    // Regression: a retryable provider failure while re-resolving after a
+    // first-attempt 401 failed the flush at once, with the retry budget
+    // unspent. The same failure before the first request is re-resolved
+    // inside `retry_timeout`; after a 401 -- which applied nothing -- it now is
+    // too.
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            match seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Ok("tok0".to_string()),
+                1 | 2 => Err(crate::error::fmt!(SocketError, "IdP unreachable")),
+                _ => Ok("tok1".to_string()),
+            }
+        })?
+        .retry_timeout(Duration::from_secs(10))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 1.0)?
+        .at(TimestampNanos::new(1))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+    _ = server_thread.join().unwrap()?;
+    res?;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    Ok(())
+}
+
+#[test]
+fn test_post_401_provider_retries_and_request_retries_share_one_deadline() -> TestResult {
+    // Regression: re-resolving the provider after a first-attempt 401 ran
+    // against one `retry_timeout` window and the request retries after the
+    // rotated attempt against a second, fresh one, so the flush could block
+    // for about twice `retry_timeout`.
+    let retry_timeout = Duration::from_millis(1500);
+    let provider_outage = Duration::from_millis(1300);
+    let mut server = MockServer::new()?;
+    let first_failure: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let failure_start = std::sync::Arc::clone(&first_failure);
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Ok("tok0".to_string());
+            }
+            let mut start = failure_start.lock().unwrap();
+            if start.get_or_insert_with(std::time::Instant::now).elapsed() < provider_outage {
+                Err(crate::error::fmt!(SocketError, "IdP unreachable"))
+            } else {
+                Ok("tok1".to_string())
+            }
+        })?
+        .retry_timeout(retry_timeout)?
+        .retry_max_backoff(Duration::from_millis(50))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("f1", 1.0)?
+        .at(TimestampNanos::new(1))?;
+
+    // The shared deadline starts at the 401, so time the flush from there.
+    // Timing from before `flush_and_keep` also counted the first connect,
+    // which on Windows costs ~2s: the mock listens on 127.0.0.1 only and
+    // `localhost` tries `::1` first, where a refused connect is retried.
+    let server_thread = std::thread::spawn(
+        move || -> io::Result<(MockServer, usize, std::time::Instant)> {
+            server.accept()?;
+            let req = server.recv_http_q()?;
+            assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+            let unauthorized_sent = std::time::Instant::now();
+            server.send_http_response_q(
+                HttpResponse::empty()
+                    .with_status(401, "Unauthorized")
+                    .with_body_str("Unauthorized"),
+            )?;
+            let mut rotated_requests = 0;
+            while let Ok(req) = server.recv_http(3.0) {
+                assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+                rotated_requests += 1;
+                server.send_http_response_q(
+                    HttpResponse::empty()
+                        .with_status(503, "Service Unavailable")
+                        .with_body_str("busy"),
+                )?;
+            }
+            Ok((server, rotated_requests, unauthorized_sent))
+        },
+    );
+
+    let res = sender.flush_and_keep(&buffer);
+    let finished = std::time::Instant::now();
+    let (_server, rotated_requests, unauthorized_sent) = server_thread.join().unwrap()?;
+    let elapsed = finished.duration_since(unauthorized_sent);
+    assert!(res.is_err(), "the server never accepts the rotated request");
+    assert!(
+        rotated_requests >= 1,
+        "the rotated credential must be replayed"
+    );
+    assert!(
+        elapsed < retry_timeout + Duration::from_millis(700),
+        "flush took {elapsed:?} after the 401, beyond one retry_timeout of {retry_timeout:?}"
+    );
+    Ok(())
+}
+
 #[rstest]
 fn test_one_retry(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
@@ -884,6 +1551,94 @@ fn test_buffer_protocol_version1_not_support_array() -> TestResult {
         res,
         ErrorCode::ProtocolVersionError,
         "Protocol version v1 does not support array datatype",
+    );
+    Ok(())
+}
+
+const PROXY_ENV_CHILD_TEST: &str = "tests::http::http_flush_ignores_proxy_env_child";
+const PROXY_ENV_CHILD_MARKER: &str = "QDB_TEST_HTTP_PROXY_ENV_CHILD";
+
+/// Child half of [`test_http_flush_ignores_proxy_env`]. It needs a proxy in
+/// its environment, and mutating the environment of the multi-threaded test
+/// harness is unsound, so the parent re-runs this binary with one set.
+#[test]
+#[ignore = "child process of test_http_flush_ignores_proxy_env"]
+fn http_flush_ignores_proxy_env_child() -> TestResult {
+    if std::env::var_os(PROXY_ENV_CHILD_MARKER).is_none() {
+        return Ok(());
+    }
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_http()
+        // Skip the /settings probe, which this mock does not answer.
+        .protocol_version(ProtocolVersion::V2)?
+        // A refused connection is retryable; fail on the first one instead of
+        // spending the default ten-second budget reporting it.
+        .retry_timeout(Duration::ZERO)?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body(), buffer2.as_bytes());
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+    // With the proxy honoured half-way the request never leaves the client,
+    // so the server thread would wait in accept() forever: report the flush
+    // failure without joining it.
+    sender.flush(&mut buffer)?;
+    _ = server_thread.join().unwrap()?;
+    assert!(buffer.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_http_flush_ignores_proxy_env() -> TestResult {
+    // Point every proxy variable ureq reads at a port nothing listens on.
+    // Honouring it would fail to connect; half-honouring it -- ureq's default
+    // proxy config with no proxy connector in the chain -- used to fail every
+    // flush with "Connection refused" without dialling anything at all.
+    let dead_proxy = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        format!("http://127.0.0.1:{}", listener.local_addr()?.port())
+    };
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .arg(PROXY_ENV_CHILD_TEST)
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(PROXY_ENV_CHILD_MARKER, "1")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
+    for name in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        command.env(name, &dead_proxy);
+    }
+    let output = command.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "flush failed with a proxy in the environment:\n{stdout}\n{stderr}"
+    );
+    // Guard against a filter that silently matches nothing.
+    assert!(
+        stdout.contains("1 passed"),
+        "the child test did not run:\n{stdout}\n{stderr}"
     );
     Ok(())
 }

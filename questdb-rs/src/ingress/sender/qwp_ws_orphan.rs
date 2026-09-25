@@ -387,6 +387,11 @@ impl ManualOrphanDrainers {
                 self.requeue(slot.slot_dir, slot.backoff);
                 true
             }
+            OrphanOpenOutcome::Terminal(reason) => {
+                // Not requeued: retired for this session, kept on disk.
+                let _ = record_last_error(&slot.slot_dir, &reason);
+                true
+            }
             OrphanOpenOutcome::Unrecoverable(reason) => {
                 let _ = mark_failed(&slot.slot_dir, &reason);
                 true
@@ -500,6 +505,11 @@ enum OrphanOpenOutcome {
     FailedSentinel,
     Locked,
     RetryLater(String),
+    /// Opening can never succeed in this session -- the token provider is
+    /// closed or misconfigured -- but the slot itself is intact. Retire it for
+    /// this session and leave it on disk for the next one, exactly as a
+    /// drive-phase [`OrphanDriveOutcome::Terminal`] does.
+    Terminal(String),
     Stopped,
     Unrecoverable(String),
 }
@@ -715,6 +725,18 @@ impl OrphanDrainer {
             traffic_gate.cloned(),
         ) {
             Ok(transport) => transport,
+            // A closed or misconfigured OIDC provider fails every later pull
+            // identically. The foreground stops on it (`reconnect_error_is_terminal`),
+            // and `questdb_oidc_auth_close` promises every attached reconnect
+            // loop does; retrying here would poll the dead provider and rewrite
+            // `.last_error` on every backoff tick until the sender closed.
+            Err(err) if crate::token_provider::is_terminal_oidc_provider_error(&err) => {
+                return if orphan_stop_requested(stop) {
+                    OrphanOpenOutcome::Stopped
+                } else {
+                    OrphanOpenOutcome::Terminal(err.to_string())
+                };
+            }
             Err(err) => return retry_open_later(err.to_string(), stop),
         };
         if orphan_stop_requested(stop) {
@@ -876,6 +898,10 @@ fn drain_orphan_to_completion(
                     return;
                 }
                 retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
+            }
+            OrphanOpenOutcome::Terminal(reason) => {
+                record_last_error_unless_stopped(&slot_dir, &reason, stop);
+                return;
             }
             OrphanOpenOutcome::Unrecoverable(reason) => {
                 mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
@@ -1468,6 +1494,48 @@ mod tests {
             drainers.drive_once(),
             "an expired backoff gate must allow the next connect attempt"
         );
+    }
+
+    /// Regression: an orphan drainer that had not opened its session kept
+    /// polling a closed OIDC provider and rewriting `.last_error` on every
+    /// backoff tick until the sender closed, although closing the provider is
+    /// documented as stopping every attached reconnect loop.
+    #[cfg(all(feature = "sync-sender-qwp-ws", feature = "_oidc", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_retires_slot_on_a_closed_oidc_provider() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut config = test_config();
+        config.qwp_ws.reconnect_initial_backoff =
+            ConfigSetting::new_default(Duration::from_millis(1));
+        config.qwp_ws.token_provider = Some(crate::token_provider::TokenProvider::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Err::<String, _>(crate::oidc::OidcError::cancelled(
+                "The OIDC authentication provider is closed.",
+            ))
+        }));
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !drainers.drive_once(),
+            "a slot retired on a closed provider must not be retried"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !has_failed_sentinel(&slot_dir),
+            "the slot stays recoverable"
+        );
+        let last_error = fs::read_to_string(slot_dir.join(LAST_ERROR_NAME)).unwrap();
+        assert!(last_error.contains("closed"), "{last_error}");
+
+        // The queued frame is still there for the next session.
+        let queue = SfaSlotQueue::open(slot_options(&sf_dir, "orphan")).unwrap();
+        assert!(!orphan_queue_drained(&queue));
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]

@@ -1,0 +1,6935 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+//! Device-flow tests driven by an in-process mock identity provider.
+//!
+//! A no-op sleep hook is injected so the poll loop (whose interval is floored at
+//! 5s in production) runs instantly; the mock scripts the token endpoint's
+//! `authorization_pending` / `slow_down` / success sequence.
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use tempfile::TempDir;
+
+use super::*;
+use crate::oidc::error::OidcErrorKind;
+use crate::oidc::token_store::{
+    FileTokenStore, PersistedToken, TokenStore, TokenStoreKey, TokenStoreResult,
+};
+
+/// Keep format/refresh tests running on non-Unix CI while production refuses
+/// file-store mutations there for lack of a durable metadata barrier.
+fn test_file_store(directory: impl AsRef<Path>) -> FileTokenStore {
+    FileTokenStore::at(directory.as_ref()).allow_unsafe_mutations_for_tests()
+}
+
+/// A tiny single-request-per-connection HTTP mock. The handler receives
+/// `(method, path, body)` and returns `(status, json_body)`.
+struct MockServer {
+    addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl MockServer {
+    fn start<H>(handler: H) -> Self
+    where
+        H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+    {
+        Self::start_inner(None, None, handler)
+    }
+
+    /// Like [`start`], but stamps a `Retry-After: <secs>` header on every response.
+    /// The tiny mock can't otherwise set one, and the 429 / `slow_down` backoff
+    /// path needs it to exercise a low Retry-After.
+    fn start_with_retry_after<H>(secs: u64, handler: H) -> Self
+    where
+        H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+    {
+        Self::start_inner(Some(secs), None, handler)
+    }
+
+    /// Like [`start`], but stamps a `Location: <target>` header on every 3xx
+    /// response, so the redirect-follow defense (the client must NOT follow a
+    /// 30x to another host) can be exercised end-to-end.
+    fn start_redirecting<H>(location: impl Into<String>, handler: H) -> Self
+    where
+        H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+    {
+        Self::start_inner(None, Some(location.into()), handler)
+    }
+
+    fn start_inner<H>(retry_after: Option<u64>, location: Option<String>, handler: H) -> Self
+    where
+        H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(handler);
+        let handle = {
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                while !shutdown.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            handle_conn(stream, &*handler, retry_after, location.as_deref())
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        MockServer {
+            addr,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{}", self.addr, path)
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_conn<H>(
+    mut stream: TcpStream,
+    handler: &H,
+    retry_after: Option<u64>,
+    location: Option<&str>,
+) where
+    H: Fn(&str, &str, &str) -> (u16, String),
+{
+    stream.set_nonblocking(false).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let headers_end = loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => return,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            }
+            Err(_) => return,
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..headers_end]).to_string();
+    let req_line = head.lines().next().unwrap_or("");
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let raw_path = parts.next().unwrap_or("").to_string();
+    let path = raw_path.split('?').next().unwrap_or("").to_string();
+    let content_length = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let mut body = buf[headers_end..].to_vec();
+    while body.len() < content_length {
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&tmp[..n]),
+            Err(_) => break,
+        }
+    }
+    let body_str = String::from_utf8_lossy(&body).to_string();
+    let (status, json) = handler(&method, &path, &body_str);
+    // Sentinel: status 0 means "simulate a transport failure" — drop the
+    // connection without any HTTP response, so the client sees no status.
+    if status == 0 {
+        return;
+    }
+    let retry_after_header = match retry_after {
+        Some(secs) => format!("Retry-After: {secs}\r\n"),
+        None => String::new(),
+    };
+    // Emit a Location only on a 3xx, so a redirect-follow defense test can point
+    // the token endpoint's 30x at a sink and prove the client never chases it.
+    let location_header = match location {
+        Some(loc) if (300..400).contains(&status) => format!("Location: {loc}\r\n"),
+        _ => String::new(),
+    };
+    let response = format!(
+        "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\n{retry_after_header}{location_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        json.len(),
+        json
+    );
+    stream.write_all(response.as_bytes()).ok();
+    stream.flush().ok();
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn no_sleep() -> SleepFn {
+    Arc::new(|_| {})
+}
+
+/// Build an auth against the mock with explicit endpoints, non-interactive TTY
+/// bypassed, no browser, and instant polling.
+fn explicit_auth(mock: &MockServer, groups_in_token: bool) -> OidcDeviceAuth {
+    OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .groups_in_token(groups_in_token)
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("build auth")
+}
+
+fn sign_in_and_token(auth: &OidcDeviceAuth) -> Result<String> {
+    auth.sign_in()?;
+    auth.token()
+}
+
+#[test]
+fn inherited_provider_rejects_access_before_entering_any_lock() {
+    // Simulate the PID change without spawning a fork in Rust's parallel test
+    // harness. The Python subprocess test forks with an actual acquisition
+    // lock held by a vanished worker and bounds the child's exit time.
+    let mut auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("https://idp.example/device")
+        .token_endpoint("https://idp.example/token")
+        .interactive(false)
+        .open_browser(false)
+        .build()
+        .unwrap();
+    auth.creator_pid = auth.creator_pid.wrapping_add(1);
+    assert!(auth.is_inherited());
+    assert_eq!(
+        auth.ensure_current_process().unwrap_err().kind(),
+        OidcErrorKind::Config
+    );
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Config);
+    assert_eq!(
+        auth.cached_token().unwrap().unwrap_err().kind(),
+        OidcErrorKind::Config
+    );
+    assert_eq!(auth.try_clear().unwrap_err().kind(), OidcErrorKind::Config);
+    auth.close();
+    auth.signal_close();
+    auth.discard_credentials();
+    assert!(!auth.cancel_sign_in());
+    assert!(auth.token_set().is_none());
+    assert!(!auth.is_closed());
+}
+
+#[test]
+fn operation_wait_can_be_aborted_after_it_has_started() {
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example/device")
+            .token_endpoint("https://idp.example/token")
+            .interactive(false)
+            .open_browser(false)
+            .build()
+            .expect("build auth"),
+    );
+    let held = auth.lock_acquire();
+    let callback_active = Arc::new(AtomicBool::new(false));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let worker_auth = Arc::clone(&auth);
+    let worker_active = Arc::clone(&callback_active);
+    let worker_checks = Arc::clone(&checks);
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let error = worker_auth
+            .try_clear_with_acquire_abort(&|| {
+                // Read the flag BEFORE publishing the check. The main thread
+                // sets the flag only once it has seen a check, so ordering it
+                // the other way round leaves a window in which the very first
+                // check increments the counter, is observed, and only then
+                // loads a flag the main thread has already set -- aborting
+                // after one check and failing the re-check assertion below.
+                let active = worker_active.load(Ordering::SeqCst);
+                worker_checks.fetch_add(1, Ordering::SeqCst);
+                active.then(|| {
+                    crate::Error::new(
+                        crate::ErrorCode::InvalidApiCall,
+                        "callback became active".to_string(),
+                    )
+                })
+            })
+            .expect_err("the waiter must observe callback admission");
+        result_tx.send(error.code()).unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while checks.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "clear never entered its wait loop"
+        );
+        std::thread::yield_now();
+    }
+    callback_active.store(true, Ordering::SeqCst);
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("clear did not abort after callback admission"),
+        crate::ErrorCode::InvalidApiCall
+    );
+    assert!(
+        checks.load(Ordering::SeqCst) >= 2,
+        "the abort predicate was not re-checked while waiting"
+    );
+    worker.join().expect("clear worker");
+    drop(held);
+}
+
+/// A token() already waiting behind a peer's silent refresh must be released
+/// when the binding's abort predicate starts reporting a callback, not held
+/// until the bounded acquisition wait (6 x timeout) expires.
+#[test]
+fn token_wait_can_be_aborted_after_it_has_started() {
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example/device")
+            .token_endpoint("https://idp.example/token")
+            .interactive(false)
+            .open_browser(false)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("build auth"),
+    );
+    let held = auth.lock_acquire();
+    let callback_active = Arc::new(AtomicBool::new(false));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let worker_auth = Arc::clone(&auth);
+    let worker_active = Arc::clone(&callback_active);
+    let worker_checks = Arc::clone(&checks);
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let error = worker_auth
+            .token_with_acquire_abort(&|| {
+                let active = worker_active.load(Ordering::SeqCst);
+                worker_checks.fetch_add(1, Ordering::SeqCst);
+                active.then(|| {
+                    crate::Error::new(
+                        crate::ErrorCode::SocketError,
+                        "callback became active".to_string(),
+                    )
+                })
+            })
+            .expect_err("the waiter must observe callback admission");
+        result_tx.send(error.msg().to_string()).unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while checks.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "token() never entered its wait loop"
+        );
+        std::thread::yield_now();
+    }
+    callback_active.store(true, Ordering::SeqCst);
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("token() did not abort after callback admission"),
+        "callback became active"
+    );
+    worker.join().expect("token worker");
+    drop(held);
+}
+
+/// Clearing an already-closed provider waits on the acquisition lock with a
+/// teardown spin. A holder parked in a callback never observes `closed`, so
+/// that spin must honour the binding's abort predicate too; otherwise a
+/// callback that closes the auth and then joins the clearing thread hangs both
+/// forever.
+#[test]
+fn closed_clear_teardown_wait_can_be_aborted() {
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example/device")
+            .token_endpoint("https://idp.example/token")
+            .interactive(false)
+            .open_browser(false)
+            .build()
+            .expect("build auth"),
+    );
+    let held = auth.lock_acquire();
+    auth.signal_close();
+    let worker_auth = Arc::clone(&auth);
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = worker_auth.try_clear_with_acquire_abort(&|| {
+            Some(crate::Error::new(
+                crate::ErrorCode::InvalidApiCall,
+                "callback is active".to_string(),
+            ))
+        });
+        result_tx.send(result.map_err(|e| e.code())).unwrap();
+    });
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("teardown wait ignored the abort predicate"),
+        Err(crate::ErrorCode::InvalidApiCall)
+    );
+    worker.join().expect("clear worker");
+    drop(held);
+
+    // Without an active callback the teardown path still clears a closed
+    // provider: `clear` outlives `close`.
+    auth.try_clear_with_acquire_abort(&|| None)
+        .expect("clear after close must still work");
+}
+
+#[test]
+fn store_state_zeroizes_every_secret_field() {
+    // Pins the FIELD LIST of `zeroize_secrets`, not the heap scrubbing itself,
+    // which is not observable in safe Rust. `last_persisted_refresh` holds a
+    // copy of the refresh token; dropping it from the scrub would otherwise
+    // fail nothing anywhere in the crate.
+    let mut state = StoreState::default();
+    state.last_persisted_refresh = Some("RT-1".to_string());
+    state.zeroize_secrets();
+    assert_eq!(state.last_persisted_refresh, None);
+}
+
+#[test]
+fn discard_credentials_drops_the_in_memory_token_without_the_acquire_lock() {
+    // Regression: the credential teardown used to live only after
+    // `lock_acquire()` inside `close()`. Any close that skipped the drain --
+    // notably one issued from inside a renderer callback, which runs within
+    // that very critical section -- therefore left the access and refresh
+    // tokens resident for the remaining life of the provider, contradicting
+    // close's documented "drops the in-memory credential".
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("https://idp.example/device")
+        .token_endpoint("https://idp.example/token")
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .build()
+        .expect("build auth");
+
+    let now = now_epoch();
+    *auth.lock_tokens() = Some(TokenSet {
+        access_token: Some("AT-secret".to_string()),
+        id_token: Some("ID-secret".to_string()),
+        refresh_token: Some("RT-secret".to_string()),
+        expires_at: now + 300.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: Some("subject".to_string()),
+        issued_at: now,
+    });
+    assert!(auth.lock_tokens().is_some());
+
+    // Hold the acquisition lock, exactly as a running callback would, and show
+    // the teardown still completes rather than deadlocking or being skipped.
+    let held = auth.lock_acquire();
+    auth.discard_credentials();
+    drop(held);
+
+    assert!(
+        auth.lock_tokens().is_none(),
+        "the in-memory credential must be dropped even when the drain is skipped"
+    );
+}
+
+#[test]
+fn cached_token_is_served_while_the_acquisition_lock_is_held() {
+    // The property the FFI relies on to stop failing unrelated callers while a
+    // renderer callback runs on another thread: a valid cached token comes from
+    // the token cache alone, so it can be served even though the acquisition
+    // critical section is occupied. Blanket-rejecting those callers meant a
+    // pooled PG-wire checkout failed for the whole time a prompt was on screen,
+    // despite a perfectly good token being cached.
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("https://idp.example/device")
+        .token_endpoint("https://idp.example/token")
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .build()
+        .expect("build auth");
+
+    let now = now_epoch();
+    *auth.lock_tokens() = Some(TokenSet {
+        access_token: Some("AT-cached".to_string()),
+        id_token: None,
+        refresh_token: None,
+        expires_at: now + 300.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: Some("subject".to_string()),
+        issued_at: now,
+    });
+
+    // Stand in for a callback holding the acquisition critical section.
+    let held = auth.lock_acquire();
+    assert_eq!(
+        auth.cached_token().expect("a valid cached token").unwrap(),
+        "AT-cached"
+    );
+    drop(held);
+
+    // With no usable credential it reports "no cached token" rather than
+    // blocking, leaving the caller to decide whether to wait for an
+    // acquisition.
+    *auth.lock_tokens() = None;
+    let held = auth.lock_acquire();
+    assert!(auth.cached_token().is_none());
+    drop(held);
+}
+
+#[test]
+fn close_cancels_device_polling_and_disables_shared_auth() {
+    let (polling_tx, polling_rx) = mpsc::sync_channel(1);
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => {
+            let _ = polling_tx.try_send(());
+            (400, r#"{"error":"authorization_pending"}"#.to_string())
+        }
+        _ => (404, "{}".to_string()),
+    });
+    // Do not install the test sleep hook: production polling waits on the close
+    // condvar, which must wake rather than wait out the five-second interval.
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build auth"),
+    );
+    let worker_auth = Arc::clone(&auth);
+    let worker = std::thread::spawn(move || worker_auth.sign_in());
+
+    polling_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sign-in did not reach token polling");
+    let started = Instant::now();
+    auth.close();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "close waited out the device poll interval"
+    );
+    let error = worker.join().expect("sign-in thread panicked").unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Cancelled);
+    assert!(auth.is_closed());
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Cancelled);
+    // clear is the exception: it is pure teardown, and close leaves the
+    // persisted entry behind, so it has to keep working afterwards.
+    auth.try_clear()
+        .expect("clear must remain available on a closed provider");
+    // Idempotent, including the synchronous drain guarantee.
+    auth.close();
+}
+
+#[test]
+fn cancel_sign_in_aborts_only_the_current_device_flow() {
+    let (polling_tx, polling_rx) = mpsc::sync_channel(1);
+    let authorized = Arc::new(AtomicBool::new(false));
+    let mock = {
+        let authorized = Arc::clone(&authorized);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if authorized.load(Ordering::Acquire) => (
+                200,
+                r#"{"access_token":"AT-after-cancel","expires_in":300}"#.to_string(),
+            ),
+            ("POST", "/token") => {
+                let _ = polling_tx.try_send(());
+                (400, r#"{"error":"authorization_pending"}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    // Production polling waits on the cancellation condvar; a synthetic sleep
+    // would not prove that cancel_sign_in wakes the five-second interval.
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build auth"),
+    );
+    let worker_auth = Arc::clone(&auth);
+    let worker = std::thread::spawn(move || worker_auth.sign_in());
+
+    polling_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sign-in did not reach token polling");
+    let started = Instant::now();
+    auth.cancel_sign_in();
+    let error = worker.join().expect("sign-in thread panicked").unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "attempt cancellation waited out the device poll interval"
+    );
+    assert_eq!(error.kind(), OidcErrorKind::Cancelled);
+    assert!(error.message().contains("provider remains open"));
+    assert!(
+        !auth.is_closed(),
+        "attempt cancellation must not close auth"
+    );
+    assert_eq!(
+        auth.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired,
+        "attached token consumers must see a recoverable missing credential"
+    );
+
+    // Cancellation while idle is a no-op and must not poison the next flow.
+    auth.cancel_sign_in();
+    authorized.store(true, Ordering::Release);
+    auth.sign_in().expect("same provider must be reusable");
+    assert_eq!(auth.token().unwrap(), "AT-after-cancel");
+}
+
+#[test]
+fn clear_fails_fast_behind_an_interactive_sign_in() {
+    // A device flow holds the acquisition lock for up to the device-code
+    // lifetime. `try_clear` used to wait for all of it -- uninterruptibly, with
+    // only `close` as an escape -- which hung a binding that released its
+    // runtime lock (and with it signal delivery) around the call.
+    let (polling_tx, polling_rx) = mpsc::sync_channel(1);
+    let authorized = Arc::new(AtomicBool::new(false));
+    let mock = {
+        let authorized = Arc::clone(&authorized);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if authorized.load(Ordering::Acquire) => (
+                200,
+                r#"{"access_token":"AT-after-clear","expires_in":300}"#.to_string(),
+            ),
+            ("POST", "/token") => {
+                let _ = polling_tx.try_send(());
+                (400, r#"{"error":"authorization_pending"}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build auth"),
+    );
+    let worker_auth = Arc::clone(&auth);
+    let worker = std::thread::spawn(move || worker_auth.sign_in());
+    polling_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sign-in did not reach token polling");
+    assert!(auth.interactive_sign_in_in_progress());
+
+    let started = Instant::now();
+    let error = auth
+        .try_clear()
+        .expect_err("clear must not run behind a device flow");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "clear waited behind the interactive sign-in"
+    );
+    assert_eq!(error.kind(), OidcErrorKind::Cancelled);
+    assert!(error.message().contains("Nothing was cleared"));
+    assert!(!auth.is_closed(), "a refused clear must not close auth");
+
+    // The sign-in it refused to wait for is unaffected and completes.
+    authorized.store(true, Ordering::Release);
+    worker
+        .join()
+        .expect("sign-in thread panicked")
+        .expect("the sign-in must be unaffected by the refused clear");
+    assert!(!auth.interactive_sign_in_in_progress());
+    assert_eq!(auth.token().unwrap(), "AT-after-clear");
+
+    // With no device flow running, clear proceeds as before.
+    auth.try_clear().expect("clear after the sign-in");
+    assert_eq!(
+        auth.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+}
+
+#[test]
+fn close_cancels_file_store_lock_wait() {
+    let dir = TempDir::new().unwrap();
+    let store = test_file_store(dir.path());
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example/device")
+            .token_endpoint("https://idp.example/token")
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .token_store(store.clone())
+            .build()
+            .expect("build auth"),
+    );
+    let key = auth.store_key.as_ref().unwrap().clone();
+    let release = Arc::new(Barrier::new(2));
+    let (locked_tx, locked_rx) = mpsc::sync_channel(1);
+    let holder_release = Arc::clone(&release);
+    let holder = std::thread::spawn(move || {
+        store
+            .in_lock(&key, &mut || {
+                locked_tx.send(()).unwrap();
+                holder_release.wait();
+                Ok(())
+            })
+            .unwrap();
+    });
+    locked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("holder did not acquire token-store lock");
+
+    let clear_auth = Arc::clone(&auth);
+    let clear = std::thread::spawn(move || clear_auth.try_clear());
+    // Observe clear holding the auth acquisition lock, which means it has
+    // reached (or is about to reach) the externally held store lock.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match auth.acquire.try_lock() {
+            Err(TryLockError::WouldBlock) => break,
+            Err(TryLockError::Poisoned(_)) => panic!("auth lock was poisoned"),
+            Ok(guard) => {
+                drop(guard);
+                assert!(Instant::now() < deadline, "clear did not acquire auth lock");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    let close_auth = Arc::clone(&auth);
+    let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+    let closer = std::thread::spawn(move || {
+        close_auth.close();
+        closed_tx.send(()).unwrap();
+    });
+    let closed_promptly = closed_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+    // Always unblock the holder so a failed assertion cannot strand the test.
+    release.wait();
+    holder.join().unwrap();
+    closer.join().unwrap();
+    assert!(
+        closed_promptly,
+        "close waited for the held token-store lock"
+    );
+    assert_eq!(
+        clear.join().unwrap().unwrap_err().kind(),
+        OidcErrorKind::Cancelled
+    );
+}
+
+/// Reserve a loopback port with no listener, so connects to it are refused
+/// (ECONNREFUSED) — modelling a pre-send transport failure where the request
+/// never leaves the client. Loopback `http` is allowed without insecure
+/// transport, so this needs no extra opt-in.
+fn dead_loopback_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
+
+/// A no-store auth whose token endpoint points at a closed loopback port, so a
+/// refresh POST fails pre-send (connection refused): the request never reaches
+/// the IdP, proving a refresh token carried in it was not consumed.
+fn auth_with_dead_token_endpoint() -> OidcDeviceAuth {
+    let addr = dead_loopback_addr();
+    OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(format!("http://{addr}/device"))
+        .token_endpoint(format!("http://{addr}/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("build auth")
+}
+
+fn device_response() -> String {
+    serde_json::json!({
+        "device_code": "DEV-CODE-123",
+        "user_code": "WXYZ-1234",
+        "verification_uri": "https://idp.example.com/activate",
+        "verification_uri_complete": "https://idp.example.com/activate?user_code=WXYZ-1234",
+        "expires_in": 600,
+        "interval": 5
+    })
+    .to_string()
+}
+
+#[test]
+fn token_requires_explicit_sign_in_without_starting_device_flow() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-explicit","expires_in":300}"#.to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        0,
+        "token() unexpectedly started the interactive device flow"
+    );
+
+    auth.sign_in().unwrap();
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(auth.token().unwrap(), "AT-explicit");
+}
+
+#[test]
+fn explicit_builder_rejects_endpoints_off_pinned_issuer_origin() {
+    let err = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .issuer("https://idp.example.com/realms/prod")
+        .device_authorization_endpoint("https://tokens.example.com/device")
+        .token_endpoint("https://tokens.example.com/token")
+        .build()
+        .unwrap_err();
+
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(err.message().contains("pinned issuer origin"));
+}
+
+#[test]
+fn token_does_not_wait_behind_interactive_sign_in() {
+    struct BlockingPrompt {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl Renderer for BlockingPrompt {
+        fn on_prompt(&self, _challenge: &DeviceCodeChallenge) {
+            self.entered.wait();
+            self.release.wait();
+        }
+    }
+
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-after-prompt","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .interactive(true)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .renderer(BlockingPrompt {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            })
+            .build()
+            .unwrap(),
+    );
+
+    let signer = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || auth.sign_in())
+    };
+    entered.wait();
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let token_caller = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || {
+            let result = auth.token().map_err(|error| error.kind());
+            result_tx.send(result).unwrap();
+        })
+    };
+    let token_result = result_rx.recv_timeout(Duration::from_secs(1));
+
+    // Always unblock the signer before asserting, so a regression fails rather
+    // than leaving a permanently hung test process.
+    release.wait();
+    signer.join().unwrap().unwrap();
+    token_caller.join().unwrap();
+
+    assert_eq!(
+        token_result.expect("token() blocked behind the interactive sign-in"),
+        Err(OidcErrorKind::InteractionRequired)
+    );
+}
+
+#[test]
+fn token_waits_behind_concurrent_silent_refresh_and_reuses_result() {
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let (refresh_entered_tx, refresh_entered_rx) = std::sync::mpsc::channel();
+    let (release_refresh_tx, release_refresh_rx) = std::sync::mpsc::channel();
+    let release_refresh_rx = Arc::new(Mutex::new(release_refresh_rx));
+    let mock = {
+        let token_calls = Arc::clone(&token_calls);
+        let release_refresh_rx = Arc::clone(&release_refresh_rx);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/token") => {
+                let call = token_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    refresh_entered_tx.send(()).unwrap();
+                    release_refresh_rx.lock().unwrap().recv().unwrap();
+                }
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = Arc::new(explicit_auth(&mock, false));
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+    let first = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || auth.token())
+    };
+    refresh_entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first caller did not enter silent refresh");
+
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    let second = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || second_tx.send(auth.token()).unwrap())
+    };
+    let before_release = second_rx.recv_timeout(Duration::from_millis(200));
+    let waited_for_refresh = matches!(
+        &before_release,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+
+    // Always release and join the refresh before asserting, so a regression
+    // cannot leave the mock or either caller blocked.
+    release_refresh_tx.send(()).unwrap();
+    let first_result = first.join().unwrap();
+    let second_result = match before_release {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => second_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second caller did not resume after refresh"),
+        Err(error) => panic!("second token caller disconnected: {error}"),
+    };
+    second.join().unwrap();
+
+    assert!(
+        waited_for_refresh,
+        "token() failed fast instead of waiting behind a silent refresh"
+    );
+    assert_eq!(first_result.unwrap(), "AT-refreshed");
+    assert_eq!(second_result.unwrap(), "AT-refreshed");
+    assert_eq!(
+        token_calls.load(Ordering::SeqCst),
+        1,
+        "concurrent callers performed duplicate refreshes"
+    );
+}
+
+#[test]
+fn happy_path_returns_access_token() {
+    let poll = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let poll = Arc::clone(&poll);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                // Two pending polls then success, proving the loop keeps polling.
+                if poll.fetch_add(1, Ordering::SeqCst) < 2 {
+                    (400, r#"{"error":"authorization_pending"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-999","token_type":"Bearer","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-999");
+    assert!(poll.load(Ordering::SeqCst) >= 3);
+    // Cached: a second call does not poll again.
+    let before = poll.load(Ordering::SeqCst);
+    assert_eq!(auth.token().unwrap(), "AT-999");
+    assert_eq!(poll.load(Ordering::SeqCst), before);
+}
+
+#[test]
+fn mixed_case_bearer_token_type_is_normalized() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-1","token_type":"bEaReR","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-1");
+    assert_eq!(
+        auth.token_set().as_ref().map(TokenSet::token_type),
+        Some("Bearer")
+    );
+}
+
+#[test]
+fn initial_non_bearer_token_type_is_rejected() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-1","token_type":"DPoP","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    let error = auth.sign_in().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(error.message().contains("unsupported token_type \"DPoP\""));
+    assert!(auth.token_set().is_none(), "unsupported token was cached");
+}
+
+#[test]
+fn initial_malformed_token_types_are_rejected() {
+    for invalid in ["\"\"", "null", "123", "{}", "[]"] {
+        let response =
+            format!(r#"{{"access_token":"AT-1","token_type":{invalid},"expires_in":300}}"#);
+        let mock = MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => (200, response.clone()),
+            _ => (404, "{}".to_string()),
+        });
+        let auth = explicit_auth(&mock, false);
+
+        let error = auth.sign_in().unwrap_err();
+        assert_eq!(error.kind(), OidcErrorKind::Config, "token_type={invalid}");
+        assert!(
+            error.message().contains("unsupported token_type"),
+            "token_type={invalid}: {error}"
+        );
+        assert!(
+            auth.token_set().is_none(),
+            "malformed token_type={invalid} was cached"
+        );
+    }
+}
+
+/// A `/device` response carrying an exact, mutation-discriminating device code.
+fn device_response_with_code(device_code: &str) -> String {
+    serde_json::json!({
+        "device_code": device_code,
+        "user_code": "WXYZ-1234",
+        "verification_uri": "https://idp.example.com/activate",
+        "expires_in": 600,
+        "interval": 5
+    })
+    .to_string()
+}
+
+#[test]
+fn reflected_token_type_on_a_successful_grant_does_not_escape() {
+    // A 200 is not a safe response: `token_type` is quoted verbatim into a
+    // public config error, so an IdP/proxy that reflects the submitted device
+    // code there hands the live credential to every caller of `sign_in()`.
+    const DEVICE_CODE: &str = "TT +/% exact credential";
+    const ENCODED_DEVICE_CODE: &str = "TT+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/device") => (200, device_response_with_code(DEVICE_CODE)),
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("device_code={ENCODED_DEVICE_CODE}")),
+                "the mutation-discriminating credential was not submitted: {body}"
+            );
+            (
+                200,
+                serde_json::json!({
+                    "access_token": "AT-1",
+                    "token_type": DEVICE_CODE,
+                    "expires_in": 300
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    let error = auth.sign_in().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(
+        error
+            .message()
+            .contains("unsupported token_type \"[redacted credential]\""),
+        "{error}"
+    );
+    assert!(auth.token_set().is_none(), "unsupported token was cached");
+
+    let public_error: crate::Error = error.into();
+    for surface in [public_error.msg().to_string(), public_error.to_string()] {
+        assert!(!surface.contains(DEVICE_CODE), "raw reflection: {surface}");
+        assert!(
+            !surface.contains(ENCODED_DEVICE_CODE),
+            "encoded reflection: {surface}"
+        );
+    }
+}
+
+#[test]
+fn reflected_container_token_type_is_not_echoed_as_a_document() {
+    // Redaction rewrites string VALUES; a property name cannot be rewritten
+    // (wiped keys would all collide on ""). Serializing a container token_type
+    // would therefore echo a credential reflected as a key, so the error
+    // reports the shape instead of the document.
+    const DEVICE_CODE: &str = "KEY-REFLECTED-DEVICE-CODE";
+
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response_with_code(DEVICE_CODE)),
+        ("POST", "/token") => (
+            200,
+            serde_json::json!({
+                "access_token": "AT-1",
+                "token_type": {DEVICE_CODE: "reflected as a property name"},
+                "expires_in": 300
+            })
+            .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    let error = auth.sign_in().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(
+        error
+            .message()
+            .contains("unsupported token_type \"a JSON object\""),
+        "{error}"
+    );
+    assert!(!error.message().contains(DEVICE_CODE));
+    assert!(!error.to_string().contains(DEVICE_CODE));
+}
+
+#[test]
+fn reflected_scope_on_a_successful_grant_is_not_retained_in_token_metadata() {
+    // `scope` survives the request: it is kept in the public `TokenSet` and
+    // printed by its `Debug`, so a reflected device code would outlive the
+    // sign-in inside ordinary token metadata rather than in an error.
+    const DEVICE_CODE: &str = "SC +/% exact credential";
+    const ENCODED_DEVICE_CODE: &str = "SC+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/device") => (200, device_response_with_code(DEVICE_CODE)),
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("device_code={ENCODED_DEVICE_CODE}")),
+                "the mutation-discriminating credential was not submitted: {body}"
+            );
+            (
+                200,
+                serde_json::json!({
+                    "access_token": "AT-1",
+                    "token_type": "Bearer",
+                    "scope": format!("openid {DEVICE_CODE} {ENCODED_DEVICE_CODE}"),
+                    "expires_in": 300
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-1");
+    let cached = auth.token_set().expect("the grant must be cached");
+    assert_eq!(
+        cached.scope(),
+        Some("openid [redacted credential] [redacted credential]")
+    );
+    for surface in [
+        cached.scope().unwrap_or_default().to_string(),
+        format!("{cached:?}"),
+    ] {
+        assert!(!surface.contains(DEVICE_CODE), "raw reflection: {surface}");
+        assert!(
+            !surface.contains(ENCODED_DEVICE_CODE),
+            "encoded reflection: {surface}"
+        );
+    }
+}
+
+#[test]
+fn reflected_scope_on_a_successful_refresh_keeps_the_issued_credential_intact() {
+    // The refresh counterpart, and the boundary that keeps the redaction safe:
+    // a non-rotating IdP re-sends the SUBMITTED refresh token verbatim, so the
+    // issued-token fields must survive byte-for-byte while the reflected copy
+    // in `scope` is scrubbed.
+    const REFRESH_TOKEN: &str = "RS +/% exact credential";
+    const ENCODED_REFRESH_TOKEN: &str = "RS+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("refresh_token={ENCODED_REFRESH_TOKEN}")),
+                "the mutation-discriminating credential was not submitted: {body}"
+            );
+            (
+                200,
+                serde_json::json!({
+                    "access_token": "AT-2",
+                    "refresh_token": REFRESH_TOKEN,
+                    "token_type": "Bearer",
+                    "scope": format!("openid {REFRESH_TOKEN} {ENCODED_REFRESH_TOKEN}"),
+                    "expires_in": 300
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens(REFRESH_TOKEN));
+
+    assert_eq!(auth.token().unwrap(), "AT-2");
+    let cached = auth.token_set().expect("the refresh must be cached");
+    assert_eq!(
+        cached.refresh_token.as_deref(),
+        Some(REFRESH_TOKEN),
+        "redaction must never rewrite the credential the IdP issued"
+    );
+    assert_eq!(
+        cached.scope(),
+        Some("openid [redacted credential] [redacted credential]")
+    );
+    assert!(!format!("{cached:?}").contains(REFRESH_TOKEN));
+    assert!(!format!("{cached:?}").contains(ENCODED_REFRESH_TOKEN));
+}
+
+#[test]
+fn refreshed_non_bearer_token_type_is_rejected() {
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let token_calls = Arc::clone(&token_calls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/token") => {
+                token_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-2","refresh_token":"RT-2","token_type":"DPoP","expires_in":300}"#.to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+    let error = auth.token().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(error.message().contains("unsupported token_type \"DPoP\""));
+    assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+    let cached = auth
+        .token_set()
+        .expect("the expired parent remains inspectable");
+    assert_eq!(cached.access_token.as_deref(), Some("AT-expired"));
+    assert!(
+        cached.refresh_token.is_none(),
+        "the submitted refresh-token parent remained reusable"
+    );
+}
+
+#[test]
+fn refreshed_malformed_token_types_are_rejected() {
+    for invalid in ["\"\"", "null", "123", "{}", "[]"] {
+        let response = format!(
+            r#"{{"access_token":"AT-2","refresh_token":"RT-2","token_type":{invalid},"expires_in":300}}"#
+        );
+        let mock = MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/token") => (200, response.clone()),
+            _ => (404, "{}".to_string()),
+        });
+        let auth = explicit_auth(&mock, false);
+        *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+        let error = auth.token().unwrap_err();
+        assert_eq!(error.kind(), OidcErrorKind::Config, "token_type={invalid}");
+        assert!(
+            error.message().contains("unsupported token_type"),
+            "token_type={invalid}: {error}"
+        );
+        let cached = auth
+            .token_set()
+            .expect("the expired parent remains inspectable");
+        assert!(
+            cached.refresh_token.is_none(),
+            "malformed token_type={invalid} left the submitted parent reusable"
+        );
+    }
+}
+
+#[test]
+fn groups_mode_selects_id_token() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-1","id_token":"ID-TOKEN-abc","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, true);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "ID-TOKEN-abc");
+}
+
+#[test]
+fn groups_mode_missing_id_token_errors() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        // Grant completes but omits the required id_token.
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-only","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, true);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+}
+
+#[test]
+fn slow_down_then_success() {
+    let poll = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let poll = Arc::clone(&poll);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                if poll.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (400, r#"{"error":"slow_down"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-slow","expires_in":300}"#.to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-slow");
+}
+
+#[test]
+fn slow_down_via_429_still_increases_interval() {
+    // RFC 8628: `slow_down` MUST increase the poll interval — even when the IdP
+    // bundles it into an HTTP 429 with a low Retry-After (1s here), which would
+    // otherwise let the generic 429 backoff undercut the +5s step.
+    let slept: Arc<std::sync::Mutex<Vec<Duration>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let poll = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let poll = Arc::clone(&poll);
+        MockServer::start_with_retry_after(1, move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                if poll.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (429, r#"{"error":"slow_down"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-sd","expires_in":300}"#.to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let recorder = Arc::clone(&slept);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(Arc::new(move |d: Duration| {
+            recorder.lock().unwrap().push(d)
+        }))
+        .build()
+        .expect("build");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-sd");
+    let durations = slept.lock().unwrap();
+    // The first poll is immediate. The only sleep is before the retry and must
+    // use the original 5s interval plus slow_down's mandatory 5s increase,
+    // rather than shrinking toward the 1s Retry-After.
+    assert_eq!(poll.load(Ordering::SeqCst), 2);
+    assert_eq!(durations.as_slice(), &[Duration::from_secs(10)]);
+}
+
+#[test]
+fn authorization_pending_honors_retry_after() {
+    let slept: Arc<std::sync::Mutex<Vec<Duration>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let poll = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let poll = Arc::clone(&poll);
+        MockServer::start_with_retry_after(30, move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                if poll.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (400, r#"{"error":"authorization_pending"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-pending","expires_in":300}"#.to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let recorder = Arc::clone(&slept);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(Arc::new(move |duration| {
+            recorder.lock().unwrap().push(duration)
+        }))
+        .build()
+        .expect("build");
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-pending");
+    assert_eq!(poll.load(Ordering::SeqCst), 2);
+    assert_eq!(slept.lock().unwrap().as_slice(), &[Duration::from_secs(30)]);
+}
+
+#[test]
+fn poll_retries_json_and_non_json_http_408() {
+    for transient_body in [
+        r#"{"error":"request_timeout"}"#,
+        "<html>upstream timed out</html>",
+    ] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let polls = Arc::clone(&polls);
+            let transient_body = transient_body.to_string();
+            MockServer::start_with_retry_after(7, move |method, path, _body| match (method, path) {
+                ("POST", "/device") => (200, device_response()),
+                ("POST", "/token") => {
+                    if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (408, transient_body.clone())
+                    } else {
+                        (
+                            200,
+                            r#"{"access_token":"AT-after-408","expires_in":300}"#.to_string(),
+                        )
+                    }
+                }
+                _ => (404, "{}".to_string()),
+            })
+        };
+        let sleeps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sleep_log = Arc::clone(&sleeps);
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .interactive(true)
+            .open_browser(false)
+            .sleep_hook(Arc::new(move |duration| {
+                sleep_log.lock().unwrap().push(duration)
+            }))
+            .build()
+            .expect("build");
+
+        assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-after-408");
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[Duration::from_secs(7)],
+            "HTTP 408 did not honor Retry-After before polling again"
+        );
+    }
+}
+
+#[test]
+fn device_code_lifetime_preserves_positive_values() {
+    // A positive expires_in is authoritative; a huge one is capped, while a
+    // missing or non-positive value receives the defensive default.
+    assert_eq!(clamp_lifetime(Some(1)), 1);
+    assert_eq!(clamp_lifetime(Some(0)), DEFAULT_DEVICE_CODE_LIFETIME);
+    assert_eq!(clamp_lifetime(None), DEFAULT_DEVICE_CODE_LIFETIME);
+    assert_eq!(clamp_lifetime(Some(600)), 600);
+    assert_eq!(clamp_lifetime(Some(100_000)), MAX_DEVICE_CODE_LIFETIME);
+}
+
+#[test]
+fn poll_interval_is_floored_and_capped() {
+    // A hostile/buggy interval is floored to MIN_POLL_INTERVAL so a 0 or negative
+    // value can't drive a tight poll-flood against the IdP; a sane value is
+    // unchanged.
+    assert_eq!(clamp_interval(-5), MIN_POLL_INTERVAL);
+    assert_eq!(clamp_interval(0), MIN_POLL_INTERVAL);
+    assert_eq!(clamp_interval(1), MIN_POLL_INTERVAL);
+    assert_eq!(clamp_interval(MIN_POLL_INTERVAL as i64), MIN_POLL_INTERVAL);
+    assert_eq!(clamp_interval(30), 30);
+
+    // RFC 8628 3.5: the client waits AT LEAST the advertised interval. An
+    // advertised value above MAX_POLL_INTERVAL used to be truncated to it,
+    // polling five times faster than the IdP asked -- the rate-limit-ban
+    // behaviour `backoff` already refuses for `Retry-After`. Only the
+    // device-code lifetime bounds it now.
+    assert_eq!(clamp_interval(300), 300);
+    assert!(clamp_interval(300) > MAX_POLL_INTERVAL);
+    assert_eq!(clamp_interval(100_000), MAX_DEVICE_CODE_LIFETIME);
+}
+
+#[test]
+fn configured_default_poll_interval_is_clamped_before_narrowing() {
+    assert_eq!(
+        OidcDeviceAuth::builder()
+            .default_interval(0)
+            .default_interval,
+        MIN_POLL_INTERVAL
+    );
+    assert_eq!(
+        OidcDeviceAuth::builder()
+            .default_interval(30)
+            .default_interval,
+        30
+    );
+    assert_eq!(
+        OidcDeviceAuth::builder()
+            .default_interval(u64::MAX)
+            .default_interval,
+        MAX_DEVICE_CODE_LIFETIME,
+        "an unsigned overflow boundary must select the maximum, not wrap to the minimum"
+    );
+}
+
+#[test]
+fn access_denied_is_device_flow_error() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            400,
+            r#"{"error":"access_denied","error_description":"user declined"}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.idp_error(), Some("access_denied"));
+    assert_eq!(err.idp_error_description(), Some("user declined"));
+}
+
+#[test]
+fn reflected_device_code_is_redacted_from_renderer_and_converted_error() {
+    const DEVICE_CODE: &str = "DEV +/% exact credential";
+    const ENCODED_DEVICE_CODE: &str = "DEV+%2B%2F%25+exact+credential";
+
+    struct RecordFailures(Arc<Mutex<Vec<String>>>);
+    impl Renderer for RecordFailures {
+        fn on_failure(&self, message: &str) {
+            self.0.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            serde_json::json!({
+                "device_code": DEVICE_CODE,
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://idp.example.com/activate",
+                "expires_in": 300,
+                "interval": 5
+            })
+            .to_string(),
+        ),
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("device_code={ENCODED_DEVICE_CODE}")),
+                "the mutation-discriminating credential was not submitted as expected: {body}"
+            );
+            (
+                400,
+                serde_json::json!({
+                    "error": DEVICE_CODE,
+                    "error_description": format!(
+                        "safe diagnostic before {ENCODED_DEVICE_CODE} after"
+                    )
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .renderer(RecordFailures(Arc::clone(&failures)))
+        .build()
+        .expect("build auth");
+
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.idp_error(), Some("[redacted credential]"));
+    assert_eq!(
+        err.idp_error_description(),
+        Some("safe diagnostic before [redacted credential] after")
+    );
+    let displayed_error = err.to_string();
+    for rendered in [err.message(), displayed_error.as_str()] {
+        assert!(
+            !rendered.contains(DEVICE_CODE),
+            "raw reflection: {rendered}"
+        );
+        assert!(
+            !rendered.contains(ENCODED_DEVICE_CODE),
+            "encoded reflection: {rendered}"
+        );
+    }
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("safe diagnostic before"));
+    assert!(!failures[0].contains(DEVICE_CODE));
+    assert!(!failures[0].contains(ENCODED_DEVICE_CODE));
+    drop(failures);
+
+    // `questdb_error_oidc_get_view` reads these same structured fields, so the
+    // converted crate error pins both transport use and the eventual FFI view.
+    let public_error: crate::Error = err.into();
+    assert!(!public_error.msg().contains(DEVICE_CODE));
+    assert!(!public_error.msg().contains(ENCODED_DEVICE_CODE));
+    assert!(!public_error.to_string().contains(DEVICE_CODE));
+    assert!(!public_error.to_string().contains(ENCODED_DEVICE_CODE));
+    let structured = public_error.oidc_error().unwrap();
+    assert_eq!(structured.idp_error(), Some("[redacted credential]"));
+    assert_eq!(
+        structured.idp_error_description(),
+        Some("safe diagnostic before [redacted credential] after")
+    );
+}
+
+#[test]
+fn empty_error_description_keeps_error_code() {
+    // An empty error_description must not erase the error code from the message or
+    // the structured fields (it previously shadowed both, yielding "failed: ").
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            400,
+            r#"{"error":"access_denied","error_description":""}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.idp_error(), Some("access_denied"));
+    // The empty description is normalized to absent, not surfaced as Some("").
+    assert_eq!(err.idp_error_description(), None);
+    // The code survives in both the message and the Display output.
+    assert!(
+        err.message().contains("access_denied"),
+        "message: {}",
+        err.message()
+    );
+    assert!(format!("{err}").contains("access_denied"), "display: {err}");
+}
+
+#[test]
+fn control_chars_in_token_are_rejected() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        // A token carrying a control byte (header-injection vector) is dropped,
+        // so the grant is treated as missing the required token.
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"bad\ntoken","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+}
+
+#[test]
+fn empty_endpoint_overrides_are_rejected_like_the_other_four() {
+    // An empty override still counts as EXPLICIT, so it suppresses both the
+    // `/settings` value and the IdP discovery fallback for that endpoint and
+    // then fails far away with a message about unsafe authority characters.
+    // All six string overrides now fail the same way, as the Python binding
+    // already made them.
+    for (label, builder) in [
+        (
+            "token endpoint",
+            OidcDeviceAuth::from_questdb("https://q.example.com:9000").token_endpoint(""),
+        ),
+        (
+            "device-authorization endpoint",
+            OidcDeviceAuth::from_questdb("https://q.example.com:9000")
+                .device_authorization_endpoint(""),
+        ),
+    ] {
+        let err = builder.build().unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Config, "{label}");
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "{label}: expected the empty-override message, got {err}"
+        );
+    }
+}
+
+#[test]
+fn silent_refresh_without_reprompt() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => {
+                if body.contains("grant_type=refresh_token") {
+                    (
+                        200,
+                        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string(),
+                    )
+                } else {
+                    // Initial sign-in yields a refresh token.
+                    (
+                        200,
+                        r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+
+    // Force the cached token to look expired, so the next call must refresh.
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    assert_eq!(auth.token().unwrap(), "AT-refreshed");
+    // No second device-authorization request: the refresh was silent.
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    // The refresh response omitted a refresh_token, so the original RT-1 must be
+    // carried forward (not dropped) — otherwise the next refresh couldn't run.
+    assert_eq!(
+        auth.tokens
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .refresh_token
+            .as_deref(),
+        Some("RT-1")
+    );
+}
+
+#[test]
+fn refresh_request_omits_scope_after_narrower_grant() {
+    let refresh_body = Arc::new(Mutex::new(None));
+    let mock = {
+        let refresh_body = Arc::clone(&refresh_body);
+        MockServer::start(move |method, path, body| {
+            match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                *refresh_body.lock().unwrap() = Some(body.to_string());
+                if body.split('&').any(|field| field.starts_with("scope=")) {
+                    (
+                        400,
+                        r#"{"error":"invalid_scope","error_description":"refresh scope exceeds the original grant"}"#
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string(),
+                    )
+                }
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300,"scope":"openid offline_access"}"#
+                    .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        }
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid profile offline_access")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("build auth");
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    assert_eq!(
+        auth.tokens
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .scope
+            .as_deref(),
+        Some("openid offline_access"),
+        "the IdP's narrower granted scope must be recorded"
+    );
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    assert_eq!(auth.token().unwrap(), "AT-refreshed");
+
+    let body = refresh_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("refresh request was captured");
+    let fields: Vec<&str> = body.split('&').collect();
+    assert!(fields.contains(&"grant_type=refresh_token"));
+    assert!(fields.contains(&"refresh_token=RT-1"));
+    assert!(fields.contains(&"client_id=questdb"));
+    assert!(
+        !fields.iter().any(|field| field.starts_with("scope=")),
+        "refresh must omit scope so the original grant is preserved; body={body}"
+    );
+}
+
+#[test]
+fn groups_mode_refresh_omits_scope_and_keeps_original_grant() {
+    let refresh_body = Arc::new(Mutex::new(None));
+    let mock = {
+        let refresh_body = Arc::clone(&refresh_body);
+        MockServer::start(move |method, path, body| {
+            match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                *refresh_body.lock().unwrap() = Some(body.to_string());
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","id_token":"ID-refreshed","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-1","id_token":"ID-1","refresh_token":"RT-1","expires_in":300}"#
+                    .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        }
+        })
+    };
+    let auth = explicit_auth(&mock, true);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "ID-1");
+
+    // Force a refresh. An omitted scope preserves the original `openid` grant,
+    // so the IdP re-issues an id_token without an interactive re-prompt.
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    assert_eq!(auth.token().unwrap(), "ID-refreshed");
+
+    let body = refresh_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("refresh request was captured");
+    let fields: Vec<&str> = body.split('&').collect();
+    assert!(fields.contains(&"grant_type=refresh_token"));
+    assert!(
+        !fields.iter().any(|field| field.starts_with("scope=")),
+        "groups-mode refresh must omit scope and preserve the original grant; body={body}"
+    );
+}
+
+#[test]
+fn groups_mode_preserves_scope_and_loads_java_store_entry() {
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let dir = TempDir::new().unwrap();
+    let configured_scope = "profile offline_access";
+    let java_key = TokenStoreKey::from_config(
+        "questdb",
+        &mock.url("/token"),
+        &mock.url("/device"),
+        configured_scope,
+        None,
+        true,
+        None,
+    );
+    test_file_store(dir.path())
+        .save(
+            &java_key,
+            &PersistedToken::new(
+                None,
+                Some("ID-from-Java".to_string()),
+                Some("RT-from-Java".to_string()),
+                now_epoch() + 300.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope(configured_scope)
+        .groups_in_token(true)
+        .interactive(true)
+        .open_browser(false)
+        .token_store(test_file_store(dir.path()))
+        .build()
+        .unwrap();
+
+    assert_eq!(auth.config().scope, configured_scope);
+    assert_eq!(
+        auth.store_key.as_ref().unwrap().hash(),
+        java_key.hash(),
+        "groups mode changed the Java-compatible persisted identity"
+    );
+    assert_eq!(auth.token().unwrap(), "ID-from-Java");
+}
+
+#[test]
+fn empty_optional_overrides_are_rejected() {
+    let cases = [
+        (
+            "scope",
+            OidcDeviceAuth::builder()
+                .client_id("questdb")
+                .device_authorization_endpoint("https://idp.example.com/device")
+                .token_endpoint("https://idp.example.com/token")
+                .scope("")
+                .build(),
+        ),
+        (
+            "audience",
+            OidcDeviceAuth::builder()
+                .client_id("questdb")
+                .device_authorization_endpoint("https://idp.example.com/device")
+                .token_endpoint("https://idp.example.com/token")
+                .audience("")
+                .build(),
+        ),
+        (
+            "issuer",
+            OidcDeviceAuth::builder()
+                .client_id("questdb")
+                .device_authorization_endpoint("https://idp.example.com/device")
+                .token_endpoint("https://idp.example.com/token")
+                .issuer("")
+                .build(),
+        ),
+    ];
+
+    for (name, result) in cases {
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), OidcErrorKind::Config);
+        assert!(
+            error.message().contains(name) && error.message().contains("must not be empty"),
+            "unexpected {name} error: {error}"
+        );
+    }
+}
+
+#[test]
+fn empty_discovery_override_is_rejected_before_network_io() {
+    let error = OidcDeviceAuth::from_questdb("http://127.0.0.1:1")
+        .scope("")
+        .build()
+        .unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(error.message().contains("scope must not be empty"));
+}
+
+#[test]
+fn non_interactive_context_refuses() {
+    let mock = MockServer::start(|_m, _p, _b| (404, "{}".to_string()));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .build()
+        .unwrap();
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+}
+
+#[test]
+fn sign_in_is_interactive_unless_told_otherwise() {
+    // The default used to be `stderr().is_terminal()`, so this whole suite --
+    // and every caller piping stderr, or watched by a human through a
+    // supervisor or IDE -- was refused before a device code was requested. A
+    // missing TTY is not evidence of a missing human; `sign_in()` is an
+    // explicit interactive call, so it runs, matching the Java client.
+    // Reaching the device request (a 404 here) is the proof: the refusal
+    // happens strictly before it.
+    let requested = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let requested = Arc::clone(&requested);
+        MockServer::start(move |_m, path, _b| {
+            if path == "/device" {
+                requested.fetch_add(1, Ordering::SeqCst);
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .build()
+        .unwrap();
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(
+        requested.load(Ordering::SeqCst),
+        1,
+        "the device flow was refused instead of started"
+    );
+    assert_ne!(err.kind(), OidcErrorKind::InteractionRequired);
+}
+
+#[test]
+fn explicit_empty_client_id_is_rejected_during_build() {
+    let err = OidcDeviceAuth::builder()
+        .client_id("")
+        .device_authorization_endpoint("https://idp.example.com/device")
+        .token_endpoint("https://idp.example.com/token")
+        .build()
+        .unwrap_err();
+
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(err.message().contains("client_id must not be empty"));
+}
+
+#[test]
+fn discovery_from_questdb_settings() {
+    // One mock plays both QuestDB (/settings) and the IdP (/device, /token).
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (
+            200,
+            serde_json::json!({
+                "config": {
+                    "acl.oidc.enabled": true,
+                    "acl.oidc.client.id": "discovered-client",
+                    "acl.oidc.scope": "openid",
+                    "acl.oidc.groups.encoded.in.token": false
+                }
+            })
+            .to_string(),
+        ),
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-discovered","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    // client id comes from /settings; endpoints passed explicitly (the server
+    // does not advertise absolute IdP URLs in this unit test).
+    let auth = OidcDeviceAuth::from_questdb(mock.url(""))
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .allow_insecure_transport(true)
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("discovery build");
+    assert_eq!(auth.config().client_id, "discovered-client");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-discovered");
+}
+
+#[test]
+fn oidc_disabled_on_server_errors() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (
+            200,
+            serde_json::json!({"config": {"acl.oidc.enabled": false}}).to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+}
+
+// -- endpoint-pinning rejection paths (settings-supplied endpoints) ----------
+
+/// A `/settings` response advertising the given credential endpoints.
+fn settings_advertising(token_ep: &str, device_ep: &str) -> String {
+    serde_json::json!({
+        "config": {
+            "acl.oidc.enabled": true,
+            "acl.oidc.client.id": "questdb",
+            "acl.oidc.scope": "openid",
+            "acl.oidc.token.endpoint": token_ep,
+            "acl.oidc.device.authorization.endpoint": device_ep,
+        }
+    })
+    .to_string()
+}
+
+/// A mock that serves `/settings` from `settings(base)` and, under
+/// `{base}{issuer_path}`, an IdP discovery document that is reachable but does
+/// NOT confirm the advertised endpoints. Keeps the pin tests offline and makes
+/// the rejection come from the pin itself rather than an unreachable IdP.
+fn non_confirming_idp_mock(
+    issuer_path: &'static str,
+    settings: impl Fn(&str) -> String + Send + Sync + 'static,
+) -> (MockServer, String) {
+    let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+    let well_known = format!("{issuer_path}/.well-known/openid-configuration");
+    let mock = {
+        let base = Arc::clone(&base);
+        MockServer::start(move |method, path, _body| {
+            let b = base.get().cloned().unwrap_or_default();
+            if method == "GET" && path == "/settings" {
+                (200, settings(&b))
+            } else if method == "GET" && path == well_known {
+                let iss = format!("{b}{issuer_path}");
+                (
+                    200,
+                    serde_json::json!({
+                        "issuer": iss,
+                        "token_endpoint": format!("{iss}/token"),
+                        "device_authorization_endpoint": format!("{iss}/device"),
+                    })
+                    .to_string(),
+                )
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+    };
+    base.set(mock.url("")).unwrap();
+    let issuer = format!("{}{issuer_path}", mock.url(""));
+    (mock, issuer)
+}
+
+#[test]
+fn settings_endpoint_off_issuer_origin_rejected() {
+    // A tampered / misconfigured /settings advertises credential endpoints on an
+    // origin other than the pinned issuer — must be refused before any POST.
+    let (mock, issuer) = non_confirming_idp_mock("", |_| {
+        settings_advertising(
+            "https://evil.example.com/token",
+            "https://evil.example.com/device",
+        )
+    });
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(issuer)
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    // Pin the cause to the origin check, not some earlier Config error.
+    assert!(
+        err.message().contains("pinned issuer origin"),
+        "expected origin-pin rejection, got: {}",
+        err.message()
+    );
+}
+
+/// Entra-style layout on the mock: issuer `{base}/tid/v2.0`, endpoints under
+/// `{base}/tid/oauth2/v2.0/`, both advertised by /settings. The pin accepts them
+/// only once the IdP discovery document confirms them.
+fn entra_layout_mock(well_known: fn(&str) -> (u16, String)) -> (MockServer, String) {
+    let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+    let mock = {
+        let base = Arc::clone(&base);
+        MockServer::start(move |method, path, _body| {
+            let b = base.get().cloned().unwrap_or_default();
+            match (method, path) {
+                ("GET", "/settings") => (
+                    200,
+                    settings_advertising(
+                        &format!("{b}/tid/oauth2/v2.0/token"),
+                        &format!("{b}/tid/oauth2/v2.0/devicecode"),
+                    ),
+                ),
+                ("GET", "/tid/v2.0/.well-known/openid-configuration") => well_known(&b),
+                _ => (404, "{}".to_string()),
+            }
+        })
+    };
+    base.set(mock.url("")).unwrap();
+    let issuer = format!("{}/tid/v2.0", mock.url(""));
+    (mock, issuer)
+}
+
+#[test]
+fn off_issuer_path_endpoints_confirmed_by_the_idp_build() {
+    let (mock, issuer) = entra_layout_mock(|b| {
+        (
+            200,
+            serde_json::json!({
+                "issuer": format!("{b}/tid/v2.0"),
+                "token_endpoint": format!("{b}/tid/oauth2/v2.0/token"),
+                "device_authorization_endpoint": format!("{b}/tid/oauth2/v2.0/devicecode"),
+            })
+            .to_string(),
+        )
+    });
+    OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(issuer)
+        .allow_insecure_transport(true)
+        .build()
+        .expect("IdP-confirmed endpoints must build");
+}
+
+#[test]
+fn transient_confirmation_failure_is_retryable_not_config() {
+    // The IdP is briefly unavailable (503). The pin cannot be confirmed, but the
+    // configuration is valid: the build must fail with a retryable Network
+    // error carrying the IdP status, not a terminal "reconfigure" Config error.
+    let (mock, issuer) = entra_layout_mock(|_| (503, "{}".to_string()));
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(issuer)
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network, "{}", err.message());
+    assert_eq!(err.status(), Some(503));
+    assert!(
+        err.message().contains("Could not confirm"),
+        "unexpected message: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn definitive_confirmation_failure_keeps_the_pin_rejection() {
+    // A 404 is a definitive answer, not a blip: the pin rejection stands.
+    let (mock, issuer) = entra_layout_mock(|_| (404, "{}".to_string()));
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(issuer)
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(err.message().contains("not under the pinned issuer"));
+}
+
+#[test]
+fn settings_endpoint_sibling_tenant_path_rejected() {
+    // Same origin as the issuer, but a sibling tenant path (/realms/production
+    // vs the pinned /realms/prod) — the path pin must reject it.
+    let (mock, issuer) = non_confirming_idp_mock("/realms/prod", |b| {
+        settings_advertising(
+            &format!("{b}/realms/production/token"),
+            &format!("{b}/realms/production/device"),
+        )
+    });
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(issuer)
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    // Origin matches, so the rejection must come from the path pin specifically.
+    assert!(
+        err.message().contains("different tenant"),
+        "expected path-pin rejection, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn settings_endpoint_semicolon_tenant_path_rejected() {
+    for suffix in [";tenant=evil", "%3Btenant=evil"] {
+        let (mock, issuer) = non_confirming_idp_mock("/realms/prod", move |b| {
+            settings_advertising(
+                &format!("{b}/realms/prod{suffix}/token"),
+                &format!("{b}/realms/prod{suffix}/device"),
+            )
+        });
+        let err = OidcDeviceAuth::from_questdb(mock.url(""))
+            .issuer(issuer)
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Config);
+        assert!(
+            err.message().contains("different tenant"),
+            "expected {suffix:?} path-pin rejection, got: {}",
+            err.message()
+        );
+    }
+}
+
+// -- IdP .well-known discovery + plaintext-channel guard ---------------------
+
+/// A `/settings` response advertising only the client id (no endpoints), so the
+/// credential endpoints must come from IdP discovery.
+fn settings_client_only() -> String {
+    serde_json::json!({
+        "config": {"acl.oidc.enabled": true, "acl.oidc.client.id": "questdb"}
+    })
+    .to_string()
+}
+
+#[test]
+fn idp_discovery_supplies_endpoints() {
+    // /settings advertises no endpoints, so they are discovered from the IdP's
+    // .well-known document (fetched from the pinned issuer). The doc's declared
+    // issuer matches the pin, so its endpoints are trusted and used.
+    let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+    let mock = {
+        let base = Arc::clone(&base);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/settings") => (200, settings_client_only()),
+            ("GET", "/.well-known/openid-configuration") => {
+                let b = base.get().cloned().unwrap_or_default();
+                (
+                    200,
+                    serde_json::json!({
+                        "issuer": b,
+                        "token_endpoint": format!("{b}/token"),
+                        "device_authorization_endpoint": format!("{b}/device"),
+                    })
+                    .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    base.set(mock.url("")).unwrap();
+    let auth = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(mock.url(""))
+        .allow_insecure_transport(true)
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("IdP discovery should supply the endpoints");
+    assert_eq!(auth.config().token_endpoint, mock.url("/token"));
+    assert_eq!(
+        auth.config().device_authorization_endpoint,
+        mock.url("/device")
+    );
+}
+
+#[test]
+fn idp_discovery_issuer_mismatch_rejected() {
+    // The .well-known doc declares an issuer other than the pinned one (RFC 8414
+    // violation / wrong tenant); its endpoints must be refused, not trusted.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (200, settings_client_only()),
+        ("GET", "/.well-known/openid-configuration") => (
+            200,
+            serde_json::json!({
+                "issuer": "https://wrong.example.com",
+                "token_endpoint": "https://wrong.example.com/token",
+                "device_authorization_endpoint": "https://wrong.example.com/device",
+            })
+            .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(mock.url(""))
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(
+        err.message().contains("does not match the pinned issuer"),
+        "expected issuer-mismatch rejection, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn idp_discovery_issuer_trailing_slash_mismatch_rejected() {
+    for document_has_slash in [false, true] {
+        let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+        let mock = {
+            let base = Arc::clone(&base);
+            MockServer::start(move |method, path, _body| match (method, path) {
+                ("GET", "/settings") => (200, settings_client_only()),
+                ("GET", "/.well-known/openid-configuration") => {
+                    let b = base.get().cloned().unwrap_or_default();
+                    let declared = if document_has_slash {
+                        format!("{b}/")
+                    } else {
+                        b.clone()
+                    };
+                    (
+                        200,
+                        serde_json::json!({
+                            "issuer": declared,
+                            "token_endpoint": format!("{b}/token"),
+                            "device_authorization_endpoint": format!("{b}/device"),
+                        })
+                        .to_string(),
+                    )
+                }
+                _ => (404, "{}".to_string()),
+            })
+        };
+        base.set(mock.url("")).unwrap();
+        let pinned = if document_has_slash {
+            mock.url("")
+        } else {
+            format!("{}/", mock.url(""))
+        };
+        let err = OidcDeviceAuth::from_questdb(mock.url(""))
+            .issuer(pinned)
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Config);
+        assert!(err.message().contains("does not match the pinned issuer"));
+    }
+}
+
+#[test]
+fn idp_discovery_missing_device_endpoint_rejected() {
+    // The discovery doc declares a matching issuer + token endpoint but omits
+    // device_authorization_endpoint (the IdP does not support the device grant) —
+    // resolution must fail with a clear error, not return a half-built config.
+    let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+    let mock = {
+        let base = Arc::clone(&base);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/settings") => (200, settings_client_only()),
+            ("GET", "/.well-known/openid-configuration") => {
+                let b = base.get().cloned().unwrap_or_default();
+                (
+                    200,
+                    serde_json::json!({
+                        "issuer": b,
+                        "token_endpoint": format!("{b}/token"),
+                    })
+                    .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    base.set(mock.url("")).unwrap();
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(mock.url(""))
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(
+        err.message().contains("device_authorization_endpoint"),
+        "expected missing-device-endpoint rejection, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn idp_discovery_without_doc_issuer_rejected() {
+    // A .well-known doc that declares no issuer (RFC 8414 requires one) must fail
+    // closed, not have its endpoints trusted just because the fetch was over TLS.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (200, settings_client_only()),
+        ("GET", "/.well-known/openid-configuration") => (
+            200,
+            serde_json::json!({
+                "token_endpoint": "https://idp.example.com/token",
+                "device_authorization_endpoint": "https://idp.example.com/device",
+            })
+            .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(mock.url(""))
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(
+        err.message().contains("declares no"),
+        "expected no-issuer rejection, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn discovery_without_issuer_pin_rejected() {
+    // /settings advertises no endpoints and no issuer is pinned, so discovery
+    // can't proceed safely — a tampered /settings could otherwise name any IdP.
+    // Must refuse up front, pointing the user at issuer(...).
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (200, settings_client_only()),
+        _ => (404, "{}".to_string()),
+    });
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(
+        err.message().contains("not pinned"),
+        "expected 'issuer not pinned' rejection, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn loopback_plaintext_settings_endpoints_allowed() {
+    // The plaintext-/settings guard (which demands an issuer pin when a tampered
+    // channel could redirect credentials) is waived over a LOOPBACK http channel:
+    // there is no in-transit MITM to worry about locally. So settings-advertised
+    // endpoints with no issuer pin are accepted here — exercising the guard's
+    // reachable (loopback) branch end-to-end.
+    //
+    // The non-loopback *trigger* of that guard is covered by
+    // `plaintext_non_loopback_settings_channel_flagged` in discovery.rs: the guard
+    // sits after a successful /settings fetch, so an in-process test can't have a
+    // host that is both plaintext-rejected there and reachable — the mock is
+    // always loopback.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (
+            200,
+            settings_advertising(
+                "https://idp.example.com/token",
+                "https://idp.example.com/device",
+            ),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = OidcDeviceAuth::from_questdb(mock.url(""))
+        .allow_insecure_transport(true)
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("loopback plaintext settings endpoints should be allowed");
+    assert_eq!(
+        auth.config().token_endpoint,
+        "https://idp.example.com/token"
+    );
+}
+
+#[test]
+fn allow_insecure_does_not_relax_idp_endpoints() {
+    // allow_insecure_transport relaxes only the QuestDB /settings channel; a
+    // plaintext non-loopback IdP endpoint is still refused when the flow POSTs to
+    // it. build() succeeds (co-located, well-formed); the scheme is enforced at
+    // flow time by require_secure, before any network I/O.
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("http://idp.example.com/device")
+        .token_endpoint("http://idp.example.com/token")
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .allow_insecure_transport(true)
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("build succeeds; scheme is enforced at flow time");
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    // Pin the cause to the transport-security check on the IdP endpoint.
+    assert!(
+        err.message().contains("insecure URL"),
+        "expected require_secure rejection, got: {}",
+        err.message()
+    );
+}
+
+// -- refresh branches --------------------------------------------------------
+
+#[test]
+fn refresh_transient_error_discards_ambiguous_parent() {
+    // A 5xx can be synthesized by an intermediary after the IdP consumed the
+    // rotating parent. Surface a Network error, discard the ambiguous parent,
+    // and require a fresh explicit sign-in on the next lookup.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => {
+                if body.contains("grant_type=refresh_token") {
+                    refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    (503, r#"{"error":"temporarily_unavailable"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    // Force the cached token to look expired so the next call must refresh.
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(err.status(), Some(503));
+    assert!(err.message().contains("refresh token was discarded"));
+    assert!(err.message().contains("Sign in again"));
+    assert_eq!(auth.token_set().unwrap().refresh_token, None);
+    let next = auth.token().unwrap_err();
+    assert_eq!(next.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn refresh_transient_responses_preserve_structured_metadata() {
+    let cases = [
+        (
+            408,
+            r#"{"error":"temporarily_unavailable","error_description":"request timed out"}"#,
+            Some("temporarily_unavailable"),
+            Some("request timed out"),
+        ),
+        (408, "<html>request timed out</html>", None, None),
+        (
+            503,
+            r#"{"error":"temporarily_unavailable","error_description":"service overloaded"}"#,
+            Some("temporarily_unavailable"),
+            Some("service overloaded"),
+        ),
+        (503, "<html>service unavailable</html>", None, None),
+    ];
+
+    for (status, response_body, expected_error, expected_description) in cases {
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let device_calls = Arc::clone(&device_calls);
+            let refresh_calls = Arc::clone(&refresh_calls);
+            let response_body = response_body.to_string();
+            MockServer::start_with_retry_after(11, move |method, path, body| match (method, path) {
+                ("POST", "/device") => {
+                    device_calls.fetch_add(1, Ordering::SeqCst);
+                    (200, device_response())
+                }
+                ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                    refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    (status, response_body.clone())
+                }
+                ("POST", "/token") => (
+                    200,
+                    r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#
+                        .to_string(),
+                ),
+                _ => (404, "{}".to_string()),
+            })
+        };
+        let auth = explicit_auth(&mock, false);
+        assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+        auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+
+        let err = auth.token().unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Network);
+        assert_eq!(err.status(), Some(status));
+        assert_eq!(err.retry_after_secs(), Some(11));
+        assert_eq!(err.idp_error(), expected_error);
+        assert_eq!(err.idp_error_description(), expected_description);
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(auth.token_set().unwrap().refresh_token, None);
+        assert_eq!(
+            device_calls.load(Ordering::SeqCst),
+            1,
+            "a transient refresh response started another device flow"
+        );
+
+        // The crate-wide error retained by Rust transports and exposed through
+        // the C error view must carry the same OIDC details.
+        let public_error: crate::Error = err.into();
+        let preserved = public_error.oidc_error().unwrap();
+        assert_eq!(preserved.status(), Some(status));
+        assert_eq!(preserved.retry_after_secs(), Some(11));
+        assert_eq!(preserved.idp_error(), expected_error);
+        assert_eq!(preserved.idp_error_description(), expected_description);
+    }
+}
+
+#[test]
+fn transient_refresh_reflection_is_redacted_from_converted_error() {
+    const REFRESH_TOKEN: &str = "RT +/% exact credential";
+    const ENCODED_REFRESH_TOKEN: &str = "RT+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start_with_retry_after(11, |method, path, body| match (method, path) {
+        ("POST", "/token") => {
+            assert!(
+                body.contains(&format!("refresh_token={ENCODED_REFRESH_TOKEN}")),
+                "the mutation-discriminating credential was not submitted as expected: {body}"
+            );
+            (
+                503,
+                serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": format!(
+                        "safe transient diagnostic: {REFRESH_TOKEN}; wire={ENCODED_REFRESH_TOKEN}"
+                    )
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens(REFRESH_TOKEN));
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(err.status(), Some(503));
+    assert_eq!(err.retry_after_secs(), Some(11));
+    assert_eq!(err.idp_error(), Some("temporarily_unavailable"));
+    assert_eq!(
+        err.idp_error_description(),
+        Some("safe transient diagnostic: [redacted credential]; wire=[redacted credential]")
+    );
+    assert!(!err.message().contains(REFRESH_TOKEN));
+    assert!(!err.to_string().contains(REFRESH_TOKEN));
+    assert!(!err.to_string().contains(ENCODED_REFRESH_TOKEN));
+
+    let public_error: crate::Error = err.into();
+    assert!(!public_error.msg().contains(REFRESH_TOKEN));
+    assert!(!public_error.msg().contains(ENCODED_REFRESH_TOKEN));
+    assert!(!public_error.to_string().contains(REFRESH_TOKEN));
+    assert!(!public_error.to_string().contains(ENCODED_REFRESH_TOKEN));
+    let structured = public_error.oidc_error().unwrap();
+    assert_eq!(structured.idp_error(), Some("temporarily_unavailable"));
+    assert_eq!(
+        structured.idp_error_description(),
+        Some("safe transient diagnostic: [redacted credential]; wire=[redacted credential]")
+    );
+}
+
+#[test]
+fn refresh_rejected_requires_explicit_device_flow() {
+    // A 4xx (revoked / expired refresh token) is terminal. A token-provider call
+    // must report that interaction is required without starting a device flow;
+    // only the subsequent explicit sign_in() may prompt.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => {
+                if body.contains("grant_type=refresh_token") {
+                    (400, r#"{"error":"invalid_grant"}"#.to_string())
+                } else {
+                    // Tag each fresh sign-in by the device-call count so the test
+                    // can prove a second sign-in actually happened.
+                    let n = device_calls.load(Ordering::SeqCst);
+                    (
+                        200,
+                        format!(
+                            r#"{{"access_token":"AT-{n}","refresh_token":"RT-{n}","expires_in":300}}"#
+                        ),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-1");
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    auth.sign_in().unwrap();
+    assert_eq!(auth.token().unwrap(), "AT-2");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn groups_mode_refresh_without_id_token_requires_explicit_sign_in() {
+    // In groups mode a refresh that returns 200 but omits the id_token does not
+    // satisfy the requirement. The provider reports InteractionRequired without
+    // prompting, and a later explicit sign_in() starts the fresh device flow.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => {
+                if body.contains("grant_type=refresh_token") {
+                    (
+                        200,
+                        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-1","id_token":"ID-1","refresh_token":"RT-1","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, true);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "ID-1");
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    auth.sign_in().unwrap();
+    assert_eq!(auth.token().unwrap(), "ID-1");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn groups_mode_refresh_returning_an_expired_id_token_requires_explicit_sign_in() {
+    // Twin of `groups_mode_refresh_without_id_token_requires_explicit_sign_in`
+    // for the IdP that re-returns the ORIGINAL id_token instead of omitting it.
+    // The set then HAS the required kind and is already expired, so gating the
+    // accept arm on `has_required_token` admitted it: the refresh backoff was
+    // reset, a dead token was cached and served, and because `is_usable` still
+    // rejected it on the read path every later `token()` ran the whole
+    // coordinated refresh again -- one IdP round-trip and one refresh-token
+    // rotation per call, with the caller handed an expired token and a 401
+    // rather than InteractionRequired.
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let stale_id = jwt_with_exp(1);
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        let device_calls = Arc::clone(&device_calls);
+        let stale_id = stale_id.clone();
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => {
+                if body.contains("grant_type=refresh_token") {
+                    let n = refresh_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    (
+                        200,
+                        format!(
+                            r#"{{"access_token":"AT-{n}","id_token":"{stale_id}","refresh_token":"RT-{n}","expires_in":3600}}"#
+                        ),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-1","id_token":"ID-1","refresh_token":"RT-1","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, true);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "ID-1");
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+
+    // The expired id_token must never be served, and the refresh must not be
+    // re-armed by accepting it.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+
+    // The backoff the accept arm used to clear now holds, so repeated calls do
+    // not burn a refresh-token rotation each. They report the same
+    // "temporarily backed off" Network error the missing-kind case produces.
+    for _ in 0..4 {
+        assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Network);
+    }
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        1,
+        "each token() burned another refresh-token rotation"
+    );
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+
+    // The rotated refresh token is still carried, so an explicit sign_in()
+    // recovers through a fresh device flow.
+    auth.sign_in().unwrap();
+    assert_eq!(auth.token().unwrap(), "ID-1");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 2);
+}
+
+/// Build an auth with explicit dummy endpoints — no server is contacted, enough
+/// to exercise the pure `tokenset_from_response` mapping.
+fn offline_auth() -> OidcDeviceAuth {
+    OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("https://idp.example.com/device")
+        .token_endpoint("https://idp.example.com/token")
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("build auth")
+}
+
+#[test]
+fn lifetime_cap_bounds_refreshable_and_opaque_tokens() {
+    // `expires_at` and `issued_at` are stamped from the same `now`, so their
+    // difference is exactly the (capped or uncapped) lifetime — no clock race.
+    let auth = offline_auth();
+    let long: i64 = 24 * 3600; // a 24h IdP TTL, far over the 1h cap
+
+    // No refresh token and an opaque access token: cap the believed lifetime so a
+    // hostile or stale `expires_in` cannot wedge the client indefinitely.
+    let ts = auth
+        .tokenset_from_response(
+            &serde_json::json!({
+                "access_token": "AT",
+                "expires_in": long,
+            }),
+            None,
+        )
+        .unwrap();
+    assert!(ts.refresh_token.is_none());
+    assert!(
+        (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
+        "opaque token without refresh: lifetime must be capped (got {}s)",
+        ts.expires_at - ts.issued_at
+    );
+
+    // With a refresh token in the response: the cap fires, so a silent refresh
+    // re-checks at least hourly (bounding a leaked long-lived access token).
+    let ts = auth
+        .tokenset_from_response(
+            &serde_json::json!({
+                "access_token": "AT",
+                "refresh_token": "RT",
+                "expires_in": long,
+            }),
+            None,
+        )
+        .unwrap();
+    assert!(ts.refresh_token.is_some());
+    assert!(
+        (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
+        "with refresh token: lifetime must be capped to MAX_EXPIRES_IN (got {}s)",
+        ts.expires_at - ts.issued_at
+    );
+
+    // Regression (M1): a refresh from a non-rotating IdP omits refresh_token, but
+    // the prior one is carried forward — the effective token can rotate, so the
+    // cap MUST still fire. Previously the cap keyed off the response body alone,
+    // leaving the carried-forward case uncapped for the sender's whole lifetime.
+    let ts = auth
+        .tokenset_from_response(
+            &serde_json::json!({
+                "access_token": "AT",
+                "expires_in": long,
+            }),
+            Some("carried-RT"),
+        )
+        .unwrap();
+    assert_eq!(ts.refresh_token.as_deref(), Some("carried-RT"));
+    assert!(
+        (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
+        "carried-forward refresh token: lifetime must be capped (got {}s)",
+        ts.expires_at - ts.issued_at
+    );
+}
+
+// -- poll-loop error branches ------------------------------------------------
+
+/// A device-authorization response with a one-second lifetime and a longer poll
+/// interval, so a single clipped virtual sleep reaches the deadline.
+fn device_response_short() -> String {
+    serde_json::json!({
+        "device_code": "DEV-CODE-123",
+        "user_code": "WXYZ-1234",
+        "verification_uri": "https://idp.example.com/activate",
+        "expires_in": 1,
+        "interval": 60
+    })
+    .to_string()
+}
+
+#[test]
+fn expired_token_error_returns_timeout() {
+    // The IdP reports the code expired via the OAuth error body → Timeout kind,
+    // while the response's structured diagnostics remain available to bindings.
+    let mock = MockServer::start(|method, path, _body| {
+        match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            400,
+            r#"{"error":"expired_token","error_description":"The device code is no longer valid."}"#
+                .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    }
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    assert_eq!(
+        err.idp_error_description(),
+        Some("The device code is no longer valid.")
+    );
+    assert_eq!(err.status(), Some(400));
+}
+
+#[test]
+fn expired_token_reflection_does_not_escape_in_structured_error() {
+    const DEVICE_CODE: &str = "EXP +/% exact credential";
+    const ENCODED_DEVICE_CODE: &str = "EXP+%2B%2F%25+exact+credential";
+
+    let mock = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            serde_json::json!({
+                "device_code": DEVICE_CODE,
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://idp.example.com/activate",
+                "expires_in": 300,
+                "interval": 5
+            })
+            .to_string(),
+        ),
+        ("POST", "/token") => {
+            assert!(body.contains(&format!("device_code={ENCODED_DEVICE_CODE}")));
+            (
+                400,
+                serde_json::json!({
+                    "error": "expired_token",
+                    "error_description": format!(
+                        "expired {DEVICE_CODE}; submitted={ENCODED_DEVICE_CODE}"
+                    )
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    assert_eq!(
+        err.idp_error_description(),
+        Some("expired [redacted credential]; submitted=[redacted credential]")
+    );
+    assert!(!err.message().contains(DEVICE_CODE));
+    assert!(!err.to_string().contains(DEVICE_CODE));
+    assert!(!err.to_string().contains(ENCODED_DEVICE_CODE));
+
+    let public_error: crate::Error = err.into();
+    assert!(!public_error.msg().contains(DEVICE_CODE));
+    assert!(!public_error.msg().contains(ENCODED_DEVICE_CODE));
+    let structured = public_error.oidc_error().unwrap();
+    assert_eq!(structured.idp_error(), Some("expired_token"));
+    assert_eq!(
+        structured.idp_error_description(),
+        Some("expired [redacted credential]; submitted=[redacted credential]")
+    );
+}
+
+#[test]
+fn deadline_expiry_returns_timeout() {
+    // The IdP never authorizes (always pending). A virtual clock advanced by the
+    // sleep hook drives the loop to the one-second device-code deadline,
+    // exercising the deadline-expiry Timeout branch instantly.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response_short()),
+        ("POST", "/token") => (400, r#"{"error":"authorization_pending"}"#.to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert!(err.message().contains("expired"), "got: {}", err.message());
+}
+
+#[test]
+fn transport_failures_continue_until_device_code_expiry() {
+    // Every token-endpoint poll drops the connection without an HTTP status.
+    // Match Java by retrying throughout the device-code lifetime instead of
+    // aborting early for an arbitrary failure count. The server's one-second
+    // lifetime is authoritative, yielding one immediate attempt before expiry.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (
+                200,
+                serde_json::json!({
+                    "device_code": "DEV-CODE-123",
+                    "user_code": "WXYZ-1234",
+                    "verification_uri": "https://idp.example.com/activate",
+                    "expires_in": 1,
+                    "interval": 5
+                })
+                .to_string(),
+            ),
+            ("POST", "/token") => {
+                polls.fetch_add(1, Ordering::SeqCst);
+                (0, String::new()) // 0 == drop the connection
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_stalled_token_response_cannot_outlive_the_device_code() {
+    // The configured timeout bounds one request; the device code bounds the
+    // sign-in as a whole, and is routinely the shorter of the two. An IdP that
+    // accepts a poll and then withholds its response must not hold the caller
+    // for a full request timeout past an expiry that has already passed --
+    // which is what a caller is promised, and what the Python binding
+    // documents on `timeout`.
+    //
+    // Real time deliberately: the overrun being tested is the HTTP layer's,
+    // which a virtual clock cannot reproduce. A 1s device code keeps it quick;
+    // `clamp_lifetime` imposes no floor.
+    let release = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let release = Arc::clone(&release);
+        let polls = Arc::clone(&polls);
+        MockServer::start(move |_method, path, _body| {
+            match path {
+            "/device" => (
+                200,
+                r#"{"device_code":"DC-1","user_code":"UC-1","verification_uri":"https://idp.example/device","expires_in":1,"interval":1}"#
+                    .to_string(),
+            ),
+            "/token" => {
+                polls.fetch_add(1, Ordering::SeqCst);
+                // Accept the request, then withhold the response.
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                (200, r#"{"access_token":"AT-1","expires_in":300}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        }
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build");
+
+    let started = Instant::now();
+    let err = auth.sign_in().unwrap_err();
+    let elapsed = started.elapsed();
+    release.store(true, Ordering::SeqCst);
+
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    assert!(
+        polls.load(Ordering::SeqCst) >= 1,
+        "the token endpoint must have been polled"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "sign-in must end at the device-code deadline, not the 30s request \
+         timeout (took {elapsed:?})"
+    );
+}
+
+#[test]
+fn connection_timeout_increases_poll_interval() {
+    // RFC 8628 requires a five-second increase after a connection timeout. With
+    // a six-second code lifetime, increasing 5s -> 10s leaves room for only the
+    // immediate poll; retaining 5s would incorrectly make a second request.
+    //
+    // The poll is made to time out by withholding the response until the flow
+    // has ended, not by sleeping longer than the configured timeout. A sleep
+    // margin has to be tuned against the slowest host that will ever run it:
+    // this test used a 20ms timeout against a 100ms sleep, which also required
+    // the /device request to complete within 20ms, and on a loaded Windows CI
+    // agent that intermittently did not happen -- `request_device_code` then
+    // returned OidcErrorKind::Network and the first assertion failed on a
+    // machine, not on a behaviour. Withholding removes the margin entirely:
+    // the poll times out at whatever the configured timeout is, however slow
+    // the host, and the timeout is now large enough that /device cannot
+    // plausibly miss it.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        let release = Arc::clone(&release);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (
+                200,
+                serde_json::json!({
+                    "device_code": "DEV-CODE-123",
+                    "user_code": "WXYZ-1234",
+                    "verification_uri": "https://idp.example.com/activate",
+                    "expires_in": 6,
+                    "interval": 5
+                })
+                .to_string(),
+            ),
+            ("POST", "/token") => {
+                polls.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (400, r#"{"error":"authorization_pending"}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let sleeps = Arc::new(Mutex::new(Vec::new()));
+    let sleep_log = Arc::clone(&sleeps);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_millis(250))
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |duration| {
+            sleep_ns.fetch_add(duration.as_nanos() as u64, Ordering::SeqCst);
+            sleep_log.lock().unwrap().push(duration);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    // Let the withheld poll finish so the mock's accept loop can be joined.
+    release.store(true, Ordering::SeqCst);
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(sleeps.lock().unwrap().as_slice(), &[Duration::from_secs(6)]);
+}
+
+#[test]
+fn poll_redirect_is_terminal() {
+    // A 3xx from the token endpoint (which never legitimately redirects) is a
+    // terminal device-flow error, not something to keep polling.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (302, "{}".to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.status(), Some(302));
+}
+
+#[test]
+fn poll_does_not_follow_redirect_to_another_host() {
+    // A 30x from the token endpoint must NOT be followed. Only the original URL is
+    // vetted; following a redirect could resend the device_code / refresh_token
+    // (POSTed in the request body) to another origin, even downgrading to
+    // plaintext. `HttpClient` sets max_redirects(0), so the 30x is returned as-is
+    // and the sink is never contacted. Without that defense the client would chase
+    // the Location and accept the sink's response as a token.
+    let sink_hits = Arc::new(AtomicUsize::new(0));
+    let sink = {
+        let sink_hits = Arc::clone(&sink_hits);
+        MockServer::start(move |_method, _path, _body| {
+            sink_hits.fetch_add(1, Ordering::SeqCst);
+            (
+                200,
+                r#"{"access_token":"STOLEN","expires_in":300}"#.to_string(),
+            )
+        })
+    };
+    let sink_url = sink.url("/steal");
+    let mock =
+        MockServer::start_redirecting(sink_url, |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => (302, "{}".to_string()),
+            _ => (404, "{}".to_string()),
+        });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.status(), Some(302));
+    assert_eq!(
+        sink_hits.load(Ordering::SeqCst),
+        0,
+        "the redirect target must never be contacted — credentials must not be resent"
+    );
+}
+
+#[test]
+fn poll_non_json_body_is_terminal_rejection() {
+    // A non-JSON 4xx (a WAF / proxy error page) at the token endpoint is a
+    // terminal rejection — a conformant poll reply is always JSON.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (403, "<html>Forbidden</html>".to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.status(), Some(403));
+}
+
+// -- request_device_code error paths -----------------------------------------
+
+#[test]
+fn device_request_http_408_is_retryable_with_json_or_non_json_body() {
+    for (body, expected_error) in [
+        (
+            r#"{"error":"temporarily_unavailable","error_description":"request timed out"}"#,
+            Some("temporarily_unavailable"),
+        ),
+        ("<html>request timed out</html>", None),
+    ] {
+        let response_body = body.to_string();
+        let mock = MockServer::start_with_retry_after(13, move |method, path, _body| {
+            match (method, path) {
+                ("POST", "/device") => (408, response_body.clone()),
+                _ => (404, "{}".to_string()),
+            }
+        });
+        let auth = explicit_auth(&mock, false);
+        let err = auth.sign_in().unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Network);
+        assert_eq!(err.status(), Some(408));
+        assert_eq!(err.retry_after_secs(), Some(13));
+        assert_eq!(err.idp_error(), expected_error);
+    }
+}
+
+#[test]
+fn device_endpoint_rejection_errors() {
+    // A non-200 from the device-authorization endpoint surfaces the IdP error.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (400, r#"{"error":"invalid_client"}"#.to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.idp_error(), Some("invalid_client"));
+    assert_eq!(err.status(), Some(400));
+}
+
+#[test]
+fn device_endpoint_missing_required_field_errors() {
+    // A 200 device response missing a required field (device_code) can't start
+    // the flow.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            r#"{"user_code":"WXYZ-1234","verification_uri":"https://idp.example.com/act"}"#
+                .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.status(), Some(200));
+}
+
+// -- token-cache hygiene -----------------------------------------------------
+
+#[test]
+fn cached_token_fast_path_selects_only_required_credential() {
+    for (groups_in_token, expected) in [(false, "AT-cached"), (true, "ID-cached")] {
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example.com/device")
+            .token_endpoint("https://idp.example.com/token")
+            .groups_in_token(groups_in_token)
+            .interactive(false)
+            .build()
+            .unwrap();
+        let now = now_epoch();
+        *auth.tokens.lock().unwrap() = Some(TokenSet {
+            access_token: Some("AT-cached".to_string()),
+            id_token: Some("ID-cached".to_string()),
+            refresh_token: Some("RT-cached".to_string()),
+            expires_at: now + 300.0,
+            token_type: "Bearer".to_string(),
+            scope: Some("openid".to_string()),
+            sub: Some("subject".to_string()),
+            issued_at: now,
+        });
+
+        assert_eq!(auth.token().unwrap(), expected);
+        // The explicit snapshot API still returns the complete token state.
+        let snapshot = auth.token_set().unwrap();
+        assert_eq!(snapshot.access_token.as_deref(), Some("AT-cached"));
+        assert_eq!(snapshot.id_token.as_deref(), Some("ID-cached"));
+        assert_eq!(snapshot.refresh_token.as_deref(), Some("RT-cached"));
+    }
+}
+
+#[test]
+fn stale_token_cleared_when_no_refresh_and_device_flow_fails() {
+    // A cached token with NO refresh token, forced expired: obtain_tokens must
+    // clear it before the interactive flow, so a failing device flow leaves no
+    // stale token cached.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            // First sign-in succeeds; the second device request is rejected so
+            // run_device_flow fails.
+            ("POST", "/device") => {
+                if device_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (200, device_response())
+                } else {
+                    (400, r#"{"error":"invalid_client"}"#.to_string())
+                }
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-1","expires_in":300}"#.to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-1");
+    assert!(auth.token_set().is_some());
+    // Force expiry; the cached token has no refresh token.
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        auth.token_set().is_none(),
+        "stale expired token left cached after a non-interactive lookup"
+    );
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert!(auth.token_set().is_none());
+}
+
+// -- token store persistence (Layer 1 + Layer 2) -----------------------------
+
+/// An auth wired to a `FileTokenStore` rooted at `dir`, against the mock IdP.
+fn auth_with_store(mock: &MockServer, dir: &Path) -> OidcDeviceAuth {
+    OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(test_file_store(dir))
+        .build()
+        .expect("build auth with store")
+}
+
+/// An in-memory store whose save path can fail after the refresh parent has been
+/// cleared. The independent mutex models the store's cross-process lock.
+#[derive(Clone, Default)]
+struct FailingSaveStore {
+    token: Arc<std::sync::Mutex<Option<PersistedToken>>>,
+    coordination: Arc<std::sync::Mutex<()>>,
+    fail_save: Arc<AtomicBool>,
+    /// Publish the entry, then fail as if a post-publish durability step had.
+    publish_then_fail_save: Arc<AtomicBool>,
+    fail_clear: Arc<AtomicBool>,
+    operations: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl FailingSaveStore {
+    fn seed(&self, token: PersistedToken) {
+        *self.token.lock().unwrap() = Some(token);
+    }
+
+    fn token(&self) -> Option<PersistedToken> {
+        self.token.lock().unwrap().clone()
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingDiagnostic(Arc<Mutex<Vec<String>>>);
+
+impl DiagnosticHandler for RecordingDiagnostic {
+    fn on_persistence_warning(&self, message: &str) {
+        self.0.lock().unwrap().push(message.to_string());
+    }
+}
+
+impl TokenStore for FailingSaveStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        self.operations.lock().unwrap().push("load");
+        Ok(self.token())
+    }
+
+    fn save(&self, _key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        self.operations.lock().unwrap().push("save");
+        if self.fail_save.load(Ordering::SeqCst) {
+            return Err(Box::new(std::io::Error::other("injected save failure")));
+        }
+        *self.token.lock().unwrap() = Some(token.clone());
+        if self.publish_then_fail_save.load(Ordering::SeqCst) {
+            return Err(crate::oidc::token_store::PublishedNotDurable::wrap(
+                Box::new(std::io::Error::other("injected directory fsync failure")),
+            ));
+        }
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        self.operations.lock().unwrap().push("clear");
+        if self.fail_clear.load(Ordering::SeqCst) {
+            return Err(Box::new(std::io::Error::other("injected clear failure")));
+        }
+        *self.token.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        let _guard = self.coordination.lock().unwrap();
+        action()
+    }
+}
+
+/// A store whose locked READ succeeds but whose lock release then reports a
+/// lost lease. That is the one shape where the provider emits a persistence
+/// warning while still holding a fully loaded, valid credential.
+#[derive(Clone)]
+struct PostActionLockLossStore {
+    token: Arc<Mutex<Option<PersistedToken>>>,
+}
+
+impl TokenStore for PostActionLockLossStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(self.token.lock().unwrap().clone())
+    }
+
+    fn save(&self, _key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = Some(token.clone());
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        action()?;
+        Err(Box::new(std::io::Error::other(
+            "injected post-action lock loss",
+        )))
+    }
+}
+
+/// A diagnostic handler that closes its own auth, which the C API documents as
+/// callback-safe. It mirrors the FFI's non-draining close branch: the warning
+/// is emitted while the acquisition critical section is still owned by this
+/// stack, so close publishes and tears down credentials without waiting.
+struct ClosingDiagnostic {
+    auth: Arc<std::sync::OnceLock<std::sync::Weak<OidcDeviceAuth>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl DiagnosticHandler for ClosingDiagnostic {
+    fn on_persistence_warning(&self, _message: &str) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let auth = self
+            .auth
+            .get()
+            .expect("auth installed")
+            .upgrade()
+            .expect("auth alive");
+        auth.signal_close();
+        auth.discard_credentials();
+    }
+}
+
+#[test]
+fn a_close_from_a_persistence_warning_is_not_undone_by_the_loaded_entry() {
+    // Regression: the seed read warned about its lost lease, the handler closed
+    // the provider (documented as callback-safe and TERMINAL), and the entry
+    // read a moment earlier was then adopted anyway -- republishing a live
+    // credential into a closed provider and handing it to the very caller the
+    // close was meant to terminate.
+    let now = crate::oidc::token::now_epoch();
+    let store = PostActionLockLossStore {
+        token: Arc::new(Mutex::new(Some(PersistedToken::new(
+            Some("AT-persisted".to_string()),
+            None,
+            Some("RT-persisted".to_string()),
+            now + 300.0,
+            300.0,
+        )))),
+    };
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example.com/device")
+            .token_endpoint("https://idp.example.com/token")
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .diagnostic_handler(ClosingDiagnostic {
+                auth: Arc::clone(&handle),
+                calls: Arc::clone(&calls),
+            })
+            .build()
+            .expect("build auth with closing diagnostic handler"),
+    );
+    assert!(
+        handle.set(Arc::downgrade(&auth)).is_ok(),
+        "the auth handle must be installed exactly once"
+    );
+
+    let err = auth
+        .token()
+        .expect_err("a closed provider must not serve the entry it just read");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler must have run");
+    assert_eq!(err.kind(), OidcErrorKind::Cancelled);
+    assert!(auth.is_closed());
+    assert!(
+        auth.token_set().is_none(),
+        "close discarded the credential; the store read must not restore it"
+    );
+}
+
+/// `(entered, release)`: the store signals the first and then waits on the
+/// second, so a test can act while the write is parked.
+type LockGate = (Arc<Barrier>, Arc<Barrier>);
+
+/// A store whose locked write waits for a peer before acting, consulting
+/// `cancelled` while it waits. That is the shape `FileTokenStore::with_lock`
+/// has when another process holds the per-identity lock, and that wait is the
+/// window a concurrent `close()` lands in.
+#[derive(Clone, Default)]
+struct SlowLockStore {
+    token: Arc<Mutex<Option<PersistedToken>>>,
+    /// `in_lock_cancellable` entries so far. Entry 0 is the seed load, which
+    /// must not block; entry 1 is the post-sign-in write.
+    entries: Arc<AtomicUsize>,
+    gate: Arc<Mutex<Option<LockGate>>>,
+    refused: Arc<AtomicBool>,
+}
+
+impl TokenStore for SlowLockStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(self.token.lock().unwrap().clone())
+    }
+
+    fn save(&self, _key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = Some(token.clone());
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        action()
+    }
+
+    fn in_lock_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        if self.entries.fetch_add(1, Ordering::SeqCst) == 1
+            && let Some((entered, release)) = self.gate.lock().unwrap().clone()
+        {
+            entered.wait();
+            release.wait();
+            if cancelled() {
+                self.refused.store(true, Ordering::SeqCst);
+                return Err(Box::new(std::io::Error::other(
+                    "cancelled during lock wait",
+                )));
+            }
+        }
+        self.in_lock(key, action)
+    }
+}
+
+#[test]
+fn a_close_racing_a_completed_device_flow_keeps_the_credential() {
+    // Regression: `obtain_tokens` gated the post-sign-in store write behind
+    // `ensure_open()`, and `persist_fresh_durable` passed `|| self.is_closed()`
+    // as its cancellation predicate. A close published between the device flow
+    // completing and that write therefore threw away a credential the human had
+    // just authorized: nothing reached the store, the next process start faced a
+    // full interactive sign-in, and the refresh token stayed live at the IdP,
+    // never stored and never used. `refresh_under_lock` already wrote before
+    // `ensure_open()` for exactly this reason.
+    //
+    // The realistic window is the store-lock wait, which is seconds wide when a
+    // peer process is mid-refresh -- not the few instructions between two
+    // statements. `SlowLockStore` reproduces that wait deterministically.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-1","refresh_token":"RT-1","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let store = SlowLockStore::default();
+    *store.gate.lock().unwrap() = Some((Arc::clone(&entered), Arc::clone(&release)));
+
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .build()
+            .expect("build auth"),
+    );
+
+    let signer = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || auth.sign_in())
+    };
+
+    // The human has authorized and the write is parked behind the peer's lock.
+    entered.wait();
+    // A close lands right there. `signal_close` publishes without draining, as
+    // a close from another thread does.
+    auth.signal_close();
+    release.wait();
+
+    let result = signer.join().unwrap();
+    // The close is reported to the caller...
+    assert_eq!(
+        result.unwrap_err().kind(),
+        OidcErrorKind::Cancelled,
+        "the close must still be reported"
+    );
+    // ...and the credential the human authorized survived it.
+    assert!(
+        !store.refused.load(Ordering::SeqCst),
+        "the close cancelled the write of an already-authorized credential"
+    );
+    let persisted = store
+        .token
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a close racing the write discarded the authorized credential");
+    assert_eq!(persisted.refresh_token(), Some("RT-1"));
+}
+
+/// An in-memory store that exposes whether a peer attempted the locked lazy
+/// load while another auth instance holds the coordination lock across refresh.
+#[derive(Clone, Default)]
+struct TombstoneRaceStore {
+    token: Arc<std::sync::Mutex<Option<PersistedToken>>>,
+    coordination: Arc<std::sync::Mutex<()>>,
+    progress: Arc<(std::sync::Mutex<TombstoneRaceProgress>, std::sync::Condvar)>,
+}
+
+#[derive(Default)]
+struct TombstoneRaceProgress {
+    lock_attempts: usize,
+    loads: usize,
+}
+
+impl TombstoneRaceStore {
+    fn seed(&self, token: PersistedToken) {
+        *self.token.lock().unwrap() = Some(token);
+    }
+
+    fn token(&self) -> Option<PersistedToken> {
+        self.token.lock().unwrap().clone()
+    }
+
+    fn wait_for_peer_load_or_lock_attempt(&self) -> (bool, usize, usize) {
+        let (progress, changed) = &*self.progress;
+        let (progress, timeout) = changed
+            .wait_timeout_while(
+                progress.lock().unwrap(),
+                Duration::from_secs(5),
+                |progress| progress.lock_attempts < 3 && progress.loads < 3,
+            )
+            .unwrap();
+        (!timeout.timed_out(), progress.lock_attempts, progress.loads)
+    }
+}
+
+impl TokenStore for TombstoneRaceStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        let (progress, changed) = &*self.progress;
+        progress.lock().unwrap().loads += 1;
+        changed.notify_all();
+        Ok(self.token())
+    }
+
+    fn save(&self, _key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = Some(token.clone());
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        let (progress, changed) = &*self.progress;
+        progress.lock().unwrap().lock_attempts += 1;
+        changed.notify_all();
+        let _guard = self.coordination.lock().unwrap();
+        action()
+    }
+}
+
+fn auth_with_failing_store(
+    mock: &MockServer,
+    store: FailingSaveStore,
+    interactive: bool,
+) -> OidcDeviceAuth {
+    OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(interactive)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(store)
+        .build()
+        .expect("build auth with test store")
+}
+
+fn expired_tokens(refresh_token: &str) -> TokenSet {
+    TokenSet {
+        access_token: Some("AT-expired".to_string()),
+        id_token: None,
+        refresh_token: Some(refresh_token.to_string()),
+        expires_at: 1.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: None,
+        issued_at: 0.0,
+    }
+}
+
+/// The store key matching `auth_with_store`'s config, for inspecting the file.
+fn key_for(mock: &MockServer) -> TokenStoreKey {
+    TokenStoreKey::from_config(
+        "questdb",
+        &mock.url("/token"),
+        &mock.url("/device"),
+        "openid",
+        None,
+        false,
+        None,
+    )
+}
+
+/// A mock that signs in with a refresh token, then answers refresh polls. The
+/// `refresh_body` closure builds the refresh response so a test can pick rotating
+/// vs non-rotating behaviour. Counts device-authorization requests.
+fn persistence_mock(
+    device_calls: Arc<AtomicUsize>,
+    refresh_body: impl Fn() -> String + Send + Sync + 'static,
+) -> MockServer {
+    MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/device") => {
+            device_calls.fetch_add(1, Ordering::SeqCst);
+            (200, device_response())
+        }
+        ("POST", "/token") => {
+            if body.contains("grant_type=refresh_token") {
+                (200, refresh_body())
+            } else {
+                (
+                    200,
+                    r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+        }
+        _ => (404, "{}".to_string()),
+    })
+}
+
+/// Rewrite the persisted entry with an expired access token (keeping the refresh
+/// token), simulating a restart after the access token's lifetime elapsed — so a
+/// fresh instance must silently refresh rather than serve the on-disk token.
+fn expire_persisted(dir: &Path, key: &TokenStoreKey) {
+    let store = test_file_store(dir);
+    let p = store.load(key).unwrap().unwrap();
+    let expired = PersistedToken::new(
+        p.access_token().map(String::from),
+        p.id_token().map(String::from),
+        p.refresh_token().map(String::from),
+        1.0, // long past
+        300.0,
+    );
+    store.save(key, &expired).unwrap();
+}
+
+#[cfg(not(unix))]
+#[test]
+fn persisted_refresh_is_rejected_before_submitting_the_parent() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    test_file_store(dir.path())
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT-expired".to_string()),
+                None,
+                Some("RT-parent".to_string()),
+                1.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .token_store(FileTokenStore::at(dir.path()))
+        .build()
+        .unwrap();
+
+    let error = auth
+        .token()
+        .expect_err("non-durable store must reject before refresh submission");
+    assert!(
+        error.message().contains("durable directory-entry"),
+        "unexpected error: {}",
+        error.message()
+    );
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn success_renderer_panic_keeps_token_cached_and_persisted() {
+    struct PanicOnSuccess;
+
+    impl Renderer for PanicOnSuccess {
+        fn on_success(&self, _identity: Option<&str>, _expires_in_secs: f64) {
+            panic!("injected renderer panic");
+        }
+    }
+
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .renderer(PanicOnSuccess)
+        .token_store(test_file_store(dir.path()))
+        .build()
+        .unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| auth.sign_in()));
+    assert!(
+        result.is_err(),
+        "the custom renderer should still propagate its panic"
+    );
+    assert_eq!(
+        auth.token_set().unwrap().access_token.as_deref(),
+        Some("AT-initial"),
+        "the authorized token was lost from memory"
+    );
+    assert_eq!(
+        test_file_store(dir.path())
+            .load(&key)
+            .unwrap()
+            .unwrap()
+            .access_token(),
+        Some("AT-initial"),
+        "the authorized token was not persisted before the callback"
+    );
+
+    // The acquisition lock is poisoned by the renderer panic, but the cache fast
+    // path must still return the completed sign-in without another device flow.
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn restart_resumes_from_persisted_token_without_reprompt() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+
+    // First run: sign in, persisting the token (one device prompt).
+    let auth_a = auth_with_store(&mock, dir.path());
+    assert_eq!(sign_in_and_token(&auth_a).unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    drop(auth_a); // simulate a process restart
+
+    // A brand-new instance sharing the store resumes the still-valid access token
+    // straight from disk — no network, no re-prompt.
+    let auth_b = auth_with_store(&mock, dir.path());
+    assert_eq!(auth_b.token().unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    drop(auth_b);
+
+    // Simulate the persisted access token having expired; a fresh instance must
+    // silently refresh from the persisted refresh token, still no device prompt.
+    expire_persisted(dir.path(), &key);
+    let auth_c = auth_with_store(&mock, dir.path());
+    assert_eq!(auth_c.token().unwrap(), "AT-refreshed");
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        1,
+        "a persisted refresh token must not trigger a re-prompt"
+    );
+}
+
+#[test]
+fn close_during_successful_refresh_persists_the_rotated_child() {
+    // The parent is tombstoned before submission. If close wins after the IdP
+    // rotates it but before the response is parsed, neither close nor a final
+    // cancellation check may discard the only surviving child credential.
+    let request_entered = Arc::new(std::sync::Barrier::new(2));
+    let release_response = Arc::new(std::sync::Barrier::new(2));
+    let mock = {
+        let request_entered = Arc::clone(&request_entered);
+        let release_response = Arc::clone(&release_response);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                request_entered.wait();
+                release_response.wait();
+                (
+                    200,
+                    r#"{"access_token":"AT-child","refresh_token":"RT-child","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let store = test_file_store(dir.path());
+    store
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT-expired".to_string()),
+                None,
+                Some("RT-parent".to_string()),
+                1.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .token_store(test_file_store(dir.path()))
+            .build()
+            .unwrap(),
+    );
+
+    let token_thread = std::thread::spawn({
+        let auth = Arc::clone(&auth);
+        move || auth.token()
+    });
+    request_entered.wait();
+    let close_thread = std::thread::spawn({
+        let auth = Arc::clone(&auth);
+        move || auth.close()
+    });
+    while !auth.is_closed() {
+        std::thread::yield_now();
+    }
+    release_response.wait();
+
+    let error = token_thread
+        .join()
+        .unwrap()
+        .expect_err("close must still cancel the caller");
+    assert_eq!(error.kind(), OidcErrorKind::Cancelled);
+    close_thread.join().unwrap();
+    let persisted = store
+        .load(&key)
+        .unwrap()
+        .expect("close destroyed the rotated credential family");
+    assert_eq!(persisted.access_token(), Some("AT-child"));
+    assert_eq!(persisted.refresh_token(), Some("RT-child"));
+    assert!(auth.token_set().is_none(), "close must still scrub memory");
+}
+
+#[test]
+fn refresh_only_persisted_entry_is_rejected_in_both_token_modes() {
+    for groups_in_token in [false, true] {
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let device_calls = Arc::clone(&device_calls);
+            let refresh_calls = Arc::clone(&refresh_calls);
+            MockServer::start(move |method, path, body| match (method, path) {
+                ("POST", "/device") => {
+                    device_calls.fetch_add(1, Ordering::SeqCst);
+                    (200, device_response())
+                }
+                ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                    refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        200,
+                        r#"{"access_token":"AT-refreshed","id_token":"ID-refreshed","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+                _ => (404, "{}".to_string()),
+            })
+        };
+        let store = FailingSaveStore::default();
+        store.seed(PersistedToken::new(
+            None,
+            None,
+            Some("RT-only".to_string()),
+            0.0,
+            0.0,
+        ));
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .groups_in_token(groups_in_token)
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .build()
+            .expect("build auth with refresh-only store");
+
+        let err = auth.token().unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+        assert!(
+            !auth.store_state.lock().unwrap().load_attempted,
+            "an invalid refresh-only entry must not latch the one-shot loader"
+        );
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            device_calls.load(Ordering::SeqCst),
+            0,
+            "non-interactive auth unexpectedly started a device flow"
+        );
+    }
+}
+
+#[test]
+fn transient_refresh_failure_rearms_the_shared_store_loader() {
+    let mock = MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+            (503, r#"{"error":"temporarily_unavailable"}"#.to_string())
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    test_file_store(dir.path())
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT-expired".to_string()),
+                None,
+                Some("RT-parent".to_string()),
+                1.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+    let auth = auth_with_store(&mock, dir.path());
+
+    let error = auth.token().expect_err("transient refresh must surface");
+    assert_eq!(error.kind(), OidcErrorKind::Network);
+    let state = auth.store_state.lock().unwrap();
+    assert!(
+        !state.load_attempted,
+        "a consumed credential left the shared-store loader latched"
+    );
+    assert!(
+        state.next_empty_load_recheck.is_some(),
+        "the re-armed read must retain the normal anti-stampede throttle"
+    );
+}
+
+#[test]
+fn refresh_only_response_is_kept_in_memory_but_not_persisted() {
+    let mock = MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/token") if body.contains("grant_type=refresh_token") => (
+            200,
+            r#"{"refresh_token":"RT-child","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let store = test_file_store(dir.path());
+    store
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT-expired".to_string()),
+                None,
+                Some("RT-parent".to_string()),
+                1.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+    let auth = auth_with_store(&mock, dir.path());
+
+    let error = auth
+        .token()
+        .expect_err("refresh-only result is not servable");
+    assert_eq!(error.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(
+        auth.token_set()
+            .as_ref()
+            .and_then(|tokens| tokens.refresh_token.as_deref()),
+        Some("RT-child"),
+        "the live process should retain the rotated child for a later retry"
+    );
+    assert!(
+        store.load(&key).unwrap().is_none(),
+        "the client wrote a refresh-only record its own loader rejects"
+    );
+}
+
+#[test]
+fn persist_restores_non_rotating_refresh_token_after_consuming_parent() {
+    // Non-rotating IdP: the refresh response carries no new refresh_token.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let reader = test_file_store(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    let before = reader.load(&key).unwrap().unwrap();
+    assert_eq!(before.access_token(), Some("AT-initial"));
+    assert_eq!(before.refresh_token(), Some("RT-1"));
+    drop(auth);
+
+    // Expire the on-disk access token, then a fresh instance silently refreshes.
+    expire_persisted(dir.path(), &key);
+    let auth2 = auth_with_store(&mock, dir.path());
+    assert_eq!(auth2.token().unwrap(), "AT-refreshed");
+
+    // Even though the refresh token did not rotate, it was removed before the
+    // network call and must be restored with the refreshed access token.
+    let after = reader.load(&key).unwrap().unwrap();
+    assert_eq!(
+        after.access_token(),
+        Some("AT-refreshed"),
+        "the consumed parent must be restored after a non-rotating refresh"
+    );
+    assert_eq!(after.refresh_token(), Some("RT-1"));
+}
+
+#[test]
+fn groups_mode_refresh_without_id_token_keeps_the_rotated_credential() {
+    // Regression: a refresh that rotates the refresh token but withholds the
+    // required kind must not destroy the credential.
+    //
+    // `refresh_under_lock` deletes the persisted parent and drops the in-memory
+    // copy *before* submitting (refresh-token-reuse defence). If the response
+    // then lacks the id_token this configuration serves -- which OIDC Core 12.1
+    // expressly permits -- the rotated replacement used to be discarded on both
+    // sides, leaving nothing anywhere. A headless caller with a token store was
+    // locked out after its first silent refresh, and a restart did not recover.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => {
+                if body.contains("grant_type=refresh_token") {
+                    // Rotates the refresh token, but returns no id_token.
+                    (
+                        200,
+                        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-1","id_token":"ID-1","refresh_token":"RT-1","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let key = TokenStoreKey::from_config(
+        "questdb",
+        &mock.url("/token"),
+        &mock.url("/device"),
+        "openid",
+        None,
+        true, // groups_in_token
+        None,
+    );
+    let groups_auth = |dir: &Path| {
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .groups_in_token(true)
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(test_file_store(dir))
+            .build()
+            .expect("build groups-mode auth with store")
+    };
+
+    // Sign in once so RT-1 is persisted, then expire the stored token so the
+    // next instance must refresh.
+    let first = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .groups_in_token(true)
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(test_file_store(dir.path()))
+        .build()
+        .expect("build groups-mode auth");
+    assert_eq!(sign_in_and_token(&first).unwrap(), "ID-1");
+    drop(first);
+    expire_persisted(dir.path(), &key);
+
+    // The silent refresh cannot satisfy groups mode, so this still reports
+    // InteractionRequired and never prompts.
+    let auth = groups_auth(dir.path());
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        1,
+        "a non-interactive token() must not start a device flow"
+    );
+
+    // ...but the rotated credential survives, in memory and on disk. Before the
+    // fix both were empty here.
+    let cached = auth.tokens.lock().unwrap();
+    assert_eq!(
+        cached.as_ref().and_then(|t| t.refresh_token.as_deref()),
+        Some("RT-2"),
+        "the rotated refresh token was dropped from the in-memory cache"
+    );
+    drop(cached);
+
+    let reader = test_file_store(dir.path());
+    let after = reader
+        .load(&key)
+        .unwrap()
+        .expect("the persisted entry was destroyed by a refresh that rotated it");
+    assert_eq!(after.refresh_token(), Some("RT-2"));
+    assert_eq!(after.access_token(), Some("AT-refreshed"));
+
+    // A restart still finds a usable refresh token rather than being locked out.
+    let restarted = groups_auth(dir.path());
+    assert_eq!(
+        restarted.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+    assert_eq!(
+        reader.load(&key).unwrap().unwrap().refresh_token(),
+        Some("RT-2"),
+        "a restart must not consume the credential without replacing it"
+    );
+}
+
+#[test]
+fn a_long_retry_after_is_waited_out_in_slices() {
+    // Regression: `backoff` deliberately has no upper clamp, and the only other
+    // bound on the wait is the whole device-code lifetime, so a 429 carrying a
+    // large `Retry-After` -- routine from a WAF or proxy -- collapsed the wait
+    // into a single opaque sleep of up to MAX_DEVICE_CODE_LIFETIME. The prompt's
+    // countdown stopped updating for its duration, and because the renderer
+    // callback is the only place a host language runs code on the waiting
+    // thread, it also removed the point at which an interrupt such as Ctrl-C
+    // could be delivered.
+    struct CountingWaits(Arc<AtomicUsize>);
+    impl Renderer for CountingWaits {
+        fn on_waiting(&self, _seconds_left: f64) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    const RETRY_AFTER: u64 = 300;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        MockServer::start_with_retry_after(RETRY_AFTER, move |method, path, _body| {
+            match (method, path) {
+                ("POST", "/device") => (200, device_response()),
+                ("POST", "/token") => {
+                    if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (429, r#"{"error":"slow_down"}"#.to_string())
+                    } else {
+                        (
+                            200,
+                            r#"{"access_token":"AT-sliced","expires_in":300}"#.to_string(),
+                        )
+                    }
+                }
+                _ => (404, "{}".to_string()),
+            }
+        })
+    };
+    let sleeps = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sleep_log = Arc::clone(&sleeps);
+    let waits = Arc::new(AtomicUsize::new(0));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .renderer(CountingWaits(Arc::clone(&waits)))
+        .sleep_hook(Arc::new(move |duration| {
+            sleep_log.lock().unwrap().push(duration)
+        }))
+        .build()
+        .expect("build");
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-sliced");
+    let slept = sleeps.lock().unwrap();
+
+    // No single wait exceeds the slice, so the prompt is refreshed and the
+    // interrupt point reached at least that often.
+    assert!(
+        slept
+            .iter()
+            .all(|d| *d <= Duration::from_secs(MAX_POLL_INTERVAL)),
+        "a wait exceeded MAX_POLL_INTERVAL: {slept:?}"
+    );
+    assert!(
+        slept.len() > 1,
+        "the long Retry-After was not sliced: {slept:?}"
+    );
+    // The polling RATE is unchanged: the server's full pause is still honoured
+    // before the next token request. Ignoring it is what earns a rate-limit ban.
+    assert_eq!(
+        slept.iter().sum::<Duration>(),
+        Duration::from_secs(RETRY_AFTER),
+        "slicing changed the total wait"
+    );
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        2,
+        "polled before the pause elapsed"
+    );
+    // The countdown ticks once per slice rather than once for the whole pause.
+    assert_eq!(waits.load(Ordering::SeqCst), slept.len());
+}
+
+/// An unsigned JWT (native never verifies one) whose payload is `{"exp":1}`,
+/// i.e. an `exp` one second after the epoch. `tokenset_from_response` bounds
+/// `expires_at` by that, so the resulting set is expired the moment it is built.
+const ALREADY_EXPIRED_JWT: &str = "e30.eyJleHAiOjF9.";
+
+#[test]
+fn a_device_grant_that_returns_an_expired_token_fails_the_sign_in() {
+    // Regression: the device-flow arm accepted on `has_required_token` alone
+    // while the refresh arm in `obtain_tokens` deliberately requires
+    // `is_usable`. `tokenset_from_response` bounds `expires_at` by the served
+    // token's own `exp`, so a stale token from the IdP -- or a host clock far
+    // enough ahead to consume the whole lifetime -- produced a set that HAS the
+    // required kind and is already expired. `sign_in()` then returned Ok,
+    // announced success through the renderer, and persisted a dead credential;
+    // the caller's very next request answered "no usable token, call sign_in()",
+    // which is exactly what they had just done.
+    struct RecordRenderer {
+        failures: Arc<std::sync::Mutex<Vec<String>>>,
+        successes: Arc<AtomicUsize>,
+    }
+    impl Renderer for RecordRenderer {
+        fn on_failure(&self, message: &str) {
+            self.failures.lock().unwrap().push(message.to_string());
+        }
+        fn on_success(&self, _identity: Option<&str>, _expires_in_secs: f64) {
+            self.successes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // No refresh token: nothing can renew this, so it is a dead end rather
+    // than one extra round trip. The recoverable shape is pinned separately by
+    // `an_expired_token_with_a_refresh_token_still_signs_in`.
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            format!(r#"{{"access_token":"{ALREADY_EXPIRED_JWT}","expires_in":300}}"#),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let successes = Arc::new(AtomicUsize::new(0));
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(test_file_store(dir.path()))
+        .renderer(RecordRenderer {
+            failures: Arc::clone(&failures),
+            successes: Arc::clone(&successes),
+        })
+        .build()
+        .expect("build auth");
+
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    let msg = err.to_string();
+    assert!(msg.contains("already expired"), "{msg}");
+    assert!(msg.contains("no refresh token"), "{msg}");
+    // Not the missing-kind message: the kind IS present, so pointing the user
+    // at their scope would send them after the wrong thing.
+    assert!(!msg.contains("no access_token"), "{msg}");
+
+    assert_eq!(
+        successes.load(Ordering::SeqCst),
+        0,
+        "a dead credential was announced as a successful sign-in"
+    );
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("already expired"), "{:?}", failures[0]);
+
+    // Nothing dead was written to the store.
+    assert!(
+        test_file_store(dir.path()).load(&key).unwrap().is_none(),
+        "an expired credential was persisted"
+    );
+}
+
+#[test]
+fn an_expired_token_with_a_refresh_token_still_signs_in() {
+    // The boundary of the guard above, and a live constraint: three Python
+    // integration tests reach the refresh path by signing in with exactly this
+    // shape. An IdP issuing a short-lived access token alongside a refresh
+    // token is ordinary, and the next `token()` renews it without a prompt --
+    // one extra round trip, not a dead end. Refusing it here would be a
+    // regression, not a fix.
+    let mock = MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") if body.contains("grant_type=refresh_token") => (
+            200,
+            r#"{"access_token":"AT-fresh","refresh_token":"RT-2","expires_in":300}"#.to_string(),
+        ),
+        ("POST", "/token") => (
+            200,
+            format!(
+                r#"{{"access_token":"{ALREADY_EXPIRED_JWT}","refresh_token":"RT-1","expires_in":300}}"#
+            ),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+    let auth = auth_with_store(&mock, dir.path());
+
+    auth.sign_in()
+        .expect("a refreshable credential must sign in");
+    // ...and the very next call renews it silently rather than demanding a
+    // second sign-in.
+    assert_eq!(auth.token().unwrap(), "AT-fresh");
+}
+
+#[test]
+fn a_pause_that_outlives_the_device_code_reports_the_pause() {
+    // Regression: `backoff` honours an unbounded `Retry-After` and the caller
+    // clips the wait to the remaining device-code lifetime, so a WAF answering
+    // `Retry-After: 600` to a 60-second code ended the sign-in at the deadline
+    // reported as a plain "Code expired" -- with nothing pointing at the pause
+    // that actually consumed the code, and nobody having failed to authorize.
+    struct RecordFailures(Arc<std::sync::Mutex<Vec<String>>>);
+    impl Renderer for RecordFailures {
+        fn on_failure(&self, message: &str) {
+            self.0.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    const RETRY_AFTER: u64 = 600;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        MockServer::start_with_retry_after(RETRY_AFTER, move |method, path, _body| {
+            match (method, path) {
+                ("POST", "/device") => (
+                    200,
+                    serde_json::json!({
+                        "device_code": "DEV-CODE-123",
+                        "user_code": "WXYZ-1234",
+                        "verification_uri": "https://idp.example.com/activate",
+                        "expires_in": 60,
+                        "interval": 5
+                    })
+                    .to_string(),
+                ),
+                ("POST", "/token") => {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    (429, r#"{"error":"slow_down"}"#.to_string())
+                }
+                _ => (404, "{}".to_string()),
+            }
+        })
+    };
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .renderer(RecordFailures(Arc::clone(&failures)))
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    // The terminal condition is the same -- the code is gone, a fresh sign-in is
+    // the only recovery -- so the kind and the tag callers key on are unchanged.
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    // What changed is that the cause is named.
+    let msg = err.message().to_string();
+    assert!(msg.contains("600s poll"), "got: {msg}");
+    assert!(msg.contains("outlasted"), "got: {msg}");
+    // One poll, then the mandated pause ate the rest of the code's life.
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1, "got: {failures:?}");
+    assert!(
+        failures[0].contains("required a 600s pause"),
+        "got: {:?}",
+        failures[0]
+    );
+    assert!(
+        !failures[0].starts_with("Code expired"),
+        "the bare expiry message hides the real cause: {:?}",
+        failures[0]
+    );
+}
+
+#[test]
+fn an_ordinary_expiry_does_not_blame_a_pause() {
+    // Regression: the pause diagnostic was gated on `owed > remaining` alone,
+    // which is true on the LAST wait of every flow whose device-code lifetime
+    // is not an exact multiple of the interval plus the round-trip time -- i.e.
+    // essentially all of them. A user who simply walked away was then told the
+    // identity provider had required a pause, and that "Nothing was wrong with
+    // the authorization", when the authorization was exactly what was wrong.
+    //
+    // Every other test here hides this because the virtual clock advances only
+    // by the amount slept, making the lifetime an exact multiple. This one
+    // charges each poll a round trip, which is what any real flow does.
+    struct RecordFailures(Arc<std::sync::Mutex<Vec<String>>>);
+    impl Renderer for RecordFailures {
+        fn on_failure(&self, message: &str) {
+            self.0.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    const RTT_NS: u64 = 100_000_000; // 100ms per poll.
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        let rtt_ns = Arc::clone(&virtual_ns);
+        // No `Retry-After`, and never `slow_down`: the interval stays at the
+        // advertised 5s for the whole flow, so nothing the IdP did ended it.
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (
+                200,
+                serde_json::json!({
+                    "device_code": "DEV-CODE-123",
+                    "user_code": "WXYZ-1234",
+                    "verification_uri": "https://idp.example.com/activate",
+                    "expires_in": 63,
+                    "interval": 5
+                })
+                .to_string(),
+            ),
+            ("POST", "/token") => {
+                polls.fetch_add(1, Ordering::SeqCst);
+                rtt_ns.fetch_add(RTT_NS, Ordering::SeqCst);
+                (400, r#"{"error":"authorization_pending"}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .renderer(RecordFailures(Arc::clone(&failures)))
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    // The terminal condition is unchanged: expiry, tagged `expired_token`.
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    // The flow really did run to the deadline over many polls, so the last
+    // wait was the partial one that used to trip the diagnostic.
+    assert!(polls.load(Ordering::SeqCst) > 5, "the flow ended too early");
+    let msg = err.message().to_string();
+    assert!(
+        !msg.contains("poll interval the IdP imposed"),
+        "an ordinary expiry must not blame the IdP: {msg}"
+    );
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1, "got: {failures:?}");
+    assert!(
+        failures[0].starts_with("Code expired"),
+        "an ordinary expiry must report itself as one: {:?}",
+        failures[0]
+    );
+}
+
+#[test]
+fn a_conformant_interval_is_not_sliced() {
+    // The slice must not change the shape of an ordinary flow: an interval at
+    // or below MAX_POLL_INTERVAL is still served as exactly one wait.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (400, r#"{"error":"authorization_pending"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-plain","expires_in":300}"#.to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let sleeps = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sleep_log = Arc::clone(&sleeps);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(Arc::new(move |duration| {
+            sleep_log.lock().unwrap().push(duration)
+        }))
+        .build()
+        .expect("build");
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-plain");
+    assert_eq!(
+        sleeps.lock().unwrap().as_slice(),
+        &[Duration::from_secs(MIN_POLL_INTERVAL)]
+    );
+}
+
+#[test]
+fn retry_after_raises_the_poll_interval_and_never_lowers_it() {
+    // RFC 8628 3.5: the client waits at least the advertised interval. A proxy
+    // or WAF answering `Retry-After: 1` to a flow whose interval is 30 used to
+    // set the interval to 5 -- six times faster than the identity provider
+    // asked for, for the rest of the flow.
+    assert_eq!(backoff(30, Some(1), false), 30);
+    assert_eq!(backoff(30, Some(45), false), 45);
+
+    // A long Retry-After is honoured rather than truncated to MAX_POLL_INTERVAL.
+    // Ignoring a rate limiter's stated pause is what earns a ban; the caller
+    // still clips the wait to the remaining device-code lifetime.
+    assert_eq!(backoff(5, Some(300), false), 300);
+    assert!(backoff(5, Some(300), false) > MAX_POLL_INTERVAL);
+
+    // Absent Retry-After keeps the RFC 8628 +5s step.
+    assert_eq!(backoff(10, None, false), 15);
+
+    // slow_down MUST increase, even against a contradictory low Retry-After.
+    assert_eq!(backoff(30, Some(1), true), 35);
+    assert_eq!(backoff(30, None, true), 35);
+
+    // The floor still applies.
+    assert_eq!(backoff(1, Some(0), false), MIN_POLL_INTERVAL);
+}
+
+#[test]
+fn clear_after_close_still_deletes_the_persisted_entry() {
+    // close() drops the in-memory credential but deliberately leaves the
+    // persisted entry, so clear() has to outlive it. It used to refuse:
+    // acquire_for_operation and the store-cancellation predicate both key on
+    // `closed`, the latter aborting the delete before it began. That left a
+    // long-lived plaintext refresh token on disk with no supported way to
+    // remove it.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let reader = test_file_store(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    assert!(
+        reader.load(&key).unwrap().is_some(),
+        "nothing was persisted"
+    );
+
+    auth.close();
+    assert!(
+        reader.load(&key).unwrap().is_some(),
+        "close must leave the persisted entry alone -- clear is what removes it"
+    );
+
+    auth.try_clear()
+        .expect("clear must work on a closed provider");
+    assert!(
+        reader.load(&key).unwrap().is_none(),
+        "the persisted credential survived clear() after close()"
+    );
+}
+
+#[test]
+fn persist_rewrites_when_refresh_token_rotates() {
+    // Rotating IdP: the refresh response carries a new refresh_token.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let reader = test_file_store(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    drop(auth);
+
+    // Expire the on-disk access token, then a fresh instance silently refreshes
+    // and the IdP rotates the refresh token.
+    expire_persisted(dir.path(), &key);
+    let auth2 = auth_with_store(&mock, dir.path());
+    assert_eq!(auth2.token().unwrap(), "AT-refreshed");
+
+    // A rotated refresh token MUST be persisted, or a later restart would replay a
+    // revoked one; so the file now holds the rotated token and the new access token.
+    let after = reader.load(&key).unwrap().unwrap();
+    assert_eq!(after.access_token(), Some("AT-refreshed"));
+    assert_eq!(after.refresh_token(), Some("RT-2"));
+}
+
+#[test]
+fn replacement_without_refresh_token_clears_rejected_persisted_token() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let device_token_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        let device_token_calls = Arc::clone(&device_token_calls);
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                let attempt = refresh_calls.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // The first process learns that the persisted token is no
+                    // longer usable and falls back to a replacement device flow.
+                    (400, r#"{"error":"invalid_grant"}"#.to_string())
+                } else {
+                    // If the rejected token survives on disk, the restarted
+                    // process stops here with a retryable error instead of
+                    // reaching its device flow.
+                    (503, r#"{"error":"temporarily_unavailable"}"#.to_string())
+                }
+            }
+            ("POST", "/token") => {
+                let attempt = device_token_calls.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    (
+                        200,
+                        r#"{"access_token":"AT-initial","refresh_token":"RT-rejected","expires_in":300}"#
+                            .to_string(),
+                    )
+                } else {
+                    // The replacement and post-restart flows deliberately issue
+                    // no refresh token.
+                    (
+                        200,
+                        format!(r#"{{"access_token":"AT-device-{attempt}","expires_in":300}}"#),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let reader = test_file_store(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    expire_persisted(dir.path(), &key);
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+
+    // The provider consumes the rejected refresh parent but never starts a
+    // replacement prompt. Only explicit sign_in() runs the new device flow.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    auth.sign_in().unwrap();
+    assert_eq!(auth.token().unwrap(), "AT-device-1");
+    assert!(
+        reader.load(&key).unwrap().is_none(),
+        "the rejected persisted refresh token survived its replacement sign-in"
+    );
+    drop(auth);
+
+    // A new process has no credential to load and must ask for explicit sign-in,
+    // rather than starting a prompt from token().
+    let restarted = auth_with_store(&mock, dir.path());
+    let err = restarted.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    restarted.sign_in().unwrap();
+    assert_eq!(restarted.token().unwrap(), "AT-device-2");
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn clear_deletes_the_persisted_entry() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let reader = test_file_store(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    sign_in_and_token(&auth).unwrap();
+    assert!(reader.load(&key).unwrap().is_some());
+
+    auth.clear();
+    assert!(
+        reader.load(&key).unwrap().is_none(),
+        "clear() must delete the persisted entry"
+    );
+}
+
+#[test]
+fn try_clear_reports_persisted_deletion_failure() {
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-persisted".to_string()),
+        None,
+        Some("RT-persisted".to_string()),
+        now_epoch() + 300.0,
+        300.0,
+    ));
+    store.fail_clear.store(true, Ordering::SeqCst);
+    let auth = auth_with_failing_store(&mock, store.clone(), false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-in-memory"));
+
+    let err = auth.try_clear().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("injected clear failure"));
+    assert!(auth.token_set().is_none(), "in-memory token was retained");
+    assert!(
+        store.token().is_some(),
+        "failing test store unexpectedly deleted the persisted token"
+    );
+    assert!(
+        auth.store_state.lock().unwrap().load_attempted,
+        "the same auth may reload a credential after clear was requested"
+    );
+}
+
+#[test]
+fn a_persisted_jwt_with_a_refresh_token_still_honours_the_rotation_cap() {
+    // Regression: the wire path caps a believed lifetime at MAX_EXPIRES_IN when
+    // a refresh token is available, so the credential rotates at least that
+    // often, and `oidc/mod.rs` documents that unconditionally. The persisted
+    // path bounded a JWT by its own `exp` alone, so a store entry carrying a
+    // long-lived JWT plus offline_access -- which another QuestDB language
+    // client may well have written -- was served for its full lifetime with no
+    // refresh round-trip, quietly losing that property. It needs a JWT served
+    // token, which Entra, Keycloak and Auth0 all issue; the bundled Java
+    // fixture carries an opaque token and so took the already-capped branch,
+    // which is why nothing caught it.
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = auth_with_failing_store(&mock, FailingSaveStore::default(), false);
+    let now = now_epoch();
+    let far_future = (now + 30.0 * 86_400.0) as i64;
+
+    let with_refresh = PersistedToken::new(
+        Some(jwt_with_exp(far_future)),
+        None,
+        Some("RT-persisted".to_string()),
+        now + 30.0 * 86_400.0,
+        30.0 * 86_400.0,
+    );
+    let tokens = auth
+        .tokenset_from_persisted(&with_refresh)
+        .expect("a valid persisted entry");
+    assert!(
+        tokens.expires_at <= now + MAX_EXPIRES_IN as f64 + 1.0,
+        "a refreshable persisted JWT escaped the rotation cap: {} vs {}",
+        tokens.expires_at,
+        now + MAX_EXPIRES_IN as f64
+    );
+
+    // Without a refresh token there is nothing to rotate with, so the signed
+    // exp stands -- exactly as on the wire path, and as documented.
+    let no_refresh = PersistedToken::new(
+        Some(jwt_with_exp(far_future)),
+        None,
+        None,
+        now + 30.0 * 86_400.0,
+        30.0 * 86_400.0,
+    );
+    let tokens = auth
+        .tokenset_from_persisted(&no_refresh)
+        .expect("a valid persisted entry");
+    assert!(
+        tokens.expires_at > now + MAX_EXPIRES_IN as f64,
+        "a non-refreshable JWT must keep its signed exp"
+    );
+}
+
+#[test]
+fn tampered_persisted_token_is_rejected_on_load() {
+    // A persisted access_token carrying a CR/LF (a header-injection vector) must be
+    // rejected on load exactly like a wire token, so it never reaches a header. The
+    // whole entry is unusable, so the flow falls back to a fresh device sign-in.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let writer = test_file_store(dir.path());
+    let key = key_for(&mock);
+
+    let now = crate::oidc::token::now_epoch();
+    let tampered = PersistedToken::new(
+        Some("bad\r\nInjected: header".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        now + 300.0,
+        300.0,
+    );
+    writer.save(&key, &tampered).unwrap();
+
+    let auth = auth_with_store(&mock, dir.path());
+    // The tampered served token is dropped and the entry rejected wholesale,
+    // but token() must not turn that into a hidden prompt.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 0);
+    auth.sign_in().unwrap();
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn tampered_persisted_refresh_token_is_dropped_on_load() {
+    // A persisted refresh_token carrying a CR/LF is dropped by is_safe_token_str on
+    // load, just like the served token, so it is never submitted to the token
+    // endpoint. With an expired access token and no usable refresh token, token()
+    // reports InteractionRequired instead of refreshing with the tampered value.
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let writer = test_file_store(dir.path());
+    let key = key_for(&mock);
+    let tampered = PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1\r\nInjected: header".to_string()), // control chars in the refresh token
+        1.0,                                          // expired access token
+        300.0,
+    );
+    writer.save(&key, &tampered).unwrap();
+
+    let auth = auth_with_store(&mock, dir.path());
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        0,
+        "a tampered refresh token must never be submitted to the token endpoint"
+    );
+}
+
+#[test]
+fn refresh_refuses_in_memory_fallback_when_persisted_entry_has_no_refresh_token() {
+    // A refresh-token-less peer entry means the in-memory parent is no longer
+    // authoritative. Reusing it could trigger rotating-token reuse detection.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string(),
+                )
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#
+                    .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+
+    // Sign in: in-memory + disk hold RT-1, so last_persisted_refresh == RT-1.
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+
+    // A peer process / corruption overwrites the file for this identity with a
+    // served token, NO refresh token, and a long-past expiry — a state the load
+    // path accepts (only the served token is required) but that must never reach
+    // the refresh network call as the refresh source.
+    let writer = test_file_store(dir.path());
+    writer
+        .save(
+            &key,
+            &PersistedToken::new(Some("AT-stale".to_string()), None, None, 1.0, 300.0),
+        )
+        .unwrap();
+
+    // Force the in-memory access token expired while keeping its refresh token, so
+    // obtain_tokens enters the coordinated refresh and re-reads the swapped file.
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("has no refresh token"));
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        1,
+        "a fail-closed refresh must not re-prompt in the same call"
+    );
+    assert_eq!(auth.token_set().unwrap().refresh_token, None);
+}
+
+#[test]
+fn failed_rotated_child_save_leaves_no_reusable_parent() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    store.fail_save.store(true, Ordering::SeqCst);
+
+    let diagnostic = RecordingDiagnostic::default();
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(store.clone())
+        .diagnostic_handler(diagnostic.clone())
+        .build()
+        .expect("build auth with diagnostic handler");
+    assert_eq!(auth.token().unwrap(), "AT-2");
+    let warnings = diagnostic.0.lock().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("token store save failed"));
+    assert!(!warnings[0].contains("AT-2"));
+    drop(warnings);
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-2")
+    );
+    assert!(
+        store.token().is_none(),
+        "a failed child save must not leave the submitted parent in the store"
+    );
+    assert_eq!(
+        *store.operations.lock().unwrap(),
+        ["load", "load", "clear", "save"],
+        "the parent must be cleared before the refresh result is saved"
+    );
+
+    // Model a peer that loaded RT-1 before the first process consumed it. The
+    // missing store entry proves that its in-memory copy is no longer safe.
+    let stale_peer = auth_with_failing_store(&mock, store.clone(), false);
+    *stale_peer.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+    *stale_peer.store_state.lock().unwrap() = StoreState {
+        load_attempted: true,
+        last_persisted_refresh: Some("RT-1".to_string()),
+        ..StoreState::default()
+    };
+    let err = stale_peer.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("removed by another refresh attempt"));
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        1,
+        "the stale peer replayed a refresh-token parent"
+    );
+    assert_eq!(stale_peer.token_set().unwrap().refresh_token, None);
+}
+
+/// A save that failed only after publishing its entry must still record the
+/// refresh token as persisted. Otherwise, once a peer consumes that on-disk
+/// child and fails to save its successor, this process treats its in-memory
+/// copy as an unpersisted child and submits an already-consumed refresh token.
+#[test]
+fn published_but_not_durable_save_blocks_replay_of_the_consumed_child() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    store.publish_then_fail_save.store(true, Ordering::SeqCst);
+
+    let diagnostic = RecordingDiagnostic::default();
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(store.clone())
+        .diagnostic_handler(diagnostic.clone())
+        .build()
+        .expect("build auth");
+    assert_eq!(auth.token().unwrap(), "AT-2");
+    assert!(
+        diagnostic.0.lock().unwrap()[0].contains("token store save failed"),
+        "the durability failure is still reported"
+    );
+    assert_eq!(
+        store
+            .token()
+            .and_then(|t| t.refresh_token().map(str::to_string)),
+        Some("RT-2".to_string()),
+        "the child reached the store"
+    );
+    assert_eq!(
+        auth.store_state
+            .lock()
+            .unwrap()
+            .last_persisted_refresh
+            .as_deref(),
+        Some("RT-2"),
+        "a published child must be remembered as persisted"
+    );
+
+    // A peer consumes RT-2 from the store and fails before saving RT-3.
+    *store.token.lock().unwrap() = None;
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-2"));
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("removed by another refresh attempt"));
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        1,
+        "the consumed child was replayed"
+    );
+}
+
+#[test]
+fn a_peer_process_sign_in_is_adopted_without_a_restart() {
+    // Regression: an empty locked read latched `load_attempted`, so a provider
+    // that started before any credential existed never consulted the store
+    // again. A headless service sharing a FileTokenStore with an operator's
+    // separate sign-in then returned InteractionRequired for the life of the
+    // process, and the QWP drainer retried forever -- while
+    // `classify_provider_error` keeps that error retryable precisely because a
+    // human is expected to be able to clear it. Only a restart worked.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-1","refresh_token":"RT-1","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+
+    // The long-lived service starts before anyone has signed in.
+    let service = auth_with_store(&mock, dir.path());
+    assert_eq!(
+        service.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+    {
+        // The empty read is throttled, not latched.
+        let state = service.store_state.lock().unwrap();
+        assert!(
+            !state.load_attempted,
+            "an empty read latched the one-shot load"
+        );
+        assert!(
+            state.next_empty_load_recheck.is_some(),
+            "an empty read must schedule a re-check"
+        );
+    }
+
+    // An operator signs in from another process against the same store.
+    let operator = auth_with_store(&mock, dir.path());
+    operator.sign_in().unwrap();
+
+    // Let the re-check interval elapse without sleeping in the test.
+    service.store_state.lock().unwrap().next_empty_load_recheck = None;
+    assert_eq!(service.token().unwrap(), "AT-1");
+    assert!(
+        service.store_state.lock().unwrap().load_attempted,
+        "adopting an entry must latch the one-shot load"
+    );
+}
+
+#[test]
+fn a_rejected_refresh_does_not_strand_the_provider_against_a_peer_sign_in() {
+    // Regression, and the sibling of
+    // `a_peer_process_sign_in_is_adopted_without_a_restart` for a store that was
+    // read and adopted before it was lost.
+    //
+    // `load_attempted` means "the store has been folded into this cache", which
+    // holds only while the adopted credential still exists. A refresh the IdP
+    // rejects ends that: `refresh_under_lock` consumes and deletes the persisted
+    // parent before submitting it, to prevent refresh-token reuse, and scrubs
+    // the in-memory copy alongside it. The provider was then left holding
+    // nothing while the latch still claimed the store had been consumed, so
+    // every later `token()` short-circuited the read and returned
+    // InteractionRequired for the life of the process. `classify_provider_error`
+    // keeps that retryable, so the QWP drainer retried a condition that could
+    // never clear, while an operator signing in from another process wrote a
+    // perfectly good entry nobody ever read. Only a restart recovered.
+    let reject_refresh = Arc::new(AtomicBool::new(true));
+    let mock = {
+        let reject_refresh = Arc::clone(&reject_refresh);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                if reject_refresh.load(Ordering::SeqCst) {
+                    // Expired, revoked, or reuse-detected: ordinary IdP
+                    // behaviour over a long process lifetime.
+                    (400, r#"{"error":"invalid_grant"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-1","refresh_token":"RT-1","expires_in":300}"#.to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+
+    // An operator signs in, so the shared store holds a credential.
+    auth_with_store(&mock, dir.path()).sign_in().unwrap();
+
+    // The long-lived headless service adopts it, which latches the one-shot read.
+    let service = auth_with_store(&mock, dir.path());
+    assert_eq!(service.token().unwrap(), "AT-1");
+    assert!(
+        service.store_state.lock().unwrap().load_attempted,
+        "adopting an entry must latch the one-shot load"
+    );
+
+    // The access token's lifetime elapses, on disk as well as in memory, so the
+    // next call must actually go to the token endpoint. The refresh is rejected
+    // there, which consumes the persisted parent and scrubs the in-memory copy.
+    expire_persisted(dir.path(), &key);
+    service.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    assert_eq!(
+        service.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+    {
+        let state = service.store_state.lock().unwrap();
+        assert!(
+            !state.load_attempted,
+            "a rejected refresh left the read latched, so a peer sign-in can never be adopted"
+        );
+        assert!(
+            state.next_empty_load_recheck.is_some(),
+            "the re-armed read must be throttled, not repeated per token()"
+        );
+    }
+
+    // An operator signs in again from another process, against the same store.
+    reject_refresh.store(false, Ordering::SeqCst);
+    auth_with_store(&mock, dir.path()).sign_in().unwrap();
+
+    // Let the re-check interval elapse without sleeping in the test.
+    service.store_state.lock().unwrap().next_empty_load_recheck = None;
+    assert_eq!(
+        service.token().unwrap(),
+        "AT-1",
+        "the peer sign-in was not picked up without a restart"
+    );
+}
+
+#[test]
+fn lazy_load_waits_out_peer_refresh_tombstone() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_entered = Arc::new(Barrier::new(2));
+    let release_refresh = Arc::new(Barrier::new(2));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        let refresh_entered = Arc::clone(&refresh_entered);
+        let release_refresh = Arc::clone(&release_refresh);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                // refresh_under_lock has consumed RT-1 but still holds the
+                // coordination lock. Keep the child unsaved until the peer has
+                // attempted its one-shot lazy load.
+                refresh_entered.wait();
+                release_refresh.wait();
+                return (
+                    200,
+                    r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = TombstoneRaceStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    let build_auth = || {
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .build()
+            .unwrap()
+    };
+
+    let refreshing = build_auth();
+    let refresh_thread = std::thread::spawn(move || refreshing.token());
+    refresh_entered.wait();
+    let parent_consumed = store.token().is_none();
+
+    let peer = build_auth();
+    let peer_thread = std::thread::spawn(move || peer.token());
+    // With an unlocked lazy load, the peer reaches a third load here, observes
+    // None, and permanently latches the tombstone. With the fix, its third lock
+    // attempt blocks until RT-2 is saved.
+    let (peer_attempted, lock_attempts, loads) = store.wait_for_peer_load_or_lock_attempt();
+    release_refresh.wait();
+
+    let refreshed = refresh_thread.join().unwrap();
+    let peer_token = peer_thread.join().unwrap();
+    assert!(
+        parent_consumed,
+        "refresh parent was not consumed before the token request"
+    );
+    assert!(
+        peer_attempted,
+        "peer never attempted to load during the refresh tombstone window: locks={lock_attempts}, loads={loads}"
+    );
+    assert_eq!(refreshed.unwrap(), "AT-2");
+    assert_eq!(
+        peer_token.unwrap(),
+        "AT-2",
+        "peer permanently cached the temporary refresh tombstone"
+    );
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.token().unwrap().refresh_token(), Some("RT-2"));
+}
+
+#[test]
+fn lost_refresh_response_consumes_parent_before_retry() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                // 0 == drop the connection: an ambiguous post-send transport
+                // failure with NO HTTP status. The IdP may have consumed and
+                // rotated RT-1 before the response was lost, so the parent must
+                // stay discarded. A received transient status is ambiguous for
+                // the same reason: an intermediary may have generated it.
+                return (0, String::new());
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    let auth = auth_with_failing_store(&mock, store.clone(), false);
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(store.token().is_none());
+    assert_eq!(auth.token_set().unwrap().refresh_token, None);
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+
+    // A transport failure with no status can happen after the IdP consumed RT-1.
+    // A later call must require a new sign-in rather than submitting RT-1 again.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn refresh_ambiguous_transport_failure_discards_in_memory_parent() {
+    // Default (no-store) path: a status-less transport failure that may have
+    // reached the IdP is ambiguous — the parent may have been consumed and
+    // rotated with its response lost. Resubmitting it to a reuse-detecting IdP
+    // would revoke the whole token family, so the in-memory parent must be
+    // discarded and the next call must require a fresh sign-in rather than replay
+    // RT-1. This makes the default path match the store path's
+    // `lost_refresh_response_consumes_parent_before_retry`.
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                return (0, String::new()); // drop after reading: post-send, no status
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token,
+        None,
+        "an ambiguous post-send failure must discard the in-memory refresh token"
+    );
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+
+    // The next call must re-sign-in, never resubmit the possibly-consumed RT-1.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn refresh_pre_send_failure_keeps_in_memory_parent() {
+    // Default (no-store) path: a pre-send connection failure proves the IdP never
+    // received the refresh request, so the still-valid refresh token must be
+    // retained and retried — a transient IdP outage must not wedge an unattended
+    // client into an interactive re-sign-in. The outage-tolerance half of the
+    // store/no-store consistency fix (discarding uniformly would terminalize a
+    // long-lived transport on a momentary connect blip).
+    let auth = auth_with_dead_token_endpoint();
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-1"),
+        "a pre-send connect failure must keep the refresh token for a later retry"
+    );
+
+    // A later call keeps retrying with RT-1 rather than giving up.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-1")
+    );
+}
+
+#[test]
+fn refresh_pre_send_failure_keeps_persisted_parent() {
+    // Store path: a pre-send connection failure proves the refresh token was not
+    // consumed, so it must be restored on disk and in memory (not tombstoned) and
+    // remain replayable by this process, a peer, or a restart. Together with
+    // `lost_refresh_response_consumes_parent_before_retry` this pins that only a
+    // genuinely ambiguous post-send failure consumes the persisted parent.
+    let addr = dead_loopback_addr();
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(format!("http://{addr}/device"))
+        .token_endpoint(format!("http://{addr}/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .token_store(store.clone())
+        .build()
+        .expect("build auth with store");
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        store
+            .token()
+            .and_then(|t| t.refresh_token().map(str::to_string)),
+        Some("RT-1".to_string()),
+        "a pre-send connect failure must not consume the persisted refresh token"
+    );
+    assert_eq!(
+        auth.token_set()
+            .and_then(|t| t.refresh_token.clone())
+            .as_deref(),
+        Some("RT-1")
+    );
+}
+
+#[test]
+fn transient_status_refresh_discards_persisted_parent() {
+    // A proxy can return 503 after the IdP consumed and rotated RT-1. The parent
+    // is therefore ambiguous and must remain tombstoned on disk and in memory.
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                return (503, r#"{"error":"temporarily_unavailable"}"#.to_string());
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    let auth = auth_with_failing_store(&mock, store.clone(), false);
+
+    // The transient 503 surfaces a Network error, and RT-1 stays consumed.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(err.status(), Some(503));
+    assert!(err.message().contains("refresh token was discarded"));
+    assert!(err.message().contains("Sign in again"));
+    assert_eq!(
+        store
+            .token()
+            .and_then(|t| t.refresh_token().map(str::to_string)),
+        None,
+        "a transient 503 must consume the ambiguous persisted refresh token"
+    );
+    assert_eq!(
+        auth.token_set().and_then(|t| t.refresh_token.clone()),
+        None,
+        "the in-memory refresh token must not survive a transient 503"
+    );
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn coordinated_refresh_never_falls_back_without_the_store_lock() {
+    struct LockUnavailableStore;
+
+    impl TokenStore for LockUnavailableStore {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            Ok(None)
+        }
+
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            _action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "peer holds the refresh lock",
+            )))
+        }
+    }
+
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let token_calls = Arc::clone(&token_calls);
+        MockServer::start(move |method, path, _body| {
+            if (method, path) == ("POST", "/token") {
+                token_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            (500, r#"{"error":"must_not_be_called"}"#.to_string())
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(LockUnavailableStore)
+        .build()
+        .unwrap();
+    *auth.tokens.lock().unwrap() = Some(TokenSet {
+        access_token: Some("AT-expired".to_string()),
+        id_token: None,
+        refresh_token: Some("RT-1".to_string()),
+        expires_at: 1.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: None,
+        issued_at: 0.0,
+    });
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("cross-process OIDC refresh lock"));
+    assert_eq!(
+        token_calls.load(Ordering::SeqCst),
+        0,
+        "refresh ran after coordination failed"
+    );
+}
+
+#[test]
+fn refresh_result_is_rejected_when_store_loses_lock_after_action() {
+    struct LosesLockAfterAction;
+
+    impl TokenStore for LosesLockAfterAction {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            Ok(None)
+        }
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            action()?;
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected ownership loss",
+            )))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let calls = Arc::clone(&calls);
+        MockServer::start(move |method, path, _body| {
+            if (method, path) == ("POST", "/token") {
+                calls.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{"access_token":"AT-child","refresh_token":"RT-child","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (500, r#"{"error":"must_not_be_called"}"#.to_string())
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .open_browser(false)
+        .token_store(LosesLockAfterAction)
+        .build()
+        .unwrap();
+    *auth.tokens.lock().unwrap() = Some(TokenSet {
+        access_token: Some("AT-expired".to_string()),
+        id_token: None,
+        refresh_token: Some("RT-parent".to_string()),
+        expires_at: 1.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: None,
+        issued_at: 0.0,
+    });
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("Lost the cross-process"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_ne!(
+        auth.token_set()
+            .and_then(|tokens| tokens.access_token.clone()),
+        Some("AT-child".to_string()),
+        "an uncoordinated refresh child must not be cached"
+    );
+}
+
+#[test]
+fn first_use_store_lock_failure_is_retryable_and_never_prompts() {
+    struct LockedStore;
+
+    impl TokenStore for LockedStore {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            Ok(None)
+        }
+
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            _action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "peer holds the token-store lock",
+            )))
+        }
+    }
+
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, _body| {
+            if (method, path) == ("POST", "/device") {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            (500, r#"{"error":"must_not_be_called"}"#.to_string())
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(LockedStore)
+        .build()
+        .unwrap();
+
+    for err in [auth.token().unwrap_err(), auth.sign_in().unwrap_err()] {
+        assert_eq!(err.kind(), OidcErrorKind::Network);
+        assert!(
+            err.message()
+                .contains("Could not load the OIDC token store")
+        );
+    }
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        0,
+        "store contention started a needless device flow"
+    );
+}
+
+#[test]
+fn transient_store_load_error_is_retryable_and_retried() {
+    // M2: FileTokenStore reports a missing/corrupt/oversized file as Ok(None); the
+    // only case it surfaces as Err is a genuine (transient) I/O error. A transient
+    // failure on the first load must NOT permanently disable persistence — a later
+    // call must retry and resume from the on-disk token instead of re-prompting.
+    struct FlakyStore {
+        loads: std::sync::atomic::AtomicUsize,
+        inner: FileTokenStore,
+    }
+    impl TokenStore for FlakyStore {
+        fn load(&self, key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            if self.loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Box::new(std::io::Error::other("transient EMFILE")));
+            }
+            self.inner.load(key)
+        }
+        fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+            self.inner.save(key, token)
+        }
+        fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+            self.inner.clear(key)
+        }
+        fn in_lock(
+            &self,
+            key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            self.inner.in_lock(key, action)
+        }
+    }
+
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    // Seed a valid persisted entry (a refresh token) via a plain store.
+    let now = crate::oidc::token::now_epoch();
+    test_file_store(dir.path())
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT".to_string()),
+                None,
+                Some("RT-1".to_string()),
+                now + 300.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(FlakyStore {
+            loads: std::sync::atomic::AtomicUsize::new(0),
+            inner: test_file_store(dir.path()),
+        })
+        .build()
+        .unwrap();
+
+    // The public first-use path surfaces the transient load failure as retryable
+    // rather than claiming that an interactive sign-in is required.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("transient EMFILE"));
+    assert!(
+        auth.token_set().is_none(),
+        "nothing should be adopted after a transient load error"
+    );
+    // The error was not latched, so a second attempt retries and resumes.
+    assert_eq!(auth.token().unwrap(), "AT");
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-1")
+    );
+}
+
+#[test]
+fn repeated_store_load_failures_are_backed_off() {
+    struct UnreadableStore {
+        loads: Arc<AtomicUsize>,
+    }
+
+    impl TokenStore for UnreadableStore {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "token store is unreadable",
+            )))
+        }
+
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            action()
+        }
+    }
+
+    let loads = Arc::new(AtomicUsize::new(0));
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .token_store(UnreadableStore {
+            loads: Arc::clone(&loads),
+        })
+        .build()
+        .unwrap();
+
+    // Java gives a one-shot store fault one immediate free retry. A second
+    // consecutive failure starts the 5s exponential backoff, so the third hot
+    // path lookup reports the failure without opening/logging the store again.
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Network);
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Network);
+    let backed_off = auth.token().unwrap_err();
+    assert_eq!(backed_off.kind(), OidcErrorKind::Network);
+    assert!(backed_off.message().contains("temporarily backed off"));
+    assert_eq!(loads.load(Ordering::SeqCst), 2);
+
+    // An explicit recovery request bypasses the transport-path throttle.
+    assert_eq!(auth.sign_in().unwrap_err().kind(), OidcErrorKind::Network);
+    assert_eq!(loads.load(Ordering::SeqCst), 3);
+}
+
+/// A minimal JWT (`header.payload.sig`) whose payload carries `exp` (and a `sub`),
+/// for exercising the unverified `exp`-bounding of the believed lifetime.
+fn jwt_with_exp(exp: i64) -> String {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    let payload = format!(r#"{{"exp":{exp},"sub":"user@example.com"}}"#);
+    let b64 = Base64UrlUnpadded::encode_string(payload.as_bytes());
+    format!("header.{b64}.signature")
+}
+
+#[test]
+fn wire_expiry_bounded_by_jwt_exp() {
+    // M3: a non-conformant `expires_in` with NO refresh token (so the rotation cap
+    // doesn't apply) must not push the believed expiry past the served token's own
+    // JWT `exp` — otherwise one bad field wedges the sender on permanent auth
+    // failures with no self-heal.
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = explicit_auth(&mock, false);
+    let exp = (crate::oidc::token::now_epoch() + 86_400.0).floor(); // 24h out
+    let body = serde_json::json!({
+        "access_token": jwt_with_exp(exp as i64),
+        "expires_in": 99_999_999_999i64,
+    });
+    let ts = auth.tokenset_from_response(&body, None).unwrap();
+    assert!(
+        (ts.expires_at() - exp).abs() < 1.5,
+        "expires_at not bounded by the JWT exp: {} (exp {exp})",
+        ts.expires_at()
+    );
+}
+
+#[test]
+fn groups_mode_expiry_uses_id_token_exp() {
+    // M6: in groups mode the served token is the id_token, so the believed expiry
+    // must follow the id_token's exp, not the access token's `expires_in`.
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = explicit_auth(&mock, true);
+    let now = crate::oidc::token::now_epoch();
+    let id_exp = (now + 120.0).floor(); // id_token expires in 2 minutes
+    let body = serde_json::json!({
+        "access_token": jwt_with_exp((now + 100_000.0) as i64), // long-lived
+        "id_token": jwt_with_exp(id_exp as i64),                // short-lived
+        "expires_in": 100_000,
+    });
+    let ts = auth.tokenset_from_response(&body, None).unwrap();
+    assert!(
+        (ts.expires_at() - id_exp).abs() < 1.5,
+        "groups mode ignored the id_token exp: {} (id_exp {id_exp})",
+        ts.expires_at()
+    );
+}
+
+#[test]
+fn persisted_expiry_honors_jwt_exp_but_caps_opaque() {
+    // M3: a persisted no-refresh JWT token (e.g. written by another language
+    // client) whose real exp is well beyond an hour must be honored, not capped to
+    // 1h. An opaque (non-JWT) token has no self-describing expiry, so the
+    // untrusted-file 1h cap still applies.
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = explicit_auth(&mock, false);
+    let now = crate::oidc::token::now_epoch();
+
+    let exp = (now + 8.0 * 3600.0).floor(); // 8h out
+    let jwt = PersistedToken::new(
+        Some(jwt_with_exp(exp as i64)),
+        None,
+        None,
+        exp,
+        8.0 * 3600.0,
+    );
+    let ts = auth.tokenset_from_persisted(&jwt).unwrap();
+    assert!(
+        (ts.expires_at() - exp).abs() < 1.5,
+        "persisted JWT exp was capped instead of honored: {}",
+        ts.expires_at()
+    );
+
+    let opaque = PersistedToken::new(
+        Some("opaque-token".to_string()),
+        None,
+        None,
+        now + 8.0 * 3600.0,
+        300.0,
+    );
+    let ts2 = auth.tokenset_from_persisted(&opaque).unwrap();
+    assert!(
+        ts2.expires_at() <= now + 3600.0 + 5.0,
+        "opaque token not capped to the 1h untrusted-file window: {}",
+        ts2.expires_at()
+    );
+}
+
+/// The silent-refresh backoff must escalate, not sit at a flat 5s.
+///
+/// Regression: an IdP that withholds the required token kind on the refresh
+/// grant fails identically every time, so a flat interval re-asked the token
+/// endpoint -- rotating another refresh token and rewriting the store -- twelve
+/// times a minute for the life of the process. The delay now doubles to the
+/// same 60s ceiling `load_retry_interval` uses.
+#[test]
+fn refresh_backoff_escalates_and_caps() {
+    let mut state = StoreState::default();
+    let start = Instant::now();
+
+    for expected in [5u64, 10, 20, 40, 60, 60] {
+        state.record_refresh_failure(start);
+        assert!(
+            state.refresh_backed_off(
+                start + Duration::from_secs(expected) - Duration::from_millis(1)
+            ),
+            "still backed off just before {expected}s"
+        );
+        assert!(
+            !state.refresh_backed_off(start + Duration::from_secs(expected)),
+            "retry allowed at {expected}s"
+        );
+    }
+
+    // A success -- or an explicit sign_in() -- clears the ladder, so a recovered
+    // provider is not left waiting a minute between attempts.
+    state.reset_refresh_backoff();
+    assert!(!state.refresh_backed_off(start));
+    state.record_refresh_failure(start);
+    assert!(!state.refresh_backed_off(start + Duration::from_secs(5)));
+}
+
+// -- review fixes ------------------------------------------------------------
+
+/// A refresh token the store cannot round-trip must be rejected where it
+/// arrives, not persisted and then silently dropped on the next start.
+///
+/// `tokenset_from_response` took the refresh token verbatim while the access
+/// and ID tokens went through `safe_token`, and `tokenset_from_persisted`
+/// applied the strict gate to all three. A refresh token holding a control or
+/// non-ASCII byte was therefore accepted in memory, written to the plaintext
+/// store, and dropped by the stricter load on the next process start -- which
+/// still adopted the entry for its access token and then failed every refresh
+/// with "the persisted OIDC token has no refresh token", naming a rotation
+/// hazard that had not happened, while the file stayed on disk.
+#[test]
+fn unsafe_refresh_token_is_rejected_at_ingestion() {
+    let auth = offline_auth();
+    for bad in ["RT\nwith-newline", "RT\u{0}nul", "RT-caf\u{e9}", "   "] {
+        let err = auth
+            .tokenset_from_response(
+                &serde_json::json!({
+                    "access_token": "AT",
+                    "refresh_token": bad,
+                    "expires_in": 300,
+                }),
+                None,
+            )
+            .expect_err(&format!("{bad:?} must be refused"));
+        assert_eq!(err.kind(), OidcErrorKind::Config, "for {bad:?}: {err}");
+        assert!(
+            err.to_string().contains("refresh token"),
+            "the error must name the field: {err}"
+        );
+    }
+
+    // An absent, null or empty refresh token is not an error: it means the
+    // response carries none and the prior one is carried forward.
+    for ok in [
+        serde_json::json!({"access_token": "AT", "expires_in": 300}),
+        serde_json::json!({"access_token": "AT", "refresh_token": null, "expires_in": 300}),
+        serde_json::json!({"access_token": "AT", "refresh_token": "", "expires_in": 300}),
+    ] {
+        let ts = auth
+            .tokenset_from_response(&ok, Some("RT-prior"))
+            .expect("a missing refresh token is not a failure");
+        assert_eq!(ts.refresh_token.as_deref(), Some("RT-prior"));
+    }
+}
+
+/// A device flow whose polls never reach the token endpoint must say so, not
+/// report that the user failed to authorize in time.
+///
+/// A status-less transport error is retried until the code dies -- right for a
+/// blip, and matching Java -- but the loop kept no record of the cause, so a
+/// `token_endpoint` that is misconfigured, unresolvable or firewalled polled
+/// silently for up to the code's lifetime (`MAX_DEVICE_CODE_LIFETIME`, 1800s)
+/// and then blamed the user. The retry policy is unchanged; only the cause
+/// reported at expiry is.
+#[test]
+fn expiry_names_the_transport_failure_when_no_poll_ever_landed() {
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            serde_json::json!({
+                "device_code": "DEV-CODE-123",
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://idp.example.com/activate",
+                "expires_in": 1,
+                "interval": 5
+            })
+            .to_string(),
+        ),
+        // 0 == drop the connection, so the poll fails with no HTTP status.
+        ("POST", "/token") => (0, String::new()),
+        _ => (404, "{}".to_string()),
+    });
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    assert!(
+        err.message()
+            .contains("No poll of the token endpoint completed"),
+        "expiry must name the transport failure, got: {}",
+        err.message()
+    );
+    assert!(
+        !err.message()
+            .contains("expired before authorization completed"),
+        "must not blame the user for not authorizing: {}",
+        err.message()
+    );
+    // Unchanged terminal classification: the code is still gone and a fresh
+    // sign-in is still the only recovery, so anything keying on these is safe.
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+}
+
+/// A later HTTP response invalidates an earlier status-less failure. Otherwise
+/// expiry falsely says that the token endpoint was never reachable and names a
+/// stale first error even though every subsequent poll received a response.
+#[test]
+fn expiry_does_not_report_a_stale_unsent_failure_after_an_http_response() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let poll_count = Arc::clone(&polls);
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            serde_json::json!({
+                "device_code": "DEV-CODE-123",
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://idp.example.com/activate",
+                "expires_in": 6,
+                "interval": 5
+            })
+            .to_string(),
+        ),
+        ("POST", "/token") => {
+            if poll_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                // No HTTP status: remember this only until a later poll lands.
+                (0, String::new())
+            } else {
+                // A transient non-JSON HTTP response proves reachability but
+                // keeps polling until the code expires.
+                (503, "<html>temporarily unavailable</html>".to_string())
+            }
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    assert!(polls.load(Ordering::SeqCst) >= 2);
+    assert!(
+        err.message()
+            .contains("expired before authorization completed"),
+        "a later HTTP response must discard the stale unsent failure: {}",
+        err.message()
+    );
+    assert!(
+        !err.message().contains("never reachable") && !err.message().contains("last failure"),
+        "expiry must not claim that no poll landed: {}",
+        err.message()
+    );
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+}
+
+/// The counterpart: once a poll *has* reached the endpoint, an expiry is a
+/// genuine "nobody authorized" and must keep saying so.
+#[test]
+fn expiry_still_reports_authorization_pending_when_polls_landed() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response_short()),
+        ("POST", "/token") => (400, r#"{"error":"authorization_pending"}"#.to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    assert!(
+        err.message()
+            .contains("expired before authorization completed"),
+        "a reached endpoint must keep the ordinary expiry message, got: {}",
+        err.message()
+    );
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+}
+
+/// A store that can never hold a credential must fail the sign-in before the
+/// user is shown a code, rather than completing and persisting nothing.
+///
+/// `save` already refused, but the refusal was only `log::warn!`-ed into a
+/// facade neither the C nor the Python binding subscribes to: the flow
+/// succeeded, wrote nothing, and re-ran in full on every process start with no
+/// error, no exception and no output anywhere.
+#[derive(Default)]
+struct PreflightRefusingStore {
+    preflights: Arc<AtomicUsize>,
+    saves: Arc<AtomicUsize>,
+}
+
+impl TokenStore for PreflightRefusingStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(None)
+    }
+
+    fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        action()
+    }
+
+    fn preflight(&self, _cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
+        self.preflights.fetch_add(1, Ordering::SeqCst);
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to persist: the directory could not be restricted",
+        )))
+    }
+}
+
+/// A store with no `preflight` override, proving the trait default is a no-op
+/// and that only an opting-in store changes `sign_in`'s behaviour.
+#[derive(Default)]
+struct SilentStore {
+    saves: Arc<AtomicUsize>,
+}
+
+impl TokenStore for SilentStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(None)
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        action()
+    }
+
+    fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn sign_in_refuses_a_token_store_that_cannot_persist() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+
+    let preflights = Arc::new(AtomicUsize::new(0));
+    let saves = Arc::new(AtomicUsize::new(0));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(PreflightRefusingStore {
+            preflights: Arc::clone(&preflights),
+            saves: Arc::clone(&saves),
+        })
+        .build()
+        .expect("build auth with refusing store");
+
+    let err = auth
+        .sign_in()
+        .expect_err("an unusable store must fail the sign-in");
+    assert_eq!(err.kind(), OidcErrorKind::Config, "{err}");
+    assert!(
+        err.message().contains("cannot persist a credential"),
+        "the error must say persistence is what failed: {}",
+        err.message()
+    );
+    assert!(
+        err.message().contains("could not be restricted"),
+        "the store's own reason must be carried through: {}",
+        err.message()
+    );
+    assert_eq!(preflights.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        0,
+        "the preflight must run before the device flow, so no code is ever shown"
+    );
+    assert_eq!(saves.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn sign_in_reports_an_unusable_file_store_path_as_config() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let not_a_directory = dir.path().join("store-is-a-file");
+    std::fs::write(&not_a_directory, b"x").unwrap();
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(test_file_store(&not_a_directory))
+        .build()
+        .expect("build auth with an unusable store path");
+
+    for _ in 0..2 {
+        let err = auth
+            .sign_in()
+            .expect_err("a store path that is not a directory must fail the sign-in");
+        assert_eq!(err.kind(), OidcErrorKind::Config, "{err}");
+        assert!(
+            err.message().contains("not a directory"),
+            "the store's own reason must be carried through: {}",
+            err.message()
+        );
+    }
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        0,
+        "no device code may be shown for a store that can never persist it"
+    );
+
+    // A transport-facing token() keeps the retryable classification: the
+    // location may be repaired while the process runs.
+    let err = auth.token().expect_err("no credential is available");
+    assert_eq!(err.kind(), OidcErrorKind::Network, "{err}");
+}
+
+#[test]
+fn sign_in_is_unaffected_by_a_store_that_does_not_override_preflight() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+    let saves = Arc::new(AtomicUsize::new(0));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(SilentStore {
+            saves: Arc::clone(&saves),
+        })
+        .build()
+        .expect("build auth with silent store");
+
+    auth.sign_in()
+        .expect("the default preflight must be a no-op");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        saves.load(Ordering::SeqCst),
+        1,
+        "the credential is persisted"
+    );
+}

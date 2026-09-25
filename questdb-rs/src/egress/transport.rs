@@ -118,8 +118,13 @@ pub struct WsTransport {
 }
 
 impl WsTransport {
-    /// Connect to a specific endpoint in `config.addrs` by index.
-    pub fn connect_to(config: &ReaderConfig, addr_idx: usize) -> Result<Self> {
+    /// Connect to a specific endpoint in `config.addrs` by index using headers
+    /// resolved once for the surrounding endpoint walk.
+    pub fn connect_to(
+        config: &ReaderConfig,
+        addr_idx: usize,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<Self> {
         if addr_idx >= config.addrs.len() {
             return Err(fmt!(
                 ConfigError,
@@ -234,8 +239,7 @@ impl WsTransport {
         // validation.
         let host_header = endpoint.to_string();
         let path = config.path.clone();
-        let extra_headers = config.upgrade_headers();
-        let handshake_result = handshake::upgrade(&mut stream, &host_header, &path, &extra_headers);
+        let handshake_result = handshake::upgrade(&mut stream, &host_header, &path, extra_headers);
 
         let handshake = match handshake_result {
             Ok(h) => h,
@@ -669,6 +673,7 @@ fn map_http_reject(reject: HttpReject) -> Error {
         code,
         format!("WebSocket handshake failed with HTTP {}", status),
     )
+    .with_ws_http_status(status)
 }
 
 /// Extract `X-QuestDB-Role` (and the optional `X-QuestDB-Zone`) from a
