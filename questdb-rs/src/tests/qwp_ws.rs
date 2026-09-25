@@ -2495,7 +2495,7 @@ fn qwp_ws_provider_failure_after_401_retains_rejected_endpoint() {
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
     let (tx, rx) = mpsc::channel();
-    let err = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .qwp_ws_token_provider(move || {
             if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok("stale".to_string())
@@ -2505,9 +2505,9 @@ fn qwp_ws_provider_failure_after_401_retains_rejected_endpoint() {
         })
         .unwrap()
         .connection_listener(Arc::new(move |event| tx.send(event.clone()).unwrap()), 0)
-        .unwrap()
-        .build()
-        .unwrap_err();
+        .unwrap();
+    let _keep_events_alive = builder.connection_event_source_for_test().unwrap();
+    let err = builder.build().unwrap_err();
     server.join().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(err.code(), ErrorCode::SocketError);
@@ -2533,15 +2533,15 @@ fn qwp_ws_provider_failure_before_dial_has_no_endpoint() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
-    let err = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .qwp_ws_token_provider(|| {
             Err::<String, _>(crate::Error::new(ErrorCode::SocketError, "refresh failed"))
         })
         .unwrap()
         .connection_listener(Arc::new(move |event| tx.send(event.clone()).unwrap()), 0)
-        .unwrap()
-        .build()
-        .unwrap_err();
+        .unwrap();
+    let _keep_events_alive = builder.connection_event_source_for_test().unwrap();
+    let err = builder.build().unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(!err.msg().contains("HTTP 401"), "{err}");
     let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();

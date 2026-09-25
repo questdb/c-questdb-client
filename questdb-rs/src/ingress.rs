@@ -1966,6 +1966,15 @@ impl SenderBuilder {
         Ok(self)
     }
 
+    /// Keep the asynchronous dispatcher alive while a test inspects an event
+    /// from a failed build (which otherwise drops the builder and its queue).
+    #[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+    pub(crate) fn connection_event_source_for_test(
+        &self,
+    ) -> Option<std::sync::Arc<conn_events::ConnectionEventSource>> {
+        self.qwp_ws.as_ref()?.conn_events.clone()
+    }
+
     #[cfg(feature = "_sender-qwp-ws")]
     /// Control whether QWP/WebSocket progress is driven by a background thread
     /// or manually by the caller. The default is [`QwpWsProgress::Background`],
