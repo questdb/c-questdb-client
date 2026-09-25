@@ -3340,21 +3340,21 @@ fn standalone_direct_sender_force_drop_discards_in_flight() {
         "deferred flush must be in-flight"
     );
 
+    // The second flush is asynchronous. Wait until the server has actually
+    // received its deferred frame before dropping; otherwise on a slow runner
+    // the last captured frame may still be the first (committed) flush.
+    let committed = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(committed[5] & FLAG_DEFER_COMMIT, 0);
+    let deferred = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(deferred[5] & FLAG_DEFER_COMMIT, 0);
+
     // `questdb_db_drop_direct_sender` sets must_close before dropping the
     // box (via `on_deferred_close`); replicate that to drive the discard arm.
     sender.mark_must_close();
     drop(sender);
-
-    let mut captured = Vec::new();
-    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
-        captured.push(frame);
-    }
-    let last = captured.last().expect("server must have received frames");
-    assert_ne!(
-        last[5] & FLAG_DEFER_COMMIT,
-        0,
-        "force-drop must leave the deferred tail uncommitted (discarded), \
-         not send a commit boundary"
+    assert!(
+        frames.recv_timeout(Duration::from_secs(2)).is_err(),
+        "force-drop must not send a commit boundary for the deferred tail"
     );
 }
 
