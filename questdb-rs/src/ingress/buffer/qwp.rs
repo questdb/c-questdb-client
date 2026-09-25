@@ -11256,7 +11256,7 @@ mod tests {
                 None => buf.rewind_to_marker().unwrap(),
             }
 
-            let (row_count, precision) = ws_first_geohash_precision(&ws_replay_bytes(&mut buf));
+            let (row_count, _, precision) = ws_first_geohash_header(&ws_replay_bytes(&mut buf));
             assert_eq!(row_count, 1, "{api}: the rewind must keep the first row");
             assert_eq!(
                 precision, 25,
@@ -11306,7 +11306,7 @@ mod tests {
         write_without_geohash(&mut buf);
 
         let bytes = ws_replay_bytes(&mut buf);
-        let (_, precision) = ws_first_geohash_precision(&bytes);
+        let (_, _, precision) = ws_first_geohash_header(&bytes);
         assert_eq!(
             precision, 25,
             "a failed row's repin must not outlive its rollback"
