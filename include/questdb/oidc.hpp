@@ -218,7 +218,10 @@ public:
     std::string_view view() const&& = delete;
 
 #if defined(QUESTDB_OIDC_CPP_TEST_HOOKS)
-    static token test_empty() noexcept { return token{nullptr}; }
+    static token test_empty() noexcept
+    {
+        return token{nullptr};
+    }
 #endif
 
 private:
