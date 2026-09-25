@@ -73,12 +73,20 @@ impl ImportedArrowColumn {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `array` and `schema` are valid
-    /// `FFI_ArrowArray` / `FFI_ArrowSchema` structures as produced by
-    /// the Arrow C Data Interface. The caller's `array.release` is
-    /// consumed unconditionally: cleared to `None` on every return,
-    /// success or error. The caller MUST NOT invoke the original
-    /// release after this call. `schema` is borrowed and remains owned
+    /// This is a low-level importer, not the guarded Python/C-ABI entry point.
+    /// It calls `Field::try_from` and arrow-rs `from_ffi` directly. The caller
+    /// must provide valid, stable, correctly allocated C Data Interface memory
+    /// and must preflight metadata encodings, schema/array arity, buffer layout,
+    /// and every conversion slice invariant required by the resolved arrow-rs
+    /// version. Malformed values may panic or abort according to the consuming
+    /// binary's panic profile; invalid pointers and undersized allocations may
+    /// cause undefined behavior. Callers that require clean errors must use the
+    /// guarded Python/C-ABI path or implement equivalent version-specific
+    /// preflight.
+    ///
+    /// The caller's `array.release` is consumed unconditionally: cleared to
+    /// `None` on every return, success or error. The caller MUST NOT invoke the
+    /// original release after this call. `schema` is borrowed and remains owned
     /// by the caller.
     pub unsafe fn import_from_ffi(
         array: &mut arrow::ffi::FFI_ArrowArray,
@@ -115,7 +123,7 @@ impl ImportedArrowColumn {
             .map_err(|err| error::fmt!(ArrowIngest, "Arrow array validation failed: {}", err))?;
 
         let array = make_array(array_data);
-        let kind = arrow_batch::classify(&field, array.as_ref())?;
+        let kind = arrow_batch::classify(&field)?;
         Ok(Self { field, array, kind })
     }
 
@@ -1540,7 +1548,7 @@ impl<'a> Chunk<'a> {
                 arr.data_type()
             ));
         }
-        let kind = arrow_batch::classify(field, arr.as_ref())?;
+        let kind = arrow_batch::classify(field)?;
         self.push_arrow_deferred(name, kind, arr)
     }
 

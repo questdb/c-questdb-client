@@ -368,6 +368,10 @@ impl Error {
     /// ("in doubt"): the current input may already have reached the server, so
     /// blindly replaying it on a fresh connection can duplicate rows.
     ///
+    /// For a high-level DataFrame ingestion call, the input is the entire
+    /// DataFrame, including any batches already committed by that call. For a
+    /// low-level flush, this does not track earlier independent flushes.
+    ///
     /// This is independent of the [`code`](Error::code): a delivery-unknown
     /// failure typically reports [`ErrorCode::FailoverRetry`] (the connection
     /// can be replaced), yet `FailoverRetry` alone does **not** mean the input
