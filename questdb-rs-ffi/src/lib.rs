@@ -2740,10 +2740,14 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_progress(
 /// Register a connection lifecycle listener on the sender being built.
 /// One `questdb_connection_event` per connection-state transition of the
 /// sender's QWP/WebSocket connection, delivered on a dedicated dispatcher
-/// thread through a bounded inbox (`inbox_capacity`; `0` = default 64)
-/// with a drop-oldest overflow policy. The caller guarantees `user_data`
-/// is safe to use from that thread. QWP/WebSocket only; at most one
-/// listener per builder.
+/// thread through a bounded inbox (`inbox_capacity`; `0` = default 64,
+/// maximum 65536) with a drop-oldest overflow policy. The caller guarantees
+/// `user_data` is safe to use from that thread. QWP/WebSocket only; at most
+/// one listener per builder.
+///
+/// Fails with a config error when a listener is already registered, or when
+/// `inbox_capacity` exceeds 65536: the capacity reaches an allocation whose
+/// failure aborts the process, so an absurd value is refused here instead.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_connection_event_handler(
     opts: *mut line_sender_opts,

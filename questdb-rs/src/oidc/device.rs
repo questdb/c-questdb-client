@@ -402,7 +402,13 @@ impl OidcDeviceAuthBuilder {
     }
 
     /// Verify TLS to QuestDB and the IdP against this PEM CA bundle (e.g. a
-    /// private/corporate CA) instead of the system trust store.
+    /// private/corporate CA) instead of the default roots.
+    ///
+    /// The default roots depend on the enabled TLS root features: the
+    /// compiled-in Mozilla bundle with `tls-webpki-certs`, the operating
+    /// system's trust store with `tls-native-certs`, and both together when
+    /// both are enabled (as in the C and Python bindings). With the OS store
+    /// in use, an OS store that reports a load error fails `build()`.
     pub fn ca_bundle(mut self, path: impl Into<PathBuf>) -> Self {
         self.ca_bundle = Some(path.into());
         self
@@ -1500,9 +1506,17 @@ impl OidcDeviceAuth {
             state.reset_store_load_backoff();
             state.reset_refresh_backoff();
         }
+        // The binding's abort also releases a wait for the store's per-identity
+        // lock: a sibling auth sharing this store identity can hold it while
+        // its own diagnostic callback -- which may be waiting for this very
+        // thread -- runs. It never interrupts a critical section once entered.
+        let store_wait = StoreWaitAbort::new(abort_wait);
         // Seed the cache from the persisted store once, so a restart resumes from
         // a saved refresh token instead of re-prompting (a no-op without a store).
-        let load_result = self.maybe_load_from_store(allow_interaction);
+        let load_result = self.maybe_load_from_store(allow_interaction, &store_wait);
+        if store_wait.fired() {
+            return Err(store_wait_aborted_error());
+        }
         // The store read can run a persistence diagnostic, and that handler may
         // close this auth. Closing is terminal, so re-check before serving
         // anything the cache happens to hold at this point.
@@ -1539,7 +1553,11 @@ impl OidcDeviceAuth {
                      failure. Retry shortly or call sign_in() to retry explicitly.",
                 ));
             }
-            match self.try_refresh_coordinated(tokens) {
+            let refresh_result = self.try_refresh_coordinated(tokens, &store_wait);
+            if store_wait.fired() {
+                return Err(store_wait_aborted_error());
+            }
+            match refresh_result {
                 // `is_usable`, not `has_required_token`: the served token must
                 // also still be valid. Bounding `expires_at` by the served
                 // token's own `exp` (see `tokenset_from_response`) means an IdP
@@ -1689,7 +1707,11 @@ impl OidcDeviceAuth {
     /// misconfigured store, reported as `Config` while the user is present, as
     /// `preflight_token_store` would have reported it had the read not failed
     /// first.
-    fn maybe_load_from_store(&self, allow_interaction: bool) -> Result<()> {
+    fn maybe_load_from_store(
+        &self,
+        allow_interaction: bool,
+        store_wait: &StoreWaitAbort<'_>,
+    ) -> Result<()> {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
             return Ok(());
         };
@@ -1714,12 +1736,20 @@ impl OidcDeviceAuth {
         }
 
         let mut loaded = None;
-        let cancelled = || self.is_closed();
+        let entered = std::cell::Cell::new(false);
+        let cancelled = || self.is_closed() || (!entered.get() && store_wait.check());
         let lock_result = store.in_lock_cancellable(key, &cancelled, &mut || {
+            entered.set(true);
             loaded = Some(store.load_cancellable(key, &cancelled)?);
             Ok(())
         });
         self.ensure_open()?;
+        // Released from the lock wait by the binding: not a store failure, so
+        // neither back off nor emit a diagnostic (which would queue behind the
+        // very callback that released us).
+        if loaded.is_none() && store_wait.fired() {
+            return Err(store_wait_aborted_error());
+        }
         match loaded {
             Some(persisted) => {
                 // The locked read completed, so even an absent entry is stable
@@ -1911,7 +1941,11 @@ impl OidcDeviceAuth {
     /// lock when one is configured. Mirrors [`refresh`](Self::refresh)'s `Result`
     /// contract (an `Ok` without the required token kind, or a non-network `Err`,
     /// means "fall through to an interactive sign-in").
-    fn try_refresh_coordinated(&self, existing: &TokenSet) -> Result<TokenSet> {
+    fn try_refresh_coordinated(
+        &self,
+        existing: &TokenSet,
+        store_wait: &StoreWaitAbort<'_>,
+    ) -> Result<TokenSet> {
         self.ensure_open()?;
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
             return self.refresh_no_store(existing); // no store: memory-only coordination
@@ -1919,12 +1953,19 @@ impl OidcDeviceAuth {
         let store = Arc::clone(store);
         let existing = existing.clone();
         let mut out: Option<Result<TokenSet>> = None;
-        let cancelled = || self.is_closed();
+        let entered = std::cell::Cell::new(false);
+        let cancelled = || self.is_closed() || (!entered.get() && store_wait.check());
         let lock_res = store.in_lock_cancellable(key, &cancelled, &mut || {
+            entered.set(true);
             out = Some(self.refresh_under_lock(store.as_ref(), key, &existing));
             Ok(())
         });
         self.ensure_open()?;
+        // Released from the lock wait before the refresh started: nothing was
+        // consumed or lost, and it is no lock failure to report.
+        if out.is_none() && store_wait.fired() {
+            return Err(store_wait_aborted_error());
+        }
         // A post-action lock error means the lease was lost while the refresh
         // was in flight. The child is not authoritative: a peer may have
         // consumed the same rotating parent or published a successor. Drop it
@@ -2247,9 +2288,14 @@ impl OidcDeviceAuth {
                 // in-memory copy as an unpersisted child, and after a peer
                 // consumed the on-disk one and failed to save its successor we
                 // would submit an already-consumed refresh token.
-                self.warn_persistence("save", &*e);
+                //
+                // Record it before the diagnostic runs: the handler may close
+                // this provider (a skipped-drain close runs only
+                // `discard_credentials`), and a write after it would put the
+                // refresh token back into memory the close just cleared.
                 let taken = std::mem::take(&mut *rt);
                 self.lock_store_state().set_last_persisted_refresh(taken);
+                self.warn_persistence("save", &*e);
             }
             Err(e) => self.warn_persistence("save", &*e),
         }
@@ -2978,6 +3024,40 @@ impl OidcDeviceAuth {
 /// A [`PersistedToken`] mirroring the current in-memory token. `token_ttl` is the
 /// lifetime the expiry was derived from (`expires_at - issued_at`), mirroring how
 /// a wire response sets them; `0` when `issued_at` is unknown.
+/// The binding's abort check, applied to a wait for the token store's
+/// per-identity lock. Records whether it fired so the caller can tell a
+/// released wait from a genuine store failure.
+struct StoreWaitAbort<'a> {
+    abort: Option<&'a dyn Fn() -> bool>,
+    fired: std::cell::Cell<bool>,
+}
+
+impl<'a> StoreWaitAbort<'a> {
+    fn new(abort: Option<&'a dyn Fn() -> bool>) -> Self {
+        Self {
+            abort,
+            fired: std::cell::Cell::new(false),
+        }
+    }
+
+    fn check(&self) -> bool {
+        if self.abort.is_some_and(|abort| abort()) {
+            self.fired.set(true);
+        }
+        self.fired.get()
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.get()
+    }
+}
+
+/// Placeholder for a store-lock wait the binding released. The binding
+/// replaces it with its own error (see `token_with_acquire_abort`).
+fn store_wait_aborted_error() -> OidcError {
+    OidcError::network("The wait for the OIDC token-store lock was abandoned.")
+}
+
 fn snapshot(tokens: &TokenSet) -> PersistedToken {
     let ttl = if tokens.issued_at > 0.0 {
         (tokens.expires_at - tokens.issued_at).max(0.0)

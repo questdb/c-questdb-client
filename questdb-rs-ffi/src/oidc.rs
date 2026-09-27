@@ -717,6 +717,24 @@ std::thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+// Every access to the callback thread-locals goes through `try_with`, never
+// `with`. A C `atexit` handler, a C++ static destructor, or another
+// thread-local's destructor can call `close` or a `detach_*` after this
+// thread's thread-locals were destroyed -- the shutdown hooks oidc.h
+// recommends the `_nowait` forms for. `with` panics there, and under
+// `panic = "abort"` that turns a clean exit into SIGABRT. No callback of this
+// library can be running on a thread whose thread-locals are gone, so "not in
+// a callback" is the accurate answer; callers that must not block pick their
+// own conservative fallback.
+
+/// Whether this thread is inside `target`'s diagnostic callback, or `None`
+/// once this thread's thread-locals were destroyed.
+fn in_diagnostic_callback_of(target: *const CDiagnosticTarget) -> Option<bool> {
+    IN_DIAGNOSTIC_CALLBACK
+        .try_with(|stack| stack.borrow().contains(&target))
+        .ok()
+}
+
 /// How many times a bounded [`CDiagnosticSink`] detach retries the gate before
 /// giving up on the drain. Bounded because the caller cannot safely wait --
 /// it holds either another target's gate or a caller-runtime lock the callback
@@ -785,16 +803,20 @@ impl Drop for ActiveDiagnosticState<'_> {
 }
 
 impl InDiagnosticCallback {
-    fn enter(target: &Arc<CDiagnosticTarget>) -> Self {
+    /// `None` once this thread's thread-locals were destroyed: the callback
+    /// could then not be recorded, so it must not be delivered.
+    fn enter(target: &Arc<CDiagnosticTarget>) -> Option<Self> {
         let target = Arc::as_ptr(target);
-        IN_DIAGNOSTIC_CALLBACK.with(|stack| stack.borrow_mut().push(target));
-        Self(target)
+        IN_DIAGNOSTIC_CALLBACK
+            .try_with(|stack| stack.borrow_mut().push(target))
+            .ok()?;
+        Some(Self(target))
     }
 }
 
 impl Drop for InDiagnosticCallback {
     fn drop(&mut self) {
-        IN_DIAGNOSTIC_CALLBACK.with(|stack| {
+        let _ = IN_DIAGNOSTIC_CALLBACK.try_with(|stack| {
             let mut stack = stack.borrow_mut();
             let popped = stack.pop();
             debug_assert_eq!(popped, Some(self.0));
@@ -822,8 +844,7 @@ impl CDiagnosticSink {
     }
 
     fn in_callback_on_this_thread(&self) -> bool {
-        let target = Arc::as_ptr(&self.target);
-        IN_DIAGNOSTIC_CALLBACK.with(|stack| stack.borrow().contains(&target))
+        in_diagnostic_callback_of(Arc::as_ptr(&self.target)).unwrap_or(false)
     }
 
     /// Stop delivering this auth's diagnostics, waiting out a callback already
@@ -886,7 +907,7 @@ impl CDiagnosticSink {
 
     fn detach_inner(&self, may_block: bool) {
         let target: *const CDiagnosticTarget = Arc::as_ptr(&self.target);
-        let reentrant = IN_DIAGNOSTIC_CALLBACK.with(|stack| stack.borrow().contains(&target));
+        let reentrant = in_diagnostic_callback_of(target).unwrap_or(false);
         // Holding either callback kind can form the same AB/BA inversion: an
         // event callback may reclaim a diagnostic target while its diagnostic
         // callback reclaims the event target, and vice versa.
@@ -960,7 +981,9 @@ impl DiagnosticHandler for CDiagnosticSink {
         let Some(_active) = ActiveDiagnosticState::enter(&self.state, &self.target) else {
             return;
         };
-        let _in_callback = InDiagnosticCallback::enter(&self.target);
+        let Some(_in_callback) = InDiagnosticCallback::enter(&self.target) else {
+            return;
+        };
         unsafe { (self.target.callback)(self.target.user_data as *mut c_void, &diagnostic) };
     }
 }
@@ -1042,7 +1065,9 @@ fn in_event_callback_of_target_on_this_thread(handler: Option<&Arc<CEventHandler
         return false;
     };
     let target: *const CEventTarget = Arc::as_ptr(&handler.target);
-    IN_EVENT_CALLBACK_TARGET.with(|stack| stack.borrow().contains(&target))
+    IN_EVENT_CALLBACK_TARGET
+        .try_with(|stack| stack.borrow().contains(&target))
+        .unwrap_or(false)
 }
 
 /// Whether this thread is executing inside `handler`'s own callback — the only
@@ -1056,7 +1081,9 @@ fn in_event_callback_of_on_this_thread(handler: Option<&Arc<CEventHandler>>) -> 
         return false;
     };
     let target: *const CEventHandler = Arc::as_ptr(handler);
-    IN_EVENT_CALLBACK.with(|stack| stack.borrow().contains(&target))
+    IN_EVENT_CALLBACK
+        .try_with(|stack| stack.borrow().contains(&target))
+        .unwrap_or(false)
 }
 
 /// Whether this thread currently owns any OIDC callback gate, regardless of
@@ -1064,9 +1091,17 @@ fn in_event_callback_of_on_this_thread(handler: Option<&Arc<CEventHandler>>) -> 
 /// unbounded drain of the other kind: cross-kind callbacks can reclaim each
 /// other's handles and otherwise form the same AB/BA deadlock as two event or
 /// two diagnostic targets.
+///
+/// Once this thread's thread-locals were destroyed the answer is unknown, and
+/// it is reported as `true`: the callers use it to choose a bounded drain over
+/// an unbounded wait, and a thread that is exiting must not wait unboundedly.
 fn in_any_oidc_callback_on_this_thread() -> bool {
-    IN_EVENT_CALLBACK.with(|stack| !stack.borrow().is_empty())
-        || IN_DIAGNOSTIC_CALLBACK.with(|stack| !stack.borrow().is_empty())
+    let events = IN_EVENT_CALLBACK.try_with(|stack| !stack.borrow().is_empty());
+    let diagnostics = IN_DIAGNOSTIC_CALLBACK.try_with(|stack| !stack.borrow().is_empty());
+    match (events, diagnostics) {
+        (Ok(events), Ok(diagnostics)) => events || diagnostics,
+        _ => true,
+    }
 }
 
 struct ActiveEventHandler<'a> {
@@ -1075,6 +1110,10 @@ struct ActiveEventHandler<'a> {
 
 impl<'a> ActiveEventHandler<'a> {
     fn enter(handler: &'a CEventHandler) -> Option<Self> {
+        // The callback could not be recorded on a thread whose thread-locals
+        // were destroyed, so it is not delivered there.
+        IN_EVENT_CALLBACK.try_with(|_| ()).ok()?;
+        IN_EVENT_CALLBACK_TARGET.try_with(|_| ()).ok()?;
         let mut gate = handler
             .target
             .callback_gate
@@ -1099,16 +1138,16 @@ impl<'a> ActiveEventHandler<'a> {
             "callback gate must serialize shared target entry"
         );
         drop(gate);
-        IN_EVENT_CALLBACK.with(|stack| stack.borrow_mut().push(handler as *const _));
-        IN_EVENT_CALLBACK_TARGET
-            .with(|stack| stack.borrow_mut().push(Arc::as_ptr(&handler.target)));
+        let _ = IN_EVENT_CALLBACK.try_with(|stack| stack.borrow_mut().push(handler as *const _));
+        let _ = IN_EVENT_CALLBACK_TARGET
+            .try_with(|stack| stack.borrow_mut().push(Arc::as_ptr(&handler.target)));
         Some(Self { handler })
     }
 }
 
 impl Drop for ActiveEventHandler<'_> {
     fn drop(&mut self) {
-        IN_EVENT_CALLBACK.with(|stack| {
+        let _ = IN_EVENT_CALLBACK.try_with(|stack| {
             let mut stack = stack.borrow_mut();
             let popped = stack.pop();
             debug_assert_eq!(
@@ -1117,7 +1156,7 @@ impl Drop for ActiveEventHandler<'_> {
                 "callback handler stack must unwind in order"
             );
         });
-        IN_EVENT_CALLBACK_TARGET.with(|stack| {
+        let _ = IN_EVENT_CALLBACK_TARGET.try_with(|stack| {
             let popped = stack.borrow_mut().pop();
             debug_assert_eq!(
                 popped,
@@ -1287,7 +1326,9 @@ impl CEventHandler {
 
     fn detach_inner(&self, may_block: bool) {
         let target: *const CEventHandler = self;
-        let reentrant = IN_EVENT_CALLBACK.with(|stack| stack.borrow().contains(&target));
+        let reentrant = IN_EVENT_CALLBACK
+            .try_with(|stack| stack.borrow().contains(&target))
+            .unwrap_or(false);
         let nested = in_any_oidc_callback_on_this_thread();
         {
             // Serialize suppression with callback admission. Once this store
@@ -3048,6 +3089,104 @@ mod tests {
             );
         }
         builder
+    }
+
+    unsafe fn build_auth_with_handlers() -> *mut questdb_oidc_auth {
+        unsafe {
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_builder_event_handler(
+                builder,
+                Some(ignore_event),
+                ptr::null_mut(),
+                None,
+                &mut error,
+            ));
+            assert!(questdb_oidc_builder_diagnostic_handler(
+                builder,
+                Some(ignore_diagnostic),
+                ptr::null_mut(),
+                None,
+                &mut error,
+            ));
+            let auth = questdb_oidc_builder_build(builder, &mut error);
+            assert!(!auth.is_null());
+            questdb_oidc_builder_free(builder);
+            auth
+        }
+    }
+
+    /// The raw auth a thread-local destructor tears down, as a C `atexit`
+    /// handler or C++ static destructor would.
+    struct TeardownOnThreadExit(*mut questdb_oidc_auth);
+
+    impl Drop for TeardownOnThreadExit {
+        fn drop(&mut self) {
+            unsafe {
+                questdb_oidc_auth_detach_events_nowait(self.0);
+                questdb_oidc_auth_detach_diagnostics_nowait(self.0);
+                questdb_oidc_auth_detach_events(self.0);
+                questdb_oidc_auth_detach_diagnostics(self.0);
+                let mut error = ptr::null_mut();
+                assert!(questdb_oidc_auth_close(self.0, &mut error));
+                questdb_oidc_auth_free(self.0);
+            }
+        }
+    }
+
+    std::thread_local! {
+        static TEARDOWN_ON_EXIT: std::cell::RefCell<Option<TeardownOnThreadExit>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    const TLS_TEARDOWN_CHILD: &str = "QUESTDB_OIDC_TLS_TEARDOWN_CHILD";
+
+    /// Regression: `close` and every `detach_*` read the callback
+    /// thread-locals with `LocalKey::with`, which panics once this thread's
+    /// thread-locals were destroyed -- a process abort under
+    /// `panic = "abort"`. That is exactly where the shutdown hooks oidc.h
+    /// recommends the `_nowait` forms for run. The teardown happens in a
+    /// thread-local destructor that runs after the OIDC ones, in a child
+    /// process so a regression aborts the child rather than this test binary.
+    #[test]
+    fn shutdown_hooks_survive_destroyed_callback_thread_locals() {
+        if std::env::var_os(TLS_TEARDOWN_CHILD).is_some() {
+            std::thread::spawn(|| unsafe {
+                let auth = build_auth_with_handlers();
+                // Register the teardown first: thread-local destructors run in
+                // reverse registration order, so it runs after the OIDC
+                // callback thread-locals, which this thread touches next.
+                TEARDOWN_ON_EXIT.with(|slot| *slot.borrow_mut() = Some(TeardownOnThreadExit(auth)));
+                let other = build_auth_with_handlers();
+                questdb_oidc_auth_detach_events_nowait(other);
+                let mut error = ptr::null_mut();
+                assert!(questdb_oidc_auth_close(other, &mut error));
+                questdb_oidc_auth_free(other);
+            })
+            .join()
+            .unwrap();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "oidc::tests::shutdown_hooks_survive_destroyed_callback_thread_locals",
+                "--test-threads=1",
+            ])
+            .env(TLS_TEARDOWN_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "teardown after thread-local destruction failed: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child must have run the teardown: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     fn event_target(

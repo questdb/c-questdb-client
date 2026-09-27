@@ -252,7 +252,12 @@ struct config_view
  * Interactive OIDC device-flow sign-in handle.
  *
  * `sign_in()`, `token()`, `clear()`, and `close()` throw `questdb::oidc::error`
- * on failure. Note that when this same auth state is attached to an ingest
+ * on an OIDC failure. A call rejected because it would wait behind this
+ * provider's own work -- `sign_in()` or `clear()` while an event or
+ * diagnostic callback of this state is running, or `clear()` behind an
+ * interactive sign-in -- throws the base `questdb::error` with
+ * `error_code::invalid_api_call` instead, so catch `const questdb::error&` to
+ * handle both. Note that when this same auth state is attached to an ingest
  * sender via `opts::oidc_auth`, a later token-acquisition failure surfaces from
  * `flush()` as a `questdb::ingress::line_sender_error` (with the OIDC detail on
  * its `oidc_diagnostic()` member), **not** as a `questdb::oidc::error` — so an
@@ -320,6 +325,9 @@ public:
      * that may invoke prompt callbacks and wait for user authorization.
      * @throws questdb::oidc::error on sign-in failure (see the class note for
      *         how OIDC failures surface across the sender/reader/device APIs).
+     * @throws questdb::error with `error_code::invalid_api_call` when called
+     *         while a callback of this state is running (see
+     *         `builder::event_handler`).
      */
     void sign_in() const
     {
@@ -630,7 +638,10 @@ public:
     /**
      * Explicitly persist access, ID, and long-lived refresh tokens as
      * unencrypted JSON in `directory`. Unix uses `0600` token files and a
-     * `0700` store directory. Non-Unix platforms currently reject persistence
+     * `0700` store directory; an existing directory is tightened to `0700` and,
+     * when it was group- or other-writable, swept of entries named like store
+     * records (see `questdb_oidc_builder_file_token_store`), so dedicate the
+     * directory to the store. Non-Unix platforms currently reject persistence
      * before changing disk state because the durable metadata barrier required
      * for rotating refresh tokens is unavailable. C++ callers should use
      * memory-only authentication there; custom keychain-backed stores are

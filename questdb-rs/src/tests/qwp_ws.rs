@@ -2526,6 +2526,48 @@ fn qwp_ws_provider_failure_after_401_retains_rejected_endpoint() {
     );
 }
 
+/// Closing a sender whose token provider is still resolving cancels that
+/// acquisition. That is the user's own close, not a credential outage: no
+/// `CredentialUnavailable` event may reach the listener.
+#[test]
+fn qwp_ws_close_during_provider_acquisition_reports_no_credential_event() {
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let (event_tx, event_rx) = mpsc::channel();
+    let builder = SenderBuilder::from_conf("ws::addr=127.0.0.1:1;initial_connect_retry=async;")
+        .unwrap()
+        .qwp_ws_token_provider(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+            Ok::<_, crate::Error>("token".to_string())
+        })
+        .unwrap()
+        .connection_listener(
+            Arc::new(move |event| {
+                let _ = event_tx.send(event.clone());
+            }),
+            0,
+        )
+        .unwrap();
+    let _keep_events_alive = builder.connection_event_source_for_test().unwrap();
+    let sender = builder.build().unwrap();
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the provider must be called");
+    drop(sender);
+    release_tx.send(()).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let events: Vec<_> = event_rx.try_iter().map(|event| event.kind).collect();
+    assert!(
+        !events.contains(&crate::ingress::ConnectionEventKind::CredentialUnavailable),
+        "a close must not be reported as an unavailable credential: {events:?}"
+    );
+}
+
 #[test]
 fn qwp_ws_provider_failure_before_dial_has_no_endpoint() {
     use crate::ingress::ConnectionEventKind;

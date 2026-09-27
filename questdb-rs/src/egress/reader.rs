@@ -2436,13 +2436,16 @@ impl<'r> Cursor<'r> {
                     // mismatched on every endpoint, config-level issue —
                     // tells the user *what to fix* and should win over
                     // the original cause-of-death.
-                    return Err(
-                        if prefer_over_trigger(&e) || is_failover_deadline_exhaustion(&e) {
-                            e
-                        } else {
-                            trigger
-                        },
-                    );
+                    //
+                    // A wall-clock exhaustion is not diagnostic by itself:
+                    // it keeps a preferred code (and any OIDC payload) of
+                    // the last walk, and then wins through
+                    // `prefer_over_trigger`. Otherwise the trigger stays the
+                    // surfaced error -- including when the deadline expired
+                    // before any reconnect ran, where the exhaustion error
+                    // would carry no cause at all. The exhaustion error is
+                    // still reported as the `GaveUp` event's `final_error`.
+                    return Err(if prefer_over_trigger(&e) { e } else { trigger });
                 }
             };
             // Reset connection-scoped state. The new connection has its
@@ -3000,14 +3003,17 @@ fn prefer_over_trigger(err: &Error) -> bool {
     )
 }
 
-/// Add wall-clock exhaustion context without replacing any structured
-/// diagnostics attached to the last reconnect error.
+/// Whether `error` is the wall-clock exhaustion error built by
+/// [`failover_deadline_exhausted_error`].
+#[cfg(test)]
 fn is_failover_deadline_exhaustion(error: &Error) -> bool {
     error
         .msg()
         .starts_with("failover wall-clock budget exhausted ")
 }
 
+/// Add wall-clock exhaustion context without replacing any structured
+/// diagnostics attached to the last reconnect error.
 fn failover_deadline_exhausted_error(
     max_duration_ms: u64,
     attempts: u32,
@@ -3172,13 +3178,28 @@ fn is_walk_deadline_cutoff(error: &Error) -> bool {
     error.code() == ErrorCode::SocketError && error.msg() == WALK_DEADLINE_CUTOFF_MSG
 }
 
+/// Resolve the upgrade headers for one walk, bounded by the failover deadline.
+///
+/// When the deadline cancels the provider acquisition before it answered, the
+/// result is reported as the walk-deadline cutoff it is (see
+/// [`is_walk_deadline_cutoff`]), not as a transport "shutting down": the
+/// caller then keeps what an earlier walk found, such as a `RoleMismatch`.
 fn upgrade_headers_for_walk(
     cfg: &ReaderConfig,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<(&'static str, String)>> {
-    match deadline {
+    let result = match deadline {
         Some(deadline) => cfg.upgrade_headers_until(|| std::time::Instant::now() >= deadline),
         None => cfg.upgrade_headers(),
+    };
+    match result {
+        Err(error)
+            if crate::token_provider::is_provider_shutdown_error(&error)
+                && walk_deadline_passed(deadline) =>
+        {
+            Err(Error::new(ErrorCode::SocketError, WALK_DEADLINE_CUTOFF_MSG))
+        }
+        result => result,
     }
 }
 
@@ -3218,18 +3239,7 @@ fn walk_via_tracker(
     // and immediately discard one socket per endpoint (or twice per endpoint
     // when the reconnect fall-through pass runs). The next outer reconnect
     // round calls this function again and therefore polls the provider afresh.
-    let mut upgrade_headers = match upgrade_headers_for_walk(cfg, deadline) {
-        Ok(headers) => headers,
-        // The deadline cancelled the acquisition before the provider answered.
-        // Report that as the cutoff it is, not as a transport "shutting down".
-        Err(error)
-            if crate::token_provider::is_provider_shutdown_error(&error)
-                && walk_deadline_passed(deadline) =>
-        {
-            return Err(Error::new(ErrorCode::SocketError, WALK_DEADLINE_CUTOFF_MSG));
-        }
-        Err(error) => return Err(error),
-    };
+    let mut upgrade_headers = upgrade_headers_for_walk(cfg, deadline)?;
     // Provider resolution during failover is isolated and cancellation-aware.
     // Re-check immediately afterwards so a result racing the deadline is never
     // followed by endpoint dials or a second credential resolution. A static

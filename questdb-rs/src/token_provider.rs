@@ -151,6 +151,9 @@ impl TokenProvider {
         F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
         E: Into<crate::Error>,
     {
+        // Only the QWP/WebSocket and egress transports isolate acquisitions.
+        #[cfg(not(any(feature = "_sender-qwp-ws", feature = "_egress")))]
+        let _ = isolation;
         TokenProvider {
             provide: Arc::new(move || provider().map_err(Into::into)),
             #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
@@ -421,7 +424,7 @@ fn classify_provider_error(e: crate::Error) -> crate::Error {
         // it at all -- they now returned on the first `acquire_timeout`
         // expiry. `ConfigError` is already in that set, so a genuine provider
         // contract violation stays terminal without the collateral.
-        let msg = format!("Token provider failed: {}", e.msg());
+        let msg = format!("{PROVIDER_FAILED_PREFIX}{}", e.msg());
         return e.reclassified(crate::ErrorCode::ConfigError, msg);
     }
     if is_terminal_oidc_provider_error(&e) {
@@ -430,9 +433,24 @@ fn classify_provider_error(e: crate::Error) -> crate::Error {
     if e.code() == crate::ErrorCode::SocketError {
         e
     } else {
-        let msg = format!("Token provider failed: {}", e.msg());
+        let msg = format!("{PROVIDER_FAILED_PREFIX}{}", e.msg());
         e.reclassified(crate::ErrorCode::SocketError, msg)
     }
+}
+
+/// Message prefix [`classify_provider_error`] puts on a re-coded provider error.
+const PROVIDER_FAILED_PREFIX: &str = "Token provider failed: ";
+
+/// Whether `e` is a token-provider failure no later invocation can resolve:
+/// a terminal OIDC failure ([`is_terminal_oidc_provider_error`]) or a provider
+/// that returned `InvalidApiCall`, which [`classify_provider_error`] carries as
+/// a terminal `ConfigError`. A background loop that pulls a token (an orphan
+/// drainer) must stop on these exactly as the foreground reconnect loop does.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) fn is_terminal_provider_error(e: &crate::Error) -> bool {
+    is_terminal_oidc_provider_error(e)
+        || (e.code() == crate::ErrorCode::ConfigError
+            && e.msg().starts_with(PROVIDER_FAILED_PREFIX))
 }
 
 /// Whether `e` is an OIDC provider failure that no later invocation can

@@ -725,12 +725,13 @@ impl OrphanDrainer {
             traffic_gate.cloned(),
         ) {
             Ok(transport) => transport,
-            // A closed or misconfigured OIDC provider fails every later pull
-            // identically. The foreground stops on it (`reconnect_error_is_terminal`),
-            // and `questdb_oidc_auth_close` promises every attached reconnect
-            // loop does; retrying here would poll the dead provider and rewrite
+            // A closed or misconfigured OIDC provider, or a provider that
+            // returned `InvalidApiCall`, fails every later pull identically.
+            // The foreground stops on it (`reconnect_error_is_terminal`), and
+            // `questdb_oidc_auth_close` promises every attached reconnect loop
+            // does; retrying here would poll the dead provider and rewrite
             // `.last_error` on every backoff tick until the sender closed.
-            Err(err) if crate::token_provider::is_terminal_oidc_provider_error(&err) => {
+            Err(err) if crate::token_provider::is_terminal_provider_error(&err) => {
                 return if orphan_stop_requested(stop) {
                     OrphanOpenOutcome::Stopped
                 } else {
@@ -1534,6 +1535,47 @@ mod tests {
         assert!(last_error.contains("closed"), "{last_error}");
 
         // The queued frame is still there for the next session.
+        let queue = SfaSlotQueue::open(slot_options(&sf_dir, "orphan")).unwrap();
+        assert!(!orphan_queue_drained(&queue));
+    }
+
+    /// Regression: a provider that returns `InvalidApiCall` signals a failure
+    /// retrying can never clear. The foreground stops on it; an orphan drainer
+    /// must retire the slot for the session too instead of polling forever.
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_retires_slot_on_an_invalid_api_call_provider() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut config = test_config();
+        config.qwp_ws.reconnect_initial_backoff =
+            ConfigSetting::new_default(Duration::from_millis(1));
+        config.qwp_ws.token_provider = Some(crate::token_provider::TokenProvider::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Err::<String, _>(crate::Error::new(
+                ErrorCode::InvalidApiCall,
+                "provider permanently broken",
+            ))
+        }));
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !drainers.drive_once(),
+            "a slot retired on a permanently failed provider must not be retried"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !has_failed_sentinel(&slot_dir),
+            "the slot stays recoverable"
+        );
+        let last_error = fs::read_to_string(slot_dir.join(LAST_ERROR_NAME)).unwrap();
+        assert!(last_error.contains("permanently broken"), "{last_error}");
+
         let queue = SfaSlotQueue::open(slot_options(&sf_dir, "orphan")).unwrap();
         assert!(!orphan_queue_drained(&queue));
     }

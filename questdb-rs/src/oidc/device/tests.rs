@@ -6933,3 +6933,162 @@ fn sign_in_is_unaffected_by_a_store_that_does_not_override_preflight() {
         "the credential is persisted"
     );
 }
+
+/// Regression: a handler that closes the provider from the persistence
+/// diagnostic of a published-but-not-durable save (a skipped-drain close runs
+/// only `discard_credentials`) must leave no refresh token in memory. The
+/// rotated token used to be recorded after the handler returned, putting it
+/// back into the state the close had just cleared.
+#[test]
+fn close_from_a_published_save_warning_keeps_no_refresh_token() {
+    let mock = MockServer::start(move |method, path, body| {
+        if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+            return (
+                200,
+                r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#.to_string(),
+            );
+        }
+        (404, "{}".to_string())
+    });
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    store.publish_then_fail_save.store(true, Ordering::SeqCst);
+
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .diagnostic_handler(ClosingDiagnostic {
+                auth: Arc::clone(&handle),
+                calls: Arc::clone(&calls),
+            })
+            .build()
+            .expect("build auth"),
+    );
+    assert!(handle.set(Arc::downgrade(&auth)).is_ok());
+
+    let err = auth.token().expect_err("the handler closed the provider");
+    assert_eq!(err.kind(), OidcErrorKind::Cancelled);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(auth.is_closed());
+    assert!(auth.token_set().is_none());
+    assert_eq!(
+        auth.store_state.lock().unwrap().last_persisted_refresh,
+        None,
+        "close() must drop the rotated refresh token from memory"
+    );
+    // The published entry itself stays for the next process.
+    assert_eq!(
+        store
+            .token()
+            .and_then(|t| t.refresh_token().map(str::to_string))
+            .as_deref(),
+        Some("RT-2")
+    );
+}
+
+/// A store whose per-identity lock stays held by a peer for `held_for`. The
+/// cancellable wait polls `cancelled` like `FileTokenStore`'s bounded one.
+struct PeerHeldLockStore {
+    held_for: Duration,
+}
+
+impl TokenStore for PeerHeldLockStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(None)
+    }
+    fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+        Ok(())
+    }
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        Ok(())
+    }
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        action()
+    }
+    fn in_lock_cancellable(
+        &self,
+        _key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        let start = Instant::now();
+        while start.elapsed() < self.held_for {
+            if cancelled() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled",
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        action()
+    }
+}
+
+/// Regression: a binding's abort released only the wait for this auth's own
+/// acquisition mutex. A sibling auth sharing the store identity can hold the
+/// store lock while its diagnostic callback -- which may be waiting for this
+/// thread -- runs; `token()` then waited out the whole store-lock budget and
+/// queued a diagnostic behind that very callback. The abort must release the
+/// store-lock wait too, without a store diagnostic or a load backoff.
+#[test]
+fn acquire_abort_releases_a_wait_for_the_store_lock() {
+    let diagnostics = RecordingDiagnostic::default();
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("http://127.0.0.1:9/device")
+        .token_endpoint("http://127.0.0.1:9/token")
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .token_store(PeerHeldLockStore {
+            held_for: Duration::from_secs(10),
+        })
+        .diagnostic_handler(diagnostics.clone())
+        .build()
+        .expect("build auth");
+
+    let start = Instant::now();
+    let abort = || {
+        (start.elapsed() >= Duration::from_millis(100))
+            .then(|| crate::Error::new(crate::ErrorCode::InvalidApiCall, "callback is active"))
+    };
+    let err = auth
+        .token_with_acquire_abort(&abort)
+        .expect_err("the abort must end the wait");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "the store-lock wait was not released: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall, "{err}");
+    assert!(
+        diagnostics.0.lock().unwrap().is_empty(),
+        "no store diagnostic"
+    );
+    assert!(
+        !auth
+            .lock_store_state()
+            .store_load_backed_off(Instant::now()),
+        "a released wait is no store failure"
+    );
+}

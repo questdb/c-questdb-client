@@ -1931,8 +1931,14 @@ std::thread_local! {
     static HELD_LOCKS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
 
+// Accessed with `try_with`, never `with`: a clear or token call can arrive
+// from a C `atexit` handler or a static destructor after this thread's
+// thread-locals were destroyed, where `with` panics -- an abort under the FFI
+// crate's `panic = "abort"`. A thread in that state holds no store lock.
 fn current_thread_holds(lock: &Path) -> bool {
-    HELD_LOCKS.with(|held| held.borrow().iter().any(|candidate| candidate == lock))
+    HELD_LOCKS
+        .try_with(|held| held.borrow().iter().any(|candidate| candidate == lock))
+        .unwrap_or(false)
 }
 
 /// Marks the dynamic scope in which this thread owns a filesystem lock.
@@ -1942,7 +1948,7 @@ struct HeldLockScope {
 
 impl HeldLockScope {
     fn enter(lock: PathBuf) -> Self {
-        HELD_LOCKS.with(|held| {
+        let _ = HELD_LOCKS.try_with(|held| {
             let mut held = held.borrow_mut();
             debug_assert!(!held.contains(&lock));
             held.push(lock.clone());
@@ -1953,7 +1959,7 @@ impl HeldLockScope {
 
 impl Drop for HeldLockScope {
     fn drop(&mut self) {
-        HELD_LOCKS.with(|held| {
+        let _ = HELD_LOCKS.try_with(|held| {
             let mut held = held.borrow_mut();
             // Drop must be infallible: the FFI crate is built with
             // `panic = "abort"`, so an invariant-only `expect` here could turn a

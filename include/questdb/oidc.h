@@ -313,8 +313,12 @@ bool questdb_oidc_builder_timeout_ms(
     questdb_error** err_out);
 /**
  * PEM CA bundle used to verify TLS for BOTH the QuestDB `/settings` discovery
- * request and every identity-provider request. Unset means the platform trust
- * store. The path is read at `questdb_oidc_builder_build` time, not here. No
+ * request and every identity-provider request. Unset means the default roots:
+ * the Mozilla root bundle compiled into the library (webpki) together with the
+ * operating system's trust store. An OS store that reports a load error fails
+ * `questdb_oidc_builder_build`; set a bundle to avoid consulting it. A set
+ * bundle replaces both. The path is read at `questdb_oidc_builder_build` time,
+ * not here. No
  * home-directory expansion is performed: a path beginning with `~`, `~/` or
  * `~\\` is rejected; pass an already-expanded absolute path.
  */
@@ -330,7 +334,12 @@ bool questdb_oidc_builder_ca_bundle(
  *
  * The store writes access, ID, and long-lived refresh tokens as unencrypted
  * JSON. On Unix, the library creates token files with mode `0600` and store
- * directories with mode `0700`. The bundled file store currently rejects
+ * directories with mode `0700`. An EXISTING directory is tightened to `0700`
+ * on first use when it grants any group or other permission, and one that was
+ * group- or other-writable is swept before its contents are trusted: entries
+ * named like store records (64 lowercase hex characters then `.json`, or a
+ * `.tmp` temporary) are deleted, whoever wrote them. Use a directory dedicated
+ * to the token store. The bundled file store currently rejects
  * persistence on non-Unix platforms before changing disk state because it
  * cannot provide the durable directory-entry replacement/deletion required for
  * rotating refresh tokens there. C callers should keep credentials in memory
@@ -359,9 +368,11 @@ bool questdb_oidc_builder_file_token_store(
  *
  * The store writes access, ID, and long-lived refresh tokens as unencrypted
  * JSON. On Unix, the library creates token files with mode `0600` and store
- * directories with mode `0700`. The bundled file store currently rejects
- * persistence on non-Unix platforms before changing disk state because the
- * required durable metadata barrier is unavailable. C callers should use
+ * directories with mode `0700`; an existing directory is tightened and, when
+ * it was group- or other-writable, swept exactly as for
+ * `questdb_oidc_builder_file_token_store`. The bundled file store currently
+ * rejects persistence on non-Unix platforms before changing disk state because
+ * the required durable metadata barrier is unavailable. C callers should use
  * memory-only authentication there; custom stores are currently Rust-only.
  * Without this call, credentials remain in memory only.
  */

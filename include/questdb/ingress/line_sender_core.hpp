@@ -226,7 +226,10 @@ enum class error_kind : int
  * are *sibling* types under `questdb::error`, so a handler for one does not
  * catch the other:
  * - **Device API** (`questdb::oidc::device_auth::sign_in`/`token`/`clear`)
- *   throws `questdb::oidc::error` directly.
+ *   throws `questdb::oidc::error` directly, except that `sign_in`/`clear`
+ *   rejected because a callback of the same state is running (or `clear`
+ *   behind an interactive sign-in) throw the base `questdb::error` with
+ *   `error_code::invalid_api_call`.
  * - **Query reader** (`questdb::egress::reader{config, auth}` and reader calls)
  *   throws `questdb::oidc::error` (or a base `questdb::error`).
  * - **Ingest sender** (`opts::oidc_auth` + `flush()` and other sender calls)

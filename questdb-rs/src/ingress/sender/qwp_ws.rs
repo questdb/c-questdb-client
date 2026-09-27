@@ -3380,6 +3380,14 @@ pub(crate) fn establish_connection(
     Ok((stream, handshake_result, leftover))
 }
 
+/// Whether a provider acquisition failed only because the transport's own
+/// traffic gate shut down (the user closed or dropped the sender): a normal
+/// close, not a credential outage, so it must not be narrated as one.
+fn provider_cancelled_by_shutdown(err: &crate::Error, traffic_gate: Option<&TrafficGate>) -> bool {
+    traffic_gate.is_some_and(TrafficGate::is_shutdown)
+        && crate::token_provider::is_provider_shutdown_error(err)
+}
+
 fn acquire_qwp_ws_provider_header(
     provider: &crate::token_provider::TokenProvider,
     connect_kind: QwpWsConnectKind,
@@ -3441,6 +3449,13 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
             // the caller would otherwise observe an indefinite silent stall
             // whose first symptom is unrelated store backpressure.
             Some(acquired.map_err(|err| {
+                if provider_cancelled_by_shutdown(&err, traffic_gate) {
+                    log::debug!(
+                        "questdb: QWP/WebSocket token provider acquisition \
+                         abandoned because the transport is shutting down"
+                    );
+                    return err;
+                }
                 match events {
                     // Foreground rounds narrate; background (orphan-drainer)
                     // walks deliberately do not, so as not to claim an outage
@@ -3518,8 +3533,9 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
                         endpoint.port,
                         err.msg()
                     );
+                    let shutdown = provider_cancelled_by_shutdown(&err, traffic_gate);
                     let err = err.reclassified(code, message);
-                    if let Some(events) = events {
+                    if let Some(events) = events.filter(|_| !shutdown) {
                         events.token_provider_failed(
                             Some((&endpoint.host, &endpoint.port)),
                             &err,
