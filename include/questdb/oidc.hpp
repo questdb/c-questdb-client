@@ -453,7 +453,8 @@ public:
      * suppression remains exact. The caller must be able to wait for arbitrary
      * user callback code; finalizers and shutdown hooks must use
      * `detach_events_nowait()`. Detaching this handle also suppresses events
-     * for every handle from `share()`. Idempotent and safe on a moved-from handle.
+     * for every handle from `share()`. Idempotent and safe on a moved-from
+     * handle.
      */
     void detach_events() const noexcept
     {
@@ -490,9 +491,10 @@ public:
 
     /**
      * Stop later persistence diagnostics (also on all `share()` handles)
-     * without waiting for a callback that is already running. This is the safe form for finalizers and collection
-     * hooks, which can run while their thread owns an arbitrary runtime lock.
-     * Idempotent and safe on a moved-from handle.
+     * without waiting for a callback that is already running. This is the safe
+     * form for finalizers and collection hooks, which can run while their
+     * thread owns an arbitrary runtime lock. Idempotent and safe on a
+     * moved-from handle.
      */
     void detach_diagnostics_nowait() const noexcept
     {

@@ -453,7 +453,7 @@ fn store_state_zeroizes_every_secret_field() {
 #[test]
 fn discard_credentials_drops_the_in_memory_token_without_the_acquire_lock() {
     // Regression: the credential teardown used to live only after
-    // `lock_acquire()` inside `close()`. Any close that skipped the drain --
+    // acquiring the mutex inside `close()`. Any close that skipped the drain --
     // notably one issued from inside a renderer callback, which runs within
     // that very critical section -- therefore left the access and refresh
     // tokens resident for the remaining life of the provider, contradicting

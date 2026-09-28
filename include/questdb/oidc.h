@@ -627,8 +627,8 @@ bool questdb_oidc_auth_cancel_sign_in(
  * An already-active clear waiting for a persisted-store lock also continues
  * after close returns, so a rotated credential is still deleted when that lock
  * becomes available. Activity on an independent auth built from the same
- * reusable builder does not skip this auth's drain. Unlike `sign_in`, `token` and `clear`, close is never
- * rejected as callback re-entry.
+ * reusable builder does not skip this auth's drain. Unlike `sign_in`, `token`
+ * and `clear`, close is never rejected as callback re-entry.
  *
  * The in-memory credential is dropped on every path, including the
  * skipped-drain one; only the wait is skipped. The persisted entry is

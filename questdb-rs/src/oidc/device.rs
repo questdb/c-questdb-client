@@ -838,7 +838,7 @@ impl OidcDeviceAuth {
     ///
     /// Splitting it out is what keeps `close`'s documented promise — "drops the
     /// in-memory credential but leaves the persisted entry" — true on every
-    /// path. While the teardown lived only after `lock_acquire()`, any close
+    /// path. While the teardown lived only after waiting for `acquire`, any close
     /// that skipped the drain left the access and refresh tokens resident for
     /// the remaining life of the provider.
     ///
@@ -875,7 +875,7 @@ impl OidcDeviceAuth {
         // Storing outside it races that waiter's `is_closed()` re-check: the
         // notify can land after the check and before the wait registers, and is
         // then lost until the full slice expires -- up to a whole poll interval,
-        // with close() blocked on lock_acquire() for all of it.
+        // with close() blocked on the acquisition lock for all of it.
         let _guard = self
             .close_wait
             .lock()
@@ -1320,10 +1320,10 @@ impl OidcDeviceAuth {
         }
     }
 
-    // Recover from a poisoned lock rather than propagate the panic: the guarded
-    // data (`()` and `Option<TokenSet>`) is always consistent, and a panic in a
-    // user-supplied renderer / sleep hook while `acquire` is held must not brick
-    // every later `token()` / `clear()` on a long-lived shared instance.
+    // Test seam for holding the acquisition mutex across a lifecycle call.
+    // Production takes it with cancellable try_lock loops, including recovery
+    // from poisoning after a panic in a user-supplied renderer / sleep hook.
+    #[cfg(test)]
     fn lock_acquire(&self) -> std::sync::MutexGuard<'_, ()> {
         self.acquire.lock().unwrap_or_else(|e| e.into_inner())
     }
