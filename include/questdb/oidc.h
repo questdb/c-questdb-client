@@ -160,7 +160,12 @@ typedef struct questdb_oidc_diagnostic
 
 /**
  * Persistence diagnostic callback. It may run on a token-provider or transport
- * thread during silent refresh. Invocations are serialized. Return promptly.
+ * thread during silent refresh. Invocations are serialized across every auth
+ * built from the same builder. Return promptly: diagnostics are best-effort,
+ * and one that cannot start within 5 seconds because a sibling auth's
+ * diagnostic callback is still running is dropped rather than delivered. That
+ * bound is what keeps a callback that hands work to another thread and waits
+ * for it from deadlocking against a diagnostic queued on that thread.
  * Calling `sign_in`, uncached `token`, `clear`, or an attached transport that
  * needs a token from a diagnostic callback sharing this target is rejected
  * before it can wait on the acquisition lock; a valid cached `token` remains
@@ -562,8 +567,10 @@ void questdb_oidc_auth_detach_diagnostics_nowait(const questdb_oidc_auth* auth);
  * inherited handle deliberately leaves its copied native state allocated in the
  * child rather than running destructors or callback-release hooks on unsafe
  * locks. The parent is unaffected. Creating even a NEW OIDC provider in that
- * child is refused: HTTP/TLS initialization after fork is not safe if OIDC was
- * used in the parent. Use fork+exec, then build a new provider and transports.
+ * child is refused once the parent has called `questdb_oidc_builder_build`
+ * (successfully or not; the provider need not have been used): HTTP/TLS
+ * initialization after fork is not safe then. Use fork+exec, then build a new
+ * provider and transports.
  */
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_free(questdb_oidc_auth* auth);

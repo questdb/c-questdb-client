@@ -684,8 +684,10 @@ impl std::fmt::Debug for OidcDeviceAuth {
 }
 
 impl OidcDeviceAuth {
-    /// Reject reinitialization after fork when OIDC was used in the parent.
-    /// This must run before discovery, TLS initialization or callback setup.
+    /// Reject reinitialization after fork when the parent built (or attempted
+    /// to build) any OIDC provider -- constructing one is enough, it need not
+    /// have been used. This must run before discovery, TLS initialization or
+    /// callback setup.
     #[doc(hidden)]
     pub fn ensure_builder_process() -> Result<()> {
         let pid = std::process::id();
@@ -699,7 +701,7 @@ impl OidcDeviceAuth {
         };
         if recorded != 0 && recorded != pid {
             return Err(OidcError::config(
-                "OIDC cannot be initialized after fork in a process that already used it; exec a fresh process first.",
+                "OIDC cannot be initialized after fork in a process that already built an OIDC provider; exec a fresh process first.",
             ));
         }
         Ok(())

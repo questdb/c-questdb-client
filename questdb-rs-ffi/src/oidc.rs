@@ -36,7 +36,7 @@ use std::slice;
 use std::str;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libc::{c_char, c_void, size_t};
 use questdb::oidc::{
@@ -742,6 +742,11 @@ fn in_diagnostic_callback_of(target: *const CDiagnosticTarget) -> Option<bool> {
 /// mid-flight on another thread normally releases within a few yields.
 const DETACH_BOUNDED_DRAIN_ROUNDS: usize = 64;
 
+/// How long a persistence diagnostic waits for a sibling's diagnostic callback
+/// on the shared target to return before it is dropped. See
+/// [`ActiveDiagnosticState::enter`].
+const DIAGNOSTIC_ADMISSION_WAIT: Duration = Duration::from_secs(5);
+
 /// Marks this thread as being inside `target`'s callback for as long as it
 /// lives. Mirrors [`ActiveEventHandler`]'s stack discipline.
 struct InDiagnosticCallback(*const CDiagnosticTarget);
@@ -757,17 +762,31 @@ impl<'a> ActiveDiagnosticState<'a> {
             .callback_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bounded: the thread emitting a diagnostic is inside an OIDC operation
+        // it was admitted to before a sibling's callback started, and nothing
+        // else can release it. A sibling callback that hands work to this
+        // thread and waits for it would otherwise park both threads forever.
+        // Diagnostics are best-effort, so one that cannot be admitted in time
+        // is dropped instead.
+        let deadline = Instant::now() + DIAGNOSTIC_ADMISSION_WAIT;
+        let mut timed_out = false;
         while gate.held && !state.detached.load(Ordering::Acquire) {
+            let now = Instant::now();
+            if now >= deadline {
+                timed_out = true;
+                break;
+            }
             #[cfg(test)]
             state.waiting_for_target.store(true, Ordering::Release);
             gate = target
                 .callback_ready
-                .wait(gate)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(gate, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
         #[cfg(test)]
         state.waiting_for_target.store(false, Ordering::Release);
-        if state.detached.load(Ordering::Acquire) {
+        if timed_out || state.detached.load(Ordering::Acquire) {
             return None;
         }
         gate.held = true;
@@ -5536,6 +5555,171 @@ mod tests {
             crate::column_sender::questdb_db_close(db);
             questdb_oidc_builder_free(builder);
         }
+    }
+
+    struct DispatchAndWaitState {
+        release_save: Arc<AtomicBool>,
+        callback_started: AtomicBool,
+        worker_serviced: AtomicBool,
+    }
+
+    /// A diagnostic callback that hands work to another thread and waits for it
+    /// -- here, to the thread whose own diagnostic is queued behind it.
+    unsafe extern "C" fn dispatch_to_worker_and_wait(
+        user_data: *mut c_void,
+        _diagnostic: *const questdb_oidc_diagnostic,
+    ) {
+        let state = unsafe { &*(user_data as *const Arc<DispatchAndWaitState>) };
+        if state.callback_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        state.release_save.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !state.worker_serviced.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    unsafe extern "C" fn release_dispatch_and_wait_state(user_data: *mut c_void) {
+        unsafe { drop(Box::from_raw(user_data as *mut Arc<DispatchAndWaitState>)) };
+    }
+
+    fn one_device_flow_idp(listener: TcpListener) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (device, _) = listener.accept().unwrap();
+            write_json_response(
+                device,
+                r#"{"device_code":"DEV-CODE","user_code":"ABCD-1234","verification_uri":"https://idp.example.com/activate","expires_in":600,"interval":1}"#,
+            );
+            let (token, _) = listener.accept().unwrap();
+            write_json_response(
+                token,
+                r#"{"access_token":"short-lived","refresh_token":"refresh-secret","token_type":"Bearer","expires_in":300}"#,
+            );
+        })
+    }
+
+    /// A persistence diagnostic queued behind a sibling's callback on the shared
+    /// target must not wait forever: that callback may be waiting for the very
+    /// thread whose diagnostic is queued. It used to park both threads until a
+    /// third one closed or detached the auth.
+    #[test]
+    fn diagnostic_queued_behind_a_sibling_callback_waiting_for_it_is_dropped() {
+        let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let idp_a = one_device_flow_idp(listener_a);
+        let idp_b = one_device_flow_idp(listener_b);
+
+        let save_entered = Arc::new(AtomicBool::new(false));
+        let release_save = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(DispatchAndWaitState {
+            release_save: Arc::clone(&release_save),
+            callback_started: AtomicBool::new(false),
+            worker_serviced: AtomicBool::new(false),
+        });
+        let user_data = Box::into_raw(Box::new(Arc::clone(&shared))) as *mut c_void;
+        // One target shared by both auths, as `questdb_oidc_builder_build`
+        // wires every auth built from one builder.
+        let target = Arc::new(CDiagnosticTarget {
+            callback: dispatch_to_worker_and_wait,
+            user_data: user_data as usize,
+            release: Some(release_dispatch_and_wait_state),
+            callback_gate: Mutex::new(CallbackGateState::default()),
+            callback_ready: std::sync::Condvar::new(),
+            active: AtomicBool::new(false),
+        });
+        let sink_a = CDiagnosticSink {
+            target: Arc::clone(&target),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        let sink_b = CDiagnosticSink {
+            target,
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        let shared_auth = |addr: std::net::SocketAddr,
+                           sink: CDiagnosticSink,
+                           store: Box<
+            dyn FnOnce(
+                questdb::oidc::OidcDeviceAuthBuilder,
+            ) -> questdb::oidc::OidcDeviceAuthBuilder,
+        >| {
+            let builder = OidcDeviceAuth::builder()
+                .client_id("questdb-c")
+                .scope("openid")
+                .token_endpoint(format!("http://{addr}/token"))
+                .device_authorization_endpoint(format!("http://{addr}/device"))
+                .allow_insecure_transport(true)
+                .interactive(true)
+                .open_browser(false)
+                .diagnostic_handler(sink.clone());
+            let inner = store(builder).build().unwrap();
+            SharedOidcAuth {
+                inner: Arc::new(inner),
+                event_handler: None,
+                diagnostic: Some(sink),
+                token_provider_isolation: TokenProviderIsolation::default(),
+            }
+        };
+        let auth_a = shared_auth(
+            addr_a,
+            sink_a,
+            Box::new({
+                let entered = Arc::clone(&save_entered);
+                move |builder| {
+                    builder.token_store(CoordinatedFailingSaveStore {
+                        entered,
+                        release: release_save,
+                    })
+                }
+            }),
+        );
+        let auth_b = shared_auth(
+            addr_b,
+            sink_b,
+            Box::new(|builder| builder.token_store(FailingSaveStore)),
+        );
+
+        // The worker: signs A in, then services the callback's job.
+        let worker = std::thread::spawn({
+            let auth = auth_a.clone();
+            let shared = Arc::clone(&shared);
+            move || {
+                let result = auth.sign_in().map_err(|e| e.msg().to_string());
+                shared.worker_serviced.store(true, Ordering::Release);
+                result
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !save_entered.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "A's sign-in never reached its save"
+            );
+            std::thread::yield_now();
+        }
+        let sibling = std::thread::spawn({
+            let auth = auth_b.clone();
+            move || auth.sign_in().map_err(|e| e.msg().to_string())
+        });
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(30);
+        while !(worker.is_finished() && sibling.is_finished()) {
+            assert!(
+                Instant::now() < deadline,
+                "sibling diagnostic callback and the worker it waits for deadlocked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(worker.join().unwrap().is_ok());
+        assert!(sibling.join().unwrap().is_ok());
+        assert!(shared.callback_started.load(Ordering::SeqCst));
+        drop(auth_a);
+        drop(auth_b);
+        idp_a.join().unwrap();
+        idp_b.join().unwrap();
     }
 }
 

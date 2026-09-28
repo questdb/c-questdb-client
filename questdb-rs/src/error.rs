@@ -408,6 +408,14 @@ impl Error {
     /// Transport adapters use this when an error must become retryable or gain
     /// endpoint context. Constructing a fresh [`Error`] there would silently
     /// discard OIDC, QWP, and query-side diagnostic payloads.
+    #[cfg_attr(
+        not(any(
+            feature = "_sender-http",
+            feature = "_sender-qwp-ws",
+            feature = "_egress"
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn reclassified<S: Into<String>>(mut self, code: ErrorCode, msg: S) -> Self {
         self.0.code = code;
         self.0.msg = msg.into();

@@ -381,7 +381,7 @@ fn provider_shutdown_error() -> crate::Error {
 /// returns when its cancellation predicate fired before the provider answered.
 /// It says nothing about the provider or the server, so a caller that
 /// cancelled on a deadline can prefer the diagnostic it already holds.
-#[cfg(feature = "_egress")]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 pub(crate) fn is_provider_shutdown_error(err: &crate::Error) -> bool {
     err.code() == crate::ErrorCode::SocketError && err.msg() == PROVIDER_SHUTDOWN_MSG
 }

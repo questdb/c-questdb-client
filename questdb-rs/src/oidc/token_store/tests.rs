@@ -118,8 +118,75 @@ fn held_lock_scope_drop_is_infallible_when_marker_is_missing() {
     // embedding Python/C process. A normally constructed scope still removes
     // its marker; this deliberately malformed one simply has nothing to do.
     drop(HeldLockScope {
+        thread: os_thread_id(),
         lock: PathBuf::from("missing-lock-marker"),
     });
+}
+
+/// A nested store call inside `in_lock` must still recognise the lock its own
+/// thread holds when that thread's thread-locals were already destroyed -- a
+/// clear from a C `atexit` handler, a static destructor or a thread-local
+/// destructor. It used to miss the outer hold and wait out the lock budget on
+/// the non-reentrant process mutex it already owned, then fail with the
+/// credential still on disk.
+#[test]
+fn nested_lock_is_reentrant_during_thread_local_teardown() {
+    struct ClearOnThreadExit {
+        store: Arc<FileTokenStore>,
+        key: TokenStoreKey,
+        done: mpsc::Sender<(bool, Duration)>,
+    }
+
+    impl Drop for ClearOnThreadExit {
+        fn drop(&mut self) {
+            let started = Instant::now();
+            let store = &self.store;
+            let key = &self.key;
+            let result = store.in_lock(key, &mut || store.clear(key));
+            let _ = self.done.send((result.is_ok(), started.elapsed()));
+        }
+    }
+
+    std::thread_local! {
+        static CLEAR_ON_EXIT: std::cell::RefCell<Option<ClearOnThreadExit>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(
+        test_file_store(dir.path()).with_lock_timings(Duration::from_secs(3), MIN_LOCK_STALE),
+    );
+    let key = test_key();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let thread_store = Arc::clone(&store);
+    let thread_key = key.clone();
+    std::thread::spawn(move || {
+        // Register the destructor FIRST, so every thread-local the store
+        // touches afterwards is destroyed before it runs (destructors run in
+        // reverse registration order).
+        CLEAR_ON_EXIT.with(|slot| {
+            *slot.borrow_mut() = Some(ClearOnThreadExit {
+                store: Arc::clone(&thread_store),
+                key: thread_key.clone(),
+                done: done_tx,
+            });
+        });
+        thread_store.save(&thread_key, &test_token()).unwrap();
+        assert!(thread_store.load(&thread_key).unwrap().is_some());
+    })
+    .join()
+    .unwrap();
+
+    let (ok, elapsed) = done_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the thread-local destructor must report");
+    assert!(ok, "a nested clear during teardown must succeed");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a nested clear during teardown must not wait out the lock budget: {elapsed:?}"
+    );
+    assert!(store.load(&key).unwrap().is_none());
 }
 
 #[test]

@@ -66,7 +66,6 @@
 //! protocols) is a **frozen cross-language contract** shared with the QuestDB
 //! Java and Python clients, so a file written by one can be read by another.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, FileTimes, OpenOptions};
@@ -1924,52 +1923,88 @@ fn lock_process_cancellable<'a>(
     }
 }
 
-std::thread_local! {
-    /// Filesystem locks owned by this thread. `in_lock` actions are synchronous,
-    /// so this is a precise re-entrancy proof rather than a process-wide guess
-    /// based on the mere presence of a lock pathname.
-    static HELD_LOCKS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+/// Filesystem locks owned by each live thread, keyed by the OS thread id.
+/// `in_lock` actions are synchronous, so this is a precise re-entrancy proof
+/// rather than a process-wide guess based on the mere presence of a lock
+/// pathname.
+///
+/// Deliberately NOT a `thread_local!`: a clear or token call can arrive from a
+/// C `atexit` handler, a static destructor or a thread-local destructor, after
+/// this thread's thread-locals were destroyed. `LocalKey::with` panics there
+/// (an abort under the FFI crate's `panic = "abort"`), and `try_with` cannot
+/// record the outer hold at all -- so the nested acquisition inside that same
+/// call then waited on the non-reentrant process mutex this thread already
+/// held, and failed after the lock budget. The OS thread id stays valid for as
+/// long as the thread runs, and every entry is removed by its RAII scope
+/// before the thread can exit, so an id is never reused while registered.
+static HELD_LOCKS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
+
+/// An identifier for the calling OS thread that needs no thread-local storage.
+fn os_thread_id() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: `pthread_self` has no preconditions and cannot fail.
+        (unsafe { libc::pthread_self() }) as usize
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: `GetCurrentThreadId` has no preconditions and cannot fail.
+        (unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }) as usize
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        hasher.finish() as usize
+    }
 }
 
-// Accessed with `try_with`, never `with`: a clear or token call can arrive
-// from a C `atexit` handler or a static destructor after this thread's
-// thread-locals were destroyed, where `with` panics -- an abort under the FFI
-// crate's `panic = "abort"`. A thread in that state holds no store lock.
+fn held_locks() -> std::sync::MutexGuard<'static, Vec<(usize, PathBuf)>> {
+    HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn current_thread_holds(lock: &Path) -> bool {
-    HELD_LOCKS
-        .try_with(|held| held.borrow().iter().any(|candidate| candidate == lock))
-        .unwrap_or(false)
+    let thread = os_thread_id();
+    held_locks()
+        .iter()
+        .any(|(holder, candidate)| *holder == thread && candidate == lock)
 }
 
 /// Marks the dynamic scope in which this thread owns a filesystem lock.
 struct HeldLockScope {
+    thread: usize,
     lock: PathBuf,
 }
 
 impl HeldLockScope {
     fn enter(lock: PathBuf) -> Self {
-        let _ = HELD_LOCKS.try_with(|held| {
-            let mut held = held.borrow_mut();
-            debug_assert!(!held.contains(&lock));
-            held.push(lock.clone());
-        });
-        Self { lock }
+        let thread = os_thread_id();
+        let mut held = held_locks();
+        debug_assert!(
+            !held
+                .iter()
+                .any(|(holder, candidate)| *holder == thread && candidate == &lock)
+        );
+        held.push((thread, lock.clone()));
+        Self { thread, lock }
     }
 }
 
 impl Drop for HeldLockScope {
     fn drop(&mut self) {
-        let _ = HELD_LOCKS.try_with(|held| {
-            let mut held = held.borrow_mut();
-            // Drop must be infallible: the FFI crate is built with
-            // `panic = "abort"`, so an invariant-only `expect` here could turn a
-            // future bookkeeping bug into an interpreter abort during lock
-            // teardown. Construction always pushes today; if that invariant is
-            // ever broken, leaving no marker is already the desired state.
-            if let Some(position) = held.iter().rposition(|candidate| candidate == &self.lock) {
-                held.remove(position);
-            }
-        });
+        let mut held = held_locks();
+        // Drop must be infallible: the FFI crate is built with
+        // `panic = "abort"`, so an invariant-only `expect` here could turn a
+        // future bookkeeping bug into an interpreter abort during lock
+        // teardown. Construction always pushes today; if that invariant is
+        // ever broken, leaving no marker is already the desired state.
+        if let Some(position) = held
+            .iter()
+            .rposition(|(holder, candidate)| *holder == self.thread && candidate == &self.lock)
+        {
+            held.remove(position);
+        }
     }
 }
 

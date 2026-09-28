@@ -796,6 +796,9 @@ public:
 
     /** Install a serialized persistence diagnostic handler. The callback may
      * run on a background token-provider thread and must return promptly.
+     * Diagnostics are best-effort: one that cannot start within 5 seconds
+     * because a sibling auth's diagnostic callback is still running is
+     * dropped rather than delivered.
      * Acquisition-taking auth/transport operations sharing this handler are
      * rejected while it runs, with the same per-operation error classes as
      * `event_handler` documents (`invalid_api_call` for sign_in/clear, the
