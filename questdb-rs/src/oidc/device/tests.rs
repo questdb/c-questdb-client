@@ -726,7 +726,7 @@ fn clear_fails_fast_behind_an_interactive_sign_in() {
 }
 
 #[test]
-fn close_cancels_file_store_lock_wait() {
+fn close_does_not_cancel_an_active_clear_waiting_for_the_file_store() {
     let dir = TempDir::new().unwrap();
     let store = test_file_store(dir.path());
     let auth = Arc::new(
@@ -790,10 +790,10 @@ fn close_cancels_file_store_lock_wait() {
         closed_promptly,
         "close waited for the held token-store lock"
     );
-    assert_eq!(
-        clear.join().unwrap().unwrap_err().kind(),
-        OidcErrorKind::Cancelled
-    );
+    clear
+        .join()
+        .unwrap()
+        .expect("a clear already waiting for the store lock must finish after close");
 }
 
 /// Reserve a loopback port with no listener, so connects to it are refused
@@ -4738,9 +4738,8 @@ fn a_device_grant_that_returns_an_expired_token_fails_the_sign_in() {
         }
     }
 
-    // No refresh token: nothing can renew this, so it is a dead end rather
-    // than one extra round trip. The recoverable shape is pinned separately by
-    // `an_expired_token_with_a_refresh_token_still_signs_in`.
+    // Without a refresh token there is no recovery, but even a refresh token
+    // must not make an already-expired JWT an apparently successful sign-in.
     let mock = MockServer::start(move |method, path, _body| match (method, path) {
         ("POST", "/device") => (200, device_response()),
         ("POST", "/token") => (
@@ -4774,7 +4773,7 @@ fn a_device_grant_that_returns_an_expired_token_fails_the_sign_in() {
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     let msg = err.to_string();
     assert!(msg.contains("already expired"), "{msg}");
-    assert!(msg.contains("no refresh token"), "{msg}");
+    assert!(msg.contains("clock"), "{msg}");
     // Not the missing-kind message: the kind IS present, so pointing the user
     // at their scope would send them after the wrong thing.
     assert!(!msg.contains("no access_token"), "{msg}");
@@ -4796,13 +4795,9 @@ fn a_device_grant_that_returns_an_expired_token_fails_the_sign_in() {
 }
 
 #[test]
-fn an_expired_token_with_a_refresh_token_still_signs_in() {
-    // The boundary of the guard above, and a live constraint: three Python
-    // integration tests reach the refresh path by signing in with exactly this
-    // shape. An IdP issuing a short-lived access token alongside a refresh
-    // token is ordinary, and the next `token()` renews it without a prompt --
-    // one extra round trip, not a dead end. Refusing it here would be a
-    // regression, not a fix.
+fn an_expired_token_with_a_refresh_token_is_refreshed_before_success() {
+    // An IdP can issue a one-off stale token. One immediate refresh can rescue
+    // the sign-in; it must not announce success until it has a usable token.
     let mock = MockServer::start(move |method, path, body| match (method, path) {
         ("POST", "/device") => (200, device_response()),
         ("POST", "/token") if body.contains("grant_type=refresh_token") => (
@@ -4821,10 +4816,41 @@ fn an_expired_token_with_a_refresh_token_still_signs_in() {
     let auth = auth_with_store(&mock, dir.path());
 
     auth.sign_in()
-        .expect("a refreshable credential must sign in");
-    // ...and the very next call renews it silently rather than demanding a
-    // second sign-in.
+        .expect("the immediate refresh returned a usable token");
     assert_eq!(auth.token().unwrap(), "AT-fresh");
+}
+
+#[test]
+fn consistently_expired_refresh_jwts_fail_sign_in_with_clock_diagnostic() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_count = Arc::clone(&refresh_calls);
+    let mock = MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => {
+            if body.contains("grant_type=refresh_token") {
+                refresh_count.fetch_add(1, Ordering::SeqCst);
+            }
+            (
+                200,
+                format!(
+                    r#"{{"access_token":"{ALREADY_EXPIRED_JWT}","refresh_token":"RT-1","expires_in":300}}"#
+                ),
+            )
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let auth = auth_with_store(&mock, dir.path());
+    let err = auth
+        .sign_in()
+        .expect_err("a second expired JWT must fail sign-in");
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert!(err.to_string().contains("clock"));
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+    assert!(auth.token().is_err());
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+    assert!(test_file_store(dir.path()).load(&key).unwrap().is_none());
 }
 
 #[test]
@@ -5104,6 +5130,35 @@ fn clear_after_close_still_deletes_the_persisted_entry() {
         reader.load(&key).unwrap().is_none(),
         "the persisted credential survived clear() after close()"
     );
+}
+
+#[test]
+fn clear_started_before_close_still_removes_persisted_credentials() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let reader = test_file_store(dir.path());
+    let key = key_for(&mock);
+    let auth = Arc::new(auth_with_store(&mock, dir.path()));
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    let busy_refresh = auth.lock_acquire();
+    let clearing_auth = Arc::clone(&auth);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let clear = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        clearing_auth.try_clear()
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    auth.signal_close();
+    drop(busy_refresh);
+    clear
+        .join()
+        .unwrap()
+        .expect("a live-started clear must outlive close");
+    assert!(reader.load(&key).unwrap().is_none());
 }
 
 #[test]

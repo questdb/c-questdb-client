@@ -55,7 +55,8 @@ use super::qwp_ws_driver::{
     QwpWsCounters, QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore,
     QwpWsReconnectState, QwpWsReconnectStep, QwpWsSendCore, QwpWsTransportFailureAction,
     ReconnectPolicy, ReconnectReason, TransportFailure, TransportPoll, TransportResponse,
-    reconnect_error_is_terminal, reconnect_sleep_duration, retry_budget_exhausted_error,
+    reconnect_error_is_foreground_terminal, reconnect_error_is_terminal, reconnect_sleep_duration,
+    retry_budget_exhausted_error,
 };
 use super::qwp_ws_orphan::{
     ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, is_candidate_orphan,
@@ -4121,7 +4122,7 @@ fn connect_blocking_transport_with_retry(
                     connected,
                 ));
             }
-            Err(err) if reconnect_error_is_terminal(&err) => return Err(err),
+            Err(err) if reconnect_error_is_foreground_terminal(&err) => return Err(err),
             Err(err) => {
                 let role_reject = is_qwp_ws_role_reject_error(&err);
                 last_error = Some(err);

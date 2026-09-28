@@ -329,6 +329,9 @@ public:
      *         while a callback of this state is running (see
      *         `builder::event_handler`).
      */
+    // With a registered renderer, concurrent sign_in() on this provider is
+    // rejected with invalid_api_call, regardless of callback timing. Without
+    // one, native sign-in queues and the second caller reuses the cached token.
     void sign_in() const
     {
         detail::wrapped_call(::questdb_oidc_auth_sign_in, raw());
@@ -368,8 +371,11 @@ public:
      * Not a copy. The token cache, the persisted entry and the closed state are
      * shared by every handle `share()` produces and by every sender, reader and
      * pool attached to any of them, so `clear()` on one removes the credential
-     * for all, and `close()` on one closes all. Contrast
-     * `line_sender_opts::clone`, which does produce an independent value.
+     * for all, and `close()` on one closes all. Event and diagnostic callback
+     * delivery is shared too: detaching either callback on any clone silences
+     * all handles. Do not detach a temporary clone while another handle still
+     * needs prompts or diagnostics. Contrast `line_sender_opts::clone`, which
+     * does produce an independent value.
      *
      * Each handle must be destroyed independently; destroying one leaves the
      * others usable.
@@ -417,7 +423,9 @@ public:
      * operation could deadlock when the callback delegates close to that thread
      * and joins it. Publishing does not wait for that authentication operation,
      * though it may briefly contend with wait registration. A later close after
-     * the callback returns performs the drain.
+     * the callback returns performs the drain. An active clear waiting for a
+     * persisted-store lock is not cancelled and may finish deleting the entry
+     * after close returns.
      *
      * Closing is TERMINAL for every attached transport, not merely a state they
      * observe. Closing is monotonic, so each sender, reader and pool built from
@@ -444,7 +452,8 @@ public:
      * cross-target callback drain is bounded to avoid AB/BA deadlock, while
      * suppression remains exact. The caller must be able to wait for arbitrary
      * user callback code; finalizers and shutdown hooks must use
-     * `detach_events_nowait()`. Idempotent and safe on a moved-from handle.
+     * `detach_events_nowait()`. Detaching this handle also suppresses events
+     * for every handle from `share()`. Idempotent and safe on a moved-from handle.
      */
     void detach_events() const noexcept
     {
@@ -455,7 +464,8 @@ public:
      * Stop later renderer events without waiting for a callback that is already
      * running. This is the safe form for finalizers and managed-runtime
      * shutdown hooks. Suppression remains exact; only the callback drain is
-     * best-effort. Idempotent and safe on a moved-from handle.
+     * best-effort. All `share()` handles are affected. Idempotent and safe
+     * on a moved-from handle.
      */
     void detach_events_nowait() const noexcept
     {
@@ -470,8 +480,8 @@ public:
      *
      * The caller must hold no lock the diagnostic callback might acquire. A
      * finalizer or garbage-collection hook cannot establish that and must use
-     * `detach_diagnostics_nowait()` instead. Idempotent and safe on a
-     * moved-from handle.
+     * `detach_diagnostics_nowait()` instead. This also silences diagnostics
+     * on all `share()` handles. Idempotent and safe on a moved-from handle.
      */
     void detach_diagnostics() const noexcept
     {
@@ -479,8 +489,8 @@ public:
     }
 
     /**
-     * Stop later persistence diagnostics without waiting for a callback that
-     * is already running. This is the safe form for finalizers and collection
+     * Stop later persistence diagnostics (also on all `share()` handles)
+     * without waiting for a callback that is already running. This is the safe form for finalizers and collection
      * hooks, which can run while their thread owns an arbitrary runtime lock.
      * Idempotent and safe on a moved-from handle.
      */

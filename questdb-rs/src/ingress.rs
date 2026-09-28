@@ -103,7 +103,7 @@ pub(crate) use sender::ReconnectReason;
 #[cfg(feature = "_sync-sender")]
 pub use sender::*;
 #[cfg(feature = "sync-sender-qwp-ws")]
-pub(crate) use sender::{reconnect_backoff_step, reconnect_error_is_terminal};
+pub(crate) use sender::{reconnect_backoff_step, reconnect_error_is_foreground_terminal};
 
 mod decimal;
 pub use decimal::DecimalView;

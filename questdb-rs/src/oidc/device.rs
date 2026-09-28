@@ -275,6 +275,17 @@ impl Drop for InteractiveGuard<'_> {
     }
 }
 
+/// An active clear owns the acquisition lock but may wait for a peer's
+/// persisted-identity lock. Close must not block on that external lock, nor
+/// cancel the clear and leave a rotated credential behind.
+struct ClearGuard<'a>(&'a AtomicBool);
+
+impl Drop for ClearGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, AtomicOrdering::Release);
+    }
+}
+
 /// The RFC 8628 device-authorization response (device code is a secret used only
 /// in the poll body, never displayed).
 struct DeviceResponse {
@@ -588,6 +599,7 @@ impl OidcDeviceAuthBuilder {
             tokens: Mutex::new(None),
             acquire: Mutex::new(()),
             interactive_in_progress: AtomicBool::new(false),
+            clear_in_progress: AtomicBool::new(false),
             sign_in_cancelled: AtomicBool::new(false),
             token_store: self.token_store,
             store_key,
@@ -628,7 +640,8 @@ impl OidcDeviceAuthBuilder {
 /// thread-safe and aborts only the current interactive device flow, leaving the
 /// provider and attached transports usable. [`close`](Self::close) is the
 /// permanent operation: it wakes device-poll and bundled file-store lock waits,
-/// then waits for the operation to leave the acquisition critical section.
+/// then waits for token work to leave the acquisition critical section; an
+/// active `clear` can finish deleting persisted credentials after close returns.
 pub struct OidcDeviceAuth {
     // An acquisition lock may be held by a thread that disappears at fork.
     // Never enter any of this instance's locks in a different process.
@@ -655,6 +668,8 @@ pub struct OidcDeviceAuth {
     /// Set only around the device flow so token() can distinguish a long human
     /// interaction from the short silent-refresh work that precedes it.
     interactive_in_progress: AtomicBool,
+    /// A clear that owns `acquire`, including its bounded persisted-store wait.
+    clear_in_progress: AtomicBool,
     /// Cancellation signal for only the current interactive device flow. It is
     /// reset before and after every flow and never changes `closed`.
     sign_in_cancelled: AtomicBool,
@@ -763,6 +778,8 @@ impl OidcDeviceAuth {
     /// The signal is permanent and shared by every `Arc`/FFI clone and attached
     /// transport. An HTTP request already in flight is not cancelled at the
     /// transport layer, so this waits for that bounded request to return.
+    /// An already-active `clear` waiting on a persisted-store lock continues
+    /// after close returns: close never interrupts deletion of credentials.
     /// Idempotent. After `fork()`, an inherited provider cannot safely enter
     /// any of its locks; this infallible method returns without draining it.
     /// Fallible operations reject it, and a child must `exec()` before using
@@ -786,11 +803,29 @@ impl OidcDeviceAuth {
         }
         self.signal_close();
 
-        // Match the Java lifecycle: close does not return while token work can
-        // still mutate this instance. The active operation observes `closed`
-        // between blocking steps and releases this lock promptly.
-        let _acq = self.lock_acquire();
-        self.discard_credentials();
+        // Token work observes `closed` and leaves promptly. A clear, however,
+        // must finish deleting the persisted credential even if a peer holds
+        // its store lock. Never make close wait for that external lock. Poll
+        // rather than blocking on `acquire`: clear may enter between the first
+        // try_lock and the next attempt, and must still be able to signal us.
+        loop {
+            if self.clear_in_progress.load(AtomicOrdering::Acquire) {
+                self.discard_credentials();
+                return;
+            }
+            match self.acquire.try_lock() {
+                Ok(_guard) => {
+                    self.discard_credentials();
+                    return;
+                }
+                Err(TryLockError::Poisoned(error)) => {
+                    let _guard = error.into_inner();
+                    self.discard_credentials();
+                    return;
+                }
+                Err(TryLockError::WouldBlock) => std::thread::sleep(ACQUIRE_WAIT_POLL_SLICE),
+            }
+        }
     }
 
     /// Drop the in-memory credential without waiting for the acquisition lock.
@@ -1084,16 +1119,18 @@ impl OidcDeviceAuth {
         let _acq = if started_closed {
             self.acquire_for_teardown(abort_wait)?
         } else {
-            // Never behind a device flow: it holds the acquisition lock for up
-            // to the whole device-code lifetime (30 minutes), and a caller
-            // blocked here has no way out short of `close()`. A binding that
-            // released its runtime lock around this call (the GIL, say) would
-            // also have no signal delivery for all of it.
-            self.acquire_for_operation(abort_wait, InteractiveHolder::Fail)?
+            // Never wait behind a device flow. If close interrupts the wait
+            // behind a *short* refresh, however, continue as teardown instead
+            // of abandoning a clear that already started: the refresh may
+            // have just rotated and persisted a live credential.
+            match self.acquire_for_operation(abort_wait, InteractiveHolder::Fail) {
+                Ok(guard) => guard,
+                Err(_) if self.is_closed() => self.acquire_for_teardown(abort_wait)?,
+                Err(error) => return Err(error),
+            }
         };
-        if !started_closed {
-            self.ensure_open()?;
-        }
+        self.clear_in_progress.store(true, AtomicOrdering::Release);
+        let _clearing = ClearGuard(&self.clear_in_progress);
         *self.lock_tokens() = None;
         {
             let mut state = self.lock_store_state();
@@ -1105,18 +1142,13 @@ impl OidcDeviceAuth {
         if let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) {
             // Delete under the per-identity lock so it serialises against a peer's
             // in-flight save (which writes under the same lock).
-            // A clear that began on a live provider stays cancellable by a
-            // concurrent close. One that began after close must not be: that
-            // predicate is permanently true by then and would abort the delete
-            // before it started. The store's own bounded lock wait still bounds
-            // this.
-            let cancelled = || !started_closed && self.is_closed();
-            let outcome = store.in_lock_cancellable(key, &cancelled, &mut || {
-                store.clear_cancellable(key, &cancelled)
+            // Close drops the in-memory token, not the persisted entry. Once a
+            // clear owns the acquisition lock, it must delete even if close is
+            // published during the bounded per-identity store lock wait.
+            let never_cancel = || false;
+            let outcome = store.in_lock_cancellable(key, &never_cancel, &mut || {
+                store.clear_cancellable(key, &never_cancel)
             });
-            if !started_closed {
-                self.ensure_open()?;
-            }
             if let Err(e) = outcome {
                 clear_error = Some(OidcError::network(format!(
                     "Failed to delete persisted OIDC credentials: {e}"
@@ -2685,17 +2717,32 @@ impl OidcDeviceAuth {
                     // dead credential, and the caller's very next request said
                     // no usable token was available and to call `sign_in()` --
                     // which is what they had just done.
-                    // A refresh token makes an expired set recoverable: the
-                    // next `token()` mints a usable one without a prompt, which
-                    // is the ordinary shape for an IdP issuing a short-lived
-                    // access token. Only a set with nothing to recover with is
-                    // a dead end.
-                    if self.is_usable(&tokens) || tokens.refresh_token.is_some() {
+                    // A refresh token can rescue an IdP's *one-off* stale JWT,
+                    // but a skewed host sees every newly issued JWT as expired.
+                    // Probe exactly once, before reporting SUCCESS or persisting
+                    // a credential that token() cannot serve. This also keeps
+                    // the old short-lived-token recovery path working.
+                    if self.is_usable(&tokens) {
                         return Ok(tokens);
+                    }
+                    if tokens.refresh_token.is_some() {
+                        match self.refresh(&tokens) {
+                            Ok(refreshed) if self.is_usable(&refreshed) => {
+                                return Ok(refreshed);
+                            }
+                            Err(error) => {
+                                self.renderer.on_failure(
+                                    "Sign-in failed: the expired token could not be refreshed.",
+                                );
+                                return Err(error);
+                            }
+                            Ok(_) => {} // persistent expiry: likely clock skew
+                        }
                     }
                     self.renderer.on_failure(
                         "Sign-in failed: the identity provider returned a token that \
-                         had already expired, and no refresh token to renew it with.",
+                         had already expired. Check this host's clock against \
+                         the identity provider's clock.",
                     );
                     return Err(self.expired_on_issue_error());
                 }
@@ -2873,8 +2920,9 @@ impl OidcDeviceAuth {
     fn expired_on_issue_error(&self) -> OidcError {
         OidcError::device_flow(format!(
             "Device authorization completed, but the {} the IdP returned had \
-             already expired and it issued no refresh token to renew it with. \
-             Check this host's clock against the identity provider's; if they \
+             already expired. A refresh token cannot make sign-in succeed if \
+             each rotated JWT is expired on this host. Check this host's clock \
+             against the identity provider's; if they \
              agree, the provider issued a stale token.",
             if self.config.groups_in_token {
                 "id_token"

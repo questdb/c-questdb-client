@@ -82,7 +82,7 @@ use crate::ingress::{
     )),
     allow(unused_imports)
 )]
-use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
+use crate::ingress::{reconnect_backoff_step, reconnect_error_is_foreground_terminal};
 use crate::{Result, error};
 
 /// Connect-string parsing for the [`QuestDb`] pool. Shared by every borrow
@@ -1730,7 +1730,8 @@ impl<'a> DirectSenderHandle<'a> {
             match self.reborrow_from_pool() {
                 Ok(()) => return Ok(()),
                 Err(e)
-                    if reconnect_error_is_terminal(&e) || reconnect_deadline_expired(deadline) =>
+                    if reconnect_error_is_foreground_terminal(&e)
+                        || reconnect_deadline_expired(deadline) =>
                 {
                     return Err(e);
                 }
@@ -2966,7 +2967,10 @@ fn reconnect_pick<S>(
     loop {
         match pick(inner) {
             Ok(cs) => return Ok(cs),
-            Err(e) if reconnect_error_is_terminal(&e) || reconnect_deadline_expired(deadline) => {
+            Err(e)
+                if reconnect_error_is_foreground_terminal(&e)
+                    || reconnect_deadline_expired(deadline) =>
+            {
                 return Err(e);
             }
             Err(e) => {

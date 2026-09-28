@@ -62,7 +62,8 @@ mod qwp_ws_driver;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws_driver::{
-    ReconnectPolicy, ReconnectReason, reconnect_backoff_step, reconnect_error_is_terminal,
+    ReconnectPolicy, ReconnectReason, reconnect_backoff_step,
+    reconnect_error_is_foreground_terminal,
 };
 
 #[cfg(feature = "_sender-qwp-ws")]

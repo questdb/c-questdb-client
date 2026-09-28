@@ -380,31 +380,27 @@ impl SharedOidcAuth {
         }
     }
 
-    /// Acquire the per-auth sign-in gate without waiting through a callback
-    /// that the queued caller may be joined from. The callback and gate belong
-    /// to the same sign-in, so once this lock becomes available that callback
-    /// has returned; the second check closes the try-lock admission window.
+    /// Reject a concurrent C sign-in deterministically, instead of queuing
+    /// until a 5 ms sample happens to land in a renderer callback. In
+    /// particular a callback that joins this caller must never wait on the
+    /// first sign-in's gate. Python already rejects concurrent sign-ins.
     fn lock_sign_in_gate<'a>(
         &self,
         handler: &'a CEventHandler,
     ) -> Result<std::sync::MutexGuard<'a, ()>, Error> {
-        loop {
-            self.reject_callback_reentry()?;
-            match handler.sign_in_gate.try_lock() {
-                Ok(guard) => {
-                    self.reject_callback_reentry()?;
-                    return Ok(guard);
-                }
-                Err(std::sync::TryLockError::Poisoned(error)) => {
-                    let guard = error.into_inner();
-                    self.reject_callback_reentry()?;
-                    return Ok(guard);
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+        self.reject_callback_reentry()?;
+        let guard = match handler.sign_in_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "OIDC sign_in() is already in progress on this provider.",
+                ));
             }
-        }
+        };
+        self.reject_callback_reentry()?;
+        Ok(guard)
     }
 
     fn sign_in(&self) -> Result<(), Error> {
@@ -4710,6 +4706,32 @@ mod tests {
         assert!(!in_event_callback_of_on_this_thread(Some(&b)));
         // A handler-less auth is never inside its own callback.
         assert!(!in_event_callback_of_on_this_thread(None));
+    }
+
+    #[test]
+    fn concurrent_sign_in_rejects_before_any_callback_runs() {
+        let handler = Arc::new(CEventHandler::new(event_target(ignore_event, 0, None)));
+        let inner = OidcDeviceAuth::builder()
+            .client_id("questdb-c")
+            .scope("openid")
+            .token_endpoint("https://idp.example.com/token")
+            .device_authorization_endpoint("https://idp.example.com/device")
+            .interactive(true)
+            .open_browser(false)
+            .build()
+            .unwrap();
+        let auth = SharedOidcAuth {
+            inner: Arc::new(inner),
+            event_handler: Some(Arc::clone(&handler)),
+            diagnostic: None,
+            token_provider_isolation: TokenProviderIsolation::default(),
+        };
+        // No event is active. Contention must still reject immediately, not
+        // wait for a 5 ms sample to land in a callback (or for flow expiry).
+        let _first = handler.sign_in_gate.lock().unwrap();
+        let err = auth.lock_sign_in_gate(&handler).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("already in progress"));
     }
 
     #[test]

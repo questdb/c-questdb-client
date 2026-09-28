@@ -2623,6 +2623,23 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     )
 }
 
+/// Fail fast on a synchronous caller's own OIDC callback re-entry. Unlike a
+/// background reconnect, this caller cannot return from the callback until its
+/// borrow/connect call returns. Do not classify it as a terminal *driver*
+/// error: store-and-forward frames must remain replayable after the callback.
+pub(crate) fn reconnect_error_is_foreground_terminal(err: &Error) -> bool {
+    if reconnect_error_is_terminal(err) {
+        return true;
+    }
+    #[cfg(feature = "_oidc")]
+    if err.oidc_error().is_some_and(|oidc| {
+        oidc.kind() == crate::oidc::OidcErrorKind::InteractionRequired && !oidc.acquisition_busy()
+    }) {
+        return true;
+    }
+    false
+}
+
 pub(super) fn is_qwp_ws_role_reject_error(err: &Error) -> bool {
     err.qwp_ws_role_reject().is_some()
 }
@@ -4634,6 +4651,20 @@ mod tests {
         // without dragging every other `InvalidApiCall` with it.
         assert_eq!(error.code(), ErrorCode::ConfigError);
         assert!(reconnect_error_is_terminal(&error));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn foreground_reentry_fails_fast_without_terminalizing_replay() {
+        let reentry = crate::oidc::OidcError::reentrant_interaction_required(
+            "OIDC authentication cannot be re-entered",
+        );
+        assert!(reconnect_error_is_foreground_terminal(&reentry));
+        assert!(!reconnect_error_is_terminal(&reentry));
+        let busy = crate::oidc::OidcError::retryable_interaction_required(
+            "another thread is rendering the prompt",
+        );
+        assert!(!reconnect_error_is_foreground_terminal(&busy));
     }
 
     #[test]

@@ -457,7 +457,10 @@ questdb_oidc_auth* questdb_oidc_builder_build(
  * and the closed state are shared by every handle and by every attached sender,
  * reader and pool. `questdb_oidc_auth_clear` on any handle therefore removes
  * the credential for all of them, and `questdb_oidc_auth_close` on any handle
- * permanently closes all of them.
+ * permanently closes all of them. Event and diagnostic callbacks are also
+ * shared: detaching either callback on a clone silences it on the original,
+ * every other clone, and attached transports. Do not detach a temporary clone
+ * while another handle still needs to present sign-in prompts or diagnostics.
  *
  * Both the original and the clone must be freed with
  * `questdb_oidc_auth_free`; freeing one does not disturb the other.
@@ -475,7 +478,10 @@ questdb_oidc_auth* questdb_oidc_auth_clone(
  * deadlock two threads against each other's callback gates; suppression remains
  * exact. Idempotent, NULL-tolerant, and callable from any thread. Auths built
  * from the same reusable builder are unaffected: they keep delivering, and this
- * call waits only for THIS auth's callback, never for a sibling's.
+ * call waits only for THIS auth's callback, never for a sibling's. All handles
+ * made with `questdb_oidc_auth_clone` share THIS auth's callback: detaching any
+ * one suppresses prompts and completion events for all of them. Merely freeing
+ * a clone does not detach callbacks.
  *
  * Use this form only when the caller can wait for arbitrary user callback
  * code to return. The caller must not delegate this call to another thread and
@@ -497,7 +503,8 @@ void questdb_oidc_auth_detach_events(const questdb_oidc_auth* auth);
  * hooks, interpreter shutdown hooks, and other contexts that cannot wait for
  * arbitrary user callback code.
  *
- * Auths built from the same reusable builder are unaffected.
+ * Auths built from the same reusable builder are unaffected. Clones of this
+ * auth ARE affected (see `questdb_oidc_auth_detach_events`).
  */
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_detach_events_nowait(const questdb_oidc_auth* auth);
@@ -538,6 +545,8 @@ void questdb_oidc_auth_detach_events_nowait(const questdb_oidc_auth* auth);
  *
  * Auths built from the same builder are unaffected and keep delivering; this
  * call waits only for THIS auth's diagnostic callback, never for a sibling's.
+ * Handles from `questdb_oidc_auth_clone` are NOT independent auths: detaching
+ * on one silences diagnostics on all its clones and attached transports.
  */
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_detach_diagnostics(const questdb_oidc_auth* auth);
@@ -554,7 +563,8 @@ void questdb_oidc_auth_detach_diagnostics(const questdb_oidc_auth* auth);
  * This is the form for a finalizer or garbage-collection hook: it runs
  * wherever a collection happened to fire, so it cannot prove which locks the
  * thread already holds, and the waiting form would deadlock against any of
- * them that the callback also needs.
+ * them that the callback also needs. As with the waiting form, all clones of
+ * this auth lose diagnostic delivery.
  */
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_detach_diagnostics_nowait(const questdb_oidc_auth* auth);
@@ -614,8 +624,10 @@ bool questdb_oidc_auth_cancel_sign_in(
  * it instead returns as soon as close is published, regardless of which thread
  * calls it: a callback may delegate close to a worker and join that worker, so
  * draining there would deadlock just as it would on the callback thread itself.
- * Activity on an independent auth built from the same reusable builder does not
- * skip this auth's drain. Unlike `sign_in`, `token` and `clear`, close is never
+ * An already-active clear waiting for a persisted-store lock also continues
+ * after close returns, so a rotated credential is still deleted when that lock
+ * becomes available. Activity on an independent auth built from the same
+ * reusable builder does not skip this auth's drain. Unlike `sign_in`, `token` and `clear`, close is never
  * rejected as callback re-entry.
  *
  * The in-memory credential is dropped on every path, including the
@@ -643,7 +655,11 @@ bool questdb_oidc_auth_close(
  * Run the interactive device flow when no cached or silently refreshable token
  * is available. This is the only auth operation that may display a prompt and
  * wait for user authorization; call it on a suitable UI thread before starting
- * attached transports.
+ * attached transports. When a renderer is registered, a concurrent sign-in
+ * on the same auth fails immediately with `questdb_error_invalid_api_call`
+ * ("sign_in() is already in progress"), regardless of whether the first
+ * sign-in is currently rendering an event. Without a renderer, a second
+ * sign-in queues behind the first and reuses its cached credential.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_auth_sign_in(
