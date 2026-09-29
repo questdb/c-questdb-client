@@ -1694,9 +1694,12 @@ typedef struct qwp_arrow_override
  * designated timestamp and silently substitute server arrival time,
  * producing wrong partitions/order.
  *
- * Ownership: same contract as `qwp_chunk_append_arrow_column`
- * — on success `array->release` is consumed (set to NULL); on failure
- * it may also have been consumed. Callers MUST check
+ * Ownership: on success `array->release` is consumed (set to NULL). A
+ * failure detected before the Arrow import step leaves `array->release`
+ * intact. Once import begins, a failure consumes it, except that a failure
+ * with `line_sender_error_in_doubt == false` re-exports the batch into
+ * `*array` on a best-effort basis so the caller can retry with the same
+ * data. The error code does not determine ownership; callers MUST check
  * `array->release != NULL` before invoking it on the failure path.
  * `schema` is borrowed in all cases.
  *
@@ -1800,10 +1803,9 @@ bool qwp_sender_flush_arrow_batch_at_column(
 /**
  * `qwp_sender_flush_arrow_batch_at_now` on a direct sender: publish without
  * waiting, with the first-flush behavior of `qwp_direct_sender_flush`.
- * Same Arrow ownership contract: `array->release` is consumed on success and
- * re-exported on a provably-not-delivered failure
- * (`line_sender_error_failover_retry` with `line_sender_error_in_doubt ==
- * false`); callers MUST check `array->release != NULL` on the failure path.
+ * Same Arrow ownership contract as `qwp_sender_flush_arrow_batch_at_now`:
+ * the error code does not determine ownership; callers MUST check
+ * `array->release != NULL` on the failure path.
  */
 QUESTDB_CLIENT_API
 bool qwp_direct_sender_flush_arrow_batch_at_now(
