@@ -5013,43 +5013,6 @@ unsafe fn validate_arrow_root_headers(
 }
 
 #[cfg(feature = "arrow")]
-unsafe fn validate_parsed_column_types(
-    schema: *const arrow::ffi::FFI_ArrowSchema,
-    root_kind: ArrowImportRootKind,
-) -> questdb::Result<()> {
-    unsafe {
-        let root_format = arrow_format_str(schema, "root")?;
-        if root_kind == ArrowImportRootKind::RecordBatchEnvelope && root_format == "+s" {
-            let children = (*schema).children;
-            for i in 0..(*schema).n_children as usize {
-                let segments = [ArrowPathSegment::Child(i)];
-                let path = ArrowPath(&segments);
-                // RAW-READ AUDIT: pass 2 already checked the root cap, entire
-                // fan-out budget, non-NULL pointer, and every shallow node.
-                // Pointer-array allocation remains a producer obligation.
-                let child = *children.add(i);
-                let data_type = arrow::datatypes::DataType::try_from(&*child).map_err(|err| {
-                    arrow_ingest_err(format!(
-                        "Arrow schema {path}: datatype conversion failed: {err}"
-                    ))
-                })?;
-                reject_overflowing_fixed_size(&data_type)?;
-                validate_arrow_column_data_type(&data_type, &path)?;
-            }
-        } else {
-            let data_type = arrow::datatypes::DataType::try_from(&*schema).map_err(|err| {
-                arrow_ingest_err(format!(
-                    "Arrow schema root: datatype conversion failed: {err}"
-                ))
-            })?;
-            reject_overflowing_fixed_size(&data_type)?;
-            validate_arrow_column_data_type(&data_type, "root")?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "arrow")]
 fn checked_arrow_parent_end(
     path: &(impl std::fmt::Display + ?Sized),
     offset: i64,
@@ -5221,6 +5184,10 @@ unsafe fn validate_arrow_array_depth_after_schema(
             bool,
         )> = Vec::new();
         let mut total: usize = 0;
+        // Each column is the root itself, or a root child of a
+        // record-batch envelope.
+        let envelope_root = root_kind == ArrowImportRootKind::RecordBatchEnvelope
+            && arrow_format_str(schema, "root")? == "+s";
         try_reserve_one(&mut stack)?;
         stack.push((array, schema, 0, None, false));
         while let Some((a, s, depth, segment, dictionary_value)) = stack.pop() {
@@ -5300,6 +5267,14 @@ unsafe fn validate_arrow_array_depth_after_schema(
                 )));
             }
             reject_overflowing_fixed_size(&data_type)?;
+            let is_column = if envelope_root {
+                depth == 1 && !dictionary_value
+            } else {
+                depth == 0
+            };
+            if is_column {
+                validate_arrow_column_data_type(&data_type, &path)?;
+            }
             validate_arrow_buffer_layout(a, &data_type, parsed_model, &path)?;
 
             let expects_dictionary = parsed_model.conversion == ArrowConversionCategory::Dictionary;
@@ -5457,10 +5432,8 @@ unsafe fn validate_arrow_preflight(
         // child/dictionary pointers are traversed.
         let mut metadata_budget = ArrowMetadataBudget::new()?;
         validate_arrow_schema_depth_with_budget(schema, root_kind, &mut metadata_budget)?;
-        // Pass 3: semantic parse and exhaustive supported-column model. No
-        // array has been imported or materialized yet.
-        validate_parsed_column_types(schema, root_kind)?;
-        // Pass 4: schema/array cross-walk, exact buffers, and slice proof.
+        // Pass 3: schema/array cross-walk, supported column types, exact
+        // buffers, and slice proof. No array is imported or materialized yet.
         validate_arrow_array_depth_after_schema(array, schema, root_kind)
     }
 }
