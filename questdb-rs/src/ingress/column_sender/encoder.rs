@@ -1307,6 +1307,9 @@ fn is_valid_row(validity: Option<&ValidityDescriptor>, i: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::wire::{
+        QWP_TYPE_DECIMAL64, QWP_TYPE_DECIMAL128, QWP_TYPE_DECIMAL256, QWP_TYPE_DOUBLE_ARRAY,
+    };
     use super::*;
     use crate::ingress::TimestampUnit;
     use crate::ingress::column_sender::Validity;
@@ -1328,6 +1331,151 @@ mod tests {
         let mut scratch = EncodeScratch::new();
         encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap();
         out
+    }
+
+    #[test]
+    fn native_decimal_wire_preserves_mantissas_scale_and_nulls() {
+        let d64 = [i64::MIN, 0, i64::MAX, -12345];
+        let d128 = [i64::MIN as i128, 0, u64::MAX as i128, -123_450_000_001];
+        let d256 = [
+            [0; 32],
+            [0x55; 32],
+            [0xff; 32],
+            std::array::from_fn(|i| i as u8),
+        ];
+        let bits = [0b1101];
+        let validity = Validity::from_bitmap(&bits, 4).unwrap();
+        for nullable in [false, true] {
+            let valid = nullable.then_some(&validity);
+            let mut chunk = Chunk::new("t");
+            chunk.column_decimal64("d64", &d64, 2, valid).unwrap();
+            chunk.column_decimal128("d128", &d128, 9, valid).unwrap();
+            chunk.column_decimal256("d256", &d256, 76, valid).unwrap();
+            let cases = [
+                (
+                    QWP_TYPE_DECIMAL64,
+                    2,
+                    d64.iter()
+                        .map(|v| v.to_le_bytes().to_vec())
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    QWP_TYPE_DECIMAL128,
+                    9,
+                    d128.iter().map(|v| v.to_le_bytes().to_vec()).collect(),
+                ),
+                (
+                    QWP_TYPE_DECIMAL256,
+                    76,
+                    d256.iter().map(|v| v.to_vec()).collect(),
+                ),
+            ];
+            for (column, (wire_type, scale, rows)) in chunk.columns.iter().zip(cases) {
+                assert_eq!(column.wire_type, wire_type);
+                let mut actual = Vec::new();
+                // SAFETY: typed source buffers and validity cover all four rows.
+                unsafe {
+                    encode_column(&mut actual, column, 4, 0, &[]).unwrap();
+                }
+                let mut expected = if nullable {
+                    vec![1, 0b0010, scale]
+                } else {
+                    vec![0, scale]
+                };
+                for (index, row) in rows.iter().enumerate() {
+                    if !nullable || index != 1 {
+                        expected.extend_from_slice(row);
+                    }
+                }
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn native_array_wire_preserves_shape_null_rows_and_nan_elements() {
+        for shape in [&[4][..], &[2, 3], &[2, 2, 2], &[1; 32]] {
+            let row_size: usize = shape.iter().map(|&n| n as usize).product();
+            // Distinct rows detect incorrect source offsets after a NULL row.
+            let mut values: Vec<f64> = (0..3 * row_size).map(|i| i as f64 - 2.5).collect();
+            values[0] = f64::NAN;
+            values[1] = u32::MAX as f64;
+            for mask in [None, Some(0b111), Some(0b101), Some(0)] {
+                let bits = [mask.unwrap_or(0b111)];
+                let validity = Validity::from_bitmap(&bits, 3).unwrap();
+                let mut chunk = Chunk::new("t");
+                chunk
+                    .column_f64_array("a", &values, 3, shape, mask.map(|_| &validity))
+                    .unwrap();
+                assert_eq!(chunk.columns[0].wire_type, QWP_TYPE_DOUBLE_ARRAY);
+                let mut actual = Vec::new();
+                // SAFETY: all three rows occupy a full shape, including NULL rows.
+                unsafe {
+                    encode_column(&mut actual, &chunk.columns[0], 3, 0, &[]).unwrap();
+                }
+                let mut expected = if bits[0] == 0b111 {
+                    vec![0]
+                } else {
+                    vec![1, bits[0] ^ 0b111]
+                };
+                for (row, values) in values.chunks_exact(row_size).enumerate() {
+                    if bits[0] & (1 << row) == 0 {
+                        continue;
+                    }
+                    expected.push(shape.len() as u8);
+                    for dimension in shape {
+                        expected.extend_from_slice(&dimension.to_le_bytes());
+                    }
+                    for value in values {
+                        expected.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                assert_eq!(actual, expected, "shape={shape:?}, validity={mask:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_columns_split_matches_fresh_tail_with_nulls() {
+        let d64: Vec<i64> = (0..24).map(|i| (i - 12) * 12345).collect();
+        let d128: Vec<i128> = d64.iter().map(|&v| v as i128 * 1_000_000_001).collect();
+        let d256: Vec<[u8; 32]> = (0..24).map(|i| [i; 32]).collect();
+        let arrays: Vec<f64> = (0..24 * 6).map(|i| i as f64 + 0.25).collect();
+        let ts: Vec<i64> = (0..24).collect();
+        let bits = [0b1111_1110, 0b1101_1011, 0b1011_1111];
+        let validity = Validity::from_bitmap(&bits, 24).unwrap();
+        let tail_validity = Validity::from_bitmap(&bits[1..], 16).unwrap();
+        let mut chunk = Chunk::new("t");
+        chunk
+            .column_decimal64("d64", &d64, 2, Some(&validity))
+            .unwrap();
+        chunk
+            .column_decimal128("d128", &d128, 9, Some(&validity))
+            .unwrap();
+        chunk
+            .column_decimal256("d256", &d256, 76, Some(&validity))
+            .unwrap();
+        chunk
+            .column_f64_array("a", &arrays, 24, &[2, 3], Some(&validity))
+            .unwrap();
+        chunk.at_nanos(&ts).unwrap();
+        // SAFETY: offset is byte aligned; all source buffers contain 24 rows.
+        let tail = unsafe { chunk.slice_rows(8, 16) };
+        let mut fresh = Chunk::new("t");
+        fresh
+            .column_decimal64("d64", &d64[8..], 2, Some(&tail_validity))
+            .unwrap();
+        fresh
+            .column_decimal128("d128", &d128[8..], 9, Some(&tail_validity))
+            .unwrap();
+        fresh
+            .column_decimal256("d256", &d256[8..], 76, Some(&tail_validity))
+            .unwrap();
+        fresh
+            .column_f64_array("a", &arrays[8 * 6..], 16, &[2, 3], Some(&tail_validity))
+            .unwrap();
+        fresh.at_nanos(&ts[8..]).unwrap();
+        assert_eq!(encode_fresh(&tail), encode_fresh(&fresh));
     }
 
     #[test]
