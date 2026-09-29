@@ -4034,18 +4034,10 @@ pub unsafe extern "C" fn qwp_direct_sender_flush_and_wait(
 /// batch — reaching for this entry point would discard that column's role
 /// as the designated timestamp and silently substitute server arrival time.
 ///
-/// Ownership: on success, `array->release` is consumed (set to NULL)
-/// and the function has invoked it internally. On a **transient,
-/// provably-not-delivered** (`line_sender_error_failover_retry` with
-/// `line_sender_error_in_doubt == false`) failure `array` is left intact
-/// (re-exported back into `*array` with a fresh `release`) so the caller
-/// can drop+re-borrow a live sender and retry with the same array. A
-/// delivery-unknown failure (a partial write that fails mid-frame: also
-/// `line_sender_error_failover_retry` but with `line_sender_error_in_doubt ==
-/// true`) is **not** re-exported, since replaying it could duplicate rows. On
-/// any failure `array->release` may have been consumed if the call reached the
-/// Arrow import step — callers MUST check `array->release != NULL` before
-/// invoking it on the failure path. `schema` is always borrowed.
+/// Ownership: success consumes `array->release`. On failure the batch is
+/// normally handed back (`release` non-NULL) unless the Arrow import itself
+/// failed or the error is `in_doubt`. Always check `array->release != NULL`
+/// before invoking it. `schema` is borrowed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 ///
@@ -4344,15 +4336,9 @@ pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_scalar_nanos(
 /// `request_durable_ack=on`) returns `line_sender_error_invalid_api_call` and
 /// leaves `array` untouched.
 ///
-/// Ownership differs from the publish-only flush on the failure path. On a
-/// failure that is provably **pre-publication** (validation, encode, size, or a
-/// transport error before any byte was written) the batch is re-exported back
-/// into `*array` with a fresh `release` so the caller can drop+re-borrow and
-/// retry. On any **post-publication** failure — including an ACK-wait or SFA
-/// no-progress timeout reported as `line_sender_error_failover_retry` — the
-/// batch is **not** re-exported (`array->release` stays NULL): delivery is
-/// unknown and a blind replay could duplicate rows. Callers MUST check
-/// `array->release != NULL` before invoking it on the failure path.
+/// Ownership: as the publish-only flush, except that after the import the
+/// batch is handed back only if nothing was published; after publication
+/// (including an ACK timeout) it stays consumed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 #[cfg(feature = "arrow")]

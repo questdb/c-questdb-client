@@ -1694,14 +1694,10 @@ typedef struct qwp_arrow_override
  * designated timestamp and silently substitute server arrival time,
  * producing wrong partitions/order.
  *
- * Ownership: on success `array->release` is consumed (set to NULL). A
- * failure detected before the Arrow import step leaves `array->release`
- * intact. Once import begins, a failure consumes it, except that a failure
- * with `line_sender_error_in_doubt == false` re-exports the batch into
- * `*array` on a best-effort basis so the caller can retry with the same
- * data. The error code does not determine ownership; callers MUST check
- * `array->release != NULL` before invoking it on the failure path.
- * `schema` is borrowed in all cases.
+ * Ownership: success consumes `array->release`. On failure the batch is
+ * normally handed back (`release` non-NULL) unless the Arrow import itself
+ * failed or the error is `in_doubt`. Always check `array->release != NULL`
+ * before invoking it. `schema` is borrowed.
  *
  * `overrides` (length `overrides_len`) optionally supplies per-column
  * wire-type hints. Pass `NULL, 0` for no overrides. Returns `false`
@@ -1762,15 +1758,9 @@ bool qwp_sender_flush_arrow_batch_at_now_and_get_fsn(
  * level returns `line_sender_error_invalid_api_call` and leaves `array`
  * untouched.
  *
- * Ownership differs from the publish-only flush on the failure path. On a
- * failure that is provably pre-publication (validation, encode, size, or a
- * transport error before any byte was written) the batch is re-exported back
- * into `*array` with a fresh `release` so the caller can retry on a fresh
- * sender. On any post-publication failure — including an ACK-wait or SFA
- * no-progress timeout reported as `line_sender_error_failover_retry` — the
- * batch is not re-exported (`array->release` stays NULL): delivery is unknown
- * and a blind replay could duplicate rows. Callers MUST check
- * `array->release != NULL` before invoking it on the failure path.
+ * Ownership: as `qwp_sender_flush_arrow_batch_at_now`, except that after the
+ * import the batch is handed back only if nothing was published; after
+ * publication (including an ACK timeout) it stays consumed.
  */
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_arrow_batch_at_now_and_wait(
