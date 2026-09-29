@@ -30,23 +30,25 @@
 //! resumes from the saved refresh token (one silent token-endpoint round-trip)
 //! instead of re-prompting.
 //!
-//! The default [`FileTokenStore`] writes one plaintext JSON file per identity,
-//! protected at rest by file permissions rather than encryption — the same
-//! approach `gcloud`, `aws` and `gh` take. **On Unix** that means a `0600` file
-//! in a `0700` directory, enforced on every write. **On other platforms**, and
-//! on any filesystem that cannot represent POSIX permissions, the mode cannot
-//! be set or verified and protection falls back to whatever the directory's
-//! default ACL grants: the caller must ensure the directory is reachable only
-//! by the intended account. For at-rest encryption, back a custom
+//! The bundled [`FileTokenStore`] writes one plaintext JSON file per identity
+//! **only on Unix**, using a `0600` file in a `0700` directory. A Unix filesystem
+//! that cannot enforce owner-only permissions refuses to persist. On non-Unix
+//! platforms, `preflight`, `save` and `clear` refuse credential mutations: the
+//! durable directory-entry barrier required for rotating refresh tokens is not
+//! available. An existing entry can still be read, but its confidentiality
+//! depends on the directory's ACL. For at-rest encryption, back a custom
 //! [`TokenStore`] with an OS keychain or a secrets manager instead.
 //!
-//! Where the mode cannot be enforced the store emits a persistence diagnostic.
+//! On non-Unix reads the store logs a warning about unverifiable owner-only
+//! permissions when a logger is installed. Authentication reports failed
+//! best-effort store operations through its persistence diagnostic handler:
 //! Rust applications receive the default stderr warning unless they install a
 //! custom handler; C/C++ can register the dedicated diagnostic callback and the
-//! Python binding forwards it to the `questdb` logger. The same channel covers
-//! every failed store operation: save and automatic clear are reported there
-//! and nowhere else, while a load or a lost refresh lease is reported there
-//! *and* returned to the caller as a network error.
+//! Python binding forwards it to the `questdb` logger. Save and automatic clear
+//! failures are reported there and nowhere else, while a load or lost refresh
+//! lease failure is reported there *and* returned as a network error. An
+//! unsupported file store instead fails sign-in preflight with a configuration
+//! error before prompting.
 //!
 //! # Security
 //!
