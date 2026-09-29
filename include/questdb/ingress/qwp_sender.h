@@ -1695,9 +1695,9 @@ typedef struct qwp_arrow_override
  * producing wrong partitions/order.
  *
  * Ownership: success consumes `array->release`. On failure the batch is
- * normally handed back (`release` non-NULL) unless the Arrow import itself
- * failed or the error is `in_doubt`. Always check `array->release != NULL`
- * before invoking it. `schema` is borrowed.
+ * normally handed back (`release` non-NULL) unless the Arrow import failed
+ * after taking ownership or the error is `in_doubt`. Always check
+ * `array->release != NULL` before invoking it. `schema` is borrowed.
  *
  * `overrides` (length `overrides_len`) optionally supplies per-column
  * wire-type hints. Pass `NULL, 0` for no overrides. Returns `false`
@@ -1759,8 +1759,8 @@ bool qwp_sender_flush_arrow_batch_at_now_and_get_fsn(
  * untouched.
  *
  * Ownership: as `qwp_sender_flush_arrow_batch_at_now`, except that after the
- * import the batch is handed back only if nothing was published; after
- * publication (including an ACK timeout) it stays consumed.
+ * import the batch is handed back only if it was provably not delivered;
+ * otherwise (including an ACK timeout) it stays consumed.
  */
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_arrow_batch_at_now_and_wait(

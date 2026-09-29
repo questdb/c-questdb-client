@@ -4035,9 +4035,9 @@ pub unsafe extern "C" fn qwp_direct_sender_flush_and_wait(
 /// as the designated timestamp and silently substitute server arrival time.
 ///
 /// Ownership: success consumes `array->release`. On failure the batch is
-/// normally handed back (`release` non-NULL) unless the Arrow import itself
-/// failed or the error is `in_doubt`. Always check `array->release != NULL`
-/// before invoking it. `schema` is borrowed.
+/// normally handed back (`release` non-NULL) unless the Arrow import failed
+/// after taking ownership or the error is `in_doubt`. Always check
+/// `array->release != NULL` before invoking it. `schema` is borrowed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 ///
@@ -4337,7 +4337,7 @@ pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_scalar_nanos(
 /// leaves `array` untouched.
 ///
 /// Ownership: as the publish-only flush, except that after the import the
-/// batch is handed back only if nothing was published; after publication
+/// batch is handed back only if it was provably not delivered; otherwise
 /// (including an ACK timeout) it stays consumed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
