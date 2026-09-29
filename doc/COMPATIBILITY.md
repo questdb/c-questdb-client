@@ -62,3 +62,15 @@ releases do not contain pre-built native libraries.
 Python, Java, Maven, and a local QuestDB checkout are needed only for the
 repository's live-server test harness. They are not runtime dependencies of the
 client library.
+
+## Arrow input limits
+
+Arrow data passed through the C, C++, or Python API may carry at most 64 MiB
+of field metadata in total across all columns of one batch. A batch over the
+limit is rejected with an error and nothing is sent. Earlier releases did not
+enforce this limit.
+
+In practice only Polars `Enum` columns come near it, because each one carries
+its full category list. That means several million categories in one column,
+or a large category list shared by several columns. Cast such columns to
+`pl.Categorical` before ingestion.
