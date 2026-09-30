@@ -2944,7 +2944,7 @@ fn reconnect_deadline_abandons_blocked_provider_before_dial() {
     let conf = format!(
         "ws::addr={};failover_max_attempts=3;\
          failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
-         failover_max_duration_ms=40",
+         failover_max_duration_ms=1000",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
@@ -2954,7 +2954,10 @@ fn reconnect_deadline_abandons_blocked_provider_before_dial() {
             let blocked_provider_returned = Arc::clone(&blocked_provider_returned);
             move || {
                 if provider_calls.fetch_add(1, Ordering::SeqCst) != 0 {
-                    std::thread::sleep(Duration::from_secs(1));
+                    // Give the initial socket close and reconnect ample time
+                    // on loaded Windows CI runners. The provider must remain
+                    // blocked well beyond the failover deadline.
+                    std::thread::sleep(Duration::from_secs(5));
                     blocked_provider_returned.store(true, Ordering::SeqCst);
                 }
                 Ok::<_, questdb::Error>("token".to_string())
