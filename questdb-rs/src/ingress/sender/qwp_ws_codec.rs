@@ -29,12 +29,14 @@
 
 use crate::error;
 use crate::ingress::QwpWsRoleReject;
+use crate::ingress::conf::DurableAckTiers;
 use crate::ws::frame::{self, Opcode};
 
 pub(super) const WS_PATH: &str = "/api/v4/write";
 
 pub(super) const WS_STATUS_OK: u8 = 0x00;
 pub(super) const WS_STATUS_DURABLE_ACK: u8 = 0x02;
+pub(super) const WS_STATUS_LOCAL_DURABLE_ACK: u8 = 0x0E;
 pub(super) const WS_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 pub(super) const WS_STATUS_PARSE_ERROR: u8 = 0x05;
 pub(super) const WS_STATUS_INTERNAL_ERROR: u8 = 0x06;
@@ -67,15 +69,16 @@ pub(super) fn qwp_extra_headers(
     auth_header: Option<&str>,
     max_version: u32,
     client_id: Option<&str>,
-    request_durable_ack: bool,
+    request_durable_ack: impl Into<DurableAckTiers>,
 ) -> Vec<(&'static str, String)> {
+    let request_durable_ack = request_durable_ack.into();
     let mut extras = Vec::with_capacity(4);
     extras.push(("X-QWP-Max-Version", max_version.to_string()));
     if let Some(cid) = client_id {
         extras.push(("X-QWP-Client-Id", cid.to_owned()));
     }
-    if request_durable_ack {
-        extras.push(("X-QWP-Request-Durable-Ack", "true".to_owned()));
+    if let Some(value) = request_durable_ack.request_header_value() {
+        extras.push(("X-QWP-Request-Durable-Ack", value.to_owned()));
     }
     if let Some(auth) = auth_header {
         extras.push(("Authorization", auth.to_owned()));
@@ -105,8 +108,9 @@ pub(crate) struct QwpWsHandshakeResult {
 pub(super) fn validate_qwp_handshake_headers(
     headers: &crate::ws::handshake::Headers,
     max_version: u32,
-    request_durable_ack: bool,
+    request_durable_ack: impl Into<DurableAckTiers>,
 ) -> crate::Result<QwpWsHandshakeResult> {
+    let request_durable_ack = request_durable_ack.into();
     let version: u8 = match headers.find_ci("x-qwp-version") {
         Some(v) => v.parse().map_err(|_| {
             error::fmt!(
@@ -131,14 +135,14 @@ pub(super) fn validate_qwp_handshake_headers(
             max_version
         ));
     }
-    if request_durable_ack {
-        let enabled = headers
+    if let Some(expected) = request_durable_ack.confirmation_value() {
+        let granted = headers
             .find_ci("x-qwp-durable-ack")
-            .is_some_and(|v| v.eq_ignore_ascii_case("enabled"));
-        if !enabled {
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case(expected));
+        if !granted {
             return Err(error::fmt!(
                 ProtocolVersionError,
-                "WebSocket upgrade failed: server did not enable durable ACK"
+                "WebSocket upgrade failed: server did not enable durable ACK: grant mismatch [requested={expected}]"
             ));
         }
     }
@@ -292,6 +296,7 @@ pub(super) struct PipelinedError {
 pub(super) enum PipelinedResponse {
     Ok { sequence: u64 },
     DurableAck,
+    LocalDurableAck,
     Error(PipelinedError),
 }
 
@@ -299,6 +304,7 @@ pub(super) enum PipelinedResponse {
 pub(super) enum PipelinedTableEntryKind {
     Ok,
     DurableAck,
+    LocalDurableAck,
 }
 
 pub(super) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<PipelinedResponse> {
@@ -331,15 +337,28 @@ pub(super) fn parse_pipelined_response_with_table_handler(
             )?;
             Ok(PipelinedResponse::Ok { sequence: seq })
         }
-        WS_STATUS_DURABLE_ACK => {
+        WS_STATUS_DURABLE_ACK | WS_STATUS_LOCAL_DURABLE_ACK => {
+            let is_local = status == WS_STATUS_LOCAL_DURABLE_ACK;
             handle_table_seq_txn_entries(
                 payload,
                 1,
-                "QWP durable ACK response",
-                PipelinedTableEntryKind::DurableAck,
+                if is_local {
+                    "QWP local durable ACK response"
+                } else {
+                    "QWP durable ACK response"
+                },
+                if is_local {
+                    PipelinedTableEntryKind::LocalDurableAck
+                } else {
+                    PipelinedTableEntryKind::DurableAck
+                },
                 on_table_entry,
             )?;
-            Ok(PipelinedResponse::DurableAck)
+            Ok(if is_local {
+                PipelinedResponse::LocalDurableAck
+            } else {
+                PipelinedResponse::DurableAck
+            })
         }
         _ => {
             let (sequence, msg) = parse_error_body(payload)?;
@@ -512,6 +531,20 @@ mod tests {
     }
 
     #[test]
+    fn qwp_extra_headers_encode_explicit_tiers_canonically() {
+        for (tiers, expected) in [
+            (DurableAckTiers::Local, "local"),
+            (DurableAckTiers::Replicated, "replicated"),
+            (DurableAckTiers::LocalAndReplicated, "local,replicated"),
+        ] {
+            let extras = qwp_extra_headers(None, 1, None, tiers);
+            assert!(extras.iter().any(|(name, value)| {
+                *name == "X-QWP-Request-Durable-Ack" && value == expected
+            }));
+        }
+    }
+
+    #[test]
     fn qwp_extra_headers_omits_durable_ack_by_default() {
         let extras = qwp_extra_headers(None, 1, None, false);
         assert!(
@@ -598,11 +631,7 @@ mod tests {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
         let err = validate_qwp_handshake_headers(&headers, 1, true).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
-        assert!(
-            err.msg().contains("server did not enable durable ACK"),
-            "got: {}",
-            err.msg()
-        );
+        assert!(err.msg().contains("grant mismatch"), "got: {}", err.msg());
 
         let headers =
             Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", "enabled")]);
@@ -612,6 +641,29 @@ mod tests {
                 .version,
             1
         );
+    }
+
+    #[test]
+    fn validate_qwp_handshake_headers_requires_exact_tier_grant() {
+        let granted = Headers::from_pairs([
+            ("X-QWP-Version", "1"),
+            ("X-QWP-Durable-Ack", "local,replicated"),
+        ]);
+        validate_qwp_handshake_headers(&granted, 1, DurableAckTiers::LocalAndReplicated).unwrap();
+
+        for value in [None, Some("local"), Some("replicated"), Some("enabled")] {
+            let headers = match value {
+                Some(value) => {
+                    Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", value)])
+                }
+                None => Headers::from_pairs([("X-QWP-Version", "1")]),
+            };
+            assert!(
+                validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::LocalAndReplicated)
+                    .is_err(),
+                "partial/missing grant {value:?} must fail"
+            );
+        }
     }
 
     #[test]
@@ -846,6 +898,31 @@ mod tests {
             }
             _ => panic!("expected durable ACK response"),
         }
+    }
+
+    #[test]
+    fn local_durable_ack_response_uses_durable_payload_layout() {
+        let mut payload = vec![WS_STATUS_LOCAL_DURABLE_ACK];
+        append_table_entries(&mut payload, &[("wal_table", 321)]);
+
+        let mut table_seq_txns = Vec::new();
+        let mut handler = |kind, table: &str, seq_txn| {
+            table_seq_txns.push((kind, table.to_string(), seq_txn));
+            Ok(())
+        };
+        assert!(matches!(
+            parse_pipelined_response_with_table_handler(&payload, Some(&mut handler)).unwrap(),
+            PipelinedResponse::LocalDurableAck
+        ));
+        assert_eq!(
+            table_seq_txns,
+            vec![(
+                PipelinedTableEntryKind::LocalDurableAck,
+                "wal_table".to_string(),
+                321
+            )]
+        );
+        assert!(parse_pipelined_response(&[WS_STATUS_LOCAL_DURABLE_ACK]).is_err());
     }
 
     #[test]

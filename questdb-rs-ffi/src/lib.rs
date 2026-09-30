@@ -3761,6 +3761,8 @@ pub unsafe extern "C" fn line_sender_qwpws_acked_fsn(
 pub const qwpws_ack_level_ok: u32 = 0;
 #[allow(non_upper_case_globals)]
 pub const qwpws_ack_level_durable: u32 = 1;
+#[allow(non_upper_case_globals)]
+pub const qwpws_ack_level_local_durable: u32 = 2;
 
 /// Wait until every QWP/WebSocket frame published so far on `sender` reaches
 /// `ack_level` (a `qwpws_ack_level_*` value). This is the
@@ -3768,8 +3770,9 @@ pub const qwpws_ack_level_durable: u32 = 1;
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
-/// `qwpws_ack_level_durable` requires QuestDB Enterprise and the sender to be
-/// opened with `request_durable_ack=on`; otherwise this returns
+/// `qwpws_ack_level_durable` requires `request_durable_ack=on`, `replicated`,
+/// or `local,replicated`; `qwpws_ack_level_local_durable` requires
+/// `request_durable_ack=local`. Otherwise this returns
 /// `line_sender_error_invalid_api_call` even when nothing has been published.
 ///
 /// Returns `true` once the boundary is acknowledged. Returns `false` and sets
@@ -3787,11 +3790,16 @@ pub unsafe extern "C" fn line_sender_qwpws_wait(
         let ack_level = match ack_level {
             value if value == qwpws_ack_level_ok => questdb::ingress::AckLevel::Ok,
             value if value == qwpws_ack_level_durable => questdb::ingress::AckLevel::Durable,
+            value if value == qwpws_ack_level_local_durable => {
+                questdb::ingress::AckLevel::LocalDurable
+            }
             other => {
                 set_err_out(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    format!("line_sender_qwpws_wait: invalid ack_level {other} (expected 0 or 1)"),
+                    format!(
+                        "line_sender_qwpws_wait: invalid ack_level {other} (expected 0, 1, or 2)"
+                    ),
                 );
                 return false;
             }
