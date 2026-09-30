@@ -248,12 +248,11 @@ bool questdb_oidc_builder_groups_in_token(
  * supplies the OIDC configuration (local development only).
  *
  * Despite the name, this relaxes ONLY that one link. The identity provider's
- * device-authorization and token endpoints are always held to `https`, so the
- * device code and the refresh token are never sent in cleartext, and enabling
- * this cannot change that.
- *
- * Plaintext `http` to a loopback host is allowed with or without this flag: the
- * request never leaves the machine. (`localhost` is accepted only if it
+ * device-authorization and token endpoints require `https` unless they are
+ * loopback hosts, where plaintext `http` is permitted for local development.
+ * A device code or refresh token can therefore be sent in cleartext to an
+ * explicitly configured loopback endpoint, regardless of this flag; non-loopback
+ * cleartext endpoints are rejected. (`localhost` is accepted only if it
  * actually resolves to a loopback address.)
  *
  * A tampered `/settings` response can redirect where you sign in, so over a
