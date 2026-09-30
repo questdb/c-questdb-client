@@ -51,69 +51,71 @@ pub(crate) const ENCODING_UNCOMPRESSED: u8 = 0x00;
 /// Per-column encoding discriminator: Gorilla seeds + DoD bitstream.
 pub(crate) const ENCODING_GORILLA: u8 = 0x01;
 
-/// LSB-first bit writer appending to a byte vector.
+/// LSB-first bit writer appending to a byte vector. Bits collect in a 64-bit
+/// accumulator that reaches `out` one whole word at a time.
 struct BitWriter<'a> {
     out: &'a mut Vec<u8>,
-    cur: u8,
-    nbits: u8,
+    acc: u64,
+    /// Pending bits in `acc`, always < 64.
+    nbits: u32,
 }
 
 impl<'a> BitWriter<'a> {
     fn new(out: &'a mut Vec<u8>) -> Self {
         Self {
             out,
-            cur: 0,
+            acc: 0,
             nbits: 0,
         }
     }
 
-    #[inline]
-    fn write_bit(&mut self, bit: u8) {
-        self.cur |= (bit & 1) << self.nbits;
-        self.nbits += 1;
-        if self.nbits == 8 {
-            self.out.push(self.cur);
-            self.cur = 0;
-            self.nbits = 0;
-        }
-    }
-
-    #[inline]
+    /// Append the low `n` bits of `value`; the bits above `n` must be zero.
+    ///
+    /// Forced inline: the encode loop is instantiated once per value source,
+    /// and with the plain hint it measured about 1 ns per value slower.
+    #[inline(always)]
     fn write_bits(&mut self, value: u64, n: u32) {
-        for i in 0..n {
-            self.write_bit(((value >> i) & 1) as u8);
+        debug_assert!(n > 0 && n < 64 && value >> n == 0);
+        self.acc |= value << self.nbits;
+        let total = self.nbits + n;
+        if total >= 64 {
+            self.out.extend_from_slice(&self.acc.to_le_bytes());
+            // `n < 64` means a flush only happens with bits already pending,
+            // so the shift below is always < 64.
+            self.acc = value >> (64 - self.nbits);
+            self.nbits = total - 64;
+        } else {
+            self.nbits = total;
         }
     }
 
-    /// Write the low `n` bits of `v`'s two's-complement representation.
-    #[inline]
-    fn write_signed(&mut self, v: i64, n: u32) {
-        self.write_bits((v as u64) & ((1u64 << n) - 1), n);
-    }
-
-    /// Flush the trailing partial byte (zero-padded high bits).
+    /// Flush the pending bits, zero-padding the last byte's high bits.
     fn finish(self) {
-        if self.nbits > 0 {
-            self.out.push(self.cur);
-        }
+        let bytes = self.nbits.div_ceil(8) as usize;
+        self.out.extend_from_slice(&self.acc.to_le_bytes()[..bytes]);
     }
 }
 
-fn encode_dod(w: &mut BitWriter<'_>, dod: i64) {
+/// The low `n` bits of `v`'s two's-complement representation.
+#[inline(always)]
+fn low_bits(v: i64, n: u32) -> u64 {
+    (v as u64) & ((1u64 << n) - 1)
+}
+
+/// One delta-of-delta as `(code, bit length)`: the bucket prefix in the low
+/// bits, the payload above it, so each value is a single write.
+#[inline(always)]
+fn dod_code(dod: i64) -> (u64, u32) {
     if dod == 0 {
-        w.write_bit(0);
+        (0, 1)
     } else if (-64..=63).contains(&dod) {
-        w.write_bits(0b01, 2);
-        w.write_signed(dod, 7);
+        (0b01 | (low_bits(dod, 7) << 2), 9)
     } else if (-256..=255).contains(&dod) {
-        w.write_bits(0b011, 3);
-        w.write_signed(dod, 9);
+        (0b011 | (low_bits(dod, 9) << 3), 12)
     } else if (-2048..=2047).contains(&dod) {
-        w.write_bits(0b0111, 4);
-        w.write_signed(dod, 12);
+        (0b0111 | (low_bits(dod, 12) << 4), 16)
     } else {
-        w.write_bits(0b1111, 4);
-        w.write_signed(dod, 32);
+        (0b1111 | (low_bits(dod, 32) << 4), 36)
     }
 }
 
@@ -154,7 +156,8 @@ fn encode_gorilla(out: &mut Vec<u8>, mut values: impl Iterator<Item = i64>) {
     for v in values {
         let delta = v.wrapping_sub(prev);
         let dod = delta.wrapping_sub(prev_delta);
-        encode_dod(&mut w, dod);
+        let (code, n) = dod_code(dod);
+        w.write_bits(code, n);
         prev_delta = delta;
         prev = v;
     }
@@ -186,6 +189,75 @@ where
     }
 }
 
+/// The payload [`write_temporal_column`] emits for `dense` values. Tests of
+/// the encode paths build their expected bytes from it; `golden_tests` pins
+/// the bytes themselves.
+#[cfg(test)]
+pub(crate) fn temporal_payload(dense: &[i64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_temporal_column(&mut out, dense.len(), || dense.iter().copied());
+    out
+}
+
+/// Fixed-byte tests: they pin the exact wire bytes, so a bucket or padding
+/// change that stays self-consistent with the client's own decoder (and so
+/// survives the round-trip tests below) still fails here.
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+
+    /// Rebuild the value sequence whose consecutive delta-of-deltas are `dods`.
+    fn values_from_dods(first: i64, second: i64, dods: &[i64]) -> Vec<i64> {
+        let mut values = vec![first, second];
+        let mut delta = second.wrapping_sub(first);
+        let mut prev = second;
+        for &dod in dods {
+            delta = delta.wrapping_add(dod);
+            prev = prev.wrapping_add(delta);
+            values.push(prev);
+        }
+        values
+    }
+
+    #[test]
+    fn bucket_edges_match_reference_bytes() {
+        // Both sides of every bucket edge, negative and positive, then the
+        // i32 extremes. 293 stream bits, so the last byte carries 3 bits of
+        // zero padding.
+        #[rustfmt::skip]
+        let dods = [
+            0, 1, -1, 63, -64, 64, -65, 255, -256, 256, -257, 2047, -2048, 2048, -2049,
+            i32::MAX as i64, i32::MIN as i64,
+        ];
+        let values = values_from_dods(1_700_000_000_000_000, 1_700_000_000_001_000, &dods);
+        // Produced by an independent bit-at-a-time implementation of the
+        // format in the module docs, not by this encoder.
+        #[rustfmt::skip]
+        let expected: [u8; 54] = [
+            // discriminator
+            0x01,
+            // seeds
+            0x00, 0x40, 0x1E, 0x18, 0x24, 0x0A, 0x06, 0x00,
+            0xE8, 0x43, 0x1E, 0x18, 0x24, 0x0A, 0x06, 0x00,
+            // DoD bitstream
+            0x0A, 0xF4, 0xEF, 0x17, 0x70, 0x40, 0xF6, 0x7B, 0xFF, 0x06,
+            0xF0, 0x00, 0xE2, 0xFE, 0xFD, 0xFE, 0xEF, 0x00, 0xF0, 0x01,
+            0x10, 0x00, 0x00, 0xFE, 0xFF, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0x1E, 0x00, 0x00, 0x00, 0x10,
+        ];
+        assert_eq!(temporal_payload(&values), expected);
+    }
+
+    #[test]
+    fn dod_one_past_i32_encodes_raw() {
+        for values in [[0, 0, i32::MAX as i64 + 1], [0, 0, i32::MIN as i64 - 1]] {
+            let mut raw = vec![ENCODING_UNCOMPRESSED];
+            raw.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+            assert_eq!(temporal_payload(&values), raw);
+        }
+    }
+}
+
 // The round-trip tests depend on the egress decoder, which is behind the
 // `_egress` feature (not implied by the sender-only CI feature combos) —
 // gate them accordingly, following the `ingress/polars.rs` precedent.
@@ -201,8 +273,10 @@ mod tests {
         match *disc {
             ENCODING_UNCOMPRESSED => {
                 assert_eq!(rest.len(), count * 8);
-                rest.chunks_exact(8)
-                    .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                rest.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| i64::from_le_bytes(*c))
                     .collect()
             }
             ENCODING_GORILLA => {
