@@ -3350,11 +3350,10 @@ fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str
 
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         if wait_for_client_hello {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-
             let mut record_header = [0u8; 5];
             stream.read_exact(&mut record_header).unwrap();
             assert_eq!(record_header[0], 0x16, "expected a TLS handshake record");
@@ -3363,12 +3362,20 @@ fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str
             let mut record = vec![0u8; record_len];
             stream.read_exact(&mut record).unwrap();
             assert_eq!(record.first(), Some(&0x01), "expected a TLS ClientHello");
-
-            // Give the client time to finish writing the ClientHello and block
-            // waiting for the ServerHello. This delay is outside the measured
-            // sender shutdown interval.
-            thread::sleep(Duration::from_millis(200));
+        } else {
+            let request = read_request_until_blank(&mut stream).unwrap();
+            assert!(
+                request.ends_with(b"\r\n\r\n"),
+                "expected a complete WebSocket upgrade request"
+            );
         }
+
+        // Give the client time to finish writing and block waiting for the
+        // reply. On Windows the traffic gate's CancelIoEx only cancels a recv
+        // already in flight, so a drop that races the client into recv would
+        // wait for the server to hang up instead. This delay is outside the
+        // measured sender shutdown interval.
+        thread::sleep(Duration::from_millis(200));
         connect_stalled_tx.send(()).unwrap();
         let _ = release_rx.recv_timeout(Duration::from_secs(10));
     });

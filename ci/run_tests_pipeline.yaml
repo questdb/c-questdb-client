@@ -180,17 +180,17 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - script: rustup toolchain install 1.91.1 --profile minimal
-            displayName: "Install Rust 1.91.1"
+          - script: rustup toolchain install 1.91.0 --profile minimal
+            displayName: "Install Rust 1.91.0"
           - script: |
-              cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml
-              cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml \
+              cargo +1.91.0 check --manifest-path questdb-rs/Cargo.toml
+              cargo +1.91.0 check --manifest-path questdb-rs/Cargo.toml \
                 --features almost-all-features,arrow,polars
-              cargo +1.91.1 check \
+              cargo +1.91.0 check \
                 --manifest-path questdb-rs-ffi/Cargo.toml --all-features
             displayName: "Check advertised features at the MSRV"
           - script: |
-              cargo +1.91.1 doc --manifest-path questdb-rs/Cargo.toml \
+              cargo +1.91.0 doc --manifest-path questdb-rs/Cargo.toml \
                 --no-deps --features almost-all-features,arrow,polars
             env:
               RUSTDOCFLAGS: "-D warnings"
