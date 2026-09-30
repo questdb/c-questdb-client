@@ -773,7 +773,10 @@ public:
      *   store-and-forward queue behind a prompt that was still being painted.
      * - `cancel_sign_in()` and `close()` are never rejected.
      *
-     * Return from the callback before starting another auth operation.
+     * Return from the callback before starting another auth operation. If a
+     * transport invoked this callback, do not re-enter that same sender or
+     * reader (including read-only getters): native code may still hold an
+     * exclusive borrow. Defer access until the transport operation returns.
      * Destruction of captured state may occur on whichever thread releases the
      * final auth/transport reference.
      *
@@ -815,7 +818,10 @@ public:
      * rejected while it runs, with the same per-operation error classes as
      * `event_handler` documents (`invalid_api_call` for sign_in/clear, the
      * retryable `socket_error` for token pulls); cached token reads,
-     * cancellation and close remain safe. */
+     * cancellation and close on the AUTH remain safe. If a sender or reader
+     * invoked this callback, do not re-enter that same transport, even through
+     * a read-only getter: native code may still hold an exclusive borrow of it.
+     * Defer transport access until its operation returns. */
     builder& diagnostic_handler(
         std::function<void(const diagnostic_view&)> handler)
     {

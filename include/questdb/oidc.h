@@ -127,7 +127,10 @@ typedef struct questdb_oidc_event
  * `token` DOES succeed from a valid cache: that path consults no lock the
  * callback holds. The rejection applies to any thread, not only the callback's
  * own, because a callback may dispatch to a worker and wait for it. Return
- * from the callback before starting another auth operation.
+ * from the callback before starting another auth operation. If a transport
+ * invoked this callback, do not re-enter that SAME sender or reader, including
+ * read-only getters: native code may still hold an exclusive borrow of it.
+ * Defer access until the transport operation returns.
  *
  * The two cases are distinguished in the error message: a caller on the
  * callback's own thread is told it re-entered, while a caller on another thread
@@ -169,8 +172,13 @@ typedef struct questdb_oidc_diagnostic
  * Calling `sign_in`, uncached `token`, `clear`, or an attached transport that
  * needs a token from a diagnostic callback sharing this target is rejected
  * before it can wait on the acquisition lock; a valid cached `token` remains
- * available. `cancel_sign_in` and `close` are callback-safe. Never throw,
- * unwind, or perform a non-local jump across this boundary.
+ * available. `cancel_sign_in` and `close` on the AUTH are callback-safe.
+ * If a transport invoked this callback during one of its operations, do not
+ * re-enter that SAME sender or reader, even through a read-only getter: native
+ * code may still hold an exclusive borrow of it. Such re-entry is undefined
+ * behavior. Use a different transport or defer access until the operation
+ * returns. Never throw, unwind, or perform a non-local jump across this
+ * boundary.
  */
 typedef void (*questdb_oidc_diagnostic_cb)(
     void* user_data, const questdb_oidc_diagnostic* diagnostic);
