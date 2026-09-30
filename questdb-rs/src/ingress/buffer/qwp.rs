@@ -10138,6 +10138,49 @@ mod tests {
         decode_datagram(&datagrams[0]).unwrap();
     }
 
+    /// The production row-API encoder. The tests above drive the `QwpBuffer`
+    /// row log; senders publish from a `QwpWsColumnarBuffer`, whose timestamp
+    /// columns are written by `QwpWsColumnValues::write`.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_gorilla_encodes_timestamp_columns() {
+        let designated: Vec<i64> = (0..5)
+            .map(|i| 1_700_000_000_000_000_000 + i * 1_000_000)
+            .collect();
+        // Row 2 carries no `event_ts`, so the column needs a null bitmap.
+        let event = [
+            Some(10_000i64),
+            Some(10_500),
+            None,
+            Some(11_000),
+            Some(11_500),
+        ];
+
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for (i, &ts) in designated.iter().enumerate() {
+            buf.table("trades")
+                .unwrap()
+                .column_i64("qty", i as i64)
+                .unwrap();
+            if let Some(event_ts) = event[i] {
+                buf.column_ts("event_ts", TimestampMicros::new(event_ts))
+                    .unwrap();
+            }
+            buf.at(TimestampNanos::new(ts)).unwrap();
+        }
+        let message = ws_replay_bytes(&mut buf);
+        assert_eq!(message[5] & QWP_FLAG_GORILLA, QWP_FLAG_GORILLA);
+
+        // `event_ts`: bitmap flag, QWP null bitmap, Gorilla payload of the four
+        // non-null cells. Then the designated timestamp, never nullable.
+        let mut tail = vec![1, 0b0000_0100];
+        tail.extend(gorilla::temporal_payload(&[10_000, 10_500, 11_000, 11_500]));
+        assert_eq!(tail[2], gorilla::ENCODING_GORILLA);
+        tail.push(0);
+        tail.extend(gorilla::temporal_payload(&designated));
+        assert!(message.ends_with(&tail));
+    }
+
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn symbol_dict_enforces_entry_cap() {

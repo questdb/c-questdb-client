@@ -1329,6 +1329,7 @@ mod tests {
     use super::*;
     use crate::ingress::TimestampUnit;
     use crate::ingress::column_sender::Validity;
+    use crate::ingress::column_sender::wire::QWP_TYPE_DATE;
 
     fn make_chunk_i64(name: &str, data: &[i64]) -> Vec<u8> {
         let mut chunk = Chunk::new("trades");
@@ -1380,6 +1381,68 @@ mod tests {
         // Same frame shape; only the designated-ts payload differs
         // (~1 bit/row gorilla vs 8 bytes/row raw).
         assert!(big.len() > small.len() + (n as usize) * 6);
+    }
+
+    #[test]
+    fn chunk_ts_column_with_nulls_sends_only_valid_rows() {
+        // Row 2 is null; the value in its slot must not reach the wire.
+        let data = [10_000i64, 10_500, i64::MAX, 11_000, 11_500];
+        let after = [1i64, 2, 3, 4, 5];
+        let bits = [0b0001_1011u8];
+        let validity = Validity::from_bitmap(&bits, data.len()).unwrap();
+        let mut chunk = Chunk::new("t");
+        chunk
+            .column_ts("ts", &data, TimestampUnit::Micros, Some(&validity))
+            .unwrap();
+        chunk.column_i64("after", &after, None).unwrap();
+        chunk.at_now().unwrap();
+
+        // Bitmap flag + QWP null bitmap, the Gorilla payload of the four
+        // valid rows, then the next column starting straight after it.
+        let mut tail = vec![1, 0b0000_0100];
+        tail.extend(gorilla::temporal_payload(&[10_000, 10_500, 11_000, 11_500]));
+        assert_eq!(tail[2], gorilla::ENCODING_GORILLA);
+        tail.push(0);
+        tail.extend(after.iter().flat_map(|v| v.to_le_bytes()));
+        assert!(encode_fresh(&chunk).ends_with(&tail));
+    }
+
+    #[test]
+    fn chunk_date_column_stays_raw_without_a_discriminator() {
+        // Regular spacing, > 2 values: what Gorilla would compress. DATE must
+        // still go out as plain LE values right after its null flag.
+        let data = [1_000i64, 2_000, 3_000, 4_000, 5_000];
+        let mut chunk = Chunk::new("t");
+        chunk.column_date("d", &data, None).unwrap();
+        chunk.at_now().unwrap();
+        let mut tail = vec![QWP_TYPE_DATE, 0];
+        tail.extend(data.iter().flat_map(|v| v.to_le_bytes()));
+        assert!(encode_fresh(&chunk).ends_with(&tail));
+    }
+
+    #[test]
+    fn designated_ts_millis_and_seconds_scale_to_micros() {
+        // Both units go out as TIMESTAMP (µs): the frame must be byte-identical
+        // to the one built from the pre-scaled µs values.
+        let qty = [1i64, 2, 3, 4];
+        let units = [1i64, 2, 3, 5];
+        let micros_frame = |scale: i64| {
+            let scaled = units.map(|v| v * scale);
+            let mut chunk = Chunk::new("t");
+            chunk.column_i64("qty", &qty, None).unwrap();
+            chunk.at_micros(&scaled).unwrap();
+            encode_fresh(&chunk)
+        };
+
+        let mut millis = Chunk::new("t");
+        millis.column_i64("qty", &qty, None).unwrap();
+        millis.at_millis(&units).unwrap();
+        assert_eq!(encode_fresh(&millis), micros_frame(1_000));
+
+        let mut seconds = Chunk::new("t");
+        seconds.column_i64("qty", &qty, None).unwrap();
+        seconds.at_seconds(&units).unwrap();
+        assert_eq!(encode_fresh(&seconds), micros_frame(1_000_000));
     }
 
     // Gated on `_egress`: the reference decoder lives behind that feature and

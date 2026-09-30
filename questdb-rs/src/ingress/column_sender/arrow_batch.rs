@@ -3257,26 +3257,29 @@ fn write_dict_to_varchar_payload(
     }
 }
 
-/// Temporal column body: Gorilla/raw discriminator + dense non-null values.
-/// `convert` must be infallible — validate any unit conversion before calling.
+/// Temporal column body: Gorilla/raw discriminator + dense non-null values,
+/// each multiplied by `scale`. The multiplication wraps — validate the unit
+/// conversion before calling.
 fn write_temporal_arrow(
     out: &mut Vec<u8>,
     arr: &dyn Array,
     values: &[i64],
-    null_count: usize,
-    convert: impl Fn(i64) -> i64 + Copy,
-) {
-    if null_count == 0 {
-        gorilla::write_temporal_column(out, values.len(), || values.iter().map(|&v| convert(v)));
-    } else {
-        gorilla::write_temporal_column(out, values.len() - null_count, || {
-            values
-                .iter()
-                .enumerate()
-                .filter(|&(row, _)| !arr.is_null(row))
-                .map(move |(_, &v)| convert(v))
-        });
+    scale: i64,
+) -> Result<()> {
+    match arr.nulls().filter(|nulls| nulls.null_count() > 0) {
+        None => gorilla::write_temporal_column(out, values.len(), || {
+            values.iter().map(|&v| v.wrapping_mul(scale))
+        }),
+        Some(nulls) => {
+            let non_null = non_null_count(arr, "timestamp column")?;
+            gorilla::write_temporal_column(out, non_null, || {
+                nulls
+                    .valid_indices()
+                    .map(|row| values[row].wrapping_mul(scale))
+            });
+        }
     }
+    Ok(())
 }
 
 pub(crate) fn write_arrow_column_body(
@@ -3549,8 +3552,9 @@ pub(crate) fn write_arrow_column_body(
         }
         ColumnKind::TimestampSecondToMicros => {
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+            let nulls = arr.nulls();
             for (row, &v) in a.values().iter().enumerate() {
-                if !arr.is_null(row) && v.checked_mul(1_000_000).is_none() {
+                if v.checked_mul(1_000_000).is_none() && nulls.is_none_or(|n| n.is_valid(row)) {
                     return Err(fmt!(
                         ArrowIngest,
                         "Timestamp s→µs overflow at row {} (value {})",
@@ -3559,26 +3563,21 @@ pub(crate) fn write_arrow_column_body(
                     ));
                 }
             }
-            write_temporal_arrow(out, arr, a.values(), null_count, |v| {
-                v.wrapping_mul(1_000_000)
-            });
-            Ok(())
+            write_temporal_arrow(out, arr, a.values(), 1_000_000)
         }
         ColumnKind::TimestampMicros => {
             let a = arr
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
-            write_temporal_arrow(out, arr, a.values(), null_count, |v| v);
-            Ok(())
+            write_temporal_arrow(out, arr, a.values(), 1)
         }
         ColumnKind::TimestampNanos => {
             let a = arr
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .unwrap();
-            write_temporal_arrow(out, arr, a.values(), null_count, |v| v);
-            Ok(())
+            write_temporal_arrow(out, arr, a.values(), 1)
         }
         ColumnKind::Date => {
             let a = arr
@@ -5626,6 +5625,95 @@ mod tests {
             got.push(dec.decode_next().unwrap());
         }
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn timestamp_second_column_scales_valid_rows_to_micros() {
+        // With a null row (bitmap branch) and without (dense branch).
+        let cases = [
+            (
+                vec![Some(1), Some(2), None, Some(3), Some(4)],
+                vec![1, 0b0000_0100],
+            ),
+            (vec![Some(1), Some(2), Some(3), Some(4)], vec![0]),
+        ];
+        for (cells, null_header) in cases {
+            let arr = TimestampSecondArray::from(cells);
+            let mut out = Vec::new();
+            write_arrow_column_body(&mut out, ColumnKind::TimestampSecondToMicros, &arr, None)
+                .unwrap();
+            let mut expected: Vec<u8> = null_header;
+            expected.extend(gorilla::temporal_payload(&[
+                1_000_000, 2_000_000, 3_000_000, 4_000_000,
+            ]));
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn timestamp_null_count_over_len_is_an_error_not_a_panic() {
+        use arrow::array::ArrayDataBuilder;
+        use arrow::buffer::Buffer;
+
+        // Only reachable through the unchecked constructors: a null count
+        // larger than the array. The non-null count would underflow.
+        let data = unsafe {
+            ArrayDataBuilder::new(DataType::Timestamp(TimeUnit::Microsecond, None))
+                .len(3)
+                .null_count(5)
+                .null_bit_buffer(Some(Buffer::from_vec(vec![0b0000_0101u8])))
+                .add_buffer(Buffer::from_vec(vec![1i64, 2, 3]))
+                .build_unchecked()
+        };
+        let arr = TimestampMicrosecondArray::from(data);
+        let err = write_arrow_column_body(&mut Vec::new(), ColumnKind::TimestampMicros, &arr, None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("null_count 5 exceeds len 3"),
+            "{}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn date_column_stays_raw_without_a_discriminator() {
+        // Regular spacing, > 2 values: what Gorilla would compress. DATE must
+        // still go out as plain LE values right after its null flag.
+        let values = [1_000i64, 2_000, 3_000, 4_000];
+        let arr = TimestampMillisecondArray::from(values.to_vec());
+        let mut out = Vec::new();
+        write_arrow_column_body(&mut out, ColumnKind::Date, &arr, None).unwrap();
+        let mut expected = vec![0];
+        expected.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn designated_ts_millis_and_seconds_scale_to_micros() {
+        // Both units widen to the TIMESTAMP (µs) wire type: the frame must be
+        // byte-identical to the one built from the pre-scaled µs values.
+        fn frame(ts: ArrayRef) -> Vec<u8> {
+            let v: ArrayRef = Arc::new(Int64Array::from(vec![0i64, 1, 2, 3]));
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("v", DataType::Int64, false),
+                Field::new("ts", ts.data_type().clone(), false),
+            ]));
+            encode_at_ts(&RecordBatch::try_new(schema, vec![v, ts]).unwrap(), 1)
+        }
+        let units = vec![1i64, 2, 3, 5];
+        let micros = |scale: i64| -> ArrayRef {
+            let scaled: Vec<i64> = units.iter().map(|v| v * scale).collect();
+            Arc::new(TimestampMicrosecondArray::from(scaled))
+        };
+        assert_eq!(
+            frame(Arc::new(TimestampMillisecondArray::from(units.clone()))),
+            frame(micros(1_000)),
+        );
+        assert_eq!(
+            frame(Arc::new(TimestampSecondArray::from(units.clone()))),
+            frame(micros(1_000_000)),
+        );
     }
 
     #[test]

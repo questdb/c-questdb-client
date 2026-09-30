@@ -21,8 +21,8 @@ constructs the logical fixture from source and checks both files byte-for-byte.
 Buffer fixture to check the pooled-sender flush path the same way.
 
 Both fixtures are Gorilla-era: header flags byte `0x0C`
-(`FLAG_DELTA_SYMBOL_DICT | FLAG_GORILLA`), and the designated `TIMESTAMP`
-column carries the raw/Gorilla discriminator byte, matching the Java client's
+(`FLAG_DELTA_SYMBOL_DICT | FLAG_GORILLA`), and the designated
+`TIMESTAMP_NANOS` column carries the raw/Gorilla discriminator byte, matching the Java client's
 `QwpWebSocketEncoder`. They were regenerated from the Rust encoders' actual
 output after Gorilla support landed; the old-vs-new byte delta was verified to
 be confined to the header flags byte, the header `payload_len` field, and the
