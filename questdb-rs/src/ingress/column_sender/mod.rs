@@ -86,6 +86,13 @@ pub use validity::Validity;
 /// constant, so raising it here raises both in lockstep.
 pub const MAX_CHUNK_ROWS: usize = 16 * 1024 * 1024;
 
+/// Most rows a single frame may carry. The server rejects a table block with
+/// more rows than its `qwp.max.rows.per.table` setting, whose default is also
+/// the largest value it accepts. Narrow rows fit far more than this under the
+/// byte cap (a regularly spaced timestamp compresses to about a bit per row),
+/// so the column sender splits on row count as well as on encoded size.
+pub(crate) const MAX_FRAME_ROWS: usize = 1_000_000;
+
 /// Per-column ceiling on the distinct-entry count a caller may *declare* for a
 /// categorical / symbol dictionary (`dict_offsets_len - 1`), checked eagerly at
 /// append. The FFI `dict_offsets` length bound is derived from this
@@ -128,8 +135,8 @@ const _: () = assert!(MAX_SYMBOL_DICT_ENTRIES == 8 * 1024 * 1024);
 
 /// Default rows per chunk for DataFrame / Arrow ingestion helpers. Only a
 /// pipelining-granularity knob: the column sender splits any frame that exceeds
-/// the negotiated batch cap regardless of this value. Divisible by 8 so it
-/// never forces validity-bitmap realignment.
+/// the negotiated batch cap or the server's per-frame row limit regardless of
+/// this value. Divisible by 8 so it never forces validity-bitmap realignment.
 ///
 /// Each language binding hardcodes this same literal (e.g. the Python client's
 /// `DEFAULT_MAX_CHUNK_ROWS`); keep them in sync when changing it. Tests on both
