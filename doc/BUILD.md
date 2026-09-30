@@ -9,11 +9,11 @@ supported toolchain and dependency ranges.
 
 The library build requires:
 
-- Rust 1.91.1 or newer, installed with [rustup](https://rustup.rs/);
+- Rust 1.91.0 or newer, installed with [rustup](https://rustup.rs/);
 - a C11 compiler and a C++17 compiler; and
 - CMake 3.15 or newer.
 
-Rust 1.91.1 is the minimum supported Rust version (MSRV) for both
+Rust 1.91.0 is the minimum supported Rust version (MSRV) for both
 `questdb-rs` and `questdb-rs-ffi`, including the Arrow and Polars feature set
 used by docs.rs.
 

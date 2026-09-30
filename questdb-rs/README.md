@@ -24,7 +24,7 @@ also supported for ingestion.
 * [Repository compatibility matrix](../doc/COMPATIBILITY.md)
 * [InfluxDB Line Protocol reference](https://questdb.com/docs/reference/api/ilp/overview/)
 
-Version 7.0.0 requires Rust 1.91.1. QWP over WebSocket requires QuestDB 10.0
+Version 7.0.0 requires Rust 1.91.0. QWP over WebSocket requires QuestDB 10.0
 or newer.
 
 ## Transports
