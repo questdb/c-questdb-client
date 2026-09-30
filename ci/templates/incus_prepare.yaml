@@ -1,0 +1,127 @@
+# Prepare a self-hosted hetzner-incus agent for a Linux job.
+#
+# The pool image is built from questdb/azure-ci-runners'
+# roles/incus/files/provision.sh, which ships openjdk-17-jdk, openjdk-25-jdk,
+# maven, build-essential, zip, curl, git, jq, gh, GraalVM 17/25, Docker (the
+# `agent` user is in the `docker` group), and a *root-owned* rustup under
+# /root/.cargo (exposed only via /etc/profile.d/rust.sh).
+#
+# This template fills the gaps every Linux job needs: it apt-installs the
+# packages the image lacks, exports the image's JDK paths, and provisions a
+# *user-writable* Rust toolchain. Each job runs in a fresh ephemeral container
+# (incus-azure-pipelines registers the agent with `run.sh --once`, then powers
+# the container off and lets Incus reap it), so there is no cross-job state to
+# clean up. compile.yaml installs its Python packages with the PEP 668 override
+# after this template provides python3-pip.
+parameters:
+  # Packages the image does not ship that this job needs. cmake plus the
+  # Python packages is the common compile.yaml case; override per job.
+  - name: aptPackages
+    type: object
+    default:
+      - cmake
+      - python3-pip
+  # Jobs that need only the image JDKs and user-local Rust can skip apt.
+  - name: isAptInstallEnabled
+    type: boolean
+    default: true
+  # Set true for jobs that run the full system_test suite. Ubuntu 24.04's apt
+  # numpy is 1.26 (max 32 ndarray dims), but test_f64_arr_max_dims builds a
+  # 33-dim array, which needs numpy >= 2.0. This installs pip + numpy>=2
+  # (shadowing any apt numpy). PEP 668 blocks pip into system python, hence
+  # --break-system-packages.
+  - name: pipNumpy
+    type: boolean
+    default: false
+  # Toolchain rustup-init installs as the default. Jobs that immediately
+  # install their own (the MSRV job's 1.91.1) pass `none` so the container
+  # does not download a stable it never compiles with; everything else wants
+  # a working `cargo` straight out of this template.
+  - name: rustToolchain
+    type: string
+    default: stable
+
+steps:
+  - ${{ if parameters.isAptInstallEnabled }}:
+    - bash: |
+        set -eux
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ${{ join(' ', parameters.aptPackages) }}
+      displayName: "incus: apt install"
+
+  - ${{ if parameters.pipNumpy }}:
+    - bash: |
+        set -eux
+        # Refresh the lists here too, not just in the apt step above: this
+        # step must keep working if a job ever combines pipNumpy with
+        # isAptInstallEnabled false, where no other update has run.
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends python3-pip
+        python3 -m pip install --break-system-packages --upgrade 'numpy>=2'
+        python3 -c 'import numpy; print("numpy", numpy.__version__)'
+      displayName: "incus: install numpy>=2 (pip)"
+
+  - bash: |
+      set -eux
+      # Image-provided JDK paths (provision.sh installs openjdk-17-jdk and
+      # openjdk-25-jdk). JAVA_HOME defaults to 25 because the
+      # QuestDB-from-master Maven builds need it; steps that want 17 (the
+      # cmake build in compile.yaml, run_all_tests.py) read
+      # $(JAVA_HOME_17_X64) explicitly.
+      JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
+      JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
+      for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
+        if [ ! -x "$p/bin/javac" ]; then
+          echo "Expected JDK missing at $p" >&2
+          ls /usr/lib/jvm/ >&2 || true
+          exit 1
+        fi
+      done
+      # `set -x` traces `echo "##vso[...]VALUE"` as `+ echo '##vso[...]VALUE'`;
+      # Azure's stdout parser matches `##vso[` anywhere on the line and takes
+      # everything past `]` to EOL as the value, including the trailing `'`
+      # bash added. Disable trace just for these echoes so JAVA_HOME does not
+      # end up as `/usr/lib/jvm/java-25-openjdk-amd64'`.
+      set +x
+      echo "##vso[task.setvariable variable=JAVA_HOME_17_X64]$JAVA_PATH_17"
+      echo "##vso[task.setvariable variable=JAVA_HOME_25_X64]$JAVA_PATH_25"
+      echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH_25"
+    displayName: "incus: resolve JDKs"
+
+  - bash: |
+      set -euxo pipefail
+      # The image installs rustup as root in /root/.cargo, which the agent
+      # user can neither read nor extend — so `rustup install beta/nightly`
+      # (needed by the RunOn toolchain matrix) would fail against it.
+      # Always provision a user-writable rustup in the default $HOME/.cargo +
+      # $HOME/.rustup locations instead. The container is ephemeral (one job,
+      # then reaped), so $HOME/.rustup starts empty and rustup-init runs every
+      # job; the guard below is just defensive. Subsequent steps get
+      # cargo/rustup via prependpath.
+      #
+      # The fetch is downloaded to a file rather than piped into `sh`:
+      # `curl | sh` reports `sh`'s exit status, so a transfer that dies
+      # mid-stream feeds a truncated installer to a shell that can still
+      # exit 0. Downloading first makes curl's own failure the job's
+      # failure, and the bounded retry budget fits comfortably inside the
+      # shortest job timeout.
+      if ! [ -x "$HOME/.cargo/bin/rustup" ]; then
+        init="$HOME/rustup-init.sh"
+        curl --proto '=https' --tlsv1.2 -fsSL \
+          --retry 2 --retry-delay 5 --retry-connrefused \
+          --connect-timeout 15 --max-time 60 --retry-max-time 180 \
+          https://sh.rustup.rs -o "$init"
+        sh "$init" -y \
+          --default-toolchain '${{ parameters.rustToolchain }}' \
+          --profile minimal --no-modify-path
+        rm -f "$init"
+      fi
+      . "$HOME/.cargo/env"
+      # `rustup --version`, not `cargo --version`: with
+      # `--default-toolchain none` there is no toolchain for cargo to
+      # proxy to yet, and the job's own install step provides it.
+      rustup --version
+      # See the JAVA_HOME comment above re: `set -x` + `##vso[...]`.
+      set +x
+      echo "##vso[task.prependpath]$HOME/.cargo/bin"
+    displayName: "incus: resolve Rust toolchain"
