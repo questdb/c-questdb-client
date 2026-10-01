@@ -1495,6 +1495,31 @@ mod tests {
     }
 
     #[test]
+    fn numpy_date_column_stays_raw_without_a_discriminator() {
+        // Regular spacing, > 2 values: what Gorilla would compress. DATE must
+        // still go out as plain LE values right after its null flag, because
+        // the server reads DATE as a fixed-width column; a discriminator byte
+        // would misalign every later column.
+        let data = [1_000i64, 2_000, 3_000, 4_000, 5_000];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "d",
+                    NumpyDtype::DateI64Direct,
+                    data.as_ptr() as *const u8,
+                    data.len(),
+                    None,
+                )
+                .unwrap();
+        }
+        chunk.at_now().unwrap();
+        let mut tail = vec![QWP_TYPE_DATE, 0];
+        tail.extend(data.iter().flat_map(|v| v.to_le_bytes()));
+        assert!(encode(&chunk).ends_with(&tail));
+    }
+
+    #[test]
     fn chunk_row_count_above_max_rejected_before_read() {
         // The encoder must reject an oversized row_count before touching the
         // column buffer, so a deliberately tiny backing buffer paired with a
