@@ -3808,6 +3808,25 @@ impl QwpWsColumnarBuffer {
         delta_dict: bool,
     ) -> crate::Result<()> {
         self.check_can_flush()?;
+        // A `Buffer` is published as one indivisible frame, so a table block
+        // over the server's row limit cannot be split the way the column
+        // sender splits a chunk: fail here, before anything is interned or
+        // queued, and leave the buffer intact for the caller to split.
+        if let Some(table) = self
+            .tables
+            .iter()
+            .find(|table| table.row_count as usize > MAX_FRAME_ROWS)
+        {
+            return Err(error::fmt!(
+                BatchTooLarge,
+                "Could not flush buffer: table {:?} holds {} rows, over the \
+                 QWP/WebSocket limit of {} rows per table per flush. Flush \
+                 smaller batches.",
+                String::from_utf8_lossy(&table.table_name),
+                table.row_count,
+                MAX_FRAME_ROWS
+            ));
+        }
         out.clear();
 
         let header_start = out.len();
@@ -5410,6 +5429,17 @@ const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 /// `QwpConstants.FLAG_GORILLA`.
 #[cfg(feature = "_sender-qwp-ws")]
 const QWP_FLAG_GORILLA: u8 = 0x04;
+
+/// Most rows one QWP/WebSocket table block may carry. The server rejects a
+/// block with more rows than its `qwp.max.rows.per.table` setting, whose
+/// default (1,000,000) is also the largest value it accepts. Narrow rows fit
+/// far more than this under the byte cap (a regularly spaced timestamp
+/// compresses to about a bit per row), so the column sender splits chunks on
+/// row count as well as on encoded size, and the row-API encoder rejects a
+/// `Buffer` table block over it: a `Buffer` is published as one indivisible
+/// frame and cannot be split.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const MAX_FRAME_ROWS: usize = 1_000_000;
 
 /// Connection-scoped global symbol dictionary used by the QWP/WebSocket
 /// transport's delta-symbol-dict mode.

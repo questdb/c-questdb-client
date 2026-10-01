@@ -53,7 +53,7 @@ use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
 use crate::ingress::{AckLevel, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::qwp_ws::{
     perform_server_upgrade, perform_server_upgrade_durable, read_frame,
-    upgrade_mock_stream_with_max_batch_size, write_qwp_durable_ack_response,
+    upgrade_mock_stream_with_max_batch_size, write_narrow_ts_rows, write_qwp_durable_ack_response,
     write_qwp_error_response, write_qwp_ok_response, write_qwp_ok_response_with_table_entries,
     write_server_frame,
 };
@@ -3888,6 +3888,58 @@ fn store_and_forward_flush_splits_chunk_over_the_server_row_cap() {
         captured.push(frame);
     }
     assert_split_at_server_row_cap(&captured);
+}
+
+#[test]
+fn store_and_forward_flush_buffer_rejects_table_block_over_the_server_row_cap() {
+    // A row-API `Buffer` is one indivisible frame, so unlike a chunk it cannot
+    // be split at the row cap: the flush must fail locally, publish nothing,
+    // and keep the buffer. Exactly the cap publishes as one frame.
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+
+    let mut buf = sender.new_buffer();
+    write_narrow_ts_rows(
+        &mut buf,
+        "trades",
+        0..SERVER_MAX_ROWS_PER_TABLE_BLOCK as i64,
+    );
+    let at_cap = buf.bookmark().unwrap();
+    write_narrow_ts_rows(
+        &mut buf,
+        "trades",
+        SERVER_MAX_ROWS_PER_TABLE_BLOCK as i64..OVER_ROW_CAP_ROWS as i64,
+    );
+
+    let err = sender
+        .flush_buffer(&mut buf)
+        .expect_err("a table block over the row cap fails locally");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{err}");
+    assert_eq!(
+        buf.row_count(),
+        OVER_ROW_CAP_ROWS,
+        "a rejected flush keeps the buffer"
+    );
+    assert!(
+        frames.recv_timeout(Duration::from_millis(500)).is_err(),
+        "a rejected buffer must not reach the wire"
+    );
+
+    buf.rewind_to_bookmark(at_cap).unwrap();
+    sender
+        .flush_buffer(&mut buf)
+        .expect("a table block of exactly the row cap publishes");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("the frame commits");
+    assert!(buf.is_empty(), "a published buffer is cleared");
+    let frame = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("exactly one frame on the wire");
+    assert_eq!(frame_row_count(&frame), SERVER_MAX_ROWS_PER_TABLE_BLOCK);
 }
 
 #[test]

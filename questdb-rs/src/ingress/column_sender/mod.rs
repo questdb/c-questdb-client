@@ -86,12 +86,9 @@ pub use validity::Validity;
 /// constant, so raising it here raises both in lockstep.
 pub const MAX_CHUNK_ROWS: usize = 16 * 1024 * 1024;
 
-/// Most rows a single frame may carry. The server rejects a table block with
-/// more rows than its `qwp.max.rows.per.table` setting, whose default is also
-/// the largest value it accepts. Narrow rows fit far more than this under the
-/// byte cap (a regularly spaced timestamp compresses to about a bit per row),
-/// so the column sender splits on row count as well as on encoded size.
-pub(crate) const MAX_FRAME_ROWS: usize = 1_000_000;
+// Shared with the row-API buffer encoder, which rejects a table block over it
+// instead of splitting; the doc lives on the definition in `buffer/qwp.rs`.
+pub(crate) use crate::ingress::buffer::MAX_FRAME_ROWS;
 
 /// Per-column ceiling on the distinct-entry count a caller may *declare* for a
 /// categorical / symbol dictionary (`dict_offsets_len - 1`), checked eagerly at

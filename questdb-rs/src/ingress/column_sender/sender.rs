@@ -514,6 +514,12 @@ impl PooledSenderCore {
     /// Encode and publish a QWP/WebSocket row [`Buffer`] into the local
     /// store-and-forward queue. The buffer is cleared only after local
     /// publication succeeds.
+    ///
+    /// A `Buffer` is published as one frame, so it may hold at most 1,000,000
+    /// rows per table (the server's per-frame limit). A larger buffer fails
+    /// with [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge)
+    /// before anything is queued and stays intact: flush smaller batches. The
+    /// same limit applies to every `flush_buffer*` variant.
     pub fn flush_buffer(&mut self, buffer: &mut Buffer) -> Result<()> {
         self.flush_buffer_and_get_fsn(buffer).map(|_| ())
     }
