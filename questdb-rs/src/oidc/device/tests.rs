@@ -4388,40 +4388,65 @@ fn refresh_only_persisted_entry_is_rejected_in_both_token_modes() {
 }
 
 #[test]
-fn transient_refresh_failure_rearms_the_shared_store_loader() {
+fn transient_refresh_failure_rechecks_shared_store_then_throttles() {
     let mock = MockServer::start(move |method, path, body| match (method, path) {
         ("POST", "/token") if body.contains("grant_type=refresh_token") => {
             (503, r#"{"error":"temporarily_unavailable"}"#.to_string())
         }
         _ => (404, "{}".to_string()),
     });
-    let dir = TempDir::new().unwrap();
-    let key = key_for(&mock);
-    test_file_store(dir.path())
-        .save(
-            &key,
-            &PersistedToken::new(
-                Some("AT-expired".to_string()),
-                None,
-                Some("RT-parent".to_string()),
-                1.0,
-                300.0,
-            ),
-        )
-        .unwrap();
-    let auth = auth_with_store(&mock, dir.path());
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-parent".to_string()),
+        1.0,
+        300.0,
+    ));
+    let auth = auth_with_failing_store(&mock, store.clone(), false);
 
     let error = auth.token().expect_err("transient refresh must surface");
     assert_eq!(error.kind(), OidcErrorKind::Network);
-    let state = auth.store_state.lock().unwrap();
-    assert!(
-        !state.load_attempted,
-        "a consumed credential left the shared-store loader latched"
+    {
+        let state = auth.store_state.lock().unwrap();
+        assert!(
+            !state.load_attempted,
+            "a consumed credential left the shared-store loader latched"
+        );
+        assert!(
+            state.next_empty_load_recheck.is_none(),
+            "a peer's replacement must be checked on the very next call"
+        );
+    }
+
+    // The first re-read is immediate, even though the refresh just failed. If
+    // it finds nothing, only then does the ordinary empty-store throttle start.
+    assert_eq!(
+        auth.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
     );
     assert!(
-        state.next_empty_load_recheck.is_some(),
-        "the re-armed read must retain the normal anti-stampede throttle"
+        auth.store_state
+            .lock()
+            .unwrap()
+            .next_empty_load_recheck
+            .is_some()
     );
+    let load_count = || {
+        store
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&op| op == "load")
+            .count()
+    };
+    assert_eq!(load_count(), 3); // initial load, refresh re-read, empty re-check
+    assert_eq!(
+        auth.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+    assert_eq!(load_count(), 3, "an empty store was re-read on every flush");
 }
 
 #[test]
