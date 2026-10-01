@@ -3224,13 +3224,18 @@ const SERVER_MAX_ROWS_PER_TABLE_BLOCK: u64 = 1_000_000;
 /// One row more than the server accepts in a single table block.
 const OVER_ROW_CAP_ROWS: usize = SERVER_MAX_ROWS_PER_TABLE_BLOCK as usize + 1;
 
+/// Enough rows that halving once is not enough: the first split's halves are
+/// still over the cap and must split again, so the row-limit check runs on a
+/// sub-range (`range == Some(..)`) and not only on the whole chunk.
+const FAR_OVER_ROW_CAP_ROWS: usize = 2_500_000;
+
 /// A narrow chunk just over the server's row limit: a one-byte column plus a
 /// regularly spaced designated timestamp, which Gorilla packs to about a bit
 /// per row. The whole chunk encodes to roughly 1.1 MB, far under the default
 /// byte cap, so only a row-count split can keep it within the limit.
-fn over_row_cap_columns() -> (Vec<i8>, Vec<i64>) {
-    let flags = vec![1_i8; OVER_ROW_CAP_ROWS];
-    let ts = (0..OVER_ROW_CAP_ROWS as i64)
+fn over_row_cap_columns(rows: usize) -> (Vec<i8>, Vec<i64>) {
+    let flags = vec![1_i8; rows];
+    let ts = (0..rows as i64)
         .map(|i| 1_700_000_000_000_000 + i * 1_000)
         .collect();
     (flags, ts)
@@ -3238,11 +3243,11 @@ fn over_row_cap_columns() -> (Vec<i8>, Vec<i64>) {
 
 /// Every captured frame must respect the server's row limit, all but the last
 /// deferred so the input still commits once, with every row sent exactly once.
-fn assert_split_at_server_row_cap(captured: &[Vec<u8>]) {
+fn assert_split_at_server_row_cap(captured: &[Vec<u8>], rows: usize) {
     const FLAG_DEFER_COMMIT: u8 = 0x01;
     assert!(
         captured.len() >= 2,
-        "{OVER_ROW_CAP_ROWS} rows must split into at least 2 frames, got {}",
+        "{rows} rows must split into at least 2 frames, got {}",
         captured.len()
     );
     for (i, frame) in captured.iter().enumerate() {
@@ -3260,7 +3265,7 @@ fn assert_split_at_server_row_cap(captured: &[Vec<u8>]) {
     }
     let total: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
     assert_eq!(
-        total, OVER_ROW_CAP_ROWS as u64,
+        total, rows as u64,
         "split frames must cover every row exactly once"
     );
 }
@@ -3271,7 +3276,7 @@ fn direct_flush_splits_chunk_over_the_server_row_cap() {
     let conf = conf_for(server.port(), "pool_reap=manual;");
     let db = QuestDb::connect(&conf).unwrap();
 
-    let (flags, ts) = over_row_cap_columns();
+    let (flags, ts) = over_row_cap_columns(OVER_ROW_CAP_ROWS);
     let mut chunk = Chunk::new("trades");
     chunk.column_i8("flag", &flags, None).unwrap();
     chunk.at_micros(&ts).unwrap();
@@ -3287,7 +3292,32 @@ fn direct_flush_splits_chunk_over_the_server_row_cap() {
     while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
         captured.push(frame);
     }
-    assert_split_at_server_row_cap(&captured);
+    assert_split_at_server_row_cap(&captured, OVER_ROW_CAP_ROWS);
+}
+
+#[test]
+fn direct_flush_splits_sub_ranges_still_over_the_server_row_cap() {
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(server.port(), "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (flags, ts) = over_row_cap_columns(FAR_OVER_ROW_CAP_ROWS);
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i8("flag", &flags, None).unwrap();
+    chunk.at_micros(&ts).unwrap();
+
+    {
+        let mut sender = db.borrow_direct_column_sender().unwrap();
+        sender
+            .flush_and_wait(&mut chunk, AckLevel::Ok)
+            .expect("every sub-range splits until it fits the row cap");
+    }
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert_split_at_server_row_cap(&captured, FAR_OVER_ROW_CAP_ROWS);
 }
 
 #[test]
@@ -3870,7 +3900,7 @@ fn store_and_forward_flush_splits_chunk_over_the_server_row_cap() {
     let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
     let db = QuestDb::connect(&conf).unwrap();
 
-    let (flags, ts) = over_row_cap_columns();
+    let (flags, ts) = over_row_cap_columns(OVER_ROW_CAP_ROWS);
     let mut chunk = Chunk::new("trades");
     chunk.column_i8("flag", &flags, None).unwrap();
     chunk.at_micros(&ts).unwrap();
@@ -3887,7 +3917,7 @@ fn store_and_forward_flush_splits_chunk_over_the_server_row_cap() {
     while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
         captured.push(frame);
     }
-    assert_split_at_server_row_cap(&captured);
+    assert_split_at_server_row_cap(&captured, OVER_ROW_CAP_ROWS);
 }
 
 #[test]
@@ -8033,7 +8063,7 @@ fn direct_flush_arrow_batch_splits_batch_over_the_server_row_cap() {
         .expect("batch over the row cap splits, publishes, and commits");
 
     let captured: Vec<Vec<u8>> = frames.try_iter().collect();
-    assert_split_at_server_row_cap(&captured);
+    assert_split_at_server_row_cap(&captured, OVER_ROW_CAP_ROWS);
 }
 
 #[cfg(feature = "arrow-ingress")]
@@ -8057,7 +8087,7 @@ fn store_and_forward_arrow_batch_splits_batch_over_the_server_row_cap() {
     while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
         captured.push(frame);
     }
-    assert_split_at_server_row_cap(&captured);
+    assert_split_at_server_row_cap(&captured, OVER_ROW_CAP_ROWS);
 }
 
 #[cfg(feature = "arrow-ingress")]
