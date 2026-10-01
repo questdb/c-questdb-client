@@ -46,6 +46,7 @@ use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPu
 use crate::ingress::{ColumnName, TableName};
 use crate::{Result, error};
 
+use super::MAX_FRAME_ROWS;
 #[cfg(feature = "arrow-ingress")]
 use super::arrow_batch::{self, ArrowColumnOverride, ArrowTsSource};
 use super::chunk::Chunk;
@@ -65,9 +66,10 @@ fn classify_flush_error(err: crate::Error) -> crate::Error {
 /// Outcome of publishing a single frame on the direct backend.
 enum FrameOutcome {
     Published,
-    /// The encoded frame exceeded the negotiated cap before any byte reached
-    /// the wire, so the caller may split the row range and retry. Carries the
-    /// detailed size error so the split floor can surface exact byte counts.
+    /// The frame is over the row limit or the negotiated byte cap and no byte
+    /// reached the wire, so the caller may split the row range and retry.
+    /// Carries the detailed size error so the split floor can surface exact
+    /// byte counts.
     TooLarge(crate::Error),
     /// The deferred window is full before any byte reached the wire. The
     /// top-level flush surfaces this as the explicit "call sync()" contract;
@@ -86,6 +88,40 @@ struct ArrowFrameSpec<'a> {
     batch: &'a RecordBatch,
     ts: ArrowTsSource,
     overrides: &'a [ArrowColumnOverride<'a>],
+}
+
+/// Outcome of queueing a single frame on the store-and-forward backend.
+enum SfaFrameOutcome {
+    /// Queued; carries the frame's FSN.
+    Published(u64),
+    /// The frame is over the row limit or the per-frame byte cap and nothing
+    /// was queued, so the caller may split the row range and retry. Carries
+    /// the error to surface once the range cannot be split any further.
+    TooLarge(crate::Error),
+}
+
+impl From<SfaPublishOutcome> for SfaFrameOutcome {
+    fn from(outcome: SfaPublishOutcome) -> Self {
+        match outcome {
+            SfaPublishOutcome::Published(fsn) => Self::Published(fsn),
+            SfaPublishOutcome::TooLarge {
+                encoded_len,
+                max_buf_size,
+            } => Self::TooLarge(sfa_frame_size_error(encoded_len, max_buf_size)),
+        }
+    }
+}
+
+/// A row range holds more than [`MAX_FRAME_ROWS`] rows. Only ever a split
+/// signal: a range this large can always be halved, so the error itself never
+/// reaches the caller.
+fn frame_row_limit_error(row_count: usize) -> crate::Error {
+    error::fmt!(
+        BatchTooLarge,
+        "QWP frame ({} rows) exceeds the per-frame row limit ({} rows)",
+        row_count,
+        MAX_FRAME_ROWS
+    )
 }
 
 /// Split point for an oversize `row_count`: the largest multiple of 8 not
@@ -478,6 +514,12 @@ impl PooledSenderCore {
     /// Encode and publish a QWP/WebSocket row [`Buffer`] into the local
     /// store-and-forward queue. The buffer is cleared only after local
     /// publication succeeds.
+    ///
+    /// A `Buffer` is published as one frame, so it may hold at most 1,000,000
+    /// rows per table (the server's per-frame limit). A larger buffer fails
+    /// with [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge)
+    /// before anything is queued and stays intact: flush smaller batches. The
+    /// same limit applies to every `flush_buffer*` variant.
     pub fn flush_buffer(&mut self, buffer: &mut Buffer) -> Result<()> {
         self.flush_buffer_and_get_fsn(buffer).map(|_| ())
     }
@@ -1154,9 +1196,10 @@ impl DirectColumnBackend {
         self.conn.try_drain_acks().map_err(direct_not_delivered)?;
 
         // Whole-chunk fast path: no slicing, no extra allocation. Only when a
-        // single frame would exceed the negotiated cap do we fall back to
-        // splitting the row range into multiple frames, all but the last
-        // deferred so the chunk still commits atomically at one boundary.
+        // single frame would exceed the row limit or the negotiated cap do we
+        // fall back to splitting the row range into multiple frames, all but
+        // the last deferred so the chunk still commits atomically at one
+        // boundary.
         match self.publish_frame(chunk, None, defer_commit)? {
             FrameOutcome::Published => {}
             FrameOutcome::NoSlot(err) => return Err(FlushFailure::NotDelivered(err)),
@@ -1215,14 +1258,20 @@ impl DirectColumnBackend {
     /// Publish one frame. `range` is `None` for the whole chunk (the hot path,
     /// no slice allocation) or `Some((offset, count))` for a sub-range while
     /// splitting. Returns [`FrameOutcome::TooLarge`] (nothing on the wire, dict
-    /// rolled back) when the frame exceeds the cap so the caller can split;
-    /// every other failure is a terminal [`FlushFailure`].
+    /// rolled back) when the frame exceeds the row limit or the byte cap so
+    /// the caller can split; every other failure is a terminal
+    /// [`FlushFailure`].
     fn publish_frame(
         &mut self,
         chunk: &Chunk<'_>,
         range: Option<(usize, usize)>,
         defer_commit: bool,
     ) -> std::result::Result<FrameOutcome, FlushFailure> {
+        let row_count = range.map_or(chunk.row_count(), |(_, count)| count);
+        if row_count > MAX_FRAME_ROWS {
+            return Ok(FrameOutcome::TooLarge(frame_row_limit_error(row_count)));
+        }
+
         if defer_commit && !self.conn.has_sync_commit_slot() {
             return Ok(FrameOutcome::NoSlot(error::fmt!(
                 InvalidApiCall,
@@ -1397,8 +1446,8 @@ impl DirectColumnBackend {
             overrides,
         };
         // Whole-batch fast path; split the row range only when a single frame
-        // exceeds the cap, all but the last deferred so the batch still commits
-        // at one boundary.
+        // exceeds the row limit or the cap, all but the last deferred so the
+        // batch still commits at one boundary.
         match self.publish_arrow_frame(&spec, None, defer_commit)? {
             FrameOutcome::Published => {}
             FrameOutcome::NoSlot(err) => return Err(FlushFailure::NotDelivered(err)),
@@ -1454,6 +1503,11 @@ impl DirectColumnBackend {
         range: Option<(usize, usize)>,
         defer_commit: bool,
     ) -> std::result::Result<FrameOutcome, FlushFailure> {
+        let row_count = range.map_or(spec.batch.num_rows(), |(_, count)| count);
+        if row_count > MAX_FRAME_ROWS {
+            return Ok(FrameOutcome::TooLarge(frame_row_limit_error(row_count)));
+        }
+
         if defer_commit && !self.conn.has_sync_commit_slot() {
             return Ok(FrameOutcome::NoSlot(error::fmt!(
                 InvalidApiCall,
@@ -1686,7 +1740,8 @@ impl SfaBackend {
             return Err(FlushFailure::NotDelivered(e));
         }
         let caps = self.effective_frame_caps();
-        // Whole-chunk fast path; only split when a single frame exceeds the cap.
+        // Whole-chunk fast path; only split when a single frame exceeds the
+        // row limit or the cap.
         //
         // A split chunk emits every frame but the last with FLAG_DEFER_COMMIT, so
         // the whole chunk commits ONCE, at its final frame, instead of once per
@@ -1710,12 +1765,8 @@ impl SfaBackend {
         // from deferring more frames than the publication window can hold.
         let boundary =
             match self.publish_chunk_sfa(chunk, None, caps.for_range(chunk.row_count()), false)? {
-                SfaPublishOutcome::Published(fsn) => fsn,
-                SfaPublishOutcome::TooLarge {
-                    encoded_len,
-                    max_buf_size,
-                } => {
-                    let err = sfa_frame_size_error(encoded_len, max_buf_size);
+                SfaFrameOutcome::Published(fsn) => fsn,
+                SfaFrameOutcome::TooLarge(err) => {
                     let row_count = chunk.row_count();
                     match split_mid(row_count) {
                         Some(mid) => {
@@ -1844,15 +1895,19 @@ impl SfaBackend {
 
     /// Encode `range` (`None` = whole chunk, no slice allocation) as a replay
     /// frame, check it against the cap, and append it to the queue. Returns
-    /// [`SfaPublishOutcome::TooLarge`] (nothing queued, dict rolled back) when the
-    /// frame exceeds the cap so the caller can split.
+    /// [`SfaFrameOutcome::TooLarge`] (nothing queued, dict rolled back) when the
+    /// frame exceeds the row limit or the cap so the caller can split.
     fn publish_chunk_sfa(
         &mut self,
         chunk: &Chunk<'_>,
         range: Option<(usize, usize)>,
         frame_cap: usize,
         defer_commit: bool,
-    ) -> std::result::Result<SfaPublishOutcome, FlushFailure> {
+    ) -> std::result::Result<SfaFrameOutcome, FlushFailure> {
+        let row_count = range.map_or(chunk.row_count(), |(_, count)| count);
+        if row_count > MAX_FRAME_ROWS {
+            return Ok(SfaFrameOutcome::TooLarge(frame_row_limit_error(row_count)));
+        }
         let view;
         let target = match range {
             None => chunk,
@@ -1900,7 +1955,9 @@ impl SfaBackend {
             // a group. `TooLarge` queued nothing, so it changes neither.
             self.sfa_deferred_group_open = defer_commit;
         }
-        result.map_err(FlushFailure::NotDelivered)
+        result
+            .map(SfaFrameOutcome::from)
+            .map_err(FlushFailure::NotDelivered)
     }
 
     /// Append rows `[row_offset, row_offset + row_count)`, halving the range
@@ -1940,11 +1997,8 @@ impl SfaBackend {
             caps.for_range(row_count),
             defer_commit,
         )? {
-            SfaPublishOutcome::Published(fsn) => Ok(fsn),
-            SfaPublishOutcome::TooLarge {
-                encoded_len,
-                max_buf_size,
-            } => match split_mid(row_count) {
+            SfaFrameOutcome::Published(fsn) => Ok(fsn),
+            SfaFrameOutcome::TooLarge(err) => match split_mid(row_count) {
                 Some(mid) => {
                     self.publish_split_sfa(chunk, row_offset, mid, caps, true)?;
                     self.publish_split_sfa(
@@ -1956,10 +2010,7 @@ impl SfaBackend {
                     )
                     .map_err(deny_retry_after_partial)
                 }
-                None => Err(FlushFailure::NotDelivered(sfa_frame_size_error(
-                    encoded_len,
-                    max_buf_size,
-                ))),
+                None => Err(FlushFailure::NotDelivered(err)),
             },
         }
     }
@@ -2011,18 +2062,15 @@ impl SfaBackend {
             ts,
             overrides,
         };
-        // Whole-batch fast path; only split when a single frame exceeds the cap.
+        // Whole-batch fast path; only split when a single frame exceeds the
+        // row limit or the cap.
         // A split batch defers every frame but the last, so it commits once —
         // see `flush_chunk_boundary` for the rationale and the bounded-window
         // valve that keeps the deferred prefix from stranding.
         let boundary =
             match self.publish_arrow_sfa(&spec, None, caps.for_range(batch.num_rows()), false)? {
-                SfaPublishOutcome::Published(fsn) => fsn,
-                SfaPublishOutcome::TooLarge {
-                    encoded_len,
-                    max_buf_size,
-                } => {
-                    let err = sfa_frame_size_error(encoded_len, max_buf_size);
+                SfaFrameOutcome::Published(fsn) => fsn,
+                SfaFrameOutcome::TooLarge(err) => {
                     let row_count = batch.num_rows();
                     match split_mid(row_count) {
                         Some(mid) => {
@@ -2066,7 +2114,11 @@ impl SfaBackend {
         range: Option<(usize, usize)>,
         frame_cap: usize,
         defer_commit: bool,
-    ) -> std::result::Result<SfaPublishOutcome, FlushFailure> {
+    ) -> std::result::Result<SfaFrameOutcome, FlushFailure> {
+        let row_count = range.map_or(spec.batch.num_rows(), |(_, count)| count);
+        if row_count > MAX_FRAME_ROWS {
+            return Ok(SfaFrameOutcome::TooLarge(frame_row_limit_error(row_count)));
+        }
         let sliced;
         let batch = match range {
             None => spec.batch,
@@ -2113,7 +2165,9 @@ impl SfaBackend {
         if matches!(result, Ok(SfaPublishOutcome::Published(_))) {
             self.sfa_deferred_group_open = defer_commit;
         }
-        result.map_err(FlushFailure::NotDelivered)
+        result
+            .map(SfaFrameOutcome::from)
+            .map_err(FlushFailure::NotDelivered)
     }
 
     /// Arrow counterpart of [`Self::publish_split_sfa`], including its
@@ -2134,11 +2188,8 @@ impl SfaBackend {
             caps.for_range(row_count),
             defer_commit,
         )? {
-            SfaPublishOutcome::Published(fsn) => Ok(fsn),
-            SfaPublishOutcome::TooLarge {
-                encoded_len,
-                max_buf_size,
-            } => match split_mid(row_count) {
+            SfaFrameOutcome::Published(fsn) => Ok(fsn),
+            SfaFrameOutcome::TooLarge(err) => match split_mid(row_count) {
                 Some(mid) => {
                     self.publish_arrow_split_sfa(spec, row_offset, mid, caps, true)?;
                     self.publish_arrow_split_sfa(
@@ -2150,10 +2201,7 @@ impl SfaBackend {
                     )
                     .map_err(deny_retry_after_partial)
                 }
-                None => Err(FlushFailure::NotDelivered(sfa_frame_size_error(
-                    encoded_len,
-                    max_buf_size,
-                ))),
+                None => Err(FlushFailure::NotDelivered(err)),
             },
         }
     }

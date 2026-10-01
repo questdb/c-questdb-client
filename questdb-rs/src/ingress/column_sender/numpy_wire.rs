@@ -34,6 +34,7 @@
 
 use std::slice;
 
+use crate::ingress::gorilla;
 use crate::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
 use crate::{Result, error};
 
@@ -447,7 +448,7 @@ pub(crate) unsafe fn emit_into_wire(
             emit_bitmap_le::<i64, 8>(out, data, row_count, validity, i64::to_le_bytes)
         },
         D::TimestampMicrosDirect | D::TimestampNanosDirect => unsafe {
-            emit_bitmap_le::<i64, 8>(out, data, row_count, validity, i64::to_le_bytes)
+            emit_temporal_gorilla(out, data, row_count, validity)
         },
         D::Ipv4Direct => unsafe {
             emit_bitmap_le::<u32, 4>(out, data, row_count, validity, u32::to_le_bytes)
@@ -707,6 +708,35 @@ unsafe fn emit_bitmap_le<T, const N: usize>(
                     out.extend_from_slice(&to_le(value));
                 }
             }
+        }
+    }
+}
+
+/// Temporal (TIMESTAMP / TIMESTAMP_NANOS) numpy column: null_flag +
+/// optional QWP bitmap, then the Gorilla/raw discriminator and the dense
+/// non-null values.
+unsafe fn emit_temporal_gorilla(
+    out: &mut Vec<u8>,
+    data: *const u8,
+    row_count: usize,
+    validity: Option<&ValidityDescriptor>,
+) {
+    let typed = data as *const i64;
+    match validity.filter(|v| v.has_nulls()) {
+        None => {
+            out.push(0);
+            gorilla::write_temporal_column(out, row_count, || {
+                (0..row_count).map(|i| unsafe { typed.add(i).read_unaligned() })
+            });
+        }
+        Some(v) => {
+            out.push(1);
+            unsafe { write_qwp_bitmap_from_validity(out, v) };
+            gorilla::write_temporal_column(out, v.non_null_count, || {
+                (0..row_count)
+                    .filter(|&i| unsafe { v.is_valid(i) })
+                    .map(|i| unsafe { typed.add(i).read_unaligned() })
+            });
         }
     }
 }
@@ -1080,36 +1110,46 @@ where
     // (`I64_NULL`). Map it straight through to null so an in-band NaT is
     // treated consistently with the direct (already-µs) paths instead of
     // failing the whole batch on conversion overflow.
+    //
+    // The converted values are materialized into a dense `Vec` up front
+    // (rather than converted lazily inside the `write_temporal_column`
+    // closure) because `convert` is an `FnMut` with per-call cache state
+    // (month/year offsets memoize their last input) and the Gorilla writer
+    // invokes its closure twice when the column falls back to raw; a
+    // single sequential conversion pass keeps `convert` called exactly once
+    // per row regardless.
     match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
-            out.reserve(8 * row_count);
+            let mut micros = Vec::with_capacity(row_count);
             for i in 0..row_count {
                 let value = unsafe { typed.add(i).read_unaligned() };
-                let micros = if value == I64_NULL {
+                let m = if value == I64_NULL {
                     I64_NULL
                 } else {
                     convert(value).ok_or_else(|| make_err(i, value))?
                 };
-                out.extend_from_slice(&micros.to_le_bytes());
+                micros.push(m);
             }
+            gorilla::write_temporal_column(out, micros.len(), || micros.iter().copied());
         }
         Some(v) => {
             out.push(1);
             unsafe { write_qwp_bitmap_from_validity(out, v) };
-            out.reserve(8 * v.non_null_count);
+            let mut micros = Vec::with_capacity(v.non_null_count);
             for i in 0..row_count {
                 if !unsafe { v.is_valid(i) } {
                     continue;
                 }
                 let value = unsafe { typed.add(i).read_unaligned() };
-                let micros = if value == I64_NULL {
+                let m = if value == I64_NULL {
                     I64_NULL
                 } else {
                     convert(value).ok_or_else(|| make_err(i, value))?
                 };
-                out.extend_from_slice(&micros.to_le_bytes());
+                micros.push(m);
             }
+            gorilla::write_temporal_column(out, micros.len(), || micros.iter().copied());
         }
     }
     Ok(())
@@ -1388,6 +1428,95 @@ mod tests {
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
         encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap_err()
+    }
+
+    // Gated on `_egress`: the reference decoder lives behind that feature and
+    // sender-only CI combos must still compile `cargo test`.
+    #[cfg(feature = "_egress")]
+    #[test]
+    fn numpy_timestamp_micros_gorilla_roundtrip() {
+        let values: Vec<i64> = (0..32).map(|i| 1_700_000_000_000_000 + i * 250).collect();
+        let mut out = Vec::new();
+        unsafe {
+            emit_temporal_gorilla(&mut out, values.as_ptr() as *const u8, values.len(), None)
+        };
+        assert_eq!(out[0], 0, "null flag");
+        assert_eq!(out[1], 0x01, "gorilla discriminator");
+        let s0 = i64::from_le_bytes(out[2..10].try_into().unwrap());
+        let s1 = i64::from_le_bytes(out[10..18].try_into().unwrap());
+        let mut dec = crate::egress::gorilla::GorillaDecoder::new(s0, s1, &out[18..]);
+        let mut got = vec![s0, s1];
+        for _ in 2..values.len() {
+            got.push(dec.decode_next().unwrap());
+        }
+        assert_eq!(got, values);
+    }
+
+    #[test]
+    fn numpy_temporal_columns_with_nulls_send_only_valid_rows() {
+        // Row 2 is null and its slot must not reach the wire. In the seconds
+        // column it would also overflow the conversion if it were read.
+        let bits = [0b0001_1011u8];
+        let cases = [
+            (
+                NumpyDtype::TimestampMicrosDirect,
+                [10_000i64, 10_500, i64::MAX, 11_000, 11_500],
+                [10_000i64, 10_500, 11_000, 11_500],
+            ),
+            (
+                NumpyDtype::DatetimeSecToMicros,
+                [1, 2, i64::MAX, 3, 4],
+                [1_000_000, 2_000_000, 3_000_000, 4_000_000],
+            ),
+        ];
+        for (dtype, data, dense) in cases {
+            let validity = Validity::from_bitmap(&bits, data.len()).unwrap();
+            let mut chunk = Chunk::new("t");
+            unsafe {
+                chunk
+                    .push_numpy_deferred(
+                        "c",
+                        dtype,
+                        data.as_ptr() as *const u8,
+                        data.len(),
+                        Some(&validity),
+                    )
+                    .unwrap();
+            }
+            chunk.at_now().unwrap();
+
+            // The column is the frame's tail: bitmap flag, QWP null bitmap,
+            // then the Gorilla payload of the four valid rows.
+            let mut tail = vec![1, 0b0000_0100];
+            tail.extend(gorilla::temporal_payload(&dense));
+            assert_eq!(tail[2], gorilla::ENCODING_GORILLA);
+            assert!(encode(&chunk).ends_with(&tail), "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn numpy_date_column_stays_raw_without_a_discriminator() {
+        // Regular spacing, > 2 values: what Gorilla would compress. DATE must
+        // still go out as plain LE values right after its null flag, because
+        // the server reads DATE as a fixed-width column; a discriminator byte
+        // would misalign every later column.
+        let data = [1_000i64, 2_000, 3_000, 4_000, 5_000];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "d",
+                    NumpyDtype::DateI64Direct,
+                    data.as_ptr() as *const u8,
+                    data.len(),
+                    None,
+                )
+                .unwrap();
+        }
+        chunk.at_now().unwrap();
+        let mut tail = vec![QWP_TYPE_DATE, 0];
+        tail.extend(data.iter().flat_map(|v| v.to_le_bytes()));
+        assert!(encode(&chunk).ends_with(&tail));
     }
 
     #[test]

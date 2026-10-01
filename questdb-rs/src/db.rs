@@ -1713,6 +1713,12 @@ impl<'a> BorrowedSender<'a> {
 
     /// Publish a caller-owned QWP/WebSocket [`Buffer`] into this sender's local
     /// store-and-forward queue and clear it after local acceptance.
+    ///
+    /// A `Buffer` is published as one frame, so it may hold at most 1,000,000
+    /// rows per table (the server's per-frame limit). A larger buffer fails
+    /// with [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge)
+    /// before anything is queued and stays intact: flush smaller batches. The
+    /// same limit applies to every `flush_buffer*` variant.
     pub fn flush_buffer(&mut self, buffer: &mut Buffer) -> Result<()> {
         self.0.inner_mut().flush_buffer(buffer)
     }

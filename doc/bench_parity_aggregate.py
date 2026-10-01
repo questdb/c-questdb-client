@@ -17,7 +17,7 @@ Two contract facts this normalizes (verified against real 10M S1 output):
 
 * **Egress byte basis differs.** py-egress records the *decoded Arrow* nbytes
   (~480 MB for 10M S1) as its wire proxy; rust-egress and all ingress paths
-  record the *on-wire QWP* payload (~371 MB egress / ~450 MB ingress). Native
+  record the *on-wire QWP* payload (~371 MB in either direction). Native
   ``mib_per_s`` is therefore NOT comparable across clients. We instead derive
   GiB/s from the basis-independent ``rows_per_s`` times a single canonical
   on-wire bytes/row per direction (``--ingress-bpr`` / ``--egress-bpr``), which
@@ -25,7 +25,7 @@ Two contract facts this normalizes (verified against real 10M S1 output):
 
 Usage:
     bench_parity_aggregate.py FILE [FILE ...] [--glob 'dir/*.json']
-                              [--format md|text] [--ingress-bpr 45.0]
+                              [--format md|text] [--ingress-bpr 37.1250157]
                               [--egress-bpr 37.1283602] [--raw]
 """
 
@@ -37,10 +37,14 @@ import sys
 GIB = 1024.0 ** 3
 MIB = 1024.0 ** 2
 
-# Canonical on-wire QWP bytes/row for S1-narrow (10M): ingress 450,000,140 B,
+# Canonical on-wire QWP bytes/row for S1-narrow (10M): ingress 371,250,157 B,
 # egress 371,283,602 B. Identical for both clients, so GiB/s derived from
 # rows/s x bpr is apples-to-apples. Overridable for other schemas.
-DEFAULT_BPR = {"ingress": 45.0, "egress": 37.1283602}
+#
+# The ingress figure is for clients that Gorilla-encode the designated
+# timestamp. Results from an older client, which sent it as 8 raw bytes per
+# row (450,000,140 B), need ``--ingress-bpr 45.0``.
+DEFAULT_BPR = {"ingress": 37.1250157, "egress": 37.1283602}
 
 # Path name -> (direction, canonical role). Every emitter's path names live
 # here; add a row when a new path is introduced.

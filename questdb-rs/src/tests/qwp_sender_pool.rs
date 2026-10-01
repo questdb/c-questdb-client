@@ -53,7 +53,7 @@ use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
 use crate::ingress::{AckLevel, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::qwp_ws::{
     perform_server_upgrade, perform_server_upgrade_durable, read_frame,
-    upgrade_mock_stream_with_max_batch_size, write_qwp_durable_ack_response,
+    upgrade_mock_stream_with_max_batch_size, write_narrow_ts_rows, write_qwp_durable_ack_response,
     write_qwp_error_response, write_qwp_ok_response, write_qwp_ok_response_with_table_entries,
     write_server_frame,
 };
@@ -3217,6 +3217,109 @@ fn direct_flush_splits_oversize_chunk_into_capped_deferred_frames() {
     );
 }
 
+/// The server rejects any table block over 1,000,000 rows, and its
+/// `qwp.max.rows.per.table` setting cannot raise that ceiling.
+const SERVER_MAX_ROWS_PER_TABLE_BLOCK: u64 = 1_000_000;
+
+/// One row more than the server accepts in a single table block.
+const OVER_ROW_CAP_ROWS: usize = SERVER_MAX_ROWS_PER_TABLE_BLOCK as usize + 1;
+
+/// Enough rows that halving once is not enough: the first split's halves are
+/// still over the cap and must split again, so the row-limit check runs on a
+/// sub-range (`range == Some(..)`) and not only on the whole chunk.
+const FAR_OVER_ROW_CAP_ROWS: usize = 2_500_000;
+
+/// A narrow chunk just over the server's row limit: a one-byte column plus a
+/// regularly spaced designated timestamp, which Gorilla packs to about a bit
+/// per row. The whole chunk encodes to roughly 1.1 MB, far under the default
+/// byte cap, so only a row-count split can keep it within the limit.
+fn over_row_cap_columns(rows: usize) -> (Vec<i8>, Vec<i64>) {
+    let flags = vec![1_i8; rows];
+    let ts = (0..rows as i64)
+        .map(|i| 1_700_000_000_000_000 + i * 1_000)
+        .collect();
+    (flags, ts)
+}
+
+/// Every captured frame must respect the server's row limit, all but the last
+/// deferred so the input still commits once, with every row sent exactly once.
+fn assert_split_at_server_row_cap(captured: &[Vec<u8>], rows: usize) {
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    assert!(
+        captured.len() >= 2,
+        "{rows} rows must split into at least 2 frames, got {}",
+        captured.len()
+    );
+    for (i, frame) in captured.iter().enumerate() {
+        let rows = frame_row_count(frame);
+        assert!(
+            rows <= SERVER_MAX_ROWS_PER_TABLE_BLOCK,
+            "frame {i} carries {rows} rows, over the server limit"
+        );
+        assert_eq!(
+            frame[5] & FLAG_DEFER_COMMIT != 0,
+            i + 1 < captured.len(),
+            "frame {i} of {}: every frame but the last must be deferred",
+            captured.len()
+        );
+    }
+    let total: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
+    assert_eq!(
+        total, rows as u64,
+        "split frames must cover every row exactly once"
+    );
+}
+
+#[test]
+fn direct_flush_splits_chunk_over_the_server_row_cap() {
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(server.port(), "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (flags, ts) = over_row_cap_columns(OVER_ROW_CAP_ROWS);
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i8("flag", &flags, None).unwrap();
+    chunk.at_micros(&ts).unwrap();
+
+    {
+        let mut sender = db.borrow_direct_column_sender().unwrap();
+        sender
+            .flush_and_wait(&mut chunk, AckLevel::Ok)
+            .expect("chunk over the row cap splits, sends, and commits");
+    }
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert_split_at_server_row_cap(&captured, OVER_ROW_CAP_ROWS);
+}
+
+#[test]
+fn direct_flush_splits_sub_ranges_still_over_the_server_row_cap() {
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(server.port(), "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (flags, ts) = over_row_cap_columns(FAR_OVER_ROW_CAP_ROWS);
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i8("flag", &flags, None).unwrap();
+    chunk.at_micros(&ts).unwrap();
+
+    {
+        let mut sender = db.borrow_direct_column_sender().unwrap();
+        sender
+            .flush_and_wait(&mut chunk, AckLevel::Ok)
+            .expect("every sub-range splits until it fits the row cap");
+    }
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert_split_at_server_row_cap(&captured, FAR_OVER_ROW_CAP_ROWS);
+}
+
 #[test]
 fn direct_flush_split_floor_marks_must_close_to_discard_uncommitted_prefix() {
     // A chunk whose small-row prefix fits but whose final row is irreducibly
@@ -3788,6 +3891,85 @@ fn store_and_forward_flush_splits_oversize_chunk_committing_once_at_the_last_fra
         total, ROWS as u64,
         "split frames must cover every row exactly once"
     );
+}
+
+#[test]
+fn store_and_forward_flush_splits_chunk_over_the_server_row_cap() {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (flags, ts) = over_row_cap_columns(OVER_ROW_CAP_ROWS);
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i8("flag", &flags, None).unwrap();
+    chunk.at_micros(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush(&mut chunk)
+        .expect("chunk over the row cap splits and queues");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("all split frames commit");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert_split_at_server_row_cap(&captured, OVER_ROW_CAP_ROWS);
+}
+
+#[test]
+fn store_and_forward_flush_buffer_rejects_table_block_over_the_server_row_cap() {
+    // A row-API `Buffer` is one indivisible frame, so unlike a chunk it cannot
+    // be split at the row cap: the flush must fail locally, publish nothing,
+    // and keep the buffer. Exactly the cap publishes as one frame.
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+
+    let mut buf = sender.new_buffer();
+    write_narrow_ts_rows(
+        &mut buf,
+        "trades",
+        0..SERVER_MAX_ROWS_PER_TABLE_BLOCK as i64,
+    );
+    let at_cap = buf.bookmark().unwrap();
+    write_narrow_ts_rows(
+        &mut buf,
+        "trades",
+        SERVER_MAX_ROWS_PER_TABLE_BLOCK as i64..OVER_ROW_CAP_ROWS as i64,
+    );
+
+    let err = sender
+        .flush_buffer(&mut buf)
+        .expect_err("a table block over the row cap fails locally");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{err}");
+    assert_eq!(
+        buf.row_count(),
+        OVER_ROW_CAP_ROWS,
+        "a rejected flush keeps the buffer"
+    );
+    assert!(
+        frames.recv_timeout(Duration::from_millis(500)).is_err(),
+        "a rejected buffer must not reach the wire"
+    );
+
+    buf.rewind_to_bookmark(at_cap).unwrap();
+    sender
+        .flush_buffer(&mut buf)
+        .expect("a table block of exactly the row cap publishes");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("the frame commits");
+    assert!(buf.is_empty(), "a published buffer is cleared");
+    let frame = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("exactly one frame on the wire");
+    assert_eq!(frame_row_count(&frame), SERVER_MAX_ROWS_PER_TABLE_BLOCK);
 }
 
 #[test]
@@ -7854,6 +8036,58 @@ fn direct_flush_arrow_batch_splits_oversize_batch_into_capped_frames() {
         got, vals,
         "split frames must cover every row of the batch exactly once"
     );
+}
+
+/// An `at_now` batch with a single bit-packed boolean column: about 125 KB
+/// for [`OVER_ROW_CAP_ROWS`] rows, far under every byte cap.
+#[cfg(feature = "arrow-ingress")]
+fn over_row_cap_batch() -> arrow::array::RecordBatch {
+    use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
+    use std::sync::Arc;
+
+    let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; OVER_ROW_CAP_ROWS]));
+    RecordBatch::try_from_iter([("flag", arr)]).unwrap()
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn direct_flush_arrow_batch_splits_batch_over_the_server_row_cap() {
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(server.port(), "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let batch = over_row_cap_batch();
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    sender
+        .flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
+        .expect("batch over the row cap splits, publishes, and commits");
+
+    let captured: Vec<Vec<u8>> = frames.try_iter().collect();
+    assert_split_at_server_row_cap(&captured, OVER_ROW_CAP_ROWS);
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_arrow_batch_splits_batch_over_the_server_row_cap() {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let batch = over_row_cap_batch();
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush_arrow_batch_at_now("trades", &batch, &[])
+        .expect("batch over the row cap splits and queues");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("all split frames commit");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert_split_at_server_row_cap(&captured, OVER_ROW_CAP_ROWS);
 }
 
 #[cfg(feature = "arrow-ingress")]

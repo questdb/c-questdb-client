@@ -50,17 +50,18 @@ use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 
 use crate::error::{Error, ErrorCode};
 use crate::ingress::buffer::{QwpWsSymbolHasher, SymbolGlobalDict};
+use crate::ingress::gorilla;
 use crate::ingress::{ColumnName, TableName};
 use crate::{Result, fmt};
 
 use super::wire::{
-    QWP_FLAG_DEFER_COMMIT, QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_TYPE_BINARY,
-    QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_CHAR, QWP_TYPE_DATE, QWP_TYPE_DECIMAL64,
-    QWP_TYPE_DECIMAL128, QWP_TYPE_DECIMAL256, QWP_TYPE_DOUBLE, QWP_TYPE_DOUBLE_ARRAY,
-    QWP_TYPE_FLOAT, QWP_TYPE_GEOHASH, QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256,
-    QWP_TYPE_SHORT, QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID,
-    QWP_TYPE_VARCHAR, QWP_VERSION_1, reverse_uuid_bytes, validate_table_name, write_qwp_bytes,
-    write_qwp_varint,
+    QWP_FLAG_DEFER_COMMIT, QWP_FLAG_DELTA_SYMBOL_DICT, QWP_FLAG_GORILLA, QWP_HEADER_LEN, QWP_MAGIC,
+    QWP_TYPE_BINARY, QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_CHAR, QWP_TYPE_DATE,
+    QWP_TYPE_DECIMAL64, QWP_TYPE_DECIMAL128, QWP_TYPE_DECIMAL256, QWP_TYPE_DOUBLE,
+    QWP_TYPE_DOUBLE_ARRAY, QWP_TYPE_FLOAT, QWP_TYPE_GEOHASH, QWP_TYPE_INT, QWP_TYPE_IPV4,
+    QWP_TYPE_LONG, QWP_TYPE_LONG256, QWP_TYPE_SHORT, QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP,
+    QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, QWP_TYPE_VARCHAR, QWP_VERSION_1, reverse_uuid_bytes,
+    validate_table_name, write_qwp_bytes, write_qwp_varint,
 };
 
 use super::MAX_CHUNK_ROWS as MAX_ARROW_INGEST_ROWS;
@@ -3256,6 +3257,31 @@ fn write_dict_to_varchar_payload(
     }
 }
 
+/// Temporal column body: Gorilla/raw discriminator + dense non-null values,
+/// each multiplied by `scale`. The multiplication wraps — validate the unit
+/// conversion before calling.
+fn write_temporal_arrow(
+    out: &mut Vec<u8>,
+    arr: &dyn Array,
+    values: &[i64],
+    scale: i64,
+) -> Result<()> {
+    match arr.nulls().filter(|nulls| nulls.null_count() > 0) {
+        None => gorilla::write_temporal_column(out, values.len(), || {
+            values.iter().map(|&v| v.wrapping_mul(scale))
+        }),
+        Some(nulls) => {
+            let non_null = non_null_count(arr, "timestamp column")?;
+            gorilla::write_temporal_column(out, non_null, || {
+                nulls
+                    .valid_indices()
+                    .map(|row| values[row].wrapping_mul(scale))
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn write_arrow_column_body(
     out: &mut Vec<u8>,
     kind: ColumnKind,
@@ -3526,40 +3552,32 @@ pub(crate) fn write_arrow_column_body(
         }
         ColumnKind::TimestampSecondToMicros => {
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
-            try_non_null_le::<8>(out, arr, |row| {
-                let v = a.value(row);
-                let widened = v.checked_mul(1_000_000).ok_or_else(|| {
-                    fmt!(
+            let nulls = arr.nulls();
+            for (row, &v) in a.values().iter().enumerate() {
+                if v.checked_mul(1_000_000).is_none() && nulls.is_none_or(|n| n.is_valid(row)) {
+                    return Err(fmt!(
                         ArrowIngest,
                         "Timestamp s→µs overflow at row {} (value {})",
                         row,
                         v
-                    )
-                })?;
-                Ok(widened.to_le_bytes())
-            })
+                    ));
+                }
+            }
+            write_temporal_arrow(out, arr, a.values(), 1_000_000)
         }
         ColumnKind::TimestampMicros => {
             let a = arr
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
-            if !use_bitmap && cfg!(target_endian = "little") {
-                extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
-            } else {
-                non_null_le::<8>(out, arr, |row| a.value(row).to_le_bytes())
-            }
+            write_temporal_arrow(out, arr, a.values(), 1)
         }
         ColumnKind::TimestampNanos => {
             let a = arr
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .unwrap();
-            if !use_bitmap && cfg!(target_endian = "little") {
-                extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
-            } else {
-                non_null_le::<8>(out, arr, |row| a.value(row).to_le_bytes())
-            }
+            write_temporal_arrow(out, arr, a.values(), 1)
         }
         ColumnKind::Date => {
             let a = arr
@@ -3742,7 +3760,6 @@ pub(crate) fn write_arrow_designated_ts_body(
     let label = "designated timestamp column";
     ensure_timestamp_no_nulls(arr, label)?;
     out.push(0);
-    let le = cfg!(target_endian = "little");
     match dtype {
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let a = arr
@@ -3750,11 +3767,8 @@ pub(crate) fn write_arrow_designated_ts_body(
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
             ensure_timestamp_values_non_negative(arr, a.values(), label)?;
-            if le {
-                extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
-            } else {
-                full_with_sentinel::<8>(out, arr, [0u8; 8], |row| a.value(row).to_le_bytes())
-            }
+            gorilla::write_temporal_column(out, a.values().len(), || a.values().iter().copied());
+            Ok(())
         }
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
             let a = arr
@@ -3762,11 +3776,8 @@ pub(crate) fn write_arrow_designated_ts_body(
                 .downcast_ref::<TimestampNanosecondArray>()
                 .unwrap();
             ensure_timestamp_values_non_negative(arr, a.values(), label)?;
-            if le {
-                extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
-            } else {
-                full_with_sentinel::<8>(out, arr, [0u8; 8], |row| a.value(row).to_le_bytes())
-            }
+            gorilla::write_temporal_column(out, a.values().len(), || a.values().iter().copied());
+            Ok(())
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
             let a = arr
@@ -3774,34 +3785,38 @@ pub(crate) fn write_arrow_designated_ts_body(
                 .downcast_ref::<TimestampMillisecondArray>()
                 .unwrap();
             ensure_timestamp_values_non_negative(arr, a.values(), label)?;
-            try_full_with_sentinel::<8>(out, arr, [0u8; 8], |row| {
-                let v = a.value(row);
-                v.checked_mul(1_000).map(i64::to_le_bytes).ok_or_else(|| {
-                    fmt!(
+            for (row, &v) in a.values().iter().enumerate() {
+                if v.checked_mul(1_000).is_none() {
+                    return Err(fmt!(
                         ArrowIngest,
                         "designated timestamp ms→µs overflow at row {} (value {})",
                         row,
                         v
-                    )
-                })
-            })
+                    ));
+                }
+            }
+            gorilla::write_temporal_column(out, a.values().len(), || {
+                a.values().iter().map(|&v| v.wrapping_mul(1_000))
+            });
+            Ok(())
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
             ensure_timestamp_values_non_negative(arr, a.values(), label)?;
-            try_full_with_sentinel::<8>(out, arr, [0u8; 8], |row| {
-                let v = a.value(row);
-                v.checked_mul(1_000_000)
-                    .map(i64::to_le_bytes)
-                    .ok_or_else(|| {
-                        fmt!(
-                            ArrowIngest,
-                            "designated timestamp s→µs overflow at row {} (value {})",
-                            row,
-                            v
-                        )
-                    })
-            })
+            for (row, &v) in a.values().iter().enumerate() {
+                if v.checked_mul(1_000_000).is_none() {
+                    return Err(fmt!(
+                        ArrowIngest,
+                        "designated timestamp s→µs overflow at row {} (value {})",
+                        row,
+                        v
+                    ));
+                }
+            }
+            gorilla::write_temporal_column(out, a.values().len(), || {
+                a.values().iter().map(|&v| v.wrapping_mul(1_000_000))
+            });
+            Ok(())
         }
         other => Err(fmt!(
             ArrowIngest,
@@ -3919,7 +3934,7 @@ fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16, defer_commit: b
     let start = out.len();
     out.extend_from_slice(&QWP_MAGIC);
     out.push(QWP_VERSION_1);
-    let mut flags = QWP_FLAG_DELTA_SYMBOL_DICT;
+    let mut flags = QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_GORILLA;
     if defer_commit {
         flags |= QWP_FLAG_DEFER_COMMIT;
     }
@@ -4239,14 +4254,14 @@ fn estimate_frame_size(
             | ColumnKind::I32WidenToI64
             | ColumnKind::U32WidenToI64
             | ColumnKind::U64WidenToI64Checked
-            | ColumnKind::TimestampSecondToMicros
-            | ColumnKind::TimestampMicros
-            | ColumnKind::TimestampNanos
             | ColumnKind::Date
             | ColumnKind::Date32Days
             | ColumnKind::Date64Ms
             | ColumnKind::TimeAsLong(_)
             | ColumnKind::DurationAsLong(_) => 8 * row_count,
+            ColumnKind::TimestampSecondToMicros
+            | ColumnKind::TimestampMicros
+            | ColumnKind::TimestampNanos => 1 + 8 * row_count,
             ColumnKind::Uuid | ColumnKind::UuidFromVarBinary => 16 * row_count,
             ColumnKind::Long256 | ColumnKind::Long256FromVarBinary => 32 * row_count,
             ColumnKind::Utf8
@@ -4270,7 +4285,7 @@ fn estimate_frame_size(
     }
     if has_designated_ts {
         total += 10 + 1;
-        total += 1 + 8 * row_count;
+        total += 2 + 8 * row_count;
     }
     total
 }
@@ -4284,11 +4299,7 @@ fn write_scalar_designated_ts_body(out: &mut Vec<u8>, nanos: i64, row_count: usi
         ));
     }
     out.push(0);
-    out.reserve(8 * row_count);
-    let bytes = nanos.to_le_bytes();
-    for _ in 0..row_count {
-        out.extend_from_slice(&bytes);
-    }
+    gorilla::write_temporal_column(out, row_count, || std::iter::repeat_n(nanos, row_count));
     Ok(())
 }
 
@@ -4498,7 +4509,7 @@ mod tests {
         let batch = RecordBatch::try_new(arrow_schema_with(f), vec![arr]).unwrap();
         let out = encode(&batch);
         assert_qwp_header(&out, 0);
-        assert_eq!(out[5], QWP_FLAG_DELTA_SYMBOL_DICT);
+        assert_eq!(out[5], QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_GORILLA);
     }
 
     #[test]
@@ -5526,8 +5537,12 @@ mod tests {
         assert_eq!(rows, 2);
         assert_eq!(ty, QWP_TYPE_TIMESTAMP);
         assert_eq!(body[0], 0, "no nulls → no bitmap");
+        assert_eq!(
+            body[1], 0x00,
+            "≤2 values stays raw (no gorilla discriminator)"
+        );
         let vals: Vec<i64> = (0..rows)
-            .map(|i| i64::from_le_bytes(body[1 + i * 8..1 + i * 8 + 8].try_into().unwrap()))
+            .map(|i| i64::from_le_bytes(body[2 + i * 8..2 + i * 8 + 8].try_into().unwrap()))
             .collect();
         assert_eq!(vals, vec![-1, -1_000_000]);
     }
@@ -5552,10 +5567,153 @@ mod tests {
             decode_qwp_nulls(&body[1..1 + bitmap_bytes], rows),
             vec![false, true, false]
         );
-        let vals = &body[1 + bitmap_bytes..];
+        assert_eq!(
+            body[1 + bitmap_bytes],
+            0x00,
+            "≤2 non-null values stays raw (no gorilla discriminator)"
+        );
+        let vals = &body[1 + bitmap_bytes + 1..];
         let v0 = i64::from_le_bytes(vals[0..8].try_into().unwrap());
         let v1 = i64::from_le_bytes(vals[8..16].try_into().unwrap());
         assert_eq!((v0, v1), (10, -30), "dense non-null values, nulls skipped");
+    }
+
+    /// `write_arrow_column_body` on a `> 2` non-null-value timestamp column
+    /// must gorilla-encode (discriminator 0x01) even when a null row is
+    /// interleaved, and the decoded sequence (via the reference egress
+    /// decoder) must reproduce exactly the non-null input values in order.
+    #[cfg(feature = "_egress")]
+    #[test]
+    fn arrow_timestamp_gorilla_roundtrip_with_nulls() {
+        let base = 1_700_000_000_000_000i64;
+        let step = 500i64;
+        let expected: Vec<i64> = (0..8).map(|i| base + i * step).collect();
+
+        let mut ts = TimestampMicrosecondBuilder::new();
+        ts.append_value(expected[0]);
+        ts.append_value(expected[1]);
+        ts.append_value(expected[2]);
+        ts.append_null();
+        ts.append_value(expected[3]);
+        ts.append_value(expected[4]);
+        ts.append_value(expected[5]);
+        ts.append_value(expected[6]);
+        ts.append_value(expected[7]);
+        let arr = ts.finish();
+        assert_eq!(arr.null_count(), 1, "one interleaved null row");
+
+        let mut out = Vec::new();
+        write_arrow_column_body(&mut out, ColumnKind::TimestampMicros, &arr, None).unwrap();
+
+        assert_eq!(out[0], 1, "null present -> bitmap flag set");
+        let rows = arr.len();
+        let bitmap_bytes = rows.div_ceil(8);
+        assert_eq!(
+            decode_qwp_nulls(&out[1..1 + bitmap_bytes], rows),
+            vec![false, false, false, true, false, false, false, false, false]
+        );
+        let body = &out[1 + bitmap_bytes..];
+        assert_eq!(
+            body[0], 0x01,
+            "> 2 non-null values with zero DoDs must gorilla-encode"
+        );
+        let s0 = i64::from_le_bytes(body[1..9].try_into().unwrap());
+        let s1 = i64::from_le_bytes(body[9..17].try_into().unwrap());
+        let mut got = vec![s0, s1];
+        let mut dec = crate::egress::gorilla::GorillaDecoder::new(s0, s1, &body[17..]);
+        for _ in 2..expected.len() {
+            got.push(dec.decode_next().unwrap());
+        }
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn timestamp_second_column_scales_valid_rows_to_micros() {
+        // With a null row (bitmap branch) and without (dense branch).
+        let cases = [
+            (
+                vec![Some(1), Some(2), None, Some(3), Some(4)],
+                vec![1, 0b0000_0100],
+            ),
+            (vec![Some(1), Some(2), Some(3), Some(4)], vec![0]),
+        ];
+        for (cells, null_header) in cases {
+            let arr = TimestampSecondArray::from(cells);
+            let mut out = Vec::new();
+            write_arrow_column_body(&mut out, ColumnKind::TimestampSecondToMicros, &arr, None)
+                .unwrap();
+            let mut expected: Vec<u8> = null_header;
+            expected.extend(gorilla::temporal_payload(&[
+                1_000_000, 2_000_000, 3_000_000, 4_000_000,
+            ]));
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn timestamp_null_count_over_len_is_an_error_not_a_panic() {
+        use arrow::array::ArrayDataBuilder;
+        use arrow::buffer::Buffer;
+
+        // Only reachable through the unchecked constructors: a null count
+        // larger than the array. The non-null count would underflow.
+        let data = unsafe {
+            ArrayDataBuilder::new(DataType::Timestamp(TimeUnit::Microsecond, None))
+                .len(3)
+                .null_count(5)
+                .null_bit_buffer(Some(Buffer::from_vec(vec![0b0000_0101u8])))
+                .add_buffer(Buffer::from_vec(vec![1i64, 2, 3]))
+                .build_unchecked()
+        };
+        let arr = TimestampMicrosecondArray::from(data);
+        let err = write_arrow_column_body(&mut Vec::new(), ColumnKind::TimestampMicros, &arr, None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("null_count 5 exceeds len 3"),
+            "{}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn date_column_stays_raw_without_a_discriminator() {
+        // Regular spacing, > 2 values: what Gorilla would compress. DATE must
+        // still go out as plain LE values right after its null flag.
+        let values = [1_000i64, 2_000, 3_000, 4_000];
+        let arr = TimestampMillisecondArray::from(values.to_vec());
+        let mut out = Vec::new();
+        write_arrow_column_body(&mut out, ColumnKind::Date, &arr, None).unwrap();
+        let mut expected = vec![0];
+        expected.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn designated_ts_millis_and_seconds_scale_to_micros() {
+        // Both units widen to the TIMESTAMP (µs) wire type: the frame must be
+        // byte-identical to the one built from the pre-scaled µs values.
+        fn frame(ts: ArrayRef) -> Vec<u8> {
+            let v: ArrayRef = Arc::new(Int64Array::from(vec![0i64, 1, 2, 3]));
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("v", DataType::Int64, false),
+                Field::new("ts", ts.data_type().clone(), false),
+            ]));
+            encode_at_ts(&RecordBatch::try_new(schema, vec![v, ts]).unwrap(), 1)
+        }
+        let units = vec![1i64, 2, 3, 5];
+        let micros = |scale: i64| -> ArrayRef {
+            let scaled: Vec<i64> = units.iter().map(|v| v * scale).collect();
+            Arc::new(TimestampMicrosecondArray::from(scaled))
+        };
+        assert_eq!(
+            frame(Arc::new(TimestampMillisecondArray::from(units.clone()))),
+            frame(micros(1_000)),
+        );
+        assert_eq!(
+            frame(Arc::new(TimestampSecondArray::from(units.clone()))),
+            frame(micros(1_000_000)),
+        );
     }
 
     #[test]
