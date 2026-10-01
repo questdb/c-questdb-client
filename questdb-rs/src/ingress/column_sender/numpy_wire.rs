@@ -1115,7 +1115,7 @@ where
     // (rather than converted lazily inside the `write_temporal_column`
     // closure) because `convert` is an `FnMut` with per-call cache state
     // (month/year offsets memoize their last input) and the Gorilla writer
-    // may invoke its closure twice (feasibility pass + encode pass); a
+    // invokes its closure twice when the column falls back to raw; a
     // single sequential conversion pass keeps `convert` called exactly once
     // per row regardless.
     match validity.filter(|v| v.has_nulls()) {

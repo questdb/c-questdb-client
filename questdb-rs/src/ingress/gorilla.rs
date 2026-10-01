@@ -103,49 +103,31 @@ fn low_bits(v: i64, n: u32) -> u64 {
 }
 
 /// One delta-of-delta as `(code, bit length)`: the bucket prefix in the low
-/// bits, the payload above it, so each value is a single write.
+/// bits, the payload above it, so each value is a single write. `None` when
+/// the value falls outside the 32-bit bucket, which ends Gorilla encoding for
+/// the column.
 #[inline(always)]
-fn dod_code(dod: i64) -> (u64, u32) {
+fn dod_code(dod: i64) -> Option<(u64, u32)> {
     if dod == 0 {
-        (0, 1)
+        Some((0, 1))
     } else if (-64..=63).contains(&dod) {
-        (0b01 | (low_bits(dod, 7) << 2), 9)
+        Some((0b01 | (low_bits(dod, 7) << 2), 9))
     } else if (-256..=255).contains(&dod) {
-        (0b011 | (low_bits(dod, 9) << 3), 12)
+        Some((0b011 | (low_bits(dod, 9) << 3), 12))
     } else if (-2048..=2047).contains(&dod) {
-        (0b0111 | (low_bits(dod, 12) << 4), 16)
+        Some((0b0111 | (low_bits(dod, 12) << 4), 16))
+    } else if (i32::MIN as i64..=i32::MAX as i64).contains(&dod) {
+        Some((0b1111 | (low_bits(dod, 32) << 4), 36))
     } else {
-        (0b1111 | (low_bits(dod, 32) << 4), 36)
+        None
     }
 }
 
-/// True when every delta-of-delta of `values` fits the i32 bucket, i.e. the
-/// sequence is Gorilla-encodable. Caller ensures the iterator yields ≥ 3
-/// values (shorter sequences ship raw regardless).
-fn gorilla_feasible(mut values: impl Iterator<Item = i64>) -> bool {
-    let Some(first) = values.next() else {
-        return false;
-    };
-    let Some(second) = values.next() else {
-        return false;
-    };
-    let mut prev = second;
-    let mut prev_delta = second.wrapping_sub(first);
-    for v in values {
-        let delta = v.wrapping_sub(prev);
-        let dod = delta.wrapping_sub(prev_delta);
-        if dod < i32::MIN as i64 || dod > i32::MAX as i64 {
-            return false;
-        }
-        prev_delta = delta;
-        prev = v;
-    }
-    true
-}
-
-/// Encode ≥ 3 values as two raw LE seeds + DoD bitstream. Caller must have
-/// verified feasibility via [`gorilla_feasible`].
-fn encode_gorilla(out: &mut Vec<u8>, mut values: impl Iterator<Item = i64>) {
+/// Encode ≥ 3 values as two raw LE seeds + DoD bitstream. Returns `false`,
+/// leaving a partial stream in `out`, as soon as a delta-of-delta falls
+/// outside the 32-bit bucket; the caller truncates `out` back to where it
+/// started and ships the column raw instead.
+fn try_encode_gorilla(out: &mut Vec<u8>, mut values: impl Iterator<Item = i64>) -> bool {
     let first = values.next().expect("gorilla encode needs >= 3 values");
     let second = values.next().expect("gorilla encode needs >= 3 values");
     out.extend_from_slice(&first.to_le_bytes());
@@ -156,19 +138,35 @@ fn encode_gorilla(out: &mut Vec<u8>, mut values: impl Iterator<Item = i64>) {
     for v in values {
         let delta = v.wrapping_sub(prev);
         let dod = delta.wrapping_sub(prev_delta);
-        let (code, n) = dod_code(dod);
+        let Some((code, n)) = dod_code(dod) else {
+            return false;
+        };
         w.write_bits(code, n);
         prev_delta = delta;
         prev = v;
     }
     w.finish();
+    true
+}
+
+/// Dense raw LE values through one pre-sized slab, so the loop carries no
+/// per-value capacity check and a contiguous source compiles to a plain copy.
+fn write_raw(out: &mut Vec<u8>, count: usize, values: impl Iterator<Item = i64>) {
+    let start = out.len();
+    out.resize(start + count * 8, 0);
+    for (dst, v) in out[start..].chunks_exact_mut(8).zip(values) {
+        dst.copy_from_slice(&v.to_le_bytes());
+    }
 }
 
 /// Write one temporal column's payload: discriminator byte + dense non-null
 /// values. Gorilla when `count > 2` and every DoD fits i32; raw otherwise.
 ///
-/// `make_values` is called up to twice (feasibility pass + encode pass) and
-/// must yield exactly `count` identical values each time.
+/// One optimistic pass: the column is Gorilla-encoded while it is checked, and
+/// the first out-of-range delta-of-delta discards that output and writes the
+/// raw layout instead. So `make_values` is called once when the column
+/// compresses and twice when it falls back, and must yield exactly `count`
+/// identical values each time.
 ///
 /// Output never exceeds `1 + count * 8` bytes, so callers whose frame-size
 /// estimates already cover the raw layout only need one extra byte per
@@ -177,16 +175,16 @@ pub(crate) fn write_temporal_column<I>(out: &mut Vec<u8>, count: usize, make_val
 where
     I: Iterator<Item = i64>,
 {
-    if count > 2 && gorilla_feasible(make_values()) {
+    let start = out.len();
+    if count > 2 {
         out.push(ENCODING_GORILLA);
-        encode_gorilla(out, make_values());
-    } else {
-        out.push(ENCODING_UNCOMPRESSED);
-        out.reserve(count * 8);
-        for v in make_values() {
-            out.extend_from_slice(&v.to_le_bytes());
+        if try_encode_gorilla(out, make_values()) {
+            return;
         }
+        out.truncate(start);
     }
+    out.push(ENCODING_UNCOMPRESSED);
+    write_raw(out, count, make_values());
 }
 
 /// The payload [`write_temporal_column`] emits for `dense` values. Tests of
@@ -250,7 +248,16 @@ mod golden_tests {
 
     #[test]
     fn dod_one_past_i32_encodes_raw() {
-        for values in [[0, 0, i32::MAX as i64 + 1], [0, 0, i32::MIN as i64 - 1]] {
+        // The last case overflows only at the end of a long zero-DoD run: the
+        // optimistic Gorilla pass has already flushed whole 64-bit words by
+        // then, and every one of them must be discarded.
+        let mut late_overflow = vec![0i64; 200];
+        late_overflow.push(i32::MAX as i64 + 1);
+        for values in [
+            vec![0, 0, i32::MAX as i64 + 1],
+            vec![0, 0, i32::MIN as i64 - 1],
+            late_overflow,
+        ] {
             let mut raw = vec![ENCODING_UNCOMPRESSED];
             raw.extend(values.iter().flat_map(|v| v.to_le_bytes()));
             assert_eq!(temporal_payload(&values), raw);
