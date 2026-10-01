@@ -709,7 +709,7 @@ fn require_secure(url: &str, allow_insecure: bool) -> Result<()> {
         "Refusing to use insecure URL {url:?} (scheme {scheme:?}). Use https \
          (localhost and loopback IP http are always allowed for local development); enable \
          allow_insecure_transport only to permit plaintext to a non-loopback \
-         QuestDB server. The identity provider is always held to https."
+         QuestDB server. The identity provider requires https except on loopback."
     )))
 }
 

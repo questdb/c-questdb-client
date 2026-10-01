@@ -405,8 +405,9 @@ impl OidcDeviceAuthBuilder {
     }
 
     /// Allow plaintext `http` to the QuestDB `/settings` server (local dev only).
-    /// The identity provider is always held to `https` (or loopback `http`), so
-    /// the device code and refresh token are never sent in cleartext.
+    /// The identity provider requires `https` except for loopback `http`.
+    /// A loopback endpoint can receive a device code or refresh token in
+    /// cleartext on this host; non-loopback IdP endpoints cannot.
     pub fn allow_insecure_transport(mut self, allow: bool) -> Self {
         self.allow_insecure = allow;
         self

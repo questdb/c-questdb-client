@@ -2890,6 +2890,180 @@ fn qwp_ws_reconnect_provider_failure_keeps_queued_frame_recoverable() {
 }
 
 #[test]
+fn qwp_ws_reconnect_401_rotates_token_and_completes_pending_durable_ack() {
+    // Ordinary OK does not make an SFA publication durable. Drop that session,
+    // reject the first reconnect's stale token, then accept the retry with a
+    // rotated token and durably ACK the replay. Each gate is channel-driven so
+    // the reconnect cannot race ahead of the withheld durable watermark.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (disconnect_tx, disconnect_rx) = mpsc::channel();
+    let (replayed_tx, replayed_rx) = mpsc::channel();
+    let (release_durable_tx, release_durable_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut initial, _) = listener.accept().unwrap();
+        let initial_lines = perform_server_upgrade_durable(&mut initial).unwrap();
+        assert_eq!(
+            parse_header(&initial_lines.join("\r\n"), "Authorization").as_deref(),
+            Some("Bearer initial")
+        );
+        assert!(
+            initial_lines
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("X-QWP-Request-Durable-Ack: true"))
+        );
+
+        let mut wire_seq = FIRST_WIRE_SEQUENCE;
+        loop {
+            let (_, opcode, payload) = read_frame(&mut initial).unwrap();
+            match opcode {
+                0x2 => {
+                    let seq = wire_seq;
+                    wire_seq += 1;
+                    if !qwp_frame_has_tables(&payload) {
+                        continue; // A dictionary catch-up frame is not the publication.
+                    }
+                    write_qwp_ok_response_with_table_entries(&mut initial, seq, &[("trades", 10)])
+                        .unwrap();
+                    break;
+                }
+                0x9 => write_server_frame(&mut initial, 0xA, &payload, false).unwrap(),
+                _ => panic!("unexpected opcode {opcode} before the first publication"),
+            }
+        }
+        disconnect_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(initial); // A real mid-stream reconnect with no durable ACK.
+
+        let (mut rejected, _) = listener.accept().unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = read_request_until_blank(&mut rejected).unwrap();
+        assert_eq!(
+            parse_header(&String::from_utf8_lossy(&request), "Authorization").as_deref(),
+            Some("Bearer stale")
+        );
+        rejected
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        drop(rejected);
+
+        let (mut replay, _) = listener.accept().unwrap();
+        let replay_lines = perform_server_upgrade_durable(&mut replay).unwrap();
+        assert_eq!(
+            parse_header(&replay_lines.join("\r\n"), "Authorization").as_deref(),
+            Some("Bearer fresh")
+        );
+        assert!(
+            replay_lines
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("X-QWP-Request-Durable-Ack: true"))
+        );
+
+        let mut wire_seq = FIRST_WIRE_SEQUENCE;
+        loop {
+            let (_, opcode, payload) = read_frame(&mut replay).unwrap();
+            match opcode {
+                0x2 => {
+                    let seq = wire_seq;
+                    wire_seq += 1;
+                    if !qwp_frame_has_tables(&payload) {
+                        continue;
+                    }
+                    write_qwp_ok_response_with_table_entries(&mut replay, seq, &[("trades", 10)])
+                        .unwrap();
+                    replayed_tx.send(()).unwrap();
+                    break;
+                }
+                0x9 => write_server_frame(&mut replay, 0xA, &payload, false).unwrap(),
+                _ => panic!("unexpected opcode {opcode} before the replay"),
+            }
+        }
+        release_durable_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        write_qwp_durable_ack_response(&mut replay, &[("trades", 10)]).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};\
+         request_durable_ack=on;\
+         durable_ack_keepalive_interval_millis=10;\
+         reconnect_initial_backoff_millis=1;\
+         reconnect_max_backoff_millis=1;\
+         reconnect_max_duration_millis=5000;"
+    );
+    let builder = SenderBuilder::from_conf(conf)
+        .unwrap()
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                let credential = match provider_calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => "initial",
+                    1 => "stale",
+                    _ => "fresh",
+                };
+                Ok::<_, crate::Error>(credential.to_string())
+            }
+        })
+        .unwrap();
+    let mut sender = builder.build().unwrap();
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(fsn)
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
+
+    disconnect_tx.send(()).unwrap();
+    replayed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let err = sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_millis(50))
+        .expect_err("ordinary OK on the replay must not complete the durable watermark");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry);
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(fsn),
+        "the replay must have received an ordinary OK"
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
+    release_durable_tx.send(()).unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .expect("a rotated token must keep the pending publication drainable");
+    assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 3);
+    done_tx.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {

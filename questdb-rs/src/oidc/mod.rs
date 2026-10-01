@@ -180,9 +180,10 @@
 //!
 //! # Security
 //!
-//! The IdP device-authorization and token endpoints must use `https` (a
-//! loopback endpoint may use `http`, since the request never leaves the host),
-//! so the device code and refresh token are never sent in cleartext.
+//! The IdP device-authorization and token endpoints must use `https`, except
+//! that loopback endpoints may use `http` for local development. A device code
+//! or refresh token sent to a loopback `http` IdP is in cleartext on this host;
+//! non-loopback IdP endpoints cannot receive these credentials over plaintext.
 //! [`OidcDeviceAuthBuilder::allow_insecure_transport`] relaxes only the QuestDB
 //! `/settings` link (for local development against an `http` server); it never
 //! relaxes the IdP endpoints.
