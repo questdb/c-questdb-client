@@ -6164,6 +6164,79 @@ fn coordinated_refresh_never_falls_back_without_the_store_lock() {
 }
 
 #[test]
+fn peer_token_is_read_immediately_after_refresh_lock_contention() {
+    struct PeerPublishesWhileLockedOut {
+        child: Mutex<Option<PersistedToken>>,
+        first_lock: AtomicBool,
+    }
+
+    impl TokenStore for PeerPublishesWhileLockedOut {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            Ok(self.child.lock().unwrap().clone())
+        }
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            if self.first_lock.swap(false, Ordering::SeqCst) {
+                *self.child.lock().unwrap() = Some(PersistedToken::new(
+                    Some("AT-child".into()),
+                    None,
+                    Some("RT-child".into()),
+                    now_epoch() + 300.0,
+                    300.0,
+                ));
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "peer still holds refresh lock",
+                )));
+            }
+            action()
+        }
+    }
+
+    let store = PeerPublishesWhileLockedOut {
+        child: Mutex::new(None),
+        first_lock: AtomicBool::new(true),
+    };
+    let mock = MockServer::start(|_, _, _| {
+        panic!("adopting the peer's token must not refresh via the IdP")
+    });
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .open_browser(false)
+        .token_store(store)
+        .build()
+        .unwrap();
+    *auth.tokens.lock().unwrap() = Some(TokenSet {
+        access_token: Some("AT-expired".into()),
+        id_token: None,
+        refresh_token: Some("RT-parent".into()),
+        expires_at: 1.0,
+        token_type: "Bearer".into(),
+        scope: Some("openid".into()),
+        sub: None,
+        issued_at: 0.0,
+    });
+    // Model an already-adopted token: the ordinary initial store load is
+    // complete, and the next operation must coordinate a refresh.
+    auth.store_state.lock().unwrap().load_attempted = true;
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(auth.token().unwrap(), "AT-child");
+}
+
+#[test]
 fn refresh_result_is_rejected_when_store_loses_lock_after_action() {
     struct LosesLockAfterAction;
 

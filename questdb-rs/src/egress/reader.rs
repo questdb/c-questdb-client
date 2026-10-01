@@ -3281,7 +3281,16 @@ fn walk_via_tracker(
             && cfg.token_provider.is_some()
         {
             auth_rotation_retry_used = true;
-            ensure_walk_deadline(deadline)?;
+            if let Err(deadline_err) = ensure_walk_deadline(deadline) {
+                // The endpoint has already answered 401. There is no time to
+                // fetch another credential, but replacing that definite auth
+                // rejection with a deadline error would make failover report
+                // the earlier socket failure instead.
+                if let Err(err) = connected {
+                    return Err(err);
+                }
+                return Err(deadline_err);
+            }
             let rotated_headers = upgrade_headers_for_walk(cfg, deadline)?;
             ensure_walk_deadline(deadline)?;
             if authorization_header(&rotated_headers) != authorization_header(&upgrade_headers) {

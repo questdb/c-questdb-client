@@ -530,6 +530,14 @@ impl Error {
         self.0.qwp_ws_role_reject.as_ref()
     }
 
+    /// Whether a QWP/WebSocket upgrade was rejected by a server advertising
+    /// its role. Unlike a plain protocol-version failure, this rejection can
+    /// be retried against another endpoint while the role changes.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn is_qwp_ws_role_reject(&self) -> bool {
+        self.0.qwp_ws_role_reject.is_some()
+    }
+
     /// Server-advertised role + zone carried alongside a query-side error.
     /// `Some` when the error originated from an HTTP `421 + X-QuestDB-Role`
     /// upgrade reject or a `SERVER_INFO` role / `target=` filter mismatch;

@@ -454,6 +454,12 @@ const char* questdb_error_msg(const questdb_error*, size_t* len_out);
 QUESTDB_CLIENT_API
 bool questdb_error_in_doubt(const questdb_error*);
 
+/** Whether the error carries a QWP/WebSocket server-role rejection (including
+ *  a 421 with an unrecognized role header). Unlike a plain protocol-version
+ *  error, this can be retried while server roles change. NULL-safe. */
+QUESTDB_CLIENT_API
+bool questdb_error_is_qwp_ws_role_reject(const questdb_error*);
+
 /** Clean up a client-wide error. Idempotent on NULL. */
 QUESTDB_CLIENT_API
 void questdb_error_free(questdb_error*);

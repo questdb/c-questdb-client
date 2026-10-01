@@ -40,7 +40,8 @@ use std::time::{Duration, Instant};
 
 use questdb::ErrorCode;
 use questdb::egress::{
-    ColumnView, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader, ServerRole,
+    ColumnView, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader, ReaderConfig,
+    ServerRole,
 };
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::http::HeaderValue;
@@ -5760,6 +5761,65 @@ fn slow_503_server(delay: Duration) -> SocketAddr {
         }
     });
     addr
+}
+
+fn slow_401_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
+}
+
+/// A late 401 must remain an AuthError even if there is no time left to
+/// acquire another token. Replacing it with a deadline error makes failover
+/// report the earlier, transient failure on the other endpoint instead.
+#[test]
+fn late_401_at_failover_deadline_surfaces_auth_error() {
+    for provider in [false, true] {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Standalone, "a"),
+            vec![Action::HardDrop],
+        ]);
+        let b = slow_401_server(Duration::from_millis(300));
+        let conf = format!(
+            "ws::addr={},{};failover_max_attempts=2;\
+             failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+             failover_max_duration_ms=100",
+            a.url(),
+            b
+        );
+        let cfg = ReaderConfig::from_conf(&conf).unwrap();
+        let cfg = if provider {
+            cfg.token_provider(|| Ok::<_, questdb::Error>("tok".to_string()))
+                .unwrap()
+        } else {
+            cfg
+        };
+        let mut reader = Reader::from_config(&cfg).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("401 must reject the query"),
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::AuthError,
+            "provider={provider}: {err}"
+        );
+    }
 }
 
 /// Regression: the `RoleMismatch` case above applies equally to the other

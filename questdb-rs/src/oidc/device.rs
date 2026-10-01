@@ -1633,12 +1633,14 @@ impl OidcDeviceAuth {
                     let now = Instant::now();
                     let mut state = self.lock_store_state();
                     state.record_refresh_failure(now);
-                    // A transient refresh failure may have consumed the entry
-                    // this process adopted.  Re-arm the lazy read so a peer
-                    // that repairs the shared store can be observed after the
-                    // normal empty-load throttle instead of leaving this
-                    // provider latched to stale state forever.
-                    state.rearm_store_load(now);
+                    // A peer may have persisted a new token while we waited
+                    // unsuccessfully for its refresh lock. Re-read the store
+                    // on the next call rather than treating this as a known
+                    // empty store for five seconds. The read still takes the
+                    // identity lock; if it finds nothing it installs the
+                    // ordinary empty-store throttle itself.
+                    state.load_attempted = false;
+                    state.next_empty_load_recheck = None;
                     return Err(e);
                 }
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Cancelled => {
