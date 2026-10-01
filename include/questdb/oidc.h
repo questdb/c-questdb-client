@@ -251,9 +251,9 @@ bool questdb_oidc_builder_groups_in_token(
  * device-authorization and token endpoints require `https` unless they are
  * loopback hosts, where plaintext `http` is permitted for local development.
  * A device code or refresh token can therefore be sent in cleartext to an
- * explicitly configured loopback endpoint, regardless of this flag; non-loopback
- * cleartext endpoints are rejected. (`localhost` is accepted only if it
- * actually resolves to a loopback address.)
+ * explicitly configured loopback endpoint, regardless of this flag;
+ * non-loopback cleartext endpoints are rejected. (`localhost` is accepted only
+ * if it actually resolves to a loopback address.)
  *
  * A tampered `/settings` response can redirect where you sign in, so over a
  * plaintext channel the client refuses settings-sourced values it cannot
