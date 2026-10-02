@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1.46.0", features = ["full"] }
 tokio-rustls = "0.26.2"
-rustls = "0.23.28"
+rustls = "0.23.45"
 rustls-pemfile = "2.2.0"
 argh = "0.1.13"
 anyhow = "1.0.98"
