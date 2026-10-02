@@ -423,9 +423,14 @@ fn classify_provider_error(e: crate::Error) -> crate::Error {
         // `borrow_sender_owned_with_retry` and `reborrow_with_retry` retrying
         // it at all -- they now returned on the first `acquire_timeout`
         // expiry. `ConfigError` is already in that set, so a genuine provider
-        // contract violation stays terminal without the collateral.
+        // contract violation stays terminal without the collateral. Preserve
+        // that classification independently of the message: a 401 adds
+        // endpoint context before an orphan drainer examines the error.
         let msg = format!("{PROVIDER_FAILED_PREFIX}{}", e.msg());
-        return e.reclassified(crate::ErrorCode::ConfigError, msg);
+        let err = e.reclassified(crate::ErrorCode::ConfigError, msg);
+        #[cfg(feature = "_sender-qwp-ws")]
+        let err = err.with_terminal_token_provider_failure();
+        return err;
     }
     if is_terminal_oidc_provider_error(&e) {
         return e;
@@ -446,11 +451,11 @@ const PROVIDER_FAILED_PREFIX: &str = "Token provider failed: ";
 /// that returned `InvalidApiCall`, which [`classify_provider_error`] carries as
 /// a terminal `ConfigError`. A background loop that pulls a token (an orphan
 /// drainer) must stop on these exactly as the foreground reconnect loop does.
+/// Do not infer this from the message: a rejected handshake can wrap it with
+/// HTTP 401 and endpoint context without changing the provider's failure.
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) fn is_terminal_provider_error(e: &crate::Error) -> bool {
-    is_terminal_oidc_provider_error(e)
-        || (e.code() == crate::ErrorCode::ConfigError
-            && e.msg().starts_with(PROVIDER_FAILED_PREFIX))
+    is_terminal_oidc_provider_error(e) || e.is_terminal_token_provider_failure()
 }
 
 /// Whether `e` is an OIDC provider failure that no later invocation can
@@ -564,6 +569,28 @@ mod tests {
         let err = provider.bearer_header().unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ConfigError);
         assert!(err.msg().contains("provider callback contract violated"));
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn terminal_provider_failure_survives_transport_context_without_message_matching() {
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::Error::new(
+                crate::ErrorCode::InvalidApiCall,
+                "broken",
+            ))
+        });
+        let err = provider.bearer_header().unwrap_err();
+        assert!(is_terminal_provider_error(&err));
+        let wrapped = err.reclassified(
+            crate::ErrorCode::ConfigError,
+            "WebSocket credential rejected (HTTP 401): broken",
+        );
+        assert!(is_terminal_provider_error(&wrapped));
+        assert!(!is_terminal_provider_error(&crate::Error::new(
+            crate::ErrorCode::ConfigError,
+            "Token provider failed: not actually from a provider",
+        )));
     }
 
     #[cfg(feature = "_oidc")]

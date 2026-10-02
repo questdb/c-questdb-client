@@ -5748,6 +5748,71 @@ fn a_peer_process_sign_in_is_adopted_without_a_restart() {
 }
 
 #[test]
+fn an_expired_persisted_token_without_refresh_adopts_a_peer_sign_in() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-new","refresh_token":"RT-new","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    // Check both a token already expired at adoption and one first served
+    // successfully and then allowed to expire during the provider's lifetime.
+    for initially_valid in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let store = test_file_store(dir.path());
+        let key = key_for(&mock);
+        // A compatible client or the public FileTokenStore API can persist an
+        // access-only entry. Our own sign_in() does not write one without refresh.
+        let expiry = if initially_valid {
+            now_epoch() + 300.0
+        } else {
+            1.0
+        };
+        store
+            .save(
+                &key,
+                &PersistedToken::new(Some("AT-old".to_string()), None, None, expiry, 300.0),
+            )
+            .unwrap();
+
+        let service = auth_with_store(&mock, dir.path());
+        if initially_valid {
+            assert_eq!(service.token().unwrap(), "AT-old");
+            assert!(service.store_state.lock().unwrap().load_attempted);
+            expire_persisted(dir.path(), &key);
+            service.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+        }
+        assert_eq!(
+            service.token().unwrap_err().kind(),
+            OidcErrorKind::InteractionRequired
+        );
+        {
+            let state = service.store_state.lock().unwrap();
+            assert!(
+                !state.load_attempted,
+                "expired no-refresh entry latched the store read"
+            );
+            assert!(
+                state.next_empty_load_recheck.is_some(),
+                "re-reading the expired entry must be throttled"
+            );
+        }
+
+        // A new credential at the same identity must become visible to this
+        // long-lived provider without requiring its own interactive sign-in.
+        auth_with_store(&mock, dir.path()).sign_in().unwrap();
+        assert_eq!(
+            store.load(&key).unwrap().unwrap().refresh_token(),
+            Some("RT-new")
+        );
+        service.store_state.lock().unwrap().next_empty_load_recheck = None;
+        assert_eq!(service.token().unwrap(), "AT-new");
+    }
+}
+
+#[test]
 fn a_rejected_refresh_does_not_strand_the_provider_against_a_peer_sign_in() {
     // Regression, and the sibling of
     // `a_peer_process_sign_in_is_adopted_without_a_restart` for a store that was

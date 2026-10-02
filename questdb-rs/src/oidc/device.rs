@@ -1680,6 +1680,21 @@ impl OidcDeviceAuth {
         // the kind it returned is already expired. A rejected (expired/revoked)
         // refresh token leaves this `None`.
         *self.lock_tokens() = refreshed_unusable;
+        // A persisted access token without a refresh token can be served until
+        // it expires, but cannot be refreshed. Once it is discarded, the
+        // one-shot store read no longer describes our cache: a peer may sign
+        // in and replace the entry. Re-check on the same throttled schedule as
+        // an empty or rejected store entry, not on every token() call.
+        if existing
+            .as_ref()
+            .is_some_and(|tokens| tokens.refresh_token.is_none())
+            && self.token_store.is_some()
+        {
+            let mut state = self.lock_store_state();
+            if state.load_attempted {
+                state.rearm_store_load(Instant::now());
+            }
+        }
         if !allow_interaction {
             return Err(OidcError::interaction_required(
                 "No usable cached or refreshable OIDC token is available. Call sign_in() \

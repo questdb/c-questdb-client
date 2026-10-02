@@ -313,6 +313,10 @@ struct ErrorInner {
     code: ErrorCode,
     msg: String,
     in_doubt: bool,
+    /// A provider's InvalidApiCall stays terminal even when a transport adds
+    /// context to its message (notably after a WebSocket upgrade 401).
+    #[cfg(feature = "_sender-qwp-ws")]
+    terminal_token_provider_failure: bool,
     /// Structured OIDC failure details retained across conversion into the
     /// client-wide error type. OIDC-only.
     #[cfg(feature = "_oidc")]
@@ -349,6 +353,8 @@ impl Error {
             code,
             msg: msg.into(),
             in_doubt: false,
+            #[cfg(feature = "_sender-qwp-ws")]
+            terminal_token_provider_failure: false,
             #[cfg(feature = "_oidc")]
             oidc_error: None,
             #[cfg(feature = "_sender-qwp-ws")]
@@ -391,6 +397,17 @@ impl Error {
     #[must_use]
     pub fn in_doubt(&self) -> bool {
         self.0.in_doubt
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn with_terminal_token_provider_failure(mut self) -> Self {
+        self.0.terminal_token_provider_failure = true;
+        self
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn is_terminal_token_provider_failure(&self) -> bool {
+        self.0.terminal_token_provider_failure
     }
 
     /// Attach the structured OIDC failure that produced this client-wide

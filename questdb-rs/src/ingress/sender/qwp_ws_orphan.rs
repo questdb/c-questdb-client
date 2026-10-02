@@ -1039,6 +1039,8 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     use crate::ingress::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    use std::io::{Read, Write};
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use std::net::TcpListener;
 
     #[test]
@@ -1578,6 +1580,93 @@ mod tests {
 
         let queue = SfaSlotQueue::open(slot_options(&sf_dir, "orphan")).unwrap();
         assert!(!orphan_queue_drained(&queue));
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_retires_slot_on_provider_failure_after_upgrade_401() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("orphan did not connect to the 401 fixture: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).unwrap();
+                assert_ne!(n, 0, "upgrade request ended before its headers");
+                request.extend_from_slice(&chunk[..n]);
+            }
+            assert!(
+                String::from_utf8(request)
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer stale"),
+                "orphan must have presented the stale credential"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut config = test_config();
+        config.port = port.to_string();
+        config.qwp_ws.reconnect_initial_backoff =
+            ConfigSetting::new_default(Duration::from_millis(1));
+        config.qwp_ws.token_provider = Some(crate::token_provider::TokenProvider::new(move || {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok("stale".to_string())
+            } else {
+                Err(crate::Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "provider permanently broken",
+                ))
+            }
+        }));
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+        server.join().unwrap();
+        let last_error = fs::read_to_string(slot_dir.join(LAST_ERROR_NAME)).unwrap();
+        assert!(last_error.contains("HTTP 401"), "{last_error}");
+        assert!(
+            last_error.contains("provider permanently broken"),
+            "{last_error}"
+        );
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !drainers.drive_once(),
+            "the provider contract failure must retire this orphan slot"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!has_failed_sentinel(&slot_dir));
+        let queue = SfaSlotQueue::open(slot_options(&sf_dir, "orphan")).unwrap();
+        assert!(
+            !orphan_queue_drained(&queue),
+            "queued frames must remain recoverable"
+        );
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
