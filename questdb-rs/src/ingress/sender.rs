@@ -62,7 +62,8 @@ mod qwp_ws_driver;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws_driver::{
-    ReconnectPolicy, ReconnectReason, reconnect_backoff_step, reconnect_error_is_terminal,
+    ReconnectPolicy, ReconnectReason, reconnect_backoff_step,
+    reconnect_error_is_foreground_terminal,
 };
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -493,6 +494,15 @@ impl Sender {
                     0.0f64
                 };
 
+                // The auth header is resolved inside `http_send_with_retries`.
+                // Its first retryable failure starts the same `retry_timeout`
+                // deadline later used by request retries. A token provider is
+                // called there, and a recoverable provider failure is
+                // re-resolved rather than ending the flush:
+                // resolving out here returned a `SocketError` after zero
+                // requests, and the Python binding clears its sender-owned
+                // buffer on any flush failure, so the batch died on a transient
+                // the budget was meant to cover.
                 match http_send_with_retries(
                     state,
                     bytes,
@@ -508,7 +518,7 @@ impl Sender {
                             Ok(())
                         }
                     }
-                    Err(err) => Err(crate::error::Error::from_ureq_error(err, &state.url)),
+                    Err(err) => Err(err),
                 }
             }
             #[cfg(feature = "sync-sender-qwp-udp")]

@@ -1,0 +1,1 @@
+{"v":1,"client_id":"questdb","token_endpoint":"https://idp.example.com:443/token","device_authorization_endpoint":"https://idp.example.com:443/device","scope":"openid offline_access","groups_in_token":false,"access_token":"AT-JAVA","refresh_token":"RT-JAVA","expires_at_millis":1730000000000,"token_ttl_millis":300000}

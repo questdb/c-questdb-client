@@ -22,6 +22,7 @@ import logging
 import shutil
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,7 +68,9 @@ def _survives_kill_body(sidecar, server_factory, obj_store, scenario_dir: Path,
         "drain_orphans=on;"
         "request_durable_ack=on;"
         "reconnect_max_duration_millis=60000;"
-        "close_flush_timeout_millis=5000;"
+        # The foreground has no own frames to flush; stopping it while P1 is
+        # down must not wait for a durable ACK from the destroyed server.
+        "close_flush_timeout_millis=0;"
     )
     sidecar.connect(fg_cs)
     # Window for the drainer to adopt, push the orphan frame(s), and get OK.
@@ -80,11 +83,17 @@ def _survives_kill_body(sidecar, server_factory, obj_store, scenario_dir: Path,
         shutil.rmtree(p1.db_root)
     obj_store.wipe()
 
+    # Stop the original drainer *before* P2 accepts writes. Replacing it after
+    # P2 starts can race its first replay with the new orphan scan: if the old
+    # drainer's 50 rows land but it has not received DURABLE_ACK when CLOSE
+    # stops it, the new drainer sends those rows again (at-least-once replay).
+    # That tests a different, non-idempotent delivery scenario, not survival.
+    sidecar.close()
+
     p2 = server_factory("p2", db_root_name="p2-fresh")
     p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
 
-    # A fresh orphan scan on reconnect re-adopts the still-un-acked ghost slot
-    # and replays it to P2.
+    # A fresh orphan scan adopts the still-un-acked ghost slot and replays it.
     sidecar.connect(fg_cs)
     wait_for_dense_sequence(port=p1_ports.pg, table=table,
                             expected_count=row_count, timeout_s=60.0)
@@ -159,6 +168,58 @@ def _no_durable_ack_loses_rows_body(sidecar, server_factory, obj_store,
         "survives without request_durable_ack=on the test setup isn't actually "
         "exercising the failure mode it claims to."
     )
+
+
+@pytest.mark.c_client
+def test_survival_stops_old_drainer_before_successor_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Reconnecting with P2 already online can deliver the same orphan twice."""
+    events: list[str] = []
+    connects: list[str] = []
+    ports = SimpleNamespace(http=12345, pg=12346)
+
+    class FakeServer:
+        db_root = tmp_path / "absent"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def start(self, **kwargs):
+            events.append(f"start:{self.name}")
+            return ports
+
+        def kill_9(self):
+            events.append("kill")
+
+    class FakeSidecar:
+        def connect(self, cs):
+            connects.append(cs)
+            events.append("connect")
+
+        def send(self, *_args, **_kwargs):
+            events.append("send")
+
+        def flush(self):
+            events.append("flush")
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr("tests.test_orphan_drainer_bindings.wait_port_free",
+                        lambda _: None)
+    monkeypatch.setattr("tests.test_orphan_drainer_bindings.wait_for_dense_sequence",
+                        lambda **_: events.append("verified"))
+    obj_store = SimpleNamespace(wipe=lambda: events.append("wipe"))
+    _survives_kill_body(FakeSidecar(), lambda name, **_: FakeServer(name),
+                        obj_store, tmp_path, "unit")
+
+    assert len(connects) == 3  # ghost, foreground, new scan
+    assert all("close_flush_timeout_millis=0;" in cs for cs in connects)
+    assert events.count("send") == 1
+    assert events.index("kill") < events.index("close", events.index("kill")) \
+        < events.index("start:p2") < events.index("verified")
 
 
 # ---------------------------------------------------------------------------

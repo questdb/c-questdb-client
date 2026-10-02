@@ -175,7 +175,8 @@ pub(super) fn classify_qwp_handshake_reject(
             AuthError,
             "WebSocket upgrade authentication failed: HTTP status {}",
             reject.status
-        );
+        )
+        .with_ws_http_status(reject.status);
     }
     if reject.status == 421
         && let Some(role) = reject
@@ -208,6 +209,7 @@ pub(super) fn classify_qwp_handshake_reject(
         "WebSocket upgrade failed: HTTP status {}",
         reject.status
     )
+    .with_ws_http_status(reject.status)
 }
 
 /// Map a [`crate::ws::handshake::HandshakeError`] from the shared handshake
@@ -714,6 +716,7 @@ mod tests {
             };
             let err = classify_qwp_handshake_reject(reject);
             assert_eq!(err.code(), crate::ErrorCode::AuthError);
+            assert_eq!(err.ws_http_status(), Some(status));
             assert!(
                 err.msg().contains(&format!("HTTP status {status}")),
                 "got: {}",
@@ -734,6 +737,7 @@ mod tests {
             };
             let err = classify_qwp_handshake_reject(reject);
             assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert_eq!(err.ws_http_status(), Some(status));
             assert!(err.qwp_ws_role_reject().is_none());
             assert!(
                 err.msg().contains(&format!("HTTP status {status}")),
