@@ -126,10 +126,13 @@ fn dod_code(dod: i64) -> Option<(u64, u32)> {
 /// Encode ≥ 3 values as two raw LE seeds + DoD bitstream. Returns `false`,
 /// leaving a partial stream in `out`, as soon as a delta-of-delta falls
 /// outside the 32-bit bucket; the caller truncates `out` back to where it
-/// started and ships the column raw instead.
+/// started and ships the column raw instead. A source that runs dry before
+/// both seeds also returns `false`: the caller broke its value-count
+/// contract, and the raw layout survives that without a panic.
 fn try_encode_gorilla(out: &mut Vec<u8>, mut values: impl Iterator<Item = i64>) -> bool {
-    let first = values.next().expect("gorilla encode needs >= 3 values");
-    let second = values.next().expect("gorilla encode needs >= 3 values");
+    let (Some(first), Some(second)) = (values.next(), values.next()) else {
+        return false;
+    };
     out.extend_from_slice(&first.to_le_bytes());
     out.extend_from_slice(&second.to_le_bytes());
     let mut w = BitWriter::new(out);
@@ -154,8 +157,8 @@ fn try_encode_gorilla(out: &mut Vec<u8>, mut values: impl Iterator<Item = i64>) 
 fn write_raw(out: &mut Vec<u8>, count: usize, values: impl Iterator<Item = i64>) {
     let start = out.len();
     out.resize(start + count * 8, 0);
-    for (dst, v) in out[start..].chunks_exact_mut(8).zip(values) {
-        dst.copy_from_slice(&v.to_le_bytes());
+    for (dst, v) in out[start..].as_chunks_mut::<8>().0.iter_mut().zip(values) {
+        *dst = v.to_le_bytes();
     }
 }
 
@@ -261,6 +264,24 @@ mod golden_tests {
             let mut raw = vec![ENCODING_UNCOMPRESSED];
             raw.extend(values.iter().flat_map(|v| v.to_le_bytes()));
             assert_eq!(temporal_payload(&values), raw);
+        }
+    }
+
+    #[test]
+    fn source_shorter_than_count_encodes_raw_without_panicking() {
+        // A caller that breaks the value-count contract. The FFI builds with
+        // `panic = "abort"`, so running out of seeds must not panic: the
+        // column goes out raw, `count` slots wide, zero where values ran out.
+        for yielded in [0usize, 1] {
+            let mut out = Vec::new();
+            write_temporal_column(&mut out, 4, || std::iter::repeat_n(7i64, yielded));
+            let mut raw = vec![ENCODING_UNCOMPRESSED];
+            raw.extend(
+                (0..4)
+                    .map(|i| i64::from(i < yielded) * 7)
+                    .flat_map(i64::to_le_bytes),
+            );
+            assert_eq!(out, raw);
         }
     }
 }

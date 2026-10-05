@@ -3271,7 +3271,20 @@ fn write_temporal_arrow(
             values.iter().map(|&v| v.wrapping_mul(scale))
         }),
         Some(nulls) => {
-            let non_null = non_null_count(arr, "timestamp column")?;
+            // The values below follow the live bitmap, and the server counts
+            // them from that same bitmap. The Arrow C Data import does not
+            // recount nulls, so a declared `null_count` that disagrees with
+            // the bitmap is rejected here rather than sizing the payload.
+            let declared = non_null_count(arr, "timestamp column")?;
+            let non_null = nulls.inner().count_set_bits();
+            if non_null != declared {
+                return Err(fmt!(
+                    ArrowIngest,
+                    "timestamp column: validity bitmap exposes {} non-null rows but the declared null_count implies {}",
+                    non_null,
+                    declared
+                ));
+            }
             gorilla::write_temporal_column(out, non_null, || {
                 nulls
                     .valid_indices()
@@ -5650,22 +5663,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn timestamp_null_count_over_len_is_an_error_not_a_panic() {
+    /// A timestamp column whose declared `null_count` need not match its
+    /// validity bitmap. Only the unchecked constructors can build one, and so
+    /// can a C producer: the Arrow C Data import skips `validate_full`.
+    fn timestamp_with_declared_null_count(
+        values: Vec<i64>,
+        validity: u8,
+        null_count: usize,
+    ) -> TimestampMicrosecondArray {
         use arrow::array::ArrayDataBuilder;
         use arrow::buffer::Buffer;
 
-        // Only reachable through the unchecked constructors: a null count
-        // larger than the array. The non-null count would underflow.
         let data = unsafe {
             ArrayDataBuilder::new(DataType::Timestamp(TimeUnit::Microsecond, None))
-                .len(3)
-                .null_count(5)
-                .null_bit_buffer(Some(Buffer::from_vec(vec![0b0000_0101u8])))
-                .add_buffer(Buffer::from_vec(vec![1i64, 2, 3]))
+                .len(values.len())
+                .null_count(null_count)
+                .null_bit_buffer(Some(Buffer::from_vec(vec![validity])))
+                .add_buffer(Buffer::from_vec(values))
                 .build_unchecked()
         };
-        let arr = TimestampMicrosecondArray::from(data);
+        TimestampMicrosecondArray::from(data)
+    }
+
+    #[test]
+    fn timestamp_null_count_over_len_is_an_error_not_a_panic() {
+        // A null count larger than the array: the non-null count would
+        // underflow.
+        let arr = timestamp_with_declared_null_count(vec![1, 2, 3], 0b0000_0101, 5);
         let err = write_arrow_column_body(&mut Vec::new(), ColumnKind::TimestampMicros, &arr, None)
             .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
@@ -5674,6 +5698,35 @@ mod tests {
             "{}",
             err.msg()
         );
+    }
+
+    #[test]
+    fn timestamp_null_count_disagreeing_with_bitmap_is_rejected() {
+        // Five rows; (validity bitmap, declared null_count). The value count
+        // on the wire must come from the bitmap the server reads, so a count
+        // that disagrees with it is rejected in both directions.
+        let cases = [
+            // 4 values declared, 1 valid: Gorilla would run out of seeds.
+            (0b0000_0001u8, 1),
+            // 2 values declared, 5 valid: raw slab would drop three values.
+            (0b0001_1111, 3),
+        ];
+        for (validity, null_count) in cases {
+            let arr = timestamp_with_declared_null_count(
+                vec![10_000, 10_500, 11_000, 11_500, 12_000],
+                validity,
+                null_count,
+            );
+            let err =
+                write_arrow_column_body(&mut Vec::new(), ColumnKind::TimestampMicros, &arr, None)
+                    .unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+            assert!(
+                err.msg().contains("declared null_count"),
+                "bitmap {validity:#010b}, null_count {null_count}: {}",
+                err.msg()
+            );
+        }
     }
 
     #[test]

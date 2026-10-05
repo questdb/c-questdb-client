@@ -2351,6 +2351,45 @@ mod tests {
 
     #[cfg(feature = "arrow-ingress")]
     #[test]
+    fn imported_arrow_timestamp_with_wrong_null_count_is_rejected() {
+        use crate::ingress::column_sender::ImportedArrowColumn;
+        use arrow::array::ArrayDataBuilder;
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::{DataType, TimeUnit};
+
+        // Five rows and one valid bit under a null_count of 1: what a
+        // hand-written C producer can hand over, because the import does not
+        // recount nulls and a full-range append reuses the array unsliced.
+        let data = unsafe {
+            ArrayDataBuilder::new(DataType::Timestamp(TimeUnit::Microsecond, None))
+                .len(5)
+                .null_count(1)
+                .null_bit_buffer(Some(Buffer::from_vec(vec![0b0000_0001u8])))
+                .add_buffer(Buffer::from_vec(vec![
+                    10_000i64, 10_500, 11_000, 11_500, 12_000,
+                ]))
+                .build_unchecked()
+        };
+        let (mut ffi_array, ffi_schema) = arrow::ffi::to_ffi(&data).unwrap();
+        let imported =
+            unsafe { ImportedArrowColumn::import_from_ffi(&mut ffi_array, &ffi_schema, None) }
+                .unwrap();
+
+        let mut chunk = Chunk::new("t");
+        chunk
+            .push_imported_arrow_slice("ts", &imported, 0, imported.len())
+            .unwrap();
+        chunk.at_now().unwrap();
+        let mut out = Vec::new();
+        let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
+        let err = encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("declared null_count"), "{}", err.msg());
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
     fn arrow_deferred_symbol_column_interns_into_shared_dict() {
         use crate::ingress::column_sender::arrow_batch;
         use arrow::array::{ArrayRef, StringArray};
