@@ -3779,7 +3779,7 @@ pub(crate) fn write_arrow_designated_ts_body(
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
-            ensure_timestamp_values_non_negative(arr, a.values(), label)?;
+            ensure_timestamp_values_non_negative(a.values(), label)?;
             gorilla::write_temporal_column(out, a.values().len(), || a.values().iter().copied());
             Ok(())
         }
@@ -3788,7 +3788,7 @@ pub(crate) fn write_arrow_designated_ts_body(
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .unwrap();
-            ensure_timestamp_values_non_negative(arr, a.values(), label)?;
+            ensure_timestamp_values_non_negative(a.values(), label)?;
             gorilla::write_temporal_column(out, a.values().len(), || a.values().iter().copied());
             Ok(())
         }
@@ -3797,17 +3797,7 @@ pub(crate) fn write_arrow_designated_ts_body(
                 .as_any()
                 .downcast_ref::<TimestampMillisecondArray>()
                 .unwrap();
-            ensure_timestamp_values_non_negative(arr, a.values(), label)?;
-            for (row, &v) in a.values().iter().enumerate() {
-                if v.checked_mul(1_000).is_none() {
-                    return Err(fmt!(
-                        ArrowIngest,
-                        "designated timestamp ms→µs overflow at row {} (value {})",
-                        row,
-                        v
-                    ));
-                }
-            }
+            ensure_timestamp_values_widen_to_micros(a.values(), 1_000, "ms", label)?;
             gorilla::write_temporal_column(out, a.values().len(), || {
                 a.values().iter().map(|&v| v.wrapping_mul(1_000))
             });
@@ -3815,17 +3805,7 @@ pub(crate) fn write_arrow_designated_ts_body(
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
-            ensure_timestamp_values_non_negative(arr, a.values(), label)?;
-            for (row, &v) in a.values().iter().enumerate() {
-                if v.checked_mul(1_000_000).is_none() {
-                    return Err(fmt!(
-                        ArrowIngest,
-                        "designated timestamp s→µs overflow at row {} (value {})",
-                        row,
-                        v
-                    ));
-                }
-            }
+            ensure_timestamp_values_widen_to_micros(a.values(), 1_000_000, "s", label)?;
             gorilla::write_temporal_column(out, a.values().len(), || {
                 a.values().iter().map(|&v| v.wrapping_mul(1_000_000))
             });
@@ -3846,26 +3826,52 @@ fn ensure_timestamp_no_nulls(arr: &dyn Array, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_timestamp_values_non_negative(
-    arr: &dyn Array,
+/// Every value is checked: the designated timestamp has no null rows (see
+/// [`ensure_timestamp_no_nulls`]) and all of `values` go on the wire.
+fn ensure_timestamp_values_non_negative(values: &[i64], label: &str) -> Result<()> {
+    for (row, &value) in values.iter().enumerate() {
+        if value < 0 {
+            return Err(negative_timestamp_error(label, row, value));
+        }
+    }
+    Ok(())
+}
+
+/// Pre-scan for a designated timestamp in a unit that widens to microseconds
+/// by `scale`: no value may precede the Unix epoch or overflow once scaled.
+/// One pass covers both checks, so the encode pass can multiply unchecked.
+fn ensure_timestamp_values_widen_to_micros(
     values: &[i64],
+    scale: i64,
+    unit: &str,
     label: &str,
 ) -> Result<()> {
+    let max = i64::MAX / scale;
     for (row, &value) in values.iter().enumerate() {
-        if arr.is_null(row) {
-            continue;
-        }
         if value < 0 {
+            return Err(negative_timestamp_error(label, row, value));
+        }
+        if value > max {
             return Err(fmt!(
                 ArrowIngest,
-                "{} cannot contain timestamps before the Unix epoch at row {} (value {})",
-                label,
+                "designated timestamp {}→µs overflow at row {} (value {})",
+                unit,
                 row,
                 value
             ));
         }
     }
     Ok(())
+}
+
+fn negative_timestamp_error(label: &str, row: usize, value: i64) -> Error {
+    fmt!(
+        ArrowIngest,
+        "{} cannot contain timestamps before the Unix epoch at row {} (value {})",
+        label,
+        row,
+        value
+    )
 }
 
 fn decorate_column(err: Error, column_name: &str) -> Error {
@@ -5526,14 +5532,30 @@ mod tests {
 
     #[test]
     fn designated_timestamp_arrow_negative_values_are_rejected() {
-        let mut ts = TimestampMicrosecondBuilder::new();
-        ts.append_value(-1);
-        let rb = single_col_batch(
-            Field::new("t", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-            ts.finish(),
-        );
-        let err = encode_err_at_ts(&rb, 0);
-        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        // Every unit: s and ms share a pre-scan with their overflow check,
+        // separate from the one µs and ns go through.
+        let columns: [ArrayRef; 4] = [
+            Arc::new(TimestampSecondArray::from(vec![1, -1])),
+            Arc::new(TimestampMillisecondArray::from(vec![1, -1])),
+            Arc::new(TimestampMicrosecondArray::from(vec![1, -1])),
+            Arc::new(TimestampNanosecondArray::from(vec![1, -1])),
+        ];
+        for ts in columns {
+            let v: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2]));
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("t", ts.data_type().clone(), false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            let rb = RecordBatch::try_new(schema, vec![ts, v]).unwrap();
+            let err = encode_err_at_ts(&rb, 0);
+            assert_eq!(err.code(), ErrorCode::ArrowIngest);
+            assert!(
+                err.msg()
+                    .contains("before the Unix epoch at row 1 (value -1)"),
+                "{}",
+                err.msg()
+            );
+        }
     }
 
     #[test]

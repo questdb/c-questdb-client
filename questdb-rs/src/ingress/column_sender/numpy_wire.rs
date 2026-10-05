@@ -32,6 +32,7 @@
 //! else. The numpy entry point can build (and run at full coverage)
 //! without the `arrow` Cargo feature.
 
+use std::cell::Cell;
 use std::slice;
 
 use crate::ingress::gorilla;
@@ -558,7 +559,7 @@ pub(crate) unsafe fn emit_into_wire(
         // (year, month) inputs without affecting random-data correctness.
         D::DatetimeMonthToMicros => unsafe {
             let mut last: Option<(i64, i64)> = None;
-            emit_i64_to_micros(out, data, row_count, validity, "M", |v| {
+            emit_i64_to_micros(out, data, row_count, validity, "M", move |v| {
                 if let Some((k, r)) = last
                     && k == v
                 {
@@ -571,7 +572,7 @@ pub(crate) unsafe fn emit_into_wire(
         },
         D::DatetimeYearToMicros => unsafe {
             let mut last: Option<(i64, i64)> = None;
-            emit_i64_to_micros(out, data, row_count, validity, "Y", |v| {
+            emit_i64_to_micros(out, data, row_count, validity, "Y", move |v| {
                 if let Some((k, r)) = last
                     && k == v
                 {
@@ -1084,6 +1085,11 @@ unsafe fn emit_bool(
 /// `convert` closure maps one source `i64` to a microsecond `i64`,
 /// returning `None` on overflow / out-of-range so the caller surfaces a
 /// `InvalidApiCall` error pointing at the offending row.
+///
+/// `convert` may carry cache state (the month/year conversions memoize their
+/// last input), and the Gorilla writer reads its source twice when the column
+/// falls back to raw. So `convert` is `Clone`, and each read of the source
+/// works on its own copy.
 #[inline]
 unsafe fn emit_i64_to_micros<F>(
     out: &mut Vec<u8>,
@@ -1094,7 +1100,7 @@ unsafe fn emit_i64_to_micros<F>(
     mut convert: F,
 ) -> Result<()>
 where
-    F: FnMut(i64) -> Option<i64>,
+    F: FnMut(i64) -> Option<i64> + Clone,
 {
     let typed = data as *const i64;
     let make_err = |i: usize, value: i64| {
@@ -1110,32 +1116,43 @@ where
     // (`I64_NULL`). Map it straight through to null so an in-band NaT is
     // treated consistently with the direct (already-µs) paths instead of
     // failing the whole batch on conversion overflow.
-    //
-    // The converted values are materialized into a dense `Vec` up front
-    // (rather than converted lazily inside the `write_temporal_column`
-    // closure) because `convert` is an `FnMut` with per-call cache state
-    // (month/year offsets memoize their last input) and the Gorilla writer
-    // invokes its closure twice when the column falls back to raw; a
-    // single sequential conversion pass keeps `convert` called exactly once
-    // per row regardless.
     match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
-            let mut micros = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                let value = unsafe { typed.add(i).read_unaligned() };
-                let m = if value == I64_NULL {
-                    I64_NULL
-                } else {
-                    convert(value).ok_or_else(|| make_err(i, value))?
-                };
-                micros.push(m);
+            // Converted inside the encode passes, with no dense copy of the
+            // column: most [h]/[D]/[W]/[M]/[Y] columns step by more than
+            // Gorilla can hold and go out raw, where the copy bought nothing.
+            // A row that fails to convert yields a placeholder and is
+            // reported once the encoder returns. Rows are read in order, so
+            // the first failure seen is the lowest failing row whichever
+            // pass reaches it.
+            let failed = Cell::new(None);
+            gorilla::write_temporal_column(out, row_count, || {
+                let mut convert = convert.clone();
+                let failed = &failed;
+                (0..row_count).map(move |i| {
+                    let value = unsafe { typed.add(i).read_unaligned() };
+                    if value == I64_NULL {
+                        return I64_NULL;
+                    }
+                    convert(value).unwrap_or_else(|| {
+                        if failed.get().is_none() {
+                            failed.set(Some((i, value)));
+                        }
+                        0
+                    })
+                })
+            });
+            if let Some((i, value)) = failed.get() {
+                return Err(make_err(i, value));
             }
-            gorilla::write_temporal_column(out, micros.len(), || micros.iter().copied());
         }
         Some(v) => {
             out.push(1);
             unsafe { write_qwp_bitmap_from_validity(out, v) };
+            // With nulls the valid rows are compacted and converted up front:
+            // converting while skipping null rows inside the Gorilla loop
+            // measured slower.
             let mut micros = Vec::with_capacity(v.non_null_count);
             for i in 0..row_count {
                 if !unsafe { v.is_valid(i) } {
@@ -2213,6 +2230,52 @@ mod tests {
             encode_datetime_col(NumpyDtype::DatetimeMonthToMicros, &raw, src.len()),
             encode_micros_col(&expected),
         );
+    }
+
+    #[test]
+    fn datetime_sec_without_nulls_compresses_like_column_ts_micros() {
+        // Evenly spaced enough for Gorilla, so the conversion runs inside
+        // the Gorilla pass; the other unit tests here all fall back to raw.
+        let src = [10i64, 11, 12, 13, 15];
+        let expected = src.map(|v| v * 1_000_000);
+        let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let frame = encode_datetime_col(NumpyDtype::DatetimeSecToMicros, &raw, src.len());
+        assert_eq!(frame, encode_micros_col(&expected));
+    }
+
+    #[test]
+    fn datetime_overflow_names_the_first_failing_row() {
+        // Rows 5 and 6 overflow. The rows before them either compress, so the
+        // Gorilla pass is the one that reaches row 5, or carry a jump at row
+        // 3 that ends that pass early and leaves row 5 to the raw pass.
+        let bad = i64::MAX / 1_000_000 + 1;
+        for src in [
+            [10i64, 11, 12, 13, 14, bad, bad + 1],
+            [10, 11, 12, 1 << 40, 14, bad, bad + 1],
+        ] {
+            let mut chunk = Chunk::new("t");
+            unsafe {
+                chunk
+                    .push_numpy_deferred(
+                        "ts",
+                        NumpyDtype::DatetimeSecToMicros,
+                        src.as_ptr() as *const u8,
+                        src.len(),
+                        None,
+                    )
+                    .unwrap();
+            }
+            chunk.at_now().unwrap();
+            let err = encode_err(&chunk);
+            assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+            assert_eq!(
+                err.msg(),
+                format!(
+                    "datetime64[s] value at row 5 ({bad}) overflows i64 when converted to microseconds"
+                ),
+                "{src:?}"
+            );
+        }
     }
 
     #[test]
