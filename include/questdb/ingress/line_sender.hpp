@@ -1928,7 +1928,7 @@ public:
      * also observable through the QWP/WebSocket diagnostic polling API. A
      * QWP/WebSocket buffer is published as one frame, so it may hold at most
      * 1,000,000 rows per table (the server's per-frame limit); a larger buffer
-     * fails with `line_sender_error_batch_too_large` before anything is
+     * fails with `line_sender_error_code::batch_too_large` before anything is
      * published and is left intact: flush smaller batches.
      *
      * HTTP should be the first choice, but use TCP if you need to continuously
