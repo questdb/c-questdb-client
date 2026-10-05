@@ -6090,6 +6090,149 @@ fn refresh_pre_send_failure_keeps_in_memory_parent() {
     );
 }
 
+/// Model a durable clear that pauses after removing the token. Keep the
+/// coordination lock separate from the stored value so close can publish while
+/// the refresh is inside clear().
+#[derive(Clone)]
+struct ClearBeforeRefreshStore {
+    token: Arc<Mutex<Option<PersistedToken>>>,
+    coordination: Arc<Mutex<()>>,
+    cleared: mpsc::Sender<()>,
+    resume: Arc<Mutex<mpsc::Receiver<()>>>,
+}
+
+impl TokenStore for ClearBeforeRefreshStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(self.token.lock().unwrap().clone())
+    }
+
+    fn save(&self, _key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = Some(token.clone());
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = None;
+        self.cleared.send(()).map_err(std::io::Error::other)?;
+        self.resume
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        let _guard = self.coordination.lock().unwrap();
+        action()
+    }
+}
+
+#[test]
+fn close_after_refresh_tombstone_restores_unsubmitted_parent() {
+    let refresh_posts = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_posts = Arc::clone(&refresh_posts);
+        MockServer::start(move |method, path, _body| {
+            if (method, path) == ("POST", "/token") {
+                refresh_posts.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{"access_token":"AT-child","refresh_token":"RT-child","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let (cleared_tx, cleared_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let store = ClearBeforeRefreshStore {
+        token: Arc::new(Mutex::new(Some(PersistedToken::new(
+            Some("AT-expired".to_string()),
+            None,
+            Some("RT-parent".to_string()),
+            1.0,
+            300.0,
+        )))),
+        coordination: Arc::new(Mutex::new(())),
+        cleared: cleared_tx,
+        resume: Arc::new(Mutex::new(resume_rx)),
+    };
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .build()
+            .unwrap(),
+    );
+
+    let (token_done_tx, token_done_rx) = mpsc::channel();
+    let token_worker = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || {
+            let _ = token_done_tx.send(auth.token().map_err(|error| error.kind()));
+        })
+    };
+    // Dropping resume_tx on failure releases the blocked clear as well.
+    cleared_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("refresh did not clear the persisted parent");
+    assert!(store.token.lock().unwrap().is_none());
+
+    let (close_done_tx, close_done_rx) = mpsc::channel();
+    let close_worker = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || {
+            auth.close();
+            let _ = close_done_tx.send(());
+        })
+    };
+    // close publishes cancellation before waiting for the active token call.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !auth.is_closed() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(auth.is_closed(), "close did not publish cancellation");
+    resume_tx.send(()).unwrap();
+
+    let result = token_done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("token did not finish after clear resumed");
+    close_done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("close did not drain the token call");
+    token_worker.join().unwrap();
+    close_worker.join().unwrap();
+    assert_eq!(result.unwrap_err(), OidcErrorKind::Cancelled);
+    assert_eq!(refresh_posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store
+            .token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|token| token.refresh_token().map(str::to_string))
+            .as_deref(),
+        Some("RT-parent"),
+        "close before the POST must restore the persisted refresh token"
+    );
+    assert!(
+        auth.token_set().is_none(),
+        "close must scrub the in-memory token"
+    );
+}
+
 #[test]
 fn refresh_pre_send_failure_keeps_persisted_parent() {
     // Store path: a pre-send connection failure proves the refresh token was not

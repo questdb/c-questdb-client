@@ -5177,6 +5177,123 @@ fn qwp_ws_manual_orphan_drainer_terminal_reject_leaves_slot_recoverable() {
 }
 
 #[test]
+fn qwp_ws_background_orphan_retries_transient_provider_failure() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+    let orphan_slot = sf_dir.path().join("orphan");
+    assert!(slot_has_sfa_file(&orphan_slot));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (foreground_tx, foreground_rx) = mpsc::channel();
+    let (failed_tx, failed_rx) = mpsc::channel();
+    let (orphan_failed_tx, orphan_failed_rx) = mpsc::channel();
+    let (acked_tx, acked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let accept_until = |deadline: Instant| loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "sender did not connect before deadline"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        };
+        let mut foreground = accept_until(Instant::now() + Duration::from_secs(5));
+        foreground.set_nonblocking(false).unwrap();
+        foreground
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let headers = perform_server_upgrade(&mut foreground).unwrap();
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("Authorization: Bearer bootstrap"))
+        );
+        foreground_tx.send(()).unwrap();
+
+        // No orphan connection is made until the provider has failed once.
+        orphan_failed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let mut orphan = accept_until(Instant::now() + Duration::from_secs(5));
+        orphan.set_nonblocking(false).unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let headers = perform_server_upgrade(&mut orphan).unwrap();
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("Authorization: Bearer recovered"))
+        );
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
+        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        acked_tx.send(payload).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+    });
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=20;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .qwp_ws_token_provider({
+            let calls = Arc::clone(&calls);
+            move || match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok::<String, crate::Error>("bootstrap".to_string()),
+                1 => {
+                    failed_tx.send(()).unwrap();
+                    orphan_failed_tx.send(()).unwrap();
+                    Err(crate::Error::new(
+                        ErrorCode::SocketError,
+                        "transient orphan provider failure",
+                    ))
+                }
+                _ => Ok("recovered".to_string()),
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    foreground_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("foreground upgrade did not complete");
+    failed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("orphan provider was not called");
+    let payload = acked_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("orphan did not reconnect and deliver its queued frame");
+    assert!(
+        qwp_frame_has_tables(&payload),
+        "ACK must cover the data frame"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !slot_has_sfa_file(&orphan_slot) && !orphan_slot.join(".last_error").exists()
+        }),
+        "orphan SFA or its error breadcrumb remains after ACK"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(!orphan_slot.join(".failed").exists());
+    drop(sender);
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn qwp_ws_background_terminal_orphan_releases_worker_for_next_slot() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot_named(sf_dir.path(), "orphan-a");
