@@ -1388,26 +1388,41 @@ mod tests {
 
     #[test]
     fn chunk_ts_column_with_nulls_sends_only_valid_rows() {
-        // Row 2 is null; the value in its slot must not reach the wire.
-        let data = [10_000i64, 10_500, i64::MAX, 11_000, 11_500];
-        let after = [1i64, 2, 3, 4, 5];
-        let bits = [0b0001_1011u8];
-        let validity = Validity::from_bitmap(&bits, data.len()).unwrap();
-        let mut chunk = Chunk::new("t");
-        chunk
-            .column_ts("ts", &data, TimestampUnit::Micros, Some(&validity))
-            .unwrap();
-        chunk.column_i64("after", &after, None).unwrap();
-        chunk.at_now().unwrap();
+        // Row 2 is null; the value in its slot must not reach the wire. The
+        // second case's valid rows are too far apart for Gorilla, so it takes
+        // the raw layout, which is sized from the non-null count.
+        let cases = [
+            (
+                [10_000i64, 10_500, i64::MAX, 11_000, 11_500],
+                gorilla::ENCODING_GORILLA,
+            ),
+            (
+                [0, 1 << 40, i64::MAX, 3, 1 << 41],
+                gorilla::ENCODING_UNCOMPRESSED,
+            ),
+        ];
+        for (data, encoding) in cases {
+            let after = [1i64, 2, 3, 4, 5];
+            let bits = [0b0001_1011u8];
+            let validity = Validity::from_bitmap(&bits, data.len()).unwrap();
+            let mut chunk = Chunk::new("t");
+            chunk
+                .column_ts("ts", &data, TimestampUnit::Micros, Some(&validity))
+                .unwrap();
+            chunk.column_i64("after", &after, None).unwrap();
+            chunk.at_now().unwrap();
 
-        // Bitmap flag + QWP null bitmap, the Gorilla payload of the four
-        // valid rows, then the next column starting straight after it.
-        let mut tail = vec![1, 0b0000_0100];
-        tail.extend(gorilla::temporal_payload(&[10_000, 10_500, 11_000, 11_500]));
-        assert_eq!(tail[2], gorilla::ENCODING_GORILLA);
-        tail.push(0);
-        tail.extend(after.iter().flat_map(|v| v.to_le_bytes()));
-        assert!(encode_fresh(&chunk).ends_with(&tail));
+            // Bitmap flag + QWP null bitmap, the payload of the four valid
+            // rows, then the next column starting straight after it.
+            let mut tail = vec![1, 0b0000_0100];
+            tail.extend(gorilla::temporal_payload(&[
+                data[0], data[1], data[3], data[4],
+            ]));
+            assert_eq!(tail[2], encoding);
+            tail.push(0);
+            tail.extend(after.iter().flat_map(|v| v.to_le_bytes()));
+            assert!(encode_fresh(&chunk).ends_with(&tail), "{data:?}");
+        }
     }
 
     #[test]
@@ -1446,6 +1461,39 @@ mod tests {
         seconds.column_i64("qty", &qty, None).unwrap();
         seconds.at_seconds(&units).unwrap();
         assert_eq!(encode_fresh(&seconds), micros_frame(1_000_000));
+    }
+
+    #[test]
+    fn designated_ts_millis_and_seconds_overflowing_micros_are_rejected() {
+        // One past the largest value that still fits once widened to µs. The
+        // scaled write wraps, so only this check keeps a wrapped timestamp
+        // off the wire.
+        let qty = [1i64, 2];
+        let encode_err = |chunk: &Chunk<'_>| {
+            let mut out = Vec::new();
+            let mut dict = SymbolGlobalDict::new();
+            let mut scratch = EncodeScratch::new();
+            encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap_err()
+        };
+        let assert_overflow = |err: crate::Error, value: i64| {
+            assert_eq!(err.code(), crate::ErrorCode::InvalidTimestamp);
+            assert_eq!(
+                err.msg(),
+                format!("designated timestamp at row 1 overflows microseconds ({value})")
+            );
+        };
+
+        let millis = [0, i64::MAX / 1_000 + 1];
+        let mut chunk = Chunk::new("t");
+        chunk.column_i64("qty", &qty, None).unwrap();
+        chunk.at_millis(&millis).unwrap();
+        assert_overflow(encode_err(&chunk), millis[1]);
+
+        let seconds = [0, i64::MAX / 1_000_000 + 1];
+        let mut chunk = Chunk::new("t");
+        chunk.column_i64("qty", &qty, None).unwrap();
+        chunk.at_seconds(&seconds).unwrap();
+        assert_overflow(encode_err(&chunk), seconds[1]);
     }
 
     // Gated on `_egress`: the reference decoder lives behind that feature and

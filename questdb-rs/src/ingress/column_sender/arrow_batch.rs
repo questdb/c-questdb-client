@@ -5685,6 +5685,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn timestamp_second_column_ignores_overflowing_null_slots() {
+        use arrow::buffer::NullBuffer;
+
+        // Null slots hold whatever the producer left there: pyarrow keeps
+        // NaT's `i64::MIN` under the validity bitmap. Those slots would
+        // overflow the s→µs conversion, and must not fail the batch.
+        let arr = TimestampSecondArray::new(
+            vec![1, i64::MIN, 2, i64::MAX, 3].into(),
+            Some(NullBuffer::from(vec![true, false, true, false, true])),
+        );
+        let mut out = Vec::new();
+        write_arrow_column_body(&mut out, ColumnKind::TimestampSecondToMicros, &arr, None).unwrap();
+        let mut expected = vec![1, 0b0000_1010];
+        expected.extend(gorilla::temporal_payload(&[
+            1_000_000, 2_000_000, 3_000_000,
+        ]));
+        assert_eq!(out, expected);
+    }
+
     /// A timestamp column whose declared `null_count` need not match its
     /// validity bitmap. Only the unchecked constructors can build one, and so
     /// can a C producer: the Arrow C Data import skips `validate_full`.

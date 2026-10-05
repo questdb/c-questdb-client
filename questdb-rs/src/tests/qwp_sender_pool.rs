@@ -3921,6 +3921,33 @@ fn store_and_forward_flush_splits_chunk_over_the_server_row_cap() {
 }
 
 #[test]
+fn store_and_forward_flush_splits_sub_ranges_still_over_the_server_row_cap() {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (flags, ts) = over_row_cap_columns(FAR_OVER_ROW_CAP_ROWS);
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i8("flag", &flags, None).unwrap();
+    chunk.at_micros(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush(&mut chunk)
+        .expect("every sub-range splits until it fits the row cap");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("all split frames commit");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert_split_at_server_row_cap(&captured, FAR_OVER_ROW_CAP_ROWS);
+}
+
+#[test]
 fn store_and_forward_flush_buffer_rejects_table_block_over_the_server_row_cap() {
     // A row-API `Buffer` is one indivisible frame, so unlike a chunk it cannot
     // be split at the row cap: the flush must fail locally, publish nothing,
@@ -8039,13 +8066,14 @@ fn direct_flush_arrow_batch_splits_oversize_batch_into_capped_frames() {
 }
 
 /// An `at_now` batch with a single bit-packed boolean column: about 125 KB
-/// for [`OVER_ROW_CAP_ROWS`] rows, far under every byte cap.
+/// for [`OVER_ROW_CAP_ROWS`] rows and 312 KB for [`FAR_OVER_ROW_CAP_ROWS`],
+/// far under every byte cap.
 #[cfg(feature = "arrow-ingress")]
-fn over_row_cap_batch() -> arrow::array::RecordBatch {
+fn over_row_cap_batch(rows: usize) -> arrow::array::RecordBatch {
     use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
     use std::sync::Arc;
 
-    let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; OVER_ROW_CAP_ROWS]));
+    let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; rows]));
     RecordBatch::try_from_iter([("flag", arr)]).unwrap()
 }
 
@@ -8056,7 +8084,7 @@ fn direct_flush_arrow_batch_splits_batch_over_the_server_row_cap() {
     let conf = conf_for(server.port(), "pool_reap=manual;");
     let db = QuestDb::connect(&conf).unwrap();
 
-    let batch = over_row_cap_batch();
+    let batch = over_row_cap_batch(OVER_ROW_CAP_ROWS);
     let mut sender = db.borrow_direct_column_sender().unwrap();
     sender
         .flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
@@ -8068,13 +8096,30 @@ fn direct_flush_arrow_batch_splits_batch_over_the_server_row_cap() {
 
 #[cfg(feature = "arrow-ingress")]
 #[test]
+fn direct_flush_arrow_batch_splits_sub_ranges_still_over_the_server_row_cap() {
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(server.port(), "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let batch = over_row_cap_batch(FAR_OVER_ROW_CAP_ROWS);
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    sender
+        .flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
+        .expect("every sub-range splits until it fits the row cap");
+
+    let captured: Vec<Vec<u8>> = frames.try_iter().collect();
+    assert_split_at_server_row_cap(&captured, FAR_OVER_ROW_CAP_ROWS);
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
 fn store_and_forward_arrow_batch_splits_batch_over_the_server_row_cap() {
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
     let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
     let db = QuestDb::connect(&conf).unwrap();
 
-    let batch = over_row_cap_batch();
+    let batch = over_row_cap_batch(OVER_ROW_CAP_ROWS);
     let mut sender = db.borrow_sender().unwrap();
     sender
         .flush_arrow_batch_at_now("trades", &batch, &[])
@@ -8088,6 +8133,30 @@ fn store_and_forward_arrow_batch_splits_batch_over_the_server_row_cap() {
         captured.push(frame);
     }
     assert_split_at_server_row_cap(&captured, OVER_ROW_CAP_ROWS);
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_arrow_batch_splits_sub_ranges_still_over_the_server_row_cap() {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let batch = over_row_cap_batch(FAR_OVER_ROW_CAP_ROWS);
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush_arrow_batch_at_now("trades", &batch, &[])
+        .expect("every sub-range splits until it fits the row cap");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("all split frames commit");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert_split_at_server_row_cap(&captured, FAR_OVER_ROW_CAP_ROWS);
 }
 
 #[cfg(feature = "arrow-ingress")]

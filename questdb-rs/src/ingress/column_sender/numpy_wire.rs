@@ -1472,21 +1472,37 @@ mod tests {
     #[test]
     fn numpy_temporal_columns_with_nulls_send_only_valid_rows() {
         // Row 2 is null and its slot must not reach the wire. In the seconds
-        // column it would also overflow the conversion if it were read.
+        // columns it would also overflow the conversion if it were read. The
+        // last two cases' valid rows are too far apart for Gorilla, so they
+        // take the raw layout, which is sized from the non-null count.
         let bits = [0b0001_1011u8];
         let cases = [
             (
                 NumpyDtype::TimestampMicrosDirect,
                 [10_000i64, 10_500, i64::MAX, 11_000, 11_500],
                 [10_000i64, 10_500, 11_000, 11_500],
+                gorilla::ENCODING_GORILLA,
             ),
             (
                 NumpyDtype::DatetimeSecToMicros,
                 [1, 2, i64::MAX, 3, 4],
                 [1_000_000, 2_000_000, 3_000_000, 4_000_000],
+                gorilla::ENCODING_GORILLA,
+            ),
+            (
+                NumpyDtype::TimestampMicrosDirect,
+                [0, 1 << 40, i64::MAX, 3, 1 << 41],
+                [0, 1 << 40, 3, 1 << 41],
+                gorilla::ENCODING_UNCOMPRESSED,
+            ),
+            (
+                NumpyDtype::DatetimeSecToMicros,
+                [0, 1 << 40, i64::MAX, 3, 1 << 41],
+                [0, (1 << 40) * 1_000_000, 3_000_000, (1 << 41) * 1_000_000],
+                gorilla::ENCODING_UNCOMPRESSED,
             ),
         ];
-        for (dtype, data, dense) in cases {
+        for (dtype, data, dense, encoding) in cases {
             let validity = Validity::from_bitmap(&bits, data.len()).unwrap();
             let mut chunk = Chunk::new("t");
             unsafe {
@@ -1503,11 +1519,11 @@ mod tests {
             chunk.at_now().unwrap();
 
             // The column is the frame's tail: bitmap flag, QWP null bitmap,
-            // then the Gorilla payload of the four valid rows.
+            // then the payload of the four valid rows.
             let mut tail = vec![1, 0b0000_0100];
             tail.extend(gorilla::temporal_payload(&dense));
-            assert_eq!(tail[2], gorilla::ENCODING_GORILLA);
-            assert!(encode(&chunk).ends_with(&tail), "{dtype:?}");
+            assert_eq!(tail[2], encoding);
+            assert!(encode(&chunk).ends_with(&tail), "{dtype:?} {data:?}");
         }
     }
 
