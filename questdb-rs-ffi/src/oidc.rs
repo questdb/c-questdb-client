@@ -380,25 +380,34 @@ impl SharedOidcAuth {
         }
     }
 
-    /// Reject a concurrent C sign-in deterministically, instead of queuing
-    /// until a 5 ms sample happens to land in a renderer callback. In
-    /// particular a callback that joins this caller must never wait on the
-    /// first sign-in's gate. Python already rejects concurrent sign-ins.
+    /// A reusable builder's auths share callback state: reject another
+    /// sign-in for that target BEFORE either device flow can queue a prompt.
+    /// Per-auth sign-in serialization alone does not suffice: A's callback
+    /// may be waiting for a B sign-in that began just before A's callback,
+    /// while B's prompt is queued behind the callback held by A.
     fn lock_sign_in_gate<'a>(
         &self,
         handler: &'a CEventHandler,
-    ) -> Result<std::sync::MutexGuard<'a, ()>, Error> {
+    ) -> Result<ActiveSignInTarget<'a>, Error> {
         self.reject_callback_reentry()?;
-        let guard = match handler.sign_in_gate.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "OIDC sign_in() is already in progress on this provider.",
-                ));
-            }
+        let mut gate = handler
+            .target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gate.sign_in_held {
+            return Err(Error::new(
+                ErrorCode::InvalidApiCall,
+                "OIDC sign_in() is already in progress on this callback target.",
+            ));
+        }
+        gate.sign_in_held = true;
+        drop(gate);
+        let guard = ActiveSignInTarget {
+            target: &handler.target,
         };
+        // The callback may have begun after the entry check. Drop our guard
+        // on rejection so the owning sign-in can still finish normally.
         self.reject_callback_reentry()?;
         Ok(guard)
     }
@@ -406,9 +415,9 @@ impl SharedOidcAuth {
     fn sign_in(&self) -> Result<(), Error> {
         self.inner.ensure_current_process()?;
         self.reject_callback_reentry()?;
-        // Mirror native's per-auth sign-in serialization at the callback layer.
-        // This makes the handler generation below identify the invocation that
-        // can actually render; a queued second caller cannot overwrite it.
+        // Serialize sign-ins across the whole shared callback target, not just
+        // this auth. A sibling that started before our callback must never be
+        // able to wait for this callback to return before it can render.
         let _sign_in_gate = match self.event_handler.as_deref() {
             Some(handler) => Some(self.lock_sign_in_gate(handler)?),
             None => None,
@@ -1019,6 +1028,26 @@ struct CEventTarget {
 #[derive(Default)]
 struct CallbackGateState {
     held: bool,
+    /// A sign-in anywhere on this shared target owns the right to render.
+    /// This is reserved only briefly under callback_gate: no mutex is held
+    /// while the network, device polling or user callback runs.
+    sign_in_held: bool,
+}
+
+struct ActiveSignInTarget<'a> {
+    target: &'a CEventTarget,
+}
+
+impl Drop for ActiveSignInTarget<'_> {
+    fn drop(&mut self) {
+        let mut gate = self
+            .target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(gate.sign_in_held);
+        gate.sign_in_held = false;
+    }
 }
 
 /// Per-auth callback state. The target is shared by reusable-builder siblings;
@@ -1028,9 +1057,6 @@ struct CEventHandler {
     active: AtomicBool,
     /// Permanent callback cancellation, paired with provider close.
     closed: AtomicBool,
-    /// Serializes C-facing sign-in invocations so one active generation maps
-    /// exactly to native's serialized interactive flow.
-    sign_in_gate: std::sync::Mutex<()>,
     /// Serializes begin/finish with cancellation's core attempt selection.
     /// Never held while sign-in itself runs or while user code is invoked.
     sign_in_generation_gate: std::sync::Mutex<()>,
@@ -1201,7 +1227,6 @@ impl CEventHandler {
             target,
             active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            sign_in_gate: std::sync::Mutex::new(()),
             sign_in_generation_gate: std::sync::Mutex::new(()),
             next_sign_in_generation: AtomicU64::new(1),
             active_sign_in_generation: AtomicU64::new(0),
@@ -4728,10 +4753,55 @@ mod tests {
         };
         // No event is active. Contention must still reject immediately, not
         // wait for a 5 ms sample to land in a callback (or for flow expiry).
-        let _first = handler.sign_in_gate.lock().unwrap();
-        let err = auth.lock_sign_in_gate(&handler).unwrap_err();
+        let _first = auth.lock_sign_in_gate(&handler).expect("first sign-in");
+        let err = auth.lock_sign_in_gate(&handler).err().expect("busy");
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("already in progress"));
+    }
+
+    #[test]
+    fn reusable_builder_siblings_reject_overlapping_sign_ins_before_callbacks() {
+        unsafe {
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_builder_interactive(builder, false, &mut error));
+            assert!(questdb_oidc_builder_event_handler(
+                builder,
+                Some(ignore_event),
+                ptr::null_mut(),
+                None,
+                &mut error,
+            ));
+            let a = questdb_oidc_builder_build(builder, &mut error);
+            let b = questdb_oidc_builder_build(builder, &mut error);
+            assert!(!a.is_null() && !b.is_null());
+            assert!(error.is_null());
+            let a_handler = (*a).shared.event_handler.as_ref().unwrap();
+            let b_handler = (*b).shared.event_handler.as_ref().unwrap();
+            assert!(!Arc::ptr_eq(a_handler, b_handler));
+            assert!(Arc::ptr_eq(&a_handler.target, &b_handler.target));
+
+            // A already entered sign_in but its /device request has not
+            // produced a callback yet. B must not be able to begin its flow:
+            // A's future callback can be waiting for this B thread to finish.
+            let first = (*a).shared.lock_sign_in_gate(a_handler).unwrap();
+            let sibling = (*b).shared.clone();
+            let err = std::thread::spawn(move || sibling.sign_in().unwrap_err())
+                .join()
+                .unwrap();
+            assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+            assert!(err.msg().contains("already in progress"), "{err}");
+            drop(first);
+
+            // Only the overlapping attempt is refused. A new attempt reaches
+            // the core again (and fails fast for this non-interactive fixture).
+            let err = (*b).shared.sign_in().unwrap_err();
+            assert_eq!(err.code(), ErrorCode::AuthError, "{err}");
+            assert!(err.msg().contains("non-interactive"));
+            questdb_oidc_auth_free(a);
+            questdb_oidc_auth_free(b);
+            questdb_oidc_builder_free(builder);
+        }
     }
 
     #[test]

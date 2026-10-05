@@ -5822,6 +5822,56 @@ fn late_401_at_failover_deadline_surfaces_auth_error() {
     }
 }
 
+/// A real HTTP 401 stays the terminal failure even when the rotating token
+/// provider starts its one permitted refetch before the failover deadline but
+/// cannot finish until after it. The initial socket close must not win merely
+/// because acquiring a replacement credential consumed the remaining time.
+#[test]
+fn provider_reader_preserves_401_when_refetch_crosses_deadline() {
+    let a = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        vec![Action::HardDrop],
+    ]);
+    let b = slow_401_server(Duration::ZERO);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr={},{};failover_max_attempts=2;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+         failover_max_duration_ms=1000",
+        a.url(),
+        b
+    );
+    let provider_calls = Arc::clone(&calls);
+    let cfg = ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider(move || {
+            let n = provider_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            // Initial connect, reconnect walk, then post-401 refetch.
+            if n == 3 {
+                thread::sleep(Duration::from_millis(3000));
+            }
+            Ok::<_, questdb::Error>(format!("tok{n}"))
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("initial connect to A");
+    let (capture, gave_up) = gave_up_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
+    let err = match cursor.next_batch() {
+        Err(err) => err,
+        Ok(_) => panic!("HTTP 401 must reject the query"),
+    };
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "msg={}", err.msg());
+    assert_eq!(err.code(), ErrorCode::AuthError, "msg={}", err.msg());
+    assert!(err.msg().contains("HTTP 401"), "msg={}", err.msg());
+    let (code, msg) = gave_up.lock().unwrap().clone().expect("GaveUp event");
+    assert_eq!(code, ErrorCode::AuthError, "msg={msg}");
+    assert!(msg.contains("HTTP 401"), "msg={msg}");
+}
+
 /// Regression: the `RoleMismatch` case above applies equally to the other
 /// diagnostic codes a final round can end on. When every endpoint rejects the
 /// WS upgrade on the last permitted round and the deadline expires during it,
@@ -5942,12 +5992,12 @@ fn replica_then_401_server(provider_calls: Arc<AtomicUsize>, switch_at: usize) -
     addr
 }
 
-/// The post-401 credential re-fetch is bounded by the failover deadline like
-/// the walk's first fetch. When the deadline cuts it off, the walk must report
-/// the cut-off -- keeping the `RoleMismatch` an earlier round found -- rather
-/// than a transport "shutting down" that overwrites it.
+/// A previous round found a role mismatch, but a later endpoint definitely
+/// rejected the credential with 401. If the post-401 refetch hits the failover
+/// deadline, the definite 401 is terminal, not the earlier role mismatch or a
+/// generic transport "shutting down" error.
 #[test]
-fn provider_reader_keeps_role_mismatch_when_deadline_cuts_off_the_401_refetch() {
+fn provider_reader_preserves_401_over_earlier_role_mismatch_on_refetch_deadline() {
     let a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Primary, "a-primary"),
         vec![Action::Reject421 {
@@ -5985,6 +6035,7 @@ fn provider_reader_keeps_role_mismatch_when_deadline_cuts_off_the_401_refetch() 
         Ok(_) => panic!("must fail"),
     };
     assert_eq!(calls.load(Ordering::SeqCst), 4, "msg={}", err.msg());
-    assert_eq!(err.code(), ErrorCode::RoleMismatch, "msg={}", err.msg());
+    assert_eq!(err.code(), ErrorCode::AuthError, "msg={}", err.msg());
+    assert!(err.msg().contains("HTTP 401"), "msg={}", err.msg());
     assert!(!err.msg().contains("shutting down"), "msg={}", err.msg());
 }

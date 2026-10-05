@@ -100,7 +100,11 @@ typedef struct questdb_oidc_event
  *
  * Invocations of one installed handler are serialized across every auth object
  * built from that builder, so its `user_data` is never entered concurrently by
- * OIDC events.
+ * OIDC events. Concurrent `sign_in` calls on auth objects sharing that handler
+ * do not queue: the second fails with `questdb_error_invalid_api_call` even
+ * before a callback starts. This prevents an earlier-started sibling sign-in
+ * from blocking behind a callback that is waiting for it to finish. Retry the
+ * second sign-in after the first returns, or give each auth its own handler.
  *
  * While the callback is running, `sign_in` and `clear` on an auth object
  * sharing this handler fail with `questdb_error_invalid_api_call`.

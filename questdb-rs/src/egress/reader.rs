@@ -3291,8 +3291,27 @@ fn walk_via_tracker(
                 }
                 return Err(deadline_err);
             }
-            let rotated_headers = upgrade_headers_for_walk(cfg, deadline)?;
-            ensure_walk_deadline(deadline)?;
+            let rotated_headers = match upgrade_headers_for_walk(cfg, deadline) {
+                Ok(headers) => headers,
+                Err(error) if is_walk_deadline_cutoff(&error) => {
+                    // A refresh cut off by the deadline cannot undo the 401
+                    // already returned by this endpoint. Otherwise an older
+                    // socket/role failure wins at the reconnect boundary.
+                    return match connected {
+                        Err(auth_error) => Err(auth_error),
+                        Ok(_) => Err(error),
+                    };
+                }
+                Err(error) => return Err(error),
+            };
+            if let Err(deadline_error) = ensure_walk_deadline(deadline) {
+                // A provider can finish just as the deadline passes. In that
+                // race we still have an observed 401, not a transport timeout.
+                return match connected {
+                    Err(auth_error) => Err(auth_error),
+                    Ok(_) => Err(deadline_error),
+                };
+            }
             if authorization_header(&rotated_headers) != authorization_header(&upgrade_headers) {
                 upgrade_headers = rotated_headers;
                 dials = dials.saturating_add(1);
