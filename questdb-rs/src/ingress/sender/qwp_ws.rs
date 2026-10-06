@@ -3722,6 +3722,17 @@ pub(super) fn try_dup_recovered(src: &[u8]) -> crate::Result<Vec<u8>> {
     Ok(v)
 }
 
+/// Give one sender its own token-provider attachment: shared acquisition, but
+/// a private callback-blocked state, so senders cloned from one pool or one
+/// options object never see each other's failed reconnects. Orphan drainers
+/// keep the unattached provider: nothing waits on their ACKs.
+fn attach_qwp_ws_token_provider(qwp_ws: &QwpWsConfig) -> Option<QwpWsConfig> {
+    let provider = qwp_ws.token_provider.as_ref()?;
+    let mut attached = qwp_ws.clone();
+    attached.token_provider = Some(provider.for_attachment());
+    Some(attached)
+}
+
 pub(crate) fn connect_qwp_ws_background_state(
     host: &str,
     port: &str,
@@ -3738,6 +3749,8 @@ pub(crate) fn connect_qwp_ws_background_state(
         qwp_ws,
         auth_header.clone(),
     );
+    let attached = attach_qwp_ws_token_provider(qwp_ws);
+    let qwp_ws = attached.as_ref().unwrap_or(qwp_ws);
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
     let traffic_gate = Arc::new(TrafficGate::default());
     let (
@@ -3932,6 +3945,8 @@ pub(crate) fn open_manual_qwp_ws(
         qwp_ws,
         auth_header.clone(),
     );
+    let attached = attach_qwp_ws_token_provider(qwp_ws);
+    let qwp_ws = attached.as_ref().unwrap_or(qwp_ws);
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
     let mut parts = open_qwp_ws_parts(
         host,

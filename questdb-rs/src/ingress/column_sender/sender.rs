@@ -2222,6 +2222,16 @@ impl SfaBackend {
                 }
                 return Ok(());
             }
+            // As in the row sender's wait: inside an auth callback whose
+            // return this sender's reconnect needs, the ACK cannot arrive.
+            if let Some(err) = self
+                .state
+                .token_provider
+                .as_ref()
+                .and_then(|provider| provider.callback_wait_error())
+            {
+                return Err(err);
+            }
             if completed != last_completed {
                 last_completed = completed;
                 deadline_anchor = Instant::now();

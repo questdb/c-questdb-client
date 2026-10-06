@@ -2008,14 +2008,26 @@ pub unsafe extern "C" fn questdb_oidc_builder_build(
             // the latter would make its isolation state retain itself forever.
             let event_target = event_handler.clone();
             let diagnostic_target = diagnostic.clone();
-            let isolation = TokenProviderIsolation::with_callback_guard(move || {
-                event_target
-                    .as_deref()
-                    .is_some_and(CEventHandler::target_is_active)
-                    || diagnostic_target
-                        .as_ref()
-                        .is_some_and(CDiagnosticSink::target_is_active)
-            });
+            let thread_event_target = event_handler.clone();
+            let thread_diagnostic_target = diagnostic.clone();
+            let isolation = TokenProviderIsolation::with_callback_guards(
+                move || {
+                    event_target
+                        .as_deref()
+                        .is_some_and(CEventHandler::target_is_active)
+                        || diagnostic_target
+                            .as_ref()
+                            .is_some_and(CDiagnosticSink::target_is_active)
+                },
+                // An ACK wait is rejected only on the thread running the
+                // callback: there it can never complete. Elsewhere it waits.
+                move || {
+                    in_event_callback_of_target_on_this_thread(thread_event_target.as_ref())
+                        || thread_diagnostic_target
+                            .as_ref()
+                            .is_some_and(CDiagnosticSink::in_callback_on_this_thread)
+                },
+            );
             Box::into_raw(Box::new(questdb_oidc_auth {
                 shared: SharedOidcAuth {
                     inner: Arc::new(auth),

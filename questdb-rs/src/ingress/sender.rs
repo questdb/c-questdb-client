@@ -760,9 +760,11 @@ impl Sender {
     /// A terminal server rejection of a frame in the pending range, or a
     /// terminal transport/protocol failure, is returned as an error. Retriable
     /// server rejections reconnect and replay until the frame is acknowledged or
-    /// the sender is stopped. An OIDC persistence-warning callback waiting for
-    /// this sender's ACK cannot block a reconnect on its own token worker: that
-    /// wait returns a retryable provider error and retains the publication.
+    /// the sender is stopped. A wait made from inside one of its OIDC auth's
+    /// callbacks (e.g. a persistence-warning handler) returns a retryable
+    /// provider error, and retains the publication, once this sender's
+    /// reconnect is blocked on a token that the auth cannot supply until that
+    /// callback returns. A wait on any other thread keeps waiting.
     /// When nothing has been published yet, a valid wait returns immediately.
     /// QWP/WebSocket only; other protocols return `InvalidApiCall`. In manual
     /// progress mode this also drives WebSocket progress while waiting.
@@ -801,11 +803,10 @@ impl Sender {
             if completed.is_some_and(|fsn| fsn >= boundary) {
                 return Ok(());
             }
-            // A persistence-warning callback may itself be waiting for this
-            // sender's ACK. If its reconnect was blocked by the peer worker
-            // delivering that callback, reject the pending wait instead of
-            // leaving both sides parked. A healthy sender's wait is unaffected
-            // even while a different attachment is inside the callback. The
+            // This wait may be running inside an auth callback (e.g. a
+            // persistence warning) whose return this sender's reconnect needs.
+            // Reject it instead of parking the callback forever. A connected
+            // sender, or a wait on any other thread, is unaffected. The
             // publication remains queued for replay.
             let provider = match &self.handler {
                 SyncProtocolHandler::SyncQwpWs(state) => state.token_provider.as_ref(),

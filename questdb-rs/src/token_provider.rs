@@ -49,10 +49,6 @@ static ISOLATED_PROVIDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 #[derive(Default)]
 struct IsolatedResult {
-    /// The transport attachment which started this acquisition. A second
-    /// attachment waiting for its ACK must be able to distinguish its own
-    /// worker from the peer whose callback it is waiting for.
-    owner: Arc<()>,
     done: std::sync::Mutex<Option<crate::Result<String>>>,
     ready: std::sync::Condvar,
 }
@@ -130,19 +126,39 @@ pub struct TokenProviderIsolation {
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     isolated: Arc<IsolatedAcquisition>,
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
-    callback_active: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    callback_guard: Option<CallbackGuard>,
+}
+
+/// How an isolated transport observes its shared auth's callbacks.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+#[derive(Clone)]
+struct CallbackGuard {
+    /// A callback for the auth is running on some thread.
+    active: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// The calling thread is itself inside one of the auth's callbacks. Only
+    /// QWP ACK waits consult it.
+    #[cfg_attr(not(feature = "_sender-qwp-ws"), allow(dead_code))]
+    on_this_thread: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl TokenProviderIsolation {
-    /// Tell isolated transports when their shared auth is inside a callback.
-    /// The closure must not retain the auth's isolation state (which would
+    /// Tell isolated transports when their shared auth is inside a callback,
+    /// and whether the calling thread is the one running it.
+    ///
+    /// The closures must not retain the auth's isolation state (which would
     /// create a reference cycle); capture only its callback targets.
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     #[doc(hidden)]
-    pub fn with_callback_guard(guard: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+    pub fn with_callback_guards(
+        active: impl Fn() -> bool + Send + Sync + 'static,
+        on_this_thread: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
         Self {
             isolated: Arc::new(IsolatedAcquisition::default()),
-            callback_active: Some(Arc::new(guard)),
+            callback_guard: Some(CallbackGuard {
+                active: Arc::new(active),
+                on_this_thread: Arc::new(on_this_thread),
+            }),
         }
     }
 }
@@ -157,13 +173,14 @@ pub(crate) struct TokenProvider {
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     isolated: Arc<IsolatedAcquisition>,
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
-    callback_active: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
-    attachment_id: Arc<()>,
-    /// Set only when this attachment's reconnect was rejected while another
-    /// attachment owned the callback's token worker. A healthy, connected
-    /// sender must not have its otherwise-ackable wait rejected just because
-    /// a different sender is refreshing the same provider.
+    callback_guard: Option<CallbackGuard>,
+    /// Set when this attachment's token pull failed while an auth callback
+    /// was running, i.e. its reconnect cannot complete until the callback
+    /// returns. Shared by the clones of one attachment (a sender's state and
+    /// its I/O runner) but not across attachments: see
+    /// [`Self::for_attachment`]. A healthy, connected sender must not have its
+    /// otherwise-ackable wait rejected because a different sender failed to
+    /// refresh the same provider.
     #[cfg(feature = "_sender-qwp-ws")]
     callback_blocked: Arc<AtomicBool>,
 }
@@ -191,31 +208,56 @@ impl TokenProvider {
             #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
             isolated: isolation.isolated,
             #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
-            callback_active: isolation.callback_active,
-            #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
-            attachment_id: Arc::new(()),
+            callback_guard: isolation.callback_guard,
             #[cfg(feature = "_sender-qwp-ws")]
             callback_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
-    fn callback_is_active(&self) -> bool {
-        self.callback_active.as_ref().is_some_and(|guard| guard())
+    /// A clone for one transport attachment (one sender): it shares the
+    /// provider closure and single-flight acquisition, but tracks its own
+    /// callback-blocked state. Senders cloned from one pool or one options
+    /// object must not see each other's failed reconnects.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn for_attachment(&self) -> Self {
+        Self {
+            callback_blocked: Arc::new(AtomicBool::new(false)),
+            ..self.clone()
+        }
     }
 
-    /// A pending QWP acknowledgement may depend on a reconnect by another
-    /// sender sharing this provider. If its diagnostic callback is waiting for
-    /// that ACK, the reconnect cannot join the callback's isolated worker.
-    /// Reuse the provider's own cached-token/re-entry check so a valid cache
-    /// and the structured, retryable OIDC error retain their normal behavior.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn callback_is_active(&self) -> bool {
+        self.callback_guard
+            .as_ref()
+            .is_some_and(|guard| (guard.active)())
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn callback_on_this_thread(&self) -> bool {
+        self.callback_guard
+            .as_ref()
+            .is_some_and(|guard| (guard.on_this_thread)())
+    }
+
+    /// Reject an ACK wait that can never complete: the waiting thread is
+    /// inside one of this auth's callbacks, and this sender's reconnect needs
+    /// a token that the auth cannot supply until that same callback returns.
+    /// That holds whether the callback was raised by this sender's own token
+    /// worker or by a peer's.
+    ///
+    /// A wait on any other thread keeps waiting: the callback will return, and
+    /// the reconnect then completes. A connected sender's wait is unaffected,
+    /// because it needs no token. The provider's own cached-token/re-entry
+    /// check supplies the error, so a valid cache still lets the wait proceed
+    /// and the structured, retryable OIDC error is preserved.
     #[cfg(feature = "_sender-qwp-ws")]
     pub(crate) fn callback_wait_error(&self) -> Option<crate::Error> {
         if !self.callback_is_active() {
             self.callback_blocked.store(false, Ordering::Release);
             return None;
         }
-        if self.callback_blocked.load(Ordering::Acquire) {
+        if self.callback_on_this_thread() && self.callback_blocked.load(Ordering::Acquire) {
             self.bearer_header().err()
         } else {
             None
@@ -223,14 +265,11 @@ impl TokenProvider {
     }
 
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
-    fn resolve_during_callback(&self, owned_by_peer: bool) -> crate::Result<String> {
+    fn resolve_during_callback(&self) -> crate::Result<String> {
         let result = self.bearer_header();
         #[cfg(feature = "_sender-qwp-ws")]
-        if owned_by_peer && result.is_err() {
-            self.callback_blocked.store(true, Ordering::Release);
-        }
-        #[cfg(not(feature = "_sender-qwp-ws"))]
-        let _ = owned_by_peer;
+        self.callback_blocked
+            .store(result.is_err(), Ordering::Release);
         result
     }
 
@@ -335,14 +374,7 @@ impl TokenProvider {
         // to the closure instead of joining its in-flight worker: OIDC serves
         // a valid cache or rejects a lock-taking token pull immediately.
         if self.callback_is_active() {
-            let owned_by_peer = self
-                .isolated
-                .current
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_none_or(|slot| !Arc::ptr_eq(&slot.owner, &self.attachment_id));
-            return self.resolve_during_callback(owned_by_peer);
+            return self.resolve_during_callback();
         }
         #[cfg(feature = "_sender-qwp-ws")]
         self.callback_blocked.store(false, Ordering::Release);
@@ -356,10 +388,7 @@ impl TokenProvider {
             match current.as_ref() {
                 Some(existing) => (Arc::clone(existing), false),
                 None => {
-                    let fresh = Arc::new(IsolatedResult {
-                        owner: Arc::clone(&self.attachment_id),
-                        ..IsolatedResult::default()
-                    });
+                    let fresh = Arc::new(IsolatedResult::default());
                     *current = Some(Arc::clone(&fresh));
                     (fresh, true)
                 }
@@ -379,8 +408,7 @@ impl TokenProvider {
             }
             if self.callback_is_active() {
                 drop(done);
-                return self
-                    .resolve_during_callback(!Arc::ptr_eq(&slot.owner, &self.attachment_id));
+                return self.resolve_during_callback();
             }
             let (guard, wait) = slot
                 .ready
@@ -869,66 +897,90 @@ mod tests {
 
         #[cfg(feature = "_sender-qwp-ws")]
         #[test]
-        fn callback_time_attachment_does_not_join_its_blocked_peer() {
+        fn callback_wait_rejects_only_on_the_callback_thread() {
+            std::thread_local! {
+                static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            fn on_callback_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+                std::thread::spawn(move || {
+                    IN_CALLBACK.with(|c| c.set(true));
+                    f()
+                })
+                .join()
+                .unwrap()
+            }
+
             let callback_active = Arc::new(AtomicBool::new(false));
-            let isolation = TokenProviderIsolation::with_callback_guard({
-                let callback_active = Arc::clone(&callback_active);
-                move || callback_active.load(Ordering::SeqCst)
-            });
+            let isolation = TokenProviderIsolation::with_callback_guards(
+                {
+                    let callback_active = Arc::clone(&callback_active);
+                    move || callback_active.load(Ordering::SeqCst)
+                },
+                || IN_CALLBACK.with(|c| c.get()),
+            );
             let started = Arc::new(Gate::default());
             let release = Arc::new(Gate::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            // The first pull is the worker that delivers the callback: it
+            // blocks until released. Any pull made while the callback runs is
+            // refused, as OIDC refuses an uncached token pull.
             let owner = TokenProvider::new_with_isolation(
                 {
                     let started = Arc::clone(&started);
                     let release = Arc::clone(&release);
-                    move || {
-                        started.signal();
-                        release.wait();
-                        Ok::<_, crate::Error>("owner-token".to_string())
-                    }
-                },
-                isolation.clone(),
-            );
-            let owner_wait = owner.clone();
-            let owner_call =
-                std::thread::spawn(move || owner.bearer_header_isolated_until(|| false));
-            started.wait();
-            callback_active.store(true, Ordering::SeqCst);
-
-            let peer = TokenProvider::new_with_isolation(
-                {
                     let callback_active = Arc::clone(&callback_active);
+                    let calls = Arc::clone(&calls);
                     move || {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            started.signal();
+                            release.wait();
+                            return Ok("fresh-token".to_string());
+                        }
                         if callback_active.load(Ordering::SeqCst) {
                             Err(crate::error::fmt!(
                                 SocketError,
                                 "callback must return first"
                             ))
                         } else {
-                            Ok("peer-token".to_string())
+                            Ok("fresh-token".to_string())
                         }
                     }
                 },
                 isolation,
             );
-            let peer_wait = peer.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let peer_call = std::thread::spawn(move || {
-                tx.send(peer.bearer_header_isolated_until(|| false))
-                    .unwrap();
-            });
-            let result = rx.recv_timeout(std::time::Duration::from_secs(1));
-            assert!(owner_wait.callback_wait_error().is_none());
-            assert!(peer_wait.callback_wait_error().is_some());
+            let peer = owner.for_attachment();
+            let healthy = owner.for_attachment();
+
+            // The owner starts the acquisition whose worker raises the callback.
+            let owner_runner = owner.clone();
+            let owner_call =
+                std::thread::spawn(move || owner_runner.bearer_header_isolated_until(|| false));
+            started.wait();
+            callback_active.store(true, Ordering::SeqCst);
+            // Neither attachment joins the worker delivering the callback.
+            let err = owner_call.join().unwrap().unwrap_err();
+            assert!(err.msg().contains("callback must return first"), "{err}");
+            let err = peer.bearer_header_isolated_until(|| false).unwrap_err();
+            assert!(err.msg().contains("callback must return first"), "{err}");
+
+            // A wait on an ordinary thread keeps waiting: the callback returns.
+            assert!(owner.callback_wait_error().is_none());
+            assert!(peer.callback_wait_error().is_none());
+            // Inside the callback, a wait whose reconnect is blocked is
+            // rejected -- for the worker's own attachment as well as a peer.
+            let (o, p) = (owner.clone(), peer.clone());
+            assert!(on_callback_thread(move || o.callback_wait_error()).is_some());
+            assert!(on_callback_thread(move || p.callback_wait_error()).is_some());
+            // An attachment that did not need a token is unaffected, even
+            // though it shares the provider with the blocked ones.
+            let h = healthy.clone();
+            assert!(on_callback_thread(move || h.callback_wait_error()).is_none());
+
             callback_active.store(false, Ordering::SeqCst);
             release.signal();
-            peer_call.join().unwrap();
-            owner_call.join().unwrap().unwrap();
-            let err = result
-                .expect("peer must not join the worker delivering its callback")
-                .unwrap_err();
-            assert_eq!(err.code(), crate::ErrorCode::SocketError);
-            assert!(err.msg().contains("callback must return first"));
+            let o = owner.clone();
+            assert!(on_callback_thread(move || o.callback_wait_error()).is_none());
+            assert!(!owner.callback_blocked.load(Ordering::SeqCst));
         }
 
         #[test]
