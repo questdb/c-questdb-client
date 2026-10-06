@@ -1533,11 +1533,39 @@ mod tests {
             let url = format!("http://{}/token", listener.local_addr().unwrap());
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 1024];
-                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let headers_end = loop {
                     let n = stream.read(&mut chunk).unwrap();
                     assert_ne!(n, 0);
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let content_length = std::str::from_utf8(&request[..headers_end])
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if request.starts_with(b"POST ") {
+                    assert!(content_length > 0, "test POST must include Content-Length");
+                }
+                // Drain the POST body before replying. Closing a socket with unread
+                // request bytes can reset it and truncate the 4 MiB response.
+                while request.len() - headers_end < content_length {
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert_ne!(n, 0, "request body ended before Content-Length");
                     request.extend_from_slice(&chunk[..n]);
                 }
                 let header = format!(
