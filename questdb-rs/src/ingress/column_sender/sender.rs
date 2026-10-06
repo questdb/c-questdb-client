@@ -950,6 +950,13 @@ impl DirectSenderCore {
         self.backend.conn.in_flight()
     }
 
+    /// `false` once the deferred window is full: the next no-wait flush would
+    /// fail with "call sync()".
+    #[cfg(feature = "polars-ingress")]
+    pub(crate) fn has_sync_commit_slot(&self) -> bool {
+        self.backend.conn.has_sync_commit_slot()
+    }
+
     pub(crate) fn transport_dead(&self) -> bool {
         self.backend.conn.transport_dead()
     }
@@ -1267,17 +1274,21 @@ impl DirectColumnBackend {
         range: Option<(usize, usize)>,
         defer_commit: bool,
     ) -> std::result::Result<FrameOutcome, FlushFailure> {
-        let row_count = range.map_or(chunk.row_count(), |(_, count)| count);
-        if row_count > MAX_FRAME_ROWS {
-            return Ok(FrameOutcome::TooLarge(frame_row_limit_error(row_count)));
-        }
-
+        // The slot check comes first: a range over the row limit splits into
+        // deferred frames of its own, and with the window already full the
+        // split would drain it through an implicit sync instead of telling
+        // the caller to.
         if defer_commit && !self.conn.has_sync_commit_slot() {
             return Ok(FrameOutcome::NoSlot(error::fmt!(
                 InvalidApiCall,
                 "column sender deferred flush capacity exhausted; call sync() \
                  before flushing more chunks."
             )));
+        }
+
+        let row_count = range.map_or(chunk.row_count(), |(_, count)| count);
+        if row_count > MAX_FRAME_ROWS {
+            return Ok(FrameOutcome::TooLarge(frame_row_limit_error(row_count)));
         }
 
         if self.conn.at_in_flight_cap() {
@@ -1503,17 +1514,18 @@ impl DirectColumnBackend {
         range: Option<(usize, usize)>,
         defer_commit: bool,
     ) -> std::result::Result<FrameOutcome, FlushFailure> {
-        let row_count = range.map_or(spec.batch.num_rows(), |(_, count)| count);
-        if row_count > MAX_FRAME_ROWS {
-            return Ok(FrameOutcome::TooLarge(frame_row_limit_error(row_count)));
-        }
-
+        // Slot check before the row limit, as in `publish_frame`.
         if defer_commit && !self.conn.has_sync_commit_slot() {
             return Ok(FrameOutcome::NoSlot(error::fmt!(
                 InvalidApiCall,
                 "column sender deferred flush capacity exhausted; call sync() \
                  before flushing more arrow batches."
             )));
+        }
+
+        let row_count = range.map_or(spec.batch.num_rows(), |(_, count)| count);
+        if row_count > MAX_FRAME_ROWS {
+            return Ok(FrameOutcome::TooLarge(frame_row_limit_error(row_count)));
         }
 
         if self.conn.at_in_flight_cap() {

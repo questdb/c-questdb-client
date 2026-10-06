@@ -333,11 +333,14 @@ impl Iterator for DataFrameBatches<'_> {
     }
 }
 
-/// Number of batches between commit checkpoints. The ≤63 publish-only
-/// (deferred) frames that accumulate between checkpoints stay under the QWP
-/// 127-deferred in-flight cap; the checkpoint itself is a non-deferred ACKing
-/// flush that drains in-flight to zero. 64 keeps the pipeline full and bounds a
-/// failover re-drive to ≈64 × `max_rows` rows.
+/// Number of batches between commit checkpoints. A batch is normally one
+/// publish-only (deferred) frame, so the ≤63 that accumulate between
+/// checkpoints stay under the QWP 127-deferred in-flight cap; the checkpoint
+/// itself is a non-deferred ACKing flush that drains in-flight to zero. 64
+/// keeps the pipeline full and bounds a failover re-drive to ≈64 × `max_rows`
+/// rows. A batch over the server's row limit or the frame size cap is split
+/// into several frames, and can fill the window sooner: the batch that finds
+/// it full becomes a checkpoint too.
 const CHECKPOINT_BATCHES: usize = 64;
 
 /// Optional knobs for [`QuestDb::flush_polars_dataframe`].
@@ -549,12 +552,13 @@ impl crate::db::QuestDb {
 
 /// Single forward pass over `df`, skipping the first `*committed` batches (the
 /// tail already durable from an earlier attempt). Non-checkpoint batches are
-/// published with a no-wait flush; every [`CHECKPOINT_BATCHES`]th batch is
-/// flushed with an ACKing boundary flush (`flush_arrow_batch_*_and_wait`),
-/// which folds the periodic `sync(Ok)` into the flush — one fewer empty commit
-/// frame per checkpoint. `*committed` is advanced to the batch count made
-/// durable by each successful checkpoint, so on a transient error the caller
-/// re-drives only the uncommitted tail.
+/// published with a no-wait flush; every [`CHECKPOINT_BATCHES`]th batch, and
+/// any batch that finds the deferred window full, is flushed with an ACKing
+/// boundary flush (`flush_arrow_batch_*_and_wait`), which folds the periodic
+/// `sync(Ok)` into the flush — one fewer empty commit frame per checkpoint.
+/// `*committed` is advanced to the batch count made durable by each successful
+/// checkpoint, so on a transient error the caller re-drives only the
+/// uncommitted tail.
 fn drive_from_checkpoint(
     sender: &mut crate::db::BorrowedDirectColumnSender<'_>,
     table: crate::ingress::TableName<'_>,
@@ -577,8 +581,13 @@ fn drive_from_checkpoint(
         let rb = rb?;
         // `idx` is 0-based; checkpoint after a full run of CHECKPOINT_BATCHES
         // (batches 63, 127, …). The checkpoint boundary's ack moves the replay
-        // marker.
-        let checkpoint = (idx + 1) % CHECKPOINT_BATCHES == 0;
+        // marker. Split batches can fill the deferred window before that, and
+        // a no-wait flush into a full window fails with "call sync()", so the
+        // batch that finds it full is flushed as a checkpoint instead. An
+        // ACKing flush publishes the batch as the commit frame, which needs
+        // no deferred slot; a batch that still has to split drains the window
+        // with a sync of its own before its deferred prefix.
+        let checkpoint = (idx + 1) % CHECKPOINT_BATCHES == 0 || !sender.has_sync_commit_slot();
         match (options.timestamp_column, checkpoint) {
             (Some(ts), false) => {
                 sender.flush_arrow_batch_at_column(table, &rb, ts, options.overrides)?

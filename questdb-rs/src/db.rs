@@ -1523,7 +1523,7 @@ impl<'a> DirectSenderHandle<'a> {
             .expect("borrowed direct sender already returned")
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "polars-ingress"))]
     fn inner_ref(&self) -> &DirectSenderCore {
         self.sender
             .as_ref()
@@ -2065,6 +2065,13 @@ impl<'a> BorrowedDirectColumnSender<'a> {
     #[cfg(feature = "polars-ingress")]
     pub(crate) fn default_ack_level(&self) -> AckLevel {
         self.0.db.default_ack_level()
+    }
+
+    /// `false` once the deferred window is full: the next no-wait flush would
+    /// fail with "call sync()".
+    #[cfg(feature = "polars-ingress")]
+    pub(crate) fn has_sync_commit_slot(&self) -> bool {
+        self.0.inner_ref().has_sync_commit_slot()
     }
 
     /// Force this borrowed connection to be dropped (not recycled) on return.
