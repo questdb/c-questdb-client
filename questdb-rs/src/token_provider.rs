@@ -621,9 +621,34 @@ impl std::fmt::Debug for TokenProvider {
     }
 }
 
+// `ReaderConfig` and `SenderBuilder` were `UnwindSafe` and `RefUnwindSafe`
+// before they could hold a provider; the `dyn Fn` closures inside one would
+// otherwise remove both auto traits from those public types, breaking callers
+// that keep a config across `catch_unwind`. Asserting them here is sound: a
+// provider is an opaque callable, and the state it shares across a call (the
+// single-flight cell and the blocked flag) lives behind mutexes and atomics,
+// which tolerate a panic mid-call. A panic inside the caller's own closure
+// leaves only that closure's captures in question, exactly as for any closure
+// a caller hands across an unwind boundary.
+impl std::panic::UnwindSafe for TokenProvider {}
+impl std::panic::RefUnwindSafe for TokenProvider {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+    #[test]
+    fn provider_holders_stay_unwind_safe() {
+        assert_unwind_safe::<TokenProvider>();
+        #[cfg(feature = "_egress")]
+        assert_unwind_safe::<crate::egress::ReaderConfig>();
+        // A QWP/WS connection listener (`Arc<dyn Fn>`) already made the
+        // builder non-unwind-safe before providers existed.
+        #[cfg(all(feature = "_sync-sender", not(feature = "_sender-qwp-ws")))]
+        assert_unwind_safe::<crate::ingress::SenderBuilder>();
+    }
 
     #[test]
     fn bearer_header_formats_and_validates() {
