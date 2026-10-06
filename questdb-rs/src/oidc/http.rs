@@ -29,6 +29,7 @@
 //! redirects, bounding the response body, and holding every IdP call to `https`
 //! (or loopback `http`).
 
+use std::cell::Cell;
 use std::fmt::Debug;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -176,7 +177,12 @@ impl HttpClient {
     pub(crate) fn new(ca_bundle: Option<&Path>, timeout: Duration) -> Result<Self> {
         let tls_config = configure_tls(default_tls_settings(ca_bundle)?)
             .map_err(|e| OidcError::config(format!("Could not configure TLS for OIDC: {e}")))?;
-        let connector = TcpConnector::default().chain(TlsConnector::new(tls_config));
+        // `DispatchTracker` must stay the outermost link: it observes only the
+        // HTTP request bytes, after DNS, TCP connect and (forced, see
+        // `TlsConnector`) the TLS handshake have all completed.
+        let connector = TcpConnector::default()
+            .chain(TlsConnector::new(tls_config))
+            .chain(DispatchTracker);
         let config = ureq::Agent::config_builder()
             .user_agent(USER_AGENT)
             // `Config::default()` sets `proxy: Proxy::try_from_env()`, which
@@ -280,12 +286,13 @@ impl HttpClient {
                 .build(),
             None => request,
         };
+        REQUEST_DISPATCHED.with(|dispatched| dispatched.set(false));
         let response = request.send_form(form.iter().copied()).map_err(|e| {
             // Record whether the request provably never left the client, so a
             // refresh caller can safely keep a refresh token that the IdP
             // cannot have seen (vs. an ambiguous mid-flight drop, where the
             // parent may have been consumed and rotated).
-            let unsent = request_provably_unsent(&e);
+            let unsent = !REQUEST_DISPATCHED.with(Cell::get);
             let timed_out = request_timed_out(&e);
             OidcError::network(format!("Failed to reach {url}: {e}"))
                 .with_request_unsent(unsent)
@@ -486,42 +493,86 @@ fn form_url_encode(value: &str) -> Zeroizing<String> {
     encoded
 }
 
-/// True when a `ureq` send failure proves the HTTP request was never
-/// transmitted, so a refresh token carried in it was not consumed by the IdP and
-/// is safe to reuse. Only unambiguous pre-send failures qualify — DNS
-/// resolution, TCP connect, TLS handshake, or proxy-tunnel setup — plus a
-/// resolve/connect-phase timeout. Every other failure (an I/O error at an
-/// unknown or post-connect phase, a send/receive-phase or global timeout, a
-/// protocol or decode error) may have reached the IdP and is treated as
-/// ambiguous.
-///
-/// `ureq` maps most connect failures to [`ureq::Error::Io`] and carries the
-/// [`io::ErrorKind`](std::io::ErrorKind) as the reason (`ConnectionFailed` is a
-/// last resort), so the `Io` arm inspects the kind: only kinds that mean "no
-/// connection was ever established" qualify — a reset / broken pipe / EOF may
-/// have occurred after the request bytes were written. `ureq::Error` and
-/// `ureq::Timeout` are `#[non_exhaustive]`, so any future variant falls through
-/// to the fail-safe `false` (treat as possibly-sent).
-fn request_provably_unsent(err: &ureq::Error) -> bool {
-    use std::io::ErrorKind;
-    use ureq::Error;
-    match err {
-        Error::HostNotFound
-        | Error::ConnectionFailed
-        | Error::ConnectProxyFailed(_)
-        | Error::TlsRequired
-        | Error::Tls(_) => true,
-        Error::Io(e) => matches!(
-            e.kind(),
-            ErrorKind::ConnectionRefused
-                | ErrorKind::NetworkUnreachable
-                | ErrorKind::HostUnreachable
-                | ErrorKind::AddrNotAvailable
-        ),
-        Error::Timeout(reason) => {
-            matches!(reason, ureq::Timeout::Resolve | ureq::Timeout::Connect)
+thread_local! {
+    /// Whether the request currently being sent on this thread has handed any
+    /// HTTP bytes to the transport. Set by [`DispatchTrackingTransport`], reset
+    /// by [`HttpClient::post_form_within`] before each request.
+    ///
+    /// A send failure with this still `false` proves the request never left the
+    /// client — DNS resolution, TCP connect and the TLS handshake all run
+    /// before it — so a refresh token carried in it was not consumed by the IdP
+    /// and is safe to reuse. Once any request byte reached the transport, every
+    /// failure is treated as possibly-sent.
+    ///
+    /// This tracks the send phase directly instead of inferring it from the
+    /// error: `ureq` reports a DNS failure as `Io(Uncategorized)`, a connect
+    /// timeout as `Timeout(Global)` whenever the global and connect timeouts
+    /// coincide, and a TLS handshake failure as `Io(InvalidData)`. None of those
+    /// shapes identifies the phase it came from.
+    ///
+    /// Thread-local is sound here: `ureq` runs the connector chain and every
+    /// transport write of a request on the thread that issued it.
+    static REQUEST_DISPATCHED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Outermost connector: wraps the finished transport (TCP, or TCP + TLS with
+/// the handshake already complete) so the first HTTP byte written marks the
+/// request as dispatched. See [`REQUEST_DISPATCHED`].
+#[derive(Debug)]
+struct DispatchTracker;
+
+impl<In: Transport> Connector<In> for DispatchTracker {
+    type Out = DispatchTrackingTransport<In>;
+
+    fn connect(
+        &self,
+        _details: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<In>,
+    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| DispatchTrackingTransport { inner }))
+    }
+}
+
+#[derive(Debug)]
+struct DispatchTrackingTransport<T> {
+    inner: T,
+}
+
+impl<T: Transport> Transport for DispatchTrackingTransport<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: NextTimeout,
+    ) -> std::result::Result<(), ureq::Error> {
+        if amount > 0 {
+            // Set before the write: a write that fails part-way may already
+            // have delivered the request.
+            REQUEST_DISPATCHED.with(|dispatched| dispatched.set(true));
         }
-        _ => false,
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn maybe_await_input(
+        &mut self,
+        timeout: NextTimeout,
+    ) -> std::result::Result<bool, ureq::Error> {
+        self.inner.maybe_await_input(timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        self.inner.await_input(timeout)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
     }
 }
 
@@ -824,10 +875,26 @@ impl<In: Transport> Connector<In> for TlsConnector {
         .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
         let conn = ClientConnection::new(self.tls_config.clone(), name)
             .map_err(|_e| ureq::Error::Tls("tls client connection error"))?;
-        let stream = StreamOwned {
+        let mut stream = StreamOwned {
             conn,
             sock: TransportAdapter::new(transport.boxed()),
         };
+        // Complete the handshake here rather than lazily on the first request
+        // write, so a handshake failure surfaces before `DispatchTracker` sees
+        // any request byte: the request is then provably unsent.
+        stream.sock.set_timeout(details.timeout);
+        while stream.conn.is_handshaking() {
+            let (read, written) = stream
+                .conn
+                .complete_io(&mut stream.sock)
+                .map_err(ureq::Error::from)?;
+            if read == 0 && written == 0 {
+                // No progress while still handshaking: the peer closed.
+                return Err(ureq::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                )));
+            }
+        }
         let buffers = LazyBuffers::new(
             details.config.input_buffer_size(),
             details.config.output_buffer_size(),
@@ -1465,53 +1532,117 @@ mod tests {
         assert_eq!(parse_retry_after(&HeaderMap::new()), None);
     }
 
-    #[test]
-    fn request_provably_unsent_classifies_pre_send_failures() {
-        use ureq::Error;
-        // Pre-send: the request never left the client, so a refresh token carried
-        // in it was not consumed by the IdP — safe to keep and retry.
-        assert!(request_provably_unsent(&Error::HostNotFound));
-        assert!(request_provably_unsent(&Error::ConnectionFailed));
-        assert!(request_provably_unsent(&Error::ConnectProxyFailed(
-            "x".into()
-        )));
-        assert!(request_provably_unsent(&Error::TlsRequired));
-        assert!(request_provably_unsent(&Error::Tls("handshake")));
-        assert!(request_provably_unsent(&Error::Timeout(
-            ureq::Timeout::Resolve
-        )));
-        assert!(request_provably_unsent(&Error::Timeout(
-            ureq::Timeout::Connect
-        )));
-        // ureq surfaces a refused/unreachable connect as `Io` with the kind as
-        // the reason: those never established a connection, so the request is
-        // provably unsent.
-        for kind in [
-            std::io::ErrorKind::ConnectionRefused,
-            std::io::ErrorKind::NetworkUnreachable,
-            std::io::ErrorKind::HostUnreachable,
-            std::io::ErrorKind::AddrNotAvailable,
-        ] {
-            assert!(
-                request_provably_unsent(&Error::Io(std::io::Error::new(kind, "no connection"))),
-                "{kind:?} should be pre-send"
-            );
+    /// Post to `url` and return the network error, which must exist.
+    fn post_error(client: &HttpClient, url: &str) -> OidcError {
+        match client.post_form(url, &[("grant_type", "refresh_token")], false) {
+            Err(err) => err,
+            Ok(_) => panic!("POST to {url} must fail"),
         }
-        // Ambiguous — the request may have reached the IdP, so it is NOT provably
-        // unsent and the parent must be treated as possibly-consumed. A reset or
-        // EOF can happen after the request bytes were written.
-        assert!(!request_provably_unsent(&Error::Timeout(
-            ureq::Timeout::Global
-        )));
-        assert!(!request_provably_unsent(&Error::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "reset mid-flight",
-        ))));
-        assert!(!request_provably_unsent(&Error::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "eof reading response",
-        ))));
-        assert!(!request_provably_unsent(&Error::StatusCode(500)));
+    }
+
+    #[test]
+    fn dns_failure_is_provably_unsent() {
+        // RFC 6761 reserves `.invalid`: it never resolves. ureq reports this as
+        // `Io(Uncategorized)`, a shape that names no send phase.
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, "https://questdb-oidc-test.invalid/token");
+        assert_eq!(err.kind(), crate::oidc::error::OidcErrorKind::Network);
+        assert!(err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn refused_connect_is_provably_unsent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, &format!("http://{addr}/token"));
+        assert!(err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn connect_phase_timeout_is_provably_unsent() {
+        // An accept backlog that never completes the handshake would need root;
+        // instead hold a non-routable address. Depending on the host network
+        // this times out (`Timeout(Global)`, since the global and connect
+        // timeouts coincide) or fails as unreachable: both are pre-send.
+        let client = HttpClient::new(None, Duration::from_millis(300)).unwrap();
+        let err = post_error(&client, "https://10.255.255.1/token");
+        assert!(err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn tls_handshake_failure_is_provably_unsent() {
+        // A plaintext responder: the handshake fails on its first reply, before
+        // any request byte could be encrypted and sent.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\nnot tls");
+            }
+        });
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, &format!("https://127.0.0.1:{}/token", addr.port()));
+        handle.join().unwrap();
+        assert_eq!(err.kind(), crate::oidc::error::OidcErrorKind::Network);
+        assert!(err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn tls_certificate_rejection_is_provably_unsent() {
+        let server = TlsJsonServer::localhost();
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, &server.url("/token"));
+        assert!(err.request_unsent(), "{err}");
+        assert!(server.request_bodies().is_empty());
+    }
+
+    #[test]
+    fn drop_after_the_request_is_possibly_sent() {
+        // The server reads the whole request, then closes without replying: the
+        // IdP may have consumed it, so the request must not count as unsent.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                    }
+                }
+            }
+        });
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, &format!("http://{addr}/token"));
+        handle.join().unwrap();
+        assert!(!err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn dispatch_marker_is_reset_for_each_request() {
+        // A dispatched request must not leave the next pre-send failure on the
+        // same thread looking possibly-sent.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+            }
+        });
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        assert!(!post_error(&client, &format!("http://{addr}/token")).request_unsent());
+        handle.join().unwrap();
+        assert!(post_error(&client, &format!("http://{addr}/token")).request_unsent());
     }
 
     #[test]

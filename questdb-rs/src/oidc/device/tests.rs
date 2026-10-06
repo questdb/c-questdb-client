@@ -6090,6 +6090,73 @@ fn refresh_pre_send_failure_keeps_in_memory_parent() {
     );
 }
 
+/// An auth whose IdP host never resolves (RFC 6761 `.invalid`): the refresh
+/// POST fails at DNS, before any byte leaves the client. ureq reports that as
+/// `Io(Uncategorized)` rather than a connect-phase error, so this pins that
+/// send-phase provenance, not the error shape, decides refresh-token retention.
+fn auth_with_unresolvable_idp(store: Option<FailingSaveStore>) -> OidcDeviceAuth {
+    let builder = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("https://questdb-oidc-test.invalid/device")
+        .token_endpoint("https://questdb-oidc-test.invalid/token")
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep());
+    match store {
+        Some(store) => builder.token_store(store),
+        None => builder,
+    }
+    .build()
+    .expect("build auth")
+}
+
+#[test]
+fn refresh_dns_failure_keeps_in_memory_parent() {
+    let auth = auth_with_unresolvable_idp(None);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-1"),
+        "a DNS failure must keep the refresh token for a later retry"
+    );
+    // Still a network error on retry, never a demand to sign in again.
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Network);
+}
+
+#[test]
+fn refresh_dns_failure_keeps_persisted_parent() {
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    let auth = auth_with_unresolvable_idp(Some(store.clone()));
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        store
+            .token()
+            .and_then(|t| t.refresh_token().map(str::to_string)),
+        Some("RT-1".to_string()),
+        "a DNS failure must not consume the persisted refresh token"
+    );
+    assert_eq!(
+        auth.token_set()
+            .and_then(|t| t.refresh_token.clone())
+            .as_deref(),
+        Some("RT-1")
+    );
+}
+
 /// Model a durable clear that pauses after removing the token. Keep the
 /// coordination lock separate from the stored value so close can publish while
 /// the refresh is inside clear().
