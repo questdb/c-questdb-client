@@ -239,9 +239,11 @@ fn main() -> questdb::Result<()> {
     let send_elapsed = send_start.elapsed();
 
     // Per-row wire payload estimate:
-    //   3 × f64 + 3 × i64 + 1 × i64 (ts) + 2 B symbol varint + 1 B exchange varint
-    // = 24 + 24 + 8 + 3 = 59 bytes. Schema/header overhead amortises away.
-    let bytes_per_row = 59usize;
+    //   3 × f64 + 3 × i64 + 2 B symbol varint + 1 B exchange varint
+    // = 24 + 24 + 3 = 51 bytes. The fixed-cadence timestamp is delta-of-delta
+    // encoded to about one bit per row, which amortises away along with the
+    // schema/header overhead.
+    let bytes_per_row = 51usize;
     let total_bytes = total_rows * bytes_per_row;
 
     println!(

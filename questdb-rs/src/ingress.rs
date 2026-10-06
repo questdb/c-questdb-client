@@ -86,6 +86,11 @@ pub(crate) mod ndarr;
 
 mod timestamp;
 
+// UDP included: `buffer/qwp.rs` (gated the same way) calls into it from
+// `encode_column_from_cells`, even though UDP frames themselves stay raw.
+#[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+pub(crate) mod gorilla;
+
 mod buffer;
 pub use buffer::*;
 

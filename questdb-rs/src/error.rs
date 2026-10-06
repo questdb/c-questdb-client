@@ -209,6 +209,11 @@ pub enum ErrorCode {
     /// surfaces when splitting cannot make a frame fit. Distinct from
     /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
     /// without matching on the error message text.
+    ///
+    /// Also returned when a row-API `Buffer` holds more than 1,000,000 rows
+    /// for one table: the server's per-frame row limit, which a `Buffer`
+    /// (published as one frame) cannot be split to meet. The buffer is left
+    /// intact.
     BatchTooLarge,
 
     /// The QWP/WebSocket store-and-forward persisted symbol dictionary is

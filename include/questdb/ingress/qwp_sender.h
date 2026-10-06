@@ -362,7 +362,15 @@ line_sender_buffer* questdb_db_new_buffer(
 QUESTDB_CLIENT_API
 size_t questdb_db_buffer_max_name_len(const questdb_db* db);
 
-/** Publish and clear a Buffer after local store-and-forward acceptance. */
+/**
+ * Publish and clear a Buffer after local store-and-forward acceptance.
+ *
+ * A Buffer is published as one frame, so it may hold at most 1,000,000 rows
+ * per table (the server's per-frame limit). A larger Buffer fails with
+ * `line_sender_error_batch_too_large` before anything is queued and is left
+ * intact: flush smaller batches. The same limit applies to every
+ * `qwp_sender_flush_buffer*` variant.
+ */
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_buffer(
     qwp_sender* sender,
@@ -1227,6 +1235,10 @@ bool qwp_chunk_append_arrow_column(
  * holding a raw, contiguous, native-endian NumPy buffer. The buffer is
  * walked at flush time, single pass, straight into the connection's
  * outbound frame — no chunk-side scratch arena, no per-column heap copy.
+ * TIMESTAMP and TIMESTAMP_NANOS columns are the exception: they are
+ * delta-of-delta encoded, a column that does not compress is read a second
+ * time to go out raw, and a unit-converted datetime64 column with nulls is
+ * first compacted into a temporary buffer.
  *
  * Caller contract: `data` (and `validity->bits`, if any) MUST stay alive
  * until the next `qwp_sender_flush_chunk` / `qwp_sender_wait` returns.

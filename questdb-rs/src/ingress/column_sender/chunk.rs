@@ -1514,7 +1514,10 @@ impl<'a> Chunk<'a> {
     /// native-endian; the caller retains ownership and must keep it
     /// alive until the next flush / sync. Widening, packing, and
     /// per-row conversion happen single-pass during encode — the chunk
-    /// allocates nothing per numpy column.
+    /// allocates nothing per numpy column. Timestamp columns are the
+    /// exception: the delta-of-delta encoder reads one a second time when
+    /// it does not compress, and a unit-converted datetime64 column with
+    /// nulls is first compacted into a temporary buffer.
     ///
     /// # Safety
     ///
