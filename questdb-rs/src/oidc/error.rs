@@ -360,6 +360,12 @@ impl From<OidcError> for Error {
         let code = match err.kind {
             OidcErrorKind::Config => ErrorCode::ConfigError,
             OidcErrorKind::Network => ErrorCode::SocketError,
+            // A peer holding the acquisition lock is transient: the condition
+            // clears when that peer finishes. Classify it the same way whether
+            // the caller met the peer between polls (here) or while its
+            // callback ran (`retryable_interaction_required`), so one state
+            // never yields two codes depending on timing.
+            OidcErrorKind::InteractionRequired if err.acquisition_busy => ErrorCode::SocketError,
             OidcErrorKind::DeviceFlow
             | OidcErrorKind::Timeout
             | OidcErrorKind::InteractionRequired
@@ -382,6 +388,10 @@ mod tests {
             (OidcError::device_flow("x"), ErrorCode::AuthError),
             (OidcError::timeout("x"), ErrorCode::AuthError),
             (OidcError::interaction_required("x"), ErrorCode::AuthError),
+            (
+                OidcError::interaction_required_busy("x"),
+                ErrorCode::SocketError,
+            ),
             (OidcError::cancelled("x"), ErrorCode::AuthError),
         ];
         for (oidc_err, expected) in cases {

@@ -2297,6 +2297,8 @@ pub struct questdb_oidc_config_view {
 // Pin the initial output layouts independently of future appended fields.
 // Both v1 structs deliberately end in a naturally aligned integer so adding a
 // field cannot hide inside trailing padding without increasing struct_size.
+// A struct whose current last field does leave trailing padding reports the end
+// of that field rather than `sizeof` (see `QUESTDB_OIDC_ERROR_VIEW_SIZE`).
 const QUESTDB_OIDC_CONFIG_VIEW_V1_SIZE: usize =
     std::mem::offset_of!(questdb_oidc_config_view, issuer_len) + std::mem::size_of::<size_t>();
 
@@ -2397,6 +2399,14 @@ pub struct questdb_oidc_error_view {
 const QUESTDB_OIDC_ERROR_VIEW_V1_SIZE: usize =
     std::mem::offset_of!(questdb_oidc_error_view, retry_after_seconds) + std::mem::size_of::<u64>();
 
+/// The prefix this library writes: through `acquisition_busy`, NOT
+/// `size_of::<questdb_oidc_error_view>()`. That `bool` leaves trailing padding,
+/// and a field appended later can fit inside it without changing `sizeof`; a
+/// library reporting `sizeof` would then claim to have written a field it does
+/// not know, and the caller would read zero as a real value.
+const QUESTDB_OIDC_ERROR_VIEW_SIZE: usize =
+    std::mem::offset_of!(questdb_oidc_error_view, acquisition_busy) + std::mem::size_of::<bool>();
+
 fn error_kind(kind: OidcErrorKind) -> questdb_oidc_error_kind {
     match kind {
         OidcErrorKind::Config => questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_CONFIG,
@@ -2432,7 +2442,7 @@ pub unsafe extern "C" fn questdb_error_oidc_get_view(
         str_or_null(oidc.idp_error_description());
     let status = oidc.status();
     let retry_after = oidc.retry_after_secs();
-    let written_size = capacity.min(std::mem::size_of::<questdb_oidc_error_view>());
+    let written_size = capacity.min(QUESTDB_OIDC_ERROR_VIEW_SIZE);
     let mut value = unsafe { std::mem::zeroed::<questdb_oidc_error_view>() };
     value.struct_size = written_size;
     value.kind = error_kind(oidc.kind());
@@ -3013,6 +3023,10 @@ mod tests {
         };
         let seen = unsafe { questdb_error_oidc_get_view(boxed, &mut view) };
         assert!(seen, "questdb_error_oidc_get_view must report the cause");
+        // The write-back ends at the last defined field, not at `sizeof`, so a
+        // field later appended into the trailing padding stays detectable.
+        assert_eq!(view.struct_size, QUESTDB_OIDC_ERROR_VIEW_SIZE);
+        assert!(QUESTDB_OIDC_ERROR_VIEW_SIZE < std::mem::size_of::<questdb_oidc_error_view>());
         assert_eq!(
             view.kind,
             questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED

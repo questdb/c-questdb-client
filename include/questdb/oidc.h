@@ -688,6 +688,15 @@ bool questdb_oidc_auth_sign_in(
  * QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED error when explicit sign-in is
  * needed, including when another sign-in is in progress and no valid token is
  * cached.
+ *
+ * The error code distinguishes the two: `questdb_error_auth_error` when no
+ * credential is available and someone must sign in, and the retryable
+ * `questdb_error_socket_error` (with the view's `acquisition_busy` set) when
+ * another thread's sign-in or callback holds the acquisition, whether this
+ * call met it between polls or while its callback ran. Called from this
+ * auth's own callback with nothing cached, it also fails with the retryable
+ * `questdb_error_socket_error`, but with `acquisition_busy` false: return
+ * from the callback before retrying or signing in.
  */
 QUESTDB_CLIENT_API
 questdb_oidc_token* questdb_oidc_auth_token(
@@ -798,6 +807,11 @@ typedef enum questdb_oidc_error_kind
  * prefix written by the library; consumers that can load an older shared
  * library must re-read it before accessing fields beyond that prefix.
  *
+ * That prefix ends at the last field the library defines, which can be smaller
+ * than `sizeof(questdb_oidc_error_view)` because of trailing padding. Test a
+ * field's presence with `struct_size >= offsetof(field) + sizeof(field)`,
+ * never by comparing `struct_size` with `sizeof`.
+ *
  * Token-endpoint diagnostics are untrusted. If an identity provider reflects
  * the submitted device code or refresh token in any non-issued-token string,
  * the library replaces that credential with `[redacted credential]` before it
@@ -820,7 +834,9 @@ typedef struct questdb_oidc_error_view
     /**
      * True only when `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` describes a
      * transient acquisition/callback contention window. False means no
-     * credential is available and the caller must run `sign_in()`.
+     * credential is available and the caller must run `sign_in()` -- after
+     * returning from any of this auth's callbacks: a token request made from
+     * inside one also reports false, and `sign_in()` is rejected there.
      */
     bool acquisition_busy;
 } questdb_oidc_error_view;
