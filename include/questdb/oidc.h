@@ -56,6 +56,10 @@ typedef enum questdb_oidc_event_kind
  * display only.
  * `browser_target`, when non-NULL, is the sole URL vetted for opening or making
  * clickable (HTTP(S), no userinfo, non-empty ASCII host).
+ * The display URLs are length-capped before invisible characters are removed,
+ * so a shortened one can differ from `browser_target`, including in its host.
+ * A renderer that opens or links `browser_target` must show that URL, not the
+ * display text, as the place the user is sent.
  *
  * Event-specific numeric fields:
  * - PROMPT: `expires_in_seconds` is the bounded device-code lifetime and

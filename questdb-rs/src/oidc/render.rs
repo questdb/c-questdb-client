@@ -278,18 +278,21 @@ fn defang_terminal_url(uri: &str) -> String {
 
 fn format_prompt(challenge: &DeviceCodeChallenge) -> String {
     let browser_target = challenge.browser_target();
-    let displayed = challenge.display_verification_uri();
-    let uri = if browser_target.is_some() {
-        displayed.to_string()
-    } else {
-        defang_terminal_url(&displayed)
+    // When the plain URI is vetted, show the vetted URL itself, never the
+    // display text: that is capped BEFORE invisible characters are stripped,
+    // so a padded URI would show a trusted-looking prefix of a host other
+    // than the one the browser opens. A vetted URL is already stripped and
+    // within the display cap, so display_url only escapes it.
+    let plain = safe_target(Some(&challenge.verification_uri), challenge.idp_is_loopback);
+    let uri = match plain.as_deref() {
+        Some(plain) => display_url(plain),
+        None => defang_terminal_url(&challenge.display_verification_uri()),
     };
     let code = challenge.display_user_code();
     let mut msg = format!("🔐 Sign in to QuestDB\n   Open {uri}  and enter code:  {code}\n");
     // browser_target() yields the pre-filled `complete` only when it is safe and
     // shares verification_uri's origin; otherwise it returns the plain URI shown
     // above. Offer the shortcut only for a distinct, vetted complete.
-    let plain = safe_target(Some(&challenge.verification_uri), challenge.idp_is_loopback);
     if let Some(target) = browser_target.filter(|target| Some(target) != plain.as_ref()) {
         msg.push_str(&format!("   (or open directly: {target})\n"));
     }
@@ -1003,6 +1006,38 @@ mod tests {
         let shown = format_prompt(&refused);
         assert!(shown.contains("https[:]//xn--80ak6aa92e.com/device"));
         assert!(!shown.contains("https://"));
+    }
+
+    #[test]
+    fn terminal_prompt_shows_the_host_the_browser_opens() {
+        // The display cap applies before zero-width characters are stripped,
+        // while the browser target is vetted after stripping. Showing the
+        // capped display text would print `https://trusted.example…` while
+        // the browser opened `trusted.example.evil.net`.
+        let padded = DeviceCodeChallenge {
+            user_code: "WXYZ".into(),
+            verification_uri: format!(
+                "https://trusted.example{}.evil.net/x",
+                "\u{200b}".repeat(240)
+            ),
+            verification_uri_complete: None,
+            expires_in_seconds: 600,
+            interval_seconds: 5,
+            idp_is_loopback: false,
+        };
+        let target = padded.browser_target().expect("vetted after stripping");
+        assert_eq!(target, "https://trusted.example.evil.net/x");
+        assert!(padded.display_verification_uri().ends_with("\\u{2026}"));
+        let shown = format_prompt(&padded);
+        assert!(
+            shown.contains("Open https://trusted.example.evil.net/x "),
+            "terminal must show the opened host; got: {shown}"
+        );
+        assert!(
+            !shown.contains("2026"),
+            "no shortened display text: {shown}"
+        );
+        assert!(!shown.contains("or open directly"));
     }
 
     #[test]
