@@ -1235,6 +1235,10 @@ bool qwp_chunk_append_arrow_column(
  * holding a raw, contiguous, native-endian NumPy buffer. The buffer is
  * walked at flush time, single pass, straight into the connection's
  * outbound frame — no chunk-side scratch arena, no per-column heap copy.
+ * TIMESTAMP and TIMESTAMP_NANOS columns are the exception: they are
+ * delta-of-delta encoded, a column that does not compress is read a second
+ * time to go out raw, and a unit-converted datetime64 column with nulls is
+ * first compacted into a temporary buffer.
  *
  * Caller contract: `data` (and `validity->bits`, if any) MUST stay alive
  * until the next `qwp_sender_flush_chunk` / `qwp_sender_wait` returns.

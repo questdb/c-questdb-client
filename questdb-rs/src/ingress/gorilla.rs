@@ -152,14 +152,24 @@ fn try_encode_gorilla(out: &mut Vec<u8>, mut values: impl Iterator<Item = i64>) 
     true
 }
 
-/// Dense raw LE values through one pre-sized slab, so the loop carries no
-/// per-value capacity check and a contiguous source compiles to a plain copy.
+/// Dense raw LE values written straight into reserved capacity, so the loop
+/// carries no per-value capacity check and the slab is not zero-filled first.
+/// A source that yields fewer than `count` values leaves the missing slots
+/// zero.
 fn write_raw(out: &mut Vec<u8>, count: usize, values: impl Iterator<Item = i64>) {
-    let start = out.len();
-    out.resize(start + count * 8, 0);
-    for (dst, v) in out[start..].as_chunks_mut::<8>().0.iter_mut().zip(values) {
-        *dst = v.to_le_bytes();
+    out.reserve(count * 8);
+    let (slots, _) = out.spare_capacity_mut().as_chunks_mut::<8>();
+    let mut written = 0;
+    for (slot, v) in slots[..count].iter_mut().zip(values) {
+        for (dst, byte) in slot.iter_mut().zip(v.to_le_bytes()) {
+            dst.write(byte);
+        }
+        written += 1;
     }
+    // SAFETY: the loop above initialized the first `written * 8` bytes of the
+    // spare capacity, and `written <= count` keeps them within the reserve.
+    unsafe { out.set_len(out.len() + written * 8) };
+    out.resize(out.len() + (count - written) * 8, 0);
 }
 
 /// Write one temporal column's payload: discriminator byte + dense non-null
@@ -190,13 +200,53 @@ where
     write_raw(out, count, make_values());
 }
 
+/// [`write_temporal_column`] for a contiguous source: `bytes` holds
+/// `bytes.len() / 8` native-endian `i64` values, at any alignment. The output
+/// is the same, but a column that falls back to raw is one copy of the source
+/// instead of a second pass over its values.
+///
+/// Only the column sender has contiguous sources, hence the gate.
+#[cfg(any(feature = "sync-sender-qwp-ws", test))]
+pub(crate) fn write_temporal_ne_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    let (values, _) = bytes.as_chunks::<8>();
+    let decoded = || values.iter().map(|v| i64::from_ne_bytes(*v));
+    let start = out.len();
+    if values.len() > 2 {
+        out.push(ENCODING_GORILLA);
+        if try_encode_gorilla(out, decoded()) {
+            return;
+        }
+        out.truncate(start);
+    }
+    out.push(ENCODING_UNCOMPRESSED);
+    if cfg!(target_endian = "little") {
+        out.extend_from_slice(values.as_flattened());
+    } else {
+        write_raw(out, values.len(), decoded());
+    }
+}
+
+/// [`write_temporal_ne_bytes`] for an `i64` slice.
+#[cfg(any(feature = "sync-sender-qwp-ws", test))]
+pub(crate) fn write_temporal_slice(out: &mut Vec<u8>, values: &[i64]) {
+    // SAFETY: `i64` has no padding and `u8` has alignment 1, so the slice's
+    // memory is `size_of_val(values)` initialized bytes.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) };
+    write_temporal_ne_bytes(out, bytes);
+}
+
 /// The payload [`write_temporal_column`] emits for `dense` values. Tests of
 /// the encode paths build their expected bytes from it; `golden_tests` pins
-/// the bytes themselves.
+/// the bytes themselves. [`write_temporal_slice`] must emit the same payload,
+/// which is checked here so every caller pins both writers.
 #[cfg(test)]
 pub(crate) fn temporal_payload(dense: &[i64]) -> Vec<u8> {
     let mut out = Vec::new();
     write_temporal_column(&mut out, dense.len(), || dense.iter().copied());
+    let mut from_slice = Vec::new();
+    write_temporal_slice(&mut from_slice, dense);
+    assert_eq!(from_slice, out, "slice and iterator writers disagree");
     out
 }
 
@@ -284,6 +334,34 @@ mod golden_tests {
             assert_eq!(out, raw);
         }
     }
+
+    #[test]
+    fn source_longer_than_count_writes_only_count_raw_values() {
+        // The other way to break the contract. The raw writer fills reserved
+        // capacity for exactly `count` values and must stop there, even with
+        // room to spare.
+        let mut out = Vec::with_capacity(64);
+        write_temporal_column(&mut out, 2, || std::iter::repeat_n(7i64, 5));
+        let mut raw = vec![ENCODING_UNCOMPRESSED];
+        raw.extend([7i64; 2].iter().flat_map(|v| v.to_le_bytes()));
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn byte_source_is_read_at_any_alignment() {
+        // numpy hands over column bytes with no alignment guarantee. One
+        // spare leading byte puts the values at an odd address.
+        for values in [
+            vec![1_000i64, 2_000, 3_000, 4_000],
+            vec![0, 0, i32::MAX as i64 + 1],
+        ] {
+            let mut bytes = vec![0u8];
+            bytes.extend(values.iter().flat_map(|v| v.to_ne_bytes()));
+            let mut out = Vec::new();
+            write_temporal_ne_bytes(&mut out, &bytes[1..]);
+            assert_eq!(out, temporal_payload(&values));
+        }
+    }
 }
 
 // The round-trip tests depend on the egress decoder, which is behind the
@@ -324,8 +402,8 @@ mod tests {
     }
 
     fn roundtrip(values: &[i64]) -> Vec<u8> {
-        let mut out = Vec::new();
-        write_temporal_column(&mut out, values.len(), || values.iter().copied());
+        // `temporal_payload` also holds the slice writer to the same bytes.
+        let out = temporal_payload(values);
         assert_eq!(decode_temporal(&out, values.len()), values);
         out
     }

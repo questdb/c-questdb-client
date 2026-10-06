@@ -29,7 +29,7 @@
 //! throughput in rows/s and bytes/s so a regression shows up as either
 //! a row-rate or bandwidth drop.
 //!
-//! Three families:
+//! Four families:
 //!
 //! 1. **Per-column bulk append** — exercises [`Chunk::column_i64`],
 //!    [`Chunk::column_f64`], [`Chunk::column_str`], and
@@ -50,6 +50,12 @@
 //!    Pure encoder cost (no network) so a regression in
 //!    `encode_chunk` or in any per-column append shows up here.
 //!
+//! 4. **Timestamp encoding** — one narrow column plus a timestamp in the
+//!    shapes that set the encoder's cost: regular and jittery data that
+//!    compresses, and data that falls back to raw at once or only on its
+//!    last row. `raw_copy`, a DATE column over the same data, is the
+//!    plain-copy baseline.
+//!
 //! Run:
 //!
 //! ```text
@@ -62,6 +68,7 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
+use questdb::ingress::TimestampUnit;
 use questdb::ingress::column_sender::_bench_internals::{
     BenchEncoderState, bench_encode_chunk_into,
 };
@@ -434,6 +441,137 @@ fn encode_chunk_group(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Timestamp encoding: Gorilla and its raw fallback (no network)
+// ---------------------------------------------------------------------------
+
+/// Nanosecond timestamps in the shapes that set the cost of the Gorilla
+/// timestamp encoder:
+///
+/// - `regular`: a fixed 1 ms step. Every delta-of-delta is zero, so the
+///   column compresses to one bit per row: the cheapest Gorilla pass.
+/// - `jittery`: the same step with up to 50 us of jitter either way. About
+///   98% of the delta-of-deltas need the widest code (36 bits): the
+///   costliest pass.
+/// - `early_fallback`: gaps of up to 10 s. A delta-of-delta leaves the i32
+///   range within the first few rows, so the column goes out raw almost at
+///   once.
+/// - `late_fallback`, `jittery_late_fallback`: `regular` and `jittery` with
+///   the last row 3 s late. The column goes out raw only after every other
+///   row has been Gorilla-encoded and that work is thrown away. The jittery
+///   one is the encoder's worst case.
+fn make_ts_shape(shape: &str, rows: usize) -> Vec<i64> {
+    const START: i64 = 1_700_000_000_000_000_000;
+    const STEP: i64 = 1_000_000;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound) as i64
+    };
+    let (base, late) = match shape.strip_suffix("late_fallback") {
+        Some(base) => (base.strip_suffix('_').unwrap_or("regular"), true),
+        None => (shape, false),
+    };
+    let mut ts: Vec<i64> = match base {
+        "regular" => (0..rows as i64).map(|i| START + i * STEP).collect(),
+        "jittery" => (0..rows as i64)
+            .map(|i| START + i * STEP + next(100_001) - 50_000)
+            .collect(),
+        "early_fallback" => {
+            let mut t = START;
+            (0..rows)
+                .map(|_| {
+                    t += next(10_000_000_000);
+                    t
+                })
+                .collect()
+        }
+        other => panic!("unknown timestamp shape {other}"),
+    };
+    if late && let Some(last) = ts.last_mut() {
+        *last += 3_000_000_000;
+    }
+    ts
+}
+
+/// One `i8` column plus a nanosecond timestamp. `designated` and `column`
+/// carry it as the designated timestamp and as an ordinary column, both from
+/// a contiguous slice; `column_with_nulls` has one null row in 16, which
+/// takes the per-value writer instead.
+///
+/// A fallback case ships the bytes a plain copy of the column would, so for
+/// `column/*` whatever it costs beyond `raw_copy` is what the Gorilla attempt
+/// cost. `raw_copy` is the same data as a DATE column, which is never
+/// Gorilla-encoded. `designated/*` also pays the designated timestamp's
+/// validation scan, as it does without Gorilla.
+fn encode_timestamps_group(c: &mut Criterion) {
+    let rows = row_count();
+    let flags = vec![1_i8; rows];
+    let bits = make_validity_bits(rows);
+    let validity = Validity::from_bitmap(&bits, rows).unwrap();
+
+    let mut group = c.benchmark_group("encode_timestamps");
+    group.throughput(Throughput::Elements(rows as u64));
+
+    let mut bench = |name: String, chunk: &Chunk<'_>| {
+        group.bench_function(name, |b| {
+            // One output buffer for the whole run, as a sender reuses its
+            // own: this times the encoder, not the allocator.
+            let mut state = BenchEncoderState::new();
+            let mut out = Vec::new();
+            b.iter(|| {
+                out.clear();
+                bench_encode_chunk_into(&mut out, chunk, &mut state).unwrap();
+                black_box(&out);
+            });
+        });
+    };
+
+    let regular = make_ts_shape("regular", rows);
+    let mut raw_copy = Chunk::new("ticks");
+    raw_copy.column_i8("flag", &flags, None).unwrap();
+    raw_copy.column_date("ts2", &regular, None).unwrap();
+    raw_copy.at_now().unwrap();
+    bench("raw_copy".to_owned(), &raw_copy);
+
+    for shape in [
+        "regular",
+        "jittery",
+        "early_fallback",
+        "late_fallback",
+        "jittery_late_fallback",
+    ] {
+        let ts = make_ts_shape(shape, rows);
+
+        let mut designated = Chunk::new("ticks");
+        designated.column_i8("flag", &flags, None).unwrap();
+        designated.at_nanos(&ts).unwrap();
+        bench(format!("designated/{shape}"), &designated);
+
+        let mut column = Chunk::new("ticks");
+        column.column_i8("flag", &flags, None).unwrap();
+        column
+            .column_ts("ts2", &ts, TimestampUnit::Nanos, None)
+            .unwrap();
+        column.at_now().unwrap();
+        bench(format!("column/{shape}"), &column);
+
+        if shape == "early_fallback" {
+            let mut with_nulls = Chunk::new("ticks");
+            with_nulls.column_i8("flag", &flags, None).unwrap();
+            with_nulls
+                .column_ts("ts2", &ts, TimestampUnit::Nanos, Some(&validity))
+                .unwrap();
+            with_nulls.at_now().unwrap();
+            bench(format!("column_with_nulls/{shape}"), &with_nulls);
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_column_i64,
@@ -441,5 +579,6 @@ criterion_group!(
     bench_column_str,
     bench_symbol_dict,
     encode_chunk_group,
+    encode_timestamps_group,
 );
 criterion_main!(benches);

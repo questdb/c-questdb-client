@@ -929,9 +929,7 @@ unsafe fn encode_temporal_gorilla(
     match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
-            gorilla::write_temporal_column(out, row_count, || {
-                (0..row_count).map(|i| unsafe { *data.add(i) })
-            });
+            gorilla::write_temporal_slice(out, unsafe { slice::from_raw_parts(data, row_count) });
         }
         Some(v) => {
             out.push(1);
@@ -1287,7 +1285,8 @@ fn encode_designated_ts(
                 v
             ));
         }
-        if v.checked_mul(scale).is_none() {
+        // Micros and nanos go out unscaled: nothing to overflow.
+        if scale != 1 && v.checked_mul(scale).is_none() {
             return Err(error::fmt!(
                 InvalidTimestamp,
                 "designated timestamp at row {} overflows microseconds ({})",
@@ -1297,9 +1296,13 @@ fn encode_designated_ts(
         }
     }
     out.push(0); // designated_ts is always non-null
-    gorilla::write_temporal_column(out, row_count, || {
-        values.iter().map(|&v| v.wrapping_mul(scale))
-    });
+    if scale == 1 {
+        gorilla::write_temporal_slice(out, values);
+    } else {
+        gorilla::write_temporal_column(out, row_count, || {
+            values.iter().map(|&v| v.wrapping_mul(scale))
+        });
+    }
     Ok(())
 }
 

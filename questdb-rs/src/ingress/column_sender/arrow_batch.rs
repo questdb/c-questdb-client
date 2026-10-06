@@ -3267,6 +3267,7 @@ fn write_temporal_arrow(
     scale: i64,
 ) -> Result<()> {
     match arr.nulls().filter(|nulls| nulls.null_count() > 0) {
+        None if scale == 1 => gorilla::write_temporal_slice(out, values),
         None => gorilla::write_temporal_column(out, values.len(), || {
             values.iter().map(|&v| v.wrapping_mul(scale))
         }),
@@ -3780,7 +3781,7 @@ pub(crate) fn write_arrow_designated_ts_body(
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
             ensure_timestamp_values_non_negative(a.values(), label)?;
-            gorilla::write_temporal_column(out, a.values().len(), || a.values().iter().copied());
+            gorilla::write_temporal_slice(out, a.values());
             Ok(())
         }
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
@@ -3789,7 +3790,7 @@ pub(crate) fn write_arrow_designated_ts_body(
                 .downcast_ref::<TimestampNanosecondArray>()
                 .unwrap();
             ensure_timestamp_values_non_negative(a.values(), label)?;
-            gorilla::write_temporal_column(out, a.values().len(), || a.values().iter().copied());
+            gorilla::write_temporal_slice(out, a.values());
             Ok(())
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {

@@ -726,9 +726,13 @@ unsafe fn emit_temporal_gorilla(
     match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
-            gorilla::write_temporal_column(out, row_count, || {
-                (0..row_count).map(|i| unsafe { typed.add(i).read_unaligned() })
-            });
+            // `data` may be NULL when there are no rows.
+            let bytes = if row_count > 0 {
+                unsafe { slice::from_raw_parts(data, row_count * 8) }
+            } else {
+                &[]
+            };
+            gorilla::write_temporal_ne_bytes(out, bytes);
         }
         Some(v) => {
             out.push(1);
@@ -1166,7 +1170,7 @@ where
                 };
                 micros.push(m);
             }
-            gorilla::write_temporal_column(out, micros.len(), || micros.iter().copied());
+            gorilla::write_temporal_slice(out, &micros);
         }
     }
     Ok(())
@@ -1525,6 +1529,24 @@ mod tests {
             assert_eq!(tail[2], encoding);
             assert!(encode(&chunk).ends_with(&tail), "{dtype:?} {data:?}");
         }
+    }
+
+    #[test]
+    fn numpy_timestamp_column_with_no_rows_accepts_null_data() {
+        // `emit_into_wire` allows NULL `data` when there are no rows, and the
+        // contiguous fast path must not build a slice from it.
+        let mut out = Vec::new();
+        unsafe {
+            emit_into_wire(
+                &mut out,
+                NumpyDtype::TimestampMicrosDirect,
+                std::ptr::null(),
+                0,
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(out, [0, gorilla::ENCODING_UNCOMPRESSED]);
     }
 
     #[test]
