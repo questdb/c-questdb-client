@@ -540,16 +540,30 @@ fn request_timed_out(err: &ureq::Error) -> bool {
 
 /// Read a response body, bounded by [`MAX_RESPONSE_BYTES`].
 fn read_body(url: &str, response: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
-    response
+    // ureq's limit reader errors when the allowance reaches zero *before*
+    // probing EOF. Leave one byte for that probe, then enforce the inclusive
+    // cap ourselves so an exactly-4-MiB response succeeds but a larger one
+    // still cannot be parsed or buffered without a bound.
+    let body = response
         .into_body()
         .into_with_config()
-        .limit(MAX_RESPONSE_BYTES)
+        .limit(MAX_RESPONSE_BYTES + 1)
         .read_to_vec()
         .map_err(|e| {
             let timed_out = request_timed_out(&e);
             OidcError::network(format!("Failed to read response body from {url}: {e}"))
                 .with_request_timed_out(timed_out)
-        })
+        })?;
+    if body.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(oversized_body_error(url));
+    }
+    Ok(body)
+}
+
+fn oversized_body_error(url: &str) -> OidcError {
+    OidcError::network(format!(
+        "Failed to read response body from {url}: the response body exceeds the {MAX_RESPONSE_BYTES}-byte limit"
+    ))
 }
 
 /// Read a credential-bearing response body, bounded by [`MAX_RESPONSE_BYTES`],
@@ -589,7 +603,7 @@ fn read_body_zeroizing(
     let mut reader = response
         .into_body()
         .into_with_config()
-        .limit(MAX_RESPONSE_BYTES)
+        .limit(MAX_RESPONSE_BYTES + 1)
         .reader();
     let mut body = Zeroizing::new(Vec::with_capacity(initial));
     let mut chunk = Zeroizing::new([0_u8; CHUNK]);
@@ -610,6 +624,9 @@ fn read_body_zeroizing(
             body = grown;
         }
         body.extend_from_slice(&chunk[..n]);
+    }
+    if body.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(oversized_body_error(url));
     }
     Ok(body)
 }
@@ -1507,6 +1524,59 @@ mod tests {
             io::ErrorKind::TimedOut
         ))));
         assert!(!request_timed_out(&Error::HostNotFound));
+    }
+
+    #[test]
+    fn response_body_cap_accepts_exact_limit_and_rejects_one_more_byte() {
+        fn serve(body: Vec<u8>) -> (String, JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/token", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                // An over-limit client may close the connection before the
+                // final write; that is an acceptable outcome for this server.
+                let _ = stream.write_all(&body);
+            });
+            (url, server)
+        }
+
+        let client = HttpClient::new(None, Duration::from_secs(10)).unwrap();
+        for oversize in [false, true] {
+            for post in [false, true] {
+                let mut body = b"{\"access_token\":\"AT\"}".to_vec();
+                body.resize(MAX_RESPONSE_BYTES as usize + usize::from(oversize), b' ');
+                let (url, server) = serve(body);
+                let result = if post {
+                    client
+                        .post_form(&url, &[("client_id", "questdb")], false)
+                        .map(|response| response.body["access_token"] == "AT")
+                } else {
+                    client
+                        .get_json(&url, false)
+                        .map(|response| response["access_token"] == "AT")
+                };
+                if oversize {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), crate::oidc::error::OidcErrorKind::Network);
+                    assert!(error.message().contains("response body"));
+                } else {
+                    assert!(result.unwrap());
+                }
+                server.join().unwrap();
+            }
+        }
     }
 
     #[test]

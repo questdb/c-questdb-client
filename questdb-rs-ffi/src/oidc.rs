@@ -2002,14 +2002,29 @@ pub unsafe extern "C" fn questdb_oidc_builder_build(
     }
     let config = unsafe { &(*builder).config };
     match config.build() {
-        Ok((auth, event_handler, diagnostic)) => Box::into_raw(Box::new(questdb_oidc_auth {
-            shared: SharedOidcAuth {
-                inner: Arc::new(auth),
-                event_handler,
-                diagnostic,
-                token_provider_isolation: TokenProviderIsolation::default(),
-            },
-        })),
+        Ok((auth, event_handler, diagnostic)) => {
+            // The guard may outlive this auth while an attached sender drains.
+            // Capture only the callback targets, not SharedOidcAuth: capturing
+            // the latter would make its isolation state retain itself forever.
+            let event_target = event_handler.clone();
+            let diagnostic_target = diagnostic.clone();
+            let isolation = TokenProviderIsolation::with_callback_guard(move || {
+                event_target
+                    .as_deref()
+                    .is_some_and(CEventHandler::target_is_active)
+                    || diagnostic_target
+                        .as_ref()
+                        .is_some_and(CDiagnosticSink::target_is_active)
+            });
+            Box::into_raw(Box::new(questdb_oidc_auth {
+                shared: SharedOidcAuth {
+                    inner: Arc::new(auth),
+                    event_handler,
+                    diagnostic,
+                    token_provider_isolation: isolation,
+                },
+            }))
+        }
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
             ptr::null_mut()

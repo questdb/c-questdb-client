@@ -760,10 +760,12 @@ impl Sender {
     /// A terminal server rejection of a frame in the pending range, or a
     /// terminal transport/protocol failure, is returned as an error. Retriable
     /// server rejections reconnect and replay until the frame is acknowledged or
-    /// the sender is stopped. When nothing has been published yet, a valid wait
-    /// returns immediately. QWP/WebSocket only; other
-    /// protocols return `InvalidApiCall`. In manual progress mode this also
-    /// drives WebSocket progress while waiting.
+    /// the sender is stopped. An OIDC persistence-warning callback waiting for
+    /// this sender's ACK cannot block a reconnect on its own token worker: that
+    /// wait returns a retryable provider error and retains the publication.
+    /// When nothing has been published yet, a valid wait returns immediately.
+    /// QWP/WebSocket only; other protocols return `InvalidApiCall`. In manual
+    /// progress mode this also drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         let result = self.wait_inner(ack_level, timeout);
@@ -798,6 +800,20 @@ impl Sender {
             let completed = self.qwp_ws_completed_fsn(ack_level)?;
             if completed.is_some_and(|fsn| fsn >= boundary) {
                 return Ok(());
+            }
+            // A persistence-warning callback may itself be waiting for this
+            // sender's ACK. If its reconnect was blocked by the peer worker
+            // delivering that callback, reject the pending wait instead of
+            // leaving both sides parked. A healthy sender's wait is unaffected
+            // even while a different attachment is inside the callback. The
+            // publication remains queued for replay.
+            let provider = match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => state.token_provider.as_ref(),
+                SyncProtocolHandler::ManualQwpWs(state) => state.token_provider.as_ref(),
+                _ => None,
+            };
+            if let Some(err) = provider.and_then(|provider| provider.callback_wait_error()) {
+                return Err(err);
             }
             if completed != last_completed {
                 last_completed = completed;

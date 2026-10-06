@@ -552,6 +552,10 @@ pub(crate) struct SyncQwpWsHandlerState {
     runner: SyncQwpWsRunner,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
+    /// Retained for a pending ACK wait's callback guard. Reconnects use the
+    /// same provider through the runner; a warning handler may be waiting on
+    /// this sender while that runner joins the handler's token worker.
+    pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     /// Hard cap on a single store-and-forward frame's payload: `sf_max_segment_bytes`
     /// minus the segment and frame headers. The queue rejects anything larger,
     /// so publishers must size-check and split against THIS bound —
@@ -613,6 +617,7 @@ pub(crate) struct ManualQwpWsHandlerState {
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
+    pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
@@ -3875,6 +3880,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         runner,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
+        token_provider: qwp_ws.token_provider.clone(),
         sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
         sfa_frame_split_target: two_frame_segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
         orphan_pool,
@@ -3968,6 +3974,7 @@ pub(crate) fn open_manual_qwp_ws(
         send_core: parts.send_core,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
+        token_provider: qwp_ws.token_provider.clone(),
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
