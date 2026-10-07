@@ -8921,3 +8921,229 @@ fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
         );
     }
 }
+
+/// Simulated OIDC callback state for the in-callback ACK-wait tests: one
+/// "auth" whose callback is either running or not, and a per-thread marker for
+/// the thread it runs on. The provider refuses a token while the callback runs,
+/// as a real OIDC auth refuses an acquisition that would need its callback to
+/// return first.
+struct SimulatedAuthCallback {
+    active: Arc<AtomicBool>,
+}
+
+thread_local! {
+    static IN_SIMULATED_AUTH_CALLBACK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+const SIMULATED_CALLBACK_REFUSAL: &str = "simulated auth callback is running; no token";
+
+impl SimulatedAuthCallback {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn provider(&self) -> crate::token_provider::TokenProvider {
+        let isolation = crate::TokenProviderIsolation::with_callback_guards(
+            {
+                let active = Arc::clone(&self.active);
+                move || active.load(Ordering::SeqCst)
+            },
+            || IN_SIMULATED_AUTH_CALLBACK.with(std::cell::Cell::get),
+        );
+        let active = Arc::clone(&self.active);
+        crate::token_provider::TokenProvider::new_with_isolation(
+            move || {
+                if active.load(Ordering::SeqCst) {
+                    Err(crate::Error::new(
+                        crate::ErrorCode::AuthError,
+                        SIMULATED_CALLBACK_REFUSAL,
+                    ))
+                } else {
+                    Ok::<_, crate::Error>("tok".to_string())
+                }
+            },
+            isolation,
+        )
+    }
+
+    /// Enter the callback on the calling thread.
+    fn enter(&self) {
+        self.active.store(true, Ordering::SeqCst);
+        IN_SIMULATED_AUTH_CALLBACK.with(|c| c.set(true));
+    }
+
+    fn exit(&self) {
+        IN_SIMULATED_AUTH_CALLBACK.with(|c| c.set(false));
+        self.active.store(false, Ordering::SeqCst);
+    }
+}
+
+fn one_row_buffer(sender: &crate::ingress::Sender) -> Buffer {
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    buf
+}
+
+fn fast_reconnect_builder(port: u16) -> SenderBuilder {
+    SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(5))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(10))
+        .unwrap()
+}
+
+/// Accept connections forever: the first reads one frame and drops it unacked,
+/// every later one reads one frame, acks it and parks.
+fn spawn_drop_first_then_ack_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for conn in 0.. {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                if perform_server_upgrade(&mut stream).is_err() || read_frame(&mut stream).is_err()
+                {
+                    return;
+                }
+                if conn == 0 {
+                    return; // unacked: forces a reconnect
+                }
+                let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+                let mut sink = [0u8; 256];
+                while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+            });
+        }
+    });
+    port
+}
+
+fn assert_rejected_promptly(result: crate::Result<()>, started: Instant, label: &str) {
+    let elapsed = started.elapsed();
+    let err = result.expect_err(label);
+    assert!(
+        err.msg().contains(SIMULATED_CALLBACK_REFUSAL),
+        "{label}: expected the provider's refusal, got: {}",
+        err.msg()
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "{label}: the wait spun for {elapsed:?} instead of being rejected"
+    );
+}
+
+#[test]
+fn qwp_ws_manual_progress_wait_inside_auth_callback_is_rejected() {
+    // A manual-progress sender has no traffic gate, so its reconnect pulls the
+    // token on the thread driving progress -- here, an ACK wait made inside
+    // the auth's callback. That pull must be recorded as callback-blocked so
+    // the wait is rejected; otherwise it spins until its timeout (forever with
+    // none) while the callback it runs in waits on it.
+    let auth = SimulatedAuthCallback::new();
+    let port = spawn_drop_first_then_ack_server();
+    let builder = fast_reconnect_builder(port)
+        .qwp_ws_token_provider_object(auth.provider())
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Manual, builder);
+    let mut buf = one_row_buffer(&sender);
+    sender.flush_and_get_fsn(&mut buf).unwrap();
+
+    auth.enter();
+    let started = Instant::now();
+    let result = sender.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10));
+    auth.exit();
+    assert_rejected_promptly(result, started, "in-callback manual wait");
+
+    // The rejected wait kept the frame queued; it drains once the callback
+    // has returned.
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+        .expect("the frame must drain after the callback returns");
+}
+
+#[test]
+fn qwp_ws_in_callback_wait_rejects_only_the_blocked_sibling() {
+    // Two background senders share one provider (as pooled or option-sharing
+    // siblings do). B's reconnect fails inside the callback, so B's in-callback
+    // wait is rejected; A is connected and needs no token, so A's wait must
+    // complete. A's ACK is held back until after A starts waiting, so its wait
+    // loop provably consults the blocked state at least once.
+    let auth = SimulatedAuthCallback::new();
+    let provider = auth.provider();
+
+    let release_a = Arc::new(AtomicBool::new(false));
+    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    thread::spawn({
+        let release_a = Arc::clone(&release_a);
+        move || {
+            let Ok((mut stream, _)) = listener_a.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            if perform_server_upgrade(&mut stream).is_err() || read_frame(&mut stream).is_err() {
+                return;
+            }
+            while !release_a.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+            let mut sink = [0u8; 256];
+            while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+        }
+    });
+    let port_b = spawn_drop_first_then_ack_server();
+
+    let mut a = build_qwp_ws_sender_from_builder(
+        ProgressCase::Background,
+        fast_reconnect_builder(port_a)
+            .qwp_ws_token_provider_object(provider.clone())
+            .unwrap(),
+    );
+    let mut b = build_qwp_ws_sender_from_builder(
+        ProgressCase::Background,
+        fast_reconnect_builder(port_b)
+            .qwp_ws_token_provider_object(provider)
+            .unwrap(),
+    );
+
+    auth.enter();
+    let mut buf_b = one_row_buffer(&b);
+    b.flush_and_get_fsn(&mut buf_b).unwrap();
+    let started = Instant::now();
+    let result_b = b.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10));
+    assert_rejected_promptly(result_b, started, "blocked sibling's in-callback wait");
+
+    let mut buf_a = one_row_buffer(&a);
+    a.flush_and_get_fsn(&mut buf_a).unwrap();
+    let releaser = thread::spawn({
+        let release_a = Arc::clone(&release_a);
+        move || {
+            thread::sleep(Duration::from_millis(200));
+            release_a.store(true, Ordering::SeqCst);
+        }
+    });
+    let result_a = a.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10));
+    auth.exit();
+    releaser.join().unwrap();
+    result_a.expect("a connected sibling's in-callback wait must not be rejected");
+
+    b.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+        .expect("the blocked sibling's frame must drain after the callback returns");
+}

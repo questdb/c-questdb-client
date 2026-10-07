@@ -9876,3 +9876,77 @@ fn sf_pool_borrow_with_retry_retries_an_all_replica_role_reject_until_budget() {
     assert!(elapsed >= budget, "gave up after {elapsed:?}");
     assert!(attempts > 2, "only {attempts} connect attempts");
 }
+
+#[test]
+fn pooled_lease_wait_inside_auth_callback_is_rejected() {
+    // A pooled store-and-forward lease waits through its own ACK loop. When
+    // the waiting thread is inside the auth's callback and the lease's
+    // reconnect needs a token the auth cannot supply until that callback
+    // returns, the wait must be rejected rather than spin until its timeout
+    // (forever with none). The provider refuses while the simulated callback
+    // runs, as a real OIDC auth refuses such an acquisition.
+    thread_local! {
+        static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    const REFUSAL: &str = "simulated auth callback is running; no token";
+    let active = Arc::new(AtomicBool::new(false));
+    let isolation = crate::TokenProviderIsolation::with_callback_guards(
+        {
+            let active = Arc::clone(&active);
+            move || active.load(Ordering::SeqCst)
+        },
+        || IN_CALLBACK.with(std::cell::Cell::get),
+    );
+    let server = MockServer::spawn_reconnecting(8);
+    let conf = conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;",
+    );
+    let db = QuestDb::connect_with_handlers_and_token_provider_with_isolation(
+        &conf,
+        crate::db::ConnectHandlers::default(),
+        {
+            let active = Arc::clone(&active);
+            move || {
+                if active.load(Ordering::SeqCst) {
+                    Err(crate::Error::new(ErrorCode::AuthError, REFUSAL))
+                } else {
+                    Ok::<_, crate::Error>("tok".to_string())
+                }
+            }
+        },
+        isolation,
+    )
+    .unwrap();
+    let mut sender = db.borrow_sender().expect("SFA borrow");
+    let mut buffer = one_symbol_buffer(&db, "alpha");
+
+    // Enter the callback on this thread, then publish: the mock reads the
+    // frame and drops the connection, so the lease must reconnect -- with a
+    // token the callback is withholding.
+    active.store(true, Ordering::SeqCst);
+    IN_CALLBACK.with(|c| c.set(true));
+    sender.flush_buffer_and_get_fsn(&mut buffer).unwrap();
+    let started = Instant::now();
+    let result = sender.wait(AckLevel::Ok, Duration::from_secs(10));
+    let elapsed = started.elapsed();
+    IN_CALLBACK.with(|c| c.set(false));
+    active.store(false, Ordering::SeqCst);
+
+    let err = result.expect_err("the in-callback wait must be rejected");
+    assert!(
+        err.msg().contains(REFUSAL),
+        "expected the provider's refusal, got: {}",
+        err.msg()
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the wait spun for {elapsed:?} instead of being rejected"
+    );
+
+    // The rejected wait kept the frame queued; it drains once the callback
+    // has returned.
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(10))
+        .expect("the frame must drain after the callback returns");
+}
