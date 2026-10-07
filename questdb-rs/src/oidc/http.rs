@@ -199,6 +199,18 @@ impl HttpClient {
             // proxy host rather than the target and so cannot enforce the
             // plaintext-only-to-loopback rule as written.
             .proxy(None)
+            // Never pool connections. A refresh written onto a pooled socket
+            // that died while idle (laptop sleep, a network change, a NAT or
+            // firewall that dropped the flow) fails after its bytes left the
+            // client, which is indistinguishable from an IdP that consumed the
+            // refresh token and lost the reply -- so the refresh token is
+            // discarded and the client needs an interactive sign-in for a
+            // credential the IdP never saw. A fresh connection instead fails
+            // before dispatch, keeping the token for a retry. ureq's idle-age
+            // eviction cannot be relied on (its pooled-connection age is always
+            // zero in 3.1), and IdP requests are too rare for reuse to matter.
+            .max_idle_connections(0)
+            .max_idle_connections_per_host(0)
             .no_delay(true)
             // We inspect the status ourselves (a 4xx token-endpoint reply carries
             // `authorization_pending` / `slow_down`), so don't turn it into an error.

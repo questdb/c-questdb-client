@@ -1847,6 +1847,141 @@ fn silent_refresh_without_reprompt() {
     );
 }
 
+/// A keep-alive IdP: serves any number of requests per connection and never
+/// closes an idle one, so a pooling client would reuse it. A request arriving on
+/// a connection that already served one is read and then dropped unanswered --
+/// what a client sees when its pooled socket died silently while idle (laptop
+/// sleep, a NAT or firewall that forgot the flow): the write succeeds, then the
+/// peer resets it. The returned counter records such reused requests.
+fn start_keep_alive_idp<H>(handler: H) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicBool>)
+where
+    H: Fn(&str) -> String + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind keep-alive mock");
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let reused = Arc::new(AtomicUsize::new(0));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handler = Arc::new(handler);
+    {
+        let reused = Arc::clone(&reused);
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let reused = Arc::clone(&reused);
+                        let handler = Arc::clone(&handler);
+                        std::thread::spawn(move || {
+                            stream.set_nonblocking(false).ok();
+                            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                            let mut served = 0usize;
+                            let mut buf = Vec::new();
+                            let mut tmp = [0u8; 4096];
+                            loop {
+                                let headers_end = loop {
+                                    if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                                        break pos + 4;
+                                    }
+                                    match stream.read(&mut tmp) {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                    }
+                                };
+                                let head = String::from_utf8_lossy(&buf[..headers_end]).to_string();
+                                let content_length = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        k.trim()
+                                            .eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse::<usize>().ok())?
+                                    })
+                                    .unwrap_or(0);
+                                while buf.len() < headers_end + content_length {
+                                    match stream.read(&mut tmp) {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                    }
+                                }
+                                let body = String::from_utf8_lossy(
+                                    &buf[headers_end..headers_end + content_length],
+                                )
+                                .to_string();
+                                buf.drain(..headers_end + content_length);
+                                if served > 0 {
+                                    reused.fetch_add(1, Ordering::SeqCst);
+                                    return;
+                                }
+                                served += 1;
+                                let json = handler(&body);
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                    json.len(),
+                                    json
+                                );
+                                if stream.write_all(response.as_bytes()).is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    (addr, reused, shutdown)
+}
+
+#[test]
+fn refresh_never_reuses_an_idle_idp_connection() {
+    // A refresh POST written onto a pooled connection that died while idle is
+    // indistinguishable from one the IdP received and lost the reply to, so the
+    // parent refresh token is discarded -- forcing an interactive sign-in for a
+    // credential the IdP never saw. ureq's idle-age eviction cannot be relied on
+    // to prevent that (its pooled-connection age is always zero in 3.1), so
+    // every IdP request must open its own connection.
+    let (addr, reused, shutdown) = start_keep_alive_idp(|body| {
+        if body.contains("grant_type=refresh_token") {
+            r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+        } else if body.contains("device_code=") {
+            r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#.to_string()
+        } else {
+            device_response()
+        }
+    });
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(format!("http://{addr}/device"))
+        .token_endpoint(format!("http://{addr}/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("build auth");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    let refreshed = auth.token();
+    shutdown.store(true, Ordering::Relaxed);
+    assert_eq!(
+        reused.load(Ordering::SeqCst),
+        0,
+        "an IdP request reused a pooled connection"
+    );
+    assert_eq!(refreshed.unwrap(), "AT-refreshed");
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-2")
+    );
+}
+
 #[test]
 fn refresh_request_omits_scope_after_narrower_grant() {
     let refresh_body = Arc::new(Mutex::new(None));
