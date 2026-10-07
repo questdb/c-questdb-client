@@ -71,17 +71,25 @@ struct IsolatedProviderPermit<'a>(&'a AtomicUsize);
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 impl<'a> IsolatedProviderPermit<'a> {
     fn acquire(counter: &'a AtomicUsize, limit: usize) -> crate::Result<Self> {
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < limit).then_some(active + 1)
-            })
-            .map_err(|_| {
-                crate::error::fmt!(
-                    SocketError,
-                    "The isolated token-provider worker limit ({limit}) is busy; retry later"
-                )
-            })?;
-        Ok(Self(counter))
+        // Hand-rolled CAS loop rather than `fetch_update`, which is deprecated
+        // on newer toolchains while its replacement (`try_update`) is
+        // unavailable on the crate's MSRV.
+        let mut active = counter.load(Ordering::Acquire);
+        while active < limit {
+            match counter.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self(counter)),
+                Err(actual) => active = actual,
+            }
+        }
+        Err(crate::error::fmt!(
+            SocketError,
+            "The isolated token-provider worker limit ({limit}) is busy; retry later"
+        ))
     }
 }
 

@@ -82,6 +82,27 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
+/// Atomically consumes one injected test failure, returning `true` if one
+/// was pending. A hand-rolled CAS loop rather than `fetch_update`, which is
+/// deprecated on newer toolchains while its replacement (`try_update`) is
+/// unavailable on the crate's MSRV.
+#[cfg(test)]
+fn take_injected_failure(counter: &AtomicUsize) -> bool {
+    let mut remaining = counter.load(Ordering::SeqCst);
+    while remaining > 0 {
+        match counter.compare_exchange_weak(
+            remaining,
+            remaining - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => remaining = actual,
+        }
+    }
+    false
+}
+
 use crate::oidc::OidcError;
 
 /// The environment variable that overrides the default token-store directory.
@@ -847,13 +868,7 @@ impl FileTokenStore {
     /// [`create_lock_file_handle`] with a test-only injection seam.
     fn create_lock_handle(&self, lock: &Path, stamp: &str) -> std::io::Result<File> {
         #[cfg(test)]
-        if self
-            .create_contention_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if take_injected_failure(&self.create_contention_remaining) {
             return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         }
         create_lock_file_handle(lock, stamp)
@@ -1417,13 +1432,7 @@ impl FileTokenStore {
 
     fn sync_directory(&self) -> std::io::Result<()> {
         #[cfg(test)]
-        if self
-            .directory_sync_failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if take_injected_failure(&self.directory_sync_failures_remaining) {
             return Err(std::io::Error::other("injected directory fsync failure"));
         }
         #[cfg(unix)]
