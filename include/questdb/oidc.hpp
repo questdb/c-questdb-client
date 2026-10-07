@@ -696,7 +696,8 @@ public:
     QUESTDB_OIDC_CPP_BOOL_SETTER(
         allow_insecure_transport,
         ::questdb_oidc_builder_allow_insecure_transport)
-    /** Whether `sign_in` launches a browser at the verification URL. */
+    /** Whether `sign_in` launches a browser at the verification URL. The
+     *  device code and URL are reported either way (see `event_handler`). */
     QUESTDB_OIDC_CPP_BOOL_SETTER(
         open_browser, ::questdb_oidc_builder_open_browser)
     /**
@@ -757,6 +758,8 @@ public:
     /**
      * Install a renderer event handler. It runs inside the foreground
      * `sign_in()` call; persistence warnings use `diagnostic_handler` instead.
+     * Without a handler, `sign_in()` prints the prompt, countdown and outcome
+     * to the process's stderr (see `questdb_oidc_builder_event_handler`).
      * Calls are serialized across auth objects built by this builder.
      *
      * While the callback is running, auth operations that would need the
@@ -815,6 +818,7 @@ public:
 
     /** Install a serialized persistence diagnostic handler. The callback may
      * run on a background token-provider thread and must return promptly.
+     * Without a handler, persistence warnings are written to stderr.
      * Diagnostics are best-effort: one that cannot start within 5 seconds
      * because a sibling auth's diagnostic callback is still running is
      * dropped rather than delivered.

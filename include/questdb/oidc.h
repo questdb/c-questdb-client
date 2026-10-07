@@ -291,7 +291,9 @@ bool questdb_oidc_builder_allow_insecure_transport(
  * `rundll32`) once per sign-in. Spawn failure is ignored, so on a host with no
  * opener this costs nothing -- but set it to `false` on a headless or shared
  * host where launching a browser is not wanted. The device code and URL are
- * still reported through the event handler either way.
+ * still reported either way: through the event handler when one is installed,
+ * otherwise printed to the process's stderr (see
+ * `questdb_oidc_builder_event_handler`).
  *
  * A binding may narrow this: the Python client defaults to opening a browser
  * except inside a Jupyter kernel, where the reader may be on another machine.
@@ -413,14 +415,21 @@ bool questdb_oidc_builder_default_file_token_store(
     questdb_oidc_builder* builder, questdb_error** err_out);
 
 /**
- * Install a renderer callback. If `user_data` is non-NULL, `release` must also
- * be non-NULL. On success ownership of `user_data` transfers to the builder
- * and `release` runs exactly once after the builder and all auth handles and
- * attached transports built from it have released their last reference. On
- * failure ownership remains with the caller. A stateless callback may pass
- * both `user_data` and `release` as NULL. Final release has no thread-affinity
- * guarantee and must return normally without throwing, unwinding, or
- * performing a non-local jump.
+ * Install a renderer callback.
+ *
+ * Without one, `questdb_oidc_auth_sign_in` falls back to a built-in terminal
+ * renderer that writes the sign-in prompt (verification URL and user code),
+ * the waiting countdown and the success/failure line to the process's
+ * stderr. A GUI, daemon or embedding host that must not write to stderr
+ * should install a callback, which may simply ignore the events.
+ *
+ * If `user_data` is non-NULL, `release` must also be non-NULL. On success
+ * ownership of `user_data` transfers to the builder and `release` runs exactly
+ * once after the builder and all auth handles and attached transports built
+ * from it have released their last reference. On failure ownership remains with
+ * the caller. A stateless callback may pass both `user_data` and `release` as
+ * NULL. Final release has no thread-affinity guarantee and must return normally
+ * without throwing, unwinding, or performing a non-local jump.
  *
  * Installing a handler removes the builder's reference to the one it replaces.
  * Auth handles/transports already built with the old handler retain it until
@@ -447,6 +456,10 @@ bool questdb_oidc_builder_event_handler(
  * Install a best-effort persistence diagnostic callback. Ownership and release
  * rules match `questdb_oidc_builder_event_handler`; unlike renderer events,
  * diagnostics may originate on background token-provider threads.
+ *
+ * Without one, each persistence warning is written to the process's stderr as
+ * a `questdb oidc warning: ...` line, possibly from a background thread.
+ * Install a callback, which may ignore the diagnostic, to keep stderr clean.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_diagnostic_handler(
