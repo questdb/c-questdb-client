@@ -6647,6 +6647,140 @@ mod callback_wait_regressions {
         unsafe { drop(Box::from_raw(ud as *mut Arc<SiblingState>)) };
     }
 
+    #[derive(Default)]
+    struct AckWaitState {
+        auth: AtomicPtr<questdb_oidc_auth>,
+        sender: AtomicPtr<crate::line_sender>,
+        fired: AtomicBool,
+        out: Mutex<Option<(bool, Duration, String)>>,
+    }
+
+    unsafe extern "C" fn ack_wait_cb(ud: *mut c_void, _ev: *const questdb_oidc_event) {
+        let state = unsafe { &*(ud as *const Arc<AckWaitState>) };
+        if state.fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        unsafe {
+            let sender = state.sender.load(Ordering::SeqCst);
+            let mut e = ptr::null_mut();
+            let buf = crate::line_sender_buffer_new_for_sender(sender);
+            let mut table = std::mem::zeroed::<crate::line_sender_table_name>();
+            assert!(crate::line_sender_table_name_init(
+                &mut table,
+                1,
+                c"t".as_ptr(),
+                &mut e
+            ));
+            let mut column = std::mem::zeroed::<crate::line_sender_column_name>();
+            assert!(crate::line_sender_column_name_init(
+                &mut column,
+                1,
+                c"x".as_ptr(),
+                &mut e
+            ));
+            assert!(crate::line_sender_buffer_table(buf, table, &mut e));
+            assert!(crate::line_sender_buffer_column_i64(buf, column, 1, &mut e));
+            assert!(crate::line_sender_buffer_at_now(buf, &mut e));
+            assert!(
+                crate::line_sender_flush(sender, buf, &mut e),
+                "{}",
+                error_msg(e)
+            );
+            crate::line_sender_buffer_free(buf);
+
+            let started = Instant::now();
+            let ok = crate::line_sender_qwpws_wait(sender, crate::qwpws_ack_level_ok, 5000, &mut e);
+            let elapsed = started.elapsed();
+            let (interaction_required, msg) = if ok {
+                (false, "ok".to_string())
+            } else {
+                let mut view = std::mem::zeroed::<questdb_oidc_error_view>();
+                view.struct_size = std::mem::size_of::<questdb_oidc_error_view>();
+                let has_view = questdb_error_oidc_get_view(e, &mut view);
+                let msg = error_msg(e);
+                crate::questdb_error_free(e);
+                (
+                    has_view
+                        && view.kind
+                            == questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED,
+                    msg,
+                )
+            };
+            *state.out.lock().unwrap() = Some((interaction_required, elapsed, msg));
+            // End the sign-in.
+            let mut e = ptr::null_mut();
+            questdb_oidc_auth_close(state.auth.load(Ordering::SeqCst), &mut e);
+        }
+    }
+
+    unsafe extern "C" fn release_ack_wait_state(ud: *mut c_void) {
+        unsafe { drop(Box::from_raw(ud as *mut Arc<AckWaitState>)) };
+    }
+
+    /// A QWP/WebSocket ACK wait made inside the auth's own event callback can
+    /// never complete: the sender's reconnect needs a token that only this
+    /// returning callback can release. `oidc.h` promises it fails immediately
+    /// with the OIDC payload instead of spending the wait budget, which is what
+    /// the event term of the per-thread guard passed to
+    /// `TokenProviderIsolation::with_callback_guards` provides.
+    #[test]
+    fn qwp_ws_wait_inside_own_event_callback_fails_fast() {
+        let (addr, idp) = device_only_idp();
+        unsafe {
+            let b = builder_for(&addr);
+            let state = Arc::new(AckWaitState::default());
+            let ud = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
+            let mut e = ptr::null_mut();
+            assert!(questdb_oidc_builder_event_handler(
+                b,
+                Some(ack_wait_cb),
+                ud,
+                Some(release_ack_wait_state),
+                &mut e
+            ));
+            let auth = questdb_oidc_builder_build(b, &mut e);
+            assert!(!auth.is_null());
+            state.auth.store(auth, Ordering::SeqCst);
+
+            let conf = "ws::addr=127.0.0.1:1;initial_connect_retry=async;\
+                        reconnect_initial_backoff_millis=5;reconnect_max_backoff_millis=5;";
+            let conf_utf8 = crate::line_sender_utf8 {
+                len: conf.len(),
+                buf: conf.as_ptr() as *const c_char,
+            };
+            let opts = crate::line_sender_opts_from_conf(conf_utf8, &mut e);
+            assert!(!opts.is_null(), "{}", error_msg(e));
+            assert!(line_sender_opts_oidc_auth(opts, auth, &mut e));
+            let sender = crate::line_sender_build(opts, &mut e);
+            assert!(!sender.is_null(), "{}", error_msg(e));
+            crate::line_sender_opts_free(opts);
+            state.sender.store(sender, Ordering::SeqCst);
+
+            let _ = questdb_oidc_auth_sign_in(auth, &mut e);
+            if !e.is_null() {
+                crate::questdb_error_free(e);
+            }
+            let (interaction_required, elapsed, msg) = state
+                .out
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the renderer callback ran");
+            crate::line_sender_close(sender);
+            questdb_oidc_auth_free(auth);
+            questdb_oidc_builder_free(b);
+            idp.join().unwrap();
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "the in-callback ACK wait spent {elapsed:?} of its budget: {msg}"
+            );
+            assert!(
+                interaction_required,
+                "the in-callback ACK wait did not fail with the OIDC payload: {msg}"
+            );
+        }
+    }
+
     /// A reusable-builder sibling's transport, flushed from inside A's event
     /// callback on the callback's own thread, can never obtain a token by
     /// waiting: the shared target stays active until this very thread
