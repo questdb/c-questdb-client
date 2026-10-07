@@ -13,8 +13,8 @@
 
 #pragma once
 
-#include <questdb/oidc.h>
-#include <questdb/ingress/line_sender_core.hpp>
+#include "oidc.h"
+#include "ingress/line_sender_core.hpp"
 
 #include <exception>
 #include <functional>

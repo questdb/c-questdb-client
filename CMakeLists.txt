@@ -403,6 +403,23 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         endif()
     endfunction()
 
+    # This probe must compile with only include/questdb/ingress on the include
+    # path, as the line_sender headers always have.
+    try_compile(
+        INGRESS_DIR_INCLUDES_COMPILED
+        ${CMAKE_CURRENT_BINARY_DIR}/compile_probe/ingress_dir_includes
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpp_test/compile_ingress_dir_includes.cpp
+        CMAKE_FLAGS
+            -DCMAKE_CXX_STANDARD=${CMAKE_CXX_STANDARD}
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON
+            -DCMAKE_CXX_EXTENSIONS=OFF
+            -DINCLUDE_DIRECTORIES=${CMAKE_CURRENT_SOURCE_DIR}/include/questdb/ingress
+        OUTPUT_VARIABLE INGRESS_DIR_INCLUDES_OUTPUT)
+    if(NOT INGRESS_DIR_INCLUDES_COMPILED)
+        message(FATAL_ERROR
+            "line_sender headers need more than include/questdb/ingress:\n${INGRESS_DIR_INCLUDES_OUTPUT}")
+    endif()
+
     expect_cxx_compile_failure(
         borrowed_sender_copy
         cpp_test/compile_fail_borrowed_sender_copy.cpp)

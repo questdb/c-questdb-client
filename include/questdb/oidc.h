@@ -25,7 +25,7 @@ extern "C" {
  *  OIDC builder input. The bound is applied before UTF-8 validation. */
 #define QUESTDB_OIDC_MAX_INPUT_BYTES ((size_t)1048576)
 
-#include <questdb/ingress/line_sender.h>
+#include "ingress/line_sender.h"
 
 /** Reusable device-flow builder, shared authentication state, and owned token.
  */

@@ -25,7 +25,7 @@
 #pragma once
 
 #include "line_sender.h"
-#include <questdb/oidc.h>
+#include "../oidc.h"
 
 #include <cstddef>
 #include <chrono>
