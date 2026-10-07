@@ -9147,3 +9147,6 @@ fn qwp_ws_in_callback_wait_rejects_only_the_blocked_sibling() {
     b.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
         .expect("the blocked sibling's frame must drain after the callback returns");
 }
+
+#[cfg(feature = "_oidc")]
+mod closed_provider_sf;
