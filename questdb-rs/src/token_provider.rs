@@ -60,8 +60,23 @@ const ISOLATED_PERMIT_WAIT: Duration = Duration::from_secs(30);
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 #[derive(Default)]
 struct IsolatedResult {
-    done: std::sync::Mutex<Option<crate::Result<String>>>,
+    done: std::sync::Mutex<IsolatedOutcome>,
     ready: std::sync::Condvar,
+}
+
+/// What the callers that joined an isolated acquisition receive.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+#[derive(Default)]
+enum IsolatedOutcome {
+    #[default]
+    Pending,
+    /// The acquisition's result, shared by every caller that joined it.
+    Done(crate::Result<String>),
+    /// The lead gave up before starting a worker, for a reason of its own:
+    /// its transport shut down. Joiners do not share that reason -- they may
+    /// belong to another transport attached to the same provider -- so each
+    /// starts over, leading a fresh acquisition or joining another one.
+    Abandoned,
 }
 
 /// Single-flight state for one provider's isolated acquisitions.
@@ -70,9 +85,21 @@ struct IsolatedResult {
 /// attempts of one transport coalesce onto one worker instead of each taking
 /// its own slice of the process-global worker budget.
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
-#[derive(Default)]
 struct IsolatedAcquisition {
     current: std::sync::Mutex<Option<Arc<IsolatedResult>>>,
+    /// The worker budget permits are drawn from: always the process-wide one,
+    /// except in tests that must fill a budget without starving their peers.
+    workers: &'static AtomicUsize,
+}
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+impl Default for IsolatedAcquisition {
+    fn default() -> Self {
+        Self {
+            current: std::sync::Mutex::default(),
+            workers: &ISOLATED_PROVIDER_WORKERS,
+        }
+    }
 }
 
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
@@ -208,6 +235,19 @@ impl TokenProviderIsolation {
                 active: Arc::new(active),
                 on_this_thread: Arc::new(on_this_thread),
             }),
+        }
+    }
+
+    /// An identity drawing its worker permits from `workers` instead of the
+    /// process-wide budget, so a test can fill it in isolation.
+    #[cfg(all(test, any(feature = "_sender-qwp-ws", feature = "_egress")))]
+    fn with_worker_budget(workers: &'static AtomicUsize) -> Self {
+        Self {
+            isolated: Arc::new(IsolatedAcquisition {
+                current: std::sync::Mutex::default(),
+                workers,
+            }),
+            callback_guard: None,
         }
     }
 }
@@ -431,14 +471,28 @@ impl TokenProvider {
         &self,
         cancelled: impl Fn() -> bool,
     ) -> crate::Result<String> {
+        loop {
+            if let Some(result) = self.bearer_header_isolated_attempt(&cancelled) {
+                return result;
+            }
+        }
+    }
+
+    /// One pass of [`Self::bearer_header_isolated_until`]: `None` when the
+    /// joined acquisition was abandoned by its lead and must be started over.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn bearer_header_isolated_attempt(
+        &self,
+        cancelled: &impl Fn() -> bool,
+    ) -> Option<crate::Result<String>> {
         if cancelled() {
-            return Err(provider_shutdown_error());
+            return Some(Err(provider_shutdown_error()));
         }
         // The provider's callback may be waiting for this caller. Go straight
         // to the closure instead of joining its in-flight worker: OIDC serves
         // a valid cache or rejects a lock-taking token pull immediately.
         if self.callback_is_active() {
-            return self.resolve_during_callback();
+            return Some(self.resolve_during_callback());
         }
         #[cfg(feature = "_sender-qwp-ws")]
         self.callback_blocked.store(false, Ordering::Release);
@@ -461,31 +515,37 @@ impl TokenProvider {
         if lead {
             // Wait for a worker permit rather than failing at once while the
             // process-wide cap is full: see `ISOLATED_PERMIT_WAIT`. Every exit
-            // without a worker publishes to `slot`, so a caller that joined it
-            // is never left waiting on a worker that will not run.
+            // without a worker retires `slot`, so a caller that joined it is
+            // never left waiting on a worker that will not run.
             let permit = IsolatedProviderPermit::acquire_waiting(
-                &ISOLATED_PROVIDER_WORKERS,
+                self.isolated.workers,
                 MAX_ISOLATED_PROVIDER_WORKERS,
                 ISOLATED_PERMIT_WAIT,
                 || cancelled() || self.callback_is_active(),
             );
             match permit {
-                Ok(Some(permit)) => self.spawn_isolated_worker(&slot, permit)?,
+                Ok(Some(permit)) => {
+                    if let Err(err) = self.spawn_isolated_worker(&slot, permit) {
+                        return Some(Err(err));
+                    }
+                }
                 Ok(None) if cancelled() => {
-                    let err = provider_shutdown_error();
-                    self.publish_isolated(&slot, Err(err.clone()));
-                    return Err(err);
+                    // This caller's transport is shutting down. That is no
+                    // reason for a joiner from another transport to fail, so
+                    // hand the acquisition back rather than this error.
+                    self.retire_isolated(&slot, IsolatedOutcome::Abandoned);
+                    return Some(Err(provider_shutdown_error()));
                 }
                 Ok(None) => {
                     // A callback became active while we waited: resolve on
                     // this thread as the callback-active path above does.
                     let result = self.resolve_during_callback();
                     self.publish_isolated(&slot, result.clone());
-                    return result;
+                    return Some(result);
                 }
                 Err(err) => {
                     self.publish_isolated(&slot, Err(err.clone()));
-                    return Err(err);
+                    return Some(Err(err));
                 }
             }
         }
@@ -495,20 +555,22 @@ impl TokenProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
-            if let Some(result) = done.as_ref() {
-                return result.clone();
+            match &*done {
+                IsolatedOutcome::Done(result) => return Some(result.clone()),
+                IsolatedOutcome::Abandoned => return None,
+                IsolatedOutcome::Pending => {}
             }
             if self.callback_is_active() {
                 drop(done);
-                return self.resolve_during_callback();
+                return Some(self.resolve_during_callback());
             }
             let (guard, wait) = slot
                 .ready
                 .wait_timeout(done, ISOLATED_PROVIDER_POLL)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             done = guard;
-            if done.is_none() && wait.timed_out() && cancelled() {
-                return Err(provider_shutdown_error());
+            if matches!(*done, IsolatedOutcome::Pending) && wait.timed_out() && cancelled() {
+                return Some(Err(provider_shutdown_error()));
             }
         }
     }
@@ -546,9 +608,15 @@ impl TokenProvider {
         Ok(())
     }
 
-    /// Retire the in-flight slot and wake everyone waiting on it.
+    /// Publish `result` to everyone waiting on the in-flight slot.
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     fn publish_isolated(&self, slot: &Arc<IsolatedResult>, result: crate::Result<String>) {
+        self.retire_isolated(slot, IsolatedOutcome::Done(result));
+    }
+
+    /// Retire the in-flight slot and wake everyone waiting on it.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn retire_isolated(&self, slot: &Arc<IsolatedResult>, outcome: IsolatedOutcome) {
         // Clear the slot before publishing so the next acquisition starts a
         // fresh worker rather than joining -- and re-reading the result of --
         // one that has already finished. Compare by identity: a slot retired
@@ -570,8 +638,8 @@ impl TokenProvider {
             .done
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if done.is_none() {
-            *done = Some(result);
+        if matches!(*done, IsolatedOutcome::Pending) {
+            *done = outcome;
         }
         slot.ready.notify_all();
     }
@@ -1045,6 +1113,62 @@ mod tests {
             )
             .unwrap();
             assert!(interrupted.is_none());
+        }
+
+        #[test]
+        fn a_lead_shutting_down_does_not_fail_a_joiner_from_another_transport() {
+            // Fill the worker cap so the lead waits for a permit.
+            static WORKERS: AtomicUsize = AtomicUsize::new(0);
+            let held: Vec<_> = (0..MAX_ISOLATED_PROVIDER_WORKERS)
+                .map(|_| {
+                    IsolatedProviderPermit::acquire(&WORKERS, MAX_ISOLATED_PROVIDER_WORKERS)
+                        .unwrap()
+                })
+                .collect();
+
+            let provider = TokenProvider::new_with_isolation(
+                || Ok::<_, crate::Error>("tok-iso".to_string()),
+                TokenProviderIsolation::with_worker_budget(&WORKERS),
+            );
+            // Another transport attached to the same provider.
+            let peer = provider.clone();
+
+            let lead_cancelled = Arc::new(AtomicBool::new(false));
+            let lead = {
+                let provider = provider.clone();
+                let lead_cancelled = Arc::clone(&lead_cancelled);
+                std::thread::spawn(move || {
+                    provider.bearer_header_isolated_until(|| lead_cancelled.load(Ordering::SeqCst))
+                })
+            };
+            while provider.isolated.current.lock().unwrap().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let joiner_done = Arc::new(AtomicBool::new(false));
+            let joiner = {
+                let joiner_done = Arc::clone(&joiner_done);
+                std::thread::spawn(move || {
+                    let result = peer.bearer_header_isolated_until(|| false);
+                    joiner_done.store(true, Ordering::SeqCst);
+                    result
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            // The lead's transport shuts down while the cap is still full.
+            lead_cancelled.store(true, Ordering::SeqCst);
+            let err = lead.join().unwrap().unwrap_err();
+            assert!(super::super::is_provider_shutdown_error(&err), "{err}");
+
+            // The joiner's transport did not shut down: it keeps waiting for a
+            // permit instead of reporting the lead's shutdown as its own.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                !joiner_done.load(Ordering::SeqCst),
+                "the joiner inherited the lead's shutdown"
+            );
+            drop(held);
+            assert_eq!(joiner.join().unwrap().unwrap(), "Bearer tok-iso");
         }
 
         #[test]
