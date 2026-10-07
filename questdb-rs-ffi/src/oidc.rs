@@ -1633,6 +1633,28 @@ pub(crate) unsafe fn clone_auth(
     }
 }
 
+/// [`clone_auth`] for attaching the auth to a transport (sender options, pool
+/// or reader): additionally refuses a closed auth.
+///
+/// A closed provider can never supply a token, so a transport built from it
+/// can never authenticate. Accepting it deferred the failure to the first
+/// token pull: an async store-and-forward sender then accepted -- and
+/// persisted -- frames it could not send before it terminalized. Report it at
+/// attach time with the same typed `Cancelled` error the auth's own
+/// operations return. (`clear` and the detach calls keep using
+/// [`clone_auth`]: they are documented to work after close.)
+pub(crate) unsafe fn clone_open_auth(
+    auth: *const questdb_oidc_auth,
+    err_out: *mut *mut questdb_error,
+) -> Option<SharedOidcAuth> {
+    let shared = unsafe { clone_auth(auth, err_out) }?;
+    if shared.inner.is_closed() {
+        unsafe { set_err_out_from_error(err_out, OidcError::closed_error()) };
+        return None;
+    }
+    Some(shared)
+}
+
 /// Create an explicit OIDC builder. The caller must set client id, token
 /// endpoint, and device-authorization endpoint before building.
 #[unsafe(no_mangle)]
@@ -2477,7 +2499,7 @@ pub unsafe extern "C" fn line_sender_opts_oidc_auth(
         };
         return false;
     }
-    let Some(auth) = (unsafe { clone_auth(auth, err_out) }) else {
+    let Some(auth) = (unsafe { clone_open_auth(auth, err_out) }) else {
         return false;
     };
     let current = unsafe { (*opts).0.clone() };
@@ -5661,6 +5683,80 @@ mod tests {
 
             questdb_oidc_auth_free(auth);
             crate::line_sender_opts_free(opts);
+            questdb_oidc_builder_free(builder);
+        }
+    }
+
+    #[test]
+    fn closed_auth_is_rejected_at_every_transport_attach() {
+        // A closed provider can never supply a token. Attaching it used to
+        // succeed and defer the failure to the first token pull -- by which
+        // time an async store-and-forward sender had accepted frames it could
+        // never send. Each attach point now rejects it with the provider's own
+        // typed Cancelled error.
+        unsafe fn assert_cancelled(error: &mut *mut questdb_error) {
+            assert!(!error.is_null());
+            let mut view = unsafe { std::mem::zeroed::<questdb_oidc_error_view>() };
+            view.struct_size = std::mem::size_of_val(&view);
+            assert!(unsafe { questdb_error_oidc_get_view(*error, &mut view) });
+            assert_eq!(
+                view.kind,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_CANCELLED
+            );
+            unsafe { crate::questdb_error_free(*error) };
+            *error = ptr::null_mut();
+        }
+
+        unsafe {
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+            let auth = questdb_oidc_builder_build(builder, &mut error);
+            assert!(!auth.is_null());
+            assert!(questdb_oidc_auth_close(auth, &mut error));
+            assert!(error.is_null());
+
+            let host = crate::line_sender_utf8 {
+                len: "localhost".len(),
+                buf: c"localhost".as_ptr(),
+            };
+            for protocol in [
+                crate::line_sender_protocol::line_sender_protocol_https,
+                crate::line_sender_protocol::line_sender_protocol_wss,
+            ] {
+                let opts = crate::line_sender_opts_new(protocol, host, 9000);
+                assert!(!opts.is_null());
+                assert!(!line_sender_opts_oidc_auth(opts, auth, &mut error));
+                assert_cancelled(&mut error);
+                crate::line_sender_opts_free(opts);
+            }
+
+            let mut options = crate::column_sender::questdb_db_connect_options::default();
+            let options_size = std::mem::size_of_val(&options);
+            crate::column_sender::questdb_db_connect_options_init(&mut options, options_size);
+            options.oidc_auth = auth;
+            let conf = "ws::addr=127.0.0.1:1;lazy_connect=true;";
+            let db = crate::column_sender::questdb_db_connect_ex(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                &options,
+                &mut error,
+            );
+            assert!(db.is_null());
+            assert_cancelled(&mut error);
+
+            let config = crate::line_sender_utf8 {
+                len: conf.len(),
+                buf: conf.as_ptr() as *const c_char,
+            };
+            let reader = crate::egress::qwp_reader_from_conf_with_oidc(config, auth, &mut error);
+            assert!(reader.is_null());
+            assert_cancelled(&mut error);
+
+            // clear() keeps working after close, as documented.
+            assert!(questdb_oidc_auth_clear(auth, &mut error));
+            assert!(error.is_null());
+
+            questdb_oidc_auth_free(auth);
             questdb_oidc_builder_free(builder);
         }
     }

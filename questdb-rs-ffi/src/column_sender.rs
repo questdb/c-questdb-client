@@ -1091,7 +1091,7 @@ pub unsafe extern "C" fn questdb_db_connect_ex(
         let auth = if oidc_auth.is_null() {
             None
         } else {
-            match unsafe { crate::oidc::clone_auth(oidc_auth, err_out) } {
+            match unsafe { crate::oidc::clone_open_auth(oidc_auth, err_out) } {
                 Some(auth) => Some(auth),
                 None => return std::ptr::null_mut(),
             }

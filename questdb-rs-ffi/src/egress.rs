@@ -515,7 +515,7 @@ pub unsafe extern "C" fn qwp_reader_from_conf_with_oidc(
                 return ptr::null_mut();
             }
         };
-        let Some(auth) = crate::oidc::clone_auth(auth, err_out) else {
+        let Some(auth) = crate::oidc::clone_open_auth(auth, err_out) else {
             return ptr::null_mut();
         };
         let config = reader_bubble!(err_out, ReaderConfig::from_conf(conf), ptr::null_mut());

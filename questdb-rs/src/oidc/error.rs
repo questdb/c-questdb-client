@@ -232,6 +232,21 @@ impl OidcError {
         crate::Error::from(Self::config(message))
     }
 
+    /// The [`Cancelled`](OidcErrorKind::Cancelled) failure a closed provider
+    /// reports, for the C ABI shim's transport-attach checks. Attaching a
+    /// closed provider fails here, at attach time, with the same typed error
+    /// its own operations report -- rather than succeeding and leaving the
+    /// transport to fail at its first token pull, after a store-and-forward
+    /// sender may already have accepted frames it can never send.
+    ///
+    /// Exposed for the C ABI shim, which cannot reach `Error`'s crate-private
+    /// constructors.
+    pub fn closed_error() -> crate::Error {
+        crate::Error::from(Self::cancelled(
+            "The OIDC authentication provider is closed.",
+        ))
+    }
+
     /// Attach the untrusted IdP `error` / `error_description` fields (each
     /// control-stripped, same rationale as the message).
     pub(crate) fn with_idp_error(
