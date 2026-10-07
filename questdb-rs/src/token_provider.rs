@@ -43,6 +43,17 @@ const ISOLATED_PROVIDER_POLL: Duration = Duration::from_millis(5);
 const MAX_ISOLATED_PROVIDER_WORKERS: usize = 16;
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 static ISOLATED_PROVIDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// How long a provider waits for a worker permit while every permit is held.
+///
+/// Permits are held for the duration of a provider call, so the cap fills when
+/// more than [`MAX_ISOLATED_PROVIDER_WORKERS`] distinct providers are inside a
+/// slow call at once -- typically many senders reconnecting while their OIDC
+/// refresh is in flight. Failing a healthy provider immediately there reported
+/// a spurious `credential_unavailable` for a credential that was obtainable
+/// moments later. Waiting out an ordinary slow call instead matches the OIDC
+/// client's default HTTP timeout; past it, the busy error is reported.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+const ISOLATED_PERMIT_WAIT: Duration = Duration::from_secs(30);
 
 /// The result of one isolated acquisition, shared by every caller that joined
 /// it.
@@ -86,10 +97,40 @@ impl<'a> IsolatedProviderPermit<'a> {
                 Err(actual) => active = actual,
             }
         }
-        Err(crate::error::fmt!(
+        Err(Self::busy_error(limit))
+    }
+
+    fn busy_error(limit: usize) -> crate::Error {
+        crate::error::fmt!(
             SocketError,
             "The isolated token-provider worker limit ({limit}) is busy; retry later"
-        ))
+        )
+    }
+
+    /// [`Self::acquire`], waiting up to `max_wait` for a permit to free up.
+    ///
+    /// Returns `Ok(None)` when `interrupted` becomes true first, so the caller
+    /// can report its own reason (shutdown, or a callback that became active).
+    fn acquire_waiting(
+        counter: &'a AtomicUsize,
+        limit: usize,
+        max_wait: Duration,
+        interrupted: impl Fn() -> bool,
+    ) -> crate::Result<Option<Self>> {
+        let deadline = std::time::Instant::now() + max_wait;
+        loop {
+            if let Ok(permit) = Self::acquire(counter, limit) {
+                return Ok(Some(permit));
+            }
+            if interrupted() {
+                return Ok(None);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(Self::busy_error(limit));
+            }
+            std::thread::sleep(ISOLATED_PROVIDER_POLL.min(deadline - now));
+        }
     }
 }
 
@@ -418,7 +459,35 @@ impl TokenProvider {
             }
         };
         if lead {
-            self.spawn_isolated_worker(&slot)?;
+            // Wait for a worker permit rather than failing at once while the
+            // process-wide cap is full: see `ISOLATED_PERMIT_WAIT`. Every exit
+            // without a worker publishes to `slot`, so a caller that joined it
+            // is never left waiting on a worker that will not run.
+            let permit = IsolatedProviderPermit::acquire_waiting(
+                &ISOLATED_PROVIDER_WORKERS,
+                MAX_ISOLATED_PROVIDER_WORKERS,
+                ISOLATED_PERMIT_WAIT,
+                || cancelled() || self.callback_is_active(),
+            );
+            match permit {
+                Ok(Some(permit)) => self.spawn_isolated_worker(&slot, permit)?,
+                Ok(None) if cancelled() => {
+                    let err = provider_shutdown_error();
+                    self.publish_isolated(&slot, Err(err.clone()));
+                    return Err(err);
+                }
+                Ok(None) => {
+                    // A callback became active while we waited: resolve on
+                    // this thread as the callback-active path above does.
+                    let result = self.resolve_during_callback();
+                    self.publish_isolated(&slot, result.clone());
+                    return result;
+                }
+                Err(err) => {
+                    self.publish_isolated(&slot, Err(err.clone()));
+                    return Err(err);
+                }
+            }
         }
 
         let mut done = slot
@@ -444,26 +513,19 @@ impl TokenProvider {
         }
     }
 
-    /// Take a worker permit and start the single in-flight acquisition for this
-    /// provider. Every failure is published to `slot` as well as returned, so a
-    /// caller that joined it is never left waiting on a worker that will not
-    /// run.
+    /// Start the single in-flight acquisition for this provider on `permit`.
+    /// A spawn failure is published to `slot` as well as returned, so a caller
+    /// that joined it is never left waiting on a worker that will not run.
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
-    fn spawn_isolated_worker(&self, slot: &Arc<IsolatedResult>) -> crate::Result<()> {
+    fn spawn_isolated_worker(
+        &self,
+        slot: &Arc<IsolatedResult>,
+        permit: IsolatedProviderPermit<'static>,
+    ) -> crate::Result<()> {
         // A blocked synchronous callback cannot be killed, but it must not
         // permit repeated sender teardown to grow process-global thread count
         // without bound. The permit lives on the worker and is released on
         // normal return, unwind-enabled panic, or spawn failure.
-        let permit = match IsolatedProviderPermit::acquire(
-            &ISOLATED_PROVIDER_WORKERS,
-            MAX_ISOLATED_PROVIDER_WORKERS,
-        ) {
-            Ok(permit) => permit,
-            Err(err) => {
-                self.publish_isolated(slot, Err(err.clone()));
-                return Err(err);
-            }
-        };
         let provider = self.clone();
         let published = Arc::clone(slot);
         if let Err(err) = std::thread::Builder::new()
@@ -932,6 +994,57 @@ mod tests {
             assert!(err.msg().contains("worker limit"));
             drop(first);
             assert!(IsolatedProviderPermit::acquire(&counter, 1).is_ok());
+        }
+
+        #[test]
+        fn a_full_worker_cap_waits_for_a_permit_instead_of_failing() {
+            // While every permit is held by a slow provider call, another
+            // provider -- whose credential is obtainable -- used to fail at once
+            // and report a spurious credential_unavailable. It now waits for a
+            // permit to free up.
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let held = IsolatedProviderPermit::acquire(&COUNTER, 1).unwrap();
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                drop(held);
+            });
+            let permit = IsolatedProviderPermit::acquire_waiting(
+                &COUNTER,
+                1,
+                std::time::Duration::from_secs(10),
+                || false,
+            )
+            .unwrap();
+            assert!(permit.is_some(), "the waiter must take the released permit");
+            releaser.join().unwrap();
+        }
+
+        #[test]
+        fn a_full_worker_cap_reports_busy_after_the_wait_and_honours_interrupts() {
+            let counter = AtomicUsize::new(0);
+            let _held = IsolatedProviderPermit::acquire(&counter, 1).unwrap();
+            let started = std::time::Instant::now();
+            let err = IsolatedProviderPermit::acquire_waiting(
+                &counter,
+                1,
+                std::time::Duration::from_millis(50),
+                || false,
+            )
+            .unwrap_err();
+            assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.msg().contains("worker limit"), "{}", err.msg());
+
+            // An interrupt (shutdown, or a callback becoming active) ends the
+            // wait without a permit and without the busy error.
+            let interrupted = IsolatedProviderPermit::acquire_waiting(
+                &counter,
+                1,
+                std::time::Duration::from_secs(10),
+                || true,
+            )
+            .unwrap();
+            assert!(interrupted.is_none());
         }
 
         #[test]
