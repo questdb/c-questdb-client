@@ -272,6 +272,21 @@ impl TokenProvider {
         }
     }
 
+    /// Pull a token on the calling thread, as a transport without a traffic
+    /// gate (manual progress) does, while recording whether the pull failed
+    /// during one of the auth's callbacks. Without that record an ACK wait
+    /// made inside the callback -- which drives this very reconnect on the
+    /// callback thread -- could never be rejected, and would spin until its
+    /// timeout (forever with none) while the callback it runs in waits on it.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn bearer_header_on_caller(&self) -> crate::Result<String> {
+        if self.callback_is_active() {
+            return self.resolve_during_callback();
+        }
+        self.callback_blocked.store(false, Ordering::Release);
+        self.bearer_header()
+    }
+
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     fn resolve_during_callback(&self) -> crate::Result<String> {
         let result = self.bearer_header();
@@ -1014,6 +1029,64 @@ mod tests {
             let o = owner.clone();
             assert!(on_callback_thread(move || o.callback_wait_error()).is_none());
             assert!(!owner.callback_blocked.load(Ordering::SeqCst));
+        }
+
+        #[cfg(feature = "_sender-qwp-ws")]
+        #[test]
+        fn caller_thread_pull_inside_callback_rejects_its_wait() {
+            // A manual-progress sender has no traffic gate: its reconnect pulls
+            // the token on the thread driving progress, which is the callback
+            // thread when the ACK wait runs inside a callback.
+            std::thread_local! {
+                static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            let callback_active = Arc::new(AtomicBool::new(false));
+            let isolation = TokenProviderIsolation::with_callback_guards(
+                {
+                    let callback_active = Arc::clone(&callback_active);
+                    move || callback_active.load(Ordering::SeqCst)
+                },
+                || IN_CALLBACK.with(|c| c.get()),
+            );
+            let provider = TokenProvider::new_with_isolation(
+                {
+                    let callback_active = Arc::clone(&callback_active);
+                    move || {
+                        if callback_active.load(Ordering::SeqCst) {
+                            Err(crate::error::fmt!(
+                                SocketError,
+                                "callback must return first"
+                            ))
+                        } else {
+                            Ok("fresh-token".to_string())
+                        }
+                    }
+                },
+                isolation,
+            )
+            .for_attachment();
+
+            let (active, p) = (Arc::clone(&callback_active), provider.clone());
+            let (pulled, rejected) = std::thread::spawn(move || {
+                IN_CALLBACK.with(|c| c.set(true));
+                active.store(true, Ordering::SeqCst);
+                let pulled = p.bearer_header_on_caller();
+                let rejected = p.callback_wait_error();
+                active.store(false, Ordering::SeqCst);
+                (pulled, rejected)
+            })
+            .join()
+            .unwrap();
+            assert!(pulled.is_err());
+            let err = rejected.expect("an in-callback wait must be rejected");
+            assert!(err.msg().contains("callback must return first"), "{err}");
+
+            // Once the callback has returned, the next pull clears the record.
+            assert_eq!(
+                provider.bearer_header_on_caller().unwrap(),
+                "Bearer fresh-token"
+            );
+            assert!(!provider.callback_blocked.load(Ordering::SeqCst));
         }
 
         #[test]

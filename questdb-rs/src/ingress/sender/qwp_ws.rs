@@ -3399,13 +3399,14 @@ fn acquire_qwp_ws_provider_header(
     connect_kind: QwpWsConnectKind,
     traffic_gate: Option<&TrafficGate>,
 ) -> crate::Result<String> {
-    if connect_kind.bounded_dial() {
-        match traffic_gate {
-            Some(gate) => provider.bearer_header_isolated_until(|| gate.is_shutdown()),
-            None => provider.bearer_header(),
+    // Without a traffic gate (manual progress) the pull runs on the thread
+    // driving progress, which may be an ACK wait inside one of the auth's
+    // callbacks: record a failed pull there so that wait can be rejected.
+    match traffic_gate {
+        Some(gate) if connect_kind.bounded_dial() => {
+            provider.bearer_header_isolated_until(|| gate.is_shutdown())
         }
-    } else {
-        provider.bearer_header()
+        _ => provider.bearer_header_on_caller(),
     }
 }
 
