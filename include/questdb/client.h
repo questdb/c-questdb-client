@@ -173,6 +173,10 @@ void questdb_db_connect_options_init(
  * `oidc_auth` is mutually exclusive with static credentials: `conf` must not
  * also set `username`/`password` or `token`. Setting both fails with
  * `questdb_error_config_error`.
+ * An `oidc_auth` already closed with `questdb_oidc_auth_close` is rejected
+ * with QUESTDB_OIDC_ERROR_CANCELLED rather than attached.
+ * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer token
+ * is sent in cleartext and can be captured in transit.
  * `conf_len` must not exceed `QUESTDB_CONFIG_MAX_BYTES`.
  */
 QUESTDB_CLIENT_API

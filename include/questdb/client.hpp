@@ -105,7 +105,11 @@ public:
      * calls may silently refresh but never prompt; call auth.sign_in() first.
      * Mutually exclusive with static credentials: `conf` must not also set
      * `username`/`password` or `token`.
+     * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer
+     * token is sent in cleartext and can be captured in transit.
      * @throws questdb::error with `config_error` if it does.
+     * @throws questdb::oidc::error with kind `cancelled` if `auth` was
+     *         already closed.
      */
     pool(std::string_view conf, const ::questdb::oidc::device_auth& auth)
     {

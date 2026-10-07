@@ -634,6 +634,10 @@ public:
         return *this;                                                          \
     }
 
+    // Endpoint origin rules (enforced by `build()`, see oidc.h): the token
+    // and device-authorization endpoints must share one origin; with both
+    // set explicitly and `issuer` also set, both must be on the issuer's
+    // origin.
     QUESTDB_OIDC_CPP_STRING_SETTER(client_id, ::questdb_oidc_builder_client_id)
     QUESTDB_OIDC_CPP_STRING_SETTER(scope, ::questdb_oidc_builder_scope)
     QUESTDB_OIDC_CPP_STRING_SETTER(audience, ::questdb_oidc_builder_audience)

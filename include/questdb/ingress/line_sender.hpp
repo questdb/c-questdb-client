@@ -1503,9 +1503,13 @@ public:
      * Mutually exclusive with static credentials: these opts must not also
      * carry `username`/`password` or `token`, from the config string or from
      * `username()` and friends.
+     * Use `https::` or `wss::` (TLS): over plain `http::` or `ws::` to a
+     * non-loopback host the Bearer token is sent in cleartext on every flush
+     * or connect and can be captured in transit.
      * @throws questdb::oidc::error if `auth` is empty or moved from.
      * @throws line_sender_error if the sender configuration cannot use OIDC,
-     *         including when static credentials are already set.
+     *         including when static credentials are already set, or if `auth`
+     *         was already closed (OIDC kind `cancelled`).
      * @note After attaching, a token-acquisition failure surfaces from
      *       `flush()` (and other sender calls) as a `line_sender_error`, with
      *       the structured OIDC detail on its `oidc_diagnostic()` member — not

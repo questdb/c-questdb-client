@@ -712,8 +712,11 @@ public:
      * Open a reader with a rotating OIDC Bearer-token provider. The reader
      * retains the auth state internally. Provider calls may silently refresh
      * but never prompt; call auth.sign_in() first.
-     * @throws questdb::oidc::error if `auth` is empty or moved from, or token
-     *         acquisition returns a structured OIDC failure.
+     * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer
+     * token is sent in cleartext and can be captured in transit.
+     * @throws questdb::oidc::error if `auth` is empty, moved from or already
+     *         closed (kind `cancelled`), or token acquisition returns a
+     *         structured OIDC failure.
      * @throws questdb::error on configuration or connection failure.
      * @note Unlike the ingest sender (which throws `line_sender_error` with the
      *       OIDC detail on `oidc_diagnostic()`), the reader throws

@@ -393,6 +393,10 @@ impl OidcDeviceAuthBuilder {
     }
 
     /// Set the IdP token endpoint explicitly (skips discovering it).
+    ///
+    /// [`build`](Self::build) requires the token and device-authorization
+    /// endpoints to share one origin (scheme, host and port), however they
+    /// were obtained.
     pub fn token_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.token_endpoint = Some(endpoint.into());
         self

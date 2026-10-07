@@ -195,7 +195,10 @@ qwp_reader* qwp_reader_from_conf(
  * device flow; call questdb_oidc_auth_sign_in before opening the reader.
  * Mutually exclusive with static credentials: `config` must not also set
  * `username`/`password` or `token`. Setting both fails with
- * `questdb_error_config_error`.
+ * `questdb_error_config_error`. An `auth` already closed with
+ * `questdb_oidc_auth_close` is rejected with QUESTDB_OIDC_ERROR_CANCELLED.
+ * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer token
+ * is sent in cleartext and can be captured in transit.
  * The config string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  */
 QUESTDB_CLIENT_API

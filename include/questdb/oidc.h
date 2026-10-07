@@ -225,6 +225,18 @@ void questdb_oidc_builder_free(questdb_oidc_builder* builder);
  *  it would otherwise suppress both the `/settings` value and the IdP discovery
  *  fallback, then fail much later with an unrelated message. Leave an override
  *  unset to discover that endpoint.
+ *
+ *  Endpoint origin rules, enforced by `questdb_oidc_builder_build` with an
+ *  OIDC configuration error:
+ *  - The token and device-authorization endpoints must share one origin
+ *    (scheme, host and port), however they were obtained. Credentials are
+ *    POSTed to both, and RFC 8628 co-locates them on one authorization server.
+ *  - With both endpoints set explicitly (no
+ * `questdb_oidc_builder_from_questdb`) and an `issuer` also set, both endpoints
+ * must be on the issuer's origin. Some providers serve their endpoints from a
+ * different origin than their issuer (Google: issuer
+ * `https://accounts.google.com`, endpoints on `https://oauth2.googleapis.com`);
+ * configure those without `issuer`.
  */
 QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_client_id);
 QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_scope);
@@ -658,6 +670,9 @@ bool questdb_oidc_auth_cancel_sign_in(
  * handle. Disk-backed store-and-forward slots are not deleted and stay
  * drainable by a later process, but this one will not send them.
  *
+ * Attaching an already-closed auth to a new sender, pool or reader fails
+ * immediately with QUESTDB_OIDC_ERROR_CANCELLED.
+ *
  * Recovery is to build a new auth and rebuild every sender, reader and pool
  * that used the old one. Where that matters, sign in on an auth before
  * attaching it and keep re-authentication on a separate, unattached one.
@@ -875,6 +890,15 @@ bool questdb_error_oidc_get_view(
  * `username`/`password` or `token` (whether set through the config string or
  * through `line_sender_opts_username` and friends). Setting both fails with
  * `questdb_error_config_error`.
+ *
+ * An `auth` already closed with `questdb_oidc_auth_close` is rejected with
+ * QUESTDB_OIDC_ERROR_CANCELLED; the opts are left unchanged.
+ *
+ * Use `https::` or `wss::` (TLS). Over plain `http::` or `ws::` to a
+ * non-loopback host the Bearer token -- an IdP-issued access or ID token -- is
+ * sent in cleartext on every flush or connect and can be captured in transit.
+ * Nothing rejects or warns about that configuration; reserve plaintext for a
+ * loopback server.
  *
  * A flush or connect that needs a fresh credential resolves it BEFORE its
  * first request, and that resolution can wait behind a refresh already running
