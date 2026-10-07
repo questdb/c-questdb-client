@@ -1290,12 +1290,26 @@ impl CEventHandler {
     /// signals its active attempt. Without this gate, attempt A can finish and
     /// B can publish between the native cancellation and the callback-layer
     /// store, causing A's cancellation to mute B.
+    ///
+    /// Callback admission (`callback_gate`) is also held from the speculative
+    /// publication until it is either confirmed or rolled back. Otherwise a
+    /// renderer event of an attempt with no device flow running -- `on_success`
+    /// after the flow finished, or `on_prompt` just after it started -- could
+    /// observe the speculative mark and be dropped even though the no-op cancel
+    /// leaves the sign-in running. `cancel_core` only flips the core's
+    /// cancellation flag under its own short lock and never invokes user code,
+    /// so holding the gate across it cannot deadlock.
     fn cancel_sign_in_serialized(&self, cancel_core: impl FnOnce() -> bool) {
         let _state = self
             .sign_in_generation_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let generation = self.cancel_sign_in();
+        let _gate = self
+            .target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = self.cancel_sign_in_locked();
         let cancelled = cancel_core();
         debug_assert!(
             !cancelled || generation.is_some(),
@@ -1310,6 +1324,7 @@ impl CEventHandler {
 
     /// Cancel the currently active renderer generation, if any, and return its
     /// identity so a speculative publication can be rolled back precisely.
+    #[cfg(test)]
     fn cancel_sign_in(&self) -> Option<u64> {
         // Serialize the cancellation predicate with callback admission so an
         // attempt cancellation cannot miss a waiter between its predicate
@@ -1319,6 +1334,12 @@ impl CEventHandler {
             .callback_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.cancel_sign_in_locked()
+    }
+
+    /// [`cancel_sign_in`](Self::cancel_sign_in) for a caller that already holds
+    /// `callback_gate`.
+    fn cancel_sign_in_locked(&self) -> Option<u64> {
         let generation = self.active_sign_in_generation.load(Ordering::Acquire);
         if generation == 0 {
             return None;
@@ -4967,6 +4988,42 @@ mod tests {
             "cancelling the first attempt muted the next renderer"
         );
         handler.finish_sign_in_serialized(second);
+    }
+
+    #[test]
+    fn noop_cancellation_does_not_drop_the_running_attempts_event() {
+        // A cancel that finds no device flow (the core returns false) must be a
+        // no-op for the attempt still running: its `on_success` after the flow,
+        // or `on_prompt` just before the flow is marked running, must still be
+        // delivered even when it races the speculative publication.
+        let handler = Arc::new(CEventHandler::new(event_target(ignore_event, 0, None)));
+        let generation = handler.begin_sign_in_serialized();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let mut renderer = None;
+        let mut entered_inside_window = None;
+        handler.cancel_sign_in_serialized(|| {
+            let emitting = Arc::clone(&handler);
+            renderer = Some(std::thread::spawn(move || {
+                let entered = ActiveEventHandler::enter(&emitting).is_some();
+                entered_tx.send(entered).unwrap();
+            }));
+            // Give an admission that does not wait for the outcome every chance
+            // to observe the speculative mark before it is rolled back.
+            entered_inside_window = entered_rx.recv_timeout(Duration::from_millis(200)).ok();
+            false
+        });
+        let entered = entered_inside_window.unwrap_or_else(|| {
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the renderer never resolved its admission")
+        });
+        renderer.unwrap().join().unwrap();
+        assert!(
+            entered,
+            "a no-op cancellation dropped the running attempt's renderer event"
+        );
+        assert!(!handler.callbacks_cancelled());
+        handler.finish_sign_in_serialized(generation);
     }
 
     #[test]
