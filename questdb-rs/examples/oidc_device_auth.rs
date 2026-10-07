@@ -16,6 +16,13 @@
 //! advertise its device-authorization endpoint, so the client can discover it
 //! from the issuer's `.well-known/openid-configuration` — and so a tampered
 //! `/settings` cannot redirect the sign-in.
+//!
+//! Credentials stay in memory by default. Set `QDB_EXAMPLE_PERSIST_TOKEN=1` to
+//! opt into the file token store, so a re-run resumes from the saved refresh
+//! token instead of re-prompting. That writes a plaintext refresh token under
+//! `~/.questdb/oidc-tokens/` (owner-only permissions) and is supported on Unix
+//! only: on other platforms the file store refuses to persist, and sign-in
+//! fails with a configuration error before prompting.
 
 use std::sync::Arc;
 
@@ -36,12 +43,12 @@ fn main() -> Result<()> {
         builder = builder.issuer(issuer);
     }
 
-    // Persist the token across restarts so a re-run resumes from the saved refresh
-    // token instead of re-prompting. This writes a plaintext refresh token under
-    // ~/.questdb/oidc-tokens/ (owner-only file permissions) — omit it, or back a
-    // custom TokenStore with an OS keychain, if that trade-off isn't acceptable.
-    let store = FileTokenStore::at_default_location()?;
-    builder = builder.token_store(store);
+    // Persistence is an explicit opt-in: it writes a long-lived plaintext
+    // refresh token to disk (Unix only). For at-rest encryption, back a custom
+    // TokenStore with an OS keychain instead.
+    if std::env::var_os("QDB_EXAMPLE_PERSIST_TOKEN").is_some_and(|v| v == "1") {
+        builder = builder.token_store(FileTokenStore::at_default_location()?);
+    }
 
     let auth = Arc::new(builder.build()?);
 
