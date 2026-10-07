@@ -1666,8 +1666,12 @@ impl SenderBuilder {
     /// with a non-printable-ASCII character (a header-injection vector) is
     /// rejected. A provider error fails that connection attempt and is retried by
     /// the reconnect loop because the callback may recover on its next invocation;
-    /// already accepted store-and-forward frames remain queued. A server rejection
-    /// of a successfully acquired token is a separate terminal authentication
+    /// already accepted store-and-forward frames remain queued. The exception is a
+    /// connect the caller waits for -- the synchronous initial connect
+    /// (`initial_connect_retry=sync`) or a pool borrow with retry -- which fails
+    /// immediately on an OIDC `InteractionRequired` that is not
+    /// `acquisition_busy`: nobody has signed in, and the waiting caller is the
+    /// one that would have to. A server rejection of a successfully acquired token is a separate terminal authentication
     /// error. In unwind-enabled builds, a callback panic is contained and treated
     /// as a retryable provider failure; a process built with `panic = "abort"`
     /// cannot contain panics, so providers must not rely on this as their normal
@@ -1749,7 +1753,11 @@ impl SenderBuilder {
     /// `OidcErrorKind::Config` (stays `ConfigError`).
     /// Closing the provider therefore stops the reconnect loop and terminalizes
     /// a store-and-forward sender's publication store. Every other OIDC kind,
-    /// including `InteractionRequired`, stays retryable.
+    /// including `InteractionRequired`, stays retryable for the background
+    /// reconnect loop. A connect the caller waits for (the synchronous initial
+    /// connect, or a pool borrow with retry) instead fails immediately on an
+    /// `InteractionRequired` that is not `acquisition_busy`, rather than
+    /// spending its whole budget waiting for a sign-in it is blocking.
     #[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
     pub fn bearer_token_provider<F, E>(self, provider: F) -> Result<Self>
     where

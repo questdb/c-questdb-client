@@ -2623,10 +2623,17 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     )
 }
 
-/// Fail fast on a synchronous caller's own OIDC callback re-entry. Unlike a
-/// background reconnect, this caller cannot return from the callback until its
-/// borrow/connect call returns. Do not classify it as a terminal *driver*
-/// error: store-and-forward frames must remain replayable after the callback.
+/// Terminal for a connect the caller waits for: the synchronous initial connect
+/// and pool borrows with retry. Besides every [`reconnect_error_is_terminal`]
+/// error, this fails fast on any OIDC `InteractionRequired` that is not
+/// `acquisition_busy` -- both the caller's own callback re-entry and "nobody
+/// has signed in". Neither can resolve while this caller waits: a re-entrant
+/// caller cannot return from its callback until the connect returns, and a
+/// sign-in is a separate, explicit call the waiting thread would have to make.
+/// A busy acquisition on another thread stays retryable. The background
+/// reconnect loop keeps using [`reconnect_error_is_terminal`]. Do not classify
+/// either case as a terminal *driver* error: store-and-forward frames must
+/// remain replayable.
 pub(crate) fn reconnect_error_is_foreground_terminal(err: &Error) -> bool {
     if reconnect_error_is_terminal(err) {
         return true;

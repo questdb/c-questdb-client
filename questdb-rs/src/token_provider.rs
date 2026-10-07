@@ -687,7 +687,9 @@ pub(crate) fn is_provider_shutdown_error(err: &crate::Error) -> bool {
 /// terminal would stop the store-and-forward drainer on a condition a human can
 /// fix, abandoning queued frames. It is reported through the connection-event
 /// stream instead (see `ConnectionEvents::token_provider_failed`), so the
-/// retrying is visible rather than silent.
+/// retrying is visible rather than silent. Only a connect the caller waits for
+/// treats a non-busy `InteractionRequired` as final, through
+/// `reconnect_error_is_foreground_terminal`.
 fn classify_provider_error(e: crate::Error) -> crate::Error {
     if e.code() == crate::ErrorCode::InvalidApiCall {
         // Keep it terminal, but carry it as `ConfigError` rather than leaving
