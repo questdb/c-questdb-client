@@ -1851,13 +1851,12 @@ pub unsafe extern "C" fn questdb_oidc_builder_file_token_store(
 /// directory literally named `~alice` under the working directory instead.
 fn reject_unexpanded_home(path: &str, label: &str) -> questdb::Result<()> {
     if path.starts_with('~') {
-        return Err(Error::new(
-            ErrorCode::ConfigError,
-            format!(
-                "the {label} {path:?} starts with `~`, which shells expand but this \
-                 client does not. Pass an already-expanded absolute path."
-            ),
-        ));
+        // A typed OIDC config error, like every other builder misconfiguration,
+        // so `questdb_error_oidc_get_view` reports QUESTDB_OIDC_ERROR_CONFIG.
+        return Err(OidcError::config_error(format!(
+            "the {label} {path:?} starts with `~`, which shells expand but this \
+             client does not. Pass an already-expanded absolute path."
+        )));
     }
     Ok(())
 }
@@ -2519,9 +2518,13 @@ mod tests {
                 "~alice",
                 "~\\tokens",
             ] {
-                assert!(
-                    reject_unexpanded_home(bad, label).is_err(),
-                    "{label}: {bad:?} must be rejected"
+                let err = reject_unexpanded_home(bad, label)
+                    .expect_err(&format!("{label}: {bad:?} must be rejected"));
+                assert_eq!(err.code(), ErrorCode::ConfigError);
+                assert_eq!(
+                    err.oidc_error().map(OidcError::kind),
+                    Some(OidcErrorKind::Config),
+                    "{label}: {bad:?} must be a typed OIDC config error"
                 );
             }
             // An already-expanded path, a relative one, and a name that merely

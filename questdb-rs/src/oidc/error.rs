@@ -219,6 +219,19 @@ impl OidcError {
             .reclassified(crate::ErrorCode::SocketError, message)
     }
 
+    /// A [`Config`](OidcErrorKind::Config) failure, classified
+    /// [`ConfigError`](crate::ErrorCode::ConfigError), for a misconfiguration
+    /// the C ABI shim detects itself (e.g. an unexpanded `~` path). Carrying the
+    /// structured payload keeps it the same typed OIDC config error -- through
+    /// `questdb_error_oidc_get_view` and every binding -- as the misconfigurations
+    /// the builder reports.
+    ///
+    /// Exposed for the C ABI shim, which cannot reach `Error`'s crate-private
+    /// constructors.
+    pub fn config_error(message: impl Into<String>) -> crate::Error {
+        crate::Error::from(Self::config(message))
+    }
+
     /// Attach the untrusted IdP `error` / `error_description` fields (each
     /// control-stripped, same rationale as the message).
     pub(crate) fn with_idp_error(
