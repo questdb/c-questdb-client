@@ -570,7 +570,15 @@ typedef enum qwp_reader_failover_phase
     qwp_reader_failover_phase_reset = 2,
     /** The retry budget is exhausted. The cursor is terminal; the
      *  error returned to the caller is available via
-     *  `qwp_reader_failover_progress_event_final_error_*`. */
+     *  `qwp_reader_failover_progress_event_final_error_*`.
+     *
+     *  When `failover_max_duration_ms` runs out, this final error is
+     *  `questdb_error_socket_error`, unless the last reconnect round ended
+     *  with `questdb_error_role_mismatch` (every endpoint rejected on role),
+     *  `questdb_error_handshake_error` (every endpoint rejected the WebSocket
+     *  upgrade) or `questdb_error_tls_error`: that code is kept. Either way
+     *  its message starts with "failover wall-clock budget exhausted". See
+     *  `qwp_reader_cursor_next_batch` for the error the caller receives. */
     qwp_reader_failover_phase_gave_up = 3,
     /** Sentinel for phases the running FFI build doesn't recognise.
      *  Emitted when the upstream Rust crate adds a new
@@ -1104,6 +1112,19 @@ typedef struct qwp_reader_batch qwp_reader_batch;
  * @return NULL with `*err_out` left untouched when the stream has
  *         terminated normally — no batch is available.
  * @return NULL with `*err_out` set on error; the cursor must be freed.
+ *
+ * When a mid-query failover gives up, `*err_out` is the error that names
+ * what to fix if the reconnect rounds found one, else the error that
+ * started the failover. A reconnect error naming what to fix is one coded
+ * `questdb_error_auth_error`, `questdb_error_role_mismatch`,
+ * `questdb_error_config_error`, `questdb_error_unsupported_server`,
+ * `questdb_error_handshake_error` or `questdb_error_tls_error`, or one
+ * carrying an OIDC payload (`questdb_error_oidc_get_view`). This includes a
+ * give-up caused by `failover_max_duration_ms` running out while attempts
+ * remain: if the last round was rejected on role, at the WebSocket upgrade
+ * or at TLS, that code is returned (message prefixed with "failover
+ * wall-clock budget exhausted"), not the `questdb_error_socket_error` or
+ * `questdb_error_protocol_error` that started the failover.
  */
 QUESTDB_CLIENT_API
 const qwp_reader_batch* qwp_reader_cursor_next_batch(

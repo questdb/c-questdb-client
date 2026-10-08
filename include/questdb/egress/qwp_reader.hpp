@@ -2617,7 +2617,14 @@ public:
      *         `batch::symbol_dict`). Invalidated by the next `next_batch`,
      *         `cancel`, `add_credit`, cursor destruction, or mid-query
      *         failover; do not cache across batches.
-     * @throws questdb::error on transport / protocol failure.
+     * @throws questdb::error on transport / protocol failure. When a
+     *         mid-query failover gives up -- including when
+     *         `failover_max_duration_ms` runs out while attempts remain --
+     *         the error's code is the one the reconnect rounds found that
+     *         names what to fix (for example `role_mismatch`,
+     *         `handshake_error` or `tls_error`), if any, else that of the
+     *         failure that started the failover. See
+     *         `qwp_reader_cursor_next_batch` in `qwp_reader.h`.
      */
     std::optional<egress::batch> next_batch()
     {
