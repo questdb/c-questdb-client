@@ -1381,3 +1381,208 @@ fn init_buf_size_conf_string_accepts_paired_values() -> TestResult {
     assert!(!sender.must_close());
     Ok(())
 }
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn recycle_settings_defaults_and_ranges() {
+    use crate::ingress::{SenderBuilder, sender::qwp_ws_recycle::RecycleSettings};
+    let defaults = RecycleSettings::default();
+    assert_eq!(
+        (defaults.enabled, defaults.threshold, defaults.max_wait),
+        (true, 100_000, Duration::from_millis(2_000))
+    );
+    let builder = || SenderBuilder::from_conf("ws::addr=localhost:9000;").unwrap();
+    for threshold in [1, 1_000_000] {
+        builder().symbol_dict_reset_threshold(threshold).unwrap();
+        SenderBuilder::from_conf(format!(
+            "ws::addr=localhost:9000;symbol_dict_reset_threshold={threshold};"
+        ))
+        .unwrap();
+    }
+    for threshold in [0, 1_000_001] {
+        assert_eq!(
+            builder()
+                .symbol_dict_reset_threshold(threshold)
+                .unwrap_err()
+                .code(),
+            ErrorCode::ConfigError
+        );
+        assert_eq!(
+            SenderBuilder::from_conf(format!(
+                "ws::addr=localhost:9000;symbol_dict_reset_threshold={threshold};"
+            ))
+            .unwrap_err()
+            .code(),
+            ErrorCode::ConfigError
+        );
+    }
+    for millis in [0, 9_223_372_036_854] {
+        builder()
+            .symbol_dict_reset_max_wait(Duration::from_millis(millis))
+            .unwrap();
+        SenderBuilder::from_conf(format!(
+            "ws::addr=localhost:9000;symbol_dict_reset_max_wait_millis={millis};"
+        ))
+        .unwrap();
+    }
+    for wait in [
+        Duration::from_millis(9_223_372_036_855),
+        Duration::from_nanos(1),
+        Duration::from_millis(1) + Duration::from_nanos(1),
+        Duration::MAX,
+    ] {
+        assert_eq!(
+            builder()
+                .symbol_dict_reset_max_wait(wait)
+                .unwrap_err()
+                .code(),
+            ErrorCode::ConfigError
+        );
+    }
+    for value in ["-1", "9223372036855", "18446744073709551616", "0.5"] {
+        assert_eq!(
+            SenderBuilder::from_conf(format!(
+                "ws::addr=localhost:9000;symbol_dict_reset_max_wait_millis={value};"
+            ))
+            .unwrap_err()
+            .code(),
+            ErrorCode::ConfigError
+        );
+    }
+    for enabled in [true, false] {
+        builder()
+            .symbol_dict_reset(enabled)
+            .unwrap()
+            .symbol_dict_reset(enabled)
+            .unwrap();
+    }
+    for value in ["on", "off", "ON", "OFF"] {
+        SenderBuilder::from_conf(format!(
+            "wss::addr=localhost:9000;symbol_dict_reset={value};"
+        ))
+        .unwrap();
+    }
+    assert_eq!(
+        SenderBuilder::from_conf("ws::addr=localhost:9000;symbol_dict_reset=maybe;")
+            .unwrap_err()
+            .code(),
+        ErrorCode::ConfigError
+    );
+    assert_eq!(
+        builder()
+            .symbol_dict_reset(true)
+            .unwrap()
+            .symbol_dict_reset(false)
+            .unwrap_err()
+            .code(),
+        ErrorCode::ConfigError
+    );
+    builder()
+        .symbol_dict_reset_threshold(1)
+        .unwrap()
+        .symbol_dict_reset_threshold(1)
+        .unwrap();
+    assert_eq!(
+        builder()
+            .symbol_dict_reset_threshold(1)
+            .unwrap()
+            .symbol_dict_reset_threshold(2)
+            .unwrap_err()
+            .code(),
+        ErrorCode::ConfigError
+    );
+    builder()
+        .symbol_dict_reset_max_wait(Duration::ZERO)
+        .unwrap()
+        .symbol_dict_reset_max_wait(Duration::ZERO)
+        .unwrap();
+    assert_eq!(
+        builder()
+            .symbol_dict_reset_max_wait(Duration::ZERO)
+            .unwrap()
+            .symbol_dict_reset_max_wait(Duration::from_millis(1))
+            .unwrap_err()
+            .code(),
+        ErrorCode::ConfigError
+    );
+    assert_eq!(
+        SenderBuilder::from_conf("ws::addr=localhost:9000;symbol_dict_reset=off;")
+            .unwrap()
+            .symbol_dict_reset(true)
+            .unwrap_err()
+            .code(),
+        ErrorCode::ConfigError
+    );
+    #[cfg(feature = "sync-sender-http")]
+    {
+        let http = || SenderBuilder::from_conf("http::addr=localhost:9000;").unwrap();
+        assert_eq!(
+            http().symbol_dict_reset(true).unwrap_err().code(),
+            ErrorCode::ConfigError
+        );
+        assert_eq!(
+            http().symbol_dict_reset_threshold(1).unwrap_err().code(),
+            ErrorCode::ConfigError
+        );
+        assert_eq!(
+            http()
+                .symbol_dict_reset_max_wait(Duration::ZERO)
+                .unwrap_err()
+                .code(),
+            ErrorCode::ConfigError
+        );
+    }
+    for scheme in ["http", "https", "tcp", "tcps", "udp", "udps"] {
+        for key_value in [
+            "symbol_dict_reset=on",
+            "symbol_dict_reset_threshold=1",
+            "symbol_dict_reset_max_wait_millis=0",
+        ] {
+            assert_eq!(
+                SenderBuilder::from_conf(format!("{scheme}::addr=localhost:9000;{key_value};"))
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::ConfigError
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
+#[test]
+fn recycle_settings_pool_passthrough() {
+    let conf = "ws::addr=localhost:9000;lazy_connect=true;sender_pool_min=0;query_pool_min=0;pool_reap=manual;symbol_dict_reset=on;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;";
+    crate::egress::ReaderConfig::from_conf(conf).unwrap();
+    let db = crate::db::QuestDb::connect(conf).unwrap();
+    db.close();
+    for invalid in [
+        "symbol_dict_reset=maybe",
+        "symbol_dict_reset_threshold=0",
+        "symbol_dict_reset_max_wait_millis=-1",
+    ] {
+        let conf = format!(
+            "ws::addr=localhost:9000;lazy_connect=true;sender_pool_min=0;query_pool_min=0;pool_reap=manual;{invalid};"
+        );
+        assert_eq!(
+            crate::db::QuestDb::connect(&conf).unwrap_err().code(),
+            ErrorCode::ConfigError
+        );
+    }
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn recycle_settings_reject_non_ws() {
+    for key_value in [
+        "symbol_dict_reset=on",
+        "symbol_dict_reset_threshold=1",
+        "symbol_dict_reset_max_wait_millis=0",
+    ] {
+        let error = crate::ingress::SenderBuilder::from_conf(format!(
+            "http::addr=localhost:9000;{key_value};"
+        ))
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::ConfigError);
+        assert!(error.msg().contains("only supported for QWP/WebSocket"));
+    }
+}

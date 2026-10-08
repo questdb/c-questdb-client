@@ -271,6 +271,9 @@ pub(crate) struct QwpWsConfig {
     pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) client_id: ConfigSetting<Option<String>>,
     pub(crate) max_protocol_version: ConfigSetting<u32>,
+    pub(crate) symbol_dict_reset: ConfigSetting<bool>,
+    pub(crate) symbol_dict_reset_threshold: ConfigSetting<usize>,
+    pub(crate) symbol_dict_reset_max_wait: ConfigSetting<std::time::Duration>,
     pub(crate) request_durable_ack: ConfigSetting<bool>,
     pub(crate) durable_ack_keepalive_interval: ConfigSetting<std::time::Duration>,
     /// Per-outage wall-clock budget for the reconnect loop.
@@ -334,6 +337,7 @@ pub(crate) struct QwpWsConfig {
 #[cfg(feature = "_sender-qwp-ws")]
 impl Default for QwpWsConfig {
     fn default() -> Self {
+        let recycle = super::sender::qwp_ws_recycle::RecycleSettings::default();
         Self {
             endpoints: ConfigSetting::new_default(Vec::new()),
             auth_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(15)),
@@ -341,6 +345,9 @@ impl Default for QwpWsConfig {
             request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             client_id: ConfigSetting::new_default(None),
             max_protocol_version: ConfigSetting::new_default(1),
+            symbol_dict_reset: ConfigSetting::new_default(recycle.enabled),
+            symbol_dict_reset_threshold: ConfigSetting::new_default(recycle.threshold),
+            symbol_dict_reset_max_wait: ConfigSetting::new_default(recycle.max_wait),
             request_durable_ack: ConfigSetting::new_default(false),
             durable_ack_keepalive_interval: ConfigSetting::new_default(
                 std::time::Duration::from_millis(200),
@@ -380,6 +387,14 @@ impl Default for QwpWsConfig {
 
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsConfig {
+    pub(crate) fn recycle_settings(&self) -> super::sender::qwp_ws_recycle::RecycleSettings {
+        super::sender::qwp_ws_recycle::RecycleSettings {
+            enabled: *self.symbol_dict_reset,
+            threshold: *self.symbol_dict_reset_threshold,
+            max_wait: *self.symbol_dict_reset_max_wait,
+        }
+    }
+
     pub(crate) fn periodic_sync_interval(&self) -> Option<std::time::Duration> {
         (*self.sf_durability == SfDurability::Periodic).then(|| {
             self.sf_sync_interval

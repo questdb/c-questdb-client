@@ -551,6 +551,10 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     // Generic auth timeout (Duration in millis; distinct from the
     // shared `auth_timeout_ms` which is QWP-WS-specific on ingress).
     "auth_timeout",
+    // QWP-WS symbol dictionary recycling
+    "symbol_dict_reset",
+    "symbol_dict_reset_threshold",
+    "symbol_dict_reset_max_wait_millis",
     // QWP-WS pacing
     "qwp_ws_progress",
     "max_frame_rejections",
