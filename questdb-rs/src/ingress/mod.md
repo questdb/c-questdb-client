@@ -507,3 +507,31 @@ To inspect or log a buffer's contents before you send it, call
 This byte-level inspection is only meaningful for ILP buffers. QWP buffers are
 encoded into UDP datagrams during [`flush()`](Sender::flush), so
 [`buffer.as_bytes()`](Buffer::as_bytes) is not useful there.
+
+## Symbol dictionary recycling
+
+QWP/WebSocket store-and-forward senders accept `symbol_dict_reset=on|off`
+(default `on`), `symbol_dict_reset_threshold=1..1000000` (default `100000`),
+and `symbol_dict_reset_max_wait_millis=0..9223372036854` (default `2000`).
+A successful publication arms recycling, which runs at a later nonempty safe
+flush after pending ACKs and any deferred-commit group have completed. After a
+reset, automatic rearming requires at least twice the old dictionary size, capped
+at one million, as well as the configured threshold. Live sets at or above one
+million may therefore recycle repeatedly; `off` may suit bounded sets below two
+million, subject to the 256 MiB cumulative symbol UTF-8 cap.
+
+After an arm reaches the configured wait age, a live eligible flush may pay one
+bounded wait of that duration per arm. Zero suppresses waiting, not recycling.
+Armed age survives return/reborrow, so the next pool borrower may pay the wait.
+[`Sender::reset_symbol_dictionary`] and the borrowed sender advisory method only
+request a future safe reset; requests coalesce and disabled recycling is a no-op.
+They do not flush, wait, connect, or guarantee completion. Public FSNs remain
+continuous within a sender lifetime, not across process reconstruction.
+
+Memory/disk SF, background/manual progress, standalone/pooled senders, Buffer,
+Chunk, Arrow, and Polars converted to pooled Arrow batches are included. The
+direct whole-source backend (`BorrowedDirectColumnSender`, including
+`QuestDb::flush_polars_dataframe`) retains its spent, `SymbolDictFull`, commit,
+and reborrow semantics. Retained queue bytes and SF side-files are not a hard
+dictionary-memory budget; both the two-million-entry and 256 MiB UTF-8 caps
+still apply, including to a single large publication before recycling is safe.

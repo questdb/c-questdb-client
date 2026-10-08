@@ -418,3 +418,159 @@ def test_deferred_close_exactly_once_uploads_held_until_demote_drain_c_client_ru
         f"{expected_sum}"
     )
     LOG.info("deferred close exactly-once: %d rows, no dedup, both nodes exact", total)
+
+
+@pytest.mark.c_client
+@pytest.mark.parametrize('binding', [
+    pytest.param('rust', marks=pytest.mark.c_client_rust),
+    pytest.param('c', marks=pytest.mark.c_client_c),
+    pytest.param('cpp', marks=pytest.mark.c_client_cpp),
+])
+@pytest.mark.parametrize('durable_ack', [False, True], ids=['plain', 'durable'])
+def test_symbol_dictionary_recycle_across_sql_role_switch(
+        server_factory, request, scenario_dir, durable_ack, binding):
+    """Full logical mapping under dedup; no claim of wire exactly-once delivery."""
+    import sys
+    import time
+    import psycopg
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from qwp_symbol_recycle import symbol_batch, dictionary_snapshot
+
+    a = server_factory('a', role='primary')
+    b = server_factory('b', role='replica')
+    ap, bp = a.start(min_http=True), b.start(min_http=True)
+    assert lc.lifecycle(ap.min_http)['currentRole'].lower() == 'primary'
+    assert not lc.lifecycle(ap.min_http)['switchInFlight']
+    assert lc.lifecycle(bp.min_http)['currentRole'] == 'REPLICA'
+    assert not lc.lifecycle(bp.min_http)['switchInFlight']
+    tables = ['recycle_symbols_a', 'recycle_symbols_b']
+    expected = {table: [] for table in tables}
+    for table in tables:
+        execute_ddl(port=ap.pg, ddl=(
+            f'CREATE TABLE "{table}" (ts TIMESTAMP, row_id LONG, sym SYMBOL) '
+            'TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts,row_id)'))
+    sidecar = request.getfixturevalue(f'c_client_{binding}_sidecar')
+    sf_dir = scenario_dir / 'symbol_sf'
+    sidecar.connect(ha_connect_string(ap.http, bp.http, sf_dir, durable_ack=durable_ack)
+                    + 'sender_id=recycle;symbol_dict_reset_threshold=4;'
+                    'symbol_dict_reset_max_wait_millis=0;')
+
+    def command(line):
+        sidecar._send(line)
+        return sidecar._expect_ok()
+
+    fsns = []
+
+    def publish(phase, size, wait=True):
+        batch = symbol_batch(phase, size)
+        for row_id, symbol in batch:
+            table = tables[row_id % 2]
+            token = 'null' if symbol is None else ('empty' if symbol == '' else symbol)
+            command(f'SYMBOL {table} {row_id} {token}')
+            expected[table].append((row_id, symbol))
+        fsns.append(sidecar.flush())
+        if wait:
+            assert sidecar.await_acked(fsns[-1], 120000)
+        return list(dict.fromkeys(s for _, s in batch if s is not None))
+
+    first = publish(0, 16)
+    assert set(dictionary_snapshot(sf_dir, 'recycle')) == set(first)
+    second = publish(1, 32)
+    assert set(dictionary_snapshot(sf_dir, 'recycle')) == set(second)
+    assert first[-1] not in second
+    LOG.info('observed reset before demote: %d -> %d symbols', len(first), len(second))
+    third = publish(2, 8)
+    assert set(dictionary_snapshot(sf_dir, 'recycle')) == set(third)
+    assert submit_switch_sql(ap.pg, 'replica')
+    lc.await_role(ap.min_http, 'replica', timeout_s=60)
+    assert not lc.lifecycle(ap.min_http)['switchInFlight']
+    with pytest.raises(psycopg.Error):
+        execute_ddl(port=ap.pg, ddl=f"insert into {tables[0]} values (now(),-1,'forbidden')")
+    assert lc.lifecycle(bp.min_http)['currentRole'] == 'REPLICA'
+    assert not lc.lifecycle(bp.min_http)['switchInFlight']
+    LOG.info('A REPLICA, switch settled, write rejected; B remains REPLICA')
+    if not durable_ack:
+        for table in tables:
+            wait_count_at_least(bp.pg, table, len(expected[table]), timeout_s=120)
+        LOG.info('plain ACK operator catch-up completed')
+    # The small fresh epoch is below its hysteretic floor. Arm while offline,
+    # then prove the following publication cannot recycle pending work.
+    fourth = publish(3, 128, wait=False)
+    before = dictionary_snapshot(sf_dir, 'recycle')
+    assert set(before) == set(third) | set(fourth)
+    fifth = publish(4, 256, wait=False)
+    assert set(dictionary_snapshot(sf_dir, 'recycle')) == set(before) | set(fifth)
+    assert not sidecar.await_acked(fsns[-1], 100)
+    LOG.info('all-replica publication progressed, pending ACK prevented next reset')
+    promote_with_retry_sql(bp.pg, bp.min_http)
+    assert not lc.lifecycle(bp.min_http)['switchInFlight']
+    assert sidecar.await_acked(fsns[-1], 120000)
+    # Advisory is actually supported by Rust; coalesces with the pending arm.
+    if binding == 'rust':
+        command('RESET_SYMBOLS')
+    sixth = publish(5, 512)
+    assert set(dictionary_snapshot(sf_dir, 'recycle')) == set(sixth)
+    assert fsns == list(range(fsns[0], fsns[0] + len(fsns)))
+    LOG.info('B PRIMARY; post-promote reset observed; continuous FSNs %s', fsns)
+    for ports in (bp, ap):
+        for table in tables:
+            deadline = time.monotonic() + 120
+            while True:
+                with psycopg.connect(host='127.0.0.1', port=ports.pg, user='admin',
+                                      password='quest', dbname='qdb', autocommit=True) as conn:
+                    rows = conn.execute(f'select row_id,sym from {table} order by row_id').fetchall()
+                if len(rows) >= len(expected[table]) or time.monotonic() >= deadline:
+                    break
+                time.sleep(.1)
+            assert rows == expected[table]
+            assert len({row[0] for row in rows}) == len(rows)
+    LOG.info('complete row_id -> symbol mapping verified on A and B: %d logical rows',
+             sum(map(len, expected.values())))
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+@pytest.mark.parametrize('mode', ['auto', 'off', 'manual'])
+@pytest.mark.parametrize('source', ['chunk', 'arrow', 'polars_sf'])
+def test_symbol_dictionary_recycle_column_inputs(
+        server_factory, c_client_rust_column_sidecar, scenario_dir, source, mode):
+    """Exercise included SF APIs; polars_sf explicitly converts to pooled Arrow."""
+    import sys
+    import psycopg
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from qwp_symbol_recycle import symbol_batch, decode_dictionary
+    ports = server_factory('a', role='primary').start(min_http=True)
+    sf_dir = scenario_dir / 'column_sf'
+    sidecar = c_client_rust_column_sidecar
+    sidecar.connect(f'ws::addr=127.0.0.1:{ports.http};username=admin;password=quest;'
+                    f'sf_dir={sf_dir};symbol_dict_reset_threshold={1000000 if mode == "manual" else 4};'
+                    f'symbol_dict_reset={"off" if mode == "off" else "on"};request_durable_ack=on;')
+    expected = {}
+    previous = set()
+    for phase in range(4):
+        table = f'column_symbols_{phase % 2}'
+        if table not in expected:
+            execute_ddl(port=ports.pg, ddl=(
+                f'CREATE TABLE {table} (ts TIMESTAMP, row_id LONG, sym SYMBOL) '
+                'TIMESTAMP(ts) PARTITION BY DAY WAL'))
+            expected[table] = []
+        batch = symbol_batch(phase, 16 << phase)
+        sidecar._send(f'SYMBOLS {table} {phase} {len(batch)} {source}'
+                      + (' manual' if mode == 'manual' else ''))
+        sidecar._expect_ok(timeout=120)
+        expected[table] += batch
+        paths = list(sf_dir.glob('*/.symbol-dict'))
+        assert len(paths) == 1
+        snapshot = decode_dictionary(paths[0].read_bytes())
+        wanted_symbols = {s for _, s in batch if s is not None}
+        if mode == 'off':
+            wanted_symbols |= previous
+        assert set(snapshot) == wanted_symbols
+        previous = set(snapshot)
+        LOG.info('%s/%s phase=%d observed namespace: %d entries', source, mode, phase, len(snapshot))
+    for table, wanted in expected.items():
+        with psycopg.connect(host='127.0.0.1', port=ports.pg, user='admin',
+                              password='quest', dbname='qdb', autocommit=True) as conn:
+            rows = conn.execute(f'select row_id,sym from {table} order by row_id').fetchall()
+        assert rows == wanted
+        assert len({r[0] for r in rows}) == len(rows)

@@ -195,6 +195,32 @@ static void handle_send(const char* rest)
     reply_ok("");
 }
 
+
+/* Test-only symbol corpus verb; SEND retains its original LONG schema. */
+static void handle_symbol(const char* rest)
+{
+    char table[512], token[2048];
+    long long row_id;
+    if (!g_sender || !g_buffer) { reply_err("no sender"); return; }
+    if (sscanf(rest, "%511s %lld %2047s", table, &row_id, token) != 3)
+    { reply_err("usage: SYMBOL <table> <row_id> <null|empty|text>"); return; }
+    line_sender_error* err = NULL;
+    line_sender_table_name tn = {0, NULL};
+    line_sender_column_name sn = {0, NULL}, rn = {0, NULL};
+    line_sender_utf8 value = {0, NULL};
+    const char* text = strcmp(token, "empty") == 0 ? "" : token;
+    if (!line_sender_table_name_init(&tn, strlen(table), table, &err) ||
+        !line_sender_column_name_init(&sn, 3, "sym", &err) ||
+        !line_sender_column_name_init(&rn, 6, "row_id", &err) ||
+        !line_sender_utf8_init(&value, strlen(text), text, &err) ||
+        !line_sender_buffer_table(g_buffer, tn, &err) ||
+        (strcmp(token, "null") != 0 && !line_sender_buffer_symbol(g_buffer, sn, value, &err)) ||
+        !line_sender_buffer_column_i64(g_buffer, rn, row_id, &err) ||
+        !line_sender_buffer_at_micros(g_buffer, 1700000000000000LL + row_id, &err))
+    { reply_err_from(err); return; }
+    reply_ok("");
+}
+
 static void handle_flush(void)
 {
     if (!g_sender || !g_buffer)
@@ -350,6 +376,8 @@ int main(void)
             handle_connect(rest);
         else if (strcmp(verb, "SEND") == 0)
             handle_send(rest);
+        else if (strcmp(verb, "SYMBOL") == 0)
+            handle_symbol(rest);
         else if (strcmp(verb, "FLUSH") == 0)
             handle_flush();
         else if (strcmp(verb, "AWAIT_ACKED") == 0)

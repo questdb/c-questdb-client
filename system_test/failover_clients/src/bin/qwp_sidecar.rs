@@ -169,6 +169,32 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             let _ = sender;
             reply_ok(out, "")
         }
+        "SYMBOL" => {
+            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+            if parts.len() != 3 {
+                return Err("usage: SYMBOL <table> <row_id> <null|empty|text>".into());
+            }
+            let row_id: i64 = parts[1].parse().map_err(|_| "invalid row_id")?;
+            let buf = state.buf.as_mut().ok_or("no buffer")?;
+            buf.table(parts[0]).map_err(|e| e.to_string())?;
+            if parts[2] != "null" {
+                let value = if parts[2] == "empty" { "" } else { parts[2] };
+                buf.symbol("sym", value).map_err(|e| e.to_string())?;
+            }
+            buf.column_i64("row_id", row_id)
+                .and_then(|b| b.at(TimestampMicros::new(1_700_000_000_000_000 + row_id)))
+                .map_err(|e| e.to_string())?;
+            reply_ok(out, "")
+        }
+        "RESET_SYMBOLS" => {
+            state
+                .sender
+                .as_mut()
+                .ok_or("no sender")?
+                .reset_symbol_dictionary()
+                .map_err(|e| e.to_string())?;
+            reply_ok(out, "")
+        }
         "FLUSH" => {
             let sender = state
                 .sender

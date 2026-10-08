@@ -121,3 +121,47 @@ out-pointers, or C++ exceptions. Server-side data errors follow the transport
 contracts above. See the [QuestDB data type reference](https://questdb.com/docs/reference/sql/datatypes/)
 and [server logs](https://questdb.com/docs/troubleshooting/log/) when diagnosing
 rejected or disconnected writes.
+
+## QWP/WebSocket symbol dictionary recycling
+
+Store-and-forward senders automatically recycle their connection-scoped symbol
+namespace at a safe publication boundary. The connect-string settings are:
+
+| Setting | Default | Range |
+| --- | --- | --- |
+| `symbol_dict_reset` | `on` | `on`, `off` |
+| `symbol_dict_reset_threshold` | `100000` | `1`–`1000000` distinct symbols |
+| `symbol_dict_reset_max_wait_millis` | `2000` | `0`–`9223372036854` milliseconds |
+
+A successful publication reaching the threshold arms recycling; a later nonempty
+flush can execute it after all pending frames have reached the required ACK and
+there is no open deferred-commit group. Appending a symbol does not reset the
+dictionary. After a reset, the automatic rearm floor is at least twice the old
+namespace's size, capped at one million; the configured threshold still applies.
+This hysteresis reduces repeated work, but live sets of one million or more can
+recycle repeatedly. `symbol_dict_reset=off` may suit a bounded set below two
+million symbols, provided it also fits the UTF-8 heap cap.
+
+Once an arm has aged by `symbol_dict_reset_max_wait_millis`, an eligible live
+flush may wait for progress for at most that duration, once per arm. Zero disables
+that wait, not recycling. An outage or deferred group postpones recycling. Armed
+age survives pool return and reborrow, so the next borrower may pay the one bounded
+wait. Retained queue bytes and SF side-files are not a new hard dictionary-memory
+budget: the existing two-million-entry and 256 MiB cumulative UTF-8 limits still
+apply, and a large individual publication can hit either before a reset is safe.
+
+Rust `Sender::reset_symbol_dictionary` and the corresponding borrowed sender
+advisory method coalesce requests for a later safe boundary. They do not flush,
+wait, reconnect, or guarantee completion; disabled recycling is a no-op. C and C++
+inherit automatic settings through their existing connect strings; there is no
+new C manual-reset API. Public FSNs remain continuous across recycling within one
+sender lifetime. They are not a persisted, cross-process epoch sequence.
+
+This applies to memory and disk SF, background and manual progress, standalone
+and pooled senders, and their Buffer, Chunk, Arrow, and Polars-to-Arrow ingestion
+paths. The direct whole-source backend (`BorrowedDirectColumnSender`, including
+`QuestDb::flush_polars_dataframe`) is excluded: it keeps its `spent` /
+`SymbolDictFull`, commit, and reborrow behavior. A pool can expose both kinds of
+sender. Recycling does not strengthen ordinary write durability or delivery
+certainty; replay plus server deduplication establishes logical no-loss, not wire
+exactly-once delivery.
