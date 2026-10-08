@@ -466,7 +466,14 @@ impl SharedOidcAuth {
         // fires *after* the token is committed -- was refused a token that was
         // sitting in the cache, as was any sender, reader or pool it flushed
         // from there. Only an acquisition, which would block, is still refused.
-        if self.callback_is_active() {
+        //
+        // A transport that saw a callback running and therefore pulls on its
+        // own thread (`questdb::token_pull_must_not_block`) takes the same
+        // path even if that callback has returned since: nothing can interrupt
+        // that thread while it waits for the acquisition lock, so a sender
+        // close would stall behind a peer's slow refresh. It retries on its
+        // next attempt, through the cancellable isolated worker.
+        if self.callback_is_active() || questdb::token_pull_must_not_block() {
             if let Some(cached) = self.inner.cached_token() {
                 return cached.map_err(Into::into);
             }
@@ -6472,6 +6479,66 @@ mod callback_wait_regressions {
         );
         let msg = result.expect_err("no token is available while the callback runs");
         assert!(msg.contains("busy"), "unexpected error: {msg}");
+    }
+
+    /// Regression: a transport that saw a callback running pulls on its own
+    /// thread, where a transport shutdown cannot interrupt it. When that
+    /// callback returned before this check, the pull waited for the
+    /// acquisition lock behind a peer's refresh, and `line_sender_close`
+    /// stalled for the runner-stop budget. Marked non-blocking, it must fail
+    /// fast as busy even though no callback is running any more.
+    #[test]
+    fn nonblocking_transport_pull_does_not_wait_for_a_peer_refresh() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let inner = OidcDeviceAuth::builder()
+            .client_id("questdb-c")
+            .scope("openid")
+            .token_endpoint("http://127.0.0.1:9/token")
+            .device_authorization_endpoint("http://127.0.0.1:9/device")
+            .allow_insecure_transport(true)
+            .interactive(false)
+            .open_browser(false)
+            .timeout(Duration::from_millis(1000))
+            .token_store(GatedFailingLoadStore {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            })
+            .build()
+            .unwrap();
+        let auth = SharedOidcAuth {
+            inner: Arc::new(inner),
+            event_handler: None,
+            diagnostic: None,
+            token_provider_isolation: TokenProviderIsolation::default(),
+        };
+
+        // A peer takes the acquisition lock and blocks inside the store read.
+        let refresher = std::thread::spawn({
+            let auth = auth.clone();
+            move || {
+                let _ = auth.token();
+            }
+        });
+        while !entered.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let started = Instant::now();
+        let result = questdb::with_nonblocking_token_pull(|| auth.token());
+        let elapsed = started.elapsed();
+        release.store(true, Ordering::Release);
+        refresher.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a non-blocking pull waited {elapsed:?} for the peer's refresh"
+        );
+        let err = result.expect_err("no cached token is available");
+        assert!(
+            err.msg().contains("busy"),
+            "unexpected error: {}",
+            err.msg()
+        );
+        assert_eq!(err.code(), ErrorCode::SocketError);
     }
 
     // ---- sibling auth flushed from a shared-target event callback ---------

@@ -172,6 +172,55 @@ impl Drop for IsolatedProviderPermit<'_> {
     }
 }
 
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+thread_local! {
+    static NONBLOCKING_TOKEN_PULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `pull` with the calling thread marked as making a token pull that must
+/// not block on the provider's acquisition lock. See
+/// [`token_pull_must_not_block`].
+#[doc(hidden)]
+pub fn with_nonblocking_token_pull<R>(pull: impl FnOnce() -> R) -> R {
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    {
+        struct Restore(Option<bool>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(previous) = self.0 {
+                    let _ = NONBLOCKING_TOKEN_PULL.try_with(|flag| flag.set(previous));
+                }
+            }
+        }
+        let _restore = Restore(
+            NONBLOCKING_TOKEN_PULL
+                .try_with(|flag| flag.replace(true))
+                .ok(),
+        );
+        pull()
+    }
+    #[cfg(not(any(feature = "_sender-qwp-ws", feature = "_egress")))]
+    pull()
+}
+
+/// Whether the provider closure now running was invoked by a transport that
+/// observed one of the auth's callbacks running and pulls on its own thread,
+/// where a blocking acquisition cannot be interrupted by the transport's
+/// shutdown. A binding's provider must then serve a valid cached token or fail
+/// with a retryable "busy" error instead of waiting for its acquisition lock,
+/// even if the callback has returned in the meantime.
+#[doc(hidden)]
+pub fn token_pull_must_not_block() -> bool {
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    {
+        NONBLOCKING_TOKEN_PULL
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(feature = "_sender-qwp-ws", feature = "_egress")))]
+    false
+}
+
 /// User-facing text for "a rotating token provider and static credentials were
 /// both configured".
 ///
@@ -389,7 +438,15 @@ impl TokenProvider {
 
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     fn resolve_during_callback(&self) -> crate::Result<String> {
-        let result = self.bearer_header();
+        // This pull runs on the transport's own thread, outside the isolated
+        // worker, so nothing can interrupt it if it blocks: a transport
+        // shutdown is observed only between pulls. The binding's own
+        // callback check serves a valid cache or fails fast, but the callback
+        // seen above may already have returned by the time the binding looks,
+        // and the pull would then wait for the acquisition lock (up to the
+        // auth's bounded acquisition wait). Tell the binding that this pull
+        // must not block, whatever its own check now sees.
+        let result = with_nonblocking_token_pull(|| self.bearer_header());
         #[cfg(feature = "_sender-qwp-ws")]
         self.callback_blocked
             .store(result.is_err(), Ordering::Release);
@@ -1320,6 +1377,47 @@ mod tests {
                 provider.bearer_header_isolated_until(|| false).unwrap(),
                 "Bearer tok-iso"
             );
+        }
+
+        /// Regression: a pull resolved on the transport's own thread because a
+        /// callback was running reached the binding as an ordinary, blocking
+        /// pull whenever that callback returned before the binding's own
+        /// check. Nothing interrupts that thread, so a sender close stalled
+        /// behind a peer's slow refresh. Only that path is marked non-blocking;
+        /// the isolated worker, which shutdown can abandon, is not.
+        #[test]
+        fn callback_path_pull_is_marked_nonblocking_but_worker_pull_is_not() {
+            let callback_active = Arc::new(AtomicBool::new(true));
+            let isolation = TokenProviderIsolation::with_callback_guards(
+                {
+                    let callback_active = Arc::clone(&callback_active);
+                    move || callback_active.load(Ordering::SeqCst)
+                },
+                || false,
+            );
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = TokenProvider::new_with_isolation(
+                {
+                    let seen = Arc::clone(&seen);
+                    move || {
+                        seen.lock()
+                            .unwrap()
+                            .push(crate::token_provider::token_pull_must_not_block());
+                        Ok::<_, crate::Error>("tok".to_string())
+                    }
+                },
+                isolation,
+            );
+
+            assert!(!crate::token_provider::token_pull_must_not_block());
+            provider.bearer_header_isolated_until(|| false).unwrap();
+            assert!(
+                !crate::token_provider::token_pull_must_not_block(),
+                "the mark must not outlive the pull"
+            );
+            callback_active.store(false, Ordering::SeqCst);
+            provider.bearer_header_isolated_until(|| false).unwrap();
+            assert_eq!(*seen.lock().unwrap(), vec![true, false]);
         }
 
         #[cfg(feature = "_sender-qwp-ws")]

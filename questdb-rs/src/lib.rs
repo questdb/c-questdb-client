@@ -50,7 +50,9 @@ mod token_provider;
     feature = "_egress"
 ))]
 #[doc(hidden)]
-pub use token_provider::TokenProviderIsolation;
+pub use token_provider::{
+    TokenProviderIsolation, token_pull_must_not_block, with_nonblocking_token_pull,
+};
 
 // JKS / PKCS#12 trust-store loader for `tls_roots_password`. Pulled
 // in only for the QWP transports — matches the Java reference's
