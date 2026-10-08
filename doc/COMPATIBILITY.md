@@ -38,12 +38,19 @@ as soon as it exists.
 | C language | C11 |
 | C++ language | C++17 |
 | CMake | 3.15 |
-| Arrow crate | `>=58, <60` |
+| Published `questdb-rs` Arrow crate | `>=58, <60` |
+| `questdb-rs-ffi` artifact Arrow crate | `=59.0.0` |
 | Polars crates | `>=0.52, <0.55` |
 
 Rust 1.91.1 applies to `questdb-rs`, all features advertised on docs.rs, and
 the Rust FFI crate used by C and C++. CI also tests current stable, beta, and
 nightly Rust.
+
+The published Rust library keeps its compatible Arrow range for downstream
+resolution. The unpublished FFI crate used by C/Python artifacts requires
+Arrow 59.0.0, and its tracked lockfile pins the complete Arrow implementation
+family to that version. Artifact builds use the lockfile so the version-specific
+C Data Interface preflight cannot silently resolve a different implementation.
 
 The supported native platforms are Linux, macOS, and Windows. CI covers GCC or
 Clang on Linux, Apple Clang on macOS, and the MSVC toolsets installed on the
@@ -55,3 +62,15 @@ releases do not contain pre-built native libraries.
 Python, Java, Maven, and a local QuestDB checkout are needed only for the
 repository's live-server test harness. They are not runtime dependencies of the
 client library.
+
+## Arrow input limits
+
+Arrow data passed through the C, C++, or Python API may carry at most 64 MiB
+of field metadata in total across all columns of one batch. A batch over the
+limit is rejected with an error and nothing is sent. Earlier releases did not
+enforce this limit.
+
+In practice only Polars `Enum` columns come near it, because each one carries
+its full category list. That means several million categories in one column,
+or a large category list shared by several columns. Cast such columns to
+`pl.Categorical` before ingestion.

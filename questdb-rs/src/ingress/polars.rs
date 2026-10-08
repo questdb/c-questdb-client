@@ -435,9 +435,10 @@ impl crate::db::BorrowedDirectColumnSender<'_> {
     /// `PolarsIngestOptions::default()` preserves the previous behaviour
     /// (server-assigned timestamps, schema-derived wire types).
     ///
-    /// Unlike the lower-level `flush` / `flush_arrow_batch_*`, which leave rows
-    /// uncommitted until you call [`BorrowedDirectColumnSender::commit`], this entry
-    /// owns the commit (and the failover replay boundary).
+    /// Unlike the lower-level `flush` / `flush_arrow_batch_*`, this entry owns
+    /// the commit and failover replay boundary. A fresh connection's first
+    /// publish-only flush is itself an eager commit boundary; subsequent
+    /// publish-only frames remain deferred until a checkpoint.
     ///
     /// [`BorrowedDirectColumnSender::commit`]: crate::db::BorrowedDirectColumnSender::commit
     ///
@@ -483,28 +484,47 @@ impl crate::db::BorrowedDirectColumnSender<'_> {
         // failure re-drives only the tail past this.
         let mut committed = 0usize;
 
-        loop {
-            let committed_before = committed;
-            match drive_from_checkpoint(self, table, df, options, &mut committed) {
-                Ok(()) => return Ok(()),
-                Err(err) if err.code() != crate::ErrorCode::FailoverRetry => return Err(err),
-                Err(err) => {
-                    // `reborrow_with_retry` returns as soon as a replacement
-                    // connection opens, so a server that accepts connections but
-                    // never advances acks would otherwise re-drive the tail
-                    // forever (unbounded duplicate writes). Bound the retries by
-                    // the reconnect budget, refreshed whenever a checkpoint makes
-                    // progress so a steadily-advancing ingest is never cut short.
-                    if committed > committed_before {
-                        deadline = std::time::Instant::now()
-                            .checked_add(self.reconnect_policy().max_duration());
-                    } else if crate::db::reconnect_deadline_expired(deadline) {
-                        return Err(err);
+        // This flag belongs to the whole DataFrame call, not a connection or
+        // the internal checkpoint used to retry its tail.
+        let mut published = false;
+        let result = (|| {
+            loop {
+                let committed_before = committed;
+                match drive_from_checkpoint(
+                    self,
+                    table,
+                    df,
+                    options,
+                    &mut committed,
+                    &mut published,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(err) if err.code() != crate::ErrorCode::FailoverRetry => return Err(err),
+                    Err(err) => {
+                        // A failed attempt may have published part of its first
+                        // batch. Keep that uncertainty across replacement too.
+                        published |= err.in_doubt();
+                        // `reborrow_with_retry` returns as soon as a replacement
+                        // connection opens, so a server that accepts connections but
+                        // never advances acks would otherwise re-drive the tail
+                        // forever (unbounded duplicate writes). Bound the retries by
+                        // the reconnect budget, refreshed whenever a checkpoint makes
+                        // progress so a steadily-advancing ingest is never cut short.
+                        if committed > committed_before {
+                            deadline = std::time::Instant::now()
+                                .checked_add(self.reconnect_policy().max_duration());
+                        } else if crate::db::reconnect_deadline_expired(deadline) {
+                            return Err(err);
+                        }
+                        self.reborrow_with_retry(deadline)?;
                     }
-                    self.reborrow_with_retry(deadline)?;
                 }
             }
-        }
+        })();
+        result.map_err(|err: crate::Error| {
+            let in_doubt = published || err.in_doubt();
+            err.with_in_doubt(in_doubt)
+        })
     }
 }
 
@@ -529,6 +549,12 @@ impl crate::db::QuestDb {
     /// configured reconnect budget, and returns only once the whole `df` is
     /// committed. A re-driven tail can produce **duplicate rows** unless the
     /// destination table has `DEDUP UPSERT KEYS` covering them.
+    ///
+    /// On failure, [`Error::in_doubt`](crate::Error::in_doubt) covers the whole
+    /// DataFrame: it is true if any batch may have been delivered, including
+    /// batches confirmed by an earlier checkpoint. This also applies to local
+    /// validation failures after publication. A false flag does not make a
+    /// validation error retryable; correct the input first.
     ///
     /// [`TableName`]: crate::ingress::TableName
     /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
@@ -561,6 +587,7 @@ fn drive_from_checkpoint(
     df: &DataFrame,
     options: &PolarsIngestOptions<'_>,
     committed: &mut usize,
+    published: &mut bool,
 ) -> Result<()> {
     // No caller-named level falls back to the connect string's default — the
     // same level the store-and-forward senders use for this pool.
@@ -595,6 +622,7 @@ fn drive_from_checkpoint(
                 sender.flush_arrow_batch_at_now_and_wait(table, &rb, options.overrides, ack)?
             }
         }
+        *published = true;
         if checkpoint {
             // The ACKing flush committed the boundary covering every batch up
             // to and including this one.
@@ -676,7 +704,7 @@ mod tests {
             ("u", 16, ArrowColumnOverride::Uuid { column: "u" }),
             ("l", 32, ArrowColumnOverride::Long256 { column: "l" }),
         ] {
-            let values = vec![vec![0u8; width], vec![1u8; width]];
+            let values = [vec![0u8; width], vec![1u8; width]];
             let vals: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
             let s = Series::new(PlSmallStr::from(name), vals);
             let df = crate::polars_ffi::df_from_columns(vec![s.into_column()]).unwrap();
@@ -687,9 +715,7 @@ mod tests {
                 "Polars Binary must export as BinaryView; if this changes, \
                  re-check the override applicability list"
             );
-            let kind =
-                classify_with_override(rb.schema().field(0), rb.column(0).as_ref(), Some(ov))
-                    .unwrap();
+            let kind = classify_with_override(rb.schema().field(0), Some(ov)).unwrap();
             assert!(
                 matches!(
                     (name, kind),
