@@ -513,10 +513,12 @@ encoded into UDP datagrams during [`flush()`](Sender::flush), so
 QWP/WebSocket store-and-forward senders accept `symbol_dict_reset=on|off`
 (default `on`), `symbol_dict_reset_threshold=1..1000000` (default `100000`),
 and `symbol_dict_reset_max_wait_millis=0..9223372036854` (default `2000`).
-A successful publication arms recycling, which runs at a later nonempty safe
-flush after pending ACKs and any deferred-commit group have completed. After a
-reset, automatic rearming requires at least twice the old dictionary size, capped
-at one million, as well as the configured threshold. Live sets at or above one
+When recycling is enabled, a successful publication that reaches both the
+configured threshold and the current hysteretic floor arms recycling. Recycling
+runs at the next eligible nonempty safe flush after pending ACKs and any
+deferred-commit group have completed. After a reset, automatic rearming requires
+at least twice the old dictionary size, capped at one million, as well as the
+configured threshold. Live sets at or above one
 million may therefore recycle repeatedly; `off` may suit bounded sets below two
 million, subject to the 256 MiB cumulative symbol UTF-8 cap.
 

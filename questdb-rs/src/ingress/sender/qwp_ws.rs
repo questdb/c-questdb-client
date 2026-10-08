@@ -7350,16 +7350,60 @@ mod tests {
         runner.shutdown_timeout = Duration::from_millis(10);
         assert!(runner.request_recycle(None).is_err());
         runner.begin_close();
-        assert!(runner.drain_to_deadline(Some(Instant::now())).is_err());
+        let error = runner.drain_to_deadline(Some(Instant::now())).unwrap_err();
+        assert!(error.msg().contains("waiting for recycled worker"));
+        assert_eq!(runner.lifecycle.load(), PublicationState::Closing);
+        assert!(runner.pending_recycle.is_some());
+        assert!(!runner.thread.as_ref().unwrap().is_finished());
+        // Close has started, but the channel still holds the accepted worker.
+        // Probe before releasing it so exclusion does not depend on scheduling.
+        assert_recycle_slot_locked(&options.sf_dir, &options.sender_id, "blocked close");
         assert!(matches!(
             SfaSlotQueue::open(options.clone()),
             Err(SfaQueueError::SlotInUse { .. })
         ));
+        assert!(!runner.thread.as_ref().unwrap().is_finished());
         release_tx.send(()).unwrap();
         runner
             .drain_to_deadline(Some(Instant::now() + Duration::from_secs(5)))
             .unwrap();
-        SfaSlotQueue::open(options).unwrap();
+        assert!(runner.thread.is_none());
+        let mut reopened = SfaSlotQueue::open(options.clone()).unwrap();
+        reopened.close().unwrap();
+        SfaSlotQueue::open_replay_only_existing(SfaQueueOptions {
+            slot_dir: options.sf_dir.join(&options.sender_id),
+            segment_size_bytes: options.segment_size_bytes,
+            max_bytes: options.max_bytes,
+            periodic_sync_interval: options.periodic_sync_interval,
+        })
+        .unwrap();
+    }
+
+    pub(super) fn assert_recycle_slot_locked(root: &std::path::Path, sender_id: &str, phase: &str) {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ingress::sender::qwp_ws_sfa_slot::tests::qwp_ws_sfa_slot_child_process_lock_helper",
+                "--ignored",
+            ])
+            .env("QDB_SFA_SLOT_CHILD_MODE", "probe-locked")
+            .env("QDB_SFA_SLOT_CHILD_SF_DIR", root)
+            .env("QDB_SFA_SLOT_CHILD_SENDER_ID", sender_id)
+            .output()
+            .unwrap();
+        let orphan = SfaSlotQueue::open_replay_only_existing(SfaQueueOptions {
+            slot_dir: root.join(sender_id),
+            segment_size_bytes: 4096,
+            max_bytes: 32768,
+            periodic_sync_interval: None,
+        });
+        assert!(
+            result.status.success() && matches!(orphan, Err(SfaQueueError::SlotInUse { .. })),
+            "slot exclusion during {phase}: external contender status={}, stdout={}, stderr={}, orphan={orphan:?}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
+        );
     }
 
     #[test]
@@ -8133,7 +8177,7 @@ mod publication_recycle_tests {
 
     #[test]
     fn recycle_slot_contender_during_every_phase() {
-        use super::super::qwp_ws_sfa_queue::{RECYCLE_OBSERVER, SfaQueueError, SfaQueueOptions};
+        use super::super::qwp_ws_sfa_queue::{RECYCLE_OBSERVER, SfaQueueError};
         let server = Server::new();
         let dir = tempfile::TempDir::new().unwrap();
         let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};sf_dir={};sender_id=contender;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port, dir.path().display())).unwrap().build().unwrap();
@@ -8151,18 +8195,12 @@ mod publication_recycle_tests {
         let root = dir.path().to_path_buf();
         let probes = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&probes);
-        RECYCLE_OBSERVER.with(|observer| *observer.borrow_mut() = Some(Box::new(move |phase| {
-            let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "ingress::sender::qwp_ws_sfa_slot::tests::qwp_ws_sfa_slot_child_process_lock_helper", "--ignored"])
-                .env("QDB_SFA_SLOT_CHILD_MODE", "probe-locked")
-                .env("QDB_SFA_SLOT_CHILD_SF_DIR", &root)
-                .env("QDB_SFA_SLOT_CHILD_SENDER_ID", "contender")
-                .output().unwrap();
-            assert!(result.status.success(), "external contender acquired during {phase}: {}", String::from_utf8_lossy(&result.stdout));
-            let orphan = SfaSlotQueue::open_replay_only_existing(SfaQueueOptions { slot_dir: root.join("contender"), segment_size_bytes: 4096, max_bytes: 32768, periodic_sync_interval: None });
-            assert!(matches!(orphan, Err(SfaQueueError::SlotInUse { .. })), "orphan drainer acquired during {phase}");
-            recorded.lock().unwrap().push(phase);
-        })));
+        RECYCLE_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move |phase| {
+                super::tests::assert_recycle_slot_locked(&root, "contender", phase);
+                recorded.lock().unwrap().push(phase);
+            }))
+        });
         FAIL_NEXT_RECYCLE_SPAWN.with(|fault| fault.set(true));
         buffer
             .table("trades")
@@ -8179,7 +8217,7 @@ mod publication_recycle_tests {
                 .contains("spawn failure")
         );
         super::super::qwp_ws_sfa_queue::observe_recycle_phase("failed resume");
-        super::super::qwp_ws_sfa_queue::observe_recycle_phase("close");
+        super::super::qwp_ws_sfa_queue::observe_recycle_phase("pre-close");
         RECYCLE_OBSERVER.with(|observer| observer.borrow_mut().take());
         let probes = probes.lock().unwrap();
         assert!(probes.contains(&"accepted park"));
@@ -8189,7 +8227,7 @@ mod publication_recycle_tests {
             "observed {probes:?}"
         );
         assert!(probes.contains(&"failed resume"));
-        assert!(probes.contains(&"close"));
+        assert!(probes.contains(&"pre-close"));
         sender.close_drain().unwrap();
         drop(sender);
         let options = SfaSlotOptions {

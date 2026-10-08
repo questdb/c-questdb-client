@@ -455,8 +455,24 @@ struct SfaDrainedReset {
     candidate_path: Option<PathBuf>,
     candidate_creation_started: bool,
     obsolete: Option<VecDeque<PathBuf>>,
-    phase: u8,
+    phase: SfaDrainedResetPhase,
     next_fsn: u64,
+}
+
+/// In-memory retry position; advance only after the phase's work succeeds.
+#[derive(Debug, Clone, Copy)]
+enum SfaDrainedResetPhase {
+    EnumerateObsolete,
+    WriteWatermark,
+    SyncWatermark,
+    PrepareCandidate,
+    SyncCandidateDirectory,
+    RewriteFirstManifestRecord,
+    RewriteSecondManifestRecord,
+    InstallCandidate,
+    RemoveObsolete,
+    SyncCleanupDirectory,
+    Complete,
 }
 
 #[derive(Debug)]
@@ -1288,7 +1304,7 @@ impl SfaFrameQueue {
                 candidate_path,
                 candidate_creation_started: false,
                 obsolete: None,
-                phase: 0,
+                phase: SfaDrainedResetPhase::EnumerateObsolete,
                 next_fsn: producer.next_fsn,
             });
         }
@@ -1485,9 +1501,9 @@ impl SfaDrainedReset {
         producer: &mut SfaProducer,
     ) -> Result<(), SfaQueueError> {
         let dir = engine.slot_dir.as_deref();
-        while self.phase < 10 {
-            match self.phase {
-                0 => {
+        loop {
+            self.phase = match self.phase {
+                SfaDrainedResetPhase::EnumerateObsolete => {
                     // Complete enumeration before any unlink. Preserve errors,
                     // including a failure partway through a directory iterator.
                     if let Some(dir) = dir {
@@ -1505,8 +1521,9 @@ impl SfaDrainedReset {
                         });
                         self.obsolete = Some(paths.into());
                     }
+                    SfaDrainedResetPhase::WriteWatermark
                 }
-                1 => {
+                SfaDrainedResetPhase::WriteWatermark => {
                     if let Some(watermark) = watermark.as_mut() {
                         let fsn = self
                             .next_fsn
@@ -1517,13 +1534,15 @@ impl SfaDrainedReset {
                             .unwrap_or(-1);
                         watermark.write(fsn)?;
                     }
+                    SfaDrainedResetPhase::SyncWatermark
                 }
-                2 => {
+                SfaDrainedResetPhase::SyncWatermark => {
                     if let Some(watermark) = watermark.as_mut() {
                         watermark.sync_data()?;
                     }
+                    SfaDrainedResetPhase::PrepareCandidate
                 }
-                3 => {
+                SfaDrainedResetPhase::PrepareCandidate => {
                     if self.candidate.is_none() {
                         let segment = match self.candidate_path.as_ref() {
                             Some(path) => {
@@ -1558,20 +1577,29 @@ impl SfaDrainedReset {
                             .rebase_empty(self.next_fsn)?;
                     }
                     candidate.segment.sync_header()?;
+                    SfaDrainedResetPhase::SyncCandidateDirectory
                 }
-                4 => {
+                SfaDrainedResetPhase::SyncCandidateDirectory => {
                     if let Some(dir) = dir {
                         sync_directory(dir)?;
                     }
+                    SfaDrainedResetPhase::RewriteFirstManifestRecord
                 }
-                5 | 6 => {
+                SfaDrainedResetPhase::RewriteFirstManifestRecord => {
                     if let Some(manifest) = self.manifest.as_mut() {
                         // Both records must exclude old frames before their IDs can
                         // be reused, including recovery after either record tears.
                         manifest.rewrite(self.next_fsn, self.next_fsn)?;
                     }
+                    SfaDrainedResetPhase::RewriteSecondManifestRecord
                 }
-                7 => {
+                SfaDrainedResetPhase::RewriteSecondManifestRecord => {
+                    if let Some(manifest) = self.manifest.as_mut() {
+                        manifest.rewrite(self.next_fsn, self.next_fsn)?;
+                    }
+                    SfaDrainedResetPhase::InstallCandidate
+                }
+                SfaDrainedResetPhase::InstallCandidate => {
                     let candidate = self.candidate.as_ref().unwrap();
                     let mut state = engine.lock_state()?;
                     state.sync_scratch.clear();
@@ -1584,8 +1612,9 @@ impl SfaDrainedReset {
                     if let Some(paths) = self.obsolete.as_mut() {
                         paths.retain(|path| Some(path.as_path()) != candidate.path());
                     }
+                    SfaDrainedResetPhase::RemoveObsolete
                 }
-                8 => {
+                SfaDrainedResetPhase::RemoveObsolete => {
                     if let Some(paths) = self.obsolete.as_mut() {
                         while let Some(path) = paths.front() {
                             remove_file_if_exists(path)?;
@@ -1594,19 +1623,19 @@ impl SfaDrainedReset {
                             recycle_barrier("segment unlinked")?;
                         }
                     }
+                    SfaDrainedResetPhase::SyncCleanupDirectory
                 }
-                9 => {
+                SfaDrainedResetPhase::SyncCleanupDirectory => {
                     if let Some(dir) = dir {
                         sync_directory(dir)?;
                     }
+                    SfaDrainedResetPhase::Complete
                 }
-                _ => unreachable!(),
-            }
-            self.phase += 1;
+                SfaDrainedResetPhase::Complete => return Ok(()),
+            };
             #[cfg(test)]
             recycle_barrier("reset phase")?;
         }
-        Ok(())
     }
 }
 
