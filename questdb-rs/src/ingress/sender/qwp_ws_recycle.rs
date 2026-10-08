@@ -172,7 +172,6 @@ impl RecyclePolicy {
     }
 
     /// Advisory requests bypass the dictionary size gate when enabled.
-    #[allow(dead_code)] // Advisory publication API follows separately.
     pub(crate) fn request_reset(&mut self, now: Instant, _dict_size: usize) {
         if self.settings.enabled {
             self.arm(now);

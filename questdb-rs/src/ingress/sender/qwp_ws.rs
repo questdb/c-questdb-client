@@ -620,6 +620,15 @@ macro_rules! foreground_recycle_api {
             self.publication_recycle = Some(recycle);
             result
         }
+        pub(crate) fn reset_symbol_dictionary(&mut self) -> crate::Result<()> {
+            self.check_advisory_state()?;
+            self.publication_recycle
+                .as_mut()
+                .unwrap()
+                .policy
+                .request_reset(Instant::now(), 0);
+            Ok(())
+        }
         pub(crate) fn after_publication(&mut self, symbol_count: usize) {
             self.publication_recycle
                 .as_mut()
@@ -765,6 +774,13 @@ pub(crate) struct SyncQwpWsHandlerState {
 }
 
 impl SyncQwpWsHandlerState {
+    fn check_advisory_state(&self) -> crate::Result<()> {
+        self.runner.check_error()?;
+        if self.runner.lifecycle.load() == PublicationState::Closing {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        Ok(())
+    }
     pub(crate) fn needs_recycle_boundary(&self) -> bool {
         self.publication_recycle.as_ref().unwrap().policy.is_armed()
             || self.pending_recycle_boundary().is_some()
@@ -959,6 +975,13 @@ pub(crate) struct ManualQwpWsHandlerState {
 }
 
 impl ManualQwpWsHandlerState {
+    fn check_advisory_state(&self) -> crate::Result<()> {
+        check_manual_driver_error(self)?;
+        if self.store.lifecycle().load() == PublicationState::Closing {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        Ok(())
+    }
     foreground_recycle_api!();
     pub(crate) fn pending_recycle_boundary(&self) -> Option<Option<u64>> {
         self.recycle
@@ -7881,6 +7904,113 @@ mod publication_recycle_tests {
             super::super::SyncProtocolHandler::SyncQwpWs(state) => state,
             _ => panic!("background sender expected"),
         }
+    }
+
+    #[test]
+    fn recycle_observation_three_epochs_retained_observers() {
+        let server = Server::new();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=100000;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap().connection_listener(Arc::new(|_| {}), 0).unwrap().build().unwrap();
+        let source = Arc::clone(sender.conn_events.as_ref().unwrap());
+        let lifecycle = state(&mut sender).runner.lifecycle.clone();
+        let shared_identity = Arc::as_ptr(&state(&mut sender).runner.shared);
+        let ok_upper = Arc::clone(&state(&mut sender).runner.ok_completed_upper);
+        let progress = state(&mut sender)
+            .runner
+            .shared
+            .lock()
+            .unwrap()
+            .progress_view();
+        let mut buffer = sender.new_buffer();
+        for epoch in 0..3 {
+            if epoch > 0 {
+                assert!(Arc::ptr_eq(&source, sender.conn_events.as_ref().unwrap()));
+                assert_eq!(lifecycle.load(), PublicationState::Open);
+                let before = sender.qwp_ws_totals().unwrap();
+                sender.reset_symbol_dictionary().unwrap();
+                let handler = state(&mut sender);
+                let mut encoder = handler.encoder.take().unwrap();
+                handler
+                    .before_publication(&mut encoder, true, false)
+                    .unwrap();
+                assert_eq!(encoder.symbol_count(), 0);
+                handler.encoder = Some(encoder);
+                assert_eq!(shared_identity, Arc::as_ptr(&handler.runner.shared));
+                assert!(Arc::ptr_eq(&ok_upper, &handler.runner.ok_completed_upper));
+                let boundary = Some(epoch * 2 - 1);
+                assert_eq!(sender.published_fsn().unwrap(), boundary);
+                assert_eq!(sender.acked_fsn().unwrap(), boundary);
+                assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), boundary);
+                assert_eq!(progress.completed_fsn(), boundary);
+                sender.wait(AckLevel::Ok, Duration::from_millis(1)).unwrap();
+                let after = sender.qwp_ws_totals().unwrap();
+                assert_eq!(
+                    (
+                        after.frames_sent,
+                        after.frames_replayed,
+                        after.acks,
+                        after.server_errors
+                    ),
+                    (
+                        before.frames_sent,
+                        before.frames_replayed,
+                        before.acks,
+                        before.server_errors
+                    )
+                );
+            }
+            for row in 0..2 {
+                buffer
+                    .table("trades")
+                    .unwrap()
+                    .symbol("sym", if row == 0 { "alpha" } else { "beta" })
+                    .unwrap()
+                    .at_now()
+                    .unwrap();
+                let boundary = epoch * 2 + row;
+                assert_eq!(
+                    sender.flush_and_get_fsn(&mut buffer).unwrap(),
+                    Some(boundary)
+                );
+                sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                assert_eq!(server.frame().0, epoch as usize);
+                assert_eq!(
+                    progress.completed_fsn(),
+                    Some(boundary),
+                    "observer retained before all resets must see later targets advance"
+                );
+                assert_eq!(ok_upper.load(Ordering::Acquire), boundary + 1);
+                assert_eq!(
+                    state(&mut sender)
+                        .runner
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .published_fsn(),
+                    Some(boundary)
+                );
+            }
+        }
+        state(&mut sender)
+            .runner
+            .shared
+            .lock()
+            .unwrap()
+            .mark_terminal(Some(crate::Error::new(
+                crate::ErrorCode::SocketError,
+                "terminal after completed boundary",
+            )));
+        assert_eq!(lifecycle.load(), PublicationState::Terminal);
+        assert_eq!(
+            sender
+                .wait(AckLevel::Ok, Duration::from_millis(1))
+                .unwrap_err()
+                .msg(),
+            "terminal after completed boundary"
+        );
+        assert_eq!(
+            sender.reset_symbol_dictionary().unwrap_err().msg(),
+            "terminal after completed boundary"
+        );
     }
 
     #[test]

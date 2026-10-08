@@ -23,10 +23,11 @@
  ******************************************************************************/
 
 //! Publication-boundary dictionary recycling through the public sender APIs.
-use super::qwp_ws::{perform_server_upgrade, read_frame, write_qwp_ok_response};
+use super::qwp_ws::{
+    perform_server_upgrade, read_frame, write_qwp_error_response, write_qwp_ok_response,
+};
 use crate::ingress::{AckLevel, QwpWsProgress, SenderBuilder, TimestampNanos};
 use std::net::TcpListener;
-#[cfg(feature = "arrow-ingress")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc,
@@ -40,7 +41,7 @@ pub(crate) struct Server {
     pub(crate) port: u16,
     frames: mpsc::Receiver<(usize, Vec<u8>)>,
     stop: Arc<AtomicBool>,
-    #[cfg(feature = "arrow-ingress")]
+    acks_released: Arc<AtomicBool>,
     connections: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -49,15 +50,18 @@ impl Server {
         Self::with_ack_delay(Duration::ZERO)
     }
     fn with_ack_delay(ack_delay: Duration) -> Self {
+        Self::with_behavior(ack_delay, None)
+    }
+    fn with_behavior(ack_delay: Duration, terminal_at: Option<(usize, u64)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
+        let acks_released = Arc::new(AtomicBool::new(true));
+        let release_acks = Arc::clone(&acks_released);
         let (tx, frames) = mpsc::channel();
-        #[cfg(feature = "arrow-ingress")]
         let connections = Arc::new(AtomicUsize::new(0));
-        #[cfg(feature = "arrow-ingress")]
         let accepted = Arc::clone(&connections);
         let worker = thread::spawn(move || {
             let mut connection = 0;
@@ -66,9 +70,10 @@ impl Server {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let tx = tx.clone();
+                        let release_acks = Arc::clone(&release_acks);
+                        let stop = Arc::clone(&stopped);
                         let id = connection;
                         connection += 1;
-                        #[cfg(feature = "arrow-ingress")]
                         accepted.fetch_add(1, Ordering::Release);
                         workers.push(thread::spawn(move || {
                             stream.set_nonblocking(false).unwrap();
@@ -88,8 +93,24 @@ impl Server {
                                     seq += 1;
                                     continue;
                                 }
+                                while !release_acks.load(Ordering::Acquire) {
+                                    if stop.load(Ordering::Acquire) {
+                                        return;
+                                    }
+                                    thread::sleep(Duration::from_millis(1));
+                                }
                                 thread::sleep(ack_delay);
-                                if write_qwp_ok_response(&mut stream, seq).is_err() {
+                                let response = if terminal_at == Some((id, seq)) {
+                                    write_qwp_error_response(
+                                        &mut stream,
+                                        0x05,
+                                        seq,
+                                        b"bad recycle row",
+                                    )
+                                } else {
+                                    write_qwp_ok_response(&mut stream, seq)
+                                };
+                                if response.is_err() {
                                     break;
                                 }
                                 seq += 1;
@@ -110,12 +131,11 @@ impl Server {
             port,
             frames,
             stop,
-            #[cfg(feature = "arrow-ingress")]
+            acks_released,
             connections,
             worker: Some(worker),
         }
     }
-    #[cfg(feature = "arrow-ingress")]
     pub(crate) fn connection_count(&self) -> usize {
         self.connections.load(Ordering::Acquire)
     }
@@ -602,5 +622,438 @@ fn recycle_boundary_invalid_arrow_values_keep_connection() {
         assert!(!error.in_doubt());
         assert_eq!(sender.published_fsn().unwrap(), Some(0));
         assert_eq!(server.connection_count(), 1);
+    }
+}
+
+fn symbol_buffer(buffer: &mut crate::ingress::Buffer, symbol: &str) {
+    buffer
+        .table("trades")
+        .unwrap()
+        .symbol("sym", symbol)
+        .unwrap()
+        .at_now()
+        .unwrap();
+}
+
+#[test]
+fn recycle_api_advisory_and_pool_scope() {
+    for progress in [QwpWsProgress::Background, QwpWsProgress::Manual] {
+        for disk in [false, true] {
+            for enabled in [false, true] {
+                let server = Server::new();
+                let dir = tempfile::TempDir::new().unwrap();
+                let storage = if disk {
+                    format!("sf_dir={};sender_id=advisory;", dir.path().display())
+                } else {
+                    String::new()
+                };
+                let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};symbol_dict_reset={};symbol_dict_reset_threshold=100000;symbol_dict_reset_max_wait_millis=0;{storage}", server.port, if enabled {"on"} else {"off"})).unwrap().qwp_ws_progress(progress).unwrap().build().unwrap();
+                let mut buffer = sender.new_buffer();
+                symbol_buffer(&mut buffer, "alpha");
+                sender.flush(&mut buffer).unwrap();
+                sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                let (old, _) = server.frame();
+                let dict_before = if disk {
+                    Some(std::fs::read(dir.path().join("advisory/.symbol-dict")).unwrap())
+                } else {
+                    None
+                };
+                for _ in 0..3 {
+                    sender.reset_symbol_dictionary().unwrap();
+                }
+                assert_eq!(sender.published_fsn().unwrap(), Some(0));
+                assert_eq!(sender.acked_fsn().unwrap(), Some(0));
+                assert_eq!(server.connection_count(), 1);
+                assert!(matches!(
+                    server.frames.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                if let Some(bytes) = dict_before {
+                    assert_eq!(
+                        std::fs::read(dir.path().join("advisory/.symbol-dict")).unwrap(),
+                        bytes
+                    );
+                }
+                assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), None);
+                assert_eq!(server.connection_count(), 1);
+                symbol_buffer(&mut buffer, "beta");
+                assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(1));
+                sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                let (new, frame) = server.frame();
+                if enabled {
+                    assert_ne!(old, new);
+                    assert_fresh(&frame, "beta");
+                } else {
+                    assert_eq!(old, new);
+                    assert_symbol(&frame, "beta", 1);
+                }
+                symbol_buffer(&mut buffer, "gamma");
+                sender.flush(&mut buffer).unwrap();
+                sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                assert_eq!(
+                    server.frame().0,
+                    new,
+                    "repeated advisory requests must coalesce"
+                );
+                sender.close_drain().unwrap();
+                assert!(
+                    sender.reset_symbol_dictionary().is_err(),
+                    "closed SF state must surface its existing error"
+                );
+            }
+        }
+    }
+    let server = Server::new();
+    let db = crate::QuestDb::connect(&format!("ws::addr=127.0.0.1:{};lazy_connect=true;sender_pool_max=2;pool_reap=manual;symbol_dict_reset_threshold=100000;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap();
+    let mut first = db.borrow_sender().unwrap();
+    let mut other = db.borrow_sender().unwrap();
+    let mut buffer = db.new_buffer();
+    symbol_buffer(&mut buffer, "alpha");
+    first
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    let (old, _) = server.frame();
+    symbol_buffer(&mut buffer, "alpha");
+    other
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    let (unaffected, _) = server.frame();
+    first.reset_symbol_dictionary().unwrap();
+    first.reset_symbol_dictionary().unwrap();
+    drop(first);
+    let mut first = db.borrow_sender().unwrap();
+    first.wait(AckLevel::Ok, Duration::from_millis(1)).unwrap();
+    symbol_buffer(&mut buffer, "beta");
+    first
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    let (new, frame) = server.frame();
+    assert_ne!(old, new);
+    assert_fresh(&frame, "beta");
+    assert_eq!(first.published_fsn().unwrap(), Some(1));
+    symbol_buffer(&mut buffer, "beta");
+    other
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    let (same, frame) = server.frame();
+    assert_eq!(same, unaffected);
+    assert_symbol(&frame, "beta", 1);
+    drop(first);
+    drop(other);
+    db.close();
+}
+
+#[test]
+fn recycle_observation_three_epochs() {
+    use crate::ingress::{QwpWsErrorCategory, QwpWsErrorPolicy};
+    for progress in [QwpWsProgress::Background, QwpWsProgress::Manual] {
+        let server = Server::with_behavior(Duration::ZERO, Some((2, 2)));
+        let (tx, rx) = mpsc::channel();
+        let caller = thread::current().id();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=100000;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap().qwp_ws_progress(progress).unwrap().qwp_ws_error_handler(move |error| { tx.send((thread::current().id(), error.clone())).unwrap(); }).unwrap().build().unwrap();
+        let mut buffer = sender.new_buffer();
+        let mut prior_acks = 0;
+        let mut prior_replayed = 0;
+        for epoch in 0..3 {
+            if epoch > 0 {
+                sender.reset_symbol_dictionary().unwrap();
+            }
+            for row in 0..2 {
+                server.acks_released.store(false, Ordering::Release);
+                symbol_buffer(&mut buffer, if row == 0 { "alpha" } else { "beta" });
+                let fsn = epoch * 2 + row;
+                assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(fsn));
+                let timeout = sender
+                    .wait(AckLevel::Ok, Duration::from_millis(1))
+                    .unwrap_err();
+                assert_eq!(timeout.code(), crate::ErrorCode::FailoverRetry);
+                assert!(timeout.msg().contains(&format!("{fsn}")));
+                server.acks_released.store(true, Ordering::Release);
+                sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                let (connection, frame) = server.frame();
+                assert_eq!(connection, epoch as usize);
+                if row == 0 {
+                    assert_fresh(&frame, "alpha");
+                }
+                assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
+                assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+                assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), Some(fsn));
+                assert!(sender.poll_qwp_ws_error().unwrap().is_none());
+                let totals = sender.qwp_ws_totals().unwrap();
+                assert_eq!(totals.frames_sent, fsn + 1);
+                assert!(totals.frames_replayed >= prior_replayed);
+                assert!(totals.frames_replayed <= totals.frames_sent);
+                prior_replayed = totals.frames_replayed;
+                assert_eq!(totals.server_errors, 0);
+                assert!(
+                    totals.acks >= prior_acks,
+                    "retain existing background ACK accounting"
+                );
+                if progress == QwpWsProgress::Manual {
+                    assert_eq!(totals.acks, fsn + 1);
+                }
+                prior_acks = totals.acks;
+            }
+        }
+        // The terminal diagnostic belongs to public FSN six, wire sequence two
+        // of the third session. Completed older boundaries cannot hide it.
+        symbol_buffer(&mut buffer, "bad");
+        assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(6));
+        assert_eq!(
+            sender
+                .wait(AckLevel::Ok, Duration::from_secs(5))
+                .unwrap_err()
+                .code(),
+            crate::ErrorCode::ServerRejection
+        );
+        assert_eq!(server.frame().0, 2);
+        let error = sender.poll_qwp_ws_error().unwrap().unwrap();
+        assert_eq!(
+            (error.from_fsn, error.to_fsn, error.message_sequence),
+            (6, 6, Some(2))
+        );
+        assert_eq!(error.category, QwpWsErrorCategory::ParseError);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Terminal);
+        let (callback_thread, callback) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            callback_thread, caller,
+            "standalone diagnostics run on the API caller"
+        );
+        assert_eq!(callback, error);
+        assert!(sender.poll_qwp_ws_error().unwrap().is_none());
+        assert_eq!(sender.qwp_ws_terminal_error().unwrap().unwrap(), error);
+        assert_eq!(
+            sender.reset_symbol_dictionary().unwrap_err().code(),
+            crate::ErrorCode::ServerRejection
+        );
+        assert_eq!(
+            sender
+                .wait(AckLevel::Ok, Duration::from_millis(1))
+                .unwrap_err()
+                .code(),
+            crate::ErrorCode::ServerRejection
+        );
+        assert_eq!(
+            sender.close_drain().unwrap_err().code(),
+            crate::ErrorCode::ServerRejection
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+}
+
+#[test]
+fn recycle_observation_three_epochs_pool_dispatchers() {
+    use crate::{
+        db::ConnectHandlers,
+        ingress::{ConnectionEventKind, QwpWsErrorHandler},
+    };
+    let server = Server::with_behavior(Duration::from_millis(20), Some((2, 2)));
+    let (events_tx, events_rx) = mpsc::channel();
+    let (errors_tx, errors_rx) = mpsc::channel();
+    let caller = thread::current().id();
+    let db = crate::QuestDb::connect_with_handlers(&format!("ws::addr=127.0.0.1:{};lazy_connect=true;sender_pool_max=1;pool_reap=manual;symbol_dict_reset_threshold=100000;symbol_dict_reset_max_wait_millis=0;", server.port), ConnectHandlers {
+        connection_listener: Some(Arc::new(move |event| { events_tx.send((thread::current().id(), event.kind)).unwrap(); })),
+        error_handler: Some(QwpWsErrorHandler::new(move |error| { errors_tx.send((thread::current().id(), error.clone())).unwrap(); })),
+        ..Default::default()
+    }).unwrap();
+    let mut buffer = db.new_buffer();
+    let mut connection_dispatcher = None;
+    for epoch in 0..3 {
+        let mut sender = db.borrow_sender().unwrap();
+        for row in 0..2 {
+            symbol_buffer(&mut buffer, if row == 0 { "alpha" } else { "beta" });
+            assert_eq!(
+                sender.flush_buffer_and_get_fsn(&mut buffer).unwrap(),
+                Some(epoch * 2 + row)
+            );
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+            assert_eq!(sender.acked_fsn().unwrap(), Some(epoch * 2 + row));
+            assert_eq!(server.frame().0, epoch as usize);
+            assert!(!sender.must_close_for_test());
+        }
+        loop {
+            let (dispatcher, kind) = events_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_ne!(dispatcher, caller);
+            if let Some(previous) = connection_dispatcher {
+                assert_eq!(dispatcher, previous);
+            }
+            connection_dispatcher = Some(dispatcher);
+            if matches!(
+                kind,
+                ConnectionEventKind::Connected | ConnectionEventKind::Reconnected
+            ) {
+                break;
+            }
+        }
+        if epoch < 2 {
+            sender.reset_symbol_dictionary().unwrap();
+        } else {
+            symbol_buffer(&mut buffer, "bad");
+            assert_eq!(
+                sender.flush_buffer_and_get_fsn(&mut buffer).unwrap(),
+                Some(6)
+            );
+            assert_eq!(
+                sender
+                    .wait(AckLevel::Ok, Duration::from_secs(5))
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::ServerRejection
+            );
+            server.frame();
+            let (dispatcher, error) = errors_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_ne!(
+                dispatcher, caller,
+                "pooled diagnostics run on the pool dispatcher"
+            );
+            assert_eq!(
+                (error.from_fsn, error.to_fsn, error.message_sequence),
+                (6, 6, Some(2))
+            );
+            assert!(sender.must_close_for_test());
+            assert!(sender.reset_symbol_dictionary().is_err());
+        }
+    }
+    let mut sender = db.borrow_sender().unwrap();
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        None,
+        "terminal slot must be discarded on return"
+    );
+    assert!(!sender.must_close_for_test());
+    symbol_buffer(&mut buffer, "replacement");
+    sender
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    assert_eq!(server.frame().0, 3);
+    drop(sender);
+    assert_eq!(db.connection_events_dropped(), 0);
+    assert_eq!(db.rejection_events_dropped(), 0);
+    assert!(matches!(
+        errors_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    db.close();
+}
+
+#[test]
+fn recycle_api_pending_pool_return_and_close() {
+    for disk in [false, true] {
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = if disk {
+            format!("sf_dir={};sender_id=pending;", dir.path().display())
+        } else {
+            String::new()
+        };
+        let db = crate::QuestDb::connect(&format!("ws::addr=127.0.0.1:{};lazy_connect=true;sender_pool_max=1;pool_reap=manual;symbol_dict_reset_threshold=100000;symbol_dict_reset_max_wait_millis=0;{storage}", server.port)).unwrap();
+        let mut buffer = db.new_buffer();
+        let mut sender = db.borrow_sender().unwrap();
+        symbol_buffer(&mut buffer, "alpha");
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let (old, _) = server.frame();
+        sender.reset_symbol_dictionary().unwrap();
+        crate::ingress::sender::fail_next_recycle_storage_for_test();
+        symbol_buffer(&mut buffer, "beta");
+        assert!(
+            sender
+                .flush_buffer(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("injected recycle failure")
+        );
+        assert!(
+            !sender.must_close_for_test(),
+            "maintenance is not an unhealthy endpoint"
+        );
+        assert!(!buffer.is_empty());
+        drop(sender);
+        let mut sender = db.borrow_sender().unwrap();
+        assert_eq!(sender.published_fsn().unwrap(), Some(0));
+        sender.reset_symbol_dictionary().unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let (fresh, frame) = server.frame();
+        assert_ne!(fresh, old);
+        assert_fresh(&frame, "beta");
+        assert_eq!(sender.acked_fsn().unwrap(), Some(1));
+        sender.reset_symbol_dictionary().unwrap();
+        crate::ingress::sender::fail_next_recycle_storage_for_test();
+        symbol_buffer(&mut buffer, "gamma");
+        assert!(sender.flush_buffer(&mut buffer).is_err());
+        drop(sender);
+        db.close();
+        if disk {
+            // Final pool close releases every managed slot even with maintenance pending.
+            let db = crate::QuestDb::connect(&format!("ws::addr=127.0.0.1:{};lazy_connect=true;sender_pool_max=1;pool_reap=manual;{storage}", server.port)).unwrap();
+            let mut sender = db.borrow_sender().unwrap();
+            buffer.clear();
+            symbol_buffer(&mut buffer, "after_close");
+            sender
+                .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+                .unwrap();
+            server.frame();
+            drop(sender);
+            db.close();
+        }
+    }
+}
+
+#[test]
+fn recycle_api_disabled_pool_is_noop() {
+    let server = Server::new();
+    let db = crate::QuestDb::connect(&format!("ws::addr=127.0.0.1:{};lazy_connect=true;sender_pool_max=1;pool_reap=manual;symbol_dict_reset=off;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let mut buffer = db.new_buffer();
+    symbol_buffer(&mut buffer, "alpha");
+    sender
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    let (old, _) = server.frame();
+    sender.reset_symbol_dictionary().unwrap();
+    drop(sender);
+    let mut sender = db.borrow_sender().unwrap();
+    symbol_buffer(&mut buffer, "beta");
+    sender
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    let (same, frame) = server.frame();
+    assert_eq!(same, old);
+    assert_symbol(&frame, "beta", 1);
+    drop(sender);
+    db.close();
+}
+
+#[test]
+fn recycle_api_disabled_terminal_still_errors() {
+    for progress in [QwpWsProgress::Background, QwpWsProgress::Manual] {
+        let server = Server::with_behavior(Duration::ZERO, Some((0, 0)));
+        let mut sender = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{};symbol_dict_reset=off;",
+            server.port
+        ))
+        .unwrap()
+        .qwp_ws_progress(progress)
+        .unwrap()
+        .build()
+        .unwrap();
+        let mut buffer = sender.new_buffer();
+        symbol_buffer(&mut buffer, "bad");
+        sender.flush(&mut buffer).unwrap();
+        assert_eq!(
+            sender
+                .wait(AckLevel::Ok, Duration::from_secs(5))
+                .unwrap_err()
+                .code(),
+            crate::ErrorCode::ServerRejection
+        );
+        server.frame();
+        let error = sender.reset_symbol_dictionary().unwrap_err();
+        assert_eq!(error.code(), crate::ErrorCode::ServerRejection);
+        let rejection = error.qwp_ws_rejection().unwrap();
+        assert_eq!((rejection.from_fsn, rejection.to_fsn), (0, 0));
     }
 }

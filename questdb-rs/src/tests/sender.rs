@@ -1586,3 +1586,28 @@ fn recycle_settings_reject_non_ws() {
         assert!(error.msg().contains("only supported for QWP/WebSocket"));
     }
 }
+
+#[test]
+fn recycle_api_non_qwp_is_noop() -> TestResult {
+    #[cfg(feature = "sync-sender-http")]
+    {
+        let mut sender = Sender::from_conf("http::addr=127.0.0.1:1;protocol_version=2;")?;
+        sender.reset_symbol_dictionary()?;
+        sender.reset_symbol_dictionary()?;
+    }
+    #[cfg(feature = "sync-sender-tcp")]
+    {
+        let mut server = MockServer::new()?;
+        let mut sender = server.lsb_tcp().build()?;
+        server.accept()?;
+        sender.reset_symbol_dictionary()?;
+        sender.reset_symbol_dictionary()?;
+        assert_eq!(server.recv_q()?, 0);
+    }
+    #[cfg(feature = "sync-sender-qwp-udp")]
+    {
+        let mut sender = Sender::from_conf("udp::addr=127.0.0.1:1;")?;
+        sender.reset_symbol_dictionary()?;
+    }
+    Ok(())
+}

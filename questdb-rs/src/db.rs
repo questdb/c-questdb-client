@@ -1703,6 +1703,17 @@ impl<'a> BorrowedSender<'a> {
         self.0.db.new_buffer()
     }
 
+    /// Request symbol dictionary recycling at a later safe, nonempty flush.
+    ///
+    /// The advisory request belongs to this pooled sender and survives returning
+    /// the lease. It does not flush, wait, reset storage, or connect, and success
+    /// does not guarantee a reset. Repeated requests coalesce; disabled recycling
+    /// is a no-op. Closed or terminal state returns its existing error. The
+    /// sender's publication sequence numbers remain continuous across recycling.
+    pub fn reset_symbol_dictionary(&mut self) -> Result<()> {
+        self.0.inner_mut().reset_symbol_dictionary()
+    }
+
     /// Encode and publish `chunk` into the store-and-forward queue, returning
     /// as soon as the frame is accepted locally (no server round-trip). On
     /// success `chunk` is cleared; on a delivery-uncertain failure the error

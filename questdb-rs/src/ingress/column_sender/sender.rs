@@ -362,6 +362,16 @@ impl PooledSenderCore {
         })
     }
 
+    /// Request symbol dictionary recycling at a later safe, nonempty publication.
+    ///
+    /// This advisory call does not flush, wait, reset storage, or connect. Repeated
+    /// requests coalesce; disabled recycling is a no-op. Closed or terminal state
+    /// returns its existing error. The request and publication sequence numbers
+    /// remain owned by this core across pool leases.
+    pub fn reset_symbol_dictionary(&mut self) -> Result<()> {
+        self.backend.state.reset_symbol_dictionary()
+    }
+
     /// Scope the ack barrier and diagnostic polling to the borrowing
     /// lease: fast-forward the sync boundaries past everything already
     /// published so `wait` covers only the lease's own publications (and
@@ -2479,6 +2489,129 @@ mod recycle_boundary_tests {
         .unwrap();
         PooledSenderCore::new_store_and_forward(state, 1 << 20, false, Duration::from_secs(5))
             .unwrap()
+    }
+
+    #[test]
+    fn recycle_api_floor_and_pending_lease_retained() {
+        let server = Server::new();
+        let mut sender = core(&server);
+        let mut buffer = Buffer::new_qwp_ws();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        server.frame();
+        // The first automatic reset swaps one symbol, setting the floor to two.
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let (first_reset, _) = server.frame();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "two")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        assert_eq!(server.frame().0, first_reset);
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "one")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let (second, _) = server.frame();
+        assert_ne!(second, first_reset);
+        // The second automatic swap had two symbols, raising the floor to four.
+        assert!(!sender.backend.state.needs_recycle_boundary());
+        sender.reset_symbol_dictionary().unwrap();
+        // Fail after accepted parking; rebasing a lease must retain ownership.
+        crate::ingress::sender::fail_next_recycle_storage_for_test();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "gamma")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(
+            sender
+                .flush_buffer(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("injected recycle failure")
+        );
+        sender.rebase_lease_observation();
+        sender.reset_symbol_dictionary().unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let (third, _) = server.frame();
+        assert_ne!(second, third);
+        assert!(!sender.must_close());
+        // The manual swap had one symbol; the established floor must remain four.
+        assert!(!sender.backend.state.needs_recycle_boundary());
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "delta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        assert_eq!(server.frame().0, third);
+        assert!(!sender.backend.state.needs_recycle_boundary());
+        for symbol in ["epsilon", "zeta"] {
+            buffer
+                .table("trades")
+                .unwrap()
+                .symbol("sym", symbol)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            sender
+                .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+                .unwrap();
+            assert_eq!(
+                server.frame().0,
+                third,
+                "manual reset must not lower the floor"
+            );
+        }
+        assert!(sender.backend.state.needs_recycle_boundary());
+        sender.reset_symbol_dictionary().unwrap();
+        sender.begin_close();
+        assert!(sender.reset_symbol_dictionary().is_err());
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "closed")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(sender.flush_buffer(&mut buffer).is_err());
     }
 
     #[test]
