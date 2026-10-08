@@ -76,7 +76,10 @@ impl DeviceCodeChallenge {
     ///
     /// Use [`display_verification_uri`](Self::display_verification_uri) for
     /// display and [`browser_target`](Self::browser_target) for a URL that may
-    /// be made clickable or opened.
+    /// be made clickable or opened. When a renderer opens or links
+    /// `browser_target`, it must show that URL, not the display text, as the
+    /// place the user is sent: see
+    /// [`display_verification_uri`](Self::display_verification_uri).
     pub fn verification_uri(&self) -> &str {
         &self.verification_uri
     }
@@ -120,6 +123,14 @@ impl DeviceCodeChallenge {
     /// This value is safe to print, but it is not a browser target. Use
     /// [`browser_target`](Self::browser_target) before making a URL clickable
     /// or opening it.
+    ///
+    /// The text is length-capped *before* invisible characters are removed,
+    /// so a padded URL shortens to a different string from `browser_target`,
+    /// and can show a different host (`https://trusted.example…` while the
+    /// browser opens `https://trusted.example.evil.net/…`). Never present it
+    /// as the destination of a link, QR code or opened browser: a renderer
+    /// that acts on `browser_target` must show `browser_target` itself, as
+    /// the built-in [`TerminalRenderer`] does.
     pub fn display_verification_uri(&self) -> String {
         display_url(&self.verification_uri)
     }
@@ -209,6 +220,11 @@ impl DiagnosticHandler for TerminalDiagnosticHandler {
 /// custom renderer that writes them to a terminal must sanitise them itself;
 /// echoing them raw re-opens the prompt-spoofing
 /// surface the built-in [`TerminalRenderer`] closes.
+///
+/// Only [`DeviceCodeChallenge::browser_target`] may be opened, linked or
+/// encoded as a QR code, and a renderer that does so must show that URL as the
+/// destination: the display accessors can show a different host (see
+/// [`DeviceCodeChallenge::display_verification_uri`]).
 pub trait Renderer: Send + Sync {
     /// Show the sign-in prompt at the start of the device flow.
     fn on_prompt(&self, challenge: &DeviceCodeChallenge) {

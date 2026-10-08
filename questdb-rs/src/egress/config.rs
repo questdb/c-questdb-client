@@ -1357,8 +1357,19 @@ impl ReaderConfig {
     /// when an auth mode is set.
     ///
     /// Most callers want [`Reader::from_config`](crate::egress::Reader::from_config)
-    /// instead; this is exposed for inspecting or logging the handshake the
-    /// reader will send.
+    /// instead; this is exposed for inspecting the handshake the reader will
+    /// send.
+    ///
+    /// # Secrets and side effects
+    ///
+    /// The `Authorization` value is the live credential: a Basic or Bearer
+    /// header for static credentials, or `Bearer <token>` resolved from the
+    /// configured [`token_provider`](Self::token_provider). Redact it before
+    /// logging the result. With a token provider this call also runs the
+    /// provider synchronously on the calling thread, so it can block, and an
+    /// OIDC provider may perform a silent refresh and update its token store.
+    /// The reader resolves its own token on every connect; the value returned
+    /// here is not the one it sends.
     ///
     /// # Compatibility
     ///
