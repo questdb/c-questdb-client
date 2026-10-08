@@ -606,6 +606,7 @@ impl OidcDeviceAuthBuilder {
             interactive_in_progress: AtomicBool::new(false),
             clear_in_progress: AtomicBool::new(false),
             sign_in_cancelled: AtomicBool::new(false),
+            sign_in_committed: AtomicBool::new(false),
             token_store: self.token_store,
             store_key,
             store_state: Mutex::new(StoreState::default()),
@@ -678,6 +679,12 @@ pub struct OidcDeviceAuth {
     /// Cancellation signal for only the current interactive device flow. It is
     /// reset before and after every flow and never changes `closed`.
     sign_in_cancelled: AtomicBool,
+    /// Set once the identity provider has answered the device-flow poll with
+    /// tokens. From then on the attempt runs to completion and
+    /// [`cancel_sign_in`](OidcDeviceAuth::cancel_sign_in) reports that it found
+    /// nothing to cancel. Reset before and after every flow, like
+    /// `sign_in_cancelled`, and only changed under `close_wait`.
+    sign_in_committed: AtomicBool,
     /// Optional cross-restart persistence (opt-in).
     token_store: Option<Arc<dyn TokenStore>>,
     /// The persisted-identity key; `Some` iff `token_store` is set.
@@ -915,6 +922,12 @@ impl OidcDeviceAuth {
     /// is running, this is an idempotent no-op and does not poison the next one.
     /// Returns whether a running flow was signalled.
     ///
+    /// Once the identity provider has issued tokens for the running flow, the
+    /// sign-in is committed: it completes (reporting success or failure through
+    /// the renderer as usual) and this returns `false`. A `true` return
+    /// therefore always means the active `sign_in` will fail with
+    /// `Cancelled`.
+    ///
     /// Safe from any thread, including a [`Renderer`] callback. An HTTP request
     /// already in flight is not cancelled at the transport layer, so the flow
     /// stops after that bounded request returns.
@@ -928,7 +941,9 @@ impl OidcDeviceAuth {
             .close_wait
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.interactive_in_progress.load(AtomicOrdering::Acquire) {
+        if self.interactive_in_progress.load(AtomicOrdering::Acquire)
+            && !self.sign_in_committed.load(AtomicOrdering::Acquire)
+        {
             self.sign_in_cancelled.store(true, AtomicOrdering::Release);
             self.close_wake.notify_all();
             true
@@ -1252,12 +1267,33 @@ impl OidcDeviceAuth {
         }
     }
 
+    /// Commit the running device flow once the identity provider has issued
+    /// its tokens: either report a cancellation that landed before this point,
+    /// or make every later [`cancel_sign_in`](Self::cancel_sign_in) a no-op.
+    ///
+    /// Checking the flag and committing under the lock `cancel_sign_in`
+    /// publishes under leaves no window in which a cancel is reported as
+    /// accepted (`true`) and then ignored. That window used to cover the
+    /// expired-token rescue refresh and the post-flow bookkeeping, so a cancel
+    /// landing there let `sign_in` succeed while a binding treated the attempt
+    /// as cancelled and dropped its success event.
+    fn commit_interactive_flow(&self) -> Result<()> {
+        let _guard = self
+            .close_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_interactive_flow_active()?;
+        self.sign_in_committed.store(true, AtomicOrdering::Release);
+        Ok(())
+    }
+
     fn begin_interactive_flow(&self) {
         let _guard = self
             .close_wait
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.sign_in_cancelled.store(false, AtomicOrdering::Release);
+        self.sign_in_committed.store(false, AtomicOrdering::Release);
         self.interactive_in_progress
             .store(true, AtomicOrdering::Release);
     }
@@ -1270,6 +1306,7 @@ impl OidcDeviceAuth {
         self.interactive_in_progress
             .store(false, AtomicOrdering::Release);
         self.sign_in_cancelled.store(false, AtomicOrdering::Release);
+        self.sign_in_committed.store(false, AtomicOrdering::Release);
     }
 
     /// Wait for a bounded slice, waking immediately when close signals. This
@@ -2718,6 +2755,11 @@ impl OidcDeviceAuth {
             let body = &result.body;
 
             if status == 200 {
+                // The IdP has issued tokens for this device code; it will not
+                // issue them again. Commit now (or report a cancel that landed
+                // after the check above) so a later cancel cannot be accepted
+                // and then ignored by the rescue refresh and bookkeeping below.
+                self.commit_interactive_flow()?;
                 let tokens = match self.tokenset_from_response(body, None) {
                     Ok(tokens) => tokens,
                     Err(error) => {

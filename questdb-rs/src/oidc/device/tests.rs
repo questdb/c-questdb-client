@@ -655,6 +655,90 @@ fn cancel_sign_in_aborts_only_the_current_device_flow() {
 }
 
 #[test]
+fn cancel_after_tokens_are_issued_is_a_no_op_and_success_is_reported() {
+    // Once the IdP has answered the poll with tokens, the attempt is
+    // committed. A cancel landing in the expired-token rescue refresh used to
+    // be reported as accepted (`true`) and then ignored: `sign_in` succeeded
+    // while a binding treated the attempt as cancelled and dropped its
+    // success event, leaving a renderer on "waiting" forever.
+    struct RecordRenderer {
+        successes: Arc<AtomicUsize>,
+        failures: Arc<AtomicUsize>,
+    }
+    impl Renderer for RecordRenderer {
+        fn on_failure(&self, _message: &str) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_success(&self, _identity: Option<&str>, _expires_in_secs: f64) {
+            self.successes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let (refresh_seen_tx, refresh_seen_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let mock = MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+            let _ = refresh_seen_tx.try_send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            (
+                200,
+                r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#
+                    .to_string(),
+            )
+        }
+        ("POST", "/token") => (
+            200,
+            format!(
+                r#"{{"access_token":"{ALREADY_EXPIRED_JWT}","refresh_token":"RT-1","expires_in":300}}"#
+            ),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let successes = Arc::new(AtomicUsize::new(0));
+    let failures = Arc::new(AtomicUsize::new(0));
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .sleep_hook(no_sleep())
+            .renderer(RecordRenderer {
+                successes: Arc::clone(&successes),
+                failures: Arc::clone(&failures),
+            })
+            .build()
+            .expect("build auth"),
+    );
+    let worker_auth = Arc::clone(&auth);
+    let worker = std::thread::spawn(move || worker_auth.sign_in());
+
+    refresh_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sign-in did not reach the rescue refresh");
+    assert!(
+        !auth.cancel_sign_in(),
+        "a cancel after the IdP issued tokens must report that it found nothing to cancel"
+    );
+    release_tx.send(()).unwrap();
+    worker
+        .join()
+        .expect("sign-in thread panicked")
+        .expect("a committed sign-in must complete");
+    assert_eq!(auth.token().unwrap(), "AT-refreshed");
+    assert_eq!(successes.load(Ordering::SeqCst), 1);
+    assert_eq!(failures.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn clear_fails_fast_behind_an_interactive_sign_in() {
     // A device flow holds the acquisition lock for up to the device-code
     // lifetime. `try_clear` used to wait for all of it -- uninterruptibly, with

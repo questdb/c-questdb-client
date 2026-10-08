@@ -342,7 +342,10 @@ public:
      * The active sign-in throws `oidc::error` with kind `cancelled`, but this
      * shared provider remains open, credentials are not discarded, and every
      * attached sender, reader and pool remains usable. A later sign_in() on the
-     * same provider can succeed. A no-op when no device flow is running.
+     * same provider can succeed. A no-op when no device flow is running, and
+     * once the identity provider has issued tokens for the running flow: that
+     * sign-in is committed and completes normally, delivering its success or
+     * failure event.
      *
      * Safe from any thread, including this provider's event callback. Use
      * close() instead only when the provider and every attached transport must

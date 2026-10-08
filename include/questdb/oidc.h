@@ -636,6 +636,10 @@ void questdb_oidc_auth_free(questdb_oidc_auth* auth);
  * device flow is running, this is an idempotent no-op that does not affect the
  * next sign-in.
  *
+ * Once the identity provider has issued tokens for the running flow, the
+ * sign-in is committed and completes normally, delivering its SUCCESS or
+ * FAILURE event; a cancel arriving after that point is a no-op too.
+ *
  * Safe to call from any thread, including this auth's own event callback and
  * while that callback is waiting behind a sibling built from the same reusable
  * builder. An HTTP request already in flight is not cancelled at the transport
