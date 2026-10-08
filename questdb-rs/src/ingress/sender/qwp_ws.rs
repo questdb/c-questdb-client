@@ -1159,13 +1159,7 @@ where
                 ));
             }
         }
-        if let Some(worker) = self.thread.take()
-            && worker.join().is_err()
-        {
-            let err = error::fmt!(SocketError, "QWP/WebSocket recycle worker panicked");
-            self.lock_shared()?.mark_terminal(Some(err.clone()));
-            return Err(err);
-        }
+        self.join_recycle_worker()?;
         // Errors must win even when the captured completion boundary is empty.
         let store = self.lock_shared()?;
         check_store_error(&store)?;
@@ -1218,6 +1212,19 @@ where
             generation: self.recycle_generation,
             boundary,
         }))
+    }
+
+    /// Consume a confirmed-exited maintenance worker off-lock. Both resume and
+    /// final close must observe its result before authorizing storage changes.
+    fn join_recycle_worker(&mut self) -> crate::Result<()> {
+        if let Some(worker) = self.thread.take()
+            && worker.join().is_err()
+        {
+            let err = error::fmt!(SocketError, "QWP/WebSocket recycle worker panicked");
+            self.lock_shared()?.mark_terminal(Some(err.clone()));
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn validate_recycle_permit(&self, permit: &RecyclePermit) -> crate::Result<()> {
@@ -1525,6 +1532,10 @@ where
                 continue;
             }
 
+            if self.pending_recycle.is_some() {
+                self.join_recycle_worker()?;
+            }
+
             let backpressure_generation = self.backpressure.generation();
             {
                 let mut store = self.lock_shared()?;
@@ -1534,13 +1545,7 @@ where
                 // not let the public durability latch prevent close from
                 // reaching either recovery path.
                 check_store_terminal_error(&store)?;
-                if store.all_published_receipts_resolved()
-                    && (self.pending_recycle.is_none()
-                        || self
-                            .thread
-                            .as_ref()
-                            .is_none_or(thread::JoinHandle::is_finished))
-                {
+                if store.all_published_receipts_resolved() {
                     // Storage maintenance performs file work off the
                     // publication-store lock. A task may own segment mappings,
                     // create a hot-spare file, or unlink a retired segment, so
@@ -6838,6 +6843,37 @@ mod tests {
         assert!(
             runner
                 .request_recycle(None)
+                .unwrap_err()
+                .msg()
+                .contains("worker panicked")
+        );
+        let mut store = runner.lock_shared().unwrap();
+        assert_eq!(store.poll_event(), Some(DriverEvent::Terminal));
+        assert_eq!(store.poll_event(), None);
+    }
+
+    #[test]
+    fn recycle_session_worker_failure_on_close_retains_terminal_event_once() {
+        let (mut runner, entered, release) = recycle_barrier_runner(false);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        runner.shutdown_timeout = Duration::from_millis(10);
+        assert!(runner.request_recycle(None).is_err());
+        // Disconnecting the barrier panics outside the publication-store mutex.
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runner.thread.as_ref().unwrap().is_finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(runner.thread.as_ref().unwrap().is_finished());
+        runner.begin_close();
+        let err = runner.drain_to_deadline(Some(deadline)).unwrap_err();
+        assert!(err.msg().contains("worker panicked"));
+        assert!(runner.thread.is_none());
+        assert!(runner.pending_recycle.is_some());
+        assert!(runner.lifecycle_is_terminal());
+        assert!(
+            runner
+                .drain_to_deadline(Some(deadline))
                 .unwrap_err()
                 .msg()
                 .contains("worker panicked")
