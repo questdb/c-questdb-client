@@ -531,7 +531,11 @@ def test_symbol_dictionary_recycle_across_sql_role_switch(
 @pytest.mark.c_client
 @pytest.mark.c_client_rust
 @pytest.mark.parametrize('mode', ['auto', 'off', 'manual'])
-@pytest.mark.parametrize('source', ['chunk', 'arrow', 'polars_sf'])
+@pytest.mark.parametrize('source,c_client_rust_column_sidecar', [
+    pytest.param('chunk', False, id='chunk'),
+    pytest.param('arrow', False, id='arrow'),
+    pytest.param('polars_sf', True, id='polars_sf'),
+], indirect=['c_client_rust_column_sidecar'])
 def test_symbol_dictionary_recycle_column_inputs(
         server_factory, c_client_rust_column_sidecar, scenario_dir, source, mode):
     """Exercise included SF APIs; polars_sf explicitly converts to pooled Arrow."""
