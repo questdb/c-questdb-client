@@ -82,6 +82,9 @@ mod qwp_ws_publisher;
 mod qwp_ws_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod qwp_ws_recycle;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_segment;
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -89,6 +92,16 @@ pub(crate) mod qwp_ws_sfa_manifest;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_queue;
+
+#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+pub(crate) fn fail_next_recycle_storage_for_test() {
+    qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER.with(|fail| fail.set(Some(0)));
+}
+
+#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+pub(crate) fn terminal_after_recycle_park_for_test() {
+    qwp_ws::TERMINAL_AFTER_RECYCLE_PARK.with(|fault| fault.set(true));
+}
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_slot;
@@ -303,6 +316,14 @@ impl Sender {
         )
     }
 
+    #[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => state.recycle_allocation_probe(),
+            _ => panic!("background sender expected"),
+        }
+    }
+
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn drain_qwp_ws_error_notifications(&mut self) -> Result<()> {
         loop {
@@ -357,10 +378,7 @@ impl Sender {
             )
         })?;
         qwp.check_can_flush()?;
-        if qwp.is_empty() {
-            return Ok(None);
-        }
-        if transactional {
+        if transactional && !qwp.is_empty() {
             return Err(error::fmt!(
                 InvalidApiCall,
                 "Transactional flushes are not supported for QWP/WebSocket."
@@ -631,6 +649,22 @@ impl Sender {
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
         self.flush_qwp_ws_buffer(buf, false)
+    }
+
+    /// Request symbol dictionary recycling at a later safe, nonempty flush.
+    ///
+    /// This advisory call does not flush, wait, reset storage, or connect. Repeated
+    /// requests coalesce, and success does not guarantee a reset. Disabled recycling
+    /// and non-QWP/WebSocket transports are no-ops. Closed or terminal QWP senders
+    /// return their existing error. Publication sequence numbers remain continuous.
+    pub fn reset_symbol_dictionary(&mut self) -> Result<()> {
+        match &mut self.handler {
+            #[cfg(feature = "sync-sender-qwp-ws")]
+            SyncProtocolHandler::SyncQwpWs(state) => state.reset_symbol_dictionary(),
+            #[cfg(feature = "sync-sender-qwp-ws")]
+            SyncProtocolHandler::ManualQwpWs(state) => state.reset_symbol_dictionary(),
+            _ => Ok(()),
+        }
     }
 
     /// Return the highest frame sequence number published locally by this

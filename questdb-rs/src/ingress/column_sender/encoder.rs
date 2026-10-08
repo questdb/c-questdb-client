@@ -137,17 +137,8 @@ pub(crate) fn encode_chunk_replay_into(
     )
 }
 
-fn encode_chunk_into_mode(
-    out: &mut Vec<u8>,
-    chunk: &Chunk<'_>,
-    symbol_dict: &mut SymbolGlobalDict,
-    scratch: &mut EncodeScratch,
-    defer_commit: bool,
-    replay_symbols: bool,
-) -> Result<()> {
-    scratch.reset();
+pub(crate) fn validate_chunk(chunk: &Chunk<'_>) -> Result<()> {
     if chunk.is_empty() {
-        emit_header_only_frame(out, defer_commit);
         return Ok(());
     }
     let row_count = chunk.row_count();
@@ -177,6 +168,24 @@ fn encode_chunk_into_mode(
         ));
     }
     validate_table_name(&chunk.table)?;
+    Ok(())
+}
+
+fn encode_chunk_into_mode(
+    out: &mut Vec<u8>,
+    chunk: &Chunk<'_>,
+    symbol_dict: &mut SymbolGlobalDict,
+    scratch: &mut EncodeScratch,
+    defer_commit: bool,
+    replay_symbols: bool,
+) -> Result<()> {
+    scratch.reset();
+    if chunk.is_empty() {
+        emit_header_only_frame(out, defer_commit);
+        return Ok(());
+    }
+    validate_chunk(chunk)?;
+    let row_count = chunk.row_count();
     let table_bytes = chunk.table.as_bytes();
 
     let designated = chunk.designated_ts.as_ref();

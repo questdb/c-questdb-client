@@ -46,6 +46,7 @@ import socket
 import threading
 import questdb_line_sender as qls
 import qwp_ws_fuzz
+import qwp_symbol_recycle
 import uuid
 
 # A native fault inside the client library (e.g. the 0xC0000005 access
@@ -1736,6 +1737,80 @@ class QwpWsTestSupport:
             f'Timed out waiting for {expected_rows} rows from {query!r}; '
             f'last_resp={last_resp!r}; last_error={last_error!r}')
 
+    def _symbol_recycle_scenario(self, restart=False):
+        tables = ['qwp_recycle_' + uuid.uuid4().hex[:8] for _ in range(2)]
+        expected = {table: [] for table in tables}
+        for table in tables:
+            sql_query(f'CREATE TABLE "{table}" (ts TIMESTAMP, row_id LONG, sym SYMBOL) '
+                      'TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, row_id)')
+        sender_id = 'recycle-' + uuid.uuid4().hex[:12]
+        with tempfile.TemporaryDirectory(prefix='qwp-recycle-') as sf_dir:
+            if hasattr(self, '_sender_conf_for_variant'):
+                conf = self._sender_conf_for_variant(sender_id, sf_dir)
+            else:
+                conf = self._sender_conf(sender_id, sf_dir,
+                                         reconnect_max_duration_millis=120000)
+            conf += 'symbol_dict_reset_threshold=4;symbol_dict_reset_max_wait_millis=0;'
+            sender = self._connect_sender(conf)
+            previous = []
+            fsns = []
+            try:
+                for phase in range(4):
+                    batch = qwp_symbol_recycle.symbol_batch(phase, 16 << phase)
+                    for row_id, symbol in batch:
+                        table = tables[row_id % 2]
+                        sender.table(table)
+                        if symbol is not None:
+                            sender.symbol('sym', symbol)
+                        sender.column('row_id', row_id).at_micros(self.BASE_TS_US + row_id)
+                        expected[table].append([row_id, symbol])
+                    fsns.append(sender.flush_and_get_fsn())
+                    sender.wait(0, 120000)
+                    snapshot = qwp_symbol_recycle.dictionary_snapshot(sf_dir, sender_id)
+                    wanted = list(dict.fromkeys(sym for _, sym in batch if sym is not None))
+                    self.assertEqual(set(snapshot), set(wanted))
+                    if previous:
+                        self.assertNotIn(previous[-1], snapshot)
+                    sys.stderr.write(f'[recycle] phase={phase} fsn={fsns[-1]} '
+                                     f'dictionary_entries={len(snapshot)} retired={len(previous)}\n')
+                    previous = snapshot
+                self.assertEqual(fsns, list(range(fsns[0], fsns[0] + 4)))
+                if restart:
+                    # A small fresh epoch stays below the hysteretic floor. Its
+                    # subsequent outage publication must reconnect in this same
+                    # namespace, retaining pending work and no retired symbols.
+                    for offline in (False, True):
+                        if offline:
+                            QDB_FIXTURE.stop()
+                        try:
+                            for row_id, symbol in qwp_symbol_recycle.symbol_batch(4, 8):
+                                row_id += 100 if offline else 0
+                                table = tables[row_id % 2]
+                                sender.table(table)
+                                if symbol is not None:
+                                    sender.symbol('sym', symbol)
+                                sender.column('row_id', row_id).at_micros(self.BASE_TS_US + row_id)
+                                expected[table].append([row_id, symbol])
+                            fsn = sender.flush_and_get_fsn()
+                            if offline:
+                                self.assertLess(sender.acked_fsn(), fsn)
+                                self.assertEqual(qwp_symbol_recycle.dictionary_snapshot(sf_dir, sender_id), current)
+                        finally:
+                            if offline:
+                                QDB_FIXTURE.start()
+                        sender.wait(0, 120000)
+                        current = qwp_symbol_recycle.dictionary_snapshot(sf_dir, sender_id)
+                        self.assertEqual(set(current), {'', '東京-4', 'epoch-4-0', 'epoch-4-1'})
+                    sys.stderr.write('[recycle] managed restart replayed current namespace; retired symbols absent\n')
+                sender.close_drain()
+            finally:
+                sender.close(False)
+        for table in tables:
+            rows = self._retry_query_rows(
+                f'select row_id,sym from "{table}" order by row_id', len(expected[table]))['dataset']
+            self.assertEqual(rows, expected[table])
+            self.assertEqual(len({row[0] for row in rows}), len(rows))
+
     def _retry_poll_qwp_ws_error(self, sender, timeout_sec=10):
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline:
@@ -1842,6 +1917,9 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
         sender_id = 'auth-' + self._variant_name() + '-' + uuid.uuid4().hex[:8]
         with tempfile.TemporaryDirectory(prefix='qwp-ws-auth-') as sf_dir:
             self._assert_auth_failures_rejected(sender_id, sf_dir)
+
+    def test_symbol_dictionary_recycle_churn(self):
+        self._symbol_recycle_scenario()
 
     def test_single_batch_round_trip(self):
         table_name = 'qwp_ws_smoke_' + uuid.uuid4().hex[:8]
@@ -2184,6 +2262,9 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
             self._sfa_file_count(sf_dir, sender_id),
             0,
             'close-drained recovery sender left SFA frame files behind')
+
+    def test_symbol_dictionary_recycle_restart_fresh_epoch_replay(self):
+        self._symbol_recycle_scenario(restart=True)
 
     def test_same_sender_survives_server_restart(self):
         table_name = 'qwp_ws_restart_' + uuid.uuid4().hex[:8]
@@ -2911,7 +2992,10 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # the non-bounce tests, which never reconnect, so the backoff
             # never engages.)
             reconnect_max_backoff_millis=250,
-            close_flush_timeout_millis=budget_millis)
+            close_flush_timeout_millis=budget_millis,
+            symbol_dict_reset='on' if fuzz.symbol_dict_reset else 'off',
+            symbol_dict_reset_threshold=fuzz.symbol_dict_reset_threshold,
+            symbol_dict_reset_max_wait_millis=0)
         try:
             sender = self._connect_sender(conf)
         except Exception as e:  # noqa: BLE001
@@ -2919,6 +3003,19 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             return
         try:
             points = 0
+            recycle_count = 0
+            previous_symbols = set()
+
+            def publish():
+                nonlocal recycle_count, previous_symbols
+                sender.flush()
+                if fuzz.symbol_churn:
+                    sender.wait(0, budget_millis)
+                    symbols = set(qwp_symbol_recycle.dictionary_snapshot(sf_root, sender_id))
+                    if previous_symbols - symbols:
+                        recycle_count += 1
+                    previous_symbols = symbols
+
             for _ in range(load.num_of_iterations):
                 for _ in range(load.num_of_lines):
                     table_name = qwp_ws_fuzz.pick_table_name(
@@ -2930,10 +3027,16 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     table_data.add_line(line)
                     points += 1
                     if points % qwp_ws_fuzz.BATCH_SIZE == 0:
-                        sender.flush()
-                sender.flush()
+                        publish()
+                publish()
                 if load.wait_between_iterations_ms > 0:
                     time.sleep(load.wait_between_iterations_ms / 1000.0)
+            if fuzz.symbol_churn:
+                if fuzz.symbol_dict_reset:
+                    assert recycle_count >= 2, f'planned repeated recycling missed: {recycle_count}'
+                else:
+                    assert recycle_count == 0
+                self._log(f'producer {sender_id}: reset={fuzz.symbol_dict_reset} observed_recycles={recycle_count}')
             sender.close_drain()
         except Exception as e:  # noqa: BLE001
             record_failure(f'producer {sender_id} failed: {e}')
@@ -2946,6 +3049,17 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     def _r(self):
         """Shorthand alias for the master RNG used in test parameterization."""
         return self._master_rng
+
+    def test_symbol_dictionary_recycle_seeded_churn_with_bounce(self):
+        for enabled in (True, False):
+            with self.subTest(symbol_dict_reset=enabled):
+                load = qwp_ws_fuzz.LoadParams(32, 8, 1, 2, 100)
+                fuzz = qwp_ws_fuzz.FuzzParams(
+                    symbol_dict_reset=enabled,
+                    symbol_dict_reset_threshold=4 + self._r().next_int(4),
+                    symbol_churn=True, max_bounces=1,
+                    min_bounce_interval_s=.1, max_bounce_interval_s=.2)
+                self._run_fuzz(load, fuzz)
 
     def test_add_columns(self):
         r = self._r()

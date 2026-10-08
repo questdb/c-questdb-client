@@ -34,8 +34,8 @@ use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 use crate::ingress::sender::qwp_ws::{
-    SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
-    qwp_ws_begin_close_background, qwp_ws_check_error_background,
+    RecycleForeground, SyncQwpWsHandlerState, publish_qwp_ws_payload_background,
+    qwp_ws_acked_fsn_background, qwp_ws_begin_close_background, qwp_ws_check_error_background,
     qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
     qwp_ws_published_fsn_background, qwp_ws_sender_errors_dropped_background,
@@ -307,6 +307,11 @@ impl Debug for DirectSenderCore {
 }
 
 impl PooledSenderCore {
+    #[cfg(test)]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        self.backend.state.recycle_allocation_probe()
+    }
+
     pub(crate) fn new_store_and_forward(
         mut state: SyncQwpWsHandlerState,
         max_buf_size: usize,
@@ -360,6 +365,16 @@ impl PooledSenderCore {
                 drop_on_return: false,
             }),
         })
+    }
+
+    /// Request symbol dictionary recycling at a later safe, nonempty publication.
+    ///
+    /// This advisory call does not flush, wait, reset storage, or connect. Repeated
+    /// requests coalesce; disabled recycling is a no-op. Closed or terminal state
+    /// returns its existing error. The request and publication sequence numbers
+    /// remain owned by this core across pool leases.
+    pub fn reset_symbol_dictionary(&mut self) -> Result<()> {
+        self.backend.state.reset_symbol_dictionary()
     }
 
     /// Scope the ack barrier and diagnostic polling to the borrowing
@@ -515,13 +530,17 @@ impl PooledSenderCore {
         buffer.clear();
 
         let sfa = &mut self.backend;
-        match boundary {
+        let result = match boundary {
             Some(fsn) => sfa
                 .wait_for_boundary(ack_level, fsn, sfa.sync_timeout)
                 .map_err(FlushFailure::DeliveryUnknown)
                 .map_err(FlushFailure::into_error),
             None => sfa.wait(ack_level, sfa.sync_timeout),
+        };
+        if result.is_ok() {
+            sfa.after_publication();
         }
+        result
     }
 
     fn publish_buffer(
@@ -1554,7 +1573,47 @@ impl DirectColumnBackend {
     }
 }
 
+struct SfaRecycleForeground<'a> {
+    foreground: &'a mut SfaForegroundPublisher,
+    buffer_scratch: &'a mut QwpWsEncodeScratch,
+    scratch: &'a mut encoder::EncodeScratch,
+}
+
+impl RecycleForeground for SfaRecycleForeground<'_> {
+    fn symbol_count(&self) -> usize {
+        self.foreground.symbol_count()
+    }
+    fn take_persisted_dict(
+        &mut self,
+    ) -> Option<crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict> {
+        self.foreground.take_persisted_dict()
+    }
+    fn replace_dictionary(
+        &mut self,
+        delta_enabled: bool,
+        persisted: Option<crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict>,
+    ) {
+        self.foreground.replace_dictionary(delta_enabled, persisted);
+        *self.buffer_scratch = QwpWsEncodeScratch::new();
+        *self.scratch = encoder::EncodeScratch::new();
+    }
+}
+
 impl SfaBackend {
+    fn before_publication(&mut self, nonempty: bool) -> Result<()> {
+        let mut foreground = SfaRecycleForeground {
+            foreground: &mut self.foreground,
+            buffer_scratch: &mut self.buffer_scratch,
+            scratch: &mut self.scratch,
+        };
+        self.state
+            .before_publication(&mut foreground, nonempty, self.sfa_deferred_group_open)
+    }
+
+    fn after_publication(&mut self) {
+        self.state.after_publication(self.foreground.symbol_count());
+    }
+
     /// Lifted out of [`Self::sync`] so an ACKing flush can reject a
     /// durable-without-opt-in request *before* encode mutates the symbol dict
     /// or the Arrow import consumes the caller's array.
@@ -1607,6 +1666,11 @@ impl SfaBackend {
         if let Err(err) = qwp_ws_check_error_background(&self.state) {
             return Err(FlushFailure::NotDelivered(err));
         }
+        buffer
+            .check_can_flush()
+            .map_err(FlushFailure::NotDelivered)?;
+        self.before_publication(!buffer.is_empty())
+            .map_err(FlushFailure::NotDelivered)?;
         if buffer.is_empty() {
             return Ok(None);
         }
@@ -1644,6 +1708,9 @@ impl SfaBackend {
                 // A buffer frame always commits, so it also closes a group a
                 // failed split could not.
                 self.sfa_deferred_group_open = false;
+                if ack_level.is_none() {
+                    self.after_publication();
+                }
                 Ok(Some(fsn))
             }
             SfaPublishOutcome::TooLarge {
@@ -1685,6 +1752,11 @@ impl SfaBackend {
         if let Err(e) = qwp_ws_check_error_background(&self.state) {
             return Err(FlushFailure::NotDelivered(e));
         }
+        if self.state.needs_recycle_boundary() {
+            encoder::validate_chunk(chunk).map_err(FlushFailure::NotDelivered)?;
+        }
+        self.before_publication(!chunk.is_empty())
+            .map_err(FlushFailure::NotDelivered)?;
         let caps = self.effective_frame_caps();
         // Whole-chunk fast path; only split when a single frame exceeds the cap.
         //
@@ -1746,6 +1818,7 @@ impl SfaBackend {
             self.wait_for_boundary(level, boundary, self.sync_timeout)
                 .map_err(FlushFailure::DeliveryUnknown)?;
         }
+        self.after_publication();
         Ok(boundary)
     }
 
@@ -2004,6 +2077,12 @@ impl SfaBackend {
         if let Err(e) = qwp_ws_check_error_background(&self.state) {
             return Err(FlushFailure::NotDelivered(e));
         }
+        if self.state.needs_recycle_boundary() {
+            arrow_batch::validate_arrow_batch(table, batch, ts, overrides)
+                .map_err(FlushFailure::NotDelivered)?;
+        }
+        self.before_publication(batch.num_rows() != 0)
+            .map_err(FlushFailure::NotDelivered)?;
         let caps = self.effective_frame_caps();
         let spec = ArrowFrameSpec {
             table,
@@ -2055,6 +2134,7 @@ impl SfaBackend {
             self.wait_for_boundary(level, boundary, self.sync_timeout)
                 .map_err(FlushFailure::DeliveryUnknown)?;
         }
+        self.after_publication();
         Ok(boundary)
     }
 
@@ -2388,5 +2468,298 @@ mod tests {
         let still = deny_retry_after_partial(du);
         assert!(!still.is_not_delivered());
         assert!(still.into_error().in_doubt());
+    }
+}
+
+#[cfg(test)]
+mod recycle_boundary_tests {
+    use super::*;
+    use crate::tests::qwp_ws_recycle::Server;
+
+    fn core(server: &Server) -> PooledSenderCore {
+        use crate::ingress::conf::{ConfigSetting, QwpWsConfig};
+        let config = QwpWsConfig {
+            symbol_dict_reset_threshold: ConfigSetting::new_specified(1),
+            symbol_dict_reset_max_wait: ConfigSetting::new_specified(Duration::ZERO),
+            ..QwpWsConfig::default()
+        };
+        let state = crate::ingress::sender::qwp_ws::connect_qwp_ws_background_state(
+            "127.0.0.1",
+            &server.port.to_string(),
+            false,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        PooledSenderCore::new_store_and_forward(state, 1 << 20, false, Duration::from_secs(5))
+            .unwrap()
+    }
+
+    #[test]
+    fn recycle_api_floor_and_pending_lease_retained() {
+        let server = Server::new();
+        let mut sender = core(&server);
+        let mut buffer = Buffer::new_qwp_ws();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        server.frame();
+        // The first automatic reset swaps one symbol, setting the floor to two.
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let (first_reset, _) = server.frame();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "two")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        assert_eq!(server.frame().0, first_reset);
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "one")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let (second, _) = server.frame();
+        assert_ne!(second, first_reset);
+        // The second automatic swap had two symbols, raising the floor to four.
+        assert!(!sender.backend.state.needs_recycle_boundary());
+        sender.reset_symbol_dictionary().unwrap();
+        // Fail after accepted parking; rebasing a lease must retain ownership.
+        crate::ingress::sender::fail_next_recycle_storage_for_test();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "gamma")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(
+            sender
+                .flush_buffer(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("injected recycle failure")
+        );
+        sender.rebase_lease_observation();
+        sender.reset_symbol_dictionary().unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let (third, _) = server.frame();
+        assert_ne!(second, third);
+        assert!(!sender.must_close());
+        // The manual swap had one symbol; the established floor must remain four.
+        assert!(!sender.backend.state.needs_recycle_boundary());
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "delta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        assert_eq!(server.frame().0, third);
+        assert!(!sender.backend.state.needs_recycle_boundary());
+        for symbol in ["epsilon", "zeta"] {
+            buffer
+                .table("trades")
+                .unwrap()
+                .symbol("sym", symbol)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            sender
+                .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+                .unwrap();
+            assert_eq!(
+                server.frame().0,
+                third,
+                "manual reset must not lower the floor"
+            );
+        }
+        assert!(sender.backend.state.needs_recycle_boundary());
+        sender.reset_symbol_dictionary().unwrap();
+        sender.begin_close();
+        assert!(sender.reset_symbol_dictionary().is_err());
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "closed")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(sender.flush_buffer(&mut buffer).is_err());
+    }
+
+    #[test]
+    fn recycle_boundary_open_group_retries_commit_before_recycling() {
+        let server = Server::new();
+        let mut sender = core(&server);
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .symbol_i32("sym", &[0], &[0, 5], b"alpha", None)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let backend = &mut sender.backend;
+        backend.publish_chunk_sfa(&chunk, None, 2048, true).unwrap();
+        backend.after_publication();
+        assert!(backend.sfa_deferred_group_open);
+        // Model a committing-frame rejection after a prefix reached the queue.
+        let cap = backend.max_buf_size;
+        backend.max_buf_size = 0;
+        backend.commit_orphaned_prefix();
+        assert!(backend.sfa_deferred_group_open);
+        backend.max_buf_size = cap;
+        let (old, prefix) = server.frame();
+        assert_ne!(prefix[5] & 1, 0);
+        // Existing empty-Chunk behavior closes debt without starting maintenance.
+        let mut empty = Chunk::new("");
+        sender.flush_and_wait(&mut empty, AckLevel::Ok).unwrap();
+        let (same, commit) = server.frame();
+        assert_eq!(same, old);
+        assert_eq!(commit[5] & 1, 0);
+        assert_eq!(&commit[6..8], &[0, 0]);
+        assert!(!sender.backend.sfa_deferred_group_open);
+        let mut buffer = Buffer::new_qwp_ws();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let (fresh, frame) = server.frame();
+        assert_ne!(fresh, old);
+        assert_eq!(frame[12], 0);
+        assert_eq!(sender.published_fsn().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn recycle_boundary_invalid_chunk_does_not_replace_dictionary() {
+        let server = Server::new();
+        let mut sender = core(&server);
+        let mut buffer = Buffer::new_qwp_ws();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        server.frame();
+        let mut invalid = Chunk::new("trades");
+        invalid.column_i64("value", &[1], None).unwrap();
+        assert_eq!(
+            sender.flush(&mut invalid).unwrap_err().code(),
+            ErrorCode::InvalidApiCall
+        );
+        assert_eq!(sender.backend.foreground.symbol_count(), 1);
+    }
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn recycle_boundary_invalid_arrow_does_not_replace_dictionary() {
+        use arrow::array::{ArrayRef, Int64Array};
+        let server = Server::new();
+        let mut sender = core(&server);
+        let mut buffer = Buffer::new_qwp_ws();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        server.frame();
+        let values = std::sync::Arc::new(Int64Array::from(vec![1])) as ArrayRef;
+        let invalid =
+            RecordBatch::try_from_iter(vec![("value", values.clone()), ("value", values)]).unwrap();
+        assert_eq!(
+            sender
+                .flush_arrow_batch_at_now("trades", &invalid, &[])
+                .unwrap_err()
+                .code(),
+            ErrorCode::ArrowIngest
+        );
+        assert_eq!(sender.backend.foreground.symbol_count(), 1);
+    }
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn recycle_boundary_invalid_arrow_values_preserve_namespace_and_phase() {
+        for (batch, designated) in crate::tests::qwp_ws_recycle::invalid_arrow_values() {
+            let server = Server::new();
+            let mut sender = core(&server);
+            let mut buffer = Buffer::new_qwp_ws();
+            buffer
+                .table("trades")
+                .unwrap()
+                .symbol("sym", "alpha")
+                .unwrap()
+                .at_now()
+                .unwrap();
+            sender
+                .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+                .unwrap();
+            server.frame();
+            let ts = if designated {
+                ArrowTsSource::Column(0)
+            } else {
+                ArrowTsSource::ServerNow
+            };
+            let failure = sender
+                .backend
+                .flush_arrow_batch_boundary(
+                    TableName::new("trades").unwrap(),
+                    &batch,
+                    ts,
+                    &[],
+                    WaitForAck::No,
+                )
+                .unwrap_err();
+            assert!(failure.is_not_delivered());
+            assert_eq!(failure.into_error().code(), ErrorCode::ArrowIngest);
+            assert_eq!(sender.backend.foreground.symbol_count(), 1);
+            assert!(sender.backend.state.needs_recycle_boundary());
+            assert!(sender.backend.state.pending_recycle_boundary().is_none());
+            assert_eq!(sender.published_fsn().unwrap(), Some(0));
+            assert_eq!(server.connection_count(), 1);
+        }
     }
 }

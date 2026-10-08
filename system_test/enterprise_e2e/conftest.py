@@ -124,17 +124,24 @@ def c_client_rust_column_sidecar_binary() -> Path:
 
 @pytest.fixture(scope="function")
 def c_client_rust_column_sidecar(
-    c_client_rust_column_sidecar_binary: Path, log_dir: Path
+    c_client_rust_column_sidecar_binary: Path, log_dir: Path,
+    request: pytest.FixtureRequest,
 ) -> Iterator[CClientRustColumnSidecar]:
     """Sidecar driven by the Rust binding's column-major
     ``qwp_column_sidecar`` binary. Speaks the same line protocol as
     :func:`c_client_rust_sidecar`, so tests take a ``Sidecar``-typed
     parameter polymorphically."""
+    # Indirect True requests the required Polars feature for this case. Build
+    # immediately before launch: the shared binary path may have been replaced
+    # by a default-feature build since a session-scoped fixture last ran.
+    binary = (build_qwp_column_sidecar(require_polars=True)
+              if getattr(request, "param", False)
+              else c_client_rust_column_sidecar_binary)
     s = CClientRustColumnSidecar(
         log_dir=log_dir,
         classpath=None,
         name="c-client-rust-column-sidecar",
-        binary_path=c_client_rust_column_sidecar_binary,
+        binary_path=binary,
     )
     s.start()
     try:

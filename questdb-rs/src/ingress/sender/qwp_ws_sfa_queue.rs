@@ -443,6 +443,36 @@ pub(crate) struct SfaFrameQueue {
     recovered_dict_entries: Vec<u8>,
     /// Entry count matching [`recovered_dict_entries`](Self::recovered_dict_entries).
     recovered_dict_count: u32,
+    drained_reset: Option<SfaDrainedReset>,
+}
+
+/// Owns every detached resource until reset succeeds. Errors leave this object
+/// installed and the topology reservation held; only reset may resume it.
+#[derive(Debug)]
+struct SfaDrainedReset {
+    manifest: Option<SfManifest>,
+    candidate: Option<Arc<SfaSharedSegment>>,
+    candidate_path: Option<PathBuf>,
+    candidate_creation_started: bool,
+    obsolete: Option<VecDeque<PathBuf>>,
+    phase: SfaDrainedResetPhase,
+    next_fsn: u64,
+}
+
+/// In-memory retry position; advance only after the phase's work succeeds.
+#[derive(Debug, Clone, Copy)]
+enum SfaDrainedResetPhase {
+    EnumerateObsolete,
+    WriteWatermark,
+    SyncWatermark,
+    PrepareCandidate,
+    SyncCandidateDirectory,
+    RewriteFirstManifestRecord,
+    RewriteSecondManifestRecord,
+    InstallCandidate,
+    RemoveObsolete,
+    SyncCleanupDirectory,
+    Complete,
 }
 
 #[derive(Debug)]
@@ -470,6 +500,7 @@ struct SfaEngine {
     published_upper: AtomicU64,
     completed_upper: AtomicU64,
     sync_requested: AtomicBool,
+    resetting: AtomicBool,
     durability_failed: AtomicBool,
 }
 
@@ -736,6 +767,7 @@ impl SfaFrameQueue {
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(recovered_completion.completed_upper),
             sync_requested: AtomicBool::new(false),
+            resetting: AtomicBool::new(false),
             durability_failed: AtomicBool::new(false),
         });
         let producer = Some(SfaProducer {
@@ -754,6 +786,7 @@ impl SfaFrameQueue {
             persisted_symbol_dict,
             recovered_dict_entries: Vec::new(),
             recovered_dict_count: 0,
+            drained_reset: None,
         };
         // This slot has a PRODUCER, so the recovered dictionary must cover every id
         // the surviving frames define -- not just the side-file's intact prefix.
@@ -818,6 +851,7 @@ impl SfaFrameQueue {
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(next_fsn),
             sync_requested: AtomicBool::new(false),
+            resetting: AtomicBool::new(false),
             durability_failed: AtomicBool::new(false),
         });
         let producer = Some(SfaProducer {
@@ -840,6 +874,7 @@ impl SfaFrameQueue {
             // producer's id space starts at 0 with no surviving frames to collide.
             recovered_dict_entries: Vec::new(),
             recovered_dict_count: 0,
+            drained_reset: None,
         })
     }
 
@@ -951,6 +986,7 @@ impl SfaFrameQueue {
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(recovered_completion.completed_upper),
             sync_requested: AtomicBool::new(false),
+            resetting: AtomicBool::new(false),
             durability_failed: AtomicBool::new(false),
         });
 
@@ -982,6 +1018,7 @@ impl SfaFrameQueue {
             // full extra pass to reach the same mirror state.
             recovered_dict_entries,
             recovered_dict_count,
+            drained_reset: None,
         })
     }
 
@@ -1190,6 +1227,108 @@ impl SfaFrameQueue {
         pd
     }
 
+    /// Caller owns exclusive maintenance, has released the foreground dictionary
+    /// and all replay views, and must keep publication parked until this and the
+    /// separate dictionary reset finish. Capacity deferral before reservation is
+    /// recoverable by running ordinary drained maintenance and trying again.
+    pub(crate) fn reset_drained(
+        &mut self,
+        producer: &mut SfaProducer,
+    ) -> Result<(), SfaQueueError> {
+        if !Arc::ptr_eq(&self.engine, &producer.engine) || self.producer.is_some() {
+            return Err(recovery_error(
+                "reset requires the queue's exclusive producer",
+            ));
+        }
+        self.check_durability()?;
+        if self.persisted_symbol_dict.is_some() {
+            return Err(recovery_error(
+                "reset requires releasing the dictionary handle",
+            ));
+        }
+        if self.drained_reset.is_none() {
+            let mut state = self.engine.lock_state()?;
+            if state.closed {
+                return Err(SfaQueueError::Closed);
+            }
+            if state.storage_maintenance_in_flight || state.topology_io_in_flight {
+                return Err(SfaQueueError::StorageMaintenanceInFlight);
+            }
+            if !self.engine.all_published_frames_resolved()
+                || producer.next_fsn != self.engine.published_upper.load(Ordering::Acquire)
+            {
+                return Err(recovery_error("cannot reset unresolved SFA frames"));
+            }
+            if self.engine.slot_dir.is_some() && state.manifest.is_none() {
+                return Err(recovery_error("cannot reset without the SF manifest"));
+            }
+            let active = state.active.as_ref().ok_or(SfaQueueError::Closed)?;
+            if !Arc::ptr_eq(active, &producer.active) {
+                return Err(recovery_error(
+                    "reset producer does not own the active segment",
+                ));
+            }
+            let reuse_active =
+                active.base_seq() == producer.next_fsn && active.published_frame_count() == 0;
+            let needs_allocation = !reuse_active && state.hot_spare.is_none();
+            if needs_allocation
+                && !can_allocate_segment(
+                    state.allocated_segment_bytes,
+                    self.engine.segment_size_bytes,
+                    self.engine.max_bytes,
+                )
+            {
+                return Err(self.engine.storage_backpressure_error(&state).into());
+            }
+            let candidate = if reuse_active {
+                Some(Arc::clone(active))
+            } else {
+                state.hot_spare.take()
+            };
+            let candidate_path = if needs_allocation {
+                match self.engine.slot_dir.as_deref() {
+                    Some(dir) => Some(next_segment_path(dir, &mut state.next_generation)?),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if needs_allocation {
+                state.allocated_segment_bytes += self.engine.segment_size_bytes;
+            }
+            state.topology_io_in_flight = true;
+            self.engine.resetting.store(true, Ordering::Release);
+            self.drained_reset = Some(SfaDrainedReset {
+                manifest: state.manifest.take(),
+                candidate,
+                candidate_path,
+                candidate_creation_started: false,
+                obsolete: None,
+                phase: SfaDrainedResetPhase::EnumerateObsolete,
+                next_fsn: producer.next_fsn,
+            });
+        }
+        let reset = self.drained_reset.as_mut().unwrap();
+        reset.perform(&self.engine, self.ack_watermark.as_mut(), producer)?;
+        let mut state = self.engine.lock_state()?;
+        state.manifest = reset.manifest.take();
+        state.allocated_segment_bytes = producer.active.size_bytes();
+        state.first_non_durable_sealed = 0;
+        state.trim_retry_at = None;
+        state.topology_io_in_flight = false;
+        self.engine.resetting.store(false, Ordering::Release);
+        self.recovered_dict_entries = Vec::new();
+        self.recovered_dict_count = 0;
+        self.drained_reset = None;
+        Ok(())
+    }
+
+    /// Restore the temporarily taken manual-progress producer after maintenance.
+    pub(crate) fn restore_producer(&mut self, producer: SfaProducer) {
+        assert!(self.producer.is_none() && Arc::ptr_eq(&self.engine, &producer.engine));
+        self.producer = Some(producer);
+    }
+
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
         self.producer.take();
         self.engine.close(&mut self.ack_watermark)
@@ -1354,7 +1493,212 @@ impl SfaFrameQueue {
     }
 }
 
+impl SfaDrainedReset {
+    fn perform(
+        &mut self,
+        engine: &SfaEngine,
+        mut watermark: Option<&mut SfaAckWatermark>,
+        producer: &mut SfaProducer,
+    ) -> Result<(), SfaQueueError> {
+        let dir = engine.slot_dir.as_deref();
+        loop {
+            self.phase = match self.phase {
+                SfaDrainedResetPhase::EnumerateObsolete => {
+                    // Complete enumeration before any unlink. Preserve errors,
+                    // including a failure partway through a directory iterator.
+                    if let Some(dir) = dir {
+                        let mut paths = Vec::new();
+                        for entry in fs::read_dir(dir)? {
+                            let path = entry?.path();
+                            if is_sfa_file(&path) {
+                                paths.push(path);
+                            }
+                            #[cfg(test)]
+                            recycle_barrier("enumeration entry")?;
+                        }
+                        paths.sort_by_key(|path| {
+                            segment_cleanup_rank(path.file_name().unwrap().to_str().unwrap_or(""))
+                        });
+                        self.obsolete = Some(paths.into());
+                    }
+                    SfaDrainedResetPhase::WriteWatermark
+                }
+                SfaDrainedResetPhase::WriteWatermark => {
+                    if let Some(watermark) = watermark.as_mut() {
+                        let fsn = self
+                            .next_fsn
+                            .checked_sub(1)
+                            .map(i64::try_from)
+                            .transpose()
+                            .map_err(|_| QueueError::SequenceOverflow)?
+                            .unwrap_or(-1);
+                        watermark.write(fsn)?;
+                    }
+                    SfaDrainedResetPhase::SyncWatermark
+                }
+                SfaDrainedResetPhase::SyncWatermark => {
+                    if let Some(watermark) = watermark.as_mut() {
+                        watermark.sync_data()?;
+                    }
+                    SfaDrainedResetPhase::PrepareCandidate
+                }
+                SfaDrainedResetPhase::PrepareCandidate => {
+                    if self.candidate.is_none() {
+                        let segment = match self.candidate_path.as_ref() {
+                            Some(path) => {
+                                // This generation was reserved exclusively for
+                                // reset. A failed create may have left a partial
+                                // file if its best-effort cleanup also failed.
+                                if self.candidate_creation_started {
+                                    remove_file_if_exists(path)?;
+                                }
+                                self.candidate_creation_started = true;
+                                SfaSegment::create_new_manifested(
+                                    path,
+                                    self.next_fsn,
+                                    engine.segment_size_bytes,
+                                    unix_time_micros(),
+                                )?
+                            }
+                            None => SfaSegment::create_memory(
+                                self.next_fsn,
+                                engine.segment_size_bytes,
+                                unix_time_micros(),
+                            )?,
+                        };
+                        self.candidate = Some(Arc::new(SfaSharedSegment::new(segment)));
+                        #[cfg(test)]
+                        recycle_barrier("segment created")?;
+                    }
+                    let candidate = self.candidate.as_mut().unwrap();
+                    if candidate.base_seq() != self.next_fsn {
+                        Arc::get_mut(candidate)
+                            .ok_or(SfaQueueError::StorageMaintenanceInFlight)?
+                            .rebase_empty(self.next_fsn)?;
+                    }
+                    candidate.segment.sync_header()?;
+                    SfaDrainedResetPhase::SyncCandidateDirectory
+                }
+                SfaDrainedResetPhase::SyncCandidateDirectory => {
+                    if let Some(dir) = dir {
+                        sync_directory(dir)?;
+                    }
+                    SfaDrainedResetPhase::RewriteFirstManifestRecord
+                }
+                SfaDrainedResetPhase::RewriteFirstManifestRecord => {
+                    if let Some(manifest) = self.manifest.as_mut() {
+                        // Both records must exclude old frames before their IDs can
+                        // be reused, including recovery after either record tears.
+                        manifest.rewrite(self.next_fsn, self.next_fsn)?;
+                    }
+                    SfaDrainedResetPhase::RewriteSecondManifestRecord
+                }
+                SfaDrainedResetPhase::RewriteSecondManifestRecord => {
+                    if let Some(manifest) = self.manifest.as_mut() {
+                        manifest.rewrite(self.next_fsn, self.next_fsn)?;
+                    }
+                    SfaDrainedResetPhase::InstallCandidate
+                }
+                SfaDrainedResetPhase::InstallCandidate => {
+                    let candidate = self.candidate.as_ref().unwrap();
+                    let mut state = engine.lock_state()?;
+                    state.sync_scratch.clear();
+                    state.sealed_segments.clear();
+                    state.hot_spare.take();
+                    state.active = Some(Arc::clone(candidate));
+                    producer.active = Arc::clone(candidate);
+                    producer.active_append_offset = HEADER_SIZE as u64;
+                    producer.active_frame_count = 0;
+                    if let Some(paths) = self.obsolete.as_mut() {
+                        paths.retain(|path| Some(path.as_path()) != candidate.path());
+                    }
+                    SfaDrainedResetPhase::RemoveObsolete
+                }
+                SfaDrainedResetPhase::RemoveObsolete => {
+                    if let Some(paths) = self.obsolete.as_mut() {
+                        while let Some(path) = paths.front() {
+                            remove_file_if_exists(path)?;
+                            paths.pop_front();
+                            #[cfg(test)]
+                            recycle_barrier("segment unlinked")?;
+                        }
+                    }
+                    SfaDrainedResetPhase::SyncCleanupDirectory
+                }
+                SfaDrainedResetPhase::SyncCleanupDirectory => {
+                    if let Some(dir) = dir {
+                        sync_directory(dir)?;
+                    }
+                    SfaDrainedResetPhase::Complete
+                }
+                SfaDrainedResetPhase::Complete => return Ok(()),
+            };
+            #[cfg(test)]
+            recycle_barrier("reset phase")?;
+        }
+    }
+}
+
+#[cfg(test)]
+type RecycleObserver = Box<dyn FnMut(&'static str)>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static RECYCLE_OBSERVER: std::cell::RefCell<Option<RecycleObserver>> = const { std::cell::RefCell::new(None) };
+    static RECYCLE_KILL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    pub(super) static RECYCLE_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn observe_recycle_phase(step: &'static str) {
+    RECYCLE_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().as_mut() {
+            observer(step);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(super) fn recycle_barrier(step: &'static str) -> io::Result<()> {
+    observe_recycle_phase(step);
+    RECYCLE_KILL_AFTER.with(|count| match count.get() {
+        Some(0) => {
+            use std::io::Write;
+            println!("RECYCLE_KILL_READY:{step}");
+            std::io::stdout().flush().unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        Some(n) => count.set(Some(n - 1)),
+        None => (),
+    });
+    RECYCLE_FAIL_AFTER.with(|count| match count.get() {
+        Some(0) => {
+            count.set(None);
+            Err(io::Error::other(format!(
+                "injected recycle failure after {step}"
+            )))
+        }
+        Some(n) => {
+            count.set(Some(n - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    })
+}
+
 impl SfaProgressView {
+    #[cfg(test)]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        let engine = Arc::downgrade(&self.engine);
+        Box::new(move || {
+            engine
+                .upgrade()
+                .map(|engine| engine.with_state(|state| state.allocated_segment_bytes))
+        })
+    }
+
     /// See [`SfaEngine::has_deferred_commit_headroom`].
     pub(crate) fn has_deferred_commit_headroom(&self) -> bool {
         self.engine.has_deferred_commit_headroom()
@@ -1504,6 +1848,9 @@ impl SfaProducer {
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
         self.engine.check_durability()?;
+        if self.engine.resetting.load(Ordering::Acquire) {
+            return Err(SfaQueueError::StorageMaintenanceInFlight);
+        }
         self.engine.validate_submit(payload)?;
         let fsn = self.next_fsn;
         let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
@@ -3517,6 +3864,602 @@ mod tests {
         fail_sync_after_for_test, initial_segment_path, scan_file, spare_segment_path,
     };
     use super::*;
+
+    #[test]
+    fn recycle_reset_keeps_fsn_and_slot_lock() {
+        for disk in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let mut queue = if disk {
+                SfaFrameQueue::open(options(&dir)).unwrap()
+            } else {
+                SfaFrameQueue::open_memory(memory_options(256, 1024)).unwrap()
+            };
+            drop(queue.take_persisted_symbol_dict());
+            let mut producer = queue.take_producer().unwrap();
+            for fsn in 0..3 {
+                assert_eq!(producer.try_submit(b"old").unwrap().fsn, fsn);
+            }
+            queue.complete_through_fsn(2).unwrap();
+            queue.reset_drained(&mut producer).unwrap();
+            assert_eq!(queue.completed_fsn(), Some(2));
+            for fsn in 0..3 {
+                assert_eq!(
+                    queue.receipt_status(QwpReceipt { fsn }),
+                    QwpReceiptStatus::Completed { fsn }
+                );
+            }
+            assert_eq!(producer.active.base_seq(), 3);
+            assert_eq!(producer.active.published_frame_count(), 0);
+            assert_eq!(producer.try_submit(b"new").unwrap().fsn, 3);
+        }
+    }
+
+    #[test]
+    fn recycle_reset_rejects_unresolved_and_busy_storage() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(48, 144)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        producer.try_submit(b"one").unwrap();
+        assert!(queue.reset_drained(&mut producer).is_err());
+        assert_eq!(producer.next_fsn, 1);
+        queue.complete_through_fsn(0).unwrap();
+        queue
+            .engine
+            .state
+            .lock()
+            .unwrap()
+            .storage_maintenance_in_flight = true;
+        assert!(matches!(
+            queue.reset_drained(&mut producer),
+            Err(SfaQueueError::StorageMaintenanceInFlight)
+        ));
+        assert_eq!(producer.active.base_seq(), 0);
+    }
+
+    fn recycle_symbol_frame(symbol: &str) -> Vec<u8> {
+        let mut buffer = crate::ingress::Buffer::new_qwp_ws();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", symbol)
+            .unwrap()
+            .at(crate::ingress::TimestampNanos::new(7))
+            .unwrap();
+        let mut encoder = super::super::qwp_ws_publisher::QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        encoder
+            .encode(buffer.as_qwp_ws().unwrap())
+            .unwrap()
+            .to_vec()
+    }
+
+    fn recycle_fixture(dir: &TempDir) -> (SfaFrameQueue, SfaProducer) {
+        recycle_fixture_with_segment_size(dir, 256)
+    }
+
+    fn recycle_fixture_with_segment_size(dir: &TempDir, size: u64) -> (SfaFrameQueue, SfaProducer) {
+        let mut queue = SfaFrameQueue::open(options_with(dir, size, size as usize * 4)).unwrap();
+        let mut dict = queue.take_persisted_symbol_dict().unwrap();
+        dict.append_symbol(b"old").unwrap();
+        drop(dict);
+        let mut producer = queue.take_producer().unwrap();
+        for _ in 0..3 {
+            producer.try_submit(&recycle_symbol_frame("old")).unwrap();
+        }
+        queue.complete_through_fsn(2).unwrap();
+        (queue, producer)
+    }
+
+    fn copy_slot(from: &Path, to: &Path) {
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn recycle_reset_crash_barriers() {
+        // Small segments consume the hot spare and exercise fresh allocation;
+        // large segments exercise rebasing and reusing the retained hot spare.
+        for segment_size in [128, 1024] {
+            let mut cuts = 0;
+            for cut in 0..40 {
+                let dir = TempDir::new().unwrap();
+                let (mut queue, mut producer) =
+                    recycle_fixture_with_segment_size(&dir, segment_size);
+                RECYCLE_FAIL_AFTER.with(|count| count.set(Some(cut)));
+                let result = queue.reset_drained(&mut producer);
+                RECYCLE_FAIL_AFTER.with(|count| count.set(None));
+                if result.is_ok() {
+                    break;
+                }
+                cuts += 1;
+                assert!(queue.storage_maintenance_in_flight().unwrap());
+                assert!(matches!(
+                    producer.try_submit(b"forbidden"),
+                    Err(SfaQueueError::StorageMaintenanceInFlight)
+                ));
+                assert!(queue.close().is_err());
+                let snapshot = TempDir::new().unwrap();
+                copy_slot(dir.path(), snapshot.path());
+                let reopened = SfaFrameQueue::open(options(&snapshot)).unwrap();
+                assert_eq!(reopened.published_fsn(), Some(2), "cut {cut}");
+                assert_eq!(reopened.completed_fsn(), Some(2), "cut {cut}");
+                assert_eq!(reopened.oldest_unresolved_fsn(), None, "cut {cut}");
+                assert_eq!(
+                    PersistedSymbolDict::open(snapshot.path())
+                        .unwrap()
+                        .read_loaded_symbols(),
+                    [b"old"],
+                    "cut {cut}"
+                );
+                queue.reset_drained(&mut producer).unwrap();
+                queue.reset_drained(&mut producer).unwrap();
+                assert_eq!(producer.next_fsn, 3);
+                assert_eq!(sfa_file_count(dir.path()), 1);
+                assert_eq!(
+                    queue
+                        .engine
+                        .with_state(|state| state.allocated_segment_bytes),
+                    segment_size
+                );
+                assert_eq!(
+                    PersistedSymbolDict::reset_drained(dir.path())
+                        .unwrap()
+                        .size(),
+                    0
+                );
+                assert_eq!(producer.try_submit(b"new").unwrap().fsn, 3);
+            }
+            assert!(
+                cuts >= 15,
+                "all enumeration and disk phase cuts must run: {cuts}"
+            );
+        }
+    }
+
+    #[test]
+    fn recycle_reset_dictionary_crash_barriers() {
+        for cut in 0..4 {
+            let dir = TempDir::new().unwrap();
+            let (mut queue, mut producer) = recycle_fixture(&dir);
+            queue.reset_drained(&mut producer).unwrap();
+            fs::write(
+                dir.path().join(".symbol-dict.stale"),
+                b"stale old dictionary",
+            )
+            .unwrap();
+            RECYCLE_FAIL_AFTER.with(|count| count.set(Some(cut)));
+            assert!(PersistedSymbolDict::reset_drained(dir.path()).is_err());
+            let snapshot = TempDir::new().unwrap();
+            copy_slot(dir.path(), snapshot.path());
+            let mut reopened = SfaFrameQueue::open(options(&snapshot)).unwrap();
+            assert_eq!(reopened.completed_fsn(), Some(2));
+            assert_eq!(reopened.oldest_unresolved_fsn(), None);
+            assert_eq!(reopened.take_persisted_symbol_dict().unwrap().size(), 0);
+            let fresh_payload = recycle_symbol_frame("new");
+            assert_eq!(reopened.try_submit(&fresh_payload).unwrap().fsn, 3);
+            assert_eq!(reopened.payload_vec_for_fsn(3).unwrap(), fresh_payload);
+            assert_eq!(reopened.oldest_unresolved_fsn(), Some(3));
+            let mut fresh = PersistedSymbolDict::reset_drained(dir.path()).unwrap();
+            fresh.append_symbol(b"new").unwrap();
+            drop(fresh);
+            assert_eq!(
+                PersistedSymbolDict::open(dir.path())
+                    .unwrap()
+                    .read_loaded_symbols(),
+                [b"new"]
+            );
+            assert_eq!(producer.try_submit(b"new").unwrap().fsn, 3);
+        }
+    }
+
+    #[test]
+    fn recycle_crash_after_new_publication() {
+        use std::io::BufRead;
+        const CHILD: &str = "QUESTDB_RECYCLE_CRASH_CHILD";
+        if let Ok(path) = std::env::var(CHILD) {
+            let cut: usize = std::env::var("QUESTDB_RECYCLE_CRASH_CUT")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut opts = SfaQueueOptions {
+                slot_dir: path.into(),
+                segment_size_bytes: 1024,
+                max_bytes: 4096,
+                periodic_sync_interval: None,
+            };
+            if std::env::var("QUESTDB_RECYCLE_CRASH_PERIODIC").unwrap() == "true" {
+                opts.periodic_sync_interval = Some(Duration::from_millis(1));
+            }
+            let mut queue = SfaFrameQueue::open(opts).unwrap();
+            let mut dict = queue.take_persisted_symbol_dict().unwrap();
+            dict.append_symbol(b"old").unwrap();
+            drop(dict);
+            let mut producer = queue.take_producer().unwrap();
+            for fsn in 0..3 {
+                assert_eq!(
+                    producer
+                        .try_submit(&recycle_symbol_frame("old"))
+                        .unwrap()
+                        .fsn,
+                    fsn
+                );
+            }
+            queue.complete_through_fsn(2).unwrap();
+            RECYCLE_KILL_AFTER.with(|count| count.set(Some(cut)));
+            recycle_barrier("old drain").unwrap();
+            queue.reset_drained(&mut producer).unwrap();
+            let mut fresh =
+                PersistedSymbolDict::reset_drained(queue.engine.slot_dir.as_ref().unwrap())
+                    .unwrap();
+            recycle_barrier("fresh namespace before publication").unwrap();
+            fresh.append_symbol(b"new").unwrap();
+            assert_eq!(
+                producer
+                    .try_submit(&recycle_symbol_frame("new"))
+                    .unwrap()
+                    .fsn,
+                3
+            );
+            recycle_barrier("fresh unacked publication").unwrap();
+            println!("RECYCLE_CUTS_COMPLETE");
+            return;
+        }
+        for periodic in [false, true] {
+            let mut killed = 0;
+            let mut saw_publication = false;
+            for cut in 0..40 {
+                let dir = TempDir::new().unwrap();
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "ingress::sender::qwp_ws_sfa_queue::tests::recycle_crash_after_new_publication", "--nocapture"])
+                    .env(CHILD, dir.path()).env("QUESTDB_RECYCLE_CRASH_CUT", cut.to_string())
+                    .env("QUESTDB_RECYCLE_CRASH_PERIODIC", periodic.to_string())
+                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+                let output = child.stdout.take().unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    for line in std::io::BufReader::new(output).lines() {
+                        let line = line.unwrap();
+                        if line.starts_with("RECYCLE_") {
+                            tx.send(line).unwrap();
+                        }
+                    }
+                });
+                let checkpoint = rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap_or_else(|err| {
+                        let _ = child.kill();
+                        panic!("child failed to reach cut {cut}: {err}")
+                    });
+                if checkpoint == "RECYCLE_CUTS_COMPLETE" {
+                    assert!(child.wait().unwrap().success());
+                    reader.join().unwrap();
+                    break;
+                }
+                child.kill().unwrap();
+                assert!(!child.wait().unwrap().success());
+                reader.join().unwrap();
+                killed += 1;
+                let published = checkpoint.ends_with("fresh unacked publication");
+                saw_publication |= published;
+                let mut recovered = SfaFrameQueue::open(options(&dir)).unwrap();
+                assert_eq!(recovered.completed_fsn(), Some(2), "{checkpoint}");
+                assert_eq!(
+                    recovered.published_fsn(),
+                    Some(if published { 3 } else { 2 }),
+                    "{checkpoint}"
+                );
+                assert_eq!(
+                    recovered.oldest_unresolved_fsn(),
+                    published.then_some(3),
+                    "{checkpoint}"
+                );
+                if published {
+                    let bytes = recovered.payload_vec_for_fsn(3).unwrap();
+                    assert_eq!(bytes, recycle_symbol_frame("new"));
+                    assert_eq!(
+                        PersistedSymbolDict::open(dir.path())
+                            .unwrap()
+                            .read_loaded_symbols(),
+                        [b"new"]
+                    );
+                }
+                assert_eq!(
+                    recovered
+                        .try_submit(&recycle_symbol_frame("next"))
+                        .unwrap()
+                        .fsn,
+                    if published { 4 } else { 3 }
+                );
+            }
+            assert!(
+                killed >= 15,
+                "all durable reset barriers must be killed, got {killed}"
+            );
+            assert!(
+                saw_publication,
+                "must kill after an actual fresh unacked publication"
+            );
+        }
+    }
+
+    #[test]
+    fn recycle_crash_rejects_unresolved_old_generation_residue() {
+        use super::super::qwp_ws_driver::{DriveOutcome, FakeOrderedServer, QwpWsCoreTestHarness};
+        let dir = TempDir::new().unwrap();
+        let (mut queue, mut producer) = recycle_fixture(&dir);
+        queue.reset_drained(&mut producer).unwrap();
+        let mut dict = PersistedSymbolDict::reset_drained(dir.path()).unwrap();
+        dict.append_symbol(b"new").unwrap();
+        drop(dict);
+        assert_eq!(
+            producer
+                .try_submit(&recycle_symbol_frame("new"))
+                .unwrap()
+                .fsn,
+            3
+        );
+        // Inject a valid but contradictory old-namespace frame into actual files.
+        assert_eq!(
+            producer
+                .try_submit(&recycle_symbol_frame("old"))
+                .unwrap()
+                .fsn,
+            4
+        );
+        drop(producer);
+        drop(queue);
+        let queue = SfaFrameQueue::open(options(&dir)).unwrap();
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(3));
+        let entries = queue.recovered_symbol_dict_entries().to_vec();
+        let count = queue.recovered_symbol_dict_count();
+        let (mut store, mut core) =
+            QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::ack_each_send())
+                .into_parts();
+        core.enable_delta_dict(&entries, count);
+        core.drive_once(&mut store).unwrap();
+        assert_eq!(core.drive_once(&mut store).unwrap(), DriveOutcome::Terminal);
+        assert_eq!(
+            store.terminal_error().unwrap().code(),
+            crate::ErrorCode::StoreResendRequired
+        );
+        assert_eq!(store.completed_fsn(), Some(3));
+        assert_eq!(store.published_fsn(), Some(4));
+    }
+
+    #[test]
+    fn recycle_reset_both_manifest_records_exclude_old_frames() {
+        for slot in [0, 1] {
+            let dir = TempDir::new().unwrap();
+            let (mut queue, mut producer) = recycle_fixture(&dir);
+            queue.reset_drained(&mut producer).unwrap();
+            drop(PersistedSymbolDict::reset_drained(dir.path()).unwrap());
+            let snapshot = TempDir::new().unwrap();
+            copy_slot(dir.path(), snapshot.path());
+            let path = manifest_path(snapshot.path());
+            let mut bytes = fs::read(&path).unwrap();
+            let half = bytes.len() / 2;
+            bytes[slot * half] ^= 0xff;
+            fs::write(path, bytes).unwrap();
+            let mut reopened = SfaFrameQueue::open(options(&snapshot)).unwrap();
+            assert_eq!(reopened.completed_fsn(), Some(2));
+            assert_eq!(reopened.oldest_unresolved_fsn(), None);
+            assert_eq!(reopened.try_submit(b"new").unwrap().fsn, 3);
+        }
+    }
+
+    #[test]
+    fn recycle_reset_first_unlink_failure_retains_transaction_and_budget() {
+        let dir = TempDir::new().unwrap();
+        let (mut queue, mut producer) = recycle_fixture(&dir);
+        let first = dir.path().join(INITIAL_SEGMENT_FILE_NAME);
+        // A directory is a portable unlink failure, including Windows.
+        fs::create_dir(&first).unwrap();
+        assert!(queue.reset_drained(&mut producer).is_err());
+        assert!(queue.drained_reset.is_some());
+        assert_eq!(sfa_file_count(dir.path()), 3);
+        assert_eq!(
+            queue
+                .engine
+                .with_state(|state| state.allocated_segment_bytes),
+            512
+        );
+        assert_eq!(PersistedSymbolDict::open(dir.path()).unwrap().size(), 1);
+        fs::remove_dir(first).unwrap();
+        queue.reset_drained(&mut producer).unwrap();
+        assert_eq!(sfa_file_count(dir.path()), 1);
+        assert_eq!(producer.try_submit(b"new").unwrap().fsn, 3);
+    }
+
+    #[test]
+    fn recycle_reset_full_budget_defers_until_ordinary_trim() {
+        for disk in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let mut queue = if disk {
+                SfaFrameQueue::open(options_with(&dir, 38, 76)).unwrap()
+            } else {
+                SfaFrameQueue::open_memory(memory_options(38, 76)).unwrap()
+            };
+            drop(queue.take_persisted_symbol_dict());
+            let mut producer = queue.take_producer().unwrap();
+            producer.try_submit(b"one").unwrap();
+            producer.try_submit(b"two").unwrap();
+            queue.complete_through_fsn(1).unwrap();
+            assert!(queue.reset_drained(&mut producer).is_err());
+            assert!(queue.drained_reset.is_none());
+            assert_eq!(producer.active.base_seq(), 1);
+            assert_eq!(
+                queue
+                    .engine
+                    .with_state(|state| state.allocated_segment_bytes),
+                76
+            );
+            assert_eq!(queue.sealed_segment_count(), 1);
+            assert!(queue.maintain_storage().unwrap());
+            queue.reset_drained(&mut producer).unwrap();
+            assert_eq!(producer.active.base_seq(), 2);
+            assert_eq!(
+                queue
+                    .engine
+                    .with_state(|state| state.allocated_segment_bytes),
+                38
+            );
+            assert_eq!(producer.try_submit(b"tri").unwrap().fsn, 2);
+        }
+    }
+
+    #[test]
+    fn recycle_reset_reuses_empty_active_and_recovered_fsn() {
+        let dir = TempDir::new().unwrap();
+        write_manifested_segment(&spare_segment_path(dir.path(), 0), 77, None);
+        drop(SfManifest::create(dir.path(), 77, 77).unwrap());
+        write_ack_watermark(dir.path(), 76);
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 256, 512)).unwrap();
+        drop(queue.take_persisted_symbol_dict());
+        let mut producer = queue.take_producer().unwrap();
+        let old_path = producer.active.path().unwrap().to_owned();
+        queue.reset_drained(&mut producer).unwrap();
+        assert_eq!(producer.active.path(), Some(old_path.as_path()));
+        assert_eq!(sfa_file_count(dir.path()), 1);
+        assert_eq!(queue.completed_fsn(), Some(76));
+        assert_eq!(producer.try_submit(b"new").unwrap().fsn, 77);
+    }
+
+    #[test]
+    fn recycle_reset_manifest_io_does_not_hold_engine_mutex() {
+        let dir = TempDir::new().unwrap();
+        let (mut queue, mut producer) = recycle_fixture(&dir);
+        let engine = Arc::downgrade(&queue.engine);
+        queue
+            .engine
+            .state
+            .lock()
+            .unwrap()
+            .manifest
+            .as_mut()
+            .unwrap()
+            .set_before_sync_hook(Arc::new(move || {
+                assert!(engine.upgrade().unwrap().state.try_lock().is_ok());
+                Ok(())
+            }));
+        queue.reset_drained(&mut producer).unwrap();
+    }
+
+    #[test]
+    fn recycle_reset_rejects_real_hot_spare_creation() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(38, 114)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        producer.try_submit(b"one").unwrap();
+        producer.try_submit(b"two").unwrap();
+        let step = queue.take_storage_maintenance_step(true).unwrap().unwrap();
+        queue.complete_through_fsn(1).unwrap();
+        assert!(matches!(
+            queue.reset_drained(&mut producer),
+            Err(SfaQueueError::StorageMaintenanceInFlight)
+        ));
+        let finish = queue
+            .finish_storage_maintenance(step.perform().unwrap(), true)
+            .unwrap();
+        assert!(finish.into_cleanup().is_none());
+        queue.complete_storage_maintenance().unwrap();
+        queue.reset_drained(&mut producer).unwrap();
+        assert_eq!(producer.try_submit(b"new").unwrap().fsn, 2);
+    }
+
+    #[test]
+    fn recycle_reset_requires_durable_ack_and_preserves_dictionary_on_rejection() {
+        use super::super::qwp_ws_driver::{QwpWsSendCore, ReconnectPolicy, TableSeqTxn};
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options(&dir)).unwrap();
+        let mut dict = queue.take_persisted_symbol_dict().unwrap();
+        dict.append_symbol(b"old").unwrap();
+        drop(dict);
+        let before = fs::read(dir.path().join(".symbol-dict")).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        producer.try_submit(b"old").unwrap();
+        let progress = queue.progress_view();
+        let mut core = QwpWsSendCore::new_with_durable_ack(
+            FakeOrderedServer::no_response(),
+            ReconnectPolicy::bounded(Duration::MAX, Duration::ZERO, Duration::ZERO),
+            true,
+        );
+        let outbound = core.next_outbound_sfa_frame(&progress).unwrap().unwrap();
+        let (frame, sent) = core.send_frame(outbound);
+        core.finish_send_result_hot(frame, sent.unwrap()).unwrap();
+        let txns = || {
+            vec![TableSeqTxn {
+                table: "trades".to_owned(),
+                seq_txn: 10,
+            }]
+        };
+        core.finish_durable_ok_response_sfa(&progress, 0, txns())
+            .unwrap();
+        assert!(queue.reset_drained(&mut producer).is_err());
+        assert_eq!(queue.completed_fsn(), None);
+        assert_eq!(producer.next_fsn, 1);
+        assert_eq!(before, fs::read(dir.path().join(".symbol-dict")).unwrap());
+        core.finish_durable_ack_response_sfa(&progress, txns())
+            .unwrap();
+        drop(core);
+        queue.reset_drained(&mut producer).unwrap();
+        assert_eq!(queue.completed_fsn(), Some(0));
+        assert_eq!(producer.try_submit(b"new").unwrap().fsn, 1);
+    }
+
+    #[test]
+    fn recycle_reset_manifest_sync_failure_keeps_candidate_for_retry() {
+        let dir = TempDir::new().unwrap();
+        let (mut queue, mut producer) = recycle_fixture(&dir);
+        let fail = AtomicBool::new(true);
+        queue
+            .engine
+            .state
+            .lock()
+            .unwrap()
+            .manifest
+            .as_mut()
+            .unwrap()
+            .set_before_sync_hook(Arc::new(move || {
+                if fail.swap(false, Ordering::Relaxed) {
+                    Err(io::Error::other("injected manifest sync failure"))
+                } else {
+                    Ok(())
+                }
+            }));
+        assert!(queue.reset_drained(&mut producer).is_err());
+        assert_eq!(
+            queue
+                .engine
+                .with_state(|state| state.allocated_segment_bytes),
+            512
+        );
+        assert_eq!(sfa_file_count(dir.path()), 2);
+        queue.reset_drained(&mut producer).unwrap();
+        assert_eq!(sfa_file_count(dir.path()), 1);
+        assert_eq!(producer.try_submit(b"new").unwrap().fsn, 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recycle_reset_windows_open_handle_blocks_unlink_until_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let dir = TempDir::new().unwrap();
+        let (mut queue, mut producer) = recycle_fixture(&dir);
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(producer.active.path().unwrap())
+            .unwrap();
+        assert!(queue.reset_drained(&mut producer).is_err());
+        assert!(queue.drained_reset.is_some());
+        assert_eq!(PersistedSymbolDict::open(dir.path()).unwrap().size(), 1);
+        drop(held);
+        queue.reset_drained(&mut producer).unwrap();
+        assert_eq!(producer.try_submit(b"new").unwrap().fsn, 3);
+    }
 
     const JAVA_TWO_FRAME_FIXTURE_HEX: &str =
         include_str!("../../tests/interop/qwp-ws-sfa/java-two-frame.sfa.hex");

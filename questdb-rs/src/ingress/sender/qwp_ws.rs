@@ -64,6 +64,7 @@ use super::qwp_ws_orphan::{
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
 use super::qwp_ws_queue::{OutboundFrame, SentFrame};
+use super::qwp_ws_recycle::{PendingRecycle, RecycleLink, RecyclePermit};
 use super::qwp_ws_sfa_queue::{
     SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError, segment_payload_capacity,
     two_frame_segment_payload_capacity,
@@ -81,6 +82,8 @@ const QWP_WS_RUNNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static TERMINAL_AFTER_RECYCLE_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_RECYCLE_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_RECOVERED_DICT_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -353,6 +356,32 @@ impl WsStream {
         }
     }
 
+    pub(crate) fn begin_io_deadline(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<(Option<Duration>, Option<Duration>)> {
+        let timeouts = (
+            self.tcp_stream().read_timeout()?,
+            self.tcp_stream().write_timeout()?,
+        );
+        match self {
+            Self::Plain(sock) => sock.set_io_deadline(Some(deadline)),
+            Self::Tls(stream) => stream.sock.set_io_deadline(Some(deadline)),
+        }
+        Ok(timeouts)
+    }
+
+    pub(crate) fn end_io_deadline(
+        &mut self,
+        timeouts: (Option<Duration>, Option<Duration>),
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Plain(sock) => sock.set_io_deadline(None),
+            Self::Tls(stream) => stream.sock.set_io_deadline(None),
+        }
+        self.set_timeouts(timeouts.0, timeouts.1)
+    }
+
     fn tcp_stream(&self) -> &TcpStream {
         match self {
             WsStream::Plain(sock) => sock.tcp(),
@@ -445,8 +474,260 @@ struct QwpWsConnectedParts {
     persisted_symbol_dict: Option<PersistedSymbolDict>,
 }
 
+/// The active foreground alone owns global IDs and any persisted write-ahead handle.
+pub(crate) trait RecycleForeground {
+    fn symbol_count(&self) -> usize;
+    fn take_persisted_dict(&mut self) -> Option<PersistedSymbolDict>;
+    fn replace_dictionary(&mut self, delta_enabled: bool, persisted: Option<PersistedSymbolDict>);
+}
+
+/// Retained above the session seal: successful destructive steps are never repeated
+/// when a later storage barrier or worker spawn needs another public call to resume.
+enum ForegroundRecyclePhase {
+    Idle,
+    Storage {
+        old_count: usize,
+    },
+    Dictionary {
+        old_count: usize,
+        slot_dir: Option<std::path::PathBuf>,
+    },
+    Installing {
+        old_count: usize,
+        delta_enabled: bool,
+    },
+}
+
+struct PublicationRecycle {
+    policy: super::qwp_ws_recycle::RecyclePolicy,
+    phase: ForegroundRecyclePhase,
+}
+
+trait RecycleSession {
+    fn pending_boundary(&self) -> Option<Option<u64>>;
+    fn recycle_snapshot(&self) -> crate::Result<(Option<u64>, bool, bool)>;
+    fn claim_recycle(&mut self, boundary: Option<u64>) -> crate::Result<Option<RecyclePermit>>;
+    fn reset_storage(
+        &mut self,
+        permit: &RecyclePermit,
+    ) -> crate::Result<Option<std::path::PathBuf>>;
+    fn install_session(&mut self, permit: RecyclePermit, delta: bool) -> crate::Result<()>;
+    fn drain_recycle_once(&mut self, deadline: Instant) -> crate::Result<()>;
+}
+
+impl PublicationRecycle {
+    fn new(settings: super::qwp_ws_recycle::RecycleSettings) -> Self {
+        Self {
+            policy: super::qwp_ws_recycle::RecyclePolicy::new(settings),
+            phase: ForegroundRecyclePhase::Idle,
+        }
+    }
+
+    fn before_publication(
+        &mut self,
+        session: &mut impl RecycleSession,
+        foreground: &mut impl RecycleForeground,
+        nonempty: bool,
+        deferred: bool,
+    ) -> crate::Result<()> {
+        let pending = session.pending_boundary();
+        if pending.is_none() && (!nonempty || deferred || !self.policy.is_armed()) {
+            return Ok(());
+        }
+        let boundary = if let Some(boundary) = pending {
+            boundary
+        } else {
+            let (boundary, drained, live) = session.recycle_snapshot()?;
+            if !drained
+                && let Some(budget) = self.policy.take_wait_budget(Instant::now(), live, deferred)
+                && let Some(deadline) = Instant::now().checked_add(budget)
+            {
+                while Instant::now() < deadline {
+                    let (_, drained, live) = session.recycle_snapshot()?;
+                    if drained || !live {
+                        break;
+                    }
+                    session.drain_recycle_once(deadline)?;
+                }
+            }
+            boundary
+        };
+        let Some(permit) = session.claim_recycle(boundary)? else {
+            return Ok(());
+        };
+        if matches!(self.phase, ForegroundRecyclePhase::Idle) {
+            self.phase = ForegroundRecyclePhase::Storage {
+                old_count: foreground.symbol_count(),
+            };
+            // Close the old dictionary file before any destructive filesystem work.
+            drop(foreground.take_persisted_dict());
+        }
+        if let ForegroundRecyclePhase::Storage { old_count } = self.phase {
+            let slot_dir = session.reset_storage(&permit)?;
+            self.phase = ForegroundRecyclePhase::Dictionary {
+                old_count,
+                slot_dir,
+            };
+        }
+        if let ForegroundRecyclePhase::Dictionary {
+            old_count,
+            ref slot_dir,
+        } = self.phase
+        {
+            let persisted = slot_dir
+                .as_ref()
+                .map(|path| PersistedSymbolDict::reset_drained(path))
+                .transpose()
+                .map_err(|err| {
+                    error::fmt!(
+                        SocketError,
+                        "Could not reset recycled symbol dictionary: {err}"
+                    )
+                })?;
+            // Memory always supports delta; a successful side-file reset heals dense fallback.
+            let delta_enabled = true;
+            foreground.replace_dictionary(delta_enabled, persisted);
+            self.phase = ForegroundRecyclePhase::Installing {
+                old_count,
+                delta_enabled,
+            };
+        }
+        if let ForegroundRecyclePhase::Installing {
+            old_count,
+            delta_enabled,
+        } = self.phase
+        {
+            session.install_session(permit, delta_enabled)?;
+            self.policy.committed(old_count);
+            self.phase = ForegroundRecyclePhase::Idle;
+        }
+        Ok(())
+    }
+}
+
+macro_rules! foreground_recycle_api {
+    () => {
+        pub(crate) fn before_publication(
+            &mut self,
+            foreground: &mut impl RecycleForeground,
+            nonempty: bool,
+            deferred: bool,
+        ) -> crate::Result<()> {
+            let mut recycle = self
+                .publication_recycle
+                .take()
+                .expect("exclusive foreground recycle owner");
+            let result = recycle.before_publication(self, foreground, nonempty, deferred);
+            self.publication_recycle = Some(recycle);
+            result
+        }
+        pub(crate) fn reset_symbol_dictionary(&mut self) -> crate::Result<()> {
+            self.check_advisory_state()?;
+            self.publication_recycle
+                .as_mut()
+                .unwrap()
+                .policy
+                .request_reset(Instant::now(), 0);
+            Ok(())
+        }
+        pub(crate) fn after_publication(&mut self, symbol_count: usize) {
+            self.publication_recycle
+                .as_mut()
+                .unwrap()
+                .policy
+                .after_publication(Instant::now(), symbol_count);
+        }
+    };
+}
+
+impl RecycleSession for SyncQwpWsHandlerState {
+    fn pending_boundary(&self) -> Option<Option<u64>> {
+        self.pending_recycle_boundary()
+    }
+    fn recycle_snapshot(&self) -> crate::Result<(Option<u64>, bool, bool)> {
+        self.runner.check_error()?;
+        self.runner.check_publication_open()?;
+        let store = self.runner.lock_shared()?;
+        check_store_error(&store)?;
+        Ok((
+            store.published_fsn(),
+            store.all_published_receipts_resolved(),
+            self.runner.recycle.is_live(),
+        ))
+    }
+    fn claim_recycle(&mut self, boundary: Option<u64>) -> crate::Result<Option<RecyclePermit>> {
+        self.request_recycle(boundary)
+    }
+    fn reset_storage(
+        &mut self,
+        permit: &RecyclePermit,
+    ) -> crate::Result<Option<std::path::PathBuf>> {
+        self.with_recycle_storage(permit, |queue, producer| {
+            reset_recycle_storage(queue, producer)?;
+            Ok(queue.slot_dir().map(std::path::Path::to_path_buf))
+        })
+    }
+    fn install_session(&mut self, permit: RecyclePermit, delta: bool) -> crate::Result<()> {
+        self.finish_recycle(permit, delta)
+    }
+    fn drain_recycle_once(&mut self, deadline: Instant) -> crate::Result<()> {
+        // The worker keeps its normal progress mode; never dial on the foreground.
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(1)),
+        );
+        self.runner.check_error()
+    }
+}
+
+impl RecycleSession for ManualQwpWsHandlerState {
+    fn pending_boundary(&self) -> Option<Option<u64>> {
+        self.pending_recycle_boundary()
+    }
+    fn recycle_snapshot(&self) -> crate::Result<(Option<u64>, bool, bool)> {
+        check_store_error(&self.store)?;
+        if self.store.lifecycle().load() != PublicationState::Open {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        Ok((
+            self.store.published_fsn(),
+            self.store.all_published_receipts_resolved(),
+            !self.send_core.has_pending_reconnect(),
+        ))
+    }
+    fn claim_recycle(&mut self, boundary: Option<u64>) -> crate::Result<Option<RecyclePermit>> {
+        self.request_recycle(boundary)
+    }
+    fn reset_storage(
+        &mut self,
+        permit: &RecyclePermit,
+    ) -> crate::Result<Option<std::path::PathBuf>> {
+        self.with_recycle_storage(permit, |queue, producer| {
+            reset_recycle_storage(queue, producer)?;
+            Ok(queue.slot_dir().map(std::path::Path::to_path_buf))
+        })
+    }
+    fn install_session(&mut self, permit: RecyclePermit, delta: bool) -> crate::Result<()> {
+        self.finish_recycle(permit, delta)
+    }
+    fn drain_recycle_once(&mut self, deadline: Instant) -> crate::Result<()> {
+        self.send_core
+            .drive_recycle_once(&mut self.store, deadline)
+            .map_err(|err| driver_error_to_error_from_store(&self.store, err))?;
+        check_store_error(&self.store)?;
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(1)),
+        );
+        Ok(())
+    }
+}
+
 pub(crate) struct SyncQwpWsHandlerState {
-    encoder: QwpWsReplayEncoder,
+    encoder: Option<QwpWsReplayEncoder>,
+    publication_recycle: Option<PublicationRecycle>,
     runner: SyncQwpWsRunner,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
@@ -494,6 +775,63 @@ pub(crate) struct SyncQwpWsHandlerState {
 }
 
 impl SyncQwpWsHandlerState {
+    fn check_advisory_state(&self) -> crate::Result<()> {
+        self.runner.check_error()?;
+        if self.runner.lifecycle.load() == PublicationState::Closing {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        Ok(())
+    }
+    pub(crate) fn needs_recycle_boundary(&self) -> bool {
+        self.publication_recycle.as_ref().unwrap().policy.is_armed()
+            || self.pending_recycle_boundary().is_some()
+    }
+
+    foreground_recycle_api!();
+    #[cfg(test)]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        self.runner
+            .shared
+            .lock()
+            .unwrap()
+            .progress_view()
+            .recycle_allocation_probe()
+    }
+
+    pub(crate) fn request_recycle(
+        &mut self,
+        boundary: Option<u64>,
+    ) -> crate::Result<Option<RecyclePermit>> {
+        self.runner.request_recycle(boundary)
+    }
+
+    pub(crate) fn pending_recycle_boundary(&self) -> Option<Option<u64>> {
+        self.runner
+            .pending_recycle
+            .as_ref()
+            .map(|pending| pending.boundary)
+    }
+
+    pub(crate) fn with_recycle_storage<R>(
+        &mut self,
+        permit: &RecyclePermit,
+        operation: impl FnOnce(&mut SfaSlotQueue, &mut SfaProducer) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        self.runner.with_recycle_storage(permit, operation)
+    }
+
+    pub(crate) fn finish_recycle(
+        &mut self,
+        permit: RecyclePermit,
+        delta_enabled: bool,
+    ) -> crate::Result<()> {
+        self.runner.finish_recycle(permit, delta_enabled)?;
+        self.delta_dict_enabled = delta_enabled;
+        self.recovered_dict_entries.clear();
+        self.recovered_dict_count = 0;
+        Ok(())
+    }
+
     /// Releases the recovered dictionary seeded into the standalone replay
     /// encoder at connect. The pooled core uses its own dictionary and never
     /// touches this encoder, so that seed is dead weight once the pooled core
@@ -501,12 +839,143 @@ impl SyncQwpWsHandlerState {
     ///
     /// [`PooledSenderCore::new_store_and_forward`]: super::column_sender::PooledSenderCore::new_store_and_forward
     pub(crate) fn release_dormant_encoder_dict(&mut self) {
-        self.encoder.release_dormant_dict();
+        if let Some(mut encoder) = self.encoder.take() {
+            encoder.release_dormant_dict();
+        }
+    }
+}
+
+/// Manual mode owns the core directly, so quiescence needs no worker or join.
+struct ManualRecycle {
+    owner: Arc<RecycleLink>,
+    pending: Option<PendingRecycle>,
+    generation: u64,
+    producer: Option<SfaProducer>,
+    gate: Arc<TrafficGate>,
+}
+
+impl ManualRecycle {
+    fn new(gate: Arc<TrafficGate>) -> Self {
+        Self {
+            owner: Arc::new(RecycleLink::new(true)),
+            pending: None,
+            generation: 0,
+            producer: None,
+            gate,
+        }
+    }
+
+    fn request<Q: PublicationLog, T: QwpWsCoreTransport>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+        core: &mut QwpWsSendCore<T>,
+        boundary: Option<u64>,
+    ) -> crate::Result<Option<RecyclePermit>> {
+        check_store_error(store)?;
+        if store.lifecycle().load() != PublicationState::Open {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        if let Some(pending) = &self.pending {
+            if pending.boundary != boundary {
+                return Err(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket recycle boundary changed while parked"
+                ));
+            }
+        } else {
+            if core.has_pending_reconnect()
+                || store.published_fsn() != boundary
+                || !store.all_published_receipts_resolved()
+                || store
+                    .storage_maintenance_in_flight()
+                    .map_err(driver_error_to_error_without_state)?
+            {
+                return Ok(None);
+            }
+            self.pending = Some(PendingRecycle {
+                boundary,
+                wait_spent: true,
+                quiesced: true,
+                installed: false,
+                generation: 0,
+            });
+            self.producer = store.take_producer();
+            self.gate.shutdown().map_err(|err| {
+                error::fmt!(
+                    SocketError,
+                    "Could not cancel recycled QWP/WebSocket session: {err}"
+                )
+            })?;
+        }
+        core.release_recycle_views();
+        self.generation = self.generation.checked_add(1).ok_or_else(|| {
+            error::fmt!(
+                SocketError,
+                "QWP/WebSocket recycle permit generation exhausted"
+            )
+        })?;
+        self.pending.as_mut().unwrap().generation = self.generation;
+        Ok(Some(RecyclePermit {
+            owner: Arc::clone(&self.owner),
+            generation: self.generation,
+            boundary,
+        }))
+    }
+
+    fn validate<Q: PublicationLog>(
+        &self,
+        store: &mut QwpWsPublicationStore<Q>,
+        permit: &RecyclePermit,
+    ) -> crate::Result<()> {
+        check_store_error(store)?;
+        if store.lifecycle().load() != PublicationState::Open {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        if !Arc::ptr_eq(&self.owner, &permit.owner)
+            || !self.pending.as_ref().is_some_and(|pending| {
+                pending.boundary == permit.boundary && pending.generation == permit.generation
+            })
+        {
+            return Err(error::fmt!(
+                SocketError,
+                "Invalid QWP/WebSocket recycle permit"
+            ));
+        }
+        recheck_recycle_boundary(store, permit.boundary)
+    }
+
+    fn finish<T: QwpWsCoreTransport>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<SfaSlotQueue>,
+        core: &mut QwpWsSendCore<T>,
+        permit: RecyclePermit,
+        delta_enabled: bool,
+    ) -> crate::Result<()> {
+        self.validate(store, &permit)?;
+        if store
+            .storage_maintenance_in_flight()
+            .map_err(driver_error_to_error_without_state)?
+        {
+            return Err(error::fmt!(
+                SocketError,
+                "QWP/WebSocket recycle storage reset is incomplete"
+            ));
+        }
+        let gate = Arc::new(TrafficGate::default());
+        core.install_recycled_session(delta_enabled, Arc::clone(&gate));
+        if let Some(producer) = self.producer.take() {
+            store.recycle_queue_mut().restore_producer(producer);
+        }
+        self.gate = gate;
+        self.pending = None;
+        Ok(())
     }
 }
 
 pub(crate) struct ManualQwpWsHandlerState {
-    encoder: QwpWsReplayEncoder,
+    recycle: ManualRecycle,
+    publication_recycle: Option<PublicationRecycle>,
+    encoder: Option<QwpWsReplayEncoder>,
     store: QwpWsPublicationStore<SfaSlotQueue>,
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
@@ -514,6 +983,198 @@ pub(crate) struct ManualQwpWsHandlerState {
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
+}
+
+impl ManualQwpWsHandlerState {
+    fn check_advisory_state(&self) -> crate::Result<()> {
+        check_manual_driver_error(self)?;
+        if self.store.lifecycle().load() == PublicationState::Closing {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        Ok(())
+    }
+    foreground_recycle_api!();
+    pub(crate) fn pending_recycle_boundary(&self) -> Option<Option<u64>> {
+        self.recycle
+            .pending
+            .as_ref()
+            .map(|pending| pending.boundary)
+    }
+
+    pub(crate) fn request_recycle(
+        &mut self,
+        boundary: Option<u64>,
+    ) -> crate::Result<Option<RecyclePermit>> {
+        self.recycle
+            .request(&mut self.store, &mut self.send_core, boundary)
+    }
+
+    pub(crate) fn with_recycle_storage<R>(
+        &mut self,
+        permit: &RecyclePermit,
+        operation: impl FnOnce(&mut SfaSlotQueue, &mut SfaProducer) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        self.recycle.validate(&mut self.store, permit)?;
+        let producer = self
+            .recycle
+            .producer
+            .as_mut()
+            .ok_or_else(|| error::fmt!(SocketError, "QWP/WebSocket recycle has no producer"))?;
+        operation(self.store.recycle_queue_mut(), producer)
+    }
+
+    pub(crate) fn finish_recycle(
+        &mut self,
+        permit: RecyclePermit,
+        delta_enabled: bool,
+    ) -> crate::Result<()> {
+        self.recycle
+            .finish(&mut self.store, &mut self.send_core, permit, delta_enabled)
+    }
+}
+
+fn recheck_recycle_boundary<Q: PublicationLog>(
+    store: &mut QwpWsPublicationStore<Q>,
+    boundary: Option<u64>,
+) -> crate::Result<()> {
+    check_store_error(store)?;
+    if store.published_fsn() != boundary || !store.all_published_receipts_resolved() {
+        let err = error::fmt!(
+            SocketError,
+            "QWP/WebSocket recycle lost its drained publication boundary"
+        );
+        store.mark_terminal(Some(err.clone()));
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Capacity deferral happens before the storage reset reserves topology. Retire
+/// ordinary drained storage work off-lock, then retry without releasing the seal.
+/// The foreground must release its persisted dictionary before calling this.
+pub(crate) fn reset_recycle_storage(
+    queue: &mut SfaSlotQueue,
+    producer: &mut SfaProducer,
+) -> crate::Result<()> {
+    match queue.reset_drained(producer) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let err: DriverError = err.into();
+            if !driver_error_is_backpressure(&err) {
+                return Err(driver_error_to_error_without_state(err));
+            }
+            if let Some(task) = queue
+                .take_storage_maintenance_step(false)
+                .map_err(driver_error_to_error_without_state)?
+            {
+                let result = match task.perform() {
+                    Ok(result) => result,
+                    Err(err) => {
+                        queue
+                            .complete_storage_maintenance()
+                            .map_err(driver_error_to_error_without_state)?;
+                        return Err(driver_error_to_error_without_state(err.into()));
+                    }
+                };
+                let finish = match queue.finish_storage_maintenance(result, false) {
+                    Ok(finish) => finish,
+                    Err(err) => {
+                        queue
+                            .complete_storage_maintenance()
+                            .map_err(driver_error_to_error_without_state)?;
+                        return Err(driver_error_to_error_without_state(err));
+                    }
+                };
+                let failure = finish.into_cleanup().and_then(|cleanup| cleanup.perform());
+                let cleanup_result = if let Some(failure) = failure {
+                    queue.record_storage_cleanup_failure(failure)
+                } else {
+                    Ok(())
+                };
+                queue
+                    .complete_storage_maintenance()
+                    .map_err(driver_error_to_error_without_state)?;
+                cleanup_result.map_err(driver_error_to_error_without_state)?;
+            }
+            queue
+                .reset_drained(producer)
+                .map_err(DriverError::from)
+                .map_err(driver_error_to_error_without_state)
+        }
+    }
+}
+
+/// Type erasure retains the actual transport (including endpoint history) when
+/// generic test runners and production runners hand their parked core back.
+trait ParkedRunner<Q>: Send {
+    fn install(&mut self, delta_enabled: bool, gate: Arc<TrafficGate>);
+    fn run(
+        self: Box<Self>,
+        shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        stop: Arc<AtomicBool>,
+        parked: ParkedRunnerSlot<Q>,
+    );
+}
+
+type ParkedRunnerSlot<Q> = Arc<Mutex<Option<Box<dyn ParkedRunner<Q>>>>>;
+
+fn spawn_parked_runner<Q: PublicationLog + Send + 'static>(
+    shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
+    stop: Arc<AtomicBool>,
+    parked: ParkedRunnerSlot<Q>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if FAIL_NEXT_RECYCLE_SPAWN.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected recycle worker spawn failure",
+        ));
+    }
+    // Only the successfully spawned worker takes the capsule. If thread creation
+    // fails, dropping this closure drops Arc clones, not the retained session.
+    thread::Builder::new().spawn(move || {
+        let core = parked
+            .lock()
+            .unwrap()
+            .take()
+            .expect("parked runner capsule");
+        core.run(shared, stop, parked);
+    })
+}
+
+impl<Q, T> ParkedRunner<Q> for SyncQwpWsRunnerCore<T>
+where
+    Q: PublicationLog + Send + 'static,
+    T: QwpWsCoreTransport + Send + 'static,
+{
+    fn install(&mut self, delta_enabled: bool, gate: Arc<TrafficGate>) {
+        self.send_core.install_recycled_session(delta_enabled, gate);
+    }
+
+    fn run(
+        mut self: Box<Self>,
+        shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        stop: Arc<AtomicBool>,
+        parked: ParkedRunnerSlot<Q>,
+    ) {
+        while !stop.load(Ordering::Acquire) {
+            match self.drive_step(&shared, &stop) {
+                RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
+                RunnerStep::Continue => {}
+                RunnerStep::Stop => break,
+            }
+        }
+        // A hot ACK can precede its cold watermark/event effects. Flush even
+        // on shutdown, before publishing the ownership capsule to the caller.
+        if let Ok(mut store) = shared.lock() {
+            self.flush_cold_effects_locked(&mut store);
+        } else {
+            self.handle_poisoned_lock();
+        }
+        self.send_core.release_recycle_views();
+        if let Ok(mut slot) = parked.lock() {
+            *slot = Some(self);
+        }
+    }
 }
 
 pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
@@ -526,6 +1187,10 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     stop: Arc<AtomicBool>,
     traffic_gate: Arc<TrafficGate>,
     shutdown_timeout: Duration,
+    recycle: Arc<RecycleLink>,
+    pending_recycle: Option<PendingRecycle>,
+    recycle_generation: u64,
+    parked: ParkedRunnerSlot<Q>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -536,6 +1201,7 @@ struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
+    recycle: Arc<RecycleLink>,
 }
 
 struct SyncQwpWsPendingRunnerCore {
@@ -545,6 +1211,7 @@ struct SyncQwpWsPendingRunnerCore {
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
+    recycle: Arc<RecycleLink>,
 }
 
 struct QwpWsPendingConnect {
@@ -631,28 +1298,21 @@ where
         let backpressure = Arc::new(BackpressureNotifier::new());
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let thread_shared = Arc::clone(&shared);
-        let thread_backpressure = Arc::clone(&backpressure);
-        let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
-        let thread_stop = Arc::clone(&stop);
-        let thread_lifecycle = lifecycle.clone();
-        let thread = thread::spawn(move || {
-            let mut core = SyncQwpWsRunnerCore {
-                send_core,
-                progress,
-                cold_effects: VecDeque::new(),
-                backpressure: thread_backpressure,
-                ok_completed_upper: thread_ok_completed_upper,
-                lifecycle: thread_lifecycle,
-            };
-            while !thread_stop.load(Ordering::Acquire) {
-                match core.drive_step(&thread_shared, &thread_stop) {
-                    RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
-                    RunnerStep::Continue => {}
-                    RunnerStep::Stop => break,
-                };
-            }
+        let recycle = Arc::new(RecycleLink::new(true));
+        let parked: ParkedRunnerSlot<Q> = Arc::new(Mutex::new(None));
+        let core = Box::new(SyncQwpWsRunnerCore {
+            send_core,
+            progress,
+            cold_effects: VecDeque::new(),
+            backpressure: Arc::clone(&backpressure),
+            ok_completed_upper: Arc::clone(&ok_completed_upper),
+            lifecycle: lifecycle.clone(),
+            recycle: Arc::clone(&recycle),
         });
+        *parked.lock().unwrap() = Some(core);
+        let thread =
+            spawn_parked_runner(Arc::clone(&shared), Arc::clone(&stop), Arc::clone(&parked))
+                .expect("QWP/WebSocket runner thread");
 
         Self {
             shared,
@@ -664,6 +1324,10 @@ where
             stop,
             traffic_gate,
             shutdown_timeout: QWP_WS_RUNNER_SHUTDOWN_TIMEOUT,
+            recycle,
+            pending_recycle: None,
+            recycle_generation: 0,
+            parked,
             thread: Some(thread),
         }
     }
@@ -685,6 +1349,10 @@ where
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let traffic_gate = Arc::clone(&pending_connect.traffic_gate);
+        let recycle = Arc::new(RecycleLink::new(false));
+        let thread_recycle = Arc::clone(&recycle);
+        let parked: ParkedRunnerSlot<Q> = Arc::new(Mutex::new(None));
+        let thread_parked = Arc::clone(&parked);
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
         let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
@@ -698,6 +1366,7 @@ where
                 backpressure: thread_backpressure,
                 ok_completed_upper: thread_ok_completed_upper,
                 lifecycle: thread_lifecycle,
+                recycle: thread_recycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
                 match core.drive_step(&thread_shared, &thread_stop) {
@@ -705,6 +1374,17 @@ where
                     RunnerStep::Continue => {}
                     RunnerStep::Stop => break,
                 };
+            }
+            if let Some(mut connected) = core.connected.take() {
+                if let Ok(mut store) = thread_shared.lock() {
+                    connected.flush_cold_effects_locked(&mut store);
+                } else {
+                    connected.handle_poisoned_lock();
+                }
+                connected.send_core.release_recycle_views();
+                if let Ok(mut slot) = thread_parked.lock() {
+                    *slot = Some(Box::new(connected));
+                }
             }
         });
 
@@ -718,8 +1398,243 @@ where
             stop,
             traffic_gate,
             shutdown_timeout: QWP_WS_RUNNER_SHUTDOWN_TIMEOUT,
+            recycle,
+            pending_recycle: None,
+            recycle_generation: 0,
+            parked,
             thread: Some(thread),
         }
+    }
+
+    /// None is a side-effect-free defer. An accepted request always remains
+    /// sealed across timeout/error; later calls only probe the retained worker.
+    pub(crate) fn request_recycle(
+        &mut self,
+        boundary: Option<u64>,
+    ) -> crate::Result<Option<RecyclePermit>> {
+        self.check_error()?;
+        if self.lifecycle.load() != PublicationState::Open {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        if let Some(pending) = self.pending_recycle.as_ref() {
+            if pending.boundary != boundary {
+                return Err(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket recycle boundary changed while parked"
+                ));
+            }
+        } else {
+            let store = self.lock_shared()?;
+            check_store_error(&store)?;
+            if store.published_fsn() != boundary || !store.all_published_receipts_resolved() {
+                return Ok(None);
+            }
+            drop(store);
+            if !self.recycle.claim() {
+                return Ok(None);
+            }
+            self.pending_recycle = Some(PendingRecycle {
+                boundary,
+                wait_spent: false,
+                quiesced: false,
+                installed: false,
+                generation: 0,
+            });
+            self.stop.store(true, Ordering::Release);
+            self.backpressure.notify_all();
+            // Sticky cancellation belongs to this retired session only.
+            self.traffic_gate.shutdown().map_err(|err| {
+                error::fmt!(
+                    SocketError,
+                    "Could not cancel recycled QWP/WebSocket session: {err}"
+                )
+            })?;
+        }
+        let pending = self.pending_recycle.as_mut().unwrap();
+        if let Some(worker) = self.thread.as_ref() {
+            let timeout = if pending.wait_spent {
+                Duration::ZERO
+            } else {
+                self.shutdown_timeout
+            };
+            pending.wait_spent = true;
+            if !wait_for_runner_exit(worker, timeout) {
+                return Err(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket recycle is waiting for its retired worker"
+                ));
+            }
+        }
+        self.join_recycle_worker()?;
+        #[cfg(test)]
+        super::qwp_ws_sfa_queue::observe_recycle_phase("accepted park");
+        #[cfg(test)]
+        if TERMINAL_AFTER_RECYCLE_PARK.with(|fault| fault.replace(false)) {
+            self.lock_shared()?
+                .record_protocol_violation(Some(1002), "terminal during accepted park".into());
+        }
+        // Errors must win even when the captured completion boundary is empty.
+        let store = self.lock_shared()?;
+        check_store_error(&store)?;
+        if self.lifecycle.load() != PublicationState::Open {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        if store.published_fsn() != boundary || !store.all_published_receipts_resolved() {
+            drop(store);
+            let err = error::fmt!(
+                SocketError,
+                "QWP/WebSocket recycle lost its drained publication boundary"
+            );
+            self.lock_shared()?.mark_terminal(Some(err.clone()));
+            return Err(err);
+        }
+        if !self.pending_recycle.as_ref().unwrap().quiesced
+            && store
+                .storage_maintenance_in_flight()
+                .map_err(driver_error_to_error_without_state)?
+        {
+            return Err(error::fmt!(
+                SocketError,
+                "QWP/WebSocket recycle storage is still busy"
+            ));
+        }
+        drop(store);
+        if self
+            .parked
+            .lock()
+            .map_err(|_| error::fmt!(SocketError, "QWP/WebSocket parked runner lock poisoned"))?
+            .is_none()
+        {
+            let err = error::fmt!(
+                SocketError,
+                "QWP/WebSocket retired worker did not return its session"
+            );
+            self.lock_shared()?.mark_terminal(Some(err.clone()));
+            return Err(err);
+        }
+        self.recycle_generation = self.recycle_generation.checked_add(1).ok_or_else(|| {
+            error::fmt!(
+                SocketError,
+                "QWP/WebSocket recycle permit generation exhausted"
+            )
+        })?;
+        self.pending_recycle.as_mut().unwrap().generation = self.recycle_generation;
+        self.pending_recycle.as_mut().unwrap().quiesced = true;
+        Ok(Some(RecyclePermit {
+            owner: Arc::clone(&self.recycle),
+            generation: self.recycle_generation,
+            boundary,
+        }))
+    }
+
+    /// Consume a confirmed-exited maintenance worker off-lock. Both resume and
+    /// final close must observe its result before authorizing storage changes.
+    fn join_recycle_worker(&mut self) -> crate::Result<()> {
+        if let Some(worker) = self.thread.take()
+            && worker.join().is_err()
+        {
+            let err = error::fmt!(SocketError, "QWP/WebSocket recycle worker panicked");
+            self.lock_shared()?.mark_terminal(Some(err.clone()));
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn validate_recycle_permit(&self, permit: &RecyclePermit) -> crate::Result<()> {
+        self.check_error()?;
+        if self.lifecycle.load() != PublicationState::Open {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        if self.thread.is_some()
+            || !Arc::ptr_eq(&permit.owner, &self.recycle)
+            || !self.pending_recycle.as_ref().is_some_and(|pending| {
+                pending.generation == permit.generation && pending.boundary == permit.boundary
+            })
+        {
+            return Err(error::fmt!(
+                SocketError,
+                "Invalid QWP/WebSocket recycle permit"
+            ));
+        }
+        recheck_recycle_boundary(&mut *self.lock_shared()?, permit.boundary)
+    }
+
+    /// The foreground dictionary and storage must already belong to the new
+    /// namespace. Errors leave the capsule and publication seal in place.
+    pub(crate) fn finish_recycle(
+        &mut self,
+        permit: RecyclePermit,
+        delta_enabled: bool,
+    ) -> crate::Result<()> {
+        self.validate_recycle_permit(&permit)?;
+        if self
+            .lock_shared()?
+            .storage_maintenance_in_flight()
+            .map_err(driver_error_to_error_without_state)?
+        {
+            return Err(error::fmt!(
+                SocketError,
+                "QWP/WebSocket recycle storage reset is incomplete"
+            ));
+        }
+        let mut slot = self
+            .parked
+            .lock()
+            .map_err(|_| error::fmt!(SocketError, "QWP/WebSocket parked runner lock poisoned"))?;
+        let core = slot.as_mut().ok_or_else(|| {
+            error::fmt!(
+                SocketError,
+                "QWP/WebSocket retired worker did not return its session"
+            )
+        })?;
+        if !self.pending_recycle.as_ref().unwrap().installed {
+            let gate = Arc::new(TrafficGate::default());
+            core.install(delta_enabled, Arc::clone(&gate));
+            self.traffic_gate = gate;
+            self.stop = Arc::new(AtomicBool::new(false));
+            self.recycle.restart();
+            self.pending_recycle.as_mut().unwrap().installed = true;
+        }
+        drop(slot);
+        self.thread = Some(
+            spawn_parked_runner(
+                Arc::clone(&self.shared),
+                Arc::clone(&self.stop),
+                Arc::clone(&self.parked),
+            )
+            .map_err(|err| {
+                error::fmt!(
+                    SocketError,
+                    "Could not restart recycled QWP/WebSocket worker: {err}"
+                )
+            })?,
+        );
+        self.pending_recycle = None;
+        Ok(())
+    }
+
+    /// Exclusive ownership after join avoids holding the shared-store mutex
+    /// across storage barriers. An unexpected observer retains the entire seal.
+    pub(crate) fn with_recycle_storage<R>(
+        &mut self,
+        permit: &RecyclePermit,
+        operation: impl FnOnce(&mut Q, &mut SfaProducer) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        self.validate_recycle_permit(permit)?;
+        let mutex = Arc::get_mut(&mut self.shared).ok_or_else(|| {
+            error::fmt!(
+                SocketError,
+                "QWP/WebSocket recycle store still has observers"
+            )
+        })?;
+        let store = mutex.get_mut().map_err(|_| {
+            error::fmt!(SocketError, "QWP/WebSocket publication store lock poisoned")
+        })?;
+        let producer = self
+            .producer
+            .as_mut()
+            .ok_or_else(|| error::fmt!(SocketError, "QWP/WebSocket recycle has no producer"))?;
+        operation(store.recycle_queue_mut(), producer)
     }
 
     fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<u64> {
@@ -771,7 +1686,15 @@ where
 
     fn check_publication_open(&self) -> crate::Result<()> {
         match self.lifecycle.load() {
-            PublicationState::Open => Ok(()),
+            PublicationState::Open => {
+                if self.pending_recycle.is_some() {
+                    return Err(error::fmt!(
+                        SocketError,
+                        "QWP/WebSocket publication is parked for dictionary recycling"
+                    ));
+                }
+                Ok(())
+            }
             PublicationState::Closing => {
                 Err(driver_error_to_error_without_state(DriverError::Closing))
             }
@@ -904,6 +1827,28 @@ where
         // starts the ordered unlink protocol.
         self.producer.take();
         loop {
+            if self.pending_recycle.is_some()
+                && let Some(worker) = self.thread.as_ref()
+                && !worker.is_finished()
+            {
+                let remaining = deadline.map_or(self.shutdown_timeout, |deadline| {
+                    deadline.saturating_duration_since(Instant::now())
+                });
+                if !wait_for_runner_exit(worker, remaining)
+                    && backpressure_deadline_expired(deadline)
+                {
+                    return Err(error::fmt!(
+                        SocketError,
+                        "QWP/WebSocket close drain timed out waiting for recycled worker"
+                    ));
+                }
+                continue;
+            }
+
+            if self.pending_recycle.is_some() {
+                self.join_recycle_worker()?;
+            }
+
             let backpressure_generation = self.backpressure.generation();
             {
                 let mut store = self.lock_shared()?;
@@ -1194,7 +2139,9 @@ impl SyncQwpWsPendingRunnerCore {
                     backpressure: Arc::clone(&self.backpressure),
                     ok_completed_upper: Arc::clone(&self.ok_completed_upper),
                     lifecycle: self.lifecycle.clone(),
+                    recycle: Arc::clone(&self.recycle),
                 });
+                self.recycle.connected();
                 RunnerStep::Continue
             }
             Ok(None) => RunnerStep::Stop,
@@ -1699,6 +2646,9 @@ where
     where
         Q: PublicationLog,
     {
+        if !self.recycle.enter_reconnect() {
+            return RunnerStep::Stop;
+        }
         while !stop.load(Ordering::Acquire) {
             if let Some(pace) = reconnect.take_first_attempt_pace() {
                 sleep_for = pace;
@@ -1732,6 +2682,7 @@ where
                     };
                     self.flush_cold_effects_locked(&mut store);
                     let outcome = self.send_core.finish_reconnect_success(&mut store, reason);
+                    self.recycle.connected();
                     return step_from_drive_outcome(outcome);
                 }
                 Ok(QwpWsReconnectStep::RetryAfter {
@@ -1957,7 +2908,16 @@ impl<Q> Drop for SyncQwpWsRunner<Q> {
             log::warn!("could not shut down QWP/WebSocket runner traffic: {err}");
         }
         if let Some(thread) = self.thread.take() {
-            if wait_for_runner_exit(&thread, self.shutdown_timeout) {
+            let timeout = if self
+                .pending_recycle
+                .as_ref()
+                .is_some_and(|pending| pending.wait_spent)
+            {
+                Duration::ZERO
+            } else {
+                self.shutdown_timeout
+            };
+            if wait_for_runner_exit(&thread, timeout) {
                 if thread.join().is_err() {
                     log::error!("QWP/WebSocket runner thread panicked during shutdown");
                 }
@@ -1965,7 +2925,7 @@ impl<Q> Drop for SyncQwpWsRunner<Q> {
                 log::error!(
                     "QWP/WebSocket runner did not stop within {:?}; detaching it while its \
                      publication store and slot lock remain retained by the worker",
-                    self.shutdown_timeout
+                    timeout
                 );
             }
         }
@@ -3414,7 +4374,11 @@ pub(crate) fn connect_qwp_ws(
     // the slot's persisted symbol dictionary for write-ahead. (The column sender
     // claims it in new_store_and_forward instead; the two are mutually exclusive.)
     let persisted = state.persisted_symbol_dict.take();
-    state.encoder.set_persisted_symbol_dict(persisted);
+    state
+        .encoder
+        .as_mut()
+        .unwrap()
+        .set_persisted_symbol_dict(persisted);
     // The row encoder was already seeded from the recovered entries inside
     // connect_qwp_ws_background_state (and the driver mirror seeds from the send
     // core / pending_connect, not from here), so the copy kept in the handler
@@ -3601,7 +4565,8 @@ pub(crate) fn connect_qwp_ws_background_state(
     );
 
     Ok(SyncQwpWsHandlerState {
-        encoder,
+        encoder: Some(encoder),
+        publication_recycle: Some(PublicationRecycle::new(qwp_ws.recycle_settings())),
         runner,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
@@ -3657,6 +4622,7 @@ pub(crate) fn open_manual_qwp_ws(
         auth_header.clone(),
     );
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
+    let traffic_gate = Arc::new(TrafficGate::default());
     let mut parts = open_qwp_ws_parts(
         host,
         port,
@@ -3665,7 +4631,7 @@ pub(crate) fn open_manual_qwp_ws(
         qwp_ws,
         auth_header,
         Arc::clone(&server_max_batch_size),
-        None,
+        Some(Arc::clone(&traffic_gate)),
     )?;
     // Delta symbol dictionaries: the encoder ships only ids new since the dict
     // last grew, and the driver re-registers the whole dictionary via a catch-up
@@ -3693,7 +4659,9 @@ pub(crate) fn open_manual_qwp_ws(
         orphan_config,
     );
     Ok(ManualQwpWsHandlerState {
-        encoder: parts.encoder,
+        recycle: ManualRecycle::new(traffic_gate),
+        encoder: Some(parts.encoder),
+        publication_recycle: Some(PublicationRecycle::new(qwp_ws.recycle_settings())),
         store: parts.store,
         send_core: parts.send_core,
         server_max_batch_size,
@@ -3902,11 +4870,21 @@ pub(crate) fn flush_qwp_ws(
     buffer: &QwpWsColumnarBuffer,
     max_buf_size: usize,
 ) -> crate::Result<Option<u64>> {
-    let encoder = &mut state.encoder;
-    let runner = &mut state.runner;
-    publish_qwp_ws_buffer(encoder, buffer, max_buf_size, |payload| {
-        runner.publish_replay_payload(payload)
-    })
+    let mut encoder = state.encoder.take().expect("standalone foreground");
+    let result = (|| {
+        state.before_publication(&mut encoder, !buffer.is_empty(), false)?;
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        state.runner.check_publication_open()?;
+        let result = publish_qwp_ws_buffer(&mut encoder, buffer, max_buf_size, |payload| {
+            state.runner.publish_replay_payload(payload)
+        })?;
+        state.after_publication(encoder.symbol_count());
+        Ok(result)
+    })();
+    state.encoder = Some(encoder);
+    result
 }
 
 pub(crate) fn publish_qwp_ws_payload_background(
@@ -3954,16 +4932,26 @@ pub(crate) fn flush_qwp_ws_manual(
     buffer: &QwpWsColumnarBuffer,
     max_buf_size: usize,
 ) -> crate::Result<Option<u64>> {
-    let encoder = &mut state.encoder;
-    let store = &mut state.store;
-    let send_core = &mut state.send_core;
-    let append_deadline = state.append_deadline;
-    publish_qwp_ws_buffer(encoder, buffer, max_buf_size, |payload| {
-        match manual_submit_with_drive_deadline(store, send_core, payload, append_deadline) {
-            Ok(fsn) => Ok(fsn),
-            Err(err) => Err(driver_error_to_error_from_store(store, err)),
+    let mut encoder = state.encoder.take().expect("standalone foreground");
+    let result = (|| {
+        state.before_publication(&mut encoder, !buffer.is_empty(), false)?;
+        if buffer.is_empty() {
+            return Ok(None);
         }
-    })
+        let result = publish_qwp_ws_buffer(&mut encoder, buffer, max_buf_size, |payload| {
+            manual_submit_with_drive_deadline(
+                &mut state.store,
+                &mut state.send_core,
+                payload,
+                state.append_deadline,
+            )
+            .map_err(|err| driver_error_to_error_from_store(&state.store, err))
+        })?;
+        state.after_publication(encoder.symbol_count());
+        Ok(result)
+    })();
+    state.encoder = Some(encoder);
+    result
 }
 
 fn publish_qwp_ws_buffer(
@@ -3982,6 +4970,12 @@ fn publish_qwp_ws_buffer(
 }
 
 pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::Result<bool> {
+    if state.recycle.pending.is_some() {
+        return Err(error::fmt!(
+            SocketError,
+            "QWP/WebSocket publication is parked for dictionary recycling"
+        ));
+    }
     let outcome = state.send_core.drive_once(&mut state.store);
     let foreground_progress = match outcome {
         Ok(DriveOutcome::Idle) => Ok(false),
@@ -4158,6 +5152,7 @@ pub(crate) fn qwp_ws_drain_to_deadline_background(
 }
 
 pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> crate::Result<()> {
+    state.recycle.producer.take();
     if state.close_drain_timeout.is_zero() {
         state.store.set_closing();
         return Ok(());
@@ -4696,6 +5691,89 @@ mod tests {
                 .with_single_cert(certs, key)
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn recycle_tls_deadline_bounds_stalled_data_and_pong() {
+        use std::net::TcpListener;
+        for pong in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            socket2::SockRef::from(&listener)
+                .set_recv_buffer_size(1024)
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let config = test_tls_server_config();
+            let (release, released) = mpsc::channel();
+            let peer = thread::spawn(move || {
+                let (mut tcp, _) = listener.accept().unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut conn = rustls::ServerConnection::new(config).unwrap();
+                while conn.is_handshaking() {
+                    conn.complete_io(&mut tcp).unwrap();
+                }
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("tls_certs/server_rootCA.pem");
+            let builder = crate::ingress::SenderBuilder::from_conf(format!(
+                "wss::addr=localhost:{port};tls_roots={};",
+                root.display()
+            ))
+            .unwrap();
+            let (_, tls, _, _) = builder.resolve_qwp_ws_ingredients().unwrap();
+            let cfg = configure_tls(tls.unwrap()).unwrap();
+            let mut conn =
+                rustls::ClientConnection::new(cfg, "localhost".try_into().unwrap()).unwrap();
+            let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            socket2::SockRef::from(&tcp)
+                .set_send_buffer_size(4096)
+                .unwrap();
+            let mut tcp = NoSigpipeTcp::new(tcp).unwrap();
+            complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, Duration::from_secs(5)).unwrap();
+            let mut stream = WsStream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)));
+            let bytes = vec![0; 16 * 1024 * 1024];
+            if pong {
+                stream.tcp_stream().set_nonblocking(true).unwrap();
+                while stream.write(&bytes).is_ok() {}
+                stream.tcp_stream().set_nonblocking(false).unwrap();
+            }
+            stream
+                .set_timeouts(Some(Duration::from_secs(3)), Some(Duration::from_secs(3)))
+                .unwrap();
+            let started = Instant::now();
+            let saved = stream
+                .begin_io_deadline(started + Duration::from_millis(20))
+                .unwrap();
+            let mut scratch = Vec::new();
+            if pong {
+                let mut reader = WsFrameReader::new();
+                loop {
+                    reader.append_input_for_test(&[0x89, 0]);
+                    if reader.try_read_one(&mut stream, &mut scratch).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                assert!(write_binary_frame(&mut stream, &mut scratch, &bytes).is_err());
+            }
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "TLS internal IO must share the recycle deadline"
+            );
+            stream.end_io_deadline(saved).unwrap();
+            assert_eq!(
+                stream.tcp_stream().write_timeout().unwrap(),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                stream.tcp_stream().read_timeout().unwrap(),
+                Some(Duration::from_secs(3))
+            );
+            release.send(()).unwrap();
+            peer.join().unwrap();
+        }
     }
 
     #[test]
@@ -5566,6 +6644,7 @@ mod tests {
             backpressure: Arc::new(BackpressureNotifier::new()),
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
+            recycle: Arc::new(RecycleLink::new(true)),
         };
 
         assert_eq!(
@@ -5785,6 +6864,7 @@ mod tests {
             backpressure,
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
+            recycle: Arc::new(RecycleLink::new(true)),
         };
         let stop = AtomicBool::new(false);
         let shared_for_step = Arc::clone(&shared);
@@ -5837,6 +6917,7 @@ mod tests {
             backpressure,
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
+            recycle: Arc::new(RecycleLink::new(true)),
         };
         let stop = AtomicBool::new(false);
 
@@ -5899,6 +6980,7 @@ mod tests {
             backpressure,
             ok_completed_upper: Arc::clone(&ok_completed_upper),
             lifecycle,
+            recycle: Arc::new(RecycleLink::new(true)),
         };
         let stop = AtomicBool::new(false);
 
@@ -6030,6 +7112,621 @@ mod tests {
                 .unwrap();
             Ok(())
         }
+    }
+
+    #[test]
+    fn recycle_session_defers_during_reconnect() {
+        let (send_tx, _) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let transport = RecycleBarrierTransport {
+            entered: entered_tx,
+            release: release_rx,
+            reconnect: true,
+            terminal: false,
+            first: true,
+            sent: send_tx,
+        };
+        let mut runner = SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(
+            memory_queue(1024),
+            transport,
+        ));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        assert!(runner.request_recycle(None).unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        runner.publish_replay_payload(b"after defer").unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner.acked_fsn().unwrap() != Some(0) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(runner.acked_fsn().unwrap(), Some(0));
+        assert!(
+            !runner.stop.load(Ordering::Acquire),
+            "a deferred request cannot park later"
+        );
+    }
+
+    #[test]
+    fn recycle_session_pending_timeout_is_only_waited_once() {
+        let (mut runner, entered, release) = recycle_barrier_runner(false);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        runner.shutdown_timeout = Duration::from_millis(25);
+        assert!(runner.request_recycle(None).is_err());
+        // A second full wait would make this test take ten seconds.
+        runner.shutdown_timeout = Duration::from_secs(10);
+        let started = Instant::now();
+        assert!(runner.request_recycle(None).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(runner.thread.is_some());
+        assert!(runner.parked.lock().unwrap().is_none());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runner.thread.as_ref().unwrap().is_finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let permit = runner.request_recycle(None).unwrap().unwrap();
+        assert!(runner.thread.is_none());
+        assert!(runner.parked.lock().unwrap().is_some());
+        runner
+            .with_recycle_storage(&permit, |queue, producer| {
+                queue
+                    .reset_drained(producer)
+                    .map_err(DriverError::from)
+                    .map_err(driver_error_to_error_without_state)
+            })
+            .unwrap();
+        assert!(
+            runner
+                .publish_replay_payload(b"sealed after storage reset")
+                .is_err()
+        );
+        runner.finish_recycle(permit, false).unwrap();
+        assert!(runner.thread.is_some());
+        runner.publish_replay_payload(b"new").unwrap();
+    }
+
+    #[test]
+    fn recycle_session_boundary_breach_terminalizes_before_storage() {
+        let mut runner = SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(
+            memory_queue(1024),
+            FakeOrderedServer::ack_each_send(),
+        ));
+        let permit = runner.request_recycle(None).unwrap().unwrap();
+        // Simulate an internal owner violating the publication seal.
+        runner
+            .producer
+            .as_mut()
+            .unwrap()
+            .try_submit(b"unexpected")
+            .unwrap();
+        let result = runner.with_recycle_storage(&permit, |_, _| Ok(()));
+        assert!(
+            result.is_err(),
+            "a stale drained proof cannot authorize storage work"
+        );
+        assert!(runner.lifecycle_is_terminal());
+        assert!(runner.pending_recycle.is_some());
+    }
+
+    #[test]
+    fn recycle_session_spawn_failure_keeps_installed_capsule_for_resume() {
+        let mut runner = SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(
+            memory_queue(1024),
+            FakeOrderedServer::ack_each_send(),
+        ));
+        let permit = runner.request_recycle(None).unwrap().unwrap();
+        FAIL_NEXT_RECYCLE_SPAWN.with(|fail| fail.set(true));
+        assert!(
+            runner
+                .finish_recycle(permit, true)
+                .unwrap_err()
+                .msg()
+                .contains("spawn failure")
+        );
+        assert!(runner.pending_recycle.as_ref().unwrap().installed);
+        assert!(runner.thread.is_none());
+        assert!(runner.parked.lock().unwrap().is_some());
+        assert!(runner.publish_replay_payload(b"sealed").is_err());
+        let installed_gate = Arc::clone(&runner.traffic_gate);
+        let permit = runner.request_recycle(None).unwrap().unwrap();
+        runner.finish_recycle(permit, true).unwrap();
+        assert!(
+            Arc::ptr_eq(&installed_gate, &runner.traffic_gate),
+            "resume must not reinstall the session"
+        );
+        assert!(runner.pending_recycle.is_none());
+    }
+
+    #[test]
+    fn recycle_session_worker_failure_retains_ownership_and_terminal_event_once() {
+        let (mut runner, entered, release) = recycle_barrier_runner(false);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        runner.shutdown_timeout = Duration::from_millis(10);
+        assert!(runner.request_recycle(None).is_err());
+        // Disconnecting the barrier deliberately panics the test transport.
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runner.thread.as_ref().unwrap().is_finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let err = runner.request_recycle(None).unwrap_err();
+        assert!(err.msg().contains("worker panicked"));
+        assert!(runner.thread.is_none());
+        assert!(runner.pending_recycle.is_some());
+        assert!(
+            runner
+                .request_recycle(None)
+                .unwrap_err()
+                .msg()
+                .contains("worker panicked")
+        );
+        let mut store = runner.lock_shared().unwrap();
+        assert_eq!(store.poll_event(), Some(DriverEvent::Terminal));
+        assert_eq!(store.poll_event(), None);
+    }
+
+    #[test]
+    fn recycle_session_worker_failure_on_close_retains_terminal_event_once() {
+        let (mut runner, entered, release) = recycle_barrier_runner(false);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        runner.shutdown_timeout = Duration::from_millis(10);
+        assert!(runner.request_recycle(None).is_err());
+        // Disconnecting the barrier panics outside the publication-store mutex.
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runner.thread.as_ref().unwrap().is_finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(runner.thread.as_ref().unwrap().is_finished());
+        runner.begin_close();
+        let err = runner.drain_to_deadline(Some(deadline)).unwrap_err();
+        assert!(err.msg().contains("worker panicked"));
+        assert!(runner.thread.is_none());
+        assert!(runner.pending_recycle.is_some());
+        assert!(runner.lifecycle_is_terminal());
+        assert!(
+            runner
+                .drain_to_deadline(Some(deadline))
+                .unwrap_err()
+                .msg()
+                .contains("worker panicked")
+        );
+        let mut store = runner.lock_shared().unwrap();
+        assert_eq!(store.poll_event(), Some(DriverEvent::Terminal));
+        assert_eq!(store.poll_event(), None);
+    }
+
+    #[test]
+    fn recycle_session_ok_does_not_discard_pending_durable_ack() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let transport = DurableAckWhenReadyTransport {
+            ack_ready: Arc::clone(&ready),
+            sent_frames: Vec::new(),
+        };
+        let driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(1024),
+            transport,
+            ReconnectPolicy::bounded(Duration::MAX, Duration::ZERO, Duration::ZERO),
+            true,
+        );
+        let mut runner = SyncQwpWsRunner::start(driver);
+        runner.publish_replay_payload(b"old").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner.ok_fsn().unwrap() != Some(0) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(runner.ok_fsn().unwrap(), Some(0));
+        assert_eq!(runner.acked_fsn().unwrap(), None);
+        assert!(runner.request_recycle(Some(0)).unwrap().is_none());
+        assert!(runner.pending_recycle.is_none());
+        ready.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner.acked_fsn().unwrap() != Some(0) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(runner.request_recycle(Some(0)).unwrap().is_some());
+    }
+
+    #[test]
+    fn recycle_session_close_cannot_release_slot_before_parked_worker_exits() {
+        let dir = TempDir::new().unwrap();
+        let options = recycle_slot_options(&dir, "recycle-close-stall");
+        let (entered, entered_rx) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let (sent, _) = mpsc::channel();
+        let transport = RecycleBarrierTransport {
+            entered,
+            release,
+            reconnect: false,
+            terminal: false,
+            first: true,
+            sent,
+        };
+        let queue = SfaSlotQueue::open(options.clone()).unwrap();
+        let mut runner = SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(queue, transport));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        runner.shutdown_timeout = Duration::from_millis(10);
+        assert!(runner.request_recycle(None).is_err());
+        runner.begin_close();
+        let error = runner.drain_to_deadline(Some(Instant::now())).unwrap_err();
+        assert!(error.msg().contains("waiting for recycled worker"));
+        assert_eq!(runner.lifecycle.load(), PublicationState::Closing);
+        assert!(runner.pending_recycle.is_some());
+        assert!(!runner.thread.as_ref().unwrap().is_finished());
+        // Close has started, but the channel still holds the accepted worker.
+        // Probe before releasing it so exclusion does not depend on scheduling.
+        assert_recycle_slot_locked(&options.sf_dir, &options.sender_id, "blocked close");
+        assert!(matches!(
+            SfaSlotQueue::open(options.clone()),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+        assert!(!runner.thread.as_ref().unwrap().is_finished());
+        release_tx.send(()).unwrap();
+        runner
+            .drain_to_deadline(Some(Instant::now() + Duration::from_secs(5)))
+            .unwrap();
+        assert!(runner.thread.is_none());
+        let mut reopened = SfaSlotQueue::open(options.clone()).unwrap();
+        reopened.close().unwrap();
+        SfaSlotQueue::open_replay_only_existing(SfaQueueOptions {
+            slot_dir: options.sf_dir.join(&options.sender_id),
+            segment_size_bytes: options.segment_size_bytes,
+            max_bytes: options.max_bytes,
+            periodic_sync_interval: options.periodic_sync_interval,
+        })
+        .unwrap();
+    }
+
+    pub(super) fn assert_recycle_slot_locked(root: &std::path::Path, sender_id: &str, phase: &str) {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ingress::sender::qwp_ws_sfa_slot::tests::qwp_ws_sfa_slot_child_process_lock_helper",
+                "--ignored",
+            ])
+            .env("QDB_SFA_SLOT_CHILD_MODE", "probe-locked")
+            .env("QDB_SFA_SLOT_CHILD_SF_DIR", root)
+            .env("QDB_SFA_SLOT_CHILD_SENDER_ID", sender_id)
+            .output()
+            .unwrap();
+        let orphan = SfaSlotQueue::open_replay_only_existing(SfaQueueOptions {
+            slot_dir: root.join(sender_id),
+            segment_size_bytes: 4096,
+            max_bytes: 32768,
+            periodic_sync_interval: None,
+        });
+        assert!(
+            result.status.success() && matches!(orphan, Err(SfaQueueError::SlotInUse { .. })),
+            "slot exclusion during {phase}: external contender status={}, stdout={}, stderr={}, orphan={orphan:?}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
+        );
+    }
+
+    #[test]
+    fn recycle_session_full_budget_runs_drained_maintenance_before_reset() {
+        let dir = TempDir::new().unwrap();
+        let mut options = recycle_slot_options(&dir, "recycle-full-budget");
+        options.segment_size_bytes = 38;
+        options.max_bytes = 76;
+        let mut queue = SfaSlotQueue::open(options).unwrap();
+        drop(queue.take_persisted_symbol_dict());
+        let mut producer = queue.take_producer().unwrap();
+        producer.try_submit(b"one").unwrap();
+        producer.try_submit(b"two").unwrap();
+        queue.progress_view().complete_through_fsn(1).unwrap();
+        queue.persist_completed_fsn(1);
+        assert!(queue.reset_drained(&mut producer).is_err());
+        reset_recycle_storage(&mut queue, &mut producer).unwrap();
+        assert_eq!(producer.try_submit(b"new").unwrap().fsn, 2);
+    }
+
+    fn recycle_slot_options(dir: &TempDir, sender_id: &str) -> SfaSlotOptions {
+        SfaSlotOptions {
+            sf_dir: dir.path().to_path_buf(),
+            sender_id: sender_id.to_string(),
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+            periodic_sync_interval: None,
+        }
+    }
+
+    #[test]
+    fn recycle_session_exclusive_store_failure_retains_slot() {
+        let dir = TempDir::new().unwrap();
+        let options = recycle_slot_options(&dir, "recycle-exclusive");
+        let mut queue = SfaSlotQueue::open(options.clone()).unwrap();
+        drop(queue.take_persisted_symbol_dict());
+        let mut runner = SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(
+            queue,
+            FakeOrderedServer::ack_each_send(),
+        ));
+        let observer = Arc::clone(&runner.shared);
+        let permit = runner.request_recycle(None).unwrap().unwrap();
+        let err = runner
+            .with_recycle_storage(&permit, reset_recycle_storage)
+            .unwrap_err();
+        assert!(err.msg().contains("still has observers"));
+        assert!(matches!(
+            SfaSlotQueue::open(options.clone()),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+        assert!(runner.publish_replay_payload(b"sealed").is_err());
+        assert!(observer.try_lock().is_ok());
+        drop(observer);
+        runner
+            .with_recycle_storage(&permit, reset_recycle_storage)
+            .unwrap();
+        assert!(matches!(
+            SfaSlotQueue::open(options),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+        runner.finish_recycle(permit, true).unwrap();
+    }
+
+    #[test]
+    fn recycle_session_fresh_wire_sequence_preserves_fsn_and_totals() {
+        let (entered, _) = mpsc::channel();
+        let (_, release) = mpsc::channel();
+        let (sent, received) = mpsc::channel();
+        let transport = RecycleBarrierTransport {
+            entered,
+            release,
+            reconnect: false,
+            terminal: false,
+            first: false,
+            sent,
+        };
+        let mut runner = SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(
+            memory_queue(1024),
+            transport,
+        ));
+        for fsn in 0..2 {
+            assert_eq!(runner.publish_replay_payload(b"old").unwrap(), fsn);
+            let frame = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!((frame.fsn, frame.wire_seq), (fsn, fsn));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner.acked_fsn().unwrap() != Some(1) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let original_acks = runner.counters().unwrap().total_acks;
+        let original_store = Arc::as_ptr(&runner.shared);
+        let original_ok = Arc::as_ptr(&runner.ok_completed_upper);
+        let old_gate = Arc::clone(&runner.traffic_gate);
+        let permit = runner.request_recycle(Some(1)).unwrap().unwrap();
+        runner
+            .with_recycle_storage(&permit, |queue, producer| {
+                queue
+                    .reset_drained(producer)
+                    .map_err(DriverError::from)
+                    .map_err(driver_error_to_error_without_state)
+            })
+            .unwrap();
+        runner.finish_recycle(permit, false).unwrap();
+        assert!(old_gate.is_shutdown());
+        assert!(!runner.traffic_gate.is_shutdown());
+        assert_eq!(Arc::as_ptr(&runner.shared), original_store);
+        assert_eq!(Arc::as_ptr(&runner.ok_completed_upper), original_ok);
+        assert_eq!(runner.publish_replay_payload(b"new").unwrap(), 2);
+        let frame = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((frame.fsn, frame.wire_seq), (2, 0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner.acked_fsn().unwrap() != Some(2) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let _permit = runner.request_recycle(Some(2)).unwrap().unwrap();
+        let totals = runner.counters().unwrap();
+        assert_eq!(totals.total_frames_sent, 3);
+        assert_eq!(totals.total_acks, original_acks);
+    }
+
+    #[test]
+    fn recycle_session_manual_installs_without_dial_or_worker() {
+        let queue = SfaSlotQueue::open_memory(SfaMemoryQueueOptions {
+            segment_size_bytes: 128,
+            max_bytes: 512,
+        })
+        .unwrap();
+        let (mut store, mut core) =
+            QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::ack_each_send())
+                .into_parts();
+        let mut recycle = ManualRecycle::new(Arc::new(TrafficGate::default()));
+        assert_eq!(store.try_submit(b"old").unwrap().fsn, 0);
+        core.drive_once(&mut store).unwrap();
+        let permit = recycle
+            .request(&mut store, &mut core, Some(0))
+            .unwrap()
+            .unwrap();
+        reset_recycle_storage(
+            store.recycle_queue_mut(),
+            recycle.producer.as_mut().unwrap(),
+        )
+        .unwrap();
+        recycle
+            .finish(&mut store, &mut core, permit, false)
+            .unwrap();
+        assert!(core.has_pending_reconnect());
+        assert_eq!(
+            store.counters().total_reconnects_succeeded,
+            0,
+            "installation cannot dial on the manual caller"
+        );
+        assert_eq!(store.try_submit(b"new").unwrap().fsn, 1);
+        core.drive_once(&mut store).unwrap();
+        core.drive_once(&mut store).unwrap();
+        assert_eq!(store.completed_fsn(), Some(1));
+        assert_eq!(store.counters().total_reconnects_succeeded, 1);
+    }
+
+    #[test]
+    fn recycle_session_storage_stall_retains_slot_and_can_resume() {
+        let dir = TempDir::new().unwrap();
+        let mut options = recycle_slot_options(&dir, "recycle-storage-stall");
+        options.periodic_sync_interval = Some(Duration::from_secs(3600));
+        let mut queue = SfaSlotQueue::open(options.clone()).unwrap();
+        drop(queue.take_persisted_symbol_dict());
+        let fsn = queue.try_publish(b"old").unwrap().fsn;
+        queue.progress_view().complete_through_fsn(fsn).unwrap();
+        queue.persist_completed_fsn(fsn);
+        let task = queue.take_storage_maintenance_step(false).unwrap().unwrap();
+        let mut runner = SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(
+            queue,
+            FakeOrderedServer::no_response(),
+        ));
+        assert!(runner.request_recycle(Some(fsn)).is_err());
+        assert!(runner.thread.is_none());
+        assert!(runner.publish_replay_payload(b"sealed").is_err());
+        assert!(matches!(
+            SfaSlotQueue::open(options.clone()),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+        let result = task.perform().unwrap();
+        {
+            let mut store = runner.lock_shared().unwrap();
+            store.finish_storage_maintenance(result).unwrap();
+            store.complete_storage_maintenance().unwrap();
+        }
+        let permit = runner.request_recycle(Some(fsn)).unwrap().unwrap();
+        runner
+            .with_recycle_storage(&permit, reset_recycle_storage)
+            .unwrap();
+        runner.finish_recycle(permit, false).unwrap();
+        assert!(matches!(
+            SfaSlotQueue::open(options),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+    }
+
+    #[test]
+    fn recycle_session_rejects_stale_permits_and_close_before_install() {
+        let mut runner = SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(
+            memory_queue(1024),
+            FakeOrderedServer::ack_each_send(),
+        ));
+        let old = runner.request_recycle(None).unwrap().unwrap();
+        let current = runner.request_recycle(None).unwrap().unwrap();
+        assert!(runner.finish_recycle(old, false).is_err());
+        runner.begin_close();
+        assert!(runner.finish_recycle(current, false).is_err());
+        assert!(runner.thread.is_none());
+        assert!(runner.parked.lock().unwrap().is_some());
+        assert!(runner.publish_replay_payload(b"closed").is_err());
+    }
+
+    struct RecycleBarrierTransport {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        reconnect: bool,
+        terminal: bool,
+        first: bool,
+        sent: mpsc::Sender<SentFrame>,
+    }
+
+    impl QwpWsCoreTransport for RecycleBarrierTransport {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            if self.first {
+                self.first = false;
+                if self.reconnect {
+                    return Err(TransportFailure::Retryable(error::fmt!(
+                        SocketError,
+                        "reconnect barrier"
+                    )));
+                }
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                if self.terminal {
+                    return Err(TransportFailure::Terminal(error::fmt!(
+                        SocketError,
+                        "terminal during park"
+                    )));
+                }
+            }
+            Ok(TransportPoll::Idle)
+        }
+        fn restart_connection(&mut self, _: ReconnectReason) -> Result<(), DriverError> {
+            if self.reconnect {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                self.reconnect = false;
+            }
+            Ok(())
+        }
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            let _ = self.sent.send(frame.sent_frame());
+            Ok(TransportSendResult::Response(TransportResponse::Ack {
+                wire_seq: frame.wire_seq,
+            }))
+        }
+    }
+
+    fn recycle_barrier_runner(
+        terminal: bool,
+    ) -> (
+        SyncQwpWsRunner<SfaFrameQueue>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+    ) {
+        let (entered, entered_rx) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let (sent, _) = mpsc::channel();
+        let transport = RecycleBarrierTransport {
+            entered,
+            release,
+            reconnect: false,
+            terminal,
+            first: true,
+            sent,
+        };
+        (
+            SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(
+                memory_queue(1024),
+                transport,
+            )),
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    #[test]
+    fn recycle_session_terminal_during_park() {
+        let (mut runner, entered, release) = recycle_barrier_runner(true);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        runner.shutdown_timeout = Duration::from_millis(10);
+        assert!(
+            runner.request_recycle(None).is_err(),
+            "accepted park must stay pending when its worker stalls"
+        );
+        assert!(runner.publish_replay_payload(b"sealed").is_err());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runner.thread.as_ref().unwrap().is_finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let err = runner
+            .request_recycle(None)
+            .expect_err("terminal must beat the satisfied empty boundary");
+        assert!(err.to_string().contains("terminal during park"), "{err}");
+        assert!(runner.lifecycle_is_terminal());
+    }
+
+    #[test]
+    fn recycle_session_close_wins() {
+        let (mut runner, entered, release) = recycle_barrier_runner(false);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        runner.shutdown_timeout = Duration::from_millis(10);
+        assert!(runner.request_recycle(None).is_err());
+        runner.begin_close();
+        release.send(()).unwrap();
+        assert!(runner.request_recycle(None).is_err());
+        assert!(runner.publish_replay_payload(b"closed").is_err());
+        assert_eq!(runner.lifecycle.load(), PublicationState::Closing);
     }
 
     #[test]
@@ -6338,5 +8035,672 @@ mod tests {
             );
         }
         drop(runner);
+    }
+}
+
+#[cfg(test)]
+mod publication_recycle_tests {
+    use super::*;
+    use crate::ingress::{AckLevel, SenderBuilder};
+    use crate::tests::qwp_ws_recycle::Server;
+
+    fn state(sender: &mut crate::ingress::Sender) -> &mut SyncQwpWsHandlerState {
+        match &mut sender.handler {
+            super::super::SyncProtocolHandler::SyncQwpWs(state) => state,
+            _ => panic!("background sender expected"),
+        }
+    }
+
+    #[test]
+    fn recycle_crash_after_fresh_session_install_and_publication() {
+        use crate::ingress::QwpWsProgress;
+        use std::io::{BufRead, Write};
+        if let Ok(conf) = std::env::var("QDB_RECYCLE_SESSION_CONF") {
+            let publish = std::env::var("QDB_RECYCLE_SESSION_PUBLISH").unwrap() == "true";
+            let mut sender = SenderBuilder::from_conf(conf)
+                .unwrap()
+                .qwp_ws_progress(QwpWsProgress::Manual)
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut buffer = sender.new_buffer();
+            buffer
+                .table("trades")
+                .unwrap()
+                .symbol("sym", "old")
+                .unwrap()
+                .at(crate::ingress::TimestampNanos::new(7))
+                .unwrap();
+            sender.flush(&mut buffer).unwrap();
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+            sender.reset_symbol_dictionary().unwrap();
+            let super::super::SyncProtocolHandler::ManualQwpWs(handler) = &mut sender.handler
+            else {
+                panic!("manual expected")
+            };
+            let mut encoder = handler.encoder.take().unwrap();
+            handler
+                .before_publication(&mut encoder, true, false)
+                .unwrap();
+            assert_eq!(encoder.symbol_count(), 0);
+            assert!(handler.send_core.has_pending_reconnect());
+            handler.encoder = Some(encoder);
+            if publish {
+                buffer
+                    .table("trades")
+                    .unwrap()
+                    .symbol("sym", "new")
+                    .unwrap()
+                    .at(crate::ingress::TimestampNanos::new(7))
+                    .unwrap();
+                assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(1));
+                assert_eq!(sender.acked_fsn().unwrap(), Some(0));
+            }
+            println!("SESSION_KILL_READY");
+            std::io::stdout().flush().unwrap();
+            loop {
+                thread::park();
+            }
+        }
+        for durability in ["memory", "periodic"] {
+            for publish in [false, true] {
+                let server = Server::new();
+                let dir = tempfile::TempDir::new().unwrap();
+                let conf = format!(
+                    "ws::addr=127.0.0.1:{};sf_dir={};sender_id=crash;sf_durability={durability};sf_max_segment_bytes=4096;symbol_dict_reset_max_wait_millis=0;",
+                    server.port,
+                    dir.path().display()
+                );
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "ingress::sender::qwp_ws::publication_recycle_tests::recycle_crash_after_fresh_session_install_and_publication", "--nocapture"])
+                    .env("QDB_RECYCLE_SESSION_CONF", &conf).env("QDB_RECYCLE_SESSION_PUBLISH", publish.to_string())
+                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+                let output = child.stdout.take().unwrap();
+                let (ready, wait) = std::sync::mpsc::channel();
+                let reader = thread::spawn(move || {
+                    for line in std::io::BufReader::new(output).lines() {
+                        if line.unwrap() == "SESSION_KILL_READY" {
+                            ready.send(()).unwrap();
+                        }
+                    }
+                });
+                if let Err(error) = wait.recv_timeout(Duration::from_secs(10)) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("fresh-session checkpoint missing: {error}");
+                }
+                child.kill().unwrap();
+                assert!(!child.wait().unwrap().success());
+                reader.join().unwrap();
+                let (_, mut expected) = server.frame();
+                assert_eq!(&expected[15..18], b"old");
+                expected[15..18].copy_from_slice(b"new");
+                let mut recovered = SfaSlotQueue::open(SfaSlotOptions {
+                    sf_dir: dir.path().to_path_buf(),
+                    sender_id: "crash".into(),
+                    segment_size_bytes: 4096,
+                    max_bytes: 32768,
+                    periodic_sync_interval: (durability == "periodic")
+                        .then_some(Duration::from_secs(1)),
+                })
+                .unwrap();
+                assert_eq!(recovered.completed_fsn(), Some(0));
+                assert_eq!(recovered.published_fsn(), Some(u64::from(publish)));
+                assert_eq!(recovered.oldest_unresolved_fsn(), publish.then_some(1));
+                if publish {
+                    let frame =
+                        recovered
+                            .progress_view()
+                            .next_outbound_frame(
+                                &mut super::super::qwp_ws_driver::SendCursor::default(),
+                            )
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(frame.fsn, 1);
+                    frame
+                        .payload
+                        .with_bytes(|bytes| assert_eq!(bytes, expected));
+                    assert_eq!(
+                        PersistedSymbolDict::open(&dir.path().join("crash"))
+                            .unwrap()
+                            .read_loaded_symbols(),
+                        [b"new"]
+                    );
+                }
+                assert_eq!(
+                    recovered.try_publish(&expected).unwrap().fsn,
+                    if publish { 2 } else { 1 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recycle_slot_contender_during_every_phase() {
+        use super::super::qwp_ws_sfa_queue::{RECYCLE_OBSERVER, SfaQueueError};
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};sf_dir={};sender_id=contender;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port, dir.path().display())).unwrap().build().unwrap();
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "old")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        server.frame();
+        let root = dir.path().to_path_buf();
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&probes);
+        RECYCLE_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move |phase| {
+                super::tests::assert_recycle_slot_locked(&root, "contender", phase);
+                recorded.lock().unwrap().push(phase);
+            }))
+        });
+        FAIL_NEXT_RECYCLE_SPAWN.with(|fault| fault.set(true));
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "new")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("spawn failure")
+        );
+        super::super::qwp_ws_sfa_queue::observe_recycle_phase("failed resume");
+        super::super::qwp_ws_sfa_queue::observe_recycle_phase("pre-close");
+        RECYCLE_OBSERVER.with(|observer| observer.borrow_mut().take());
+        let probes = probes.lock().unwrap();
+        assert!(probes.contains(&"accepted park"));
+        assert!(probes.contains(&"reset phase"));
+        assert!(
+            probes.contains(&"dictionary directory synced"),
+            "observed {probes:?}"
+        );
+        assert!(probes.contains(&"failed resume"));
+        assert!(probes.contains(&"pre-close"));
+        sender.close_drain().unwrap();
+        drop(sender);
+        let options = SfaSlotOptions {
+            sf_dir: dir.path().to_path_buf(),
+            sender_id: "contender".into(),
+            segment_size_bytes: 4096,
+            max_bytes: 32768,
+            periodic_sync_interval: None,
+        };
+        let mut acquired = SfaSlotQueue::open(options.clone()).unwrap();
+        assert!(matches!(
+            SfaSlotQueue::open(options.clone()),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+        acquired.close().unwrap();
+        drop(SfaSlotQueue::open(options).unwrap());
+    }
+
+    #[test]
+    fn recycle_observation_three_epochs_retained_observers() {
+        let server = Server::new();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=100000;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap().connection_listener(Arc::new(|_| {}), 0).unwrap().build().unwrap();
+        let source = Arc::clone(sender.conn_events.as_ref().unwrap());
+        let lifecycle = state(&mut sender).runner.lifecycle.clone();
+        let shared_identity = Arc::as_ptr(&state(&mut sender).runner.shared);
+        let ok_upper = Arc::clone(&state(&mut sender).runner.ok_completed_upper);
+        let progress = state(&mut sender)
+            .runner
+            .shared
+            .lock()
+            .unwrap()
+            .progress_view();
+        let mut buffer = sender.new_buffer();
+        for epoch in 0..3 {
+            if epoch > 0 {
+                assert!(Arc::ptr_eq(&source, sender.conn_events.as_ref().unwrap()));
+                assert_eq!(lifecycle.load(), PublicationState::Open);
+                let before = sender.qwp_ws_totals().unwrap();
+                sender.reset_symbol_dictionary().unwrap();
+                let handler = state(&mut sender);
+                let mut encoder = handler.encoder.take().unwrap();
+                handler
+                    .before_publication(&mut encoder, true, false)
+                    .unwrap();
+                assert_eq!(encoder.symbol_count(), 0);
+                handler.encoder = Some(encoder);
+                assert_eq!(shared_identity, Arc::as_ptr(&handler.runner.shared));
+                assert!(Arc::ptr_eq(&ok_upper, &handler.runner.ok_completed_upper));
+                let boundary = Some(epoch * 2 - 1);
+                assert_eq!(sender.published_fsn().unwrap(), boundary);
+                assert_eq!(sender.acked_fsn().unwrap(), boundary);
+                assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), boundary);
+                assert_eq!(progress.completed_fsn(), boundary);
+                sender.wait(AckLevel::Ok, Duration::from_millis(1)).unwrap();
+                let after = sender.qwp_ws_totals().unwrap();
+                assert_eq!(
+                    (
+                        after.frames_sent,
+                        after.frames_replayed,
+                        after.acks,
+                        after.server_errors
+                    ),
+                    (
+                        before.frames_sent,
+                        before.frames_replayed,
+                        before.acks,
+                        before.server_errors
+                    )
+                );
+            }
+            for row in 0..2 {
+                buffer
+                    .table("trades")
+                    .unwrap()
+                    .symbol("sym", if row == 0 { "alpha" } else { "beta" })
+                    .unwrap()
+                    .at_now()
+                    .unwrap();
+                let boundary = epoch * 2 + row;
+                assert_eq!(
+                    sender.flush_and_get_fsn(&mut buffer).unwrap(),
+                    Some(boundary)
+                );
+                sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                assert_eq!(server.frame().0, epoch as usize);
+                assert_eq!(
+                    progress.completed_fsn(),
+                    Some(boundary),
+                    "observer retained before all resets must see later targets advance"
+                );
+                // Queue completion can satisfy wait before the worker publishes
+                // its separate OK counter. Both retained observers must advance.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while ok_upper.load(Ordering::Acquire) != boundary + 1 && Instant::now() < deadline
+                {
+                    thread::yield_now();
+                }
+                assert_eq!(ok_upper.load(Ordering::Acquire), boundary + 1);
+                assert_eq!(
+                    state(&mut sender)
+                        .runner
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .published_fsn(),
+                    Some(boundary)
+                );
+            }
+        }
+        state(&mut sender)
+            .runner
+            .shared
+            .lock()
+            .unwrap()
+            .mark_terminal(Some(crate::Error::new(
+                crate::ErrorCode::SocketError,
+                "terminal after completed boundary",
+            )));
+        assert_eq!(lifecycle.load(), PublicationState::Terminal);
+        assert_eq!(
+            sender
+                .wait(AckLevel::Ok, Duration::from_millis(1))
+                .unwrap_err()
+                .msg(),
+            "terminal after completed boundary"
+        );
+        assert_eq!(
+            sender.reset_symbol_dictionary().unwrap_err().msg(),
+            "terminal after completed boundary"
+        );
+    }
+
+    #[test]
+    fn recycle_boundary_retains_storage_and_install_phases() {
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};sf_dir={};sender_id=phase;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port, dir.path().display())).unwrap().build().unwrap();
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        server.frame();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        super::super::qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER.with(|fail| fail.set(Some(0)));
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("injected recycle failure")
+        );
+        assert!(!buffer.is_empty());
+        assert!(matches!(
+            state(&mut sender)
+                .publication_recycle
+                .as_ref()
+                .unwrap()
+                .phase,
+            ForegroundRecyclePhase::Storage { old_count: 1 }
+        ));
+        assert_eq!(
+            state(&mut sender).encoder.as_ref().unwrap().symbol_count(),
+            1
+        );
+        assert!(state(&mut sender).pending_recycle_boundary().is_some());
+        FAIL_NEXT_RECYCLE_SPAWN.with(|fail| fail.set(true));
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("spawn failure")
+        );
+        assert!(!buffer.is_empty());
+        assert!(matches!(
+            state(&mut sender)
+                .publication_recycle
+                .as_ref()
+                .unwrap()
+                .phase,
+            ForegroundRecyclePhase::Installing {
+                old_count: 1,
+                delta_enabled: true
+            }
+        ));
+        assert_eq!(
+            state(&mut sender).encoder.as_ref().unwrap().symbol_count(),
+            0
+        );
+        // A replacement permit must retry finish only, not repeat storage or dictionary reset.
+        super::super::qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER.with(|fail| fail.set(Some(0)));
+        assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(1));
+        super::super::qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER
+            .with(|fail| assert_eq!(fail.replace(None), Some(0)));
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (connection, beta) = server.frame();
+        assert_eq!(beta[12], 0);
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "gamma")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(2));
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (same, gamma) = server.frame();
+        assert_eq!(
+            same, connection,
+            "the floor must use the retained pre-reset count"
+        );
+        assert_eq!(gamma[12], 1);
+    }
+
+    #[test]
+    fn recycle_boundary_invalid_and_empty_buffer_do_not_start_maintenance() {
+        let server = Server::new();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap().build().unwrap();
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        server.frame();
+        assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), None);
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap();
+        assert_eq!(
+            sender.flush(&mut buffer).unwrap_err().code(),
+            crate::ErrorCode::InvalidApiCall
+        );
+        assert_eq!(
+            state(&mut sender).encoder.as_ref().unwrap().symbol_count(),
+            1
+        );
+        assert!(state(&mut sender).pending_recycle_boundary().is_none());
+        assert!(
+            state(&mut sender)
+                .publication_recycle
+                .as_ref()
+                .unwrap()
+                .policy
+                .is_armed()
+        );
+    }
+
+    #[test]
+    fn recycle_boundary_dense_fallback_heals() {
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};sf_dir={};sender_id=heal;symbol_dict_reset_threshold=2;symbol_dict_reset_max_wait_millis=0;", server.port, dir.path().display())).unwrap().build().unwrap();
+        let encoder = state(&mut sender).encoder.as_mut().unwrap();
+        let mut persisted = encoder.take_persisted_dict().unwrap();
+        persisted.arm_fail_next_append_cleanup();
+        encoder.set_persisted_symbol_dict(Some(persisted));
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(sender.flush(&mut buffer).is_err());
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (_, dense) = server.frame();
+        assert_eq!(dense[12], 0);
+        assert!(
+            state(&mut sender)
+                .encoder
+                .as_mut()
+                .unwrap()
+                .take_persisted_dict()
+                .is_none()
+        );
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (_, dense_second) = server.frame();
+        assert_eq!(
+            &dense_second[12..14],
+            &[0, 2],
+            "dense fallback repeats the whole dictionary"
+        );
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "gamma")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (_, healed) = server.frame();
+        assert_eq!(healed[5] & 8, 8);
+        assert_eq!(healed[12], 0);
+        assert!(
+            state(&mut sender)
+                .encoder
+                .as_mut()
+                .unwrap()
+                .take_persisted_dict()
+                .is_some()
+        );
+    }
+    #[test]
+    fn recycle_boundary_io_deadline_bounds_stalled_data_and_pong() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        for pong in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            socket2::SockRef::from(&listener)
+                .set_recv_buffer_size(1024)
+                .unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (_peer, _) = listener.accept().unwrap();
+            // Fill the real kernel send buffer while the peer never reads.
+            socket2::SockRef::from(&client)
+                .set_send_buffer_size(4096)
+                .unwrap();
+            client.set_nonblocking(true).unwrap();
+            let mut stream = WsStream::Plain(NoSigpipeTcp::new(client).unwrap());
+            let bytes = vec![0; 1024 * 1024];
+            for _ in 0..5 {
+                while stream.write(&bytes).is_ok() {}
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            while stream.write(&bytes).is_ok() {}
+            while stream.write(&[0]).is_ok() {}
+            stream.tcp_stream().set_nonblocking(false).unwrap();
+            stream
+                .set_timeouts(Some(Duration::from_secs(3)), Some(Duration::from_secs(3)))
+                .unwrap();
+            let started = Instant::now();
+            let saved = stream
+                .begin_io_deadline(started + Duration::from_millis(20))
+                .unwrap();
+            let mut scratch = Vec::new();
+            if pong {
+                let mut reader = WsFrameReader::new();
+                loop {
+                    reader.append_input_for_test(&[0x89, 0]);
+                    if reader.try_read_one(&mut stream, &mut scratch).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                assert!(write_binary_frame(&mut stream, &mut scratch, &bytes).is_err());
+            }
+            stream.end_io_deadline(saved).unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "one recycle budget must bound control and data writes"
+            );
+            assert_eq!(
+                stream.tcp_stream().write_timeout().unwrap(),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                stream.tcp_stream().read_timeout().unwrap(),
+                Some(Duration::from_secs(3))
+            );
+        }
+    }
+
+    #[test]
+    fn recycle_boundary_dictionary_reset_failure_resumes_after_storage() {
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};sf_dir={};sender_id=dictfail;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port, dir.path().display())).unwrap().build().unwrap();
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        server.frame();
+        let state = state(&mut sender);
+        let slot = state
+            .runner
+            .lock_shared()
+            .unwrap()
+            .recycle_queue_mut()
+            .slot_dir()
+            .unwrap()
+            .to_path_buf();
+        drop(state.encoder.as_mut().unwrap().take_persisted_dict());
+        let dictionary = slot.join(".symbol-dict");
+        let retained = slot.join("old-symbols");
+        std::fs::rename(&dictionary, &retained).unwrap();
+        std::fs::create_dir(&dictionary).unwrap();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("reset recycled symbol dictionary")
+        );
+        assert!(matches!(
+            self::state(&mut sender)
+                .publication_recycle
+                .as_ref()
+                .unwrap()
+                .phase,
+            ForegroundRecyclePhase::Dictionary { old_count: 1, .. }
+        ));
+        assert_eq!(
+            self::state(&mut sender)
+                .encoder
+                .as_ref()
+                .unwrap()
+                .symbol_count(),
+            1
+        );
+        std::fs::remove_dir(&dictionary).unwrap();
+        std::fs::rename(&retained, &dictionary).unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (_, frame) = server.frame();
+        assert_eq!(&frame[12..14], &[0, 1]);
+        assert_eq!(sender.published_fsn().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn recycle_boundary_close_preempts_drain_readiness() {
+        let server = Server::new();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};", server.port))
+            .unwrap()
+            .build()
+            .unwrap();
+        let state = state(&mut sender);
+        state.runner.begin_close();
+        assert!(
+            state.recycle_snapshot().is_err(),
+            "a closing sender must not enter the recycle wait"
+        );
     }
 }

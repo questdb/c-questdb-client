@@ -174,6 +174,13 @@ impl SfManifest {
             return Ok(());
         }
 
+        self.rewrite(new_head_base, new_active_base)
+    }
+
+    /// Write and sync the other record even when the boundaries are unchanged.
+    /// Reset uses two writes so either surviving record excludes the old namespace.
+    pub(crate) fn rewrite(&mut self, new_head_base: u64, new_active_base: u64) -> io::Result<()> {
+        validate_manifest_boundaries(new_head_base, new_active_base)?;
         let next_generation = self
             .generation
             .checked_add(1)

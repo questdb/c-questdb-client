@@ -194,6 +194,7 @@ pub(crate) struct QwpWsSendCore<T> {
     durable_ack: Option<DurableAckTracker>,
     reconnect_policy: ReconnectPolicy,
     pending_reconnect: Option<QwpWsReconnectState>,
+    recycle_drain: bool,
     poison_tracker: PoisonFrameTracker,
     max_frame_rejections: usize,
     poison_min_escalation_window: Duration,
@@ -518,6 +519,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         let receipt = self.queue.try_publish(payload)?;
         self.push_event(DriverEvent::Published { fsn: receipt.fsn });
         Ok(receipt)
+    }
+
+    pub(super) fn recycle_queue_mut(&mut self) -> &mut Q {
+        &mut self.queue
     }
 
     pub(crate) fn take_producer(&mut self) -> Option<SfaProducer> {
@@ -861,6 +866,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             durable_ack: durable_ack.then(DurableAckTracker::new),
             reconnect_policy,
             pending_reconnect: None,
+            recycle_drain: false,
             poison_tracker: PoisonFrameTracker::default(),
             max_frame_rejections,
             poison_min_escalation_window,
@@ -868,6 +874,33 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             completed_at_last_role_recycle: None,
             sends_on_connection: 0,
         }
+    }
+
+    /// Called only after confirmed worker quiescence; release replay mappings
+    /// before storage removes their files. Keep the old dictionary until install.
+    pub(crate) fn release_recycle_views(&mut self) {
+        self.send_cursor = SendCursor::new();
+    }
+
+    /// Install a fresh wire namespace without dialing. The ordinary steady-state
+    /// reconnect machinery establishes its connection on the next drive step.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn install_recycled_session(&mut self, delta_enabled: bool, gate: Arc<TrafficGate>) {
+        self.transport.prepare_recycled_session(gate);
+        self.send_cursor = SendCursor::new();
+        self.dict_mirror = SentDictMirror::new(delta_enabled);
+        self.catch_up_pending = false;
+        self.catch_up_retry_strikes = 0;
+        self.durable_ack = self.durable_ack.as_ref().map(|_| DurableAckTracker::new());
+        self.poison_tracker = PoisonFrameTracker::default();
+        self.zero_progress_role_recycles = 0;
+        self.completed_at_last_role_recycle = None;
+        self.sends_on_connection = 0;
+        self.pending_reconnect = Some(self.begin_reconnect(
+            "QWP/WebSocket recycled session",
+            ReconnectReason::RetryableFailure,
+            error::fmt!(SocketError, "QWP/WebSocket dictionary session retired"),
+        ));
     }
 
     fn apply_response<Q: PublicationLog>(
@@ -1918,6 +1951,9 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
     ) -> Result<DriveOutcome, DriverError> {
+        if self.recycle_drain {
+            return Ok(DriveOutcome::Idle);
+        }
         let Some(mut reconnect) = self.pending_reconnect.take() else {
             return Ok(DriveOutcome::Idle);
         };
@@ -1966,6 +2002,41 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 }
             }
         }
+    }
+
+    /// Advance only the current live session under a single IO deadline. A
+    /// partial write follows normal retained replay accounting, but dialing is
+    /// deferred to the caller's ordinary progress path.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn drive_recycle_once<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+        deadline: Instant,
+    ) -> Result<(), DriverError> {
+        if self.has_pending_reconnect() || Instant::now() >= deadline || store.is_terminal() {
+            return Ok(());
+        }
+        let timeouts = self
+            .transport
+            .begin_recycle_io(deadline)
+            .map_err(DriverError::Transport)?;
+        self.recycle_drain = true;
+        let result = (|| {
+            self.drive_send_available(store)?;
+            if !self.has_pending_reconnect() && Instant::now() < deadline && !store.is_terminal() {
+                self.drive_receive_once(store)?;
+            }
+            if !self.has_pending_reconnect() && Instant::now() < deadline && !store.is_terminal() {
+                self.drive_durable_ack_keepalive_once(store)?;
+            }
+            Ok(())
+        })();
+        self.recycle_drain = false;
+        let restored = self
+            .transport
+            .end_recycle_io(timeouts)
+            .map_err(DriverError::Transport);
+        result.and(restored)
     }
 
     pub(crate) fn drive_once<Q: PublicationLog>(
@@ -2877,6 +2948,13 @@ impl InFlightRun {
     }
 }
 
+#[cfg(test)]
+impl Default for SendCursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SendCursor {
     fn new() -> Self {
         Self {
@@ -3025,6 +3103,26 @@ impl SendCursor {
 }
 
 pub(crate) trait QwpWsCoreTransport {
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn begin_recycle_io(
+        &mut self,
+        _deadline: Instant,
+    ) -> crate::Result<(Option<Duration>, Option<Duration>)> {
+        Ok((None, None))
+    }
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn end_recycle_io(
+        &mut self,
+        _timeouts: (Option<Duration>, Option<Duration>),
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// Reset transport-local bookkeeping after the old worker has quiesced.
+    /// Test transports have no socket; real transports replace the sticky gate.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn prepare_recycled_session(&mut self, _gate: Arc<TrafficGate>) {}
+
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure>;
 
     fn send_durable_ack_keepalive_if_due(
@@ -3330,6 +3428,31 @@ fn decode_durable_transport_response(
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl QwpWsCoreTransport for BlockingQwpWsTransport {
+    fn begin_recycle_io(
+        &mut self,
+        deadline: Instant,
+    ) -> crate::Result<(Option<Duration>, Option<Duration>)> {
+        self.stream
+            .begin_io_deadline(deadline)
+            .map_err(|err| error::fmt!(SocketError, "Could not bound recycle IO: {err}"))
+    }
+    fn end_recycle_io(
+        &mut self,
+        timeouts: (Option<Duration>, Option<Duration>),
+    ) -> crate::Result<()> {
+        self.stream
+            .end_io_deadline(timeouts)
+            .map_err(|err| error::fmt!(SocketError, "Could not restore recycle IO timeouts: {err}"))
+    }
+
+    fn prepare_recycled_session(&mut self, gate: Arc<TrafficGate>) {
+        self.traffic_gate = Some(gate);
+        self.reader = WsFrameReader::with_initial_input(Vec::new());
+        self.send_buf.clear();
+        self.pending_wire_sequences.clear();
+        self.last_durable_keepalive_ping = None;
+    }
+
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
         if self.pending_wire_sequences.is_empty() && !*self.qwp_ws.request_durable_ack {
             return Ok(TransportPoll::Idle);
@@ -4346,6 +4469,44 @@ mod tests {
             p = end;
         }
         assert_eq!(p, frame.len(), "no trailing bytes after the dictionary");
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn recycle_session_resets_all_core_state_but_preserves_policy() {
+        let mut driver = driver(FakeOrderedServer::ack_each_send());
+        driver.send_core.enable_delta_dict(&[], 0);
+        driver.try_submit(&make_delta_frame(0, &[b"OLD"])).unwrap();
+        driver.drive_send_once().unwrap();
+        let core = &mut driver.send_core;
+        assert_eq!(core.dict_mirror.count(), 1);
+        core.catch_up_pending = true;
+        core.catch_up_retry_strikes = 7;
+        core.zero_progress_role_recycles = 5;
+        core.completed_at_last_role_recycle = Some(0);
+        core.poison_tracker.rejection_count = 8;
+        let max_rejections = core.max_frame_rejections;
+        let backoff = core.reconnect_policy.initial_backoff();
+        core.release_recycle_views();
+        assert_eq!(
+            core.dict_mirror.count(),
+            1,
+            "parking preserves the old dictionary until installation"
+        );
+        core.install_recycled_session(true, Arc::new(TrafficGate::default()));
+        assert!(core.dict_mirror.is_empty());
+        assert!(core.dict_mirror.is_enabled());
+        assert!(!core.catch_up_pending);
+        assert_eq!(core.catch_up_retry_strikes, 0);
+        assert_eq!(core.zero_progress_role_recycles, 0);
+        assert_eq!(core.completed_at_last_role_recycle, None);
+        assert_eq!(core.poison_tracker.rejection_count, 0);
+        assert_eq!(core.sends_on_connection, 0);
+        assert_eq!(core.send_cursor.next_wire_seq, 0);
+        assert!(core.has_pending_reconnect());
+        assert_eq!(core.max_frame_rejections, max_rejections);
+        assert_eq!(core.reconnect_policy.initial_backoff(), backoff);
+        assert_eq!(driver.store.counters().total_frames_sent, 1);
     }
 
     #[test]
@@ -6752,6 +6913,43 @@ mod tests {
         assert!(!reconnect_error_is_terminal(&all_role_rejected));
     }
 
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn recycle_boundary_drain_defers_reconnect_and_preserves_partial_send() {
+        let transport = TestTransport::scripted([Err(TransportFailure::Disconnect(
+            fake_transport_error("bounded partial write"),
+        ))]);
+        let mut driver =
+            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024)), transport);
+        let receipt = driver.try_submit(b"payload").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        driver
+            .send_core
+            .drive_recycle_once(&mut driver.store, deadline)
+            .unwrap();
+        assert!(driver.send_core.has_pending_reconnect());
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(
+            drain_events(&mut driver),
+            vec![DriverEvent::Published { fsn: 0 }]
+        );
+        driver
+            .send_core
+            .drive_recycle_once(&mut driver.store, deadline)
+            .unwrap();
+        assert!(
+            drain_events(&mut driver).is_empty(),
+            "recycle wait cannot connect on a later tick either"
+        );
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected { .. }
+        ));
+    }
+
     #[test]
     fn transport_write_failure_does_not_commit_sent_receipt() {
         let transport = TestTransport::scripted([Err(TransportFailure::Disconnect(
@@ -8678,6 +8876,57 @@ mod tests {
             driver.receipt_status(receipt),
             QwpReceiptStatus::Published { fsn: 0 }
         );
+    }
+
+    #[test]
+    fn recycle_outage_terminal_classification_retains_current_data() {
+        for code in [
+            ErrorCode::AuthError,
+            ErrorCode::ConfigError,
+            ErrorCode::ProtocolVersionError,
+        ] {
+            let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+                TransportResponse::Ack { wire_seq: 0 },
+            ))])
+            .with_restart_results([Err(DriverError::Transport(Error::new(
+                code,
+                "injected fresh-session failure",
+            )))]);
+            let mut driver =
+                QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024)), transport);
+            driver.send_core.enable_delta_dict(&[], 0);
+            driver.try_submit(&make_delta_frame(0, &[b"old"])).unwrap();
+            driver.drive_once().unwrap();
+            assert_eq!(driver.store.completed_fsn(), Some(0));
+            driver.send_core.release_recycle_views();
+            let mut producer = driver.store.queue.take_producer().unwrap();
+            driver.store.queue.reset_drained(&mut producer).unwrap();
+            driver.store.queue.restore_producer(producer);
+            driver
+                .send_core
+                .install_recycled_session(true, Arc::new(TrafficGate::default()));
+            let current = make_delta_frame(0, &[b"current"]);
+            assert_eq!(driver.try_submit(&current).unwrap().fsn, 1);
+            assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+            assert_eq!(driver.terminal_error().unwrap().code(), code);
+            assert_eq!(driver.store.completed_fsn(), Some(0));
+            assert_eq!(driver.store.published_fsn(), Some(1));
+            let frame = driver
+                .store
+                .queue
+                .progress_view()
+                .next_outbound_frame(&mut SendCursor::new())
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.fsn, 1);
+            frame
+                .payload
+                .with_bytes(|bytes| assert_eq!(bytes, current.as_slice()));
+            for _ in 0..3 {
+                assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+            }
+            assert_eq!(driver.send_core.transport.restart_attempts, 1);
+        }
     }
 
     #[test]
