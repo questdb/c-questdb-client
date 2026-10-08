@@ -90,6 +90,9 @@ struct IsolatedAcquisition {
     /// The worker budget permits are drawn from: always the process-wide one,
     /// except in tests that must fill a budget without starving their peers.
     workers: &'static AtomicUsize,
+    /// How long a lead waits for a permit: always [`ISOLATED_PERMIT_WAIT`],
+    /// except in tests that must reach the busy exit without waiting it out.
+    permit_wait: Duration,
 }
 
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
@@ -98,6 +101,7 @@ impl Default for IsolatedAcquisition {
         Self {
             current: std::sync::Mutex::default(),
             workers: &ISOLATED_PROVIDER_WORKERS,
+            permit_wait: ISOLATED_PERMIT_WAIT,
         }
     }
 }
@@ -242,12 +246,27 @@ impl TokenProviderIsolation {
     /// process-wide budget, so a test can fill it in isolation.
     #[cfg(all(test, any(feature = "_sender-qwp-ws", feature = "_egress")))]
     fn with_worker_budget(workers: &'static AtomicUsize) -> Self {
+        Self::with_worker_budget_and_permit_wait(workers, ISOLATED_PERMIT_WAIT, None)
+    }
+
+    /// [`Self::with_worker_budget`] with a shorter permit wait and, optionally,
+    /// a callback guard reporting whether a callback is active.
+    #[cfg(all(test, any(feature = "_sender-qwp-ws", feature = "_egress")))]
+    fn with_worker_budget_and_permit_wait(
+        workers: &'static AtomicUsize,
+        permit_wait: Duration,
+        callback_active: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Self {
         Self {
             isolated: Arc::new(IsolatedAcquisition {
                 current: std::sync::Mutex::default(),
                 workers,
+                permit_wait,
             }),
-            callback_guard: None,
+            callback_guard: callback_active.map(|active| CallbackGuard {
+                active,
+                on_this_thread: Arc::new(|| false),
+            }),
         }
     }
 }
@@ -520,7 +539,7 @@ impl TokenProvider {
             let permit = IsolatedProviderPermit::acquire_waiting(
                 self.isolated.workers,
                 MAX_ISOLATED_PROVIDER_WORKERS,
-                ISOLATED_PERMIT_WAIT,
+                self.isolated.permit_wait,
                 || cancelled() || self.callback_is_active(),
             );
             match permit {
@@ -1031,6 +1050,7 @@ mod tests {
         };
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
 
         /// A one-shot manual-reset event usable from a `Fn + Send + Sync` provider.
         #[derive(Default)]
@@ -1115,6 +1135,126 @@ mod tests {
             )
             .unwrap();
             assert!(interrupted.is_none());
+        }
+
+        /// Fill a private worker budget so a lead has to wait for a permit.
+        fn fill_budget(workers: &'static AtomicUsize) -> Vec<IsolatedProviderPermit<'static>> {
+            (0..MAX_ISOLATED_PROVIDER_WORKERS)
+                .map(|_| {
+                    IsolatedProviderPermit::acquire(workers, MAX_ISOLATED_PROVIDER_WORKERS).unwrap()
+                })
+                .collect()
+        }
+
+        fn wait_for_lead(provider: &TokenProvider) {
+            while provider.isolated.current.lock().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        #[test]
+        fn a_lead_whose_callback_starts_during_the_permit_wait_retires_the_slot() {
+            // The lead leaves without a worker when a callback becomes active
+            // while it waits for a permit. If it did not retire the slot, every
+            // later isolated acquisition for this provider would join a slot
+            // no worker completes, and never get a token again.
+            static WORKERS: AtomicUsize = AtomicUsize::new(0);
+            let held = fill_budget(&WORKERS);
+            let active = Arc::new(AtomicBool::new(false));
+            let isolation = TokenProviderIsolation::with_worker_budget_and_permit_wait(
+                &WORKERS,
+                Duration::from_secs(30),
+                Some({
+                    let active = Arc::clone(&active);
+                    Arc::new(move || active.load(Ordering::SeqCst))
+                }),
+            );
+            let provider = TokenProvider::new_with_isolation(
+                {
+                    let active = Arc::clone(&active);
+                    move || {
+                        if active.load(Ordering::SeqCst) {
+                            Err(crate::error::fmt!(
+                                SocketError,
+                                "callback must return first"
+                            ))
+                        } else {
+                            Ok::<_, crate::Error>("tok-callback".to_string())
+                        }
+                    }
+                },
+                isolation,
+            );
+            let lead = {
+                let provider = provider.clone();
+                std::thread::spawn(move || provider.bearer_header_isolated_until(|| false))
+            };
+            wait_for_lead(&provider);
+            active.store(true, Ordering::SeqCst);
+            let lead_result = lead.join().unwrap();
+            assert!(
+                lead_result
+                    .unwrap_err()
+                    .msg()
+                    .contains("callback must return first")
+            );
+            active.store(false, Ordering::SeqCst);
+            drop(held);
+
+            assert!(
+                provider.isolated.current.lock().unwrap().is_none(),
+                "the callback-active exit left the slot in flight"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let later = provider.bearer_header_isolated_until(|| Instant::now() >= deadline);
+            assert_eq!(later.unwrap(), "Bearer tok-callback");
+        }
+
+        #[test]
+        fn a_lead_that_times_out_on_a_full_cap_shares_busy_and_retires_the_slot() {
+            // The lead leaves without a worker once the permit wait expires.
+            // Its joiners must receive that busy result, and the slot must be
+            // retired so a later acquisition can lead a fresh one.
+            static WORKERS: AtomicUsize = AtomicUsize::new(0);
+            let held = fill_budget(&WORKERS);
+            let provider = TokenProvider::new_with_isolation(
+                || Ok::<_, crate::Error>("tok-busy".to_string()),
+                TokenProviderIsolation::with_worker_budget_and_permit_wait(
+                    &WORKERS,
+                    Duration::from_millis(300),
+                    None,
+                ),
+            );
+            let lead = {
+                let provider = provider.clone();
+                std::thread::spawn(move || provider.bearer_header_isolated_until(|| false))
+            };
+            wait_for_lead(&provider);
+            let joiner = {
+                let provider = provider.clone();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                std::thread::spawn(move || {
+                    provider.bearer_header_isolated_until(|| Instant::now() >= deadline)
+                })
+            };
+            let lead_result = lead.join().unwrap();
+            let joiner_result = joiner.join().unwrap();
+            assert!(lead_result.unwrap_err().msg().contains("worker limit"));
+            assert!(
+                joiner_result
+                    .as_ref()
+                    .is_err_and(|err| err.msg().contains("worker limit")),
+                "the joiner did not share the lead's busy result: {joiner_result:?}"
+            );
+            drop(held);
+
+            assert!(
+                provider.isolated.current.lock().unwrap().is_none(),
+                "the busy exit left the slot in flight"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let later = provider.bearer_header_isolated_until(|| Instant::now() >= deadline);
+            assert_eq!(later.unwrap(), "Bearer tok-busy");
         }
 
         #[test]
