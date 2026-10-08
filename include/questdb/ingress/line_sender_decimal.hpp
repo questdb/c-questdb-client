@@ -128,6 +128,9 @@ inline decimal_str_view operator""_decimal(const char* buf, size_t len)
  * - An unscaled value (mantissa) encoded as bytes in two's complement
  * big-endian format
  *
+ * The chunk methods column_chunk::column_decimal128 and
+ * column_chunk::column_decimal256 instead require little-endian bytes.
+ *
  * # Example
  *
  * To represent the decimal "123.45":
