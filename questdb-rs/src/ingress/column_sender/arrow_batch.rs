@@ -3983,22 +3983,26 @@ pub(crate) fn encode_arrow_batch_replay_into(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn encode_arrow_batch_into_mode(
-    out: &mut Vec<u8>,
+pub(crate) fn validate_arrow_batch(
     table: TableName<'_>,
     batch: &RecordBatch,
     ts: ArrowTsSource,
     overrides: &[ArrowColumnOverride<'_>],
-    symbol_dict: &mut SymbolGlobalDict,
-    defer_commit: bool,
-    replay_symbols: bool,
 ) -> Result<()> {
-    let schema = batch.schema();
+    prepare_arrow_batch(&batch.schema(), table, batch, ts, overrides).map(|_| ())
+}
+
+fn prepare_arrow_batch<'a>(
+    schema: &'a SchemaRef,
+    table: TableName<'_>,
+    batch: &'a RecordBatch,
+    ts: ArrowTsSource,
+    overrides: &[ArrowColumnOverride<'_>],
+) -> Result<(Vec<ClassifiedColumn<'a>>, Option<u8>)> {
     let overrides_by_column = if overrides.is_empty() {
         None
     } else {
-        Some(prepare_overrides(&schema, overrides)?)
+        Some(prepare_overrides(schema, overrides)?)
     };
     let row_count = batch.num_rows();
     let total_cols = batch.num_columns();
@@ -4011,8 +4015,7 @@ fn encode_arrow_batch_into_mode(
         ));
     }
     if row_count == 0 {
-        emit_header_only_frame(out, defer_commit);
-        return Ok(());
+        return Ok((Vec::new(), None));
     }
     if row_count > MAX_ARROW_INGEST_ROWS {
         return Err(fmt!(
@@ -4068,6 +4071,47 @@ fn encode_arrow_batch_into_mode(
         });
     }
 
+    let ts_wire_type = match ts {
+        ArrowTsSource::ServerNow => None,
+        ArrowTsSource::ScalarNanos(_) => Some(QWP_TYPE_TIMESTAMP_NANOS),
+        ArrowTsSource::Column(idx) => match schema.field(idx).data_type() {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(QWP_TYPE_TIMESTAMP_NANOS),
+            DataType::Timestamp(
+                TimeUnit::Microsecond | TimeUnit::Millisecond | TimeUnit::Second,
+                _,
+            ) => Some(QWP_TYPE_TIMESTAMP),
+            other => {
+                return Err(fmt!(
+                    ArrowIngest,
+                    "designated timestamp column has unsupported Arrow type {:?}",
+                    other
+                ));
+            }
+        },
+    };
+
+    Ok((classified, ts_wire_type))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_arrow_batch_into_mode(
+    out: &mut Vec<u8>,
+    table: TableName<'_>,
+    batch: &RecordBatch,
+    ts: ArrowTsSource,
+    overrides: &[ArrowColumnOverride<'_>],
+    symbol_dict: &mut SymbolGlobalDict,
+    defer_commit: bool,
+    replay_symbols: bool,
+) -> Result<()> {
+    let schema = batch.schema();
+    let (classified, ts_wire_type) = prepare_arrow_batch(&schema, table, batch, ts, overrides)?;
+    let row_count = batch.num_rows();
+    if row_count == 0 {
+        emit_header_only_frame(out, defer_commit);
+        return Ok(());
+    }
+
     let dict_mark = symbol_dict.mark();
     let mut resolution = match resolve_arrow_symbols(&classified, symbol_dict) {
         Ok(r) => r,
@@ -4080,26 +4124,6 @@ fn encode_arrow_batch_into_mode(
         symbol_dict.rollback(dict_mark);
         return Err(e);
     }
-
-    let ts_wire_type = match ts {
-        ArrowTsSource::ServerNow => None,
-        ArrowTsSource::ScalarNanos(_) => Some(QWP_TYPE_TIMESTAMP_NANOS),
-        ArrowTsSource::Column(idx) => match schema.field(idx).data_type() {
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(QWP_TYPE_TIMESTAMP_NANOS),
-            DataType::Timestamp(
-                TimeUnit::Microsecond | TimeUnit::Millisecond | TimeUnit::Second,
-                _,
-            ) => Some(QWP_TYPE_TIMESTAMP),
-            other => {
-                symbol_dict.rollback(dict_mark);
-                return Err(fmt!(
-                    ArrowIngest,
-                    "designated timestamp column has unsupported Arrow type {:?}",
-                    other
-                ));
-            }
-        },
-    };
 
     let column_count = classified.len() + if ts_wire_type.is_some() { 1 } else { 0 };
     let mut signature: Vec<u8> = Vec::with_capacity(column_count * 16);

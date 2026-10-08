@@ -360,10 +360,7 @@ impl Sender {
             )
         })?;
         qwp.check_can_flush()?;
-        if qwp.is_empty() {
-            return Ok(None);
-        }
-        if transactional {
+        if transactional && !qwp.is_empty() {
             return Err(error::fmt!(
                 InvalidApiCall,
                 "Transactional flushes are not supported for QWP/WebSocket."

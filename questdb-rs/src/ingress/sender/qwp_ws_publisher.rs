@@ -282,6 +282,23 @@ pub(crate) fn qwp_ws_encoded_message_size_error(
     )
 }
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+impl super::qwp_ws::RecycleForeground for QwpWsReplayEncoder {
+    fn symbol_count(&self) -> usize {
+        self.global_dict.next_id() as usize
+    }
+    fn take_persisted_dict(&mut self) -> Option<PersistedSymbolDict> {
+        self.persisted_symbol_dict.take()
+    }
+    fn replace_dictionary(&mut self, delta_enabled: bool, persisted: Option<PersistedSymbolDict>) {
+        self.global_dict = SymbolGlobalDict::new();
+        self.scratch = QwpWsEncodeScratch::new();
+        self.payload.clear();
+        self.persisted_symbol_dict = persisted;
+        self.delta_dict_enabled = delta_enabled;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

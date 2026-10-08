@@ -227,7 +227,6 @@ impl PersistedSymbolDict {
     /// until new-namespace publication begins. Truncate the existing inode:
     /// platforms without directory fsync must not recover an older dictionary
     /// through a stale replacement directory entry.
-    #[allow(dead_code)] // Used by the retained-owner maintenance coordinator.
     pub(crate) fn reset_drained(slot_dir: &Path) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)

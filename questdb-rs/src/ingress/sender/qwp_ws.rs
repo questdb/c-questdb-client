@@ -355,6 +355,32 @@ impl WsStream {
         }
     }
 
+    pub(crate) fn begin_io_deadline(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<(Option<Duration>, Option<Duration>)> {
+        let timeouts = (
+            self.tcp_stream().read_timeout()?,
+            self.tcp_stream().write_timeout()?,
+        );
+        match self {
+            Self::Plain(sock) => sock.set_io_deadline(Some(deadline)),
+            Self::Tls(stream) => stream.sock.set_io_deadline(Some(deadline)),
+        }
+        Ok(timeouts)
+    }
+
+    pub(crate) fn end_io_deadline(
+        &mut self,
+        timeouts: (Option<Duration>, Option<Duration>),
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Plain(sock) => sock.set_io_deadline(None),
+            Self::Tls(stream) => stream.sock.set_io_deadline(None),
+        }
+        self.set_timeouts(timeouts.0, timeouts.1)
+    }
+
     fn tcp_stream(&self) -> &TcpStream {
         match self {
             WsStream::Plain(sock) => sock.tcp(),
@@ -447,8 +473,251 @@ struct QwpWsConnectedParts {
     persisted_symbol_dict: Option<PersistedSymbolDict>,
 }
 
+/// The active foreground alone owns global IDs and any persisted write-ahead handle.
+pub(crate) trait RecycleForeground {
+    fn symbol_count(&self) -> usize;
+    fn take_persisted_dict(&mut self) -> Option<PersistedSymbolDict>;
+    fn replace_dictionary(&mut self, delta_enabled: bool, persisted: Option<PersistedSymbolDict>);
+}
+
+/// Retained above the session seal: successful destructive steps are never repeated
+/// when a later storage barrier or worker spawn needs another public call to resume.
+enum ForegroundRecyclePhase {
+    Idle,
+    Storage {
+        old_count: usize,
+    },
+    Dictionary {
+        old_count: usize,
+        slot_dir: Option<std::path::PathBuf>,
+    },
+    Installing {
+        old_count: usize,
+        delta_enabled: bool,
+    },
+}
+
+struct PublicationRecycle {
+    policy: super::qwp_ws_recycle::RecyclePolicy,
+    phase: ForegroundRecyclePhase,
+}
+
+trait RecycleSession {
+    fn pending_boundary(&self) -> Option<Option<u64>>;
+    fn recycle_snapshot(&self) -> crate::Result<(Option<u64>, bool, bool)>;
+    fn claim_recycle(&mut self, boundary: Option<u64>) -> crate::Result<Option<RecyclePermit>>;
+    fn reset_storage(
+        &mut self,
+        permit: &RecyclePermit,
+    ) -> crate::Result<Option<std::path::PathBuf>>;
+    fn install_session(&mut self, permit: RecyclePermit, delta: bool) -> crate::Result<()>;
+    fn drain_recycle_once(&mut self, deadline: Instant) -> crate::Result<()>;
+}
+
+impl PublicationRecycle {
+    fn new(settings: super::qwp_ws_recycle::RecycleSettings) -> Self {
+        Self {
+            policy: super::qwp_ws_recycle::RecyclePolicy::new(settings),
+            phase: ForegroundRecyclePhase::Idle,
+        }
+    }
+
+    fn before_publication(
+        &mut self,
+        session: &mut impl RecycleSession,
+        foreground: &mut impl RecycleForeground,
+        nonempty: bool,
+        deferred: bool,
+    ) -> crate::Result<()> {
+        let pending = session.pending_boundary();
+        if pending.is_none() && (!nonempty || deferred || !self.policy.is_armed()) {
+            return Ok(());
+        }
+        let boundary = if let Some(boundary) = pending {
+            boundary
+        } else {
+            let (boundary, drained, live) = session.recycle_snapshot()?;
+            if !drained
+                && let Some(budget) = self.policy.take_wait_budget(Instant::now(), live, deferred)
+                && let Some(deadline) = Instant::now().checked_add(budget)
+            {
+                while Instant::now() < deadline {
+                    let (_, drained, live) = session.recycle_snapshot()?;
+                    if drained || !live {
+                        break;
+                    }
+                    session.drain_recycle_once(deadline)?;
+                }
+            }
+            boundary
+        };
+        let Some(permit) = session.claim_recycle(boundary)? else {
+            return Ok(());
+        };
+        if matches!(self.phase, ForegroundRecyclePhase::Idle) {
+            self.phase = ForegroundRecyclePhase::Storage {
+                old_count: foreground.symbol_count(),
+            };
+            // Close the old dictionary file before any destructive filesystem work.
+            drop(foreground.take_persisted_dict());
+        }
+        if let ForegroundRecyclePhase::Storage { old_count } = self.phase {
+            let slot_dir = session.reset_storage(&permit)?;
+            self.phase = ForegroundRecyclePhase::Dictionary {
+                old_count,
+                slot_dir,
+            };
+        }
+        if let ForegroundRecyclePhase::Dictionary {
+            old_count,
+            ref slot_dir,
+        } = self.phase
+        {
+            let persisted = slot_dir
+                .as_ref()
+                .map(|path| PersistedSymbolDict::reset_drained(path))
+                .transpose()
+                .map_err(|err| {
+                    error::fmt!(
+                        SocketError,
+                        "Could not reset recycled symbol dictionary: {err}"
+                    )
+                })?;
+            // Memory always supports delta; a successful side-file reset heals dense fallback.
+            let delta_enabled = true;
+            foreground.replace_dictionary(delta_enabled, persisted);
+            self.phase = ForegroundRecyclePhase::Installing {
+                old_count,
+                delta_enabled,
+            };
+        }
+        if let ForegroundRecyclePhase::Installing {
+            old_count,
+            delta_enabled,
+        } = self.phase
+        {
+            session.install_session(permit, delta_enabled)?;
+            self.policy.committed(old_count);
+            self.phase = ForegroundRecyclePhase::Idle;
+        }
+        Ok(())
+    }
+}
+
+macro_rules! foreground_recycle_api {
+    () => {
+        pub(crate) fn before_publication(
+            &mut self,
+            foreground: &mut impl RecycleForeground,
+            nonempty: bool,
+            deferred: bool,
+        ) -> crate::Result<()> {
+            let mut recycle = self
+                .publication_recycle
+                .take()
+                .expect("exclusive foreground recycle owner");
+            let result = recycle.before_publication(self, foreground, nonempty, deferred);
+            self.publication_recycle = Some(recycle);
+            result
+        }
+        pub(crate) fn after_publication(&mut self, symbol_count: usize) {
+            self.publication_recycle
+                .as_mut()
+                .unwrap()
+                .policy
+                .after_publication(Instant::now(), symbol_count);
+        }
+    };
+}
+
+impl RecycleSession for SyncQwpWsHandlerState {
+    fn pending_boundary(&self) -> Option<Option<u64>> {
+        self.pending_recycle_boundary()
+    }
+    fn recycle_snapshot(&self) -> crate::Result<(Option<u64>, bool, bool)> {
+        self.runner.check_error()?;
+        self.runner.check_publication_open()?;
+        let store = self.runner.lock_shared()?;
+        check_store_error(&store)?;
+        Ok((
+            store.published_fsn(),
+            store.all_published_receipts_resolved(),
+            self.runner.recycle.is_live(),
+        ))
+    }
+    fn claim_recycle(&mut self, boundary: Option<u64>) -> crate::Result<Option<RecyclePermit>> {
+        self.request_recycle(boundary)
+    }
+    fn reset_storage(
+        &mut self,
+        permit: &RecyclePermit,
+    ) -> crate::Result<Option<std::path::PathBuf>> {
+        self.with_recycle_storage(permit, |queue, producer| {
+            reset_recycle_storage(queue, producer)?;
+            Ok(queue.slot_dir().map(std::path::Path::to_path_buf))
+        })
+    }
+    fn install_session(&mut self, permit: RecyclePermit, delta: bool) -> crate::Result<()> {
+        self.finish_recycle(permit, delta)
+    }
+    fn drain_recycle_once(&mut self, deadline: Instant) -> crate::Result<()> {
+        // The worker keeps its normal progress mode; never dial on the foreground.
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(1)),
+        );
+        self.runner.check_error()
+    }
+}
+
+impl RecycleSession for ManualQwpWsHandlerState {
+    fn pending_boundary(&self) -> Option<Option<u64>> {
+        self.pending_recycle_boundary()
+    }
+    fn recycle_snapshot(&self) -> crate::Result<(Option<u64>, bool, bool)> {
+        check_store_error(&self.store)?;
+        if self.store.lifecycle().load() != PublicationState::Open {
+            return Err(driver_error_to_error_without_state(DriverError::Closing));
+        }
+        Ok((
+            self.store.published_fsn(),
+            self.store.all_published_receipts_resolved(),
+            !self.send_core.has_pending_reconnect(),
+        ))
+    }
+    fn claim_recycle(&mut self, boundary: Option<u64>) -> crate::Result<Option<RecyclePermit>> {
+        self.request_recycle(boundary)
+    }
+    fn reset_storage(
+        &mut self,
+        permit: &RecyclePermit,
+    ) -> crate::Result<Option<std::path::PathBuf>> {
+        self.with_recycle_storage(permit, |queue, producer| {
+            reset_recycle_storage(queue, producer)?;
+            Ok(queue.slot_dir().map(std::path::Path::to_path_buf))
+        })
+    }
+    fn install_session(&mut self, permit: RecyclePermit, delta: bool) -> crate::Result<()> {
+        self.finish_recycle(permit, delta)
+    }
+    fn drain_recycle_once(&mut self, deadline: Instant) -> crate::Result<()> {
+        self.send_core
+            .drive_recycle_once(&mut self.store, deadline)
+            .map_err(|err| driver_error_to_error_from_store(&self.store, err))?;
+        check_store_error(&self.store)?;
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(1)),
+        );
+        Ok(())
+    }
+}
+
 pub(crate) struct SyncQwpWsHandlerState {
-    encoder: QwpWsReplayEncoder,
+    encoder: Option<QwpWsReplayEncoder>,
+    publication_recycle: Option<PublicationRecycle>,
     runner: SyncQwpWsRunner,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
@@ -496,7 +765,12 @@ pub(crate) struct SyncQwpWsHandlerState {
 }
 
 impl SyncQwpWsHandlerState {
-    #[allow(dead_code)] // Publication integration follows in Task 4.
+    pub(crate) fn needs_recycle_boundary(&self) -> bool {
+        self.publication_recycle.as_ref().unwrap().policy.is_armed()
+            || self.pending_recycle_boundary().is_some()
+    }
+
+    foreground_recycle_api!();
     pub(crate) fn request_recycle(
         &mut self,
         boundary: Option<u64>,
@@ -504,7 +778,6 @@ impl SyncQwpWsHandlerState {
         self.runner.request_recycle(boundary)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn pending_recycle_boundary(&self) -> Option<Option<u64>> {
         self.runner
             .pending_recycle
@@ -512,7 +785,6 @@ impl SyncQwpWsHandlerState {
             .map(|pending| pending.boundary)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn with_recycle_storage<R>(
         &mut self,
         permit: &RecyclePermit,
@@ -521,7 +793,6 @@ impl SyncQwpWsHandlerState {
         self.runner.with_recycle_storage(permit, operation)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn finish_recycle(
         &mut self,
         permit: RecyclePermit,
@@ -541,7 +812,9 @@ impl SyncQwpWsHandlerState {
     ///
     /// [`PooledSenderCore::new_store_and_forward`]: super::column_sender::PooledSenderCore::new_store_and_forward
     pub(crate) fn release_dormant_encoder_dict(&mut self) {
-        self.encoder.release_dormant_dict();
+        if let Some(mut encoder) = self.encoder.take() {
+            encoder.release_dormant_dict();
+        }
     }
 }
 
@@ -674,7 +947,8 @@ impl ManualRecycle {
 
 pub(crate) struct ManualQwpWsHandlerState {
     recycle: ManualRecycle,
-    encoder: QwpWsReplayEncoder,
+    publication_recycle: Option<PublicationRecycle>,
+    encoder: Option<QwpWsReplayEncoder>,
     store: QwpWsPublicationStore<SfaSlotQueue>,
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
@@ -684,9 +958,8 @@ pub(crate) struct ManualQwpWsHandlerState {
     close_drain_timeout: Duration,
 }
 
-// These entry points are consumed by publication integration in the next task.
-#[allow(dead_code)]
 impl ManualQwpWsHandlerState {
+    foreground_recycle_api!();
     pub(crate) fn pending_recycle_boundary(&self) -> Option<Option<u64>> {
         self.recycle
             .pending
@@ -745,7 +1018,6 @@ fn recheck_recycle_boundary<Q: PublicationLog>(
 /// Capacity deferral happens before the storage reset reserves topology. Retire
 /// ordinary drained storage work off-lock, then retry without releasing the seal.
 /// The foreground must release its persisted dictionary before calling this.
-#[allow(dead_code)] // Publication integration follows in Task 4.
 pub(crate) fn reset_recycle_storage(
     queue: &mut SfaSlotQueue,
     producer: &mut SfaProducer,
@@ -4061,7 +4333,11 @@ pub(crate) fn connect_qwp_ws(
     // the slot's persisted symbol dictionary for write-ahead. (The column sender
     // claims it in new_store_and_forward instead; the two are mutually exclusive.)
     let persisted = state.persisted_symbol_dict.take();
-    state.encoder.set_persisted_symbol_dict(persisted);
+    state
+        .encoder
+        .as_mut()
+        .unwrap()
+        .set_persisted_symbol_dict(persisted);
     // The row encoder was already seeded from the recovered entries inside
     // connect_qwp_ws_background_state (and the driver mirror seeds from the send
     // core / pending_connect, not from here), so the copy kept in the handler
@@ -4248,7 +4524,8 @@ pub(crate) fn connect_qwp_ws_background_state(
     );
 
     Ok(SyncQwpWsHandlerState {
-        encoder,
+        encoder: Some(encoder),
+        publication_recycle: Some(PublicationRecycle::new(qwp_ws.recycle_settings())),
         runner,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
@@ -4342,7 +4619,8 @@ pub(crate) fn open_manual_qwp_ws(
     );
     Ok(ManualQwpWsHandlerState {
         recycle: ManualRecycle::new(traffic_gate),
-        encoder: parts.encoder,
+        encoder: Some(parts.encoder),
+        publication_recycle: Some(PublicationRecycle::new(qwp_ws.recycle_settings())),
         store: parts.store,
         send_core: parts.send_core,
         server_max_batch_size,
@@ -4551,12 +4829,21 @@ pub(crate) fn flush_qwp_ws(
     buffer: &QwpWsColumnarBuffer,
     max_buf_size: usize,
 ) -> crate::Result<Option<u64>> {
-    state.runner.check_publication_open()?;
-    let encoder = &mut state.encoder;
-    let runner = &mut state.runner;
-    publish_qwp_ws_buffer(encoder, buffer, max_buf_size, |payload| {
-        runner.publish_replay_payload(payload)
-    })
+    let mut encoder = state.encoder.take().expect("standalone foreground");
+    let result = (|| {
+        state.before_publication(&mut encoder, !buffer.is_empty(), false)?;
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        state.runner.check_publication_open()?;
+        let result = publish_qwp_ws_buffer(&mut encoder, buffer, max_buf_size, |payload| {
+            state.runner.publish_replay_payload(payload)
+        })?;
+        state.after_publication(encoder.symbol_count());
+        Ok(result)
+    })();
+    state.encoder = Some(encoder);
+    result
 }
 
 pub(crate) fn publish_qwp_ws_payload_background(
@@ -4604,22 +4891,26 @@ pub(crate) fn flush_qwp_ws_manual(
     buffer: &QwpWsColumnarBuffer,
     max_buf_size: usize,
 ) -> crate::Result<Option<u64>> {
-    if state.recycle.pending.is_some() {
-        return Err(error::fmt!(
-            SocketError,
-            "QWP/WebSocket publication is parked for dictionary recycling"
-        ));
-    }
-    let encoder = &mut state.encoder;
-    let store = &mut state.store;
-    let send_core = &mut state.send_core;
-    let append_deadline = state.append_deadline;
-    publish_qwp_ws_buffer(encoder, buffer, max_buf_size, |payload| {
-        match manual_submit_with_drive_deadline(store, send_core, payload, append_deadline) {
-            Ok(fsn) => Ok(fsn),
-            Err(err) => Err(driver_error_to_error_from_store(store, err)),
+    let mut encoder = state.encoder.take().expect("standalone foreground");
+    let result = (|| {
+        state.before_publication(&mut encoder, !buffer.is_empty(), false)?;
+        if buffer.is_empty() {
+            return Ok(None);
         }
-    })
+        let result = publish_qwp_ws_buffer(&mut encoder, buffer, max_buf_size, |payload| {
+            manual_submit_with_drive_deadline(
+                &mut state.store,
+                &mut state.send_core,
+                payload,
+                state.append_deadline,
+            )
+            .map_err(|err| driver_error_to_error_from_store(&state.store, err))
+        })?;
+        state.after_publication(encoder.symbol_count());
+        Ok(result)
+    })();
+    state.encoder = Some(encoder);
+    result
 }
 
 fn publish_qwp_ws_buffer(
@@ -7576,5 +7867,363 @@ mod tests {
             );
         }
         drop(runner);
+    }
+}
+
+#[cfg(test)]
+mod publication_recycle_tests {
+    use super::*;
+    use crate::ingress::{AckLevel, SenderBuilder};
+    use crate::tests::qwp_ws_recycle::Server;
+
+    fn state(sender: &mut crate::ingress::Sender) -> &mut SyncQwpWsHandlerState {
+        match &mut sender.handler {
+            super::super::SyncProtocolHandler::SyncQwpWs(state) => state,
+            _ => panic!("background sender expected"),
+        }
+    }
+
+    #[test]
+    fn recycle_boundary_retains_storage_and_install_phases() {
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};sf_dir={};sender_id=phase;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port, dir.path().display())).unwrap().build().unwrap();
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        server.frame();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        super::super::qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER.with(|fail| fail.set(Some(0)));
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("injected recycle failure")
+        );
+        assert!(!buffer.is_empty());
+        assert!(matches!(
+            state(&mut sender)
+                .publication_recycle
+                .as_ref()
+                .unwrap()
+                .phase,
+            ForegroundRecyclePhase::Storage { old_count: 1 }
+        ));
+        assert_eq!(
+            state(&mut sender).encoder.as_ref().unwrap().symbol_count(),
+            1
+        );
+        assert!(state(&mut sender).pending_recycle_boundary().is_some());
+        FAIL_NEXT_RECYCLE_SPAWN.with(|fail| fail.set(true));
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("spawn failure")
+        );
+        assert!(!buffer.is_empty());
+        assert!(matches!(
+            state(&mut sender)
+                .publication_recycle
+                .as_ref()
+                .unwrap()
+                .phase,
+            ForegroundRecyclePhase::Installing {
+                old_count: 1,
+                delta_enabled: true
+            }
+        ));
+        assert_eq!(
+            state(&mut sender).encoder.as_ref().unwrap().symbol_count(),
+            0
+        );
+        // A replacement permit must retry finish only, not repeat storage or dictionary reset.
+        super::super::qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER.with(|fail| fail.set(Some(0)));
+        assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(1));
+        super::super::qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER
+            .with(|fail| assert_eq!(fail.replace(None), Some(0)));
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (connection, beta) = server.frame();
+        assert_eq!(beta[12], 0);
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "gamma")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(2));
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (same, gamma) = server.frame();
+        assert_eq!(
+            same, connection,
+            "the floor must use the retained pre-reset count"
+        );
+        assert_eq!(gamma[12], 1);
+    }
+
+    #[test]
+    fn recycle_boundary_invalid_and_empty_buffer_do_not_start_maintenance() {
+        let server = Server::new();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap().build().unwrap();
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        server.frame();
+        assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), None);
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap();
+        assert_eq!(
+            sender.flush(&mut buffer).unwrap_err().code(),
+            crate::ErrorCode::InvalidApiCall
+        );
+        assert_eq!(
+            state(&mut sender).encoder.as_ref().unwrap().symbol_count(),
+            1
+        );
+        assert!(state(&mut sender).pending_recycle_boundary().is_none());
+        assert!(
+            state(&mut sender)
+                .publication_recycle
+                .as_ref()
+                .unwrap()
+                .policy
+                .is_armed()
+        );
+    }
+
+    #[test]
+    fn recycle_boundary_dense_fallback_heals() {
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};sf_dir={};sender_id=heal;symbol_dict_reset_threshold=2;symbol_dict_reset_max_wait_millis=0;", server.port, dir.path().display())).unwrap().build().unwrap();
+        let encoder = state(&mut sender).encoder.as_mut().unwrap();
+        let mut persisted = encoder.take_persisted_dict().unwrap();
+        persisted.arm_fail_next_append_cleanup();
+        encoder.set_persisted_symbol_dict(Some(persisted));
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(sender.flush(&mut buffer).is_err());
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (_, dense) = server.frame();
+        assert_eq!(dense[12], 0);
+        assert!(
+            state(&mut sender)
+                .encoder
+                .as_mut()
+                .unwrap()
+                .take_persisted_dict()
+                .is_none()
+        );
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (_, dense_second) = server.frame();
+        assert_eq!(
+            &dense_second[12..14],
+            &[0, 2],
+            "dense fallback repeats the whole dictionary"
+        );
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "gamma")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (_, healed) = server.frame();
+        assert_eq!(healed[5] & 8, 8);
+        assert_eq!(healed[12], 0);
+        assert!(
+            state(&mut sender)
+                .encoder
+                .as_mut()
+                .unwrap()
+                .take_persisted_dict()
+                .is_some()
+        );
+    }
+    #[test]
+    fn recycle_boundary_io_deadline_bounds_stalled_data_and_pong() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        for pong in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            socket2::SockRef::from(&listener)
+                .set_recv_buffer_size(1024)
+                .unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (_peer, _) = listener.accept().unwrap();
+            // Fill the real kernel send buffer while the peer never reads.
+            socket2::SockRef::from(&client)
+                .set_send_buffer_size(4096)
+                .unwrap();
+            client.set_nonblocking(true).unwrap();
+            let mut stream = WsStream::Plain(NoSigpipeTcp::new(client).unwrap());
+            let bytes = vec![0; 1024 * 1024];
+            for _ in 0..5 {
+                while stream.write(&bytes).is_ok() {}
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            while stream.write(&bytes).is_ok() {}
+            while stream.write(&[0]).is_ok() {}
+            stream.tcp_stream().set_nonblocking(false).unwrap();
+            stream
+                .set_timeouts(Some(Duration::from_secs(3)), Some(Duration::from_secs(3)))
+                .unwrap();
+            let started = Instant::now();
+            let saved = stream
+                .begin_io_deadline(started + Duration::from_millis(20))
+                .unwrap();
+            let mut scratch = Vec::new();
+            if pong {
+                let mut reader = WsFrameReader::new();
+                loop {
+                    reader.append_input_for_test(&[0x89, 0]);
+                    if reader.try_read_one(&mut stream, &mut scratch).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                assert!(write_binary_frame(&mut stream, &mut scratch, &bytes).is_err());
+            }
+            stream.end_io_deadline(saved).unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "one recycle budget must bound control and data writes"
+            );
+            assert_eq!(
+                stream.tcp_stream().write_timeout().unwrap(),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                stream.tcp_stream().read_timeout().unwrap(),
+                Some(Duration::from_secs(3))
+            );
+        }
+    }
+
+    #[test]
+    fn recycle_boundary_dictionary_reset_failure_resumes_after_storage() {
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};sf_dir={};sender_id=dictfail;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port, dir.path().display())).unwrap().build().unwrap();
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        server.frame();
+        let state = state(&mut sender);
+        let slot = state
+            .runner
+            .lock_shared()
+            .unwrap()
+            .recycle_queue_mut()
+            .slot_dir()
+            .unwrap()
+            .to_path_buf();
+        drop(state.encoder.as_mut().unwrap().take_persisted_dict());
+        let dictionary = slot.join(".symbol-dict");
+        let retained = slot.join("old-symbols");
+        std::fs::rename(&dictionary, &retained).unwrap();
+        std::fs::create_dir(&dictionary).unwrap();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "beta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("reset recycled symbol dictionary")
+        );
+        assert!(matches!(
+            self::state(&mut sender)
+                .publication_recycle
+                .as_ref()
+                .unwrap()
+                .phase,
+            ForegroundRecyclePhase::Dictionary { old_count: 1, .. }
+        ));
+        assert_eq!(
+            self::state(&mut sender)
+                .encoder
+                .as_ref()
+                .unwrap()
+                .symbol_count(),
+            1
+        );
+        std::fs::remove_dir(&dictionary).unwrap();
+        std::fs::rename(&retained, &dictionary).unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (_, frame) = server.frame();
+        assert_eq!(&frame[12..14], &[0, 1]);
+        assert_eq!(sender.published_fsn().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn recycle_boundary_close_preempts_drain_readiness() {
+        let server = Server::new();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};", server.port))
+            .unwrap()
+            .build()
+            .unwrap();
+        let state = state(&mut sender);
+        state.runner.begin_close();
+        assert!(
+            state.recycle_snapshot().is_err(),
+            "a closing sender must not enter the recycle wait"
+        );
     }
 }

@@ -50,6 +50,10 @@ impl RecycleLink {
         }))
     }
 
+    pub(super) fn is_live(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == LINK_LIVE
+    }
+
     pub(super) fn claim(&self) -> bool {
         self.0
             .compare_exchange(
@@ -148,9 +152,6 @@ impl RecycleSettings {
     }
 }
 
-// Publication integration follows separately; this foundation is intentionally
-// not invoked by sender publication paths yet.
-#[allow(dead_code)]
 pub(crate) struct RecyclePolicy {
     settings: RecycleSettings,
     armed_at: Option<Instant>,
@@ -159,7 +160,6 @@ pub(crate) struct RecyclePolicy {
     epoch: u64,
 }
 
-#[allow(dead_code)]
 impl RecyclePolicy {
     pub(crate) fn new(settings: RecycleSettings) -> Self {
         Self {
@@ -172,6 +172,7 @@ impl RecyclePolicy {
     }
 
     /// Advisory requests bypass the dictionary size gate when enabled.
+    #[allow(dead_code)] // Advisory publication API follows separately.
     pub(crate) fn request_reset(&mut self, now: Instant, _dict_size: usize) {
         if self.settings.enabled {
             self.arm(now);

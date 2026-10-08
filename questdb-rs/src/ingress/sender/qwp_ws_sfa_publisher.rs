@@ -224,6 +224,22 @@ impl SfaForegroundPublisher {
     }
 }
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+impl super::qwp_ws::RecycleForeground for SfaForegroundPublisher {
+    fn symbol_count(&self) -> usize {
+        self.symbols.global.next_id() as usize
+    }
+    fn take_persisted_dict(&mut self) -> Option<PersistedSymbolDict> {
+        self.symbols.persisted.take()
+    }
+    fn replace_dictionary(&mut self, delta_enabled: bool, persisted: Option<PersistedSymbolDict>) {
+        self.symbols.global = SymbolGlobalDict::new();
+        self.payload.clear();
+        self.symbols.persisted = persisted;
+        self.symbols.delta_enabled = delta_enabled;
+    }
+}
+
 #[cfg(all(test, feature = "sync-sender-qwp-ws"))]
 mod tests {
     use super::*;
