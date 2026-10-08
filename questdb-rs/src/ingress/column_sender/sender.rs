@@ -2582,4 +2582,46 @@ mod recycle_boundary_tests {
         );
         assert_eq!(sender.backend.foreground.symbol_count(), 1);
     }
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn recycle_boundary_invalid_arrow_values_preserve_namespace_and_phase() {
+        for (batch, designated) in crate::tests::qwp_ws_recycle::invalid_arrow_values() {
+            let server = Server::new();
+            let mut sender = core(&server);
+            let mut buffer = Buffer::new_qwp_ws();
+            buffer
+                .table("trades")
+                .unwrap()
+                .symbol("sym", "alpha")
+                .unwrap()
+                .at_now()
+                .unwrap();
+            sender
+                .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+                .unwrap();
+            server.frame();
+            let ts = if designated {
+                ArrowTsSource::Column(0)
+            } else {
+                ArrowTsSource::ServerNow
+            };
+            let failure = sender
+                .backend
+                .flush_arrow_batch_boundary(
+                    TableName::new("trades").unwrap(),
+                    &batch,
+                    ts,
+                    &[],
+                    WaitForAck::No,
+                )
+                .unwrap_err();
+            assert!(failure.is_not_delivered());
+            assert_eq!(failure.into_error().code(), ErrorCode::ArrowIngest);
+            assert_eq!(sender.backend.foreground.symbol_count(), 1);
+            assert!(sender.backend.state.needs_recycle_boundary());
+            assert!(sender.backend.state.pending_recycle_boundary().is_none());
+            assert_eq!(sender.published_fsn().unwrap(), Some(0));
+            assert_eq!(server.connection_count(), 1);
+        }
+    }
 }

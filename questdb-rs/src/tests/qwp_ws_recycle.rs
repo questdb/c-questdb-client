@@ -26,6 +26,8 @@
 use super::qwp_ws::{perform_server_upgrade, read_frame, write_qwp_ok_response};
 use crate::ingress::{AckLevel, QwpWsProgress, SenderBuilder, TimestampNanos};
 use std::net::TcpListener;
+#[cfg(feature = "arrow-ingress")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -38,6 +40,8 @@ pub(crate) struct Server {
     pub(crate) port: u16,
     frames: mpsc::Receiver<(usize, Vec<u8>)>,
     stop: Arc<AtomicBool>,
+    #[cfg(feature = "arrow-ingress")]
+    connections: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Server {
@@ -51,6 +55,10 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let (tx, frames) = mpsc::channel();
+        #[cfg(feature = "arrow-ingress")]
+        let connections = Arc::new(AtomicUsize::new(0));
+        #[cfg(feature = "arrow-ingress")]
+        let accepted = Arc::clone(&connections);
         let worker = thread::spawn(move || {
             let mut connection = 0;
             let mut workers = Vec::new();
@@ -60,6 +68,8 @@ impl Server {
                         let tx = tx.clone();
                         let id = connection;
                         connection += 1;
+                        #[cfg(feature = "arrow-ingress")]
+                        accepted.fetch_add(1, Ordering::Release);
                         workers.push(thread::spawn(move || {
                             stream.set_nonblocking(false).unwrap();
                             if perform_server_upgrade(&mut stream).is_err() {
@@ -100,8 +110,14 @@ impl Server {
             port,
             frames,
             stop,
+            #[cfg(feature = "arrow-ingress")]
+            connections,
             worker: Some(worker),
         }
+    }
+    #[cfg(feature = "arrow-ingress")]
+    pub(crate) fn connection_count(&self) -> usize {
+        self.connections.load(Ordering::Acquire)
     }
     pub(crate) fn frame(&self) -> (usize, Vec<u8>) {
         self.frames.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -517,4 +533,74 @@ fn recycle_boundary_polars_batches_use_pooled_arrow_boundary() {
         assert_eq!(sender.published_fsn().unwrap(), Some(index as u64));
     }
     assert_eq!(sender.published_fsn().unwrap(), Some(1));
+}
+
+#[cfg(feature = "arrow-ingress")]
+pub(crate) fn invalid_arrow_values() -> Vec<(arrow::array::RecordBatch, bool)> {
+    use arrow::array::*;
+    let cases: Vec<(ArrayRef, bool)> = vec![
+        (Arc::new(TimestampMicrosecondArray::from(vec![None])), true),
+        (Arc::new(TimestampNanosecondArray::from(vec![-1])), true),
+        (
+            Arc::new(TimestampMillisecondArray::from(vec![i64::MAX])),
+            true,
+        ),
+        (Arc::new(TimestampSecondArray::from(vec![i64::MAX])), true),
+        (Arc::new(DurationSecondArray::from(vec![i64::MAX])), false),
+        (Arc::new(TimestampSecondArray::from(vec![i64::MAX])), false),
+    ];
+    cases
+        .into_iter()
+        .map(|(value, designated)| {
+            (
+                RecordBatch::try_from_iter(vec![
+                    ("value", value),
+                    ("payload", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+                ])
+                .unwrap(),
+                designated,
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn recycle_boundary_invalid_arrow_values_keep_connection() {
+    use crate::ingress::{Buffer, ColumnName};
+    use crate::{ErrorCode, QuestDb};
+    for (batch, designated) in invalid_arrow_values() {
+        let server = Server::new();
+        let db = QuestDb::connect(&format!(
+            "ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;lazy_connect=true;pool_reap=manual;", server.port
+        )).unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let mut buffer = Buffer::new_qwp_ws();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        server.frame();
+        let error = if designated {
+            sender.flush_arrow_batch_at_column(
+                "trades",
+                &batch,
+                ColumnName::new("value").unwrap(),
+                &[],
+            )
+        } else {
+            sender.flush_arrow_batch_at_now("trades", &batch, &[])
+        }
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::ArrowIngest);
+        assert!(!error.in_doubt());
+        assert_eq!(sender.published_fsn().unwrap(), Some(0));
+        assert_eq!(server.connection_count(), 1);
+    }
 }

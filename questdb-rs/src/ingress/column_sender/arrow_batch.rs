@@ -1167,7 +1167,7 @@ fn try_non_null_le<const N: usize>(
     Ok(())
 }
 
-fn u64_to_i64_le_checked(v: u64, row: usize) -> Result<[u8; 8]> {
+fn u64_to_i64_checked(v: u64, row: usize) -> Result<i64> {
     if v > i64::MAX as u64 {
         return Err(fmt!(
             ArrowIngest,
@@ -1176,7 +1176,11 @@ fn u64_to_i64_le_checked(v: u64, row: usize) -> Result<[u8; 8]> {
             row
         ));
     }
-    Ok((v as i64).to_le_bytes())
+    Ok(v as i64)
+}
+
+fn u64_to_i64_le_checked(v: u64, row: usize) -> Result<[u8; 8]> {
+    u64_to_i64_checked(v, row).map(i64::to_le_bytes)
 }
 
 /// `arrow.uuid` column body: RFC-4122 big-endian storage → QWP wire order
@@ -1270,6 +1274,20 @@ fn write_fixed_from_var_binary_payload(
     }
 }
 
+fn validate_fixed_value(v: &[u8], elem: usize, label: &str, row: usize) -> Result<()> {
+    if v.len() != elem {
+        return Err(fmt!(
+            ArrowIngest,
+            "{}: claim requires exactly {}-byte values, got {} bytes at row {}",
+            label,
+            elem,
+            v.len(),
+            row
+        ));
+    }
+    Ok(())
+}
+
 fn emit_fixed_rows<'a, A>(
     out: &mut Vec<u8>,
     arr: A,
@@ -1285,16 +1303,7 @@ where
             continue;
         }
         let v = arr.value(row);
-        if v.len() != elem {
-            return Err(fmt!(
-                ArrowIngest,
-                "{}: claim requires exactly {}-byte values, got {} bytes at row {}",
-                label,
-                elem,
-                v.len(),
-                row
-            ));
-        }
+        validate_fixed_value(v, elem, label, row)?;
         if reverse {
             out.extend_from_slice(&reverse_uuid_bytes(v));
         } else {
@@ -1413,13 +1422,12 @@ fn write_bool_payload(out: &mut Vec<u8>, arr: &BooleanArray) -> Result<()> {
     Ok(())
 }
 
-fn write_varlen_u32_offsets_no_null(
-    out: &mut Vec<u8>,
+fn validate_varlen_u32_span(
     arr_offsets: &[i32],
     arr_data: &[u8],
     row_count: usize,
     label: &str,
-) -> Result<()> {
+) -> Result<(i32, usize)> {
     if arr_offsets.len() < row_count + 1 {
         return Err(fmt!(
             ArrowIngest,
@@ -1467,6 +1475,17 @@ fn write_varlen_u32_offsets_no_null(
             arr_data.len()
         ));
     }
+    Ok((base, used))
+}
+
+fn write_varlen_u32_offsets_no_null(
+    out: &mut Vec<u8>,
+    arr_offsets: &[i32],
+    arr_data: &[u8],
+    row_count: usize,
+    label: &str,
+) -> Result<()> {
+    let (base, used) = validate_varlen_u32_span(arr_offsets, arr_data, row_count, label)?;
     let offsets_bytes = 4usize.checked_mul(row_count + 1).ok_or_else(|| {
         fmt!(
             ArrowIngest,
@@ -1490,6 +1509,45 @@ fn write_varlen_u32_offsets_no_null(
     Ok(())
 }
 
+fn visit_varlen_rows(
+    arr: &dyn Array,
+    label: &str,
+    mut visit: impl FnMut(usize) -> Result<()>,
+) -> Result<()> {
+    let row_count = arr.len();
+    let non_null = non_null_count(arr, label)?;
+    let mut next_offset_idx = 1;
+    for row in 0..row_count {
+        if arr.is_null(row) {
+            continue;
+        }
+        // The offset table is sized from the array's declared `null_count`, but
+        // the loop is driven by the live validity bitmap. A producer whose
+        // `null_count` over-reports nulls would drive more emits than the table
+        // holds and back-patch past it — an OOB write that aborts under the
+        // `panic = "abort"` FFI. Reject the disagreement instead.
+        if next_offset_idx > non_null {
+            return Err(fmt!(
+                ArrowIngest,
+                "{}: validity bitmap exposes more non-null rows than the declared null_count permits",
+                label
+            ));
+        }
+        visit(row)?;
+        next_offset_idx += 1;
+    }
+    if next_offset_idx - 1 != non_null {
+        return Err(fmt!(
+            ArrowIngest,
+            "{}: validity bitmap exposes {} non-null rows but the declared null_count implies {}",
+            label,
+            next_offset_idx - 1,
+            non_null
+        ));
+    }
+    Ok(())
+}
+
 /// `bytes_upper_bound`, when `Some`, is the exact (or worst-case) byte
 /// total the `emit_row` closure will append across all non-null rows.
 /// It is reserved up front so the closure can do raw `extend_from_slice`
@@ -1506,7 +1564,6 @@ fn write_varlen_u32_offsets_with_bitmap<F>(
 where
     F: FnMut(&mut Vec<u8>, usize) -> Result<u32>,
 {
-    let row_count = arr.len();
     let non_null = non_null_count(arr, label)?;
     let offsets_bytes = 4usize.checked_mul(non_null + 1).ok_or_else(|| {
         fmt!(
@@ -1529,22 +1586,7 @@ where
     let mut cumulative: u32 = 0;
     let mut next_offset_idx = 1usize;
     let bytes_anchor = out.len();
-    for row in 0..row_count {
-        if arr.is_null(row) {
-            continue;
-        }
-        // The offset table is sized from the array's declared `null_count`, but
-        // the loop is driven by the live validity bitmap. A producer whose
-        // `null_count` over-reports nulls would drive more emits than the table
-        // holds and back-patch past it — an OOB write that aborts under the
-        // `panic = "abort"` FFI. Reject the disagreement instead.
-        if next_offset_idx > non_null {
-            return Err(fmt!(
-                ArrowIngest,
-                "{}: validity bitmap exposes more non-null rows than the declared null_count permits",
-                label
-            ));
-        }
+    visit_varlen_rows(arr, label, |row| {
         let written = emit_row(out, row)?;
         let next = cumulative.checked_add(written).ok_or_else(|| {
             fmt!(
@@ -1558,16 +1600,8 @@ where
         let pos = offsets_start + 4 * next_offset_idx;
         out[pos..pos + 4].copy_from_slice(&cumulative.to_le_bytes());
         next_offset_idx += 1;
-    }
-    if next_offset_idx - 1 != non_null {
-        return Err(fmt!(
-            ArrowIngest,
-            "{}: validity bitmap exposes {} non-null rows but the declared null_count implies {}",
-            label,
-            next_offset_idx - 1,
-            non_null
-        ));
-    }
+        Ok(())
+    })?;
     debug_assert_eq!(out.len() - bytes_anchor, cumulative as usize);
     Ok(())
 }
@@ -1754,12 +1788,11 @@ fn write_binary_view_payload(
     }
 }
 
-fn write_varlen_large_offsets_no_null(
-    out: &mut Vec<u8>,
+fn validate_varlen_large_span(
     arr_offsets: &[i64],
     arr_data: &[u8],
     row_count: usize,
-) -> Result<()> {
+) -> Result<(i64, usize)> {
     if arr_offsets.len() < row_count + 1 {
         return Err(fmt!(
             ArrowIngest,
@@ -1795,6 +1828,26 @@ fn write_varlen_large_offsets_no_null(
             arr_data.len()
         ));
     }
+    Ok((base, used))
+}
+
+fn validate_large_offset(off: i64, base: i64, row_count: usize) -> Result<u32> {
+    u32::try_from(off.wrapping_sub(base)).map_err(|_| {
+        fmt!(
+            ArrowIngest,
+            "VARCHAR column: cumulative offset exceeds u32::MAX at row >={}",
+            row_count
+        )
+    })
+}
+
+fn write_varlen_large_offsets_no_null(
+    out: &mut Vec<u8>,
+    arr_offsets: &[i64],
+    arr_data: &[u8],
+    row_count: usize,
+) -> Result<()> {
+    let (base, used) = validate_varlen_large_span(arr_offsets, arr_data, row_count)?;
     let offsets_bytes = 4usize.checked_mul(row_count + 1).ok_or_else(|| {
         fmt!(
             ArrowIngest,
@@ -1804,13 +1857,7 @@ fn write_varlen_large_offsets_no_null(
     })?;
     try_reserve_bytes(out, offsets_bytes + used, "VARCHAR column")?;
     for &off in &arr_offsets[..row_count + 1] {
-        let normalized = u32::try_from(off.wrapping_sub(base)).map_err(|_| {
-            fmt!(
-                ArrowIngest,
-                "VARCHAR column: cumulative offset exceeds u32::MAX at row >={}",
-                row_count
-            )
-        })?;
+        let normalized = validate_large_offset(off, base, row_count)?;
         out.extend_from_slice(&normalized.to_le_bytes());
     }
     out.extend_from_slice(&arr_data[base as usize..base as usize + used]);
@@ -1977,6 +2024,19 @@ fn nanos_per_unit(unit: TimeUnit) -> i64 {
     }
 }
 
+fn scaled_to_nanos(v: i64, factor: i64, unit: TimeUnit, label: &str, row: usize) -> Result<i64> {
+    v.checked_mul(factor).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{} value {} ({:?}) overflows i64 nanoseconds at row {}",
+            label,
+            v,
+            unit,
+            row
+        )
+    })
+}
+
 fn write_scaled_to_nanos(
     out: &mut Vec<u8>,
     arr: &dyn Array,
@@ -1987,16 +2047,7 @@ fn write_scaled_to_nanos(
     let factor = nanos_per_unit(unit);
     try_full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| {
         let v = get(row);
-        v.checked_mul(factor).map(i64::to_le_bytes).ok_or_else(|| {
-            fmt!(
-                ArrowIngest,
-                "{} value {} ({:?}) overflows i64 nanoseconds at row {}",
-                label,
-                v,
-                unit,
-                row
-            )
-        })
+        scaled_to_nanos(v, factor, unit, label, row).map(i64::to_le_bytes)
     })
 }
 
@@ -2129,6 +2180,34 @@ fn write_geohash_payload(out: &mut Vec<u8>, arr: &dyn Array, bits: u8) -> Result
 }
 
 fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -> Result<()> {
+    visit_array_double_rows(arr, ndim, |ndim_u8, shape, leaf_values| {
+        try_reserve_bytes(
+            out,
+            1 + 4 * ndim + 8 * leaf_values.len(),
+            "ARRAY DOUBLE column",
+        )?;
+        out.push(ndim_u8);
+        for &dim in shape.iter() {
+            let dim_u32 = u32::try_from(dim)
+                .map_err(|_| fmt!(ArrowIngest, "ARRAY dimension {} exceeds u32::MAX", dim))?;
+            out.extend_from_slice(&dim_u32.to_le_bytes());
+        }
+        if cfg!(target_endian = "little") {
+            out.extend_from_slice(unsafe { typed_slice_as_le_bytes(leaf_values) });
+        } else {
+            for &v in leaf_values {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Ok(())
+    })
+}
+
+fn visit_array_double_rows(
+    arr: &dyn Array,
+    ndim: usize,
+    mut visit: impl FnMut(u8, &[usize], &[f64]) -> Result<()>,
+) -> Result<()> {
     let row_count = arr.len();
     let ndim_u8 =
         u8::try_from(ndim).map_err(|_| fmt!(ArrowIngest, "ARRAY ndim {} exceeds u8::MAX", ndim))?;
@@ -2238,24 +2317,11 @@ fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -
             }
         }
         let leaf_values = &leaf_values_all[local_start..local_end];
-        try_reserve_bytes(
-            out,
-            1 + 4 * ndim + 8 * leaf_values.len(),
-            "ARRAY DOUBLE column",
-        )?;
-        out.push(ndim_u8);
-        for &dim in shape.iter() {
-            let dim_u32 = u32::try_from(dim)
+        for &dim in &shape {
+            u32::try_from(dim)
                 .map_err(|_| fmt!(ArrowIngest, "ARRAY dimension {} exceeds u32::MAX", dim))?;
-            out.extend_from_slice(&dim_u32.to_le_bytes());
         }
-        if cfg!(target_endian = "little") {
-            out.extend_from_slice(unsafe { typed_slice_as_le_bytes(leaf_values) });
-        } else {
-            for &v in leaf_values {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
+        visit(ndim_u8, &shape, leaf_values)?;
     }
     Ok(())
 }
@@ -2869,6 +2935,47 @@ fn resolve_symbol_strings<S: VarlenSource>(
     Ok(ArrowResolvedSymbolColumn { gids })
 }
 
+fn checked_dictionary_value<'a>(
+    values: &dyn Array,
+    source: &'a dyn VarlenSource,
+    slot: usize,
+    symbol: bool,
+) -> Result<&'a [u8]> {
+    if slot >= values.len() {
+        return Err(if symbol {
+            fmt!(
+                ArrowIngest,
+                "SYMBOL dictionary column: code {} out of range (dict_len={})",
+                slot,
+                values.len()
+            )
+        } else {
+            fmt!(
+                ArrowIngest,
+                "DictToVarchar: index {} out of range (dict_len={})",
+                slot,
+                values.len()
+            )
+        });
+    }
+    if values.is_null(slot) {
+        return Err(if symbol {
+            fmt!(
+                ArrowIngest,
+                "SYMBOL dictionary column: referenced dictionary values slot {} is null",
+                slot
+            )
+        } else {
+            fmt!(
+                ArrowIngest,
+                "DictToVarchar: referenced dict value at slot {} is null",
+                slot
+            )
+        });
+    }
+    source.value_bytes(slot)
+}
+
 fn resolve_symbol_dict(
     arr: &dyn Array,
     key: DictKey,
@@ -2931,15 +3038,12 @@ fn resolve_symbol_dict(
                 }
                 let gid = match slot_to_gid[slot] {
                     u64::MAX => {
-                        if values_arr.is_null(slot) {
-                            return Err(fmt!(
-                                ArrowIngest,
-                                "SYMBOL dictionary column: referenced dictionary values \
-                                 slot {} is null",
-                                slot
-                            ));
-                        }
-                        let bytes = values_typed.value_bytes(slot)?;
+                        let bytes = checked_dictionary_value(
+                            values_arr.as_ref(),
+                            values_typed,
+                            slot,
+                            true,
+                        )?;
                         validate_symbol_utf8(bytes)?;
                         let (gid, is_new) = symbol_dict.intern(bytes)?;
                         if is_new {
@@ -3167,25 +3271,9 @@ fn write_dict_to_varchar_payload(
             .as_any()
             .downcast_ref::<V>()
             .ok_or_else(|| fmt!(ArrowIngest, "DictToVarchar: dict values downcast failed"))?;
-        let dict_len = values_arr.len();
         write_varlen_u32_offsets_with_bitmap(out, dict_arr, "VARCHAR column", None, |out, row| {
             let slot = get_slot(dict_arr, row);
-            if slot >= dict_len {
-                return Err(fmt!(
-                    ArrowIngest,
-                    "DictToVarchar: index {} out of range (dict_len={})",
-                    slot,
-                    dict_len
-                ));
-            }
-            if values_arr.is_null(slot) {
-                return Err(fmt!(
-                    ArrowIngest,
-                    "DictToVarchar: referenced dict value at slot {} is null",
-                    slot
-                ));
-            }
-            let bytes = values_typed.value_bytes(slot)?;
+            let bytes = checked_dictionary_value(values_arr.as_ref(), values_typed, slot, false)?;
             try_reserve_bytes(out, bytes.len(), "VARCHAR column")?;
             out.extend_from_slice(bytes);
             u32::try_from(bytes.len()).map_err(|_| {
@@ -3528,14 +3616,7 @@ pub(crate) fn write_arrow_column_body(
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
             try_non_null_le::<8>(out, arr, |row| {
                 let v = a.value(row);
-                let widened = v.checked_mul(1_000_000).ok_or_else(|| {
-                    fmt!(
-                        ArrowIngest,
-                        "Timestamp s→µs overflow at row {} (value {})",
-                        row,
-                        v
-                    )
-                })?;
+                let widened = validate_timestamp_scale(v, 1_000_000, "Timestamp s→µs", row)?;
                 Ok(widened.to_le_bytes())
             })
         }
@@ -3776,14 +3857,8 @@ pub(crate) fn write_arrow_designated_ts_body(
             ensure_timestamp_values_non_negative(arr, a.values(), label)?;
             try_full_with_sentinel::<8>(out, arr, [0u8; 8], |row| {
                 let v = a.value(row);
-                v.checked_mul(1_000).map(i64::to_le_bytes).ok_or_else(|| {
-                    fmt!(
-                        ArrowIngest,
-                        "designated timestamp ms→µs overflow at row {} (value {})",
-                        row,
-                        v
-                    )
-                })
+                validate_timestamp_scale(v, 1_000, "designated timestamp ms→µs", row)
+                    .map(i64::to_le_bytes)
             })
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
@@ -3791,16 +3866,8 @@ pub(crate) fn write_arrow_designated_ts_body(
             ensure_timestamp_values_non_negative(arr, a.values(), label)?;
             try_full_with_sentinel::<8>(out, arr, [0u8; 8], |row| {
                 let v = a.value(row);
-                v.checked_mul(1_000_000)
+                validate_timestamp_scale(v, 1_000_000, "designated timestamp s→µs", row)
                     .map(i64::to_le_bytes)
-                    .ok_or_else(|| {
-                        fmt!(
-                            ArrowIngest,
-                            "designated timestamp s→µs overflow at row {} (value {})",
-                            row,
-                            v
-                        )
-                    })
             })
         }
         other => Err(fmt!(
@@ -3983,13 +4050,437 @@ pub(crate) fn encode_arrow_batch_replay_into(
     )
 }
 
+fn is_symbol_kind(kind: ColumnKind) -> bool {
+    matches!(
+        kind,
+        ColumnKind::SymbolUtf8
+            | ColumnKind::SymbolLargeUtf8
+            | ColumnKind::SymbolUtf8View
+            | ColumnKind::SymbolDict { .. }
+    )
+}
+
+fn varlen_source(arr: &dyn Array) -> &dyn VarlenSource {
+    match arr.data_type() {
+        DataType::Utf8 => arr.as_any().downcast_ref::<StringArray>().unwrap(),
+        DataType::LargeUtf8 => arr.as_any().downcast_ref::<LargeStringArray>().unwrap(),
+        DataType::Utf8View => arr.as_any().downcast_ref::<StringViewArray>().unwrap(),
+        DataType::Binary => arr.as_any().downcast_ref::<BinaryArray>().unwrap(),
+        DataType::LargeBinary => arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap(),
+        DataType::BinaryView => arr.as_any().downcast_ref::<BinaryViewArray>().unwrap(),
+        _ => unreachable!("classified varlen storage"),
+    }
+}
+
+fn validate_symbol_value(bytes: &[u8]) -> Result<()> {
+    validate_symbol_utf8(bytes)?;
+    let max = crate::ingress::buffer::MAX_PERSISTED_SYMBOL_ENTRY_LEN;
+    if bytes.len() as u64 > max {
+        return Err(fmt!(
+            InvalidApiCall,
+            "QWP/WS symbol value is {} bytes, exceeding the {}-byte per-symbol maximum",
+            bytes.len(),
+            max
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dictionary_values(arr: &dyn Array, key: DictKey, symbol: bool) -> Result<()> {
+    fn run<K: DictKeyTag>(
+        arr: &dyn Array,
+        symbol: bool,
+        get_slot: impl Fn(&DictionaryArray<K::ArrowType>, usize) -> usize,
+    ) -> Result<()> {
+        let dict = arr
+            .as_any()
+            .downcast_ref::<DictionaryArray<K::ArrowType>>()
+            .unwrap();
+        let values = dict.values();
+        let source = varlen_source(values.as_ref());
+        let mut cumulative = 0;
+        let mut visit = |row| {
+            let bytes =
+                checked_dictionary_value(values.as_ref(), source, get_slot(dict, row), symbol)?;
+            if symbol {
+                validate_symbol_value(bytes)?;
+            } else {
+                cumulative = validate_varlen_length(
+                    cumulative,
+                    bytes.len(),
+                    row,
+                    "VARCHAR column",
+                    "VARCHAR column",
+                )?;
+            }
+            Ok(())
+        };
+        if symbol {
+            for row in 0..arr.len() {
+                if !arr.is_null(row) {
+                    visit(row)?;
+                }
+            }
+        } else {
+            visit_varlen_rows(arr, "VARCHAR column", visit)?;
+        }
+        Ok(())
+    }
+    match key {
+        DictKey::I8 => run::<I8KeyTag>(arr, symbol, |d, r| d.keys().value(r) as usize),
+        DictKey::I16 => run::<I16KeyTag>(arr, symbol, |d, r| d.keys().value(r) as usize),
+        DictKey::I32 => run::<I32KeyTag>(arr, symbol, |d, r| d.keys().value(r) as usize),
+        DictKey::U8 => run::<U8KeyTag>(arr, symbol, |d, r| d.keys().value(r) as usize),
+        DictKey::U16 => run::<U16KeyTag>(arr, symbol, |d, r| d.keys().value(r) as usize),
+        DictKey::U32 => run::<U32KeyTag>(arr, symbol, |d, r| d.keys().value(r) as usize),
+    }
+}
+
+fn validate_varlen_length(
+    cumulative: u32,
+    len: usize,
+    row: usize,
+    row_label: &str,
+    offset_label: &str,
+) -> Result<u32> {
+    let len = u32::try_from(len).map_err(|_| {
+        fmt!(
+            ArrowIngest,
+            "{}: row {} exceeds u32::MAX bytes",
+            row_label,
+            row
+        )
+    })?;
+    cumulative.checked_add(len).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{}: cumulative offset overflow at row {}",
+            offset_label,
+            row
+        )
+    })
+}
+
+fn validate_timestamp_scale(v: i64, factor: i64, label: &str, row: usize) -> Result<i64> {
+    v.checked_mul(factor).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{} overflow at row {} (value {})",
+            label,
+            row,
+            v
+        )
+    })
+}
+
+fn validate_designated_timestamp(arr: &dyn Array) -> Result<()> {
+    let label = "designated timestamp column";
+    ensure_timestamp_no_nulls(arr, label)?;
+    let (values, factor, scale_label): (&[i64], i64, &str) = match arr.data_type() {
+        DataType::Timestamp(TimeUnit::Microsecond, _) => (
+            arr.as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .values(),
+            1,
+            "",
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => (
+            arr.as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .values(),
+            1,
+            "",
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => (
+            arr.as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .values(),
+            1_000,
+            "designated timestamp ms→µs",
+        ),
+        DataType::Timestamp(TimeUnit::Second, _) => (
+            arr.as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .values(),
+            1_000_000,
+            "designated timestamp s→µs",
+        ),
+        other => {
+            return Err(fmt!(
+                ArrowIngest,
+                "designated timestamp column has unsupported Arrow type {:?}",
+                other
+            ));
+        }
+    };
+    ensure_timestamp_values_non_negative(arr, values, label)?;
+    if factor != 1 {
+        for (row, &v) in values.iter().enumerate() {
+            validate_timestamp_scale(v, factor, scale_label, row)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate value-dependent rejection paths before accepting a maintenance boundary.
+/// This walks only fallible input conversions; it neither encodes nor interns.
+fn validate_arrow_column_values(kind: ColumnKind, arr: &dyn Array) -> Result<()> {
+    macro_rules! values {
+        ($ty:ty, $check:expr) => {{
+            let a = arr.as_any().downcast_ref::<$ty>().unwrap();
+            for row in 0..a.len() {
+                if !a.is_null(row) {
+                    $check(a.value(row), row)?;
+                }
+            }
+        }};
+    }
+    macro_rules! scaled {
+        ($ty:ty, $unit:expr, $label:expr) => {
+            values!($ty, |v, row| scaled_to_nanos(
+                v as i64,
+                nanos_per_unit($unit),
+                $unit,
+                $label,
+                row
+            ))
+        };
+    }
+    match kind {
+        ColumnKind::U64WidenToI64Checked => values!(UInt64Array, u64_to_i64_checked),
+        ColumnKind::TimestampSecondToMicros => {
+            values!(TimestampSecondArray, |v, row| validate_timestamp_scale(
+                v,
+                1_000_000,
+                "Timestamp s→µs",
+                row
+            ))
+        }
+        ColumnKind::TimeAsLong(unit) => match unit {
+            TimeUnit::Second => scaled!(Time32SecondArray, unit, "Time"),
+            TimeUnit::Millisecond => scaled!(Time32MillisecondArray, unit, "Time"),
+            TimeUnit::Microsecond => scaled!(Time64MicrosecondArray, unit, "Time"),
+            TimeUnit::Nanosecond => {}
+        },
+        ColumnKind::DurationAsLong(unit) => match unit {
+            TimeUnit::Second => scaled!(DurationSecondArray, unit, "Duration"),
+            TimeUnit::Millisecond => scaled!(DurationMillisecondArray, unit, "Duration"),
+            TimeUnit::Microsecond => scaled!(DurationMicrosecondArray, unit, "Duration"),
+            TimeUnit::Nanosecond => {}
+        },
+        ColumnKind::Decimal32WidenToDecimal64 => {
+            decimal_scale_u8(
+                arr.as_any()
+                    .downcast_ref::<Decimal32Array>()
+                    .unwrap()
+                    .scale(),
+                "Decimal32",
+                9,
+            )?;
+        }
+        ColumnKind::Decimal64 => {
+            decimal_scale_u8(
+                arr.as_any()
+                    .downcast_ref::<Decimal64Array>()
+                    .unwrap()
+                    .scale(),
+                "Decimal64",
+                18,
+            )?;
+        }
+        ColumnKind::Decimal128 => {
+            decimal_scale_u8(
+                arr.as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .unwrap()
+                    .scale(),
+                "Decimal128",
+                38,
+            )?;
+        }
+        ColumnKind::Decimal256 => {
+            decimal_scale_u8(
+                arr.as_any()
+                    .downcast_ref::<Decimal256Array>()
+                    .unwrap()
+                    .scale(),
+                "Decimal256",
+                QWP_DECIMAL_MAX_SCALE,
+            )?;
+        }
+        ColumnKind::ArrayDouble(ndim) => visit_array_double_rows(arr, ndim, |_, _, _| Ok(()))?,
+        ColumnKind::SymbolDict { key, .. } => validate_dictionary_values(arr, key, true)?,
+        ColumnKind::DictToVarchar { key, .. } => validate_dictionary_values(arr, key, false)?,
+        ColumnKind::SymbolUtf8 | ColumnKind::SymbolLargeUtf8 | ColumnKind::SymbolUtf8View => {
+            let source = varlen_source(arr);
+            for row in 0..arr.len() {
+                if !arr.is_null(row) {
+                    validate_symbol_value(source.value_bytes(row)?)?;
+                }
+            }
+        }
+        ColumnKind::UuidFromVarBinary | ColumnKind::Long256FromVarBinary => {
+            let (elem, label) = if matches!(kind, ColumnKind::UuidFromVarBinary) {
+                (16, "UUID column")
+            } else {
+                (32, "LONG256 column")
+            };
+            let source = varlen_source(arr);
+            for row in 0..arr.len() {
+                if !arr.is_null(row) {
+                    validate_fixed_value(source.value_bytes(row)?, elem, label, row)?;
+                }
+            }
+        }
+        ColumnKind::Utf8
+        | ColumnKind::LargeUtf8
+        | ColumnKind::Utf8View
+        | ColumnKind::Binary
+        | ColumnKind::LargeBinary
+        | ColumnKind::BinaryView => validate_varlen_values(arr)?,
+        ColumnKind::FsbToBinary => {
+            let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            let mut cumulative = 0;
+            visit_varlen_rows(arr, "BINARY column", |row| {
+                cumulative = validate_varlen_length(
+                    cumulative,
+                    a.value_length() as usize,
+                    row,
+                    "BINARY column",
+                    "BINARY column",
+                )?;
+                Ok(())
+            })?;
+        }
+        // These kinds only copy/widen values; prepare_arrow_batch checked their
+        // schema and structural metadata. Date32 -> i64 milliseconds cannot overflow.
+        ColumnKind::Bool
+        | ColumnKind::I8
+        | ColumnKind::I16
+        | ColumnKind::I32
+        | ColumnKind::I64
+        | ColumnKind::F16ToF32
+        | ColumnKind::F32
+        | ColumnKind::F64
+        | ColumnKind::Char
+        | ColumnKind::Ipv4
+        | ColumnKind::I8WidenToI32
+        | ColumnKind::I16WidenToI32
+        | ColumnKind::I32WidenToI64
+        | ColumnKind::U8WidenToI32
+        | ColumnKind::U16WidenToI32
+        | ColumnKind::U32WidenToI64
+        | ColumnKind::TimestampMicros
+        | ColumnKind::TimestampNanos
+        | ColumnKind::Date
+        | ColumnKind::Date32Days
+        | ColumnKind::Date64Ms
+        | ColumnKind::Uuid
+        | ColumnKind::Long256
+        | ColumnKind::Geohash(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_varlen_values(arr: &dyn Array) -> Result<()> {
+    let binary = matches!(
+        arr.data_type(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    );
+    let label = if binary {
+        "BINARY column"
+    } else {
+        "VARCHAR column"
+    };
+    if arr.null_count() == 0 {
+        match arr.data_type() {
+            DataType::Utf8 => {
+                let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
+                validate_varlen_u32_span(a.value_offsets(), a.value_data(), a.len(), label)?;
+                return Ok(());
+            }
+            DataType::Binary => {
+                let a = arr.as_any().downcast_ref::<BinaryArray>().unwrap();
+                validate_varlen_u32_span(a.value_offsets(), a.value_data(), a.len(), label)?;
+                return Ok(());
+            }
+            DataType::LargeUtf8 | DataType::LargeBinary => {
+                let (offsets, data) = if binary {
+                    let a = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                    (a.value_offsets(), a.value_data())
+                } else {
+                    let a = arr.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                    (a.value_offsets(), a.value_data())
+                };
+                validate_varlen_large_span(offsets, data, arr.len())?;
+                for &off in offsets {
+                    validate_large_offset(off, offsets[0], arr.len())?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    let source = varlen_source(arr);
+    let offset_label = if arr.null_count() == 0 {
+        "VARCHAR column"
+    } else {
+        label
+    };
+    let mut cumulative = 0;
+    let mut visit = |row| {
+        cumulative = validate_varlen_length(
+            cumulative,
+            source.value_bytes(row)?.len(),
+            row,
+            label,
+            offset_label,
+        )?;
+        Ok(())
+    };
+    if arr.null_count() > 0 {
+        visit_varlen_rows(arr, label, visit)?;
+    } else {
+        for row in 0..arr.len() {
+            visit(row)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_arrow_batch(
     table: TableName<'_>,
     batch: &RecordBatch,
     ts: ArrowTsSource,
     overrides: &[ArrowColumnOverride<'_>],
 ) -> Result<()> {
-    prepare_arrow_batch(&batch.schema(), table, batch, ts, overrides).map(|_| ())
+    let schema = batch.schema();
+    let (classified, _) = prepare_arrow_batch(&schema, table, batch, ts, overrides)?;
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+    // Match encoding order without interning symbols or allocating a wire payload.
+    for col in &classified {
+        if is_symbol_kind(col.kind) {
+            validate_arrow_column_values(col.kind, col.arr)?;
+        }
+    }
+    for col in &classified {
+        if !is_symbol_kind(col.kind) {
+            validate_arrow_column_values(col.kind, col.arr)
+                .map_err(|e| decorate_column(e, col.name.as_ref()))?;
+        }
+    }
+    match ts {
+        ArrowTsSource::Column(idx) => validate_designated_timestamp(batch.column(idx).as_ref())
+            .map_err(|e| decorate_column(e, schema.field(idx).name())),
+        ArrowTsSource::ScalarNanos(nanos) => validate_scalar_designated_timestamp(nanos),
+        ArrowTsSource::ServerNow => Ok(()),
+    }
 }
 
 fn prepare_arrow_batch<'a>(
@@ -4299,7 +4790,7 @@ fn estimate_frame_size(
     total
 }
 
-fn write_scalar_designated_ts_body(out: &mut Vec<u8>, nanos: i64, row_count: usize) -> Result<()> {
+fn validate_scalar_designated_timestamp(nanos: i64) -> Result<()> {
     if nanos < 0 {
         return Err(fmt!(
             ArrowIngest,
@@ -4307,6 +4798,11 @@ fn write_scalar_designated_ts_body(out: &mut Vec<u8>, nanos: i64, row_count: usi
             nanos
         ));
     }
+    Ok(())
+}
+
+fn write_scalar_designated_ts_body(out: &mut Vec<u8>, nanos: i64, row_count: usize) -> Result<()> {
+    validate_scalar_designated_timestamp(nanos)?;
     out.push(0);
     out.reserve(8 * row_count);
     let bytes = nanos.to_le_bytes();
@@ -4397,6 +4893,8 @@ mod tests {
         let err = write_string_payload(&mut Vec::new(), &arr, true).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
         assert!(err.msg().contains("more non-null rows"), "{}", err.msg());
+        let batch = single_col_batch(Field::new("value", DataType::Utf8, true), arr);
+        encode_err(&batch);
     }
 
     #[test]
@@ -4409,6 +4907,8 @@ mod tests {
         let err = write_string_payload(&mut Vec::new(), &arr, true).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
         assert!(err.msg().contains("non-null rows"), "{}", err.msg());
+        let batch = single_col_batch(Field::new("value", DataType::Utf8, true), arr);
+        encode_err(&batch);
     }
 
     fn arrow_schema_with(field: Field) -> Arc<ArrowSchema> {
@@ -4440,6 +4940,7 @@ mod tests {
             false,
         )
         .unwrap();
+        validate_arrow_batch(tbl(table_name), batch, ArrowTsSource::ServerNow, &[]).unwrap();
         out
     }
 
@@ -4458,37 +4959,153 @@ mod tests {
             false,
         )
         .unwrap();
+        validate_arrow_batch(tbl("t"), batch, ArrowTsSource::Column(ts_idx), &[]).unwrap();
         out
     }
 
     fn encode_err(batch: &RecordBatch) -> Error {
-        let mut out = Vec::new();
-        let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(
-            &mut out,
-            tbl("t"),
-            batch,
-            ArrowTsSource::ServerNow,
-            &[],
-            &mut dict,
-            false,
-        )
-        .unwrap_err()
+        preflight_error_matches_encoding(batch, ArrowTsSource::ServerNow, &[])
     }
 
     fn encode_err_at_ts(batch: &RecordBatch, ts_idx: usize) -> Error {
-        let mut out = Vec::new();
+        preflight_error_matches_encoding(batch, ArrowTsSource::Column(ts_idx), &[])
+    }
+
+    fn preflight_error_matches_encoding(
+        batch: &RecordBatch,
+        ts: ArrowTsSource,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Error {
+        let mut out = vec![0xAB];
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(
-            &mut out,
-            tbl("t"),
-            batch,
-            ArrowTsSource::Column(ts_idx),
-            &[],
-            &mut dict,
-            false,
+        dict.intern(b"retained").unwrap();
+        let error =
+            encode_arrow_batch_into(&mut out, tbl("t"), batch, ts, overrides, &mut dict, false)
+                .unwrap_err();
+        assert_eq!(out, [0xAB], "encoding error must roll back the payload");
+        assert_eq!(
+            dict.next_id(),
+            1,
+            "encoding error must roll back symbol interning"
+        );
+        let validation = validate_arrow_batch(tbl("t"), batch, ts, overrides)
+            .expect_err("preflight must reject the same invalid input before recycling");
+        assert_eq!(validation.code(), error.code());
+        assert_eq!(validation.msg(), error.msg());
+        error
+    }
+
+    #[test]
+    fn value_preflight_covers_scaling_claims_and_dictionary_references() {
+        let time = single_col_batch(
+            Field::new("value", DataType::Time64(TimeUnit::Microsecond), true),
+            Time64MicrosecondArray::from(vec![None, Some(i64::MAX)]),
+        );
+        encode_err(&time);
+        let duration = single_col_batch(
+            Field::new("value", DataType::Duration(TimeUnit::Millisecond), true),
+            DurationMillisecondArray::from(vec![None, Some(i64::MAX)]),
+        );
+        encode_err(&duration);
+        let bytes = single_col_batch(
+            Field::new("value", DataType::LargeBinary, true),
+            LargeBinaryArray::from(vec![Some(&[0u8; 31][..]), None]),
+        );
+        preflight_error_matches_encoding(
+            &bytes,
+            ArrowTsSource::ServerNow,
+            &[ArrowColumnOverride::Long256 { column: "value" }],
+        );
+        let dict = DictionaryArray::<arrow::array::types::Int32Type>::try_new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec![Some("ok"), None])),
         )
-        .unwrap_err()
+        .unwrap();
+        let batch = single_col_batch(Field::new("value", dict.data_type().clone(), true), dict);
+        preflight_error_matches_encoding(
+            &batch,
+            ArrowTsSource::ServerNow,
+            &[ArrowColumnOverride::NotSymbol { column: "value" }],
+        );
+        let oversized =
+            "x".repeat(crate::ingress::buffer::MAX_PERSISTED_SYMBOL_ENTRY_LEN as usize + 1);
+        let batch = single_col_batch(
+            Field::new("value", DataType::Utf8, false),
+            StringArray::from(vec![oversized]),
+        );
+        preflight_error_matches_encoding(
+            &batch,
+            ArrowTsSource::ServerNow,
+            &[ArrowColumnOverride::Symbol { column: "value" }],
+        );
+    }
+
+    #[test]
+    fn value_preflight_rejects_invalid_symbol_utf8_and_dictionary_keys() {
+        use arrow::array::ArrayDataBuilder;
+        use arrow::buffer::Buffer;
+        let data = unsafe {
+            ArrayDataBuilder::new(DataType::Utf8)
+                .len(1)
+                .add_buffer(Buffer::from_vec(vec![0i32, 1]))
+                .add_buffer(Buffer::from_vec(vec![0xffu8]))
+                .build_unchecked()
+        };
+        let batch = single_col_batch(
+            Field::new("value", DataType::Utf8, false),
+            StringArray::from(data),
+        );
+        preflight_error_matches_encoding(
+            &batch,
+            ArrowTsSource::ServerNow,
+            &[ArrowColumnOverride::Symbol { column: "value" }],
+        );
+        let dict = unsafe {
+            DictionaryArray::<arrow::array::types::Int32Type>::new_unchecked(
+                Int32Array::from(vec![1]),
+                Arc::new(StringArray::from(vec!["only"])),
+            )
+        };
+        let batch = single_col_batch(Field::new("value", dict.data_type().clone(), false), dict);
+        encode_err(&batch);
+        preflight_error_matches_encoding(
+            &batch,
+            ArrowTsSource::ServerNow,
+            &[ArrowColumnOverride::NotSymbol { column: "value" }],
+        );
+    }
+
+    #[test]
+    fn value_preflight_preserves_timestamp_and_symbol_error_order() {
+        for (batch, designated) in crate::tests::qwp_ws_recycle::invalid_arrow_values() {
+            let ts = if designated {
+                ArrowTsSource::Column(0)
+            } else {
+                ArrowTsSource::ServerNow
+            };
+            preflight_error_matches_encoding(&batch, ts, &[]);
+        }
+        let batch = single_col_batch(
+            Field::new("value", DataType::Int64, false),
+            Int64Array::from(vec![1]),
+        );
+        preflight_error_matches_encoding(&batch, ArrowTsSource::ScalarNanos(-1), &[]);
+        // SYMBOL resolution precedes ordinary column/timestamp emission errors.
+        let invalid_dict = DictionaryArray::<arrow::array::types::Int32Type>::try_new(
+            Int32Array::from(vec![0]),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "value",
+                Arc::new(DurationSecondArray::from(vec![i64::MAX])) as ArrayRef,
+            ),
+            ("symbol", Arc::new(invalid_dict) as ArrayRef),
+        ])
+        .unwrap();
+        let error = encode_err(&batch);
+        assert!(error.msg().contains("referenced dictionary values"));
     }
 
     fn assert_qwp_header(out: &[u8], table_count: u16) {
@@ -7496,7 +8113,7 @@ mod tests {
         batch: &RecordBatch,
         overrides: &[ArrowColumnOverride<'_>],
     ) -> Error {
-        encode_with_overrides(batch, overrides).unwrap_err()
+        preflight_error_matches_encoding(batch, ArrowTsSource::ServerNow, overrides)
     }
 
     #[test]
