@@ -27,6 +27,87 @@
 use crate::error::{self, Result};
 use std::time::{Duration, Instant};
 
+/// Shared with the wire worker. Claiming maintenance and entering reconnect use
+/// the same compare/exchange, so a rejected claim cannot become a latent park.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[derive(Debug)]
+pub(super) struct RecycleLink(std::sync::atomic::AtomicU8);
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+const LINK_LIVE: u8 = 0;
+#[cfg(feature = "sync-sender-qwp-ws")]
+const LINK_RECONNECTING: u8 = 1;
+#[cfg(feature = "sync-sender-qwp-ws")]
+const LINK_PARKING: u8 = 2;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+impl RecycleLink {
+    pub(super) fn new(live: bool) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(if live {
+            LINK_LIVE
+        } else {
+            LINK_RECONNECTING
+        }))
+    }
+
+    pub(super) fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                LINK_LIVE,
+                LINK_PARKING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(super) fn enter_reconnect(&self) -> bool {
+        self.0
+            .compare_exchange(
+                LINK_LIVE,
+                LINK_RECONNECTING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_or_else(|state| state == LINK_RECONNECTING, |_| true)
+    }
+
+    pub(super) fn connected(&self) {
+        let _ = self.0.compare_exchange(
+            LINK_RECONNECTING,
+            LINK_LIVE,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    pub(super) fn restart(&self) {
+        self.0
+            .store(LINK_RECONNECTING, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Non-cloneable proof that the old wire worker and its storage work have exited.
+/// Dropping a permit does not cancel maintenance or reopen publication. The
+/// retained coordinator can issue a replacement; that invalidates earlier proofs.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[derive(Debug)]
+pub(crate) struct RecyclePermit {
+    pub(super) owner: std::sync::Arc<RecycleLink>,
+    pub(super) generation: u64,
+    pub(super) boundary: Option<u64>,
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[derive(Debug)]
+pub(super) struct PendingRecycle {
+    pub(super) boundary: Option<u64>,
+    pub(super) wait_spent: bool,
+    pub(super) quiesced: bool,
+    pub(super) installed: bool,
+    pub(super) generation: u64,
+}
+
 const MAX_THRESHOLD: usize = 1_000_000;
 const MAX_WAIT_MILLIS: u64 = 9_223_372_036_854;
 

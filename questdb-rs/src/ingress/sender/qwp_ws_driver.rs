@@ -520,6 +520,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         Ok(receipt)
     }
 
+    pub(super) fn recycle_queue_mut(&mut self) -> &mut Q {
+        &mut self.queue
+    }
+
     pub(crate) fn take_producer(&mut self) -> Option<SfaProducer> {
         self.queue.take_producer()
     }
@@ -868,6 +872,33 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             completed_at_last_role_recycle: None,
             sends_on_connection: 0,
         }
+    }
+
+    /// Called only after confirmed worker quiescence; release replay mappings
+    /// before storage removes their files. Keep the old dictionary until install.
+    pub(crate) fn release_recycle_views(&mut self) {
+        self.send_cursor = SendCursor::new();
+    }
+
+    /// Install a fresh wire namespace without dialing. The ordinary steady-state
+    /// reconnect machinery establishes its connection on the next drive step.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn install_recycled_session(&mut self, delta_enabled: bool, gate: Arc<TrafficGate>) {
+        self.transport.prepare_recycled_session(gate);
+        self.send_cursor = SendCursor::new();
+        self.dict_mirror = SentDictMirror::new(delta_enabled);
+        self.catch_up_pending = false;
+        self.catch_up_retry_strikes = 0;
+        self.durable_ack = self.durable_ack.as_ref().map(|_| DurableAckTracker::new());
+        self.poison_tracker = PoisonFrameTracker::default();
+        self.zero_progress_role_recycles = 0;
+        self.completed_at_last_role_recycle = None;
+        self.sends_on_connection = 0;
+        self.pending_reconnect = Some(self.begin_reconnect(
+            "QWP/WebSocket recycled session",
+            ReconnectReason::RetryableFailure,
+            error::fmt!(SocketError, "QWP/WebSocket dictionary session retired"),
+        ));
     }
 
     fn apply_response<Q: PublicationLog>(
@@ -3025,6 +3056,11 @@ impl SendCursor {
 }
 
 pub(crate) trait QwpWsCoreTransport {
+    /// Reset transport-local bookkeeping after the old worker has quiesced.
+    /// Test transports have no socket; real transports replace the sticky gate.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn prepare_recycled_session(&mut self, _gate: Arc<TrafficGate>) {}
+
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure>;
 
     fn send_durable_ack_keepalive_if_due(
@@ -3330,6 +3366,14 @@ fn decode_durable_transport_response(
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl QwpWsCoreTransport for BlockingQwpWsTransport {
+    fn prepare_recycled_session(&mut self, gate: Arc<TrafficGate>) {
+        self.traffic_gate = Some(gate);
+        self.reader = WsFrameReader::with_initial_input(Vec::new());
+        self.send_buf.clear();
+        self.pending_wire_sequences.clear();
+        self.last_durable_keepalive_ping = None;
+    }
+
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
         if self.pending_wire_sequences.is_empty() && !*self.qwp_ws.request_durable_ack {
             return Ok(TransportPoll::Idle);
@@ -4346,6 +4390,44 @@ mod tests {
             p = end;
         }
         assert_eq!(p, frame.len(), "no trailing bytes after the dictionary");
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn recycle_session_resets_all_core_state_but_preserves_policy() {
+        let mut driver = driver(FakeOrderedServer::ack_each_send());
+        driver.send_core.enable_delta_dict(&[], 0);
+        driver.try_submit(&make_delta_frame(0, &[b"OLD"])).unwrap();
+        driver.drive_send_once().unwrap();
+        let core = &mut driver.send_core;
+        assert_eq!(core.dict_mirror.count(), 1);
+        core.catch_up_pending = true;
+        core.catch_up_retry_strikes = 7;
+        core.zero_progress_role_recycles = 5;
+        core.completed_at_last_role_recycle = Some(0);
+        core.poison_tracker.rejection_count = 8;
+        let max_rejections = core.max_frame_rejections;
+        let backoff = core.reconnect_policy.initial_backoff();
+        core.release_recycle_views();
+        assert_eq!(
+            core.dict_mirror.count(),
+            1,
+            "parking preserves the old dictionary until installation"
+        );
+        core.install_recycled_session(true, Arc::new(TrafficGate::default()));
+        assert!(core.dict_mirror.is_empty());
+        assert!(core.dict_mirror.is_enabled());
+        assert!(!core.catch_up_pending);
+        assert_eq!(core.catch_up_retry_strikes, 0);
+        assert_eq!(core.zero_progress_role_recycles, 0);
+        assert_eq!(core.completed_at_last_role_recycle, None);
+        assert_eq!(core.poison_tracker.rejection_count, 0);
+        assert_eq!(core.sends_on_connection, 0);
+        assert_eq!(core.send_cursor.next_wire_seq, 0);
+        assert!(core.has_pending_reconnect());
+        assert_eq!(core.max_frame_rejections, max_rejections);
+        assert_eq!(core.reconnect_policy.initial_backoff(), backoff);
+        assert_eq!(driver.store.counters().total_frames_sent, 1);
     }
 
     #[test]
