@@ -128,6 +128,19 @@ impl SfaSlotQueue {
         })
     }
 
+    /// Reset storage while retaining this slot's original lock. The caller keeps
+    /// exclusive maintenance ownership through the subsequent dictionary reset.
+    pub(crate) fn reset_drained(
+        &mut self,
+        producer: &mut SfaProducer,
+    ) -> Result<(), SfaQueueError> {
+        self.queue.reset_drained(producer)
+    }
+
+    pub(crate) fn restore_producer(&mut self, producer: SfaProducer) {
+        self.queue.restore_producer(producer);
+    }
+
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
         let result = self.queue.close();
         if result.is_ok() {
@@ -447,6 +460,50 @@ mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn recycle_reset_keeps_fsn_and_slot_lock() {
+        use super::super::qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER;
+        for cut in 0..24 {
+            let temp = TempDir::new().unwrap();
+            let mut slot = SfaSlotQueue::open(options(temp.path(), "reset")).unwrap();
+            drop(slot.take_persisted_symbol_dict());
+            let mut producer = slot.take_producer().unwrap();
+            for _ in 0..3 {
+                producer.try_submit(b"old").unwrap();
+            }
+            slot.queue.complete_through_fsn(2).unwrap();
+            let probe = || {
+                let result = slot_lock_helper_command(temp.path(), "reset")
+                    .env("QDB_SFA_SLOT_CHILD_MODE", "probe-locked")
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stdout)
+                );
+            };
+            probe();
+            RECYCLE_FAIL_AFTER.with(|count| count.set(Some(cut)));
+            let result = slot.reset_drained(&mut producer);
+            RECYCLE_FAIL_AFTER.with(|count| count.set(None));
+            probe();
+            slot.reset_drained(&mut producer).unwrap();
+            probe();
+            assert_eq!(slot.queue.completed_fsn(), Some(2));
+            assert_eq!(
+                slot.queue.receipt_status(QwpReceipt { fsn: 0 }),
+                QwpReceiptStatus::Completed { fsn: 0 }
+            );
+            slot.restore_producer(producer);
+            assert_eq!(slot.queue.try_submit(b"new").unwrap().fsn, 3);
+            if result.is_ok() {
+                break;
+            }
+        }
+    }
+
     #[test]
     fn sender_id_validation_matches_java_slot_name_rules() {
         for valid in ["default", "primary", "A_z-09"] {
@@ -668,9 +725,16 @@ mod tests {
         let Ok(mode) = std::env::var("QDB_SFA_SLOT_CHILD_MODE") else {
             return;
         };
-        assert_eq!(mode, "hold");
         let sf_dir = PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_SF_DIR").unwrap());
         let sender_id = std::env::var("QDB_SFA_SLOT_CHILD_SENDER_ID").unwrap();
+        if mode == "probe-locked" {
+            assert!(matches!(
+                SlotLock::acquire(sf_dir.join(sender_id), false),
+                Err(SfaQueueError::SlotInUse { .. })
+            ));
+            return;
+        }
+        assert_eq!(mode, "hold");
         ensure_dir(&sf_dir).unwrap();
         let _lock = SlotLock::acquire(sf_dir.join(sender_id), false).unwrap();
 
