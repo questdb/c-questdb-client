@@ -98,6 +98,11 @@ pub(crate) fn fail_next_recycle_storage_for_test() {
     qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER.with(|fail| fail.set(Some(0)));
 }
 
+#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+pub(crate) fn terminal_after_recycle_park_for_test() {
+    qwp_ws::TERMINAL_AFTER_RECYCLE_PARK.with(|fault| fault.set(true));
+}
+
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_slot;
 
@@ -309,6 +314,14 @@ impl Sender {
             self.init_buf_size,
             self.max_name_len,
         )
+    }
+
+    #[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => state.recycle_allocation_probe(),
+            _ => panic!("background sender expected"),
+        }
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]

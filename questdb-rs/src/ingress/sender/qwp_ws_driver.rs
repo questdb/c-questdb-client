@@ -2948,6 +2948,13 @@ impl InFlightRun {
     }
 }
 
+#[cfg(test)]
+impl Default for SendCursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SendCursor {
     fn new() -> Self {
         Self {
@@ -8869,6 +8876,57 @@ mod tests {
             driver.receipt_status(receipt),
             QwpReceiptStatus::Published { fsn: 0 }
         );
+    }
+
+    #[test]
+    fn recycle_outage_terminal_classification_retains_current_data() {
+        for code in [
+            ErrorCode::AuthError,
+            ErrorCode::ConfigError,
+            ErrorCode::ProtocolVersionError,
+        ] {
+            let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+                TransportResponse::Ack { wire_seq: 0 },
+            ))])
+            .with_restart_results([Err(DriverError::Transport(Error::new(
+                code,
+                "injected fresh-session failure",
+            )))]);
+            let mut driver =
+                QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024)), transport);
+            driver.send_core.enable_delta_dict(&[], 0);
+            driver.try_submit(&make_delta_frame(0, &[b"old"])).unwrap();
+            driver.drive_once().unwrap();
+            assert_eq!(driver.store.completed_fsn(), Some(0));
+            driver.send_core.release_recycle_views();
+            let mut producer = driver.store.queue.take_producer().unwrap();
+            driver.store.queue.reset_drained(&mut producer).unwrap();
+            driver.store.queue.restore_producer(producer);
+            driver
+                .send_core
+                .install_recycled_session(true, Arc::new(TrafficGate::default()));
+            let current = make_delta_frame(0, &[b"current"]);
+            assert_eq!(driver.try_submit(&current).unwrap().fsn, 1);
+            assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+            assert_eq!(driver.terminal_error().unwrap().code(), code);
+            assert_eq!(driver.store.completed_fsn(), Some(0));
+            assert_eq!(driver.store.published_fsn(), Some(1));
+            let frame = driver
+                .store
+                .queue
+                .progress_view()
+                .next_outbound_frame(&mut SendCursor::new())
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.fsn, 1);
+            frame
+                .payload
+                .with_bytes(|bytes| assert_eq!(bytes, current.as_slice()));
+            for _ in 0..3 {
+                assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+            }
+            assert_eq!(driver.send_core.transport.restart_attempts, 1);
+        }
     }
 
     #[test]

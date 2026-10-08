@@ -1864,6 +1864,11 @@ impl<'a> BorrowedSender<'a> {
     }
 
     #[cfg(test)]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        self.0.inner_ref().recycle_allocation_probe()
+    }
+
+    #[cfg(test)]
     pub(crate) fn must_close_for_test(&self) -> bool {
         self.0.inner_ref().must_close()
     }

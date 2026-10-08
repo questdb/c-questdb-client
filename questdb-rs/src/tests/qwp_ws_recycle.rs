@@ -43,6 +43,7 @@ pub(crate) struct Server {
     stop: Arc<AtomicBool>,
     acks_released: Arc<AtomicBool>,
     connections: Arc<AtomicUsize>,
+    upgrade_fault: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Server {
@@ -63,6 +64,8 @@ impl Server {
         let (tx, frames) = mpsc::channel();
         let connections = Arc::new(AtomicUsize::new(0));
         let accepted = Arc::clone(&connections);
+        let upgrade_fault = Arc::new(AtomicUsize::new(0));
+        let faults = Arc::clone(&upgrade_fault);
         let worker = thread::spawn(move || {
             let mut connection = 0;
             let mut workers = Vec::new();
@@ -70,6 +73,8 @@ impl Server {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let tx = tx.clone();
+                        let fault = faults.load(Ordering::Acquire);
+                        let wire_fault = Arc::clone(&faults);
                         let release_acks = Arc::clone(&release_acks);
                         let stop = Arc::clone(&stopped);
                         let id = connection;
@@ -77,6 +82,19 @@ impl Server {
                         accepted.fetch_add(1, Ordering::Release);
                         workers.push(thread::spawn(move || {
                             stream.set_nonblocking(false).unwrap();
+                            if fault == 1 { return; }
+                            if fault == 2 {
+                                use std::io::{Read, Write};
+                                let mut request = Vec::new();
+                                while !request.ends_with(b"\r\n\r\n") {
+                                    let mut byte = [0];
+                                    if stream.read_exact(&mut byte).is_err() { return; }
+                                    request.push(byte[0]);
+                                }
+                                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+                                return;
+                            }
+
                             if perform_server_upgrade(&mut stream).is_err() {
                                 return;
                             }
@@ -88,6 +106,9 @@ impl Server {
                                 let frame_deferred = frame[5] & 1 != 0;
                                 if tx.send((id, frame)).is_err() {
                                     break;
+                                }
+                                if wire_fault.compare_exchange(3, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                                    return; // Received, deliberately unacknowledged, then disconnected.
                                 }
                                 if frame_deferred {
                                     seq += 1;
@@ -133,6 +154,7 @@ impl Server {
             stop,
             acks_released,
             connections,
+            upgrade_fault,
             worker: Some(worker),
         }
     }
@@ -1055,5 +1077,315 @@ fn recycle_api_disabled_terminal_still_errors() {
         assert_eq!(error.code(), crate::ErrorCode::ServerRejection);
         let rejection = error.qwp_ws_rejection().unwrap();
         assert_eq!((rejection.from_fsn, rejection.to_fsn), (0, 0));
+    }
+}
+
+fn terminal_during_park_sender(
+    server: &Server,
+) -> (
+    crate::ingress::Sender,
+    mpsc::Receiver<crate::ingress::QwpWsSenderError>,
+) {
+    let (tx, rx) = mpsc::channel();
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;",
+        server.port
+    ))
+    .unwrap()
+    .qwp_ws_error_handler(move |error| {
+        tx.send(error.clone()).unwrap();
+    })
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    symbol_buffer(&mut buffer, "old");
+    sender.flush(&mut buffer).unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    server.frame();
+    crate::ingress::sender::terminal_after_recycle_park_for_test();
+    symbol_buffer(&mut buffer, "forbidden");
+    let error = sender.flush(&mut buffer).unwrap_err();
+    assert_eq!(error.code(), crate::ErrorCode::ServerRejection);
+    assert!(!buffer.is_empty());
+    (sender, rx)
+}
+
+fn assert_park_terminal(error: &crate::ingress::QwpWsSenderError) {
+    assert_eq!(
+        error.category,
+        crate::ingress::QwpWsErrorCategory::ProtocolViolation
+    );
+    assert_eq!(
+        error.applied_policy,
+        crate::ingress::QwpWsErrorPolicy::Terminal
+    );
+    assert_eq!(
+        (error.from_fsn, error.to_fsn, error.message_sequence),
+        (1, 1, None)
+    );
+    assert_eq!(
+        error.message.as_deref(),
+        Some("ws-close[1002]: terminal during accepted park")
+    );
+}
+
+#[test]
+fn recycle_terminal_then_immediate_close() {
+    // No API inspection after the first failing flush may repair bookkeeping.
+    let server = Server::new();
+    let (mut sender, rx) = terminal_during_park_sender(&server);
+    assert_eq!(
+        sender.close_drain().unwrap_err().code(),
+        crate::ErrorCode::ServerRejection
+    );
+    drop(sender);
+    assert_park_terminal(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    assert_eq!(server.connection_count(), 1);
+    assert!(server.frames.try_recv().is_err());
+}
+
+#[test]
+fn recycle_terminal_remains_sticky() {
+    let server = Server::new();
+    let (mut sender, rx) = terminal_during_park_sender(&server);
+    let original = sender.poll_qwp_ws_error().unwrap().unwrap();
+    assert_park_terminal(&original);
+    let mut buffer = sender.new_buffer();
+    symbol_buffer(&mut buffer, "forbidden");
+    for _ in 0..3 {
+        assert_eq!(
+            sender.flush(&mut buffer).unwrap_err().code(),
+            crate::ErrorCode::ServerRejection
+        );
+        assert_eq!(
+            sender
+                .wait(AckLevel::Ok, Duration::ZERO)
+                .unwrap_err()
+                .code(),
+            crate::ErrorCode::ServerRejection
+        );
+        assert_eq!(sender.qwp_ws_terminal_error().unwrap().unwrap(), original);
+    }
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), original);
+    assert!(sender.poll_qwp_ws_error().unwrap().is_none());
+    assert_eq!(
+        sender.close_drain().unwrap_err().code(),
+        crate::ErrorCode::ServerRejection
+    );
+    drop(sender);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    assert_eq!(server.connection_count(), 1);
+
+    let db = crate::QuestDb::connect(&format!("ws::addr=127.0.0.1:{};lazy_connect=true;sender_pool_max=1;pool_reap=manual;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap();
+    let mut buffer = db.new_buffer();
+    let mut lease = db.borrow_sender().unwrap();
+    symbol_buffer(&mut buffer, "old");
+    lease
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    server.frame();
+    crate::ingress::sender::terminal_after_recycle_park_for_test();
+    symbol_buffer(&mut buffer, "forbidden");
+    assert_eq!(
+        lease.flush_buffer(&mut buffer).unwrap_err().code(),
+        crate::ErrorCode::ServerRejection
+    );
+    assert!(lease.must_close_for_test());
+    drop(lease);
+    let mut replacement = db.borrow_sender().unwrap();
+    assert_eq!(replacement.published_fsn().unwrap(), None);
+    replacement
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    assert_fresh(&server.frame().1, "forbidden");
+    drop(replacement);
+    db.close();
+}
+
+#[test]
+fn recycle_outage_after_commit() {
+    for (initial, progress) in [
+        ("off", QwpWsProgress::Background),
+        ("sync", QwpWsProgress::Background),
+        ("async", QwpWsProgress::Background),
+        ("off", QwpWsProgress::Manual),
+        ("sync", QwpWsProgress::Manual),
+    ] {
+        for fault in [1, 2] {
+            let server = Server::new();
+            let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};initial_connect_retry={initial};symbol_dict_reset_threshold=100000;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap().qwp_ws_progress(progress).unwrap().build().unwrap();
+            let mut buffer = sender.new_buffer();
+            symbol_buffer(&mut buffer, "retired");
+            sender.flush(&mut buffer).unwrap();
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+            server.frame();
+            server.upgrade_fault.store(fault, Ordering::Release);
+            sender.reset_symbol_dictionary().unwrap();
+            symbol_buffer(&mut buffer, "current");
+            assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(1));
+            assert!(
+                sender
+                    .wait(AckLevel::Ok, Duration::from_millis(50))
+                    .is_err()
+            );
+            assert!(
+                server.connection_count() >= 2,
+                "must exercise the injected upgrade/socket fault"
+            );
+            symbol_buffer(&mut buffer, "queued");
+            assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(2));
+            assert_eq!(sender.acked_fsn().unwrap(), Some(0));
+            server.upgrade_fault.store(0, Ordering::Release);
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+            assert_fresh(&server.frame().1, "current");
+            assert_symbol(&server.frame().1, "queued", 1);
+            assert_eq!(sender.acked_fsn().unwrap(), Some(2));
+            // Reconnect once more after the fresh mirror has accumulated symbols.
+            server.upgrade_fault.store(3, Ordering::Release);
+            symbol_buffer(&mut buffer, "lost");
+            assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(3));
+            assert!(
+                sender
+                    .wait(AckLevel::Ok, Duration::from_millis(50))
+                    .is_err()
+            );
+            let (_, unacked) = server.frame();
+            assert_symbol(&unacked, "lost", 2);
+            assert_eq!(server.upgrade_fault.load(Ordering::Acquire), 1);
+            server.upgrade_fault.store(0, Ordering::Release);
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+            let (_, catchup) = server.frame();
+            assert_eq!(&catchup[6..8], &[0, 0], "catch-up contains no table rows");
+            let mut pos = 12;
+            assert_eq!(varint(&catchup, &mut pos), 0);
+            assert_eq!(varint(&catchup, &mut pos), 3);
+            for expected in ["current", "queued", "lost"] {
+                let len = varint(&catchup, &mut pos);
+                assert_eq!(&catchup[pos..pos + len], expected.as_bytes());
+                pos += len;
+            }
+            assert_eq!(
+                pos,
+                catchup.len(),
+                "no retired symbols may survive in catch-up"
+            );
+            assert_eq!(
+                server.frame().1,
+                unacked,
+                "replay preserves exactly the retained row"
+            );
+            assert_eq!(sender.acked_fsn().unwrap(), Some(3));
+        }
+    }
+}
+
+#[test]
+fn recycle_resources_repeated() {
+    for disk in [false, true] {
+        for pooled in [false, true] {
+            let server = Server::new();
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = if disk {
+                format!("sf_dir={};sender_id=resources;", dir.path().display())
+            } else {
+                String::new()
+            };
+            let conf = format!(
+                "ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;sf_max_segment_bytes=4096;sf_max_total_bytes=32768;{storage}",
+                server.port
+            );
+            // Exercise the same assertions through both real facades.
+            macro_rules! cycles {
+                ($sender:ident, $flush:ident) => {{
+                    let mut buffer = crate::ingress::Buffer::new_qwp_ws();
+                    symbol_buffer(&mut buffer, "old");
+                    $sender.$flush(&mut buffer).unwrap();
+                    $sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                    server.frame();
+                    let probe = $sender.recycle_allocation_probe();
+                    let baseline = probe().unwrap();
+                    for cycle in 0..80 {
+                        // Cycle zero is naturally armed; all later cycles use the advisory API.
+                        if cycle > 0 {
+                            $sender.reset_symbol_dictionary().unwrap();
+                        }
+                        symbol_buffer(&mut buffer, "fresh");
+                        if cycle >= 40 {
+                            crate::ingress::sender::fail_next_recycle_storage_for_test();
+                            let error = $sender.$flush(&mut buffer).unwrap_err();
+                            assert!(error.msg().contains("injected recycle failure"));
+                            assert_eq!($sender.published_fsn().unwrap(), Some(cycle));
+                            assert!(!buffer.is_empty());
+                        }
+                        $sender.$flush(&mut buffer).unwrap();
+                        $sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                        let (connection, frame) = server.frame();
+                        assert_eq!(connection, cycle as usize + 1);
+                        assert_fresh(&frame, "fresh");
+                        assert_eq!($sender.published_fsn().unwrap(), Some(cycle + 1));
+                        assert!(
+                            probe().unwrap() <= baseline,
+                            "segment budget must return after each resumed commit"
+                        );
+                    }
+                    probe
+                }};
+            }
+            if pooled {
+                let db = crate::QuestDb::connect(&format!("{conf}lazy_connect=true;sender_pool_max=1;pool_reap=manual;acquire_timeout_ms=0;")).unwrap();
+                let mut sender = db.borrow_sender().unwrap();
+                let probe = cycles!(sender, flush_buffer);
+                assert!(
+                    db.borrow_sender().is_err(),
+                    "a live lease still occupies exactly one slot"
+                );
+                drop(sender);
+                let returned = db.borrow_sender().unwrap();
+                assert_eq!(returned.published_fsn().unwrap(), Some(80));
+                assert!(!returned.must_close_for_test());
+                drop(returned);
+                db.close();
+                assert_eq!(
+                    probe(),
+                    None,
+                    "pool close must release the queue, allocations and worker ownership"
+                );
+            } else {
+                let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+                let probe = cycles!(sender, flush);
+                sender.close_drain().unwrap();
+                drop(sender);
+                assert_eq!(
+                    probe(),
+                    None,
+                    "close must release the queue, allocations and worker ownership"
+                );
+            }
+            // The exact slot can be owned again only after close; no handle leaks.
+            if disk {
+                let suffix = if pooled {
+                    "resources-ingest-0"
+                } else {
+                    "resources"
+                };
+                let mut sender = SenderBuilder::from_conf(format!(
+                    "ws::addr=127.0.0.1:{};sf_dir={};sender_id={suffix};",
+                    server.port,
+                    dir.path().display()
+                ))
+                .unwrap()
+                .build()
+                .unwrap();
+                sender.close_drain().unwrap();
+            }
+        }
     }
 }

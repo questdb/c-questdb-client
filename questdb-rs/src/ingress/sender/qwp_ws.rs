@@ -82,6 +82,7 @@ const QWP_WS_RUNNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static TERMINAL_AFTER_RECYCLE_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_RECYCLE_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_RECOVERED_DICT_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -787,6 +788,16 @@ impl SyncQwpWsHandlerState {
     }
 
     foreground_recycle_api!();
+    #[cfg(test)]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        self.runner
+            .shared
+            .lock()
+            .unwrap()
+            .progress_view()
+            .recycle_allocation_probe()
+    }
+
     pub(crate) fn request_recycle(
         &mut self,
         boundary: Option<u64>,
@@ -1455,6 +1466,13 @@ where
             }
         }
         self.join_recycle_worker()?;
+        #[cfg(test)]
+        super::qwp_ws_sfa_queue::observe_recycle_phase("accepted park");
+        #[cfg(test)]
+        if TERMINAL_AFTER_RECYCLE_PARK.with(|fault| fault.replace(false)) {
+            self.lock_shared()?
+                .record_protocol_violation(Some(1002), "terminal during accepted park".into());
+        }
         // Errors must win even when the captured completion boundary is empty.
         let store = self.lock_shared()?;
         check_store_error(&store)?;
@@ -5676,6 +5694,89 @@ mod tests {
     }
 
     #[test]
+    fn recycle_tls_deadline_bounds_stalled_data_and_pong() {
+        use std::net::TcpListener;
+        for pong in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            socket2::SockRef::from(&listener)
+                .set_recv_buffer_size(1024)
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let config = test_tls_server_config();
+            let (release, released) = mpsc::channel();
+            let peer = thread::spawn(move || {
+                let (mut tcp, _) = listener.accept().unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut conn = rustls::ServerConnection::new(config).unwrap();
+                while conn.is_handshaking() {
+                    conn.complete_io(&mut tcp).unwrap();
+                }
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("tls_certs/server_rootCA.pem");
+            let builder = crate::ingress::SenderBuilder::from_conf(format!(
+                "wss::addr=localhost:{port};tls_roots={};",
+                root.display()
+            ))
+            .unwrap();
+            let (_, tls, _, _) = builder.resolve_qwp_ws_ingredients().unwrap();
+            let cfg = configure_tls(tls.unwrap()).unwrap();
+            let mut conn =
+                rustls::ClientConnection::new(cfg, "localhost".try_into().unwrap()).unwrap();
+            let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            socket2::SockRef::from(&tcp)
+                .set_send_buffer_size(4096)
+                .unwrap();
+            let mut tcp = NoSigpipeTcp::new(tcp).unwrap();
+            complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, Duration::from_secs(5)).unwrap();
+            let mut stream = WsStream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)));
+            let bytes = vec![0; 16 * 1024 * 1024];
+            if pong {
+                stream.tcp_stream().set_nonblocking(true).unwrap();
+                while stream.write(&bytes).is_ok() {}
+                stream.tcp_stream().set_nonblocking(false).unwrap();
+            }
+            stream
+                .set_timeouts(Some(Duration::from_secs(3)), Some(Duration::from_secs(3)))
+                .unwrap();
+            let started = Instant::now();
+            let saved = stream
+                .begin_io_deadline(started + Duration::from_millis(20))
+                .unwrap();
+            let mut scratch = Vec::new();
+            if pong {
+                let mut reader = WsFrameReader::new();
+                loop {
+                    reader.append_input_for_test(&[0x89, 0]);
+                    if reader.try_read_one(&mut stream, &mut scratch).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                assert!(write_binary_frame(&mut stream, &mut scratch, &bytes).is_err());
+            }
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "TLS internal IO must share the recycle deadline"
+            );
+            stream.end_io_deadline(saved).unwrap();
+            assert_eq!(
+                stream.tcp_stream().write_timeout().unwrap(),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                stream.tcp_stream().read_timeout().unwrap(),
+                Some(Duration::from_secs(3))
+            );
+            release.send(()).unwrap();
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
     fn failed_upgrade_clears_traffic_gate_before_original_socket_closes() {
         use std::net::{Ipv4Addr, TcpListener};
 
@@ -7907,6 +8008,207 @@ mod publication_recycle_tests {
     }
 
     #[test]
+    fn recycle_crash_after_fresh_session_install_and_publication() {
+        use crate::ingress::QwpWsProgress;
+        use std::io::{BufRead, Write};
+        if let Ok(conf) = std::env::var("QDB_RECYCLE_SESSION_CONF") {
+            let publish = std::env::var("QDB_RECYCLE_SESSION_PUBLISH").unwrap() == "true";
+            let mut sender = SenderBuilder::from_conf(conf)
+                .unwrap()
+                .qwp_ws_progress(QwpWsProgress::Manual)
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut buffer = sender.new_buffer();
+            buffer
+                .table("trades")
+                .unwrap()
+                .symbol("sym", "old")
+                .unwrap()
+                .at(crate::ingress::TimestampNanos::new(7))
+                .unwrap();
+            sender.flush(&mut buffer).unwrap();
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+            sender.reset_symbol_dictionary().unwrap();
+            let super::super::SyncProtocolHandler::ManualQwpWs(handler) = &mut sender.handler
+            else {
+                panic!("manual expected")
+            };
+            let mut encoder = handler.encoder.take().unwrap();
+            handler
+                .before_publication(&mut encoder, true, false)
+                .unwrap();
+            assert_eq!(encoder.symbol_count(), 0);
+            assert!(handler.send_core.has_pending_reconnect());
+            handler.encoder = Some(encoder);
+            if publish {
+                buffer
+                    .table("trades")
+                    .unwrap()
+                    .symbol("sym", "new")
+                    .unwrap()
+                    .at(crate::ingress::TimestampNanos::new(7))
+                    .unwrap();
+                assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(1));
+                assert_eq!(sender.acked_fsn().unwrap(), Some(0));
+            }
+            println!("SESSION_KILL_READY");
+            std::io::stdout().flush().unwrap();
+            loop {
+                thread::park();
+            }
+        }
+        for durability in ["memory", "periodic"] {
+            for publish in [false, true] {
+                let server = Server::new();
+                let dir = tempfile::TempDir::new().unwrap();
+                let conf = format!(
+                    "ws::addr=127.0.0.1:{};sf_dir={};sender_id=crash;sf_durability={durability};sf_max_segment_bytes=4096;symbol_dict_reset_max_wait_millis=0;",
+                    server.port,
+                    dir.path().display()
+                );
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "ingress::sender::qwp_ws::publication_recycle_tests::recycle_crash_after_fresh_session_install_and_publication", "--nocapture"])
+                    .env("QDB_RECYCLE_SESSION_CONF", &conf).env("QDB_RECYCLE_SESSION_PUBLISH", publish.to_string())
+                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+                let output = child.stdout.take().unwrap();
+                let (ready, wait) = std::sync::mpsc::channel();
+                let reader = thread::spawn(move || {
+                    for line in std::io::BufReader::new(output).lines() {
+                        if line.unwrap() == "SESSION_KILL_READY" {
+                            ready.send(()).unwrap();
+                        }
+                    }
+                });
+                if let Err(error) = wait.recv_timeout(Duration::from_secs(10)) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("fresh-session checkpoint missing: {error}");
+                }
+                child.kill().unwrap();
+                assert!(!child.wait().unwrap().success());
+                reader.join().unwrap();
+                let (_, mut expected) = server.frame();
+                assert_eq!(&expected[15..18], b"old");
+                expected[15..18].copy_from_slice(b"new");
+                let mut recovered = SfaSlotQueue::open(SfaSlotOptions {
+                    sf_dir: dir.path().to_path_buf(),
+                    sender_id: "crash".into(),
+                    segment_size_bytes: 4096,
+                    max_bytes: 32768,
+                    periodic_sync_interval: (durability == "periodic")
+                        .then_some(Duration::from_secs(1)),
+                })
+                .unwrap();
+                assert_eq!(recovered.completed_fsn(), Some(0));
+                assert_eq!(recovered.published_fsn(), Some(u64::from(publish)));
+                assert_eq!(recovered.oldest_unresolved_fsn(), publish.then_some(1));
+                if publish {
+                    let frame =
+                        recovered
+                            .progress_view()
+                            .next_outbound_frame(
+                                &mut super::super::qwp_ws_driver::SendCursor::default(),
+                            )
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(frame.fsn, 1);
+                    frame
+                        .payload
+                        .with_bytes(|bytes| assert_eq!(bytes, expected));
+                    assert_eq!(
+                        PersistedSymbolDict::open(&dir.path().join("crash"))
+                            .unwrap()
+                            .read_loaded_symbols(),
+                        [b"new"]
+                    );
+                }
+                assert_eq!(
+                    recovered.try_publish(&expected).unwrap().fsn,
+                    if publish { 2 } else { 1 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recycle_slot_contender_during_every_phase() {
+        use super::super::qwp_ws_sfa_queue::{RECYCLE_OBSERVER, SfaQueueError, SfaQueueOptions};
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};sf_dir={};sender_id=contender;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;", server.port, dir.path().display())).unwrap().build().unwrap();
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "old")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        server.frame();
+        let root = dir.path().to_path_buf();
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&probes);
+        RECYCLE_OBSERVER.with(|observer| *observer.borrow_mut() = Some(Box::new(move |phase| {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ingress::sender::qwp_ws_sfa_slot::tests::qwp_ws_sfa_slot_child_process_lock_helper", "--ignored"])
+                .env("QDB_SFA_SLOT_CHILD_MODE", "probe-locked")
+                .env("QDB_SFA_SLOT_CHILD_SF_DIR", &root)
+                .env("QDB_SFA_SLOT_CHILD_SENDER_ID", "contender")
+                .output().unwrap();
+            assert!(result.status.success(), "external contender acquired during {phase}: {}", String::from_utf8_lossy(&result.stdout));
+            let orphan = SfaSlotQueue::open_replay_only_existing(SfaQueueOptions { slot_dir: root.join("contender"), segment_size_bytes: 4096, max_bytes: 32768, periodic_sync_interval: None });
+            assert!(matches!(orphan, Err(SfaQueueError::SlotInUse { .. })), "orphan drainer acquired during {phase}");
+            recorded.lock().unwrap().push(phase);
+        })));
+        FAIL_NEXT_RECYCLE_SPAWN.with(|fault| fault.set(true));
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "new")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("spawn failure")
+        );
+        super::super::qwp_ws_sfa_queue::observe_recycle_phase("failed resume");
+        super::super::qwp_ws_sfa_queue::observe_recycle_phase("close");
+        RECYCLE_OBSERVER.with(|observer| observer.borrow_mut().take());
+        let probes = probes.lock().unwrap();
+        assert!(probes.contains(&"accepted park"));
+        assert!(probes.contains(&"reset phase"));
+        assert!(
+            probes.contains(&"dictionary directory synced"),
+            "observed {probes:?}"
+        );
+        assert!(probes.contains(&"failed resume"));
+        assert!(probes.contains(&"close"));
+        sender.close_drain().unwrap();
+        drop(sender);
+        let options = SfaSlotOptions {
+            sf_dir: dir.path().to_path_buf(),
+            sender_id: "contender".into(),
+            segment_size_bytes: 4096,
+            max_bytes: 32768,
+            periodic_sync_interval: None,
+        };
+        let mut acquired = SfaSlotQueue::open(options.clone()).unwrap();
+        assert!(matches!(
+            SfaSlotQueue::open(options.clone()),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+        acquired.close().unwrap();
+        drop(SfaSlotQueue::open(options).unwrap());
+    }
+
+    #[test]
     fn recycle_observation_three_epochs_retained_observers() {
         let server = Server::new();
         let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=100000;symbol_dict_reset_max_wait_millis=0;", server.port)).unwrap().connection_listener(Arc::new(|_| {}), 0).unwrap().build().unwrap();
@@ -7978,6 +8280,13 @@ mod publication_recycle_tests {
                     Some(boundary),
                     "observer retained before all resets must see later targets advance"
                 );
+                // Queue completion can satisfy wait before the worker publishes
+                // its separate OK counter. Both retained observers must advance.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while ok_upper.load(Ordering::Acquire) != boundary + 1 && Instant::now() < deadline
+                {
+                    thread::yield_now();
+                }
                 assert_eq!(ok_upper.load(Ordering::Acquire), boundary + 1);
                 assert_eq!(
                     state(&mut sender)

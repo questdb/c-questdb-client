@@ -1611,12 +1611,39 @@ impl SfaDrainedReset {
 }
 
 #[cfg(test)]
+type RecycleObserver = Box<dyn FnMut(&'static str)>;
+
+#[cfg(test)]
 thread_local! {
+    pub(super) static RECYCLE_OBSERVER: std::cell::RefCell<Option<RecycleObserver>> = const { std::cell::RefCell::new(None) };
+    static RECYCLE_KILL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(super) static RECYCLE_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
+pub(super) fn observe_recycle_phase(step: &'static str) {
+    RECYCLE_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().as_mut() {
+            observer(step);
+        }
+    });
+}
+
+#[cfg(test)]
 pub(super) fn recycle_barrier(step: &'static str) -> io::Result<()> {
+    observe_recycle_phase(step);
+    RECYCLE_KILL_AFTER.with(|count| match count.get() {
+        Some(0) => {
+            use std::io::Write;
+            println!("RECYCLE_KILL_READY:{step}");
+            std::io::stdout().flush().unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        Some(n) => count.set(Some(n - 1)),
+        None => (),
+    });
     RECYCLE_FAIL_AFTER.with(|count| match count.get() {
         Some(0) => {
             count.set(None);
@@ -1633,6 +1660,16 @@ pub(super) fn recycle_barrier(step: &'static str) -> io::Result<()> {
 }
 
 impl SfaProgressView {
+    #[cfg(test)]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        let engine = Arc::downgrade(&self.engine);
+        Box::new(move || {
+            engine
+                .upgrade()
+                .map(|engine| engine.with_state(|state| state.allocated_segment_bytes))
+        })
+    }
+
     /// See [`SfaEngine::has_deferred_commit_headroom`].
     pub(crate) fn has_deferred_commit_headroom(&self) -> bool {
         self.engine.has_deferred_commit_headroom()
@@ -3849,6 +3886,23 @@ mod tests {
         assert_eq!(producer.active.base_seq(), 0);
     }
 
+    fn recycle_symbol_frame(symbol: &str) -> Vec<u8> {
+        let mut buffer = crate::ingress::Buffer::new_qwp_ws();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", symbol)
+            .unwrap()
+            .at(crate::ingress::TimestampNanos::new(7))
+            .unwrap();
+        let mut encoder = super::super::qwp_ws_publisher::QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        encoder
+            .encode(buffer.as_qwp_ws().unwrap())
+            .unwrap()
+            .to_vec()
+    }
+
     fn recycle_fixture(dir: &TempDir) -> (SfaFrameQueue, SfaProducer) {
         recycle_fixture_with_segment_size(dir, 256)
     }
@@ -3860,7 +3914,7 @@ mod tests {
         drop(dict);
         let mut producer = queue.take_producer().unwrap();
         for _ in 0..3 {
-            producer.try_submit(b"old").unwrap();
+            producer.try_submit(&recycle_symbol_frame("old")).unwrap();
         }
         queue.complete_through_fsn(2).unwrap();
         (queue, producer)
@@ -3879,7 +3933,7 @@ mod tests {
     fn recycle_reset_crash_barriers() {
         // Small segments consume the hot spare and exercise fresh allocation;
         // large segments exercise rebasing and reusing the retained hot spare.
-        for segment_size in [38, 256] {
+        for segment_size in [128, 1024] {
             let mut cuts = 0;
             for cut in 0..40 {
                 let dir = TempDir::new().unwrap();
@@ -3900,13 +3954,15 @@ mod tests {
                 assert!(queue.close().is_err());
                 let snapshot = TempDir::new().unwrap();
                 copy_slot(dir.path(), snapshot.path());
-                let mut reopened = SfaFrameQueue::open(options(&snapshot)).unwrap();
+                let reopened = SfaFrameQueue::open(options(&snapshot)).unwrap();
                 assert_eq!(reopened.published_fsn(), Some(2), "cut {cut}");
                 assert_eq!(reopened.completed_fsn(), Some(2), "cut {cut}");
                 assert_eq!(reopened.oldest_unresolved_fsn(), None, "cut {cut}");
                 assert_eq!(
-                    reopened.take_persisted_symbol_dict().unwrap().size(),
-                    1,
+                    PersistedSymbolDict::open(snapshot.path())
+                        .unwrap()
+                        .read_loaded_symbols(),
+                    [b"old"],
                     "cut {cut}"
                 );
                 queue.reset_drained(&mut producer).unwrap();
@@ -3953,6 +4009,10 @@ mod tests {
             assert_eq!(reopened.completed_fsn(), Some(2));
             assert_eq!(reopened.oldest_unresolved_fsn(), None);
             assert_eq!(reopened.take_persisted_symbol_dict().unwrap().size(), 0);
+            let fresh_payload = recycle_symbol_frame("new");
+            assert_eq!(reopened.try_submit(&fresh_payload).unwrap().fsn, 3);
+            assert_eq!(reopened.payload_vec_for_fsn(3).unwrap(), fresh_payload);
+            assert_eq!(reopened.oldest_unresolved_fsn(), Some(3));
             let mut fresh = PersistedSymbolDict::reset_drained(dir.path()).unwrap();
             fresh.append_symbol(b"new").unwrap();
             drop(fresh);
@@ -3964,6 +4024,180 @@ mod tests {
             );
             assert_eq!(producer.try_submit(b"new").unwrap().fsn, 3);
         }
+    }
+
+    #[test]
+    fn recycle_crash_after_new_publication() {
+        use std::io::BufRead;
+        const CHILD: &str = "QUESTDB_RECYCLE_CRASH_CHILD";
+        if let Ok(path) = std::env::var(CHILD) {
+            let cut: usize = std::env::var("QUESTDB_RECYCLE_CRASH_CUT")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut opts = SfaQueueOptions {
+                slot_dir: path.into(),
+                segment_size_bytes: 1024,
+                max_bytes: 4096,
+                periodic_sync_interval: None,
+            };
+            if std::env::var("QUESTDB_RECYCLE_CRASH_PERIODIC").unwrap() == "true" {
+                opts.periodic_sync_interval = Some(Duration::from_millis(1));
+            }
+            let mut queue = SfaFrameQueue::open(opts).unwrap();
+            let mut dict = queue.take_persisted_symbol_dict().unwrap();
+            dict.append_symbol(b"old").unwrap();
+            drop(dict);
+            let mut producer = queue.take_producer().unwrap();
+            for fsn in 0..3 {
+                assert_eq!(
+                    producer
+                        .try_submit(&recycle_symbol_frame("old"))
+                        .unwrap()
+                        .fsn,
+                    fsn
+                );
+            }
+            queue.complete_through_fsn(2).unwrap();
+            RECYCLE_KILL_AFTER.with(|count| count.set(Some(cut)));
+            recycle_barrier("old drain").unwrap();
+            queue.reset_drained(&mut producer).unwrap();
+            let mut fresh =
+                PersistedSymbolDict::reset_drained(queue.engine.slot_dir.as_ref().unwrap())
+                    .unwrap();
+            recycle_barrier("fresh namespace before publication").unwrap();
+            fresh.append_symbol(b"new").unwrap();
+            assert_eq!(
+                producer
+                    .try_submit(&recycle_symbol_frame("new"))
+                    .unwrap()
+                    .fsn,
+                3
+            );
+            recycle_barrier("fresh unacked publication").unwrap();
+            println!("RECYCLE_CUTS_COMPLETE");
+            return;
+        }
+        for periodic in [false, true] {
+            let mut killed = 0;
+            let mut saw_publication = false;
+            for cut in 0..40 {
+                let dir = TempDir::new().unwrap();
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "ingress::sender::qwp_ws_sfa_queue::tests::recycle_crash_after_new_publication", "--nocapture"])
+                    .env(CHILD, dir.path()).env("QUESTDB_RECYCLE_CRASH_CUT", cut.to_string())
+                    .env("QUESTDB_RECYCLE_CRASH_PERIODIC", periodic.to_string())
+                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+                let output = child.stdout.take().unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    for line in std::io::BufReader::new(output).lines() {
+                        let line = line.unwrap();
+                        if line.starts_with("RECYCLE_") {
+                            tx.send(line).unwrap();
+                        }
+                    }
+                });
+                let checkpoint = rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap_or_else(|err| {
+                        let _ = child.kill();
+                        panic!("child failed to reach cut {cut}: {err}")
+                    });
+                if checkpoint == "RECYCLE_CUTS_COMPLETE" {
+                    assert!(child.wait().unwrap().success());
+                    reader.join().unwrap();
+                    break;
+                }
+                child.kill().unwrap();
+                assert!(!child.wait().unwrap().success());
+                reader.join().unwrap();
+                killed += 1;
+                let published = checkpoint.ends_with("fresh unacked publication");
+                saw_publication |= published;
+                let mut recovered = SfaFrameQueue::open(options(&dir)).unwrap();
+                assert_eq!(recovered.completed_fsn(), Some(2), "{checkpoint}");
+                assert_eq!(
+                    recovered.published_fsn(),
+                    Some(if published { 3 } else { 2 }),
+                    "{checkpoint}"
+                );
+                assert_eq!(
+                    recovered.oldest_unresolved_fsn(),
+                    published.then_some(3),
+                    "{checkpoint}"
+                );
+                if published {
+                    let bytes = recovered.payload_vec_for_fsn(3).unwrap();
+                    assert_eq!(bytes, recycle_symbol_frame("new"));
+                    assert_eq!(
+                        PersistedSymbolDict::open(dir.path())
+                            .unwrap()
+                            .read_loaded_symbols(),
+                        [b"new"]
+                    );
+                }
+                assert_eq!(
+                    recovered
+                        .try_submit(&recycle_symbol_frame("next"))
+                        .unwrap()
+                        .fsn,
+                    if published { 4 } else { 3 }
+                );
+            }
+            assert!(
+                killed >= 15,
+                "all durable reset barriers must be killed, got {killed}"
+            );
+            assert!(
+                saw_publication,
+                "must kill after an actual fresh unacked publication"
+            );
+        }
+    }
+
+    #[test]
+    fn recycle_crash_rejects_unresolved_old_generation_residue() {
+        use super::super::qwp_ws_driver::{DriveOutcome, FakeOrderedServer, QwpWsCoreTestHarness};
+        let dir = TempDir::new().unwrap();
+        let (mut queue, mut producer) = recycle_fixture(&dir);
+        queue.reset_drained(&mut producer).unwrap();
+        let mut dict = PersistedSymbolDict::reset_drained(dir.path()).unwrap();
+        dict.append_symbol(b"new").unwrap();
+        drop(dict);
+        assert_eq!(
+            producer
+                .try_submit(&recycle_symbol_frame("new"))
+                .unwrap()
+                .fsn,
+            3
+        );
+        // Inject a valid but contradictory old-namespace frame into actual files.
+        assert_eq!(
+            producer
+                .try_submit(&recycle_symbol_frame("old"))
+                .unwrap()
+                .fsn,
+            4
+        );
+        drop(producer);
+        drop(queue);
+        let queue = SfaFrameQueue::open(options(&dir)).unwrap();
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(3));
+        let entries = queue.recovered_symbol_dict_entries().to_vec();
+        let count = queue.recovered_symbol_dict_count();
+        let (mut store, mut core) =
+            QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::ack_each_send())
+                .into_parts();
+        core.enable_delta_dict(&entries, count);
+        core.drive_once(&mut store).unwrap();
+        assert_eq!(core.drive_once(&mut store).unwrap(), DriveOutcome::Terminal);
+        assert_eq!(
+            store.terminal_error().unwrap().code(),
+            crate::ErrorCode::StoreResendRequired
+        );
+        assert_eq!(store.completed_fsn(), Some(3));
+        assert_eq!(store.published_fsn(), Some(4));
     }
 
     #[test]

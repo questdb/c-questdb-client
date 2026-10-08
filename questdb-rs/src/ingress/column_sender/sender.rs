@@ -307,6 +307,11 @@ impl Debug for DirectSenderCore {
 }
 
 impl PooledSenderCore {
+    #[cfg(test)]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        self.backend.state.recycle_allocation_probe()
+    }
+
     pub(crate) fn new_store_and_forward(
         mut state: SyncQwpWsHandlerState,
         max_buf_size: usize,
