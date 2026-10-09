@@ -90,6 +90,24 @@ const DEFAULT_INTERVAL: u64 = 5;
 const ACQUIRE_WAIT_TIMEOUT_MULTIPLE: u32 = 6;
 const ACQUIRE_WAIT_POLL_SLICE: Duration = Duration::from_millis(50);
 
+// How often a server's HTTP 401 may make `token()` drop a cached token that is
+// still valid and refresh it. A server that rejects every token -- a wrong
+// audience, say -- would otherwise turn each flush or reconnect into an IdP
+// refresh. Inside the window the rejected token is served as before, and the
+// 401 stands.
+const REJECTED_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The token a server last rejected while this provider still considered it
+/// valid. See [`OidcDeviceAuth::drop_rejected_token`].
+#[derive(Default)]
+struct RejectedToken {
+    /// SHA-256 of the rejected token; never the token itself. `None` once a
+    /// refresh or sign-in has replaced it.
+    digest: Option<[u8; 32]>,
+    /// When a rejection last made this provider drop its cached token.
+    last_dropped: Option<Instant>,
+}
+
 /// What a lifecycle operation waiting for the acquisition lock does when the
 /// holder is an interactive device flow, which can keep it for the whole
 /// device-code lifetime.
@@ -602,6 +620,7 @@ impl OidcDeviceAuthBuilder {
             custom_sleep,
             now: self.now.unwrap_or_else(|| Arc::new(Instant::now)),
             tokens: Mutex::new(None),
+            rejected: Mutex::new(RejectedToken::default()),
             acquire: Mutex::new(()),
             interactive_in_progress: AtomicBool::new(false),
             clear_in_progress: AtomicBool::new(false),
@@ -669,6 +688,8 @@ pub struct OidcDeviceAuth {
     now: NowFn,
     /// The cached token; short critical sections only.
     tokens: Mutex<Option<TokenSet>>,
+    /// A token a server rejected; locked only after `tokens`, never before.
+    rejected: Mutex<RejectedToken>,
     /// Held across a silent refresh or interactive sign-in.
     acquire: Mutex<()>,
     /// Set only around the device flow so token() can distinguish a long human
@@ -967,8 +988,17 @@ impl OidcDeviceAuth {
     /// `InteractionRequired` immediately behind an interactive sign-in rather
     /// than waiting on a human. This makes it safe to use as a synchronous or
     /// background transport token provider.
+    ///
+    /// Used as a sender's, reader's or pool's token provider, it also learns
+    /// when a server rejects the cached token with HTTP 401 before it expires
+    /// -- after a revocation or a signing-key rotation, say: the transport's
+    /// one re-resolution then refreshes the token instead of being handed the
+    /// rejected one again. Such a forced refresh happens at most once every 30
+    /// seconds; within that window the cached token is served as usual and
+    /// the 401 stands.
     pub fn token(&self) -> Result<String> {
         self.ensure_open()?;
+        self.drop_rejected_token();
         // HTTP providers call this once per flush. On the overwhelmingly common
         // cache hit, clone only the credential being returned rather than every
         // secret and metadata field in TokenSet.
@@ -994,6 +1024,7 @@ impl OidcDeviceAuth {
         abort_wait: &dyn Fn() -> Option<crate::Error>,
     ) -> crate::Result<String> {
         self.ensure_open()?;
+        self.drop_rejected_token();
         if let Some(token) = self.cached_selected_if_valid() {
             return token.map_err(Into::into);
         }
@@ -1241,8 +1272,79 @@ impl OidcDeviceAuth {
         }
     }
 
+    /// The credential [`select`](Self::select) would serve, without cloning it.
+    fn selected_credential<'t>(&self, tokens: &'t TokenSet) -> Option<&'t str> {
+        if self.config.groups_in_token {
+            tokens.id_token.as_deref()
+        } else {
+            tokens.access_token.as_deref()
+        }
+    }
+
+    /// Whether `tokens` would serve the token a server last rejected. Every
+    /// source of a servable set goes through here -- the cache, the store and a
+    /// peer's refresh -- so the rejected token is never served again from any
+    /// of them, though its expiry says it could be.
+    fn is_rejected(&self, tokens: &TokenSet) -> bool {
+        let Some(digest) = self.lock_rejected().digest else {
+            return false;
+        };
+        self.selected_credential(tokens)
+            .is_some_and(|credential| token_store::sha256(credential.as_bytes()) == digest)
+    }
+
+    fn lock_rejected(&self) -> std::sync::MutexGuard<'_, RejectedToken> {
+        self.rejected.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A refresh or sign-in has replaced the rejected token in the cache, and
+    /// in the store when there is one, so stop hashing every served token
+    /// against it. The rate limit on further drops is kept.
+    fn forget_rejected_token(&self) {
+        self.lock_rejected().digest = None;
+    }
+
+    /// Stop serving the cached token if the calling transport is replacing
+    /// exactly that token after a server answered it with HTTP 401 (see
+    /// `crate::token_provider::with_rejected_credential`).
+    ///
+    /// A cached token is otherwise served until it nears expiry, so a token
+    /// the server stopped accepting earlier -- revoked, or signed with a key
+    /// it has rotated out -- kept being presented, and every flush or
+    /// reconnect failed with the same 401 until then. Dropping it makes this
+    /// call refresh. Only the token being served is dropped: if a peer has
+    /// already replaced it, the replacement is what the transport needs. And
+    /// at most once per [`REJECTED_TOKEN_REFRESH_INTERVAL`], so a server that
+    /// rejects every token does not turn each flush into an IdP refresh.
+    fn drop_rejected_token(&self) {
+        crate::token_provider::inspect_rejected_token(|rejected| {
+            let Some(rejected) = rejected else {
+                return;
+            };
+            let serving = self
+                .lock_tokens()
+                .as_ref()
+                .and_then(|tokens| self.selected_credential(tokens))
+                .is_some_and(|credential| credential == rejected);
+            if !serving {
+                return;
+            }
+            let now = Instant::now();
+            let mut state = self.lock_rejected();
+            if state.last_dropped.is_some_and(|at| {
+                now.saturating_duration_since(at) < REJECTED_TOKEN_REFRESH_INTERVAL
+            }) {
+                return;
+            }
+            state.digest = Some(token_store::sha256(rejected.as_bytes()));
+            state.last_dropped = Some(now);
+        });
+    }
+
     fn is_usable(&self, tokens: &TokenSet) -> bool {
-        tokens.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS) && self.has_required_token(tokens)
+        tokens.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS)
+            && self.has_required_token(tokens)
+            && !self.is_rejected(tokens)
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -1549,6 +1651,7 @@ impl OidcDeviceAuth {
         if let Err(err) = self.ensure_open() {
             return Some(Err(err));
         }
+        self.drop_rejected_token();
         self.cached_selected_if_valid()
     }
 
@@ -1649,6 +1752,7 @@ impl OidcDeviceAuth {
                     self.ensure_open()?;
                     self.lock_store_state().reset_refresh_backoff();
                     *self.lock_tokens() = Some(refreshed.clone());
+                    self.forget_rejected_token();
                     return Ok(refreshed);
                 }
                 // Refresh succeeded but the result is not servable: some IdPs
@@ -1772,6 +1876,7 @@ impl OidcDeviceAuth {
         self.ensure_open()?;
         self.lock_store_state().reset_refresh_backoff();
         *self.lock_tokens() = Some(fresh.clone());
+        self.forget_rejected_token();
         self.ensure_open()?;
         // Commit the authorized token to memory and persistence before invoking
         // cosmetic user code. If a custom renderer panics and its caller catches
@@ -2127,7 +2232,10 @@ impl OidcDeviceAuth {
                     "The persisted OIDC token became invalid before refresh. Refusing to reuse a possibly rotated in-memory refresh token; retry or sign in again.",
                 )
             })?;
-            if peer.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS) && self.has_required_token(&peer) {
+            // `is_usable` also refuses the token a server just rejected: until
+            // a refresh replaces it, the persisted entry is that same token,
+            // and its expiry alone would read as a peer's fresh refresh.
+            if self.is_usable(&peer) {
                 // A peer already refreshed; skip the network.
                 self.lock_store_state()
                     .set_last_persisted_refresh(peer.refresh_token.clone());

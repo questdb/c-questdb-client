@@ -2642,6 +2642,300 @@ fn qwp_ws_retries_one_401_with_a_changed_provider_token() {
     assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
 }
 
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_401_re_resolution_names_the_rejected_token() {
+    // As above, but the provider changes its answer only when told which token
+    // the server refused -- the cache-first behaviour of `OidcDeviceAuth`,
+    // which would otherwise hand the rejected token straight back and leave
+    // the 401 standing until that token neared expiry.
+    let (port, rx) = spawn_401_then_response_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider(|| {
+            Ok::<_, crate::Error>(crate::token_provider::inspect_rejected_token(|rejected| {
+                if rejected == Some("stale") {
+                    "fresh".to_string()
+                } else {
+                    "stale".to_string()
+                }
+            }))
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let _ = sender.flush_and_get_fsn(&mut buf);
+
+    let authorization = |result: &MockResult| {
+        result
+            .request_lines
+            .iter()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_string())
+            })
+            .expect("authorization header")
+    };
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the rejected token was handed back, so the endpoint was not replayed");
+    assert_eq!(authorization(&first), "Bearer stale");
+    assert_eq!(authorization(&second), "Bearer fresh");
+}
+
+#[cfg(all(feature = "sync-reader-qwp-ws", feature = "_oidc"))]
+#[test]
+fn reader_401_re_resolution_names_the_rejected_token() {
+    // The egress reader replays an endpoint after a 401 only when its provider
+    // hands back a different token, so it must say which token was refused.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let request = read_request_until_blank(&mut first).unwrap();
+        tx.send(String::from_utf8_lossy(&request).into_owned())
+            .unwrap();
+        first
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        drop(first);
+        let (mut second, _) = listener.accept().unwrap();
+        // Version 0 lets the reader connect without a SERVER_INFO frame.
+        let request_lines = perform_server_upgrade_with_version(&mut second, 0).unwrap();
+        tx.send(request_lines.join("\r\n")).unwrap();
+        let mut sink = [0u8; 256];
+        let _ = second.read(&mut sink);
+    });
+    let cfg = crate::egress::ReaderConfig::from_conf(format!("ws::addr=127.0.0.1:{port};"))
+        .unwrap()
+        .token_provider(|| {
+            Ok::<_, crate::Error>(crate::token_provider::inspect_rejected_token(|rejected| {
+                if rejected == Some("stale") {
+                    "fresh".to_string()
+                } else {
+                    "stale".to_string()
+                }
+            }))
+        })
+        .unwrap();
+    let reader = crate::egress::Reader::from_config(&cfg);
+
+    let has_authorization = |request: &str, value: &str| {
+        request.split("\r\n").any(|line| {
+            line.split_once(':').is_some_and(|(key, found)| {
+                key.eq_ignore_ascii_case("authorization") && found.trim() == value
+            })
+        })
+    };
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(has_authorization(&first, "Bearer stale"), "{first}");
+    let second = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the rejected token was handed back, so the endpoint was not replayed");
+    assert!(has_authorization(&second, "Bearer fresh"), "{second}");
+    let reader = reader.expect("the replay with the fresh token connects");
+    drop(reader);
+    server.join().unwrap();
+}
+
+/// An ACK wait that ran out of time while the sender could not reconnect,
+/// because its OIDC credential needs a new sign-in, must say so: with the OIDC
+/// detail `line_sender_opts_oidc_auth` promises, and without blaming a live
+/// server for not acknowledging.
+#[cfg(feature = "_oidc")]
+fn assert_wait_names_the_lapsed_credential(err: &crate::Error) {
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{err}");
+    assert!(!err.in_doubt(), "{err}");
+    let oidc = err
+        .oidc_error()
+        .unwrap_or_else(|| panic!("no OIDC detail on: {err}"));
+    assert_eq!(oidc.kind(), crate::oidc::OidcErrorKind::InteractionRequired);
+    assert!(!oidc.acquisition_busy());
+    assert!(err.msg().contains("no ack progress"), "{err}");
+    assert!(err.msg().contains("reconnecting keeps failing"), "{err}");
+    assert!(err.msg().contains("sign_in()"), "{err}");
+    assert!(!err.msg().contains("the connection is alive"), "{err}");
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_wait_names_a_credential_that_blocks_the_initial_connect() {
+    // `initial_connect_retry=async` builds the sender before any connection,
+    // and nobody has signed in for the token the runner's first connect needs.
+    let auth = Arc::new(
+        crate::oidc::OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example.com/device")
+            .token_endpoint("https://idp.example.com/token")
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .build()
+            .unwrap(),
+    );
+    let mut sender = SenderBuilder::from_conf("ws::addr=127.0.0.1:1;initial_connect_retry=async;")
+        .unwrap()
+        .qwp_ws_token_provider({
+            let auth = Arc::clone(&auth);
+            move || auth.token()
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("x", 1)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    sender.flush(&mut buffer).unwrap();
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(500))
+        .unwrap_err();
+    assert_wait_names_the_lapsed_credential(&err);
+}
+
+/// Connect once, have the server drop the connection, and wait for an ACK
+/// while every reconnect fails because the credential needs a new sign-in.
+#[cfg(feature = "_oidc")]
+fn wait_after_the_credential_lapses_mid_stream(progress: ProgressCase) -> crate::Error {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+    });
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider({
+            let pulls = Arc::clone(&pulls);
+            move || {
+                if pulls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok("tok".to_string())
+                } else {
+                    Err(crate::Error::from(
+                        crate::oidc::OidcError::interaction_required(
+                            "No usable cached or refreshable OIDC token is available. \
+                             Call sign_in() explicitly before starting the transport.",
+                        ),
+                    ))
+                }
+            }
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+    // The server drops the connection once the upgrade is done.
+    server.join().unwrap();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("x", 1)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    sender.flush(&mut buffer).unwrap();
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(800))
+        .unwrap_err();
+    assert!(pulls.load(Ordering::SeqCst) >= 2, "no reconnect was tried");
+    err
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_wait_names_a_credential_that_blocks_a_background_reconnect() {
+    let err = wait_after_the_credential_lapses_mid_stream(ProgressCase::Background);
+    assert_wait_names_the_lapsed_credential(&err);
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_wait_names_a_credential_that_blocks_a_manual_reconnect() {
+    let err = wait_after_the_credential_lapses_mid_stream(ProgressCase::Manual);
+    assert_wait_names_the_lapsed_credential(&err);
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_wait_forgets_a_reconnect_failure_once_reconnected() {
+    // One reconnect fails for want of a credential, the next succeeds, and then
+    // the server stays silent. The wait's timeout is the server's again: it
+    // must not report a reconnect failure that has since been overcome.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (reconnected_tx, reconnected_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut first).unwrap();
+        drop(first);
+        let (mut second, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut second).unwrap();
+        reconnected_tx.send(()).unwrap();
+        // Read whatever arrives and never acknowledge it.
+        let mut sink = [0u8; 4096];
+        while matches!(second.read(&mut sink), Ok(n) if n > 0) {}
+    });
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{port};reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=10;"
+    ))
+    .unwrap()
+    .qwp_ws_token_provider({
+        let pulls = Arc::clone(&pulls);
+        move || {
+            if pulls.fetch_add(1, Ordering::SeqCst) == 1 {
+                Err(crate::Error::from(
+                    crate::oidc::OidcError::interaction_required("sign in"),
+                ))
+            } else {
+                Ok("tok".to_string())
+            }
+        }
+    })
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("x", 1)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    // Sending finds the dropped connection and starts the reconnect.
+    sender.flush(&mut buffer).unwrap();
+    reconnected_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the sender reconnected");
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(300))
+        .unwrap_err();
+    assert!(pulls.load(Ordering::SeqCst) >= 3, "no successful reconnect");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{err}");
+    assert!(err.oidc_error().is_none(), "{err}");
+    assert!(err.msg().contains("the connection is alive"), "{err}");
+    drop(sender);
+    server.join().unwrap();
+}
+
 #[test]
 fn qwp_ws_token_provider_rotates_across_reconnects() {
     // The rotating provider must be re-pulled on each (re)connect handshake, so a

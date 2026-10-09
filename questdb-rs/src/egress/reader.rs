@@ -3291,7 +3291,12 @@ fn walk_via_tracker(
                 }
                 return Err(deadline_err);
             }
-            let rotated_headers = match upgrade_headers_for_walk(cfg, deadline) {
+            // Name the rejected token, so a cache-first provider such as
+            // `OidcDeviceAuth` refreshes it rather than handing it back.
+            let rotated_headers = match crate::token_provider::with_rejected_credential(
+                authorization_header(&upgrade_headers),
+                || upgrade_headers_for_walk(cfg, deadline),
+            ) {
                 Ok(headers) => headers,
                 Err(error) if is_walk_deadline_cutoff(&error) => {
                     // A refresh cut off by the deadline cannot undo the 401

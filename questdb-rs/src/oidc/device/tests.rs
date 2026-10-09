@@ -7739,3 +7739,173 @@ fn acquire_abort_releases_a_wait_for_the_store_lock() {
         "a released wait is no store failure"
     );
 }
+
+/// A mock IdP that signs in as `AT-initial` (with refresh token `RT-0`) and
+/// answers refresh `n` with `AT-refreshed-n` / `RT-n`, counting refreshes.
+fn rejection_mock(refreshes: Arc<AtomicUsize>) -> MockServer {
+    MockServer::start(move |method, path, body| {
+        match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+            let n = refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+            (
+                200,
+                format!(
+                    r#"{{"access_token":"AT-refreshed-{n}","id_token":"ID-refreshed-{n}","refresh_token":"RT-{n}","expires_in":300}}"#
+                ),
+            )
+        }
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-initial","id_token":"ID-initial","refresh_token":"RT-0","expires_in":300}"#
+                .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    }
+    })
+}
+
+/// `auth.token()` as a transport calls it after `rejected` drew an HTTP 401.
+fn token_after_401(auth: &OidcDeviceAuth, rejected: &str) -> Result<String> {
+    crate::token_provider::with_rejected_credential(Some(&format!("Bearer {rejected}")), || {
+        auth.token()
+    })
+}
+
+#[test]
+fn a_token_the_server_rejected_is_refreshed_instead_of_served_again() {
+    // A server can stop accepting a token long before it expires -- it was
+    // revoked, or signed with a key the server has rotated out. The cache kept
+    // serving it, so the transport's one re-resolution after the 401 was handed
+    // the same token and the 401 stood until the token neared expiry.
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let mock = rejection_mock(Arc::clone(&refreshes));
+    let auth = explicit_auth(&mock, false);
+    auth.sign_in().unwrap();
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+
+    assert_eq!(
+        token_after_401(&auth, "AT-initial").unwrap(),
+        "AT-refreshed-1"
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    // The replacement is cached like any other token.
+    assert_eq!(auth.token().unwrap(), "AT-refreshed-1");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_rejected_id_token_is_refreshed_in_groups_mode() {
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let mock = rejection_mock(Arc::clone(&refreshes));
+    let auth = explicit_auth(&mock, true);
+    auth.sign_in().unwrap();
+    assert_eq!(auth.token().unwrap(), "ID-initial");
+
+    assert_eq!(
+        token_after_401(&auth, "ID-initial").unwrap(),
+        "ID-refreshed-1"
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_rejection_of_a_token_no_longer_served_changes_nothing() {
+    // A peer already replaced the rejected token: the replacement is exactly
+    // what the transport needs, and refreshing again would only rotate it.
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let mock = rejection_mock(Arc::clone(&refreshes));
+    let auth = explicit_auth(&mock, false);
+    auth.sign_in().unwrap();
+
+    assert_eq!(token_after_401(&auth, "AT-older").unwrap(), "AT-initial");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn rejection_refreshes_are_limited_to_one_per_interval() {
+    // A server that rejects every token -- a wrong audience, say -- must not
+    // turn each flush or reconnect into an IdP refresh.
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let mock = rejection_mock(Arc::clone(&refreshes));
+    let auth = explicit_auth(&mock, false);
+    auth.sign_in().unwrap();
+
+    assert_eq!(
+        token_after_401(&auth, "AT-initial").unwrap(),
+        "AT-refreshed-1"
+    );
+    assert_eq!(
+        token_after_401(&auth, "AT-refreshed-1").unwrap(),
+        "AT-refreshed-1",
+        "a second rejection inside the interval must keep the cached token"
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+    // Once the interval has passed, the next rejection refreshes again.
+    auth.lock_rejected().last_dropped =
+        Some(Instant::now() - REJECTED_TOKEN_REFRESH_INTERVAL - Duration::from_secs(1));
+    assert_eq!(
+        token_after_401(&auth, "AT-refreshed-1").unwrap(),
+        "AT-refreshed-2"
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_persisted_copy_of_the_rejected_token_is_not_taken_for_a_peer_refresh() {
+    // With a store, the refresh first re-reads the persisted entry and skips
+    // the network when a peer has already stored a valid token. Until this
+    // refresh replaces it, that entry is the rejected token itself, and its
+    // expiry alone made it look like a peer's fresh refresh: the refresh was
+    // skipped, and the rejected token came back as unusable.
+    let dir = TempDir::new().unwrap();
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let mock = rejection_mock(Arc::clone(&refreshes));
+    let auth = auth_with_store(&mock, dir.path());
+    auth.sign_in().unwrap();
+    let key = key_for(&mock);
+    assert_eq!(
+        test_file_store(dir.path())
+            .load(&key)
+            .unwrap()
+            .unwrap()
+            .access_token(),
+        Some("AT-initial")
+    );
+
+    assert_eq!(
+        token_after_401(&auth, "AT-initial").unwrap(),
+        "AT-refreshed-1"
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        test_file_store(dir.path())
+            .load(&key)
+            .unwrap()
+            .unwrap()
+            .access_token(),
+        Some("AT-refreshed-1"),
+        "the replacement must be persisted for peers"
+    );
+}
+
+#[test]
+fn the_cache_only_path_stops_serving_a_rejected_token() {
+    // `cached_token` is what a binding serves while one of the auth's
+    // callbacks holds the acquisition lock. It cannot refresh, so it must
+    // report no token -- the transport retries once the callback returns --
+    // rather than hand back the token the server just refused.
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let mock = rejection_mock(Arc::clone(&refreshes));
+    let auth = explicit_auth(&mock, false);
+    auth.sign_in().unwrap();
+
+    let cached = crate::token_provider::with_rejected_credential(Some("Bearer AT-initial"), || {
+        auth.cached_token()
+    });
+    assert!(cached.is_none(), "served the rejected token: {cached:?}");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    // The next ordinary pull refreshes it.
+    assert_eq!(auth.token().unwrap(), "AT-refreshed-1");
+}

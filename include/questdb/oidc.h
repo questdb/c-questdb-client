@@ -901,7 +901,18 @@ bool questdb_error_oidc_get_view(
  * interactive device flow from flush/connect/reconnect. Call
  * questdb_oidc_auth_sign_in before starting the sender; if another explicit
  * sign-in later becomes necessary, the transport reports
- * QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED.
+ * QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED. An HTTP flush, or a QWP/WS connect
+ * the caller waits for, fails with it. A QWP/WS background reconnect keeps
+ * retrying instead, so that queued frames survive until someone signs in: it
+ * reports each failed attempt as a `credential_unavailable` connection event,
+ * and an ACK wait (`line_sender_qwpws_wait`) that times out meanwhile fails
+ * with `line_sender_error_failover_retry` carrying the OIDC detail.
+ *
+ * A server that answers HTTP 401 makes the transport resolve the token once
+ * more and replay the request or handshake if it changed. If the server
+ * rejected a token before it expired -- it was revoked, or the server rotated
+ * its signing key -- that re-resolution refreshes it instead of presenting it
+ * again, at most once every 30 seconds per auth.
  *
  * Mutually exclusive with static credentials: the opts must not also carry
  * `username`/`password` or `token` (whether set through the config string or

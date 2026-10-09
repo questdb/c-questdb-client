@@ -9877,6 +9877,65 @@ fn sf_pool_borrow_with_retry_retries_an_all_replica_role_reject_until_budget() {
     assert!(attempts > 2, "only {attempts} connect attempts");
 }
 
+#[cfg(feature = "_oidc")]
+#[test]
+fn pooled_lease_wait_names_a_credential_that_blocks_its_reconnect() {
+    // A pooled store-and-forward lease whose reconnect cannot get a token --
+    // the credential needs a new sign-in -- must time out naming that, with the
+    // OIDC detail, rather than blaming a live server for not acknowledging.
+    let server = MockServer::spawn_reconnecting(8);
+    let conf = conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;",
+    );
+    let lapsed = Arc::new(AtomicBool::new(false));
+    let db = QuestDb::connect_with_handlers_and_token_provider(
+        &conf,
+        crate::db::ConnectHandlers::default(),
+        {
+            let lapsed = Arc::clone(&lapsed);
+            move || {
+                if lapsed.load(Ordering::SeqCst) {
+                    Err(crate::Error::from(
+                        crate::oidc::OidcError::interaction_required(
+                            "No usable cached or refreshable OIDC token is available. \
+                             Call sign_in() explicitly before starting the transport.",
+                        ),
+                    ))
+                } else {
+                    Ok("tok".to_string())
+                }
+            }
+        },
+    )
+    .unwrap();
+    let mut sender = db.borrow_sender().expect("SFA borrow");
+    let mut buffer = one_symbol_buffer(&db, "alpha");
+
+    // The mock reads the frame and drops the connection, so the lease must
+    // reconnect -- with a credential that has lapsed meanwhile.
+    lapsed.store(true, Ordering::SeqCst);
+    sender.flush_buffer_and_get_fsn(&mut buffer).unwrap();
+    let err = sender
+        .wait(AckLevel::Ok, Duration::from_millis(800))
+        .expect_err("no ACK can arrive while the lease cannot reconnect");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{err}");
+    assert!(!err.in_doubt(), "{err}");
+    assert_eq!(
+        err.oidc_error().map(crate::oidc::OidcError::kind),
+        Some(crate::oidc::OidcErrorKind::InteractionRequired),
+        "{err}"
+    );
+    assert!(err.msg().contains("reconnecting keeps failing"), "{err}");
+    assert!(!err.msg().contains("the connection is alive"), "{err}");
+
+    // Signed in again: the queued frame drains.
+    lapsed.store(false, Ordering::SeqCst);
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(10))
+        .expect("the frame must drain once a token is available");
+}
+
 #[test]
 fn pooled_lease_wait_inside_auth_callback_is_rejected() {
     // A pooled store-and-forward lease waits through its own ACK loop. When

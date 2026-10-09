@@ -169,7 +169,10 @@ void questdb_db_connect_options_init(
  * reconnect; the caller may free its auth handle after this call returns.
  * Provider calls may load or silently refresh a token but never start an
  * interactive device flow. Call questdb_oidc_auth_sign_in before opening the
- * pool; otherwise token acquisition reports InteractionRequired.
+ * pool; otherwise token acquisition reports InteractionRequired. After a
+ * handshake 401 for a token that had not expired, the one re-resolution a
+ * connect makes refreshes it rather than presenting it again (at most once
+ * every 30 seconds per auth).
  * `oidc_auth` is mutually exclusive with static credentials: `conf` must not
  * also set `username`/`password` or `token`. Setting both fails with
  * `questdb_error_config_error`.

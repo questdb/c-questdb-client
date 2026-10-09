@@ -2130,7 +2130,11 @@ typedef enum qwpws_ack_level
  * Returns `false` and sets `err_out` on the no-progress timeout
  * (`line_sender_error_failover_retry`), a server rejection, a transport
  * failure, or an invalid `ack_level`. With nothing published yet it succeeds
- * immediately.
+ * immediately. A timeout while the sender is disconnected and reconnecting
+ * keeps failing names that failure, and carries its OIDC detail when an
+ * attached OIDC auth could not supply a token (`questdb_error_oidc_get_view`
+ * reports `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` when a new sign-in is
+ * needed). The published frames stay queued either way.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_wait(

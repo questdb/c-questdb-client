@@ -35,14 +35,15 @@ use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use rustls_pki_types::pem::PemObject;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::time::{Duration as TimeoutAfter, Instant as TimeoutClock};
 use ureq::unversioned::transport::{
-    Buffers, Connector, Either, LazyBuffers, NextTimeout, TcpConnector, Transport, TransportAdapter,
+    Buffers, Connector, Either, LazyBuffers, NextTimeout, TcpConnector, Transport,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -550,6 +551,22 @@ struct DispatchTrackingTransport<T> {
     inner: T,
 }
 
+/// Fail an I/O call that ureq hands an already-elapsed request deadline.
+///
+/// ureq checks the global deadline only before each redirect attempt; within
+/// one it recomputes the remaining time per transport call, and a remaining
+/// time of zero reaches the transport as a timeout of exactly zero, which its
+/// TCP transport turns into a one-second socket timeout (`not_zero`). A peer
+/// that kept sending a byte a second therefore held a request open forever
+/// once its deadline had passed. Refusing the call keeps every request -- TLS
+/// or plaintext -- inside the configured timeout.
+fn refuse_elapsed_deadline(timeout: NextTimeout) -> std::result::Result<(), ureq::Error> {
+    match timeout.after {
+        TimeoutAfter::Exact(after) if after.is_zero() => Err(ureq::Error::Timeout(timeout.reason)),
+        _ => Ok(()),
+    }
+}
+
 impl<T: Transport> Transport for DispatchTrackingTransport<T> {
     fn buffers(&mut self) -> &mut dyn Buffers {
         self.inner.buffers()
@@ -561,6 +578,9 @@ impl<T: Transport> Transport for DispatchTrackingTransport<T> {
         timeout: NextTimeout,
     ) -> std::result::Result<(), ureq::Error> {
         if amount > 0 {
+            // Before marking the request dispatched: a request that times out
+            // here has provably sent nothing.
+            refuse_elapsed_deadline(timeout)?;
             // Set before the write: a write that fails part-way may already
             // have delivered the request.
             REQUEST_DISPATCHED.with(|dispatched| dispatched.set(true));
@@ -572,10 +592,18 @@ impl<T: Transport> Transport for DispatchTrackingTransport<T> {
         &mut self,
         timeout: NextTimeout,
     ) -> std::result::Result<bool, ureq::Error> {
+        // Input already buffered needs no I/O, so serve it even past the
+        // deadline: the response is complete.
+        if !self.inner.buffers().can_use_input() {
+            refuse_elapsed_deadline(timeout)?;
+        }
         self.inner.maybe_await_input(timeout)
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        if !self.inner.buffers().can_use_input() {
+            refuse_elapsed_deadline(timeout)?;
+        }
         self.inner.await_input(timeout)
     }
 
@@ -889,12 +917,14 @@ impl<In: Transport> Connector<In> for TlsConnector {
             .map_err(|_e| ureq::Error::Tls("tls client connection error"))?;
         let mut stream = StreamOwned {
             conn,
-            sock: TransportAdapter::new(transport.boxed()),
+            sock: DeadlineAdapter::new(transport.boxed()),
         };
         // Complete the handshake here rather than lazily on the first request
         // write, so a handshake failure surfaces before `DispatchTracker` sees
-        // any request byte: the request is then provably unsent.
-        stream.sock.set_timeout(details.timeout);
+        // any request byte: the request is then provably unsent. The deadline
+        // is measured from when ureq computed this connect timeout, so the
+        // TCP connect it already covered is not granted a second time.
+        stream.sock.arm_from(details.now, details.timeout);
         while stream.conn.is_handshaking() {
             let (read, written) = stream
                 .conn
@@ -915,9 +945,110 @@ impl<In: Transport> Connector<In> for TlsConnector {
     }
 }
 
+/// The `std::io` view rustls drives a ureq transport through, bounded by one
+/// absolute deadline across every read and write it makes.
+///
+/// ureq's own `TransportAdapter` hands each underlying I/O call the same
+/// relative `NextTimeout`, and rustls makes many of them per operation: the
+/// whole handshake in [`TlsConnector::connect`], and as many reads as one TLS
+/// record needs inside a single `read`. Each read then got a fresh full
+/// timeout, so an IdP -- or anything between it and the client -- that sent
+/// one byte just inside the timeout held the handshake or response open
+/// without limit: a sign-in, a `token()` refresh still holding the
+/// cross-process token-store lock, or a flush waiting on either. Converting the
+/// timeout to a deadline once per operation, and handing the transport only
+/// the time left before it, keeps the request inside the configured timeout.
+struct DeadlineAdapter {
+    transport: Box<dyn Transport>,
+    /// `None`: the operation has no deadline.
+    deadline: Option<Instant>,
+    reason: ureq::Timeout,
+}
+
+impl DeadlineAdapter {
+    fn new(transport: Box<dyn Transport>) -> Self {
+        Self {
+            transport,
+            deadline: None,
+            reason: ureq::Timeout::Global,
+        }
+    }
+
+    /// Bound the following I/O by `timeout`, counted from `start`.
+    fn arm_from(&mut self, start: TimeoutClock, timeout: NextTimeout) {
+        let start = match start {
+            TimeoutClock::Exact(start) => start,
+            _ => Instant::now(),
+        };
+        self.reason = timeout.reason;
+        self.deadline = match timeout.after {
+            // An unrepresentable deadline is one that never arrives.
+            TimeoutAfter::Exact(after) => start.checked_add(after),
+            TimeoutAfter::NotHappening => None,
+        };
+    }
+
+    /// Bound the following I/O by `timeout`, counted from now.
+    fn arm(&mut self, timeout: NextTimeout) {
+        self.arm_from(TimeoutClock::now(), timeout);
+    }
+
+    /// The timeout for one I/O call: whatever is left of the deadline, or a
+    /// timeout error once nothing is.
+    fn remaining(&self) -> std::io::Result<NextTimeout> {
+        let after = match self.deadline {
+            None => TimeoutAfter::NotHappening,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(ureq::Error::Timeout(self.reason).into_io());
+                }
+                TimeoutAfter::Exact(left)
+            }
+        };
+        Ok(NextTimeout {
+            after,
+            reason: self.reason,
+        })
+    }
+}
+
+impl Read for DeadlineAdapter {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.transport.buffers().can_use_input() {
+            let timeout = self.remaining()?;
+            self.transport
+                .await_input(timeout)
+                .map_err(ureq::Error::into_io)?;
+        }
+        let input = self.transport.buffers().input();
+        let max = buf.len().min(input.len());
+        buf[..max].copy_from_slice(&input[..max]);
+        self.transport.buffers().input_consume(max);
+        Ok(max)
+    }
+}
+
+impl Write for DeadlineAdapter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let timeout = self.remaining()?;
+        let output = self.transport.buffers().output();
+        let max = buf.len().min(output.len());
+        output[..max].copy_from_slice(&buf[..max]);
+        self.transport
+            .transmit_output(max, timeout)
+            .map_err(ureq::Error::into_io)?;
+        Ok(max)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 struct TlsTransport {
     buffers: LazyBuffers,
-    stream: StreamOwned<ClientConnection, TransportAdapter>,
+    stream: StreamOwned<ClientConnection, DeadlineAdapter>,
 }
 
 impl Debug for TlsTransport {
@@ -936,7 +1067,7 @@ impl Transport for TlsTransport {
         amount: usize,
         timeout: NextTimeout,
     ) -> std::result::Result<(), ureq::Error> {
-        self.stream.get_mut().set_timeout(timeout);
+        self.stream.get_mut().arm(timeout);
         let output = &self.buffers.output()[..amount];
         self.stream.write_all(output)?;
         Ok(())
@@ -946,7 +1077,7 @@ impl Transport for TlsTransport {
         if self.buffers.can_use_input() {
             return Ok(true);
         }
-        self.stream.get_mut().set_timeout(timeout);
+        self.stream.get_mut().arm(timeout);
         let input = self.buffers.input_append_buf();
         let amount = self.stream.read(input)?;
         self.buffers.input_appended(amount);
@@ -954,7 +1085,7 @@ impl Transport for TlsTransport {
     }
 
     fn is_open(&mut self) -> bool {
-        self.stream.get_mut().get_mut().is_open()
+        self.stream.get_mut().transport.is_open()
     }
 
     fn is_tls(&self) -> bool {
@@ -1206,6 +1337,262 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "the 3s budget overrode the 150ms request timeout: {elapsed:?}"
         );
+    }
+
+    /// Which TLS record a [`DripServer`] connection sends one byte at a time.
+    #[derive(Clone, Copy)]
+    enum Drip {
+        /// The reply to the ClientHello: a handshake record whose 16 KiB body
+        /// never finishes arriving.
+        TlsHandshake,
+        /// After a completed handshake and request, the one record that
+        /// carries the whole response.
+        TlsResponse,
+    }
+
+    /// A peer that keeps one connection alive by sending a byte every
+    /// [`Self::BYTE_INTERVAL`], always well inside the client's per-read
+    /// timeout. rustls assembles a TLS record from as many reads as it takes,
+    /// all inside one transport call, so dripping a single record is what a
+    /// per-read timeout cannot bound.
+    struct DripServer {
+        addr: SocketAddr,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl DripServer {
+        const BYTE_INTERVAL: Duration = Duration::from_millis(20);
+        /// Long enough that a client bounded only per read is still waiting,
+        /// short enough that a regression fails the elapsed-time assertion
+        /// instead of hanging the suite.
+        const MAX_DRIP: Duration = Duration::from_secs(6);
+
+        fn start(bind: &str, drip: Drip) -> Self {
+            let listener = TcpListener::bind(bind).expect("bind drip server");
+            let addr = listener.local_addr().expect("drip server address");
+            listener
+                .set_nonblocking(true)
+                .expect("set drip listener nonblocking");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let handle = {
+                let shutdown = Arc::clone(&shutdown);
+                thread::spawn(move || {
+                    while !shutdown.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                Self::drip(stream, drip, &shutdown);
+                                return;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                })
+            };
+            DripServer {
+                addr,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn drip(tcp: TcpStream, drip: Drip, shutdown: &AtomicBool) {
+            let mut tcp = tcp;
+            tcp.set_nonblocking(false).ok();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+            let started = std::time::Instant::now();
+            let keep_going =
+                || !shutdown.load(Ordering::SeqCst) && started.elapsed() < Self::MAX_DRIP;
+            let record = match drip {
+                Drip::TlsHandshake => {
+                    let mut hello = [0u8; 4096];
+                    let _ = tcp.read(&mut hello);
+                    // A handshake record header announcing 16 KiB of body.
+                    let mut record = vec![0x16, 0x03, 0x03, 0x40, 0x00];
+                    record.resize(5 + 0x4000, 0);
+                    record
+                }
+                Drip::TlsResponse => {
+                    let Ok(mut conn) = ServerConnection::new(tls_server_config()) else {
+                        return;
+                    };
+                    if !Self::read_request_head(&mut rustls::Stream::new(&mut conn, &mut tcp)) {
+                        return;
+                    }
+                    // A response whose head and body share one record, so the
+                    // client sees nothing until the whole record has arrived.
+                    let body = format!(r#"{{"pad":"{}"}}"#, "a".repeat(2000));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if conn.writer().write_all(response.as_bytes()).is_err() {
+                        return;
+                    }
+                    let mut record = Vec::new();
+                    while conn.wants_write() {
+                        if conn.write_tls(&mut record).is_err() {
+                            return;
+                        }
+                    }
+                    record
+                }
+            };
+            for byte in record {
+                if !keep_going() || tcp.write_all(&[byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Self::BYTE_INTERVAL);
+            }
+        }
+
+        fn read_request_head(stream: &mut impl Read) -> bool {
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                }
+            }
+            true
+        }
+    }
+
+    impl Drop for DripServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// POST to a peer that keeps sending a byte well inside the per-read
+    /// timeout: the request as a whole must still end at the configured
+    /// timeout rather than when the peer stops.
+    fn post_to_drip(url: &str) -> (OidcError, Duration) {
+        let client = HttpClient::new(Some(&root_ca_path()), Duration::from_millis(400)).unwrap();
+        let started = std::time::Instant::now();
+        match client.post_form(url, &[("grant_type", "refresh_token")], false) {
+            Ok(_) => panic!("a peer that never finishes its reply must time out"),
+            Err(error) => (error, started.elapsed()),
+        }
+    }
+
+    #[test]
+    fn tls_handshake_dripped_byte_by_byte_ends_at_the_request_timeout() {
+        let server = DripServer::start("localhost:0", Drip::TlsHandshake);
+        let (error, elapsed) =
+            post_to_drip(&format!("https://localhost:{}/token", server.addr.port()));
+        assert!(error.request_timed_out(), "unexpected error: {error}");
+        // The handshake runs before any request byte, so a refresh token in
+        // the body is provably unsent and may be retried.
+        assert!(error.request_unsent(), "unexpected error: {error}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a dripping handshake outlived the 400ms request timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn tls_response_record_dripped_byte_by_byte_ends_at_the_request_timeout() {
+        let server = DripServer::start("localhost:0", Drip::TlsResponse);
+        let (error, elapsed) =
+            post_to_drip(&format!("https://localhost:{}/token", server.addr.port()));
+        assert!(error.request_timed_out(), "unexpected error: {error}");
+        assert!(!error.request_unsent(), "unexpected error: {error}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a dripping TLS response outlived the 400ms request timeout: {elapsed:?}"
+        );
+    }
+
+    /// A transport that records the I/O it is asked to do and performs none.
+    #[derive(Debug)]
+    struct RecordingTransport {
+        buffers: LazyBuffers,
+        io_calls: usize,
+    }
+
+    impl RecordingTransport {
+        fn new() -> Self {
+            Self {
+                buffers: LazyBuffers::new(64, 64),
+                io_calls: 0,
+            }
+        }
+    }
+
+    impl Transport for RecordingTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(
+            &mut self,
+            _amount: usize,
+            _timeout: NextTimeout,
+        ) -> std::result::Result<(), ureq::Error> {
+            self.io_calls += 1;
+            Ok(())
+        }
+
+        fn await_input(&mut self, _timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+            self.io_calls += 1;
+            Ok(true)
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn an_elapsed_request_deadline_is_refused_rather_than_extended() {
+        // ureq passes an elapsed deadline down as a timeout of exactly zero,
+        // which its TCP transport would turn into a fresh one-second socket
+        // timeout -- for a plaintext request, after every byte.
+        let elapsed = NextTimeout {
+            after: TimeoutAfter::Exact(Duration::ZERO),
+            reason: ureq::Timeout::Global,
+        };
+        let mut transport = DispatchTrackingTransport {
+            inner: RecordingTransport::new(),
+        };
+
+        REQUEST_DISPATCHED.with(|dispatched| dispatched.set(false));
+        assert!(matches!(
+            transport.transmit_output(1, elapsed),
+            Err(ureq::Error::Timeout(ureq::Timeout::Global))
+        ));
+        assert!(
+            !REQUEST_DISPATCHED.with(Cell::get),
+            "a request refused before its first byte is provably unsent"
+        );
+        assert!(matches!(
+            transport.await_input(elapsed),
+            Err(ureq::Error::Timeout(ureq::Timeout::Global))
+        ));
+        assert!(matches!(
+            transport.maybe_await_input(elapsed),
+            Err(ureq::Error::Timeout(ureq::Timeout::Global))
+        ));
+        assert_eq!(transport.inner.io_calls, 0);
+
+        // Input that has already arrived needs no I/O and is still served: here
+        // ureq parsed one of two buffered bytes and will ask for the next.
+        let buffers = transport.buffers();
+        buffers.input_append_buf()[..2].copy_from_slice(b"xy");
+        buffers.input_appended(2);
+        buffers.input_consume(1);
+        assert!(transport.maybe_await_input(elapsed).unwrap());
+        assert_eq!(transport.inner.io_calls, 0);
     }
 
     #[test]

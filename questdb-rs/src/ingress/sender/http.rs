@@ -558,7 +558,10 @@ fn rotated_auth_after_401(
     let mut retry_interval_ms = 10i32;
     let mut rng = rand::rng();
     let value = loop {
-        match state.auth.resolve() {
+        // Tell the provider which token the server rejected: a cache-first
+        // provider such as `OidcDeviceAuth` would otherwise hand back that very
+        // token, and the 401 would stand until it neared expiry.
+        match crate::token_provider::with_rejected_credential(used, || state.auth.resolve()) {
             Ok(Some(value)) => break value.into_owned(),
             Ok(None) => return Ok(None),
             Err(e) => {

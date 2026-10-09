@@ -2362,15 +2362,25 @@ fn open_regular_bounded(path: &Path) -> TokenStoreResult<Option<(File, u64)>> {
     Ok(Some((file, meta.len())))
 }
 
-/// SHA-256 hex digest using the crate's configured crypto provider.
+/// SHA-256 digest using the crate's configured crypto provider.
 #[cfg(feature = "ring-crypto")]
-fn sha256_hex(input: &[u8]) -> String {
-    to_hex(ring::digest::digest(&ring::digest::SHA256, input).as_ref())
+pub(crate) fn sha256(input: &[u8]) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, input).as_ref());
+    digest
 }
 
 #[cfg(all(feature = "aws-lc-crypto", not(feature = "ring-crypto")))]
+pub(crate) fn sha256(input: &[u8]) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, input).as_ref());
+    digest
+}
+
+/// SHA-256 hex digest using the crate's configured crypto provider.
+#[cfg(any(feature = "ring-crypto", feature = "aws-lc-crypto"))]
 fn sha256_hex(input: &[u8]) -> String {
-    to_hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, input).as_ref())
+    to_hex(&sha256(input))
 }
 
 fn to_hex(bytes: &[u8]) -> String {

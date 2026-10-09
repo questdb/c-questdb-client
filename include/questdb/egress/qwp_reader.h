@@ -192,7 +192,10 @@ qwp_reader* qwp_reader_from_conf(
  * Bearer-token provider. The reader retains shared ownership of the auth state,
  * so the caller may free its auth handle after this call returns. Provider
  * calls may load or silently refresh a token but never start an interactive
- * device flow; call questdb_oidc_auth_sign_in before opening the reader.
+ * device flow; call questdb_oidc_auth_sign_in before opening the reader. After
+ * a handshake 401 for a token that had not expired, the one re-resolution a
+ * connect makes refreshes it rather than presenting it again (at most once
+ * every 30 seconds per auth).
  * Mutually exclusive with static credentials: `config` must not also set
  * `username`/`password` or `token`. Setting both fails with
  * `questdb_error_config_error`. An `auth` already closed with

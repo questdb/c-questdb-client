@@ -1073,8 +1073,10 @@ impl ReaderConfig {
     /// endpoint walk, so a long-lived reader keeps working as the token silently
     /// refreshes / rotates. The acquired token is reused for every endpoint tried
     /// within that walk; after one handshake 401 it is resolved once more and
-    /// the same endpoint is replayed only if the value changed. A later reconnect
-    /// round pulls a fresh one. The token is sent as the `Authorization: Bearer <token>` handshake header; a token with
+    /// the same endpoint is replayed only if the value changed.
+    /// `OidcDeviceAuth::token` answers that re-resolution with a refreshed
+    /// token when the server rejected its cached one before it expired, at most
+    /// once every 30 seconds. A later reconnect round pulls a fresh one. The token is sent as the `Authorization: Bearer <token>` handshake header; a token with
     /// a non-printable-ASCII character (a header-injection vector) is rejected,
     /// and a provider error fails that walk before DNS or TCP work. Provider
     /// acquisition failures are retryable because the callback may recover on its

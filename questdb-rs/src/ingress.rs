@@ -1602,7 +1602,11 @@ impl SenderBuilder {
     /// `ConfigError`). In unwind-enabled builds a callback panic is contained and treated
     /// as such a retryable failure (a `panic = "abort"` build cannot contain
     /// panics). A server rejection of a successfully acquired token is a separate
-    /// terminal authentication error. Mutually exclusive with
+    /// terminal authentication error, after one exception per flush: a request
+    /// answered with HTTP 401 resolves the provider again and is replayed if
+    /// the token changed. `OidcDeviceAuth::token` answers that re-resolution
+    /// with a refreshed token when the server rejected its cached one before it
+    /// expired, at most once every 30 seconds. Mutually exclusive with
     /// [`username`](Self::username) / [`password`](Self::password) /
     /// [`token`](Self::token); ILP/HTTP only.
     ///
@@ -1661,6 +1665,9 @@ impl SenderBuilder {
     /// provider is called once at each connect/reconnect endpoint walk. That
     /// value is reused across endpoint failover; after one handshake 401 it is
     /// resolved once more and the same endpoint is replayed only if it changed.
+    /// `OidcDeviceAuth::token` answers that re-resolution with a refreshed
+    /// token when the server rejected its cached one before it expired, at most
+    /// once every 30 seconds.
     /// Thus a long-lived sender keeps working as the token rotates. The returned token
     /// is sent as the `Authorization: Bearer <token>` handshake header; a token
     /// with a non-printable-ASCII character (a header-injection vector) is

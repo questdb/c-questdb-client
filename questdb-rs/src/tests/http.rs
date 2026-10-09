@@ -965,6 +965,63 @@ fn test_credential_rotation_budget_is_one_per_flush() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "_oidc")]
+#[test]
+fn test_401_re_resolution_names_the_rejected_token() -> TestResult {
+    // A cache-first provider such as `OidcDeviceAuth` answers the
+    // re-resolution after a 401 from the same cache, so it must be told which
+    // token was refused or it hands that token straight back and the 401
+    // stands. This provider changes its answer only when told.
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(|| {
+            Ok::<_, crate::Error>(crate::token_provider::inspect_rejected_token(|rejected| {
+                if rejected == Some("tok-initial") {
+                    "tok-refreshed".to_string()
+                } else {
+                    "tok-initial".to_string()
+                }
+            }))
+        })?
+        .retry_timeout(Duration::from_secs(5))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let expected_body = buffer.as_bytes().to_vec();
+
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok-initial"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok-refreshed"));
+        assert_eq!(req.body(), expected_body.as_slice());
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(())
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+    server_thread.join().unwrap()?;
+    res?;
+    // The mark lives only for the re-resolution; the next pull is ordinary.
+    assert_eq!(
+        crate::token_provider::inspect_rejected_token(|rejected| rejected.map(str::to_owned)),
+        None
+    );
+    Ok(())
+}
+
 #[test]
 fn test_credential_rotation_keeps_retry_backoff() -> TestResult {
     // Regression: `retry_http_send`'s credential-rotation branch used to make

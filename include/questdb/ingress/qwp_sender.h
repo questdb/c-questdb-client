@@ -1657,7 +1657,12 @@ bool qwp_sender_error_events_dropped(
  * instead of being undefined behaviour at the language boundary.
  *
  * `timeout_millis` is the no-progress deadline (it fires only if the ack
- * watermark fails to advance for that long); `0` waits indefinitely.
+ * watermark fails to advance for that long); `0` waits indefinitely. It fails
+ * the call with `line_sender_error_failover_retry` and leaves the frames
+ * queued. If the borrow is disconnected and reconnecting keeps failing, the
+ * error names that failure and carries its OIDC detail when an attached OIDC
+ * auth could not supply a token (`questdb_error_oidc_get_view` reports
+ * `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` when a new sign-in is needed).
  */
 QUESTDB_CLIENT_API
 bool qwp_sender_wait(

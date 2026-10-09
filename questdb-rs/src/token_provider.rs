@@ -221,6 +221,86 @@ pub fn token_pull_must_not_block() -> bool {
     false
 }
 
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+thread_local! {
+    /// The token a server has just rejected with HTTP 401, while the transport
+    /// that presented it pulls a replacement. See [`with_rejected_credential`].
+    static REJECTED_TOKEN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `pull` -- a transport re-resolving its credential after a server
+/// answered HTTP 401 -- with the calling thread marked as replacing
+/// `rejected`, the `Authorization` value it had presented (`Bearer <token>`).
+///
+/// A provider is a plain closure, so this is how the rejection reaches an
+/// [`OidcDeviceAuth`](crate::oidc::OidcDeviceAuth) the closure calls: its
+/// cache stops serving that token and it refreshes instead (see
+/// `OidcDeviceAuth::token`). Without it the re-resolution was answered from
+/// the same cache, every 401 for a token the client still considered valid
+/// stood, and the client kept presenting the rejected token until it neared
+/// expiry. Isolated acquisitions carry the mark to their worker thread.
+/// A provider that never consults it is unaffected.
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+pub(crate) fn with_rejected_credential<R>(rejected: Option<&str>, pull: impl FnOnce() -> R) -> R {
+    let token = rejected
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    with_rejected_token(token, pull)
+}
+
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+fn with_rejected_token<R>(token: Option<String>, pull: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                let _ = REJECTED_TOKEN.try_with(|cell| *cell.borrow_mut() = previous);
+            }
+        }
+    }
+    let _restore = Restore(REJECTED_TOKEN.try_with(|cell| cell.replace(token)).ok());
+    pull()
+}
+
+/// The token a server rejected, if the calling thread is pulling its
+/// replacement (see [`with_rejected_credential`]).
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+fn rejected_token() -> Option<String> {
+    REJECTED_TOKEN
+        .try_with(|cell| cell.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Call `inspect` with the token a server rejected, if the calling thread is
+/// pulling its replacement (see [`with_rejected_credential`]).
+#[cfg(feature = "_oidc")]
+pub(crate) fn inspect_rejected_token<R>(inspect: impl FnOnce(Option<&str>) -> R) -> R {
+    let mut inspect = Some(inspect);
+    let seen = REJECTED_TOKEN.try_with(|cell| {
+        let inspect = inspect.take().expect("inspect runs once");
+        inspect(cell.borrow().as_deref())
+    });
+    match seen {
+        Ok(result) => result,
+        // The thread is shutting down: no rejection to report.
+        Err(_) => (inspect.take().expect("inspect runs once"))(None),
+    }
+}
+
 /// User-facing text for "a rotating token provider and static credentials were
 /// both configured".
 ///
@@ -547,10 +627,25 @@ impl TokenProvider {
         &self,
         cancelled: impl Fn() -> bool,
     ) -> crate::Result<String> {
+        let rejected = rejected_token();
+        let mut restarted_after_rejection = false;
         loop {
-            if let Some(result) = self.bearer_header_isolated_attempt(&cancelled) {
-                return result;
+            let Some(result) = self.bearer_header_isolated_attempt(&cancelled) else {
+                continue;
+            };
+            // Re-resolving after a 401, this caller may have joined an
+            // acquisition that started before the rejection and so hands back
+            // the rejected token. Lead one fresh acquisition, which carries the
+            // rejection to its worker; if the provider still answers with the
+            // same token, that is its answer.
+            if !restarted_after_rejection
+                && let (Some(rejected), Ok(header)) = (rejected.as_deref(), &result)
+                && header.strip_prefix("Bearer ") == Some(rejected)
+            {
+                restarted_after_rejection = true;
+                continue;
             }
+            return result;
         }
     }
 
@@ -666,11 +761,14 @@ impl TokenProvider {
         // normal return, unwind-enabled panic, or spawn failure.
         let provider = self.clone();
         let published = Arc::clone(slot);
+        // A pull that replaces a rejected credential must say so on the
+        // worker's thread too: that is where the provider runs.
+        let rejected = rejected_token();
         if let Err(err) = std::thread::Builder::new()
             .name("questdb-token-provider".to_string())
             .spawn(move || {
                 let _permit = permit;
-                let result = provider.bearer_header();
+                let result = with_rejected_token(rejected, || provider.bearer_header());
                 provider.publish_isolated(&published, result);
             })
         {
@@ -1689,6 +1787,100 @@ mod tests {
                 token == "Bearer shared-token" || token == "Bearer unused",
                 "unexpected drained token: {token}"
             );
+        }
+
+        /// A provider that answers `fresh` only when told the server refused
+        /// `stale`, as a cache-first `OidcDeviceAuth` does.
+        #[cfg(feature = "_oidc")]
+        fn answer(rejected: Option<&str>) -> String {
+            if rejected == Some("stale") {
+                "fresh".to_string()
+            } else {
+                "stale".to_string()
+            }
+        }
+
+        #[cfg(feature = "_oidc")]
+        #[test]
+        fn an_isolated_pull_after_a_401_names_the_rejected_token_on_its_worker() {
+            // The provider runs on the worker thread, so that is where it must
+            // learn which token the server refused.
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let provider = TokenProvider::new({
+                let seen = Arc::clone(&seen);
+                move || {
+                    let rejected = crate::token_provider::inspect_rejected_token(|rejected| {
+                        rejected.map(str::to_owned)
+                    });
+                    let on_worker = std::thread::current().name() == Some("questdb-token-provider");
+                    seen.lock().unwrap().push((rejected.clone(), on_worker));
+                    Ok::<_, crate::Error>(answer(rejected.as_deref()))
+                }
+            });
+            let header =
+                crate::token_provider::with_rejected_credential(Some("Bearer stale"), || {
+                    provider.bearer_header_isolated_until(|| false)
+                })
+                .unwrap();
+            assert_eq!(header, "Bearer fresh");
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![(Some("stale".to_string()), true)]
+            );
+            // An ordinary pull tells the worker nothing.
+            assert_eq!(
+                provider.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer stale"
+            );
+        }
+
+        #[cfg(feature = "_oidc")]
+        #[test]
+        fn a_re_resolution_that_joins_an_older_acquisition_starts_a_fresh_one() {
+            // An acquisition that began before the server refused its token
+            // was told nothing, and hands that token to every caller that
+            // joined it. A re-resolution after the 401 must not take it as the
+            // provider's answer.
+            let started = Arc::new(Gate::default());
+            let release = Arc::new(Gate::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = TokenProvider::new({
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                let calls = Arc::clone(&calls);
+                move || {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        started.signal();
+                        release.wait();
+                    }
+                    Ok::<_, crate::Error>(answer(
+                        crate::token_provider::inspect_rejected_token(|rejected| {
+                            rejected.map(str::to_owned)
+                        })
+                        .as_deref(),
+                    ))
+                }
+            });
+            let lead = {
+                let provider = provider.clone();
+                std::thread::spawn(move || provider.bearer_header_isolated_until(|| false))
+            };
+            started.wait();
+            let re_resolution = {
+                let provider = provider.clone();
+                std::thread::spawn(move || {
+                    crate::token_provider::with_rejected_credential(Some("Bearer stale"), || {
+                        provider.bearer_header_isolated_until(|| false)
+                    })
+                })
+            };
+            // Let the re-resolution join the acquisition still in flight.
+            std::thread::sleep(Duration::from_millis(100));
+            release.signal();
+
+            assert_eq!(lead.join().unwrap().unwrap(), "Bearer stale");
+            assert_eq!(re_resolution.join().unwrap().unwrap(), "Bearer fresh");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
         }
 
         #[test]

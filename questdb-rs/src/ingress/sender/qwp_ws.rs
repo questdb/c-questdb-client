@@ -950,6 +950,14 @@ where
         Ok(())
     }
 
+    /// Why the runner's latest attempt to (re)connect failed, while it has no
+    /// connection.
+    fn reconnect_failure(&self) -> Option<crate::Error> {
+        self.lock_shared()
+            .ok()
+            .and_then(|store| store.reconnect_failure().cloned())
+    }
+
     fn published_fsn(&self) -> crate::Result<Option<u64>> {
         self.check_error()?;
         if let Some(producer) = self.producer.as_ref() {
@@ -1213,9 +1221,11 @@ impl QwpWsPendingConnect {
         }
     }
 
+    /// `on_failure` sees each failed attempt that will be retried.
     fn connect_with_retry(
         &self,
         stop: &AtomicBool,
+        on_failure: &dyn Fn(&crate::Error),
     ) -> Result<Option<BlockingQwpWsTransport>, crate::Error> {
         let started = Instant::now();
         let deadline = started.checked_add(self.reconnect_policy.max_duration());
@@ -1261,6 +1271,7 @@ impl QwpWsPendingConnect {
                 }
                 Err(err) if reconnect_error_is_terminal(&err) => return Err(err),
                 Err(err) => {
+                    on_failure(&err);
                     let role_reject = is_qwp_ws_role_reject_error(&err);
                     last_error = Some(err);
                     let sleep_for = reconnect_sleep_duration(
@@ -1306,8 +1317,21 @@ impl SyncQwpWsPendingRunnerCore {
             return connected.drive_step(shared, stop);
         }
 
-        match self.pending_connect.connect_with_retry(stop) {
+        // An ACK wait that times out before the first connection reports why
+        // connecting keeps failing, exactly as after a later drop.
+        let record_failure = |err: &crate::Error| {
+            if let Ok(mut store) = shared.lock() {
+                store.record_reconnect_failure(err);
+            }
+        };
+        match self
+            .pending_connect
+            .connect_with_retry(stop, &record_failure)
+        {
             Ok(Some(transport)) => {
+                if let Ok(mut store) = shared.lock() {
+                    store.clear_reconnect_failure();
+                }
                 let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
                     transport,
                     self.pending_connect.reconnect_policy,
@@ -1882,12 +1906,20 @@ where
                 Ok(QwpWsReconnectStep::RetryAfter {
                     sleep_for: retry_sleep,
                 }) => {
+                    if let Some(step) =
+                        self.record_reconnect_failure(shared, reconnect.last_error())
+                    {
+                        return step;
+                    }
                     deadline = reconnect.deadline();
                     sleep_for = retry_sleep;
                 }
                 Ok(QwpWsReconnectStep::Terminal(err)) => {
                     if reconnect_error_is_terminal(&err) {
                         return self.mark_store_terminal(shared, err);
+                    }
+                    if let Some(step) = self.record_reconnect_failure(shared, &err) {
+                        return step;
                     }
                     sleep_for = reconnect.initial_backoff();
                     *reconnect = reconnect.next_after_retryable_terminal(err);
@@ -1907,6 +1939,26 @@ where
             RunnerStep::Stop
         } else {
             RunnerStep::Continue
+        }
+    }
+
+    /// Latch why this reconnect attempt failed, for an ACK wait that times out
+    /// while the transport is down. `Some` only when the store lock was
+    /// poisoned and the runner must stop.
+    fn record_reconnect_failure<Q>(
+        &self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        err: &crate::Error,
+    ) -> Option<RunnerStep>
+    where
+        Q: PublicationLog,
+    {
+        match shared.lock() {
+            Ok(mut store) => {
+                store.record_reconnect_failure(err);
+                None
+            }
+            Err(_) => Some(self.handle_poisoned_lock()),
         }
     }
 
@@ -3524,8 +3576,12 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
             && let Some(provider) = qwp_ws.token_provider.as_ref()
         {
             auth_rotation_retry_used = true;
-            let rotated = match acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate)
-            {
+            // Name the rejected token, so a cache-first provider such as
+            // `OidcDeviceAuth` refreshes it rather than handing it back.
+            let rotated = match crate::token_provider::with_rejected_credential(
+                provided_header.as_deref(),
+                || acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate),
+            ) {
                 Ok(rotated) => rotated,
                 Err(err) => {
                     // A credential was already presented to this endpoint. Keep
@@ -4318,6 +4374,22 @@ pub(crate) fn qwp_ws_ok_fsn_background(
     state: &SyncQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
     state.runner.ok_fsn()
+}
+
+/// Why the background runner's latest attempt to (re)connect failed, while it
+/// has no connection.
+pub(crate) fn qwp_ws_reconnect_failure_background(
+    state: &SyncQwpWsHandlerState,
+) -> Option<crate::Error> {
+    state.runner.reconnect_failure()
+}
+
+/// Why the latest manually driven attempt to (re)connect failed, while there
+/// is no connection.
+pub(crate) fn qwp_ws_reconnect_failure_manual(
+    state: &ManualQwpWsHandlerState,
+) -> Option<crate::Error> {
+    state.store.reconnect_failure().cloned()
 }
 
 pub(crate) fn qwp_ws_published_fsn_manual(
