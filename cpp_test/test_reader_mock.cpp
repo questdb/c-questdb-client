@@ -38,6 +38,7 @@
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -774,6 +775,60 @@ TEST_CASE("mock: chrono timeout rounds a sub-millisecond value up to 1 ms")
     REQUIRE(req.size() == p + 2);
     CHECK(req[p] == qm::QUERY_FLAG_TIMEOUT);
     CHECK(req[p + 1] == 1);
+}
+
+TEST_CASE("mock: chrono timeout rejects non-finite durations")
+{
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    using ms_f = std::chrono::duration<double, std::milli>;
+    for (double v :
+         {std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::infinity()})
+    {
+        auto q = reader.prepare("X"_utf8);
+        try
+        {
+            q.timeout(ms_f{v});
+            FAIL("non-finite timeout must throw");
+        }
+        catch (const questdb::error& e)
+        {
+            CHECK(e.code() == questdb_error_invalid_api_call);
+        }
+    }
+}
+
+TEST_CASE("mock: chrono timeout saturates instead of overflowing")
+{
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    // hours::max() in milliseconds overflows int64.
+    auto cur =
+        reader.prepare("X"_utf8).timeout(std::chrono::hours::max()).execute();
+    while (cur.next_batch())
+    {
+    }
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 1);
+    const auto& req = reqs[0];
+    const size_t p = trailer_offset(1);
+    // timeout_ms = INT64_MAX (the server reads a signed long): eight 0xFF
+    // continuation bytes, then 0x7F.
+    REQUIRE(req.size() == p + 10);
+    CHECK(req[p] == qm::QUERY_FLAG_TIMEOUT);
+    for (size_t i = 1; i < 9; ++i)
+        CHECK(req[p + i] == 0xFF);
+    CHECK(req[p + 9] == 0x7F);
 }
 
 TEST_CASE("mock: chrono zero timeout clears the request")

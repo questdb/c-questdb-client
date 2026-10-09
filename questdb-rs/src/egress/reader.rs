@@ -951,8 +951,10 @@ impl<'r> ReaderQuery<'r> {
     /// applied afterwards.
     ///
     /// The server enforces it per request, so a failover replay re-sends
-    /// the full timeout rather than the remainder; the total is bounded by
-    /// [`ReaderConfig::failover_max_duration_ms`] plus one timeout.
+    /// the full timeout rather than the remainder. Nothing bounds the
+    /// query's end-to-end wall-clock:
+    /// [`ReaderConfig::failover_max_duration_ms`] only limits when a new
+    /// failover round may start.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         let ms = timeout.as_millis();
         self.timeout_ms = if ms == 0 && !timeout.is_zero() {
@@ -1200,22 +1202,8 @@ impl<'r> ReaderQuery<'r> {
             .server_info()
             .map(|info| info.capabilities)
             .unwrap_or(0);
-        let mut query_flags = 0u64;
-        if self.reset_symbol_dict && has_query_flags(capabilities) {
-            query_flags |= QUERY_FLAG_RESET_DICT;
-        }
-        if self.timeout_ms > 0 {
-            // A timeout is a correctness request, not a hint, so it does
-            // NOT degrade the way `reset_symbol_dict` does: silently
-            // dropping it would leave the caller believing it had a long
-            // budget while the server kills the query at `query.timeout`.
-            // The field rides *inside* the query_flags trailer, so both
-            // bits are required — a server advertising the timeout bit
-            // without the flags bit could not parse the frame we would
-            // send.
-            require_query_timeout(capabilities, self.timeout_ms)?;
-            query_flags |= QUERY_FLAG_TIMEOUT;
-        }
+        let query_flags =
+            derive_query_flags(capabilities, self.reset_symbol_dict, self.timeout_ms)?;
         let req = self
             .builder
             .request_id(request_id)
@@ -1306,6 +1294,28 @@ impl<'r> ReaderQuery<'r> {
             symbol_delta_modes: Vec::new(),
         })
     }
+}
+
+/// The `query_flags` word for a query sent to a server advertising
+/// `capabilities`.
+fn derive_query_flags(capabilities: u32, reset_symbol_dict: bool, timeout_ms: u64) -> Result<u64> {
+    let mut query_flags = 0u64;
+    if reset_symbol_dict && has_query_flags(capabilities) {
+        query_flags |= QUERY_FLAG_RESET_DICT;
+    }
+    if timeout_ms > 0 {
+        // A timeout is a correctness request, not a hint, so it does
+        // NOT degrade the way `reset_symbol_dict` does: silently
+        // dropping it would leave the caller believing it had a long
+        // budget while the server kills the query at `query.timeout`.
+        // The field rides *inside* the query_flags trailer, so both
+        // bits are required — a server advertising the timeout bit
+        // without the flags bit could not parse the frame we would
+        // send.
+        require_query_timeout(capabilities, timeout_ms)?;
+        query_flags |= QUERY_FLAG_TIMEOUT;
+    }
+    Ok(query_flags)
 }
 
 /// Fails with `QueryTimeout` when `capabilities` cannot carry a non-zero
@@ -3502,20 +3512,9 @@ mod tests {
     fn query_flag_derivation_matrix() {
         use crate::egress::wire::capabilities::{CAP_QUERY_FLAGS, CAP_QUERY_TIMEOUT, CAP_ZONE};
 
-        /// Mirrors the flag derivation in `ReaderQuery::execute`.
         /// `None` = execute() must fail fast.
         fn derive(caps: u32, reset_dict: bool, timeout_ms: u64) -> Option<u64> {
-            let mut flags = 0u64;
-            if reset_dict && has_query_flags(caps) {
-                flags |= QUERY_FLAG_RESET_DICT;
-            }
-            if timeout_ms > 0 {
-                if !(has_query_flags(caps) && has_query_timeout(caps)) {
-                    return None;
-                }
-                flags |= QUERY_FLAG_TIMEOUT;
-            }
-            Some(flags)
+            derive_query_flags(caps, reset_dict, timeout_ms).ok()
         }
 
         let both = CAP_QUERY_FLAGS | CAP_QUERY_TIMEOUT;

@@ -28,6 +28,7 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -1219,16 +1220,25 @@ public:
     }
 
     /** `timeout_ms` taking a `std::chrono` duration. A non-zero duration
-     *  below 1 ms rounds up to 1 ms, never down to "no timeout". */
+     *  below 1 ms rounds up to 1 ms, never down to "no timeout"; one too
+     *  large for `uint64_t` milliseconds saturates. A NaN or infinite
+     *  floating-point duration throws `error_code::invalid_api_call`. */
     template <typename Rep, typename Period>
     query& timeout(std::chrono::duration<Rep, Period> d)
     {
-        const auto ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
-        uint64_t as_u64 = ms <= 0 ? 0 : static_cast<uint64_t>(ms);
-        if (as_u64 == 0 && d.count() > 0)
-            as_u64 = 1;
-        return timeout_ms(as_u64);
+        // Convert in double: `duration_cast` to an integral rep is UB for
+        // NaN and for values outside the target range.
+        const double ms = std::chrono::duration<double, std::milli>{d}.count();
+        if (std::isnan(ms) || std::isinf(ms))
+            throw ::questdb::error{
+                error_code::invalid_api_call,
+                "query::timeout(): duration must be finite"};
+        if (ms <= 0.0)
+            return timeout_ms(0);
+        if (ms >= 18446744073709551616.0) // 2^64
+            return timeout_ms(UINT64_MAX);
+        const auto as_u64 = static_cast<uint64_t>(ms);
+        return timeout_ms(as_u64 == 0 ? 1 : as_u64);
     }
 
     /**

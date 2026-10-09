@@ -179,8 +179,11 @@ impl QueryRequestBuilder {
     /// [`query_flags`](Self::query_flags), which is what cap-gates the
     /// field against servers that would reject it. [`build`](Self::build)
     /// rejects the two being out of step.
+    ///
+    /// Capped at `i64::MAX`: the server decodes the field as a signed
+    /// long, so anything larger would arrive negative and be rejected.
     pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
-        self.timeout_ms = timeout_ms;
+        self.timeout_ms = timeout_ms.min(i64::MAX as u64);
         self
     }
 
@@ -311,7 +314,8 @@ impl QueryRequestBuilder {
         if flag_set != (self.timeout_ms > 0) {
             return Err(fmt!(
                 InvalidApiCall,
-                "QUERY_FLAG_TIMEOUT and timeout_ms disagree: flag {}, timeout_ms {}                  (set both, or neither)",
+                "QUERY_FLAG_TIMEOUT and timeout_ms disagree: flag {}, timeout_ms {} \
+                 (set both, or neither)",
                 if flag_set { "set" } else { "clear" },
                 self.timeout_ms,
             ));
@@ -513,6 +517,21 @@ mod tests {
             .encode(&mut buf)
             .unwrap();
         assert_eq!(&buf[buf.len() - 2..], &[0x03, 0x01]);
+    }
+
+    #[test]
+    fn timeout_ms_caps_at_i64_max() {
+        let mut buf = Vec::new();
+        QueryRequest::builder("X")
+            .query_flags(QUERY_FLAG_TIMEOUT)
+            .timeout_ms(u64::MAX)
+            .build()
+            .unwrap()
+            .encode(&mut buf)
+            .unwrap();
+        let mut expected = vec![0xFF; 8];
+        expected.push(0x7F);
+        assert_eq!(&buf[buf.len() - 9..], &expected[..]);
     }
 
     #[test]
