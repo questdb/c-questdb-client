@@ -443,6 +443,22 @@ pub enum line_sender_error_code {
     /// check `line_sender_error_in_doubt` before resending, or the rows the
     /// queued prefix already carried are duplicated.
     line_sender_error_symbol_dict_full = 37,
+
+    /// The query ran past the timeout it carried: server-reported QWP
+    /// `QUERY_TIMEOUT` (status `0x0E`), produced only for a request that
+    /// supplied `timeout_ms` (see `qwp_reader_query_set_timeout_ms`). Also
+    /// raised client-side, without a round trip, when a timeout is requested
+    /// against a server that does not advertise `CAP_QUERY_TIMEOUT`.
+    ///
+    /// Per-query, not per-connection: the connection stays open and
+    /// authenticated, so the next query runs on it without reconnecting.
+    ///
+    /// Do not retry a write on this error. A statement that completes past its
+    /// timeout is reported as `EXEC_DONE` with its row count rather than as a
+    /// timeout, precisely so a retrying client cannot apply it twice; and a
+    /// DDL / INSERT / UPDATE that timed out waiting for the table writer may
+    /// still be applied by that writer afterwards.
+    line_sender_error_query_timeout = 38,
 }
 
 /// Neutral spelling of the client-wide error category. The released
@@ -534,6 +550,7 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_store_resend_required
             }
             ErrorCode::SymbolDictFull => line_sender_error_code::line_sender_error_symbol_dict_full,
+            ErrorCode::QueryTimeout => line_sender_error_code::line_sender_error_query_timeout,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -4983,6 +5000,7 @@ mod tests {
                 36,
             ),
             (E::SymbolDictFull, line_sender_error_symbol_dict_full, 37),
+            (E::QueryTimeout, line_sender_error_query_timeout, 38),
         ]
     }
 

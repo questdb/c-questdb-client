@@ -174,6 +174,23 @@ pub enum ErrorCode {
     /// Query was cancelled (locally or via server `CANCELLED` status `0x0A`).
     Cancelled,
 
+    /// The query ran past the timeout it carried: server-reported QWP
+    /// `QUERY_TIMEOUT` (status `0x0E`), produced only for a request that
+    /// supplied `timeout_ms`. Per-query, so the connection stays usable and
+    /// a pooled client runs its next query on it.
+    ///
+    /// Also raised client-side, without a round trip, when a timeout is
+    /// requested against a server that does not advertise
+    /// `CAP_QUERY_TIMEOUT` — see
+    /// [`ReaderQuery::timeout`](crate::egress::ReaderQuery::timeout).
+    ///
+    /// **Do not retry a write on this error.** A DDL / `INSERT` / `UPDATE`
+    /// that timed out waiting for the table writer may still be applied
+    /// afterwards, and a statement that completes past its timeout is
+    /// reported as `EXEC_DONE` rather than a timeout precisely so a
+    /// retrying client cannot apply it twice.
+    QueryTimeout,
+
     /// Mid-query failover was eligible but at least one batch had already
     /// been delivered to the caller, and the cursor's `on_failover_reset`
     /// callback was not installed. Failover would replay the query from the
@@ -604,6 +621,7 @@ mod tests {
                 ErrorCode::LimitExceeded => {}
                 ErrorCode::ServerLimitExceeded => {}
                 ErrorCode::Cancelled => {}
+                ErrorCode::QueryTimeout => {}
                 ErrorCode::FailoverWouldDuplicate => {}
                 ErrorCode::SchemaDrift => {}
                 ErrorCode::NoSchema => {}

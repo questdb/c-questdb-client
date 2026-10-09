@@ -978,6 +978,34 @@ QUESTDB_CLIENT_API void qwp_reader_query_set_reset_symbol_dict(
     qwp_reader_query*, bool reset);
 
 /**
+ * Run this query under its own timeout, in milliseconds, instead of the
+ * server-wide `query.timeout`. Overrides the connect string's
+ * `query_timeout_ms` for this query; `0` clears it (no client timeout).
+ * Mirrors `ReaderQuery::timeout`.
+ *
+ * Requires a server advertising `CAP_QUERY_TIMEOUT` (`0x08` in
+ * `qwp_reader_server_info_capabilities`). Unlike
+ * `qwp_reader_query_set_reset_symbol_dict`, this does NOT silently degrade:
+ * against an older server `qwp_reader_query_execute` fails with
+ * `line_sender_error_query_timeout` instead of running the query under the
+ * server default while the caller believes its timeout applied. Raise the
+ * server's `query.timeout` instead, or clear the timeout here.
+ *
+ * The server applies no ceiling, so a value above `query.timeout` is
+ * honoured — which is the point for a long transform.
+ *
+ * On expiry the cursor terminates with `line_sender_error_query_timeout` and
+ * the connection stays open and authenticated, so the next query runs on it
+ * without reconnecting. DO NOT RETRY A WRITE on that error: a statement that
+ * completes past its timeout is answered with `EXEC_DONE` and its row count
+ * rather than a timeout (so a retry cannot apply it twice), and a DDL /
+ * INSERT / UPDATE that timed out waiting for the table writer may still be
+ * applied by that writer afterwards.
+ */
+QUESTDB_CLIENT_API void qwp_reader_query_set_timeout_ms(
+    qwp_reader_query*, uint64_t timeout_ms);
+
+/**
  * Install a failover-reset callback on the query. Replaces any previously
  * installed callback. `user_data` is opaque to the library; pass NULL if
  * not needed. The callback fires on the thread driving

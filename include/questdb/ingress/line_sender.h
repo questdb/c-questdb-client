@@ -289,6 +289,22 @@ typedef enum line_sender_error_code
      *  check `line_sender_error_in_doubt` before resending, or the rows the
      *  queued prefix already carried are duplicated. */
     line_sender_error_symbol_dict_full = 37,
+
+    /** The query ran past the timeout it carried: server-reported QWP
+     *  `QUERY_TIMEOUT` (status `0x0E`), produced only for a request that
+     *  supplied `timeout_ms` (see `qwp_reader_query_set_timeout_ms`). Also
+     *  raised client-side, without a round trip, when a timeout is requested
+     *  against a server that does not advertise `CAP_QUERY_TIMEOUT`.
+     *
+     *  Per-query, not per-connection: the connection stays open and
+     *  authenticated, so the next query runs on it without reconnecting.
+     *
+     *  DO NOT RETRY A WRITE ON THIS ERROR. A statement that completes past
+     *  its timeout is reported as `EXEC_DONE` with its row count rather than
+     *  as a timeout, precisely so a retrying client cannot apply it twice;
+     *  and a DDL / INSERT / UPDATE that timed out waiting for the table
+     *  writer may still be applied by that writer afterwards. */
+    line_sender_error_query_timeout = 38,
 } line_sender_error_code;
 
 /**
@@ -351,6 +367,7 @@ typedef line_sender_error_code questdb_error_code;
 #define questdb_error_store_resend_required                                    \
     line_sender_error_store_resend_required
 #define questdb_error_symbol_dict_full line_sender_error_symbol_dict_full
+#define questdb_error_query_timeout line_sender_error_query_timeout
 
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol

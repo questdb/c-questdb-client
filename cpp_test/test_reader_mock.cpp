@@ -675,6 +675,359 @@ TEST_CASE("mock: QueryError(cancelled) surfaces as Cancelled")
 // and the server's CANCELLED status surfaces as the documented error code.
 // ---------------------------------------------------------------------------
 
+TEST_CASE("mock: QueryError(query_timeout) surfaces as QueryTimeout")
+{
+    run_query_error_test(qm::STATUS_QUERY_TIMEOUT, questdb_error_query_timeout);
+}
+
+// ---------------------------------------------------------------------------
+// Per-query timeout (CAP_QUERY_TIMEOUT / QUERY_FLAG_TIMEOUT / timeout_ms).
+// ---------------------------------------------------------------------------
+
+namespace
+{
+// A SERVER_INFO advertising the capabilities a current server sends.
+qm::ActionSendServerInfo server_info_with(uint32_t caps)
+{
+    qm::ActionSendServerInfo si;
+    si.capabilities = caps;
+    return si;
+}
+
+// Offset of the `query_flags` trailer in a QUERY_REQUEST with no binds:
+// msg_kind(1) + request_id(8) + varint sql_len(1) + sql + varint credit(1)
+// + varint bind_count(1).
+size_t trailer_offset(size_t sql_len)
+{
+    return 1 + 8 + 1 + sql_len + 1 + 1;
+}
+} // namespace
+
+TEST_CASE("mock: no timeout -> QUERY_REQUEST carries no trailer")
+{
+    // The baseline an older server has always seen. Byte-exactness here is
+    // what makes the feature safe to ship against one.
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("X"_utf8);
+    while (cur.next_batch())
+    {
+    }
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(reqs[0].size() == trailer_offset(1));
+}
+
+TEST_CASE("mock: timeout_ms rides the wire after query_flags")
+{
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur = reader.prepare("X"_utf8).timeout_ms(1000).execute();
+    while (cur.next_batch())
+    {
+    }
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 1);
+    const auto& req = reqs[0];
+    const size_t p = trailer_offset(1);
+    // flags varint = QUERY_FLAG_TIMEOUT, then timeout_ms varint
+    // (1000 = 0xE8 0x07).
+    REQUIRE(req.size() == p + 3);
+    CHECK(req[p] == qm::QUERY_FLAG_TIMEOUT);
+    CHECK(req[p + 1] == 0xE8);
+    CHECK(req[p + 2] == 0x07);
+}
+
+TEST_CASE("mock: chrono timeout rounds a sub-millisecond value up to 1 ms")
+{
+    // Rounding down would mean "no timeout" — the opposite of the ask.
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur = reader.prepare("X"_utf8)
+                   .timeout(std::chrono::microseconds{500})
+                   .execute();
+    while (cur.next_batch())
+    {
+    }
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 1);
+    const auto& req = reqs[0];
+    const size_t p = trailer_offset(1);
+    REQUIRE(req.size() == p + 2);
+    CHECK(req[p] == qm::QUERY_FLAG_TIMEOUT);
+    CHECK(req[p + 1] == 1);
+}
+
+TEST_CASE("mock: chrono zero timeout clears the request")
+{
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur =
+        reader.prepare("X"_utf8).timeout(std::chrono::seconds{0}).execute();
+    while (cur.next_batch())
+    {
+    }
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(reqs[0].size() == trailer_offset(1));
+}
+
+TEST_CASE("mock: connect-string query_timeout_ms applies to every query")
+{
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    const std::string conf =
+        "ws::addr=" + srv.addr() + ";query_timeout_ms=1000;";
+    eg::reader reader{questdb::ingress::utf8_view{conf}};
+
+    for (int i = 0; i < 2; ++i)
+    {
+        auto cur = reader.execute("X"_utf8);
+        while (cur.next_batch())
+        {
+        }
+    }
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 2);
+    for (const auto& req : reqs)
+    {
+        const size_t p = trailer_offset(1);
+        REQUIRE(req.size() == p + 3);
+        CHECK(req[p] == qm::QUERY_FLAG_TIMEOUT);
+        CHECK(req[p + 1] == 0xE8);
+        CHECK(req[p + 2] == 0x07);
+    }
+}
+
+TEST_CASE("mock: per-query timeout overrides the connect-string default")
+{
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    const std::string conf =
+        "ws::addr=" + srv.addr() + ";query_timeout_ms=1000;";
+    eg::reader reader{questdb::ingress::utf8_view{conf}};
+    // Clearing it per query must also work, or a caller stuck with a
+    // profile-wide default could never opt a single query out.
+    auto cur = reader.prepare("X"_utf8).timeout_ms(0).execute();
+    while (cur.next_batch())
+    {
+    }
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(reqs[0].size() == trailer_offset(1));
+}
+
+TEST_CASE("mock: failover replay re-sends the original timeout budget")
+{
+    // Documents a deliberate v1 limitation. The replay path re-writes the
+    // stashed QUERY_REQUEST buffer with only the request_id patched, so the
+    // new endpoint receives the FULL timeout again rather than what is left
+    // of it. Total wall clock across N replays can therefore reach
+    // N x timeout. Sending the remaining budget needs a client-side
+    // deadline, which this client does not keep (the server enforces the
+    // timeout); java-questdb-client#105 does keep one and sends the
+    // remainder. Pinned here so the behaviour is visible and a future change
+    // to it is deliberate.
+    qm::Script s_a = {
+        qm::ActionSendServerInfo{
+            qm::ROLE_STANDALONE,
+            "c",
+            "a",
+            0,
+            qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionHardDrop{},
+    };
+    qm::Script s_b = {
+        qm::ActionSendServerInfo{
+            qm::ROLE_STANDALONE,
+            "c",
+            "b",
+            0,
+            qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv_a({s_a});
+    qm::MockServer srv_b({s_b});
+
+    const std::string conf =
+        "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
+        ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
+    eg::reader reader{questdb::ingress::utf8_view{conf}};
+
+    auto cur = reader.prepare("X"_utf8).timeout_ms(1000).execute();
+    while (cur.next_batch())
+    {
+    }
+
+    // Each endpoint saw one request, and both carried the same budget.
+    auto reqs_a = srv_a.captured_requests();
+    auto reqs_b = srv_b.captured_requests();
+    REQUIRE(reqs_a.size() == 1);
+    REQUIRE(reqs_b.size() == 1);
+    const size_t p = trailer_offset(1);
+    for (const auto* reqs : {&reqs_a, &reqs_b})
+    {
+        const auto& req = (*reqs)[0];
+        REQUIRE(req.size() == p + 3);
+        CHECK(req[p] == qm::QUERY_FLAG_TIMEOUT);
+        CHECK(req[p + 1] == 0xE8); // varint(1000), unchanged by the replay
+        CHECK(req[p + 2] == 0x07);
+    }
+    // The replay differs from the original only in the request_id, which is
+    // what makes the trailer survive byte-identically.
+    CHECK(reqs_a[0].size() == reqs_b[0].size());
+    CHECK(std::equal(
+        reqs_a[0].begin() + 9, reqs_a[0].end(), reqs_b[0].begin() + 9));
+}
+
+TEST_CASE("mock: timeout without CAP_QUERY_TIMEOUT fails before the wire")
+{
+    // Fail fast rather than degrade: running under the server default
+    // while the caller believes a 10-minute budget applied is how a dbt
+    // transform dies at 60 s with a confusing error.
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+
+    bool threw = false;
+    try
+    {
+        auto cur = reader.prepare("X"_utf8).timeout_ms(1000).execute();
+        while (cur.next_batch())
+        {
+        }
+    }
+    catch (const questdb::error& e)
+    {
+        threw = true;
+        CHECK(e.code() == questdb_error_query_timeout);
+        // The message has to name the missing capability and point at the
+        // server-side knob, or the operator cannot act on it.
+        const std::string msg = e.what();
+        CHECK(msg.find("CAP_QUERY_TIMEOUT") != std::string::npos);
+        CHECK(msg.find("query.timeout") != std::string::npos);
+    }
+    CHECK(threw);
+    // Nothing reached the wire: the guard runs before the QUERY_REQUEST is
+    // encoded, so the server never sees a frame it would reject.
+    CHECK(srv.captured_requests().empty());
+}
+
+TEST_CASE("mock: timeout without any capabilities fails before the wire")
+{
+    qm::Script s = {
+        qm::ActionSendServerInfo{}, // capabilities = 0
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+
+    bool threw = false;
+    try
+    {
+        auto cur = reader.prepare("X"_utf8).timeout_ms(1000).execute();
+        while (cur.next_batch())
+        {
+        }
+    }
+    catch (const questdb::error& e)
+    {
+        threw = true;
+        CHECK(e.code() == questdb_error_query_timeout);
+    }
+    CHECK(threw);
+    CHECK(srv.captured_requests().empty());
+}
+
+TEST_CASE("mock: a timed-out query leaves the connection usable")
+{
+    // The contract that makes pooling work: QUERY_TIMEOUT is per-query, so
+    // the next query runs on the same connection with no second handshake.
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[](int64_t rid) {
+            return qm::query_error_frame(
+                rid, qm::STATUS_QUERY_TIMEOUT, "timeout, query aborted");
+        }},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+
+    bool threw = false;
+    try
+    {
+        auto cur = reader.prepare("slow"_utf8).timeout_ms(1).execute();
+        while (cur.next_batch())
+        {
+        }
+    }
+    catch (const questdb::error& e)
+    {
+        threw = true;
+        CHECK(e.code() == questdb_error_query_timeout);
+    }
+    REQUIRE(threw);
+
+    // Second query on the same reader: it must go through.
+    auto cur2 = reader.execute("after"_utf8);
+    while (cur2.next_batch())
+    {
+    }
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 2);
+    // Both requests arrived on the one scripted connection, which the mock
+    // serves per slot — so no reconnect happened between them.
+    CHECK(reqs[0][0] == qm::MSG_QUERY_REQUEST);
+    CHECK(reqs[1][0] == qm::MSG_QUERY_REQUEST);
+}
+
 TEST_CASE("mock: cursor::cancel writes MSG_CANCEL and surfaces Cancelled")
 {
     // After the QueryRequest, server holds the response open; the test

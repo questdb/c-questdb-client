@@ -51,6 +51,28 @@ pub fn has_query_flags(capabilities: u32) -> bool {
     capabilities & CAP_QUERY_FLAGS != 0
 }
 
+/// Bit `0x04` is `CAP_COMPRESSION` on the server (zstd frame compression,
+/// negotiated through the `X-QWP-Accept-Encoding` upgrade header rather than
+/// through this word on the client side). Named here so the next capability
+/// does not reuse the value.
+pub const CAP_COMPRESSION: u32 = 0x0000_0004;
+
+/// Server honours `QUERY_REQUEST.timeout_ms`: it runs the query under the
+/// client-supplied timeout instead of the server-wide `query.timeout`, and
+/// reports expiry as [`StatusCode::QueryTimeout`].
+///
+/// Clients append `timeout_ms` only when this bit is set, so a server
+/// without it never receives the field. The server sets no ceiling, so a
+/// client timeout may legitimately exceed `query.timeout`.
+///
+/// [`StatusCode::QueryTimeout`]: super::msg_kind::StatusCode::QueryTimeout
+pub const CAP_QUERY_TIMEOUT: u32 = 0x0000_0008;
+
+/// True if the server honours the `QUERY_REQUEST` `timeout_ms` field.
+pub fn has_query_timeout(capabilities: u32) -> bool {
+    capabilities & CAP_QUERY_TIMEOUT != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +85,52 @@ mod tests {
         assert!(has_zone(CAP_ZONE | 0x8000_0000));
         // Future bits with CAP_ZONE clear must not trip it.
         assert!(!has_zone(0xFFFF_FFFE));
+    }
+
+    #[test]
+    fn has_query_flags_predicate() {
+        assert!(!has_query_flags(0));
+        assert!(has_query_flags(CAP_QUERY_FLAGS));
+        assert!(has_query_flags(CAP_QUERY_FLAGS | 0x8000_0000));
+        assert!(!has_query_flags(!CAP_QUERY_FLAGS));
+    }
+
+    #[test]
+    fn has_query_timeout_predicate() {
+        assert!(!has_query_timeout(0));
+        assert!(has_query_timeout(CAP_QUERY_TIMEOUT));
+        // The timeout bit rides alongside the flags bit on a current
+        // server; neither predicate may depend on the other's absence.
+        assert!(has_query_timeout(CAP_QUERY_TIMEOUT | CAP_QUERY_FLAGS));
+        assert!(has_query_flags(CAP_QUERY_TIMEOUT | CAP_QUERY_FLAGS));
+        assert!(!has_query_timeout(!CAP_QUERY_TIMEOUT));
+    }
+
+    #[test]
+    fn capability_bits_are_distinct_powers_of_two() {
+        // The server assigns these; a duplicated or non-power-of-two value
+        // would make one predicate answer for another capability.
+        let bits = [
+            CAP_ZONE,
+            CAP_QUERY_FLAGS,
+            CAP_COMPRESSION,
+            CAP_QUERY_TIMEOUT,
+        ];
+        let mut seen = 0u32;
+        for b in bits {
+            assert_eq!(b.count_ones(), 1, "0x{b:08X} is not a single bit");
+            assert_eq!(seen & b, 0, "0x{b:08X} duplicates an earlier bit");
+            seen |= b;
+        }
+        // Pin the wire values: the server's QwpConstants owns them.
+        assert_eq!(
+            (
+                CAP_ZONE,
+                CAP_QUERY_FLAGS,
+                CAP_COMPRESSION,
+                CAP_QUERY_TIMEOUT
+            ),
+            (0x01, 0x02, 0x04, 0x08)
+        );
     }
 }

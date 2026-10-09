@@ -27,6 +27,7 @@
 #include "qwp_reader.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -1193,6 +1194,41 @@ public:
         ensure_impl();
         ::qwp_reader_query_initial_credit(_impl, credit);
         return *this;
+    }
+
+    /**
+     * Run this query under its own timeout instead of the server-wide
+     * `query.timeout`. Overrides the connect string's `query_timeout_ms`;
+     * `0` clears it. Requires a server advertising `CAP_QUERY_TIMEOUT`
+     * (`0x08`) — against an older one `execute()` throws
+     * `error_code::query_timeout` rather than silently running under the
+     * server default. The server applies no ceiling, so a value above
+     * `query.timeout` is honoured.
+     *
+     * On expiry the cursor terminates with `error_code::query_timeout` and
+     * the connection stays usable. Do not retry a write on it: a statement
+     * that outlives its timeout is reported as `EXEC_DONE` instead, and a
+     * DDL / INSERT / UPDATE that timed out waiting for the table writer may
+     * still be applied afterwards.
+     */
+    query& timeout_ms(uint64_t timeout_ms)
+    {
+        ensure_impl();
+        ::qwp_reader_query_set_timeout_ms(_impl, timeout_ms);
+        return *this;
+    }
+
+    /** `timeout_ms` taking a `std::chrono` duration. A non-zero duration
+     *  below 1 ms rounds up to 1 ms, never down to "no timeout". */
+    template <typename Rep, typename Period>
+    query& timeout(std::chrono::duration<Rep, Period> d)
+    {
+        const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+        uint64_t as_u64 = ms <= 0 ? 0 : static_cast<uint64_t>(ms);
+        if (as_u64 == 0 && d.count() > 0)
+            as_u64 = 1;
+        return timeout_ms(as_u64);
     }
 
     /**

@@ -3020,6 +3020,31 @@ pub unsafe extern "C" fn qwp_reader_query_set_reset_symbol_dict(
     unsafe { mutate_query(query, |q| q.reset_symbol_dict(reset)) }
 }
 
+/// Run this query under its own timeout, in milliseconds, instead of the
+/// server-wide `query.timeout`. Overrides the connect string's
+/// `query_timeout_ms`; `0` clears it. Mirrors `ReaderQuery::timeout`.
+///
+/// Unlike `qwp_reader_query_set_reset_symbol_dict`, this does NOT silently
+/// degrade: against a server that does not advertise `CAP_QUERY_TIMEOUT`,
+/// `qwp_reader_query_execute` fails with
+/// `line_sender_error_query_timeout` rather than letting the caller believe
+/// a timeout applied. On expiry the query ends with that same code and the
+/// connection stays usable — but do not retry a write on it, because a
+/// statement that outlives its timeout is reported as `EXEC_DONE` instead,
+/// and a DDL / INSERT / UPDATE that timed out waiting for the table writer
+/// may still be applied afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_reader_query_set_timeout_ms(
+    query: *mut qwp_reader_query,
+    timeout_ms: u64,
+) {
+    unsafe {
+        mutate_query(query, |q| {
+            q.timeout(std::time::Duration::from_millis(timeout_ms))
+        })
+    }
+}
+
 /// Report a NULL out-param contract violation through `err_out`.
 #[inline]
 unsafe fn null_out_param_err(err_out: *mut *mut questdb_error, fn_name: &str) {
