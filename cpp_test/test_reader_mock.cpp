@@ -906,9 +906,10 @@ TEST_CASE("mock: failover replay re-sends the original timeout budget")
     }
     // The replay differs from the original only in the request_id, which is
     // what makes the trailer survive byte-identically.
-    CHECK(reqs_a[0].size() == reqs_b[0].size());
-    CHECK(std::equal(
-        reqs_a[0].begin() + 9, reqs_a[0].end(), reqs_b[0].begin() + 9));
+    const auto& orig = reqs_a[0];
+    const auto& replay = reqs_b[0];
+    CHECK(orig.size() == replay.size());
+    CHECK(std::equal(orig.begin() + 9, orig.end(), replay.begin() + 9));
 }
 
 TEST_CASE("mock: timeout without CAP_QUERY_TIMEOUT fails before the wire")
