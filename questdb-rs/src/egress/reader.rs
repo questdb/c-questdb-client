@@ -937,6 +937,8 @@ impl<'r> ReaderQuery<'r> {
     /// `CAP_QUERY_TIMEOUT`, rather than running the query under the server
     /// default and letting the caller believe its timeout applied. Raise
     /// the server's `query.timeout` instead, or clear the timeout here.
+    /// A mid-query failover onto such a server fails the same way instead
+    /// of replaying the query.
     ///
     /// # Behaviour on expiry
     ///
@@ -1211,16 +1213,7 @@ impl<'r> ReaderQuery<'r> {
             // bits are required — a server advertising the timeout bit
             // without the flags bit could not parse the frame we would
             // send.
-            if !(has_query_flags(capabilities) && has_query_timeout(capabilities)) {
-                return Err(fmt!(
-                    QueryTimeout,
-                    "server does not support per-query timeouts                      (SERVER_INFO capabilities 0x{:08X}, need CAP_QUERY_TIMEOUT 0x{:08X}                      and CAP_QUERY_FLAGS 0x{:08X}): the requested {} ms timeout cannot be                      honoured. Raise the server's `query.timeout` instead, or clear the                      per-query timeout.",
-                    capabilities,
-                    crate::egress::wire::capabilities::CAP_QUERY_TIMEOUT,
-                    crate::egress::wire::capabilities::CAP_QUERY_FLAGS,
-                    self.timeout_ms,
-                ));
-            }
+            require_query_timeout(capabilities, self.timeout_ms)?;
             query_flags |= QUERY_FLAG_TIMEOUT;
         }
         let req = self
@@ -1293,6 +1286,7 @@ impl<'r> ReaderQuery<'r> {
             done: false,
             terminal_error: None,
             encoded_request,
+            timeout_ms: self.timeout_ms,
             on_failover_reset: self.on_failover_reset,
             on_failover_progress: self.on_failover_progress,
             failover_budget,
@@ -1312,6 +1306,27 @@ impl<'r> ReaderQuery<'r> {
             symbol_delta_modes: Vec::new(),
         })
     }
+}
+
+/// Fails with `QueryTimeout` when `capabilities` cannot carry a non-zero
+/// `timeout_ms`. Checked on every connection a query is sent to, so a
+/// failover replay cannot land the timeout on a server that ignores it.
+fn require_query_timeout(capabilities: u32, timeout_ms: u64) -> Result<()> {
+    if timeout_ms > 0 && !(has_query_flags(capabilities) && has_query_timeout(capabilities)) {
+        return Err(fmt!(
+            QueryTimeout,
+            "server does not support per-query timeouts \
+             (SERVER_INFO capabilities 0x{:08X}, need CAP_QUERY_TIMEOUT 0x{:08X} \
+             and CAP_QUERY_FLAGS 0x{:08X}): the requested {} ms timeout cannot be \
+             honoured. Raise the server's `query.timeout` instead, or clear the \
+             per-query timeout.",
+            capabilities,
+            crate::egress::wire::capabilities::CAP_QUERY_TIMEOUT,
+            crate::egress::wire::capabilities::CAP_QUERY_FLAGS,
+            timeout_ms,
+        ));
+    }
+    Ok(())
 }
 
 /// Patch the request_id span of a stashed `QUERY_REQUEST` payload in
@@ -1523,6 +1538,8 @@ pub struct Cursor<'r> {
     /// across reconnects, only the 8-byte request_id span is mutated
     /// in place.
     encoded_request: Bytes,
+    /// Per-query timeout baked into `encoded_request`; `0` = none.
+    timeout_ms: u64,
     /// User callback fired right before replayed batches arrive on a
     /// new connection. See [`ReaderQuery::on_failover_reset`].
     on_failover_reset: Option<FailoverResetCallback<'r>>,
@@ -2518,6 +2535,33 @@ impl<'r> Cursor<'r> {
             // and queries that may carry multi-MB `Bind::Binary`
             // payloads, this is the difference between a few bytes
             // and gigabytes of churn per failure event.
+            // The stashed bytes carry the timeout the *original* server
+            // accepted; a replacement that lacks the capability would run
+            // the query under its own default instead.
+            let capabilities = self
+                .reader
+                .server_info()
+                .map(|info| info.capabilities)
+                .unwrap_or(0);
+            if let Err(e) = require_query_timeout(capabilities, self.timeout_ms) {
+                if let Some(cb) = self.on_failover_progress.as_mut() {
+                    let event = FailoverProgressEvent {
+                        phase: FailoverPhase::GaveUp,
+                        failed_addr: failed_addr.clone(),
+                        new_addr: None,
+                        new_server_info: None,
+                        new_request_id: None,
+                        attempt: attempts,
+                        trigger: trigger.clone(),
+                        elapsed: started.elapsed(),
+                        final_error: Some(e.clone()),
+                    };
+                    cb(&event);
+                }
+                self.reader.cursor_active = false;
+                self.done = true;
+                return Err(e);
+            }
             let new_rid = self.reader.alloc_request_id();
             self.request_id = new_rid;
             self.encoded_request =
@@ -2751,6 +2795,19 @@ impl<'r> Cursor<'r> {
                 None => fmt!(InvalidApiCall, "cursor is terminal; add_credit not allowed"),
             });
         }
+        // Same first-cause capture as `next_batch`: without it a cursor
+        // killed here reads as a clean EOF on the next `next_batch`.
+        let result = self.add_credit_inner(additional_bytes);
+        if let Err(e) = &result
+            && self.done
+            && self.terminal_error.is_none()
+        {
+            self.terminal_error = Some(e.clone());
+        }
+        result
+    }
+
+    fn add_credit_inner(&mut self, additional_bytes: u64) -> Result<()> {
         let first_err = match self.send_credit_frame(additional_bytes) {
             Ok(()) => return Ok(()),
             Err(e) => e,
@@ -3436,33 +3493,6 @@ mod tests {
         let mut id_bytes = [0u8; 8];
         id_bytes.copy_from_slice(&patched_again[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]);
         assert_eq!(i64::from_le_bytes(id_bytes), OLD_RID);
-    }
-
-    /// `ReaderQuery::timeout` converts to whole milliseconds, and a
-    /// non-zero duration never collapses to "no timeout".
-    #[test]
-    fn query_timeout_duration_conversion() {
-        // Exercise the conversion in isolation: building a `ReaderQuery`
-        // needs a live `Reader`, so mirror the arithmetic the setter runs.
-        fn to_ms(timeout: Duration) -> u64 {
-            let ms = timeout.as_millis();
-            if ms == 0 && !timeout.is_zero() {
-                1
-            } else {
-                ms.min(u64::MAX as u128) as u64
-            }
-        }
-
-        assert_eq!(to_ms(Duration::ZERO), 0, "ZERO means no timeout");
-        assert_eq!(to_ms(Duration::from_millis(1)), 1);
-        assert_eq!(to_ms(Duration::from_secs(600)), 600_000);
-        // Sub-millisecond rounds UP: truncating to 0 would silently mean
-        // "no timeout", the opposite of what the caller asked for.
-        assert_eq!(to_ms(Duration::from_micros(1)), 1);
-        assert_eq!(to_ms(Duration::from_micros(999)), 1);
-        assert_eq!(to_ms(Duration::from_micros(1_001)), 1);
-        // Saturates instead of wrapping.
-        assert_eq!(to_ms(Duration::MAX), u64::MAX);
     }
 
     /// The flag word `execute()` derives from the capability bits. Pinned

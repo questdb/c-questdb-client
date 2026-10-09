@@ -80,6 +80,15 @@ fn encode_varint_u64(mut v: u64, out: &mut Vec<u8>) {
 }
 
 fn server_info_frame(role: ServerRole, node_id: &str, cluster_id: &str) -> Vec<u8> {
+    server_info_frame_with_caps(role, node_id, cluster_id, 0)
+}
+
+fn server_info_frame_with_caps(
+    role: ServerRole,
+    node_id: &str,
+    cluster_id: &str,
+    capabilities: u32,
+) -> Vec<u8> {
     let role_byte = match role {
         ServerRole::Standalone => 0x00,
         ServerRole::Primary => 0x01,
@@ -90,7 +99,7 @@ fn server_info_frame(role: ServerRole, node_id: &str, cluster_id: &str) -> Vec<u
     };
     let mut payload = vec![MSG_SERVER_INFO, role_byte];
     payload.extend_from_slice(&0u64.to_le_bytes()); // epoch
-    payload.extend_from_slice(&0u32.to_le_bytes()); // capabilities
+    payload.extend_from_slice(&capabilities.to_le_bytes());
     payload.extend_from_slice(&0i64.to_le_bytes()); // server_wall_ns
     payload.extend_from_slice(&(cluster_id.len() as u16).to_le_bytes());
     payload.extend_from_slice(cluster_id.as_bytes());
@@ -1267,6 +1276,121 @@ fn pre_batch_failover_without_callback_still_replays() {
         srv_b.addr.port(),
         "cursor must be bound to the failover target after replay"
     );
+}
+
+const CAP_QUERY_FLAGS: u32 = 0x02;
+const CAP_QUERY_TIMEOUT: u32 = 0x08;
+
+fn server_info_with_caps(node_id: &str, capabilities: u32) -> Action {
+    Action::SendRaw(server_info_frame_with_caps(
+        ServerRole::Standalone,
+        node_id,
+        "test-cluster",
+        capabilities,
+    ))
+}
+
+#[test]
+fn sub_millisecond_timeout_rounds_up_on_the_wire() {
+    let srv = MockServer::start(vec![vec![
+        server_info_with_caps("n1", CAP_QUERY_FLAGS | CAP_QUERY_TIMEOUT),
+        Action::AwaitQueryRequest,
+        Action::SendResultEnd,
+    ]]);
+    let mut reader = Reader::from_conf(format!("ws::addr={}", srv.url())).expect("connect");
+    let mut cursor = reader
+        .prepare("select 1")
+        .timeout(Duration::from_micros(500))
+        .execute()
+        .expect("execute");
+    assert!(matches!(cursor.next_batch(), Ok(None)));
+    drop(cursor);
+
+    let requests = srv.captured_requests();
+    assert_eq!(requests.len(), 1);
+    // bind_count = 0, query_flags = QUERY_FLAG_TIMEOUT, timeout_ms = 1.
+    assert!(
+        requests[0].ends_with(&[0x00, 0x02, 0x01]),
+        "500 us must round up to timeout_ms = 1, got {:02X?}",
+        requests[0]
+    );
+}
+
+#[test]
+fn timeout_failover_onto_server_without_timeout_cap_refuses_replay() {
+    let srv_a = MockServer::start(vec![vec![
+        server_info_with_caps("a", CAP_QUERY_FLAGS | CAP_QUERY_TIMEOUT),
+        Action::AwaitQueryRequest,
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        server_info_with_caps("b", CAP_QUERY_FLAGS),
+        Action::AwaitQueryRequest,
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader
+        .prepare("select 1")
+        .timeout(Duration::from_millis(10))
+        .execute()
+        .expect("execute");
+
+    let err = cursor.next_batch().err().expect("replay must be refused");
+    assert_eq!(err.code(), ErrorCode::QueryTimeout, "{}", err.msg());
+    assert_eq!(cursor.failover_resets(), 0);
+    drop(cursor);
+    assert!(
+        srv_b.captured_requests().is_empty(),
+        "the timed query must never reach a server that would ignore the timeout"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "WinSock send() to a peer that has RST'd can block for the full WRITE_TIMEOUT"
+)]
+fn add_credit_refused_timeout_replay_stays_terminal() {
+    let srv_a = MockServer::start(vec![vec![
+        server_info_with_caps("a", CAP_QUERY_FLAGS | CAP_QUERY_TIMEOUT),
+        Action::AwaitQueryRequest,
+        Action::AbortiveRst,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        server_info_with_caps("b", CAP_QUERY_FLAGS),
+        Action::AwaitQueryRequest,
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader
+        .prepare("select 1")
+        .timeout(Duration::from_millis(10))
+        .execute()
+        .expect("execute");
+
+    std::thread::sleep(Duration::from_millis(100));
+    // A write can land in the send buffer before the RST is observed;
+    // keep granting until one fails and drives the failover.
+    let err = (0..50)
+        .find_map(|_| cursor.add_credit(64).err())
+        .expect("add_credit must eventually hit A's RST");
+    assert_eq!(err.code(), ErrorCode::QueryTimeout, "{}", err.msg());
+
+    let next = cursor
+        .next_batch()
+        .err()
+        .expect("must not read as clean EOF");
+    assert_eq!(next.code(), ErrorCode::QueryTimeout);
+    let again = cursor.add_credit(64).expect_err("cursor stays terminal");
+    assert_eq!(again.code(), ErrorCode::QueryTimeout);
 }
 
 /// Mid-query failover *after* a batch was already delivered: with a
