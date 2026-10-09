@@ -948,17 +948,9 @@ impl<'r> ReaderQuery<'r> {
     /// `UPDATE` that timed out waiting for the table writer may still be
     /// applied afterwards.
     ///
-    /// # Mid-query failover
-    ///
-    /// The timeout is enforced by the server, per request. A failover replay
-    /// re-sends the stashed `QUERY_REQUEST` with only the `request_id`
-    /// patched, so the new endpoint receives the **full** timeout again
-    /// rather than the remainder: total wall clock across `N` replays can
-    /// reach `N * timeout`. Bound the whole `execute` with
-    /// [`ReaderConfig::failover_max_duration_ms`] if that matters. (Sending
-    /// the remaining budget would require this client to keep its own
-    /// deadline, which it deliberately does not — the server owns
-    /// enforcement.)
+    /// The server enforces it per request, so a failover replay re-sends
+    /// the full timeout rather than the remainder; the total is bounded by
+    /// [`ReaderConfig::failover_max_duration_ms`] plus one timeout.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         let ms = timeout.as_millis();
         self.timeout_ms = if ms == 0 && !timeout.is_zero() {

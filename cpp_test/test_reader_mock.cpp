@@ -855,15 +855,8 @@ TEST_CASE("mock: per-query timeout overrides the connect-string default")
 
 TEST_CASE("mock: failover replay re-sends the original timeout budget")
 {
-    // Documents a deliberate v1 limitation. The replay path re-writes the
-    // stashed QUERY_REQUEST buffer with only the request_id patched, so the
-    // new endpoint receives the FULL timeout again rather than what is left
-    // of it. Total wall clock across N replays can therefore reach
-    // N x timeout. Sending the remaining budget needs a client-side
-    // deadline, which this client does not keep (the server enforces the
-    // timeout); java-questdb-client#105 does keep one and sends the
-    // remainder. Pinned here so the behaviour is visible and a future change
-    // to it is deliberate.
+    // The replay patches only the request_id, so the new endpoint gets the
+    // full timeout again. Pinned so a change to that is deliberate.
     qm::Script s_a = {
         qm::ActionSendServerInfo{
             qm::ROLE_STANDALONE,
