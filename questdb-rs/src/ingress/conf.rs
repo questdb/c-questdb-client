@@ -144,6 +144,13 @@ pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
 pub(crate) const QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY: usize = 256;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_MIN_ERROR_INBOX_CAPACITY: usize = 16;
+/// Upper bound for a caller-selected error inbox, mirroring the FFI's
+/// `MAX_DB_CALLBACK_INBOX_CAPACITY`. The value reaches
+/// `VecDeque::with_capacity`, and the allocator aborts on failure, so an
+/// absurd one from a configuration string must be refused rather than turned
+/// into a process abort with no traceback.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_MAX_ERROR_INBOX_CAPACITY: usize = 65_536;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_MAX_FRAME_REJECTIONS: usize = 4;
 #[cfg(feature = "_sender-qwp-ws")]
@@ -315,6 +322,11 @@ pub(crate) struct QwpWsConfig {
     pub(crate) max_background_drainers: ConfigSetting<usize>,
     pub(crate) error_inbox_capacity: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
+    /// A rotating Bearer-token source pulled at each (re)connect (e.g. from
+    /// `oidc::OidcDeviceAuth`), overriding any static basic/token auth. Set via
+    /// [`SenderBuilder::qwp_ws_token_provider`](crate::ingress::SenderBuilder::qwp_ws_token_provider);
+    /// programmatic-only (never from a conf string).
+    pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     pub(crate) max_frame_rejections: ConfigSetting<usize>,
     pub(crate) poison_min_escalation_window: ConfigSetting<std::time::Duration>,
     /// Optional connection lifecycle event source. Standalone senders set it
@@ -368,6 +380,7 @@ impl Default for QwpWsConfig {
             ),
             error_inbox_capacity: ConfigSetting::new_default(QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY),
             progress: ConfigSetting::new_default(QwpWsProgress::Background),
+            token_provider: None,
             max_frame_rejections: ConfigSetting::new_default(QWP_WS_DEFAULT_MAX_FRAME_REJECTIONS),
             poison_min_escalation_window: ConfigSetting::new_default(
                 QWP_WS_DEFAULT_POISON_MIN_ESCALATION_WINDOW,

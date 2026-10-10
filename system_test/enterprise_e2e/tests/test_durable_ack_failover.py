@@ -301,9 +301,10 @@ def test_durable_ack_drainer_never_gives_up_on_reconnect_budget_c_client_rust(
     after the budget elapsed hard-failed -> RED. Shipped semantics (both
     clients): the drainer never gives up on the budget and only ever
     terminates on SF exhaustion. In the Rust client the budget expiry rolls
-    the reconnect state over (``reconnect_with_policy`` re-arms on
-    ``retry_budget_exhausted_error``; only AuthError/ProtocolVersionError are
-    ``reconnect_error_is_terminal``). This test pins that end-to-end.
+    the reconnect state over: ``reconnect_with_policy`` re-arms retryable
+    failures, while ``reconnect_error_is_terminal`` owns the semantic decision
+    that a failure cannot recover through another reconnect. This test pins
+    that end-to-end without duplicating the classifier's evolving code list.
 
     Contrast test_durable_ack_sender_survives_replica_only_window (above),
     which promotes B inside the outage window and never outlives the budget:

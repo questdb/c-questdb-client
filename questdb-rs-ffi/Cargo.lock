@@ -1202,6 +1202,7 @@ dependencies = [
  "ureq",
  "webpki-roots",
  "windows-sys 0.60.2",
+ "zeroize",
  "zstd",
 ]
 
@@ -1213,6 +1214,7 @@ dependencies = [
  "libc",
  "questdb-confstr-ffi",
  "questdb-rs",
+ "zeroize",
 ]
 
 [[package]]

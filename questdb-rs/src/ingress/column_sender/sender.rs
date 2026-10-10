@@ -33,13 +33,14 @@ use crate::ErrorCode;
 use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+use crate::ingress::sender::ack_wait_timeout_error;
 use crate::ingress::sender::qwp_ws::{
     SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
     qwp_ws_begin_close_background, qwp_ws_check_error_background,
     qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
-    qwp_ws_published_fsn_background, qwp_ws_sender_errors_dropped_background,
-    sfa_has_deferred_commit_slot,
+    qwp_ws_published_fsn_background, qwp_ws_reconnect_failure_background,
+    qwp_ws_sender_errors_dropped_background, sfa_has_deferred_commit_slot,
 };
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
 #[cfg(feature = "arrow-ingress")]
@@ -2222,6 +2223,16 @@ impl SfaBackend {
                 }
                 return Ok(());
             }
+            // As in the row sender's wait: inside an auth callback whose
+            // return this sender's reconnect needs, the ACK cannot arrive.
+            if let Some(err) = self
+                .state
+                .token_provider
+                .as_ref()
+                .and_then(|provider| provider.callback_wait_error())
+            {
+                return Err(err);
+            }
             if completed != last_completed {
                 last_completed = completed;
                 deadline_anchor = Instant::now();
@@ -2230,7 +2241,13 @@ impl SfaBackend {
             qwp_ws_check_error_background(&self.state)?;
 
             if !timeout.is_zero() && deadline_anchor.elapsed() >= timeout {
-                return Err(sfa_sync_timeout(timeout, ack_level, boundary, completed));
+                return Err(sfa_sync_timeout(
+                    timeout,
+                    ack_level,
+                    boundary,
+                    completed,
+                    qwp_ws_reconnect_failure_background(&self.state).as_ref(),
+                ));
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -2271,8 +2288,11 @@ fn effective_hard_frame_cap(
 }
 
 /// The store-and-forward `wait` poll loop made no progress toward `boundary`
-/// for `sync_timeout`. The connection is alive but the server is not advancing
-/// the ack/durable watermark (e.g. back-pressured WAL or a stuck commit).
+/// for `sync_timeout`. Either the connection is alive but the server is not
+/// advancing the ack/durable watermark (e.g. back-pressured WAL or a stuck
+/// commit), or the connection is down and reconnecting keeps failing -- then
+/// the error names that failure and carries its OIDC detail, so a credential
+/// that needs a new sign-in reads as such.
 ///
 /// Classified `FailoverRetry`, but — unlike the direct backend's
 /// transport-timeout path, which drops the connection and discards its
@@ -2288,27 +2308,18 @@ fn sfa_sync_timeout(
     ack_level: AckLevel,
     boundary: u64,
     completed: Option<u64>,
+    reconnect_failure: Option<&crate::Error>,
 ) -> crate::Error {
     let level = match ack_level {
         AckLevel::Ok => "ok",
         AckLevel::Durable => "durable",
     };
-    let progress = match completed {
-        Some(fsn) => format!("reached FSN {}", fsn),
-        None => "reached no frame".to_string(),
-    };
-    crate::Error::new(
-        ErrorCode::FailoverRetry,
-        format!(
-            "QWP/WebSocket store-and-forward wait({}) timed out after {:?} \
-             with no ack progress (target FSN {}, {}); the connection is alive \
-             but the server is not advancing the watermark. The frames remain \
-             queued and the background runner keeps delivering them: retry \
-             wait() to keep awaiting the ack, or close the pool to drain. Do \
-             not re-flush the same data, which is already accepted and would \
-             be delivered twice.",
-            level, sync_timeout, boundary, progress
-        ),
+    ack_wait_timeout_error(
+        &format!("QWP/WebSocket store-and-forward wait({level})"),
+        sync_timeout,
+        boundary,
+        completed,
+        reconnect_failure,
     )
 }
 

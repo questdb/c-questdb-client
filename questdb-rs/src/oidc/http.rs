@@ -1,0 +1,2479 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+//! A small HTTPS helper for the OIDC device flow and discovery.
+//!
+//! Reuses the crate's rustls configuration ([`configure_tls`]) but builds its
+//! own [`ureq::Agent`] (the ILP/HTTP sender's agent is ILP-specific), refusing
+//! redirects, bounding the response body, and holding every IdP call to `https`
+//! (or loopback `http`).
+
+use std::cell::{Cell, RefCell};
+use std::fmt::Debug;
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::path::Path;
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use rustls_pki_types::pem::PemObject;
+use ureq::http::Uri;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::time::{Duration as TimeoutAfter, Instant as TimeoutClock};
+use ureq::unversioned::transport::{
+    Buffers, Connector, Either, LazyBuffers, NextTimeout, TcpConnector, Transport,
+};
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::ingress::tls::{TlsSettings, configure_tls};
+use crate::oidc::error::{OidcError, Result};
+
+const USER_AGENT: &str = concat!("questdb/rust/", env!("CARGO_PKG_VERSION"), " (oidc)");
+
+/// Cap on a response body: OIDC / discovery JSON is a few KiB, so 4 MiB is ample
+/// headroom while refusing to buffer an unbounded body from a hostile / stalled
+/// server.
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Cap on how much of a discovery/settings GET response is echoed into a
+/// diagnostic message. POST response bodies are never echoed because they can
+/// contain request credentials copied by an IdP, proxy, or WAF.
+const MAX_BODY_SNIPPET_CHARS: usize = 120;
+
+/// The result of a `POST` to the IdP token / device-authorization endpoint:
+/// the HTTP status, the parsed JSON body, and any `Retry-After` (delta-seconds).
+pub(crate) struct PostResult {
+    pub(crate) status: u16,
+    pub(crate) body: serde_json::Value,
+    pub(crate) retry_after: Option<u64>,
+}
+
+impl Drop for PostResult {
+    fn drop(&mut self) {
+        let _ = zeroize_json_strings(&mut self.body);
+    }
+}
+
+/// Wipe every response-owned string before serde releases its allocation. POST
+/// bodies may carry device, access, ID, or refresh credentials, including in a
+/// proxy/WAF error response that reflects request data.
+///
+/// Returns how many strings were wiped. Dropping a buffer is not observable, so
+/// that count is what lets a test prove the walk reaches property NAMES as well
+/// as values — a silently skipped key would otherwise fail nothing anywhere.
+fn zeroize_json_strings(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(value) => {
+            value.zeroize();
+            1
+        }
+        serde_json::Value::Array(values) => {
+            let mut wiped = 0;
+            for value in values {
+                wiped += zeroize_json_strings(value);
+            }
+            wiped
+        }
+        serde_json::Value::Object(values) => {
+            // Take the entries rather than iterating `values_mut()`: a key is a
+            // separate allocation that `values_mut()` cannot reach, and an IdP,
+            // proxy, or WAF that reflects the submitted form can put a
+            // credential in a property name. The map is left empty because a
+            // wiped key cannot be put back (every one would collide on ""),
+            // which is safe: this runs only from `Drop`.
+            let mut wiped = 0;
+            for (mut name, mut value) in std::mem::take(values) {
+                wiped += zeroize_json_strings(&mut value);
+                name.zeroize();
+                wiped += 1;
+            }
+            wiped
+        }
+        _ => 0,
+    }
+}
+
+/// HTTP statuses that indicate a retryable timeout, rate limit, or server-side
+/// failure rather than rejected credentials or invalid configuration.
+pub(crate) fn is_transient_http_status(status: u16) -> bool {
+    status == 408 || status == 429 || status >= 500
+}
+
+/// A reusable HTTPS client for the OIDC flow.
+pub(crate) struct HttpClient {
+    agent: ureq::Agent,
+    /// The configured per-request timeout, retained so a caller with a shorter
+    /// deadline can narrow one request without ever widening it.
+    timeout: Duration,
+}
+
+/// The OIDC transport permits plaintext HTTP only for local development. Keep
+/// the convenient `localhost` spelling, but verify the exact addresses handed
+/// to the connector: trusting the name alone lets a poisoned hosts/NSS/DNS
+/// configuration send device or refresh credentials off-machine in plaintext.
+#[derive(Debug, Default)]
+struct OidcResolver;
+
+impl Resolver for OidcResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let scheme = uri.scheme().ok_or(ureq::Error::HostNotFound)?;
+        let authority = uri.authority().ok_or(ureq::Error::HostNotFound)?;
+        let address =
+            DefaultResolver::host_and_port(scheme, authority).ok_or(ureq::Error::HostNotFound)?;
+
+        // ureq's DefaultResolver uses `thread::spawn` for every timed lookup;
+        // that panics when the OS refuses a thread. The shipped FFI uses
+        // panic=abort, turning ordinary resource exhaustion into termination of
+        // the host process. The same bounded resolver with Builder::spawn makes
+        // creation failure an ordinary retryable I/O error instead.
+        let resolved: Vec<SocketAddr> = if timeout.after.is_not_happening() {
+            address.to_socket_addrs()?.collect()
+        } else {
+            let (tx, rx) = mpsc::sync_channel(1);
+            thread::Builder::new()
+                .name("questdb-oidc-dns".to_string())
+                .spawn(move || {
+                    let _ = tx.send(
+                        address
+                            .to_socket_addrs()
+                            .map(|addresses| addresses.collect::<Vec<_>>()),
+                    );
+                })
+                .map_err(ureq::Error::Io)?;
+            match rx.recv_timeout(*timeout.after) {
+                Ok(addresses) => addresses?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(ureq::Error::Timeout(timeout.reason));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ureq::Error::Io(std::io::Error::other(
+                        "OIDC DNS resolver worker exited without a result",
+                    )));
+                }
+            }
+        };
+
+        let mut addresses = self.empty();
+        // `ResolvedSocketAddrs` is ureq's fixed 16-address ArrayVec.
+        for address in config
+            .ip_family()
+            .keep_wanted(resolved.into_iter())
+            .take(16)
+        {
+            addresses.push(address);
+        }
+        if addresses.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        enforce_plaintext_localhost_resolution(uri, &addresses)?;
+        Ok(addresses)
+    }
+}
+
+fn is_localhost_name(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.")
+}
+
+fn enforce_plaintext_localhost_resolution(
+    uri: &Uri,
+    addresses: &ResolvedSocketAddrs,
+) -> std::result::Result<(), ureq::Error> {
+    if uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
+        && uri.host().is_some_and(is_localhost_name)
+        && (addresses.is_empty() || addresses.iter().any(|addr| !addr.ip().is_loopback()))
+    {
+        return Err(ureq::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing plaintext HTTP because localhost resolved outside the loopback range",
+        )));
+    }
+    Ok(())
+}
+
+impl HttpClient {
+    /// Build a client verifying TLS against the default roots, or against
+    /// `ca_bundle` (a PEM file) when given. `timeout` bounds each whole request
+    /// (connect + send + receive), so a stalled IdP can't pin the caller.
+    pub(crate) fn new(ca_bundle: Option<&Path>, timeout: Duration) -> Result<Self> {
+        let tls_config = configure_tls(default_tls_settings(ca_bundle)?)
+            .map_err(|e| OidcError::config(format!("Could not configure TLS for OIDC: {e}")))?;
+        // `DispatchTracker` must stay the outermost link: it observes only the
+        // HTTP request bytes, after DNS, TCP connect and (forced, see
+        // `TlsConnector`) the TLS handshake have all completed.
+        let connector = TcpConnector::default()
+            .chain(TlsConnector::new(tls_config))
+            .chain(DispatchTracker);
+        let config = ureq::Agent::config_builder()
+            .user_agent(USER_AGENT)
+            // `Config::default()` sets `proxy: Proxy::try_from_env()`, which
+            // reads ALL_PROXY / HTTPS_PROXY / HTTP_PROXY (and the lowercase
+            // spellings), first match winning regardless of target scheme. Our
+            // connector chain below is TcpConnector -> TlsConnector with no
+            // proxy connector, so a configured proxy made ureq hand
+            // `resolver.empty()` to TcpConnector and every request failed with
+            // a bare "Connection refused" without contacting anything --
+            // including the IdP, which a corporate NO_PROXY list never covers.
+            // Ignore proxies explicitly rather than half-honouring them. Real
+            // proxy support needs `ConnectProxyConnector` in the chain AND a
+            // decision about `OidcResolver`, which would then be resolving the
+            // proxy host rather than the target and so cannot enforce the
+            // plaintext-only-to-loopback rule as written.
+            .proxy(None)
+            // Never pool connections. A refresh written onto a pooled socket
+            // that died while idle (laptop sleep, a network change, a NAT or
+            // firewall that dropped the flow) fails after its bytes left the
+            // client, which is indistinguishable from an IdP that consumed the
+            // refresh token and lost the reply -- so the refresh token is
+            // discarded and the client needs an interactive sign-in for a
+            // credential the IdP never saw. A fresh connection instead fails
+            // before dispatch, keeping the token for a retry. ureq's idle-age
+            // eviction cannot be relied on (its pooled-connection age is always
+            // zero in 3.1), and IdP requests are too rare for reuse to matter.
+            .max_idle_connections(0)
+            .max_idle_connections_per_host(0)
+            .no_delay(true)
+            // We inspect the status ourselves (a 4xx token-endpoint reply carries
+            // `authorization_pending` / `slow_down`), so don't turn it into an error.
+            .http_status_as_error(false)
+            // These endpoints never legitimately redirect. Auto-following is
+            // unsafe: only the original URL is vetted, and a 30x could re-send a
+            // credential to another host, even downgrading to plaintext. Return
+            // the 30x as-is so the caller fails it fast.
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .timeout_global(Some(timeout))
+            .timeout_connect(Some(timeout))
+            .build();
+        let agent = ureq::Agent::with_parts(config, connector, OidcResolver);
+        Ok(HttpClient { agent, timeout })
+    }
+
+    /// GET a URL and parse a JSON response, erroring on a non-2xx status.
+    pub(crate) fn get_json(&self, url: &str, allow_insecure: bool) -> Result<serde_json::Value> {
+        require_secure(url, allow_insecure)?;
+        let response = self
+            .agent
+            .get(url)
+            .header("Accept", "application/json")
+            .call()
+            .map_err(|e| OidcError::network(format!("Failed to reach {url}: {e}")))?;
+        let status = response.status().as_u16();
+        let retry_after = parse_retry_after(response.headers());
+        let body = read_body(url, response)?;
+        if !(200..300).contains(&status) {
+            let snippet = body_snippet(&body);
+            let msg = format!("HTTP {status} from {url}: {snippet}");
+            // A 408 / 429 / 5xx is a transient timeout, rate-limit, or server
+            // issue; anything else (a wrong URL, OIDC not advertised, an auth
+            // gate) is a configuration problem.
+            return Err(if is_transient_http_status(status) {
+                OidcError::network(msg).with_status(Some(status))
+            } else {
+                OidcError::config(msg).with_status(Some(status))
+            }
+            .with_retry_after(retry_after));
+        }
+        serde_json::from_slice(&body).map_err(|e| {
+            OidcError::config(format!("Invalid JSON from {url}: {e}")).with_status(Some(status))
+        })
+    }
+
+    /// POST a form-urlencoded body and parse the JSON response.
+    ///
+    /// The HTTP status is returned rather than raised (a 4xx token reply carries
+    /// the OAuth error body), unless the body is not JSON — then it is an error
+    /// carrying the status so the caller can classify terminal-vs-transient.
+    pub(crate) fn post_form(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+        allow_insecure: bool,
+    ) -> Result<PostResult> {
+        self.post_form_within_inner::<fn() -> Result<()>>(url, form, allow_insecure, None, None)
+    }
+
+    /// As [`post_form`](Self::post_form), but run `before_dispatch` immediately
+    /// before the first HTTP request byte is handed to the transport.
+    ///
+    /// Refresh-token persistence uses this boundary to publish its durable
+    /// anti-replay tombstone as late as possible: DNS, TCP and TLS failures do
+    /// not consume the stored parent, while no request byte can leave before a
+    /// successful tombstone. If the callback fails, the request is aborted and
+    /// its original structured [`OidcError`] is returned.
+    pub(crate) fn post_form_at_dispatch<F>(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+        allow_insecure: bool,
+        before_dispatch: F,
+    ) -> Result<PostResult>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.post_form_within_inner(url, form, allow_insecure, None, Some(before_dispatch))
+    }
+
+    /// As [`post_form`](Self::post_form), but additionally bounds this one
+    /// request by `budget`.
+    ///
+    /// The configured timeout bounds each request, not the operation a caller
+    /// is running. A device-flow poll is bounded by the device code's own
+    /// lifetime, which is routinely shorter: without this, an IdP that accepts
+    /// a poll and then withholds its response holds the caller for the whole
+    /// request timeout past an expiry that had already passed. The budget only
+    /// ever narrows: it is clamped to the configured timeout, so this cannot
+    /// be used to extend a request beyond it.
+    pub(crate) fn post_form_within(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+        allow_insecure: bool,
+        budget: Option<Duration>,
+    ) -> Result<PostResult> {
+        self.post_form_within_inner::<fn() -> Result<()>>(url, form, allow_insecure, budget, None)
+    }
+
+    fn post_form_within_inner<F>(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+        allow_insecure: bool,
+        budget: Option<Duration>,
+        before_dispatch: Option<F>,
+    ) -> Result<PostResult>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        require_secure(url, allow_insecure)?;
+        let request = self.agent.post(url).header("Accept", "application/json");
+        let request = match budget {
+            Some(budget) => request
+                .config()
+                .timeout_global(Some(budget.min(self.timeout)))
+                .build(),
+            None => request,
+        };
+        REQUEST_DISPATCHED.with(|dispatched| dispatched.set(false));
+        let mut hook_state = DispatchHookState::new(before_dispatch);
+        let response = {
+            let _hook = DispatchHookGuard::install(&mut hook_state);
+            request.send_form(form.iter().copied())
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(e) => {
+                // A failure in the dispatch callback is local and the transport
+                // has received no request byte. Preserve its exact diagnostic
+                // instead of replacing it with ureq's synthetic I/O error.
+                if let Some(error) = hook_state.error.take() {
+                    return Err(error);
+                }
+                // Record whether the request provably never left the client, so a
+                // refresh caller can safely keep a refresh token that the IdP
+                // cannot have seen (vs. an ambiguous mid-flight drop, where the
+                // parent may have been consumed and rotated).
+                let unsent = !REQUEST_DISPATCHED.with(Cell::get);
+                let timed_out = request_timed_out(&e);
+                return Err(OidcError::network(format!("Failed to reach {url}: {e}"))
+                    .with_request_unsent(unsent)
+                    .with_request_timed_out(timed_out));
+            }
+        };
+        let status = response.status().as_u16();
+        let retry_after = parse_retry_after(response.headers());
+        // Keep the raw response allocation under RAII zeroization as well as the
+        // parsed strings below. Both otherwise survive in freed allocator pages.
+        // `read_body_zeroizing` also wipes every buffer it outgrows; ureq's own
+        // transport buffers are outside this crate's control (see
+        // `token_provider.rs`, "Known residual").
+        let body = read_body_zeroizing(url, response)?;
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(mut value) => {
+                // Token-endpoint responses are untrusted and some IdPs, proxies,
+                // and WAFs reflect the submitted form. Scrub an exact raw or
+                // form-encoded credential before any caller can interpolate or
+                // retain a response field. The parsed response is already wiped
+                // by `PostResult::drop`; this also prevents a credential from
+                // escaping into OidcError, renderers, token metadata, or FFI.
+                redact_reflected_credentials(&mut value, form);
+                Ok(PostResult {
+                    status,
+                    body: value,
+                    retry_after,
+                })
+            }
+            Err(_) => {
+                // A response from these POST endpoints can contain OAuth secrets,
+                // including when an IdP/proxy reflects the request body into an
+                // error page. Never echo its bytes into a displayable/loggable
+                // error, regardless of status.
+                let detail = non_json_body_detail(status, &body);
+                let msg = format!("HTTP {status} from {url}: {detail}");
+                // A transient 408/429/5xx (a timeout or proxy/WAF error page) stays
+                // retryable; anything else is a terminal rejection. Either way carry
+                // the status + Retry-After so the poll loop / refresh can classify
+                // and back off correctly.
+                let err = if is_transient_http_status(status) {
+                    OidcError::network(msg)
+                } else {
+                    OidcError::device_flow(msg)
+                };
+                Err(err.with_status(Some(status)).with_retry_after(retry_after))
+            }
+        }
+    }
+}
+
+const REDACTED_CREDENTIAL: &str = "[redacted credential]";
+
+/// The response fields that legitimately carry the credentials the IdP issued.
+/// They are never rewritten: a non-rotating refresh grant re-sends the
+/// submitted refresh token verbatim, so redacting these would destroy the very
+/// credential this client has to keep, and an access / ID token is an opaque
+/// value that must reach the wire byte-for-byte.
+const ISSUED_TOKEN_FIELDS: [&str; 3] = ["access_token", "id_token", "refresh_token"];
+
+/// Remove submitted token-endpoint credentials from every response field that is
+/// later surfaced outside this module, while retaining the non-secret parts of
+/// those diagnostics.
+///
+/// Deliberately not limited to `error` / `error_description`: a 200 response
+/// reaches the caller too, where an unsupported `token_type` is quoted into a
+/// public error and `scope` is retained in the public `TokenSet` (and printed
+/// by its `Debug`). Anything but the issued-token fields above is therefore
+/// scrubbed, at any depth.
+fn redact_reflected_credentials(value: &mut serde_json::Value, form: &[(&str, &str)]) {
+    let mut credentials: Vec<Zeroizing<String>> = Vec::new();
+    for (name, credential) in form {
+        if !matches!(*name, "device_code" | "refresh_token") || credential.is_empty() {
+            continue;
+        }
+        // Match ureq's application/x-www-form-urlencoded spelling. This
+        // allocation contains a credential too, so it must be wiped on drop.
+        let encoded = form_url_encode(credential);
+        if encoded.as_str() != *credential {
+            credentials.push(encoded);
+        }
+        credentials.push(Zeroizing::new((*credential).to_string()));
+    }
+    if credentials.is_empty() {
+        return;
+    }
+    redact_reflections(value, &credentials);
+}
+
+fn redact_reflections(value: &mut serde_json::Value, credentials: &[Zeroizing<String>]) {
+    match value {
+        serde_json::Value::String(text) => {
+            for credential in credentials {
+                redact_string(text, credential);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_reflections(value, credentials);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (name, value) in values.iter_mut() {
+                if ISSUED_TOKEN_FIELDS.contains(&name.as_str()) {
+                    continue;
+                }
+                redact_reflections(value, credentials);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace every exact occurrence without ever dropping an allocation that
+/// still contains the credential. `replacement` is non-secret, so the final
+/// allocation can safely remain in the parsed error body.
+fn redact_string(value: &mut String, credential: &str) {
+    if credential.is_empty() || !value.contains(credential) {
+        return;
+    }
+    // Only text from OUTSIDE the matches and the non-secret marker are ever
+    // pushed here, so unlike `form_url_encode` this buffer may grow safely: a
+    // reallocation cannot leave a copy of the credential behind.
+    let mut redacted = Zeroizing::new(String::with_capacity(value.len()));
+    let mut rest = value.as_str();
+    while let Some(index) = rest.find(credential) {
+        redacted.push_str(&rest[..index]);
+        redacted.push_str(REDACTED_CREDENTIAL);
+        rest = &rest[index + credential.len()..];
+    }
+    redacted.push_str(rest);
+    // Scrub the response-owned reflected credential before replacing it. The
+    // sanitized allocation is then transferred out of its temporary guard.
+    value.zeroize();
+    *value = std::mem::take(&mut *redacted);
+}
+
+/// Whether ureq 3.1's `send_form` percent-encodes this byte: its query
+/// percent-encode set. A space is the one byte it replaces with a single `+`
+/// instead, so it is not percent-encoded.
+fn form_percent_encodes(byte: u8) -> bool {
+    byte != b' '
+        && (!(0x20..0x7f).contains(&byte)
+            || matches!(
+                byte,
+                b'"' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'+'
+                    | b','
+                    | b'/'
+                    | b':'
+                    | b';'
+                    | b'<'
+                    | b'='
+                    | b'>'
+                    | b'?'
+                    | b'@'
+                    | b'['
+                    | b'\\'
+                    | b']'
+                    | b'^'
+                    | b'`'
+                    | b'{'
+                    | b'|'
+                    | b'}'
+            ))
+}
+
+/// Encode exactly as ureq 3.1's `send_form`: its query percent-encode set plus
+/// HTML-form spaces (`+`). Keeping this local avoids constructing the complete
+/// request body a second time merely to identify a reflected credential.
+fn form_url_encode(value: &str) -> Zeroizing<String> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    // Size the buffer before writing a single byte of the credential. Percent
+    // encoding expands a byte to three, so a buffer sized from the input length
+    // would grow mid-write: growth copies the partially encoded secret into a
+    // new allocation and frees the old one, which `Zeroizing` can no longer
+    // reach. `String` never reallocates while its length stays within the
+    // capacity requested here, and exactly `encoded_len` bytes are pushed below.
+    let mut encoded_len: usize = 0;
+    for byte in value.bytes() {
+        encoded_len = encoded_len.saturating_add(if form_percent_encodes(byte) { 3 } else { 1 });
+    }
+    let mut encoded = Zeroizing::new(String::with_capacity(encoded_len));
+    for byte in value.bytes() {
+        if byte == b' ' {
+            encoded.push('+');
+        } else if form_percent_encodes(byte) {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        } else {
+            encoded.push(byte as char);
+        }
+    }
+    encoded
+}
+
+thread_local! {
+    /// Whether the request currently being sent on this thread has handed any
+    /// HTTP bytes to the transport. Set by [`DispatchTrackingTransport`], reset
+    /// by [`HttpClient::post_form_within`] before each request.
+    ///
+    /// A send failure with this still `false` proves the request never left the
+    /// client — DNS resolution, TCP connect and the TLS handshake all run
+    /// before it — so a refresh token carried in it was not consumed by the IdP
+    /// and is safe to reuse. Once any request byte reached the transport, every
+    /// failure is treated as possibly-sent.
+    ///
+    /// This tracks the send phase directly instead of inferring it from the
+    /// error: `ureq` reports a DNS failure as `Io(Uncategorized)`, a connect
+    /// timeout as `Timeout(Global)` whenever the global and connect timeouts
+    /// coincide, and a TLS handshake failure as `Io(InvalidData)`. None of those
+    /// shapes identifies the phase it came from.
+    ///
+    /// Thread-local is sound here: `ureq` runs the connector chain and every
+    /// transport write of a request on the thread that issued it.
+    static REQUEST_DISPATCHED: Cell<bool> = const { Cell::new(false) };
+
+    /// Request-scoped callback installed by [`HttpClient::post_form_at_dispatch`].
+    ///
+    /// ureq's connector and transport traits are `'static`, while the token
+    /// store and key borrowed by a refresh are not. Keep only a type-erased
+    /// pointer for the strictly synchronous `send_form` call, with an RAII guard
+    /// that removes it before the borrowed callback leaves scope. ureq performs
+    /// every write on the calling thread, the same invariant used by
+    /// [`REQUEST_DISPATCHED`].
+    static BEFORE_REQUEST_DISPATCH: RefCell<Option<ErasedDispatchHook>> = const {
+        RefCell::new(None)
+    };
+}
+
+struct DispatchHookState<F> {
+    hook: Option<F>,
+    error: Option<OidcError>,
+}
+
+impl<F> DispatchHookState<F> {
+    fn new(hook: Option<F>) -> Self {
+        Self { hook, error: None }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ErasedDispatchHook {
+    state: *mut (),
+    invoke: unsafe fn(*mut ()) -> bool,
+}
+
+fn invoke_dispatch_hook<F>(state: *mut ()) -> bool
+where
+    F: FnOnce() -> Result<()>,
+{
+    // SAFETY: `DispatchHookGuard` installs a pointer to a live
+    // `DispatchHookState<F>` only for the synchronous `send_form` call on this
+    // thread, and clears it before that state can leave scope.
+    let state = unsafe { &mut *state.cast::<DispatchHookState<F>>() };
+    let Some(hook) = state.hook.take() else {
+        return true;
+    };
+    match hook() {
+        Ok(()) => true,
+        Err(error) => {
+            state.error = Some(error);
+            false
+        }
+    }
+}
+
+struct DispatchHookGuard;
+
+impl DispatchHookGuard {
+    fn install<F>(state: &mut DispatchHookState<F>) -> Option<Self>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        state.hook.as_ref()?;
+        BEFORE_REQUEST_DISPATCH.with(|slot| {
+            let previous = slot.borrow_mut().replace(ErasedDispatchHook {
+                state: std::ptr::from_mut(state).cast(),
+                invoke: invoke_dispatch_hook::<F>,
+            });
+            debug_assert!(previous.is_none(), "nested OIDC dispatch hook");
+        });
+        Some(Self)
+    }
+}
+
+impl Drop for DispatchHookGuard {
+    fn drop(&mut self) {
+        BEFORE_REQUEST_DISPATCH.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+fn run_before_request_dispatch() -> bool {
+    BEFORE_REQUEST_DISPATCH.with(|slot| {
+        let hook = *slot.borrow();
+        hook.is_none_or(|hook| {
+            // SAFETY: see `invoke_dispatch_hook`; the guard owns the scoped
+            // validity proof for this erased pointer.
+            unsafe { (hook.invoke)(hook.state) }
+        })
+    })
+}
+
+/// Outermost connector: wraps the finished transport (TCP, or TCP + TLS with
+/// the handshake already complete) so the first HTTP byte written marks the
+/// request as dispatched. See [`REQUEST_DISPATCHED`].
+#[derive(Debug)]
+struct DispatchTracker;
+
+impl<In: Transport> Connector<In> for DispatchTracker {
+    type Out = DispatchTrackingTransport<In>;
+
+    fn connect(
+        &self,
+        _details: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<In>,
+    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| DispatchTrackingTransport { inner }))
+    }
+}
+
+#[derive(Debug)]
+struct DispatchTrackingTransport<T> {
+    inner: T,
+}
+
+/// Fail an I/O call that ureq hands an already-elapsed request deadline.
+///
+/// ureq checks the global deadline only before each redirect attempt; within
+/// one it recomputes the remaining time per transport call, and a remaining
+/// time of zero reaches the transport as a timeout of exactly zero, which its
+/// TCP transport turns into a one-second socket timeout (`not_zero`). A peer
+/// that kept sending a byte a second therefore held a request open forever
+/// once its deadline had passed. Refusing the call keeps every request -- TLS
+/// or plaintext -- inside the configured timeout.
+fn refuse_elapsed_deadline(timeout: NextTimeout) -> std::result::Result<(), ureq::Error> {
+    match timeout.after {
+        TimeoutAfter::Exact(after) if after.is_zero() => Err(ureq::Error::Timeout(timeout.reason)),
+        _ => Ok(()),
+    }
+}
+
+/// Retry a signal-interrupted transport read without restarting its relative
+/// timeout. Plain TCP can surface `EINTR` while ureq is reading the response
+/// head; treating it as a request failure makes a dispatched refresh ambiguous
+/// and forces the parent token to be discarded. TLS happens to retry this in
+/// its own stack. Give plaintext the same behaviour, recomputing the remaining
+/// time against one absolute deadline on every attempt.
+fn retry_interrupted_transport_io<R>(
+    mut timeout: NextTimeout,
+    mut operation: impl FnMut(NextTimeout) -> std::result::Result<R, ureq::Error>,
+) -> std::result::Result<R, ureq::Error> {
+    let deadline = match timeout.after {
+        TimeoutAfter::Exact(after) => Instant::now().checked_add(after),
+        TimeoutAfter::NotHappening => None,
+    };
+    loop {
+        match operation(timeout) {
+            Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                timeout.after = match deadline {
+                    None => TimeoutAfter::NotHappening,
+                    Some(deadline) => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return Err(ureq::Error::Timeout(timeout.reason));
+                        }
+                        TimeoutAfter::Exact(left)
+                    }
+                };
+            }
+            result => return result,
+        }
+    }
+}
+
+impl<T: Transport> Transport for DispatchTrackingTransport<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: NextTimeout,
+    ) -> std::result::Result<(), ureq::Error> {
+        if amount > 0 {
+            // Before marking the request dispatched: a request that times out
+            // here has provably sent nothing.
+            refuse_elapsed_deadline(timeout)?;
+            if !run_before_request_dispatch() {
+                return Err(ureq::Error::Io(std::io::Error::other(
+                    "OIDC pre-dispatch callback failed",
+                )));
+            }
+            // Set before the write: a write that fails part-way may already
+            // have delivered the request.
+            REQUEST_DISPATCHED.with(|dispatched| dispatched.set(true));
+        }
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn maybe_await_input(
+        &mut self,
+        timeout: NextTimeout,
+    ) -> std::result::Result<bool, ureq::Error> {
+        // Input already buffered needs no I/O, so serve it even past the
+        // deadline: the response is complete.
+        if !self.inner.buffers().can_use_input() {
+            refuse_elapsed_deadline(timeout)?;
+        }
+        retry_interrupted_transport_io(timeout, |remaining| self.inner.maybe_await_input(remaining))
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        if !self.inner.buffers().can_use_input() {
+            refuse_elapsed_deadline(timeout)?;
+        }
+        retry_interrupted_transport_io(timeout, |remaining| self.inner.await_input(remaining))
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+
+/// True when `ureq` reports that a request deadline elapsed. This is transport
+/// provenance for the RFC 8628 polling rule; it deliberately says nothing
+/// about whether the request was transmitted.
+fn request_timed_out(err: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
+    use ureq::Error;
+    match err {
+        Error::Timeout(_) => true,
+        Error::Io(e) => e.kind() == ErrorKind::TimedOut,
+        _ => false,
+    }
+}
+
+/// Read a response body, bounded by [`MAX_RESPONSE_BYTES`].
+fn read_body(url: &str, response: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
+    // ureq's limit reader errors when the allowance reaches zero *before*
+    // probing EOF. Leave one byte for that probe, then enforce the inclusive
+    // cap ourselves so an exactly-4-MiB response succeeds but a larger one
+    // still cannot be parsed or buffered without a bound.
+    let body = response
+        .into_body()
+        .into_with_config()
+        .limit(MAX_RESPONSE_BYTES + 1)
+        .read_to_vec()
+        .map_err(|e| {
+            let timed_out = request_timed_out(&e);
+            OidcError::network(format!("Failed to read response body from {url}: {e}"))
+                .with_request_timed_out(timed_out)
+        })?;
+    if body.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(oversized_body_error(url));
+    }
+    Ok(body)
+}
+
+fn oversized_body_error(url: &str) -> OidcError {
+    OidcError::network(format!(
+        "Failed to read response body from {url}: the response body exceeds the {MAX_RESPONSE_BYTES}-byte limit"
+    ))
+}
+
+/// Read a credential-bearing response body, bounded by [`MAX_RESPONSE_BYTES`],
+/// without leaving plaintext copies behind.
+///
+/// [`read_body`] goes through ureq's `read_to_vec`, which grows a `Vec` from
+/// empty: every buffer a geometric growth leaves behind is freed holding a
+/// plaintext prefix of the token response, and wrapping only the final `Vec` in
+/// `Zeroizing` cannot reach those. Here each outgrown buffer is itself a
+/// `Zeroizing` and is wiped as it is replaced, and the first one is sized from
+/// `Content-Length` so a typical response never grows at all.
+fn read_body_zeroizing(
+    url: &str,
+    response: ureq::http::Response<ureq::Body>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+
+    const INITIAL_CAPACITY: usize = 4096;
+    const CHUNK: usize = 8192;
+
+    let read_error = |e: std::io::Error| {
+        let e = ureq::Error::from(e);
+        let timed_out = request_timed_out(&e);
+        OidcError::network(format!("Failed to read response body from {url}: {e}"))
+            .with_request_timed_out(timed_out)
+    };
+    let initial = response
+        .headers()
+        .get(ureq::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(INITIAL_CAPACITY, |len| {
+            // One byte of headroom lets the terminating zero-length read land
+            // without forcing a growth.
+            usize::try_from(len.min(MAX_RESPONSE_BYTES)).unwrap_or(INITIAL_CAPACITY) + 1
+        });
+    let mut reader = response
+        .into_body()
+        .into_with_config()
+        .limit(MAX_RESPONSE_BYTES + 1)
+        .reader();
+    let mut body = Zeroizing::new(Vec::with_capacity(initial));
+    let mut chunk = Zeroizing::new([0_u8; CHUNK]);
+    loop {
+        let n = match reader.read(&mut chunk[..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(read_error(e)),
+        };
+        if body.capacity() - body.len() < n {
+            let needed = body.len() + n;
+            let mut grown = Zeroizing::new(Vec::with_capacity(
+                needed.max(body.capacity().saturating_mul(2)),
+            ));
+            grown.extend_from_slice(&body);
+            // The outgrown buffer is wiped (whole capacity) as it is dropped.
+            body = grown;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    if body.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(oversized_body_error(url));
+    }
+    Ok(body)
+}
+
+/// A short, printable snippet of a (possibly binary / error-page) body for a
+/// diagnostic message.
+fn body_snippet(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let snippet: String = text.chars().take(MAX_BODY_SNIPPET_CHARS).collect();
+    crate::oidc::render::strip_control(&snippet)
+}
+
+/// Diagnostic detail for a token / device-authorization response whose body did
+/// not parse as JSON. Never echo the body: an IdP, proxy, or WAF may reflect the
+/// POST form, including a device code or refresh token, at any HTTP status.
+fn non_json_body_detail(_status: u16, _body: &[u8]) -> String {
+    "unexpected non-JSON response body".to_string()
+}
+
+/// Parse a `Retry-After` header as a non-negative number of seconds.
+///
+/// Honors only the delta-seconds form (RFC 7231 §7.1.3) — a bare run of ASCII
+/// digits, at most 9 (>31 years is meaningless). The HTTP-date form is ignored;
+/// the caller's fixed back-off covers that rarer case.
+fn parse_retry_after(headers: &ureq::http::HeaderMap) -> Option<u64> {
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    if value.is_empty() || value.len() > 9 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// True if `host` is a loopback address — plaintext `http` is safe there because
+/// the request never leaves the machine.
+///
+/// An IP literal is answered from the literal itself. The special-use
+/// `localhost` name is accepted provisionally by spelling; [`OidcResolver`]
+/// verifies that the exact addresses used for a plaintext connection are all
+/// loopback before handing them to the connector.
+pub(crate) fn is_loopback(host: &str) -> bool {
+    // Strip the brackets off an IPv6 literal before parsing.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(addr) = bare.parse::<IpAddr>() {
+        return addr.is_loopback();
+    }
+    is_localhost_name(host)
+}
+
+/// The host of a URL, unbracketed for an IPv6 literal, or `None` when it does
+/// not parse or carries no authority.
+pub(crate) fn url_host(url: &str) -> Option<String> {
+    let uri: Uri = url.parse().ok()?;
+    let host = uri.host()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Refuse to send a request over a channel that isn't `https` (or loopback
+/// `http`, or — when `allow_insecure` — any `http`).
+fn require_secure(url: &str, allow_insecure: bool) -> Result<()> {
+    let uri: Uri = url
+        .parse()
+        .map_err(|e| OidcError::config(format!("Malformed endpoint URL {url:?}: {e}")))?;
+    let scheme = uri.scheme_str().unwrap_or("").to_ascii_lowercase();
+    if scheme == "https" {
+        // A hostless https URL (e.g. `https:///path`) would pass this gate and
+        // then reach the TLS connector, which needs a URI authority. Reject it
+        // here with a clear config error. Endpoints are already origin-checked
+        // at build time, so this is defense in depth.
+        if uri.host().unwrap_or("").is_empty() {
+            return Err(OidcError::config(format!(
+                "Malformed endpoint URL {url:?}: an https URL must have a host."
+            )));
+        }
+        return Ok(());
+    }
+    if scheme == "http" {
+        // `allow_insecure` first: it is a plain bool.
+        if allow_insecure {
+            return Ok(());
+        }
+        if is_loopback(uri.host().unwrap_or("")) {
+            return Ok(());
+        }
+    }
+    Err(OidcError::config(format!(
+        "Refusing to use insecure URL {url:?} (scheme {scheme:?}). Use https \
+         (localhost and loopback IP http are always allowed for local development); enable \
+         allow_insecure_transport only to permit plaintext to a non-loopback \
+         QuestDB server. The identity provider requires https except on loopback."
+    )))
+}
+
+/// Pick the rustls trust anchors: an explicit PEM `ca_bundle`, else the crate's
+/// compiled-in default roots.
+fn default_tls_settings(ca_bundle: Option<&Path>) -> Result<TlsSettings> {
+    if let Some(path) = ca_bundle {
+        let file = std::fs::File::open(path).map_err(|e| {
+            OidcError::config(format!(
+                "Could not open the CA bundle {path:?}: {e}. Point ca_bundle at a \
+                 readable PEM certificate file."
+            ))
+        })?;
+        let certs = rustls_pki_types::CertificateDer::pem_reader_iter(file)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                OidcError::config(format!("Could not read the CA bundle {path:?}: {e}."))
+            })?;
+        if certs.is_empty() {
+            return Err(OidcError::config(format!(
+                "The CA bundle {path:?} contained no certificates."
+            )));
+        }
+        return Ok(TlsSettings::PemFile(certs));
+    }
+
+    #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+    let settings = TlsSettings::WebpkiAndOsRoots;
+    #[cfg(all(feature = "tls-webpki-certs", not(feature = "tls-native-certs")))]
+    let settings = TlsSettings::WebpkiRoots;
+    #[cfg(all(feature = "tls-native-certs", not(feature = "tls-webpki-certs")))]
+    let settings = TlsSettings::OsRoots;
+    #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
+    return Err(OidcError::config(
+        "OIDC needs a TLS root source; enable the \"tls-webpki-certs\" or \
+         \"tls-native-certs\" feature (both are in the default set), or pass an \
+         explicit CA bundle.",
+    ));
+    #[cfg(any(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+    Ok(settings)
+}
+
+// ---------------------------------------------------------------------------
+// ureq rustls transport glue.
+//
+// ureq is compiled without built-in TLS (`default-features = false`), so HTTPS
+// needs a custom connector. This mirrors the ILP/HTTP sender's connector
+// (`ingress::sender::http`); it is kept separate because the OIDC client builds
+// its own IdP-specific `ureq::Agent` (no redirects, its own timeouts, bounded
+// body) rather than sharing the sender's ILP-specific one. Pure transport
+// plumbing — no security decisions live here (root selection is in
+// `configure_tls`, scheme enforcement in `require_secure`).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct TlsConnector {
+    tls_config: Arc<ClientConfig>,
+}
+
+impl TlsConnector {
+    fn new(tls_config: Arc<ClientConfig>) -> Self {
+        TlsConnector { tls_config }
+    }
+}
+
+impl<In: Transport> Connector<In> for TlsConnector {
+    type Out = Either<In, TlsTransport>;
+
+    fn connect(
+        &self,
+        details: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<In>,
+    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        let transport = match chained {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        if !details.needs_tls() {
+            return Ok(Some(Either::A(transport)));
+        }
+
+        // Never `.expect()` here: this crate is built into a `panic = "abort"`
+        // FFI, so a panic on a missing authority would abort the host process.
+        // A URI without an authority is already rejected upstream
+        // (`require_secure` + `reject_confusable_authority`); return a TLS error
+        // as a local safety net rather than relying on that.
+        let name = crate::ingress::tls::server_name_for_uri_host(
+            details
+                .uri
+                .authority()
+                .ok_or(ureq::Error::Tls("tls uri has no authority"))?
+                .host(),
+        )
+        .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
+        let conn = ClientConnection::new(self.tls_config.clone(), name)
+            .map_err(|_e| ureq::Error::Tls("tls client connection error"))?;
+        let mut stream = StreamOwned {
+            conn,
+            sock: DeadlineAdapter::new(transport.boxed()),
+        };
+        // Complete the handshake here rather than lazily on the first request
+        // write, so a handshake failure surfaces before `DispatchTracker` sees
+        // any request byte: the request is then provably unsent. The deadline
+        // is measured from when ureq computed this connect timeout, so the
+        // TCP connect it already covered is not granted a second time.
+        stream.sock.arm_from(details.now, details.timeout);
+        while stream.conn.is_handshaking() {
+            let (read, written) = stream
+                .conn
+                .complete_io(&mut stream.sock)
+                .map_err(ureq::Error::from)?;
+            if read == 0 && written == 0 {
+                // No progress while still handshaking: the peer closed.
+                return Err(ureq::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                )));
+            }
+        }
+        let buffers = LazyBuffers::new(
+            details.config.input_buffer_size(),
+            details.config.output_buffer_size(),
+        );
+        Ok(Some(Either::B(TlsTransport { buffers, stream })))
+    }
+}
+
+/// The `std::io` view rustls drives a ureq transport through, bounded by one
+/// absolute deadline across every read and write it makes.
+///
+/// ureq's own `TransportAdapter` hands each underlying I/O call the same
+/// relative `NextTimeout`, and rustls makes many of them per operation: the
+/// whole handshake in [`TlsConnector::connect`], and as many reads as one TLS
+/// record needs inside a single `read`. Each read then got a fresh full
+/// timeout, so an IdP -- or anything between it and the client -- that sent
+/// one byte just inside the timeout held the handshake or response open
+/// without limit: a sign-in, a `token()` refresh still holding the
+/// cross-process token-store lock, or a flush waiting on either. Converting the
+/// timeout to a deadline once per operation, and handing the transport only
+/// the time left before it, keeps the request inside the configured timeout.
+struct DeadlineAdapter {
+    transport: Box<dyn Transport>,
+    /// `None`: the operation has no deadline.
+    deadline: Option<Instant>,
+    reason: ureq::Timeout,
+}
+
+impl DeadlineAdapter {
+    fn new(transport: Box<dyn Transport>) -> Self {
+        Self {
+            transport,
+            deadline: None,
+            reason: ureq::Timeout::Global,
+        }
+    }
+
+    /// Bound the following I/O by `timeout`, counted from `start`.
+    fn arm_from(&mut self, start: TimeoutClock, timeout: NextTimeout) {
+        let start = match start {
+            TimeoutClock::Exact(start) => start,
+            _ => Instant::now(),
+        };
+        self.reason = timeout.reason;
+        self.deadline = match timeout.after {
+            // An unrepresentable deadline is one that never arrives.
+            TimeoutAfter::Exact(after) => start.checked_add(after),
+            TimeoutAfter::NotHappening => None,
+        };
+    }
+
+    /// Bound the following I/O by `timeout`, counted from now.
+    fn arm(&mut self, timeout: NextTimeout) {
+        self.arm_from(TimeoutClock::now(), timeout);
+    }
+
+    /// The timeout for one I/O call: whatever is left of the deadline, or a
+    /// timeout error once nothing is.
+    fn remaining(&self) -> std::io::Result<NextTimeout> {
+        let after = match self.deadline {
+            None => TimeoutAfter::NotHappening,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(ureq::Error::Timeout(self.reason).into_io());
+                }
+                TimeoutAfter::Exact(left)
+            }
+        };
+        Ok(NextTimeout {
+            after,
+            reason: self.reason,
+        })
+    }
+}
+
+impl Read for DeadlineAdapter {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.transport.buffers().can_use_input() {
+            let timeout = self.remaining()?;
+            self.transport
+                .await_input(timeout)
+                .map_err(ureq::Error::into_io)?;
+        }
+        let input = self.transport.buffers().input();
+        let max = buf.len().min(input.len());
+        buf[..max].copy_from_slice(&input[..max]);
+        self.transport.buffers().input_consume(max);
+        Ok(max)
+    }
+}
+
+impl Write for DeadlineAdapter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let timeout = self.remaining()?;
+        let output = self.transport.buffers().output();
+        let max = buf.len().min(output.len());
+        output[..max].copy_from_slice(&buf[..max]);
+        self.transport
+            .transmit_output(max, timeout)
+            .map_err(ureq::Error::into_io)?;
+        Ok(max)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct TlsTransport {
+    buffers: LazyBuffers,
+    stream: StreamOwned<ClientConnection, DeadlineAdapter>,
+}
+
+impl Debug for TlsTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsTransport").finish()
+    }
+}
+
+impl Transport for TlsTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        &mut self.buffers
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: NextTimeout,
+    ) -> std::result::Result<(), ureq::Error> {
+        self.stream.get_mut().arm(timeout);
+        let output = &self.buffers.output()[..amount];
+        self.stream.write_all(output)?;
+        Ok(())
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        if self.buffers.can_use_input() {
+            return Ok(true);
+        }
+        self.stream.get_mut().arm(timeout);
+        let input = self.buffers.input_append_buf();
+        let amount = self.stream.read(input)?;
+        self.buffers.input_appended(amount);
+        Ok(amount > 0)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.stream.get_mut().transport.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::thread::{self, JoinHandle};
+
+    use rustls::server::ServerConnection;
+    use rustls::{ServerConfig, StreamOwned};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    fn tls_certs_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tls_certs")
+    }
+
+    fn root_ca_path() -> PathBuf {
+        tls_certs_dir().join("server_rootCA.pem")
+    }
+
+    fn tls_server_config() -> Arc<ServerConfig> {
+        static CONFIG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
+        CONFIG
+            .get_or_init(|| {
+                let cert_chain: Vec<CertificateDer<'static>> =
+                    CertificateDer::pem_file_iter(tls_certs_dir().join("server.crt"))
+                        .expect("open OIDC TLS test certificate")
+                        .collect::<std::result::Result<_, _>>()
+                        .expect("parse OIDC TLS test certificate");
+                let key = PrivateKeyDer::from_pem_file(tls_certs_dir().join("server.key"))
+                    .expect("load OIDC TLS test private key");
+                Arc::new(
+                    ServerConfig::builder()
+                        .with_no_client_auth()
+                        .with_single_cert(cert_chain, key)
+                        .expect("build OIDC TLS test server config"),
+                )
+            })
+            .clone()
+    }
+
+    /// A one-request HTTPS endpoint using the repository's localhost test
+    /// certificate. It is intentionally separate from the plaintext device-flow
+    /// mock: these tests must execute the production OIDC TLS connector.
+    struct TlsJsonServer {
+        addr: SocketAddr,
+        url_host: &'static str,
+        requests: Arc<Mutex<Vec<String>>>,
+        accepts: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl TlsJsonServer {
+        fn start(bind: &str, url_host: &'static str) -> Self {
+            let listener = TcpListener::bind(bind).expect("bind OIDC TLS test server");
+            let addr = listener.local_addr().expect("OIDC TLS test server address");
+            listener
+                .set_nonblocking(true)
+                .expect("set OIDC TLS listener nonblocking");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let handle = {
+                let requests = Arc::clone(&requests);
+                let accepts = Arc::clone(&accepts);
+                let shutdown = Arc::clone(&shutdown);
+                thread::spawn(move || {
+                    while !shutdown.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                accepts.fetch_add(1, Ordering::SeqCst);
+                                serve_tls_json(stream, tls_server_config(), &requests);
+                                break;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+            };
+            TlsJsonServer {
+                addr,
+                url_host,
+                requests,
+                accepts,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn localhost() -> Self {
+            // Bind via the same hostname the client resolves so dual-stack hosts
+            // do not connect to ::1 while the fixture listens on 127.0.0.1.
+            Self::start("localhost:0", "localhost")
+        }
+
+        fn hostname_mismatch() -> Self {
+            // The leaf certificate contains only DNS:localhost, never this IP.
+            Self::start("127.0.0.1:0", "127.0.0.1")
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("https://{}:{}{path}", self.url_host, self.addr.port())
+        }
+
+        fn request_bodies(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn accepts(&self) -> usize {
+            self.accepts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for TlsJsonServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            // Wake a listener that has not accepted the test request because the
+            // client failed before dialing.
+            let _ = TcpStream::connect(self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn serve_tls_json(tcp: TcpStream, config: Arc<ServerConfig>, requests: &Mutex<Vec<String>>) {
+        tcp.set_nonblocking(false).ok();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        let Ok(conn) = ServerConnection::new(config) else {
+            return;
+        };
+        let mut stream = StreamOwned::new(conn, tcp);
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let headers_end = loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    if bytes.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        while bytes.len() - headers_end < content_length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            }
+        }
+        requests.lock().unwrap().push(
+            String::from_utf8_lossy(&bytes[headers_end..headers_end + content_length]).into_owned(),
+        );
+
+        let body = r#"{"access_token":"AT-tls","expires_in":300}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    fn assert_tls_network_error(err: OidcError) {
+        assert_eq!(err.kind(), crate::oidc::error::OidcErrorKind::Network);
+        let message = err.message().to_ascii_lowercase();
+        assert!(
+            message.contains("tls")
+                || message.contains("certificate")
+                || message.contains("issuer"),
+            "expected a TLS verification failure, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn post_form_budget_cannot_extend_the_configured_request_timeout() {
+        // Accept a loopback request but never answer it. The remaining
+        // device-code lifetime can be much larger than the configured request
+        // timeout; close/cancel rely on each in-flight request retaining the
+        // smaller bound rather than waiting for the whole device-code budget.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled endpoint");
+        let addr = listener.local_addr().expect("stalled endpoint address");
+        listener
+            .set_nonblocking(true)
+            .expect("set stalled endpoint nonblocking");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            let mut held = None;
+            while !server_shutdown.load(Ordering::SeqCst) {
+                if held.is_none() {
+                    match listener.accept() {
+                        Ok((stream, _)) => held = Some(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => return,
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let client = HttpClient::new(None, Duration::from_millis(150)).unwrap();
+        let started = std::time::Instant::now();
+        let error = match client.post_form_within(
+            &format!("http://{addr}/token"),
+            &[("grant_type", "refresh_token")],
+            false,
+            Some(Duration::from_secs(3)),
+        ) {
+            Ok(_) => panic!("a server withholding its response must time out"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        shutdown.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(error.request_timed_out(), "unexpected error: {error}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the 3s budget overrode the 150ms request timeout: {elapsed:?}"
+        );
+    }
+
+    /// Which TLS record a [`DripServer`] connection sends one byte at a time.
+    #[derive(Clone, Copy)]
+    enum Drip {
+        /// The reply to the ClientHello: a handshake record whose 16 KiB body
+        /// never finishes arriving.
+        TlsHandshake,
+        /// After a completed handshake and request, the one record that
+        /// carries the whole response.
+        TlsResponse,
+    }
+
+    /// A peer that keeps one connection alive by sending a byte every
+    /// [`Self::BYTE_INTERVAL`], always well inside the client's per-read
+    /// timeout. rustls assembles a TLS record from as many reads as it takes,
+    /// all inside one transport call, so dripping a single record is what a
+    /// per-read timeout cannot bound.
+    struct DripServer {
+        addr: SocketAddr,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl DripServer {
+        const BYTE_INTERVAL: Duration = Duration::from_millis(20);
+        /// Long enough that a client bounded only per read is still waiting,
+        /// short enough that a regression fails the elapsed-time assertion
+        /// instead of hanging the suite.
+        const MAX_DRIP: Duration = Duration::from_secs(6);
+
+        fn start(bind: &str, drip: Drip) -> Self {
+            let listener = TcpListener::bind(bind).expect("bind drip server");
+            let addr = listener.local_addr().expect("drip server address");
+            listener
+                .set_nonblocking(true)
+                .expect("set drip listener nonblocking");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let handle = {
+                let shutdown = Arc::clone(&shutdown);
+                thread::spawn(move || {
+                    while !shutdown.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                Self::drip(stream, drip, &shutdown);
+                                return;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                })
+            };
+            DripServer {
+                addr,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn drip(tcp: TcpStream, drip: Drip, shutdown: &AtomicBool) {
+            let mut tcp = tcp;
+            tcp.set_nonblocking(false).ok();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+            let started = std::time::Instant::now();
+            let keep_going =
+                || !shutdown.load(Ordering::SeqCst) && started.elapsed() < Self::MAX_DRIP;
+            let record = match drip {
+                Drip::TlsHandshake => {
+                    let mut hello = [0u8; 4096];
+                    let _ = tcp.read(&mut hello);
+                    // A handshake record header announcing 16 KiB of body.
+                    let mut record = vec![0x16, 0x03, 0x03, 0x40, 0x00];
+                    record.resize(5 + 0x4000, 0);
+                    record
+                }
+                Drip::TlsResponse => {
+                    let Ok(mut conn) = ServerConnection::new(tls_server_config()) else {
+                        return;
+                    };
+                    if !Self::read_request_head(&mut rustls::Stream::new(&mut conn, &mut tcp)) {
+                        return;
+                    }
+                    // A response whose head and body share one record, so the
+                    // client sees nothing until the whole record has arrived.
+                    let body = format!(r#"{{"pad":"{}"}}"#, "a".repeat(2000));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if conn.writer().write_all(response.as_bytes()).is_err() {
+                        return;
+                    }
+                    let mut record = Vec::new();
+                    while conn.wants_write() {
+                        if conn.write_tls(&mut record).is_err() {
+                            return;
+                        }
+                    }
+                    record
+                }
+            };
+            for byte in record {
+                if !keep_going() || tcp.write_all(&[byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Self::BYTE_INTERVAL);
+            }
+        }
+
+        fn read_request_head(stream: &mut impl Read) -> bool {
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                }
+            }
+            true
+        }
+    }
+
+    impl Drop for DripServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// POST to a peer that keeps sending a byte well inside the per-read
+    /// timeout: the request as a whole must still end at the configured
+    /// timeout rather than when the peer stops.
+    fn post_to_drip(url: &str) -> (OidcError, Duration) {
+        let client = HttpClient::new(Some(&root_ca_path()), Duration::from_millis(400)).unwrap();
+        let started = std::time::Instant::now();
+        match client.post_form(url, &[("grant_type", "refresh_token")], false) {
+            Ok(_) => panic!("a peer that never finishes its reply must time out"),
+            Err(error) => (error, started.elapsed()),
+        }
+    }
+
+    #[test]
+    fn tls_handshake_dripped_byte_by_byte_ends_at_the_request_timeout() {
+        let server = DripServer::start("localhost:0", Drip::TlsHandshake);
+        let (error, elapsed) =
+            post_to_drip(&format!("https://localhost:{}/token", server.addr.port()));
+        assert!(error.request_timed_out(), "unexpected error: {error}");
+        // The handshake runs before any request byte, so a refresh token in
+        // the body is provably unsent and may be retried.
+        assert!(error.request_unsent(), "unexpected error: {error}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a dripping handshake outlived the 400ms request timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn tls_response_record_dripped_byte_by_byte_ends_at_the_request_timeout() {
+        let server = DripServer::start("localhost:0", Drip::TlsResponse);
+        let (error, elapsed) =
+            post_to_drip(&format!("https://localhost:{}/token", server.addr.port()));
+        assert!(error.request_timed_out(), "unexpected error: {error}");
+        assert!(!error.request_unsent(), "unexpected error: {error}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a dripping TLS response outlived the 400ms request timeout: {elapsed:?}"
+        );
+    }
+
+    /// A transport that records the I/O it is asked to do and performs none.
+    #[derive(Debug)]
+    struct RecordingTransport {
+        buffers: LazyBuffers,
+        io_calls: usize,
+    }
+
+    impl RecordingTransport {
+        fn new() -> Self {
+            Self {
+                buffers: LazyBuffers::new(64, 64),
+                io_calls: 0,
+            }
+        }
+    }
+
+    impl Transport for RecordingTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(
+            &mut self,
+            _amount: usize,
+            _timeout: NextTimeout,
+        ) -> std::result::Result<(), ureq::Error> {
+            self.io_calls += 1;
+            Ok(())
+        }
+
+        fn await_input(&mut self, _timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+            self.io_calls += 1;
+            Ok(true)
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct InterruptedOnceTransport {
+        buffers: LazyBuffers,
+        timeouts: Vec<NextTimeout>,
+    }
+
+    impl InterruptedOnceTransport {
+        fn new() -> Self {
+            Self {
+                buffers: LazyBuffers::new(64, 64),
+                timeouts: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for InterruptedOnceTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(
+            &mut self,
+            _amount: usize,
+            _timeout: NextTimeout,
+        ) -> std::result::Result<(), ureq::Error> {
+            Ok(())
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+            self.timeouts.push(timeout);
+            if self.timeouts.len() == 1 {
+                thread::sleep(Duration::from_millis(10));
+                return Err(ureq::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::Interrupted,
+                )));
+            }
+            Ok(true)
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn interrupted_plaintext_response_head_retries_against_one_deadline() {
+        let timeout = NextTimeout {
+            after: TimeoutAfter::Exact(Duration::from_millis(100)),
+            reason: ureq::Timeout::Global,
+        };
+        let mut transport = DispatchTrackingTransport {
+            inner: InterruptedOnceTransport::new(),
+        };
+        REQUEST_DISPATCHED.with(|dispatched| dispatched.set(true));
+
+        assert!(transport.await_input(timeout).unwrap());
+        assert_eq!(transport.inner.timeouts.len(), 2);
+        let TimeoutAfter::Exact(first) = transport.inner.timeouts[0].after else {
+            panic!("test timeout unexpectedly has no deadline")
+        };
+        let TimeoutAfter::Exact(second) = transport.inner.timeouts[1].after else {
+            panic!("retried timeout unexpectedly has no deadline")
+        };
+        assert!(second < first, "EINTR restarted the response-head timeout");
+        assert!(
+            REQUEST_DISPATCHED.with(Cell::get),
+            "an interrupted response read must not make the refresh look unsent"
+        );
+    }
+
+    #[test]
+    fn an_elapsed_request_deadline_is_refused_rather_than_extended() {
+        // ureq passes an elapsed deadline down as a timeout of exactly zero,
+        // which its TCP transport would turn into a fresh one-second socket
+        // timeout -- for a plaintext request, after every byte.
+        let elapsed = NextTimeout {
+            after: TimeoutAfter::Exact(Duration::ZERO),
+            reason: ureq::Timeout::Global,
+        };
+        let mut transport = DispatchTrackingTransport {
+            inner: RecordingTransport::new(),
+        };
+
+        REQUEST_DISPATCHED.with(|dispatched| dispatched.set(false));
+        assert!(matches!(
+            transport.transmit_output(1, elapsed),
+            Err(ureq::Error::Timeout(ureq::Timeout::Global))
+        ));
+        assert!(
+            !REQUEST_DISPATCHED.with(Cell::get),
+            "a request refused before its first byte is provably unsent"
+        );
+        assert!(matches!(
+            transport.await_input(elapsed),
+            Err(ureq::Error::Timeout(ureq::Timeout::Global))
+        ));
+        assert!(matches!(
+            transport.maybe_await_input(elapsed),
+            Err(ureq::Error::Timeout(ureq::Timeout::Global))
+        ));
+        assert_eq!(transport.inner.io_calls, 0);
+
+        // Input that has already arrived needs no I/O and is still served: here
+        // ureq parsed one of two buffered bytes and will ask for the next.
+        let buffers = transport.buffers();
+        buffers.input_append_buf()[..2].copy_from_slice(b"xy");
+        buffers.input_appended(2);
+        buffers.input_consume(1);
+        assert!(transport.maybe_await_input(elapsed).unwrap());
+        assert_eq!(transport.inner.io_calls, 0);
+    }
+
+    #[test]
+    fn https_post_form_succeeds_with_custom_ca() {
+        let server = TlsJsonServer::localhost();
+        let client = HttpClient::new(Some(&root_ca_path()), Duration::from_secs(5)).unwrap();
+        let result = client
+            .post_form(
+                &server.url("/token"),
+                &[("grant_type", "refresh_token"), ("client_id", "questdb")],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(result.status, 200);
+        assert_eq!(
+            result.body.get("access_token").and_then(|v| v.as_str()),
+            Some("AT-tls")
+        );
+        assert_eq!(server.accepts(), 1);
+        let requests = server.request_bodies();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("grant_type=refresh_token"));
+        assert!(requests[0].contains("client_id=questdb"));
+    }
+
+    #[test]
+    fn https_rejects_unknown_ca() {
+        let server = TlsJsonServer::localhost();
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = match client.post_form(&server.url("/token"), &[("client_id", "questdb")], false)
+        {
+            Err(err) => err,
+            Ok(_) => panic!("an unknown CA must fail verification"),
+        };
+
+        assert_tls_network_error(err);
+        assert_eq!(server.accepts(), 1);
+        assert!(server.request_bodies().is_empty());
+    }
+
+    #[test]
+    fn https_rejects_hostname_mismatch() {
+        let server = TlsJsonServer::hostname_mismatch();
+        let client = HttpClient::new(Some(&root_ca_path()), Duration::from_secs(5)).unwrap();
+        let err = match client.post_form(&server.url("/token"), &[("client_id", "questdb")], false)
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a hostname mismatch must fail verification"),
+        };
+
+        assert_tls_network_error(err);
+        assert_eq!(server.accepts(), 1);
+        assert!(server.request_bodies().is_empty());
+    }
+
+    #[test]
+    fn https_to_an_ipv6_literal_reaches_certificate_verification() {
+        // Regression: the bracketed `[::1]` authority host was handed to rustls
+        // as the server name and failed to parse, so every HTTPS request to an
+        // IPv6-literal host failed before the handshake, whatever the
+        // certificate. The repository certificate names only DNS:localhost, so
+        // the handshake must now run and fail certificate verification instead.
+        if TcpListener::bind("[::1]:0").is_err() {
+            return; // No IPv6 loopback on this host.
+        }
+        let server = TlsJsonServer::start("[::1]:0", "[::1]");
+        let client = HttpClient::new(Some(&root_ca_path()), Duration::from_secs(5)).unwrap();
+        let err = match client.post_form(&server.url("/token"), &[("client_id", "questdb")], false)
+        {
+            Err(err) => err,
+            Ok(_) => panic!("the certificate does not name ::1"),
+        };
+
+        let message = err.message().to_string();
+        assert_tls_network_error(err);
+        assert!(
+            !message.contains("invalid dns name"),
+            "the IPv6 literal must reach the handshake: {message}"
+        );
+        assert_eq!(server.accepts(), 1);
+        assert!(server.request_bodies().is_empty());
+    }
+
+    #[test]
+    fn https_always_allowed() {
+        assert!(require_secure("https://idp.example.com/token", false).is_ok());
+    }
+
+    #[test]
+    fn hostless_https_rejected() {
+        // A hostless https URL must never slip through to the TLS connector,
+        // which needs a URI authority (a missing one would otherwise reach the
+        // `.expect` there — an abort under the `panic = "abort"` FFI).
+        for url in ["https:///token", "https://:443/token"] {
+            let err = require_secure(url, false).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                crate::oidc::error::OidcErrorKind::Config,
+                "{url} should be rejected as a config error"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_http_allowed() {
+        for url in [
+            "http://localhost:9000/settings",
+            "http://127.0.0.1:9000/settings",
+            "http://[::1]:9000/settings",
+        ] {
+            assert!(require_secure(url, false).is_ok(), "should allow {url}");
+        }
+    }
+
+    #[test]
+    fn non_loopback_http_rejected_unless_insecure() {
+        assert!(require_secure("http://questdb.example.com:9000/settings", false).is_err());
+        assert!(require_secure("http://questdb.example.com:9000/settings", true).is_ok());
+    }
+
+    #[test]
+    fn malformed_url_is_config_error() {
+        let err = require_secure("not a url", false).unwrap_err();
+        assert_eq!(err.kind(), crate::oidc::error::OidcErrorKind::Config);
+    }
+
+    #[test]
+    fn is_loopback_cases() {
+        // The special-use name passes this configuration-time check; the OIDC
+        // resolver separately verifies the addresses used by the connection.
+        assert!(is_loopback("localhost"));
+        assert!(is_loopback("LOCALHOST"));
+        assert!(is_loopback("localhost."));
+        assert!(is_loopback("127.0.0.1"));
+        assert!(is_loopback("127.5.5.5"));
+        assert!(is_loopback("::1"));
+        assert!(is_loopback("[::1]"));
+        assert!(!is_loopback("example.com"));
+        assert!(!is_loopback("10.0.0.1"));
+        // A name that merely embeds or resembles the special one is not it, and
+        // is rejected without a lookup.
+        assert!(!is_loopback("localhost.example.com"));
+        assert!(!is_loopback("notlocalhost"));
+        assert!(!is_loopback(""));
+    }
+
+    #[test]
+    fn plaintext_localhost_resolution_must_remain_on_loopback() {
+        fn resolved(values: &[&str]) -> ResolvedSocketAddrs {
+            let resolver = OidcResolver::default();
+            let mut result = resolver.empty();
+            for value in values {
+                result.push(value.parse().unwrap());
+            }
+            result
+        }
+
+        let localhost: Uri = "http://localhost:9000/settings".parse().unwrap();
+        assert!(
+            enforce_plaintext_localhost_resolution(
+                &localhost,
+                &resolved(&["127.0.0.1:9000", "[::1]:9000"]),
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_plaintext_localhost_resolution(
+                &localhost,
+                &resolved(&["127.0.0.1:9000", "203.0.113.7:9000"]),
+            )
+            .is_err(),
+            "one routable candidate must make the plaintext request fail closed"
+        );
+        assert!(
+            enforce_plaintext_localhost_resolution(&localhost, &resolved(&["203.0.113.7:9000"]),)
+                .is_err()
+        );
+
+        // HTTPS still relies on certificate verification and may legitimately
+        // resolve through a non-loopback test/container mapping.
+        let secure: Uri = "https://localhost:9000/settings".parse().unwrap();
+        assert!(
+            enforce_plaintext_localhost_resolution(&secure, &resolved(&["203.0.113.7:9000"]),)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transient_http_statuses_include_request_timeout() {
+        for status in [408, 429, 500, 503, 599] {
+            assert!(is_transient_http_status(status), "HTTP {status}");
+        }
+        for status in [200, 302, 400, 401, 403, 404] {
+            assert!(!is_transient_http_status(status), "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn non_json_post_body_is_never_echoed_into_error() {
+        // A non-conformant response or error-page reflection may carry POSTed
+        // secrets in its non-JSON body; no status may expose it in an error.
+        let secret_form = "access_token=SECRET-eyJhbGciOiJSUzI1NiJ9&token_type=bearer";
+        let truncated_json = r#"{"access_token":"SECRET-eyJhbGciOiJSUzI1NiJ9.eyJzdWIi"#;
+        for status in [200u16, 201, 204, 301, 302, 399, 400, 408, 429, 500, 503] {
+            for body in [secret_form, truncated_json] {
+                let detail = non_json_body_detail(status, body.as_bytes());
+                assert!(
+                    !detail.contains("SECRET"),
+                    "HTTP {status} non-JSON body leaked into the error detail: {detail}"
+                );
+                assert_eq!(detail, "unexpected non-JSON response body");
+            }
+        }
+    }
+
+    #[test]
+    fn post_response_json_strings_are_zeroized_recursively() {
+        let mut body = serde_json::json!({
+            "access_token": "AT-secret",
+            "nested": ["RT-secret", {"device_code": "DC-secret"}],
+            "expires_in": 300,
+            "present": true,
+        });
+        // Five property names (access_token, nested, expires_in, present,
+        // device_code) and three string values. Counting both is what makes
+        // this discriminating: a walk that skipped keys would report three.
+        assert_eq!(zeroize_json_strings(&mut body), 8);
+        assert!(
+            body.as_object().unwrap().is_empty(),
+            "object entries must be consumed so the key allocations are wiped too"
+        );
+
+        // Array elements are wiped in place, so the value zeroization itself
+        // stays observable rather than only inferred from the count.
+        let mut arrayed = serde_json::json!(["RT-secret", {"k": "v"}]);
+        assert_eq!(zeroize_json_strings(&mut arrayed), 3);
+        assert_eq!(arrayed[0], "");
+    }
+
+    #[test]
+    fn post_response_json_object_keys_are_zeroized() {
+        // A reflecting IdP/proxy can put the submitted credential in a property
+        // NAME. `values_mut()` cannot reach that separate allocation, so a
+        // key-skipping walk would leave the credential in freed heap memory.
+        let mut body = serde_json::json!({"DEV-CODE-123": {"RT-1": 7}});
+        assert_eq!(zeroize_json_strings(&mut body), 2);
+        assert!(body.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn form_url_encoding_matches_the_submitted_spelling() {
+        assert_eq!(
+            form_url_encode("DEV +/% exact").as_str(),
+            "DEV+%2B%2F%25+exact"
+        );
+        assert_eq!(form_url_encode("plain-token_1").as_str(), "plain-token_1");
+    }
+
+    #[test]
+    fn form_url_encoding_never_reallocates_the_secret_buffer() {
+        // Every byte here expands to three, so a buffer sized from the input
+        // length would grow mid-write and free a partially encoded copy of the
+        // credential that `Zeroizing` can no longer wipe. `String::with_capacity`
+        // allocates exactly, so an exactly-sized buffer never grows.
+        let encoded = form_url_encode("%%%%%%%%");
+        assert_eq!(encoded.as_str(), "%25%25%25%25%25%25%25%25");
+        assert_eq!(
+            encoded.capacity(),
+            encoded.len(),
+            "the encoded credential buffer must be sized exactly once, up front"
+        );
+    }
+
+    #[test]
+    fn reflected_credentials_are_redacted_outside_the_issued_token_fields() {
+        // A 200 response reaches the caller too: `token_type` is quoted into a
+        // public error and `scope` is retained in the public `TokenSet`. Only
+        // the issued-token fields keep their exact bytes, because a
+        // non-rotating refresh grant re-sends the submitted refresh token.
+        const REFRESH_TOKEN: &str = "RT +/% exact";
+        const ENCODED: &str = "RT+%2B%2F%25+exact";
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", REFRESH_TOKEN),
+        ];
+        let mut body = serde_json::json!({
+            "access_token": "AT-1",
+            "refresh_token": REFRESH_TOKEN,
+            "id_token": REFRESH_TOKEN,
+            "token_type": REFRESH_TOKEN,
+            "scope": format!("openid {ENCODED}"),
+            "nested": {"detail": [format!("saw {REFRESH_TOKEN}")]},
+        });
+        redact_reflected_credentials(&mut body, &form);
+
+        assert_eq!(body["refresh_token"], REFRESH_TOKEN);
+        assert_eq!(body["id_token"], REFRESH_TOKEN);
+        assert_eq!(body["access_token"], "AT-1");
+        assert_eq!(body["token_type"], REDACTED_CREDENTIAL);
+        assert_eq!(body["scope"], format!("openid {REDACTED_CREDENTIAL}"));
+        assert_eq!(
+            body["nested"]["detail"][0],
+            format!("saw {REDACTED_CREDENTIAL}")
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_only_accepts_delta_seconds() {
+        use ureq::http::{HeaderMap, HeaderValue};
+        fn with_retry_after(v: &str) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            h.insert("retry-after", HeaderValue::from_str(v).unwrap());
+            h
+        }
+        // A bare run of ASCII digits (delta-seconds), trimmed.
+        assert_eq!(parse_retry_after(&with_retry_after("5")), Some(5));
+        assert_eq!(parse_retry_after(&with_retry_after("0")), Some(0));
+        assert_eq!(parse_retry_after(&with_retry_after("  7 ")), Some(7));
+        // 9 digits is the max accepted; 10 is rejected (no u64 overflow risk, and
+        // >31 years is meaningless).
+        assert_eq!(
+            parse_retry_after(&with_retry_after("999999999")),
+            Some(999_999_999)
+        );
+        assert_eq!(parse_retry_after(&with_retry_after("1000000000")), None);
+        // Rejected: empty, sign, decimal, and the HTTP-date form.
+        assert_eq!(parse_retry_after(&with_retry_after("")), None);
+        assert_eq!(parse_retry_after(&with_retry_after("-5")), None);
+        assert_eq!(parse_retry_after(&with_retry_after("1.5")), None);
+        assert_eq!(
+            parse_retry_after(&with_retry_after("Fri, 31 Dec 1999 23:59:59 GMT")),
+            None
+        );
+        // Absent header.
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
+
+    /// Post to `url` and return the network error, which must exist.
+    fn post_error(client: &HttpClient, url: &str) -> OidcError {
+        match client.post_form(url, &[("grant_type", "refresh_token")], false) {
+            Err(err) => err,
+            Ok(_) => panic!("POST to {url} must fail"),
+        }
+    }
+
+    #[test]
+    fn dns_failure_is_provably_unsent() {
+        // RFC 6761 reserves `.invalid`: it never resolves. ureq reports this as
+        // `Io(Uncategorized)`, a shape that names no send phase.
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, "https://questdb-oidc-test.invalid/token");
+        assert_eq!(err.kind(), crate::oidc::error::OidcErrorKind::Network);
+        assert!(err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn refused_connect_is_provably_unsent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, &format!("http://{addr}/token"));
+        assert!(err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn connect_phase_timeout_is_provably_unsent() {
+        // An accept backlog that never completes the handshake would need root;
+        // instead hold a non-routable address. Depending on the host network
+        // this times out (`Timeout(Global)`, since the global and connect
+        // timeouts coincide) or fails as unreachable: both are pre-send.
+        let client = HttpClient::new(None, Duration::from_millis(300)).unwrap();
+        let err = post_error(&client, "https://10.255.255.1/token");
+        assert!(err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn tls_handshake_failure_is_provably_unsent() {
+        // A plaintext responder: the handshake fails on its first reply, before
+        // any request byte could be encrypted and sent.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\nnot tls");
+            }
+        });
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, &format!("https://127.0.0.1:{}/token", addr.port()));
+        handle.join().unwrap();
+        assert_eq!(err.kind(), crate::oidc::error::OidcErrorKind::Network);
+        assert!(err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn tls_certificate_rejection_is_provably_unsent() {
+        let server = TlsJsonServer::localhost();
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, &server.url("/token"));
+        assert!(err.request_unsent(), "{err}");
+        assert!(server.request_bodies().is_empty());
+    }
+
+    #[test]
+    fn drop_after_the_request_is_possibly_sent() {
+        // The server reads the whole request, then closes without replying: the
+        // IdP may have consumed it, so the request must not count as unsent.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                    }
+                }
+            }
+        });
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = post_error(&client, &format!("http://{addr}/token"));
+        handle.join().unwrap();
+        assert!(!err.request_unsent(), "{err}");
+    }
+
+    #[test]
+    fn dispatch_marker_is_reset_for_each_request() {
+        // A dispatched request must not leave the next pre-send failure on the
+        // same thread looking possibly-sent.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+            }
+        });
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        assert!(!post_error(&client, &format!("http://{addr}/token")).request_unsent());
+        handle.join().unwrap();
+        assert!(post_error(&client, &format!("http://{addr}/token")).request_unsent());
+    }
+
+    #[test]
+    fn request_timeout_classification_is_independent_of_send_provenance() {
+        use std::io;
+        use ureq::Error;
+
+        assert!(request_timed_out(&Error::Timeout(ureq::Timeout::Global)));
+        assert!(request_timed_out(&Error::Io(io::Error::from(
+            io::ErrorKind::TimedOut
+        ))));
+        assert!(!request_timed_out(&Error::HostNotFound));
+    }
+
+    #[test]
+    fn response_body_cap_accepts_exact_limit_and_rejects_one_more_byte() {
+        fn serve(body: Vec<u8>) -> (String, JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/token", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                let headers_end = loop {
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let content_length = std::str::from_utf8(&request[..headers_end])
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if request.starts_with(b"POST ") {
+                    assert!(content_length > 0, "test POST must include Content-Length");
+                }
+                // Drain the POST body before replying. Closing a socket with unread
+                // request bytes can reset it and truncate the 4 MiB response.
+                while request.len() - headers_end < content_length {
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert_ne!(n, 0, "request body ended before Content-Length");
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                // An over-limit client may close the connection before the
+                // final write; that is an acceptable outcome for this server.
+                let _ = stream.write_all(&body);
+            });
+            (url, server)
+        }
+
+        let client = HttpClient::new(None, Duration::from_secs(10)).unwrap();
+        for oversize in [false, true] {
+            for post in [false, true] {
+                let mut body = b"{\"access_token\":\"AT\"}".to_vec();
+                body.resize(MAX_RESPONSE_BYTES as usize + usize::from(oversize), b' ');
+                let (url, server) = serve(body);
+                let result = if post {
+                    client
+                        .post_form(&url, &[("client_id", "questdb")], false)
+                        .map(|response| response.body["access_token"] == "AT")
+                } else {
+                    client
+                        .get_json(&url, false)
+                        .map(|response| response["access_token"] == "AT")
+                };
+                if oversize {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), crate::oidc::error::OidcErrorKind::Network);
+                    assert!(error.message().contains("response body"));
+                } else {
+                    assert!(result.unwrap());
+                }
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn response_body_timeout_preserves_timeout_provenance() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let amount = stream.read(&mut chunk).unwrap();
+                assert_ne!(amount, 0, "client closed before sending request headers");
+                request.extend_from_slice(&chunk[..amount]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let client = HttpClient::new(None, Duration::from_millis(100)).unwrap();
+        let error = match client.post_form(
+            &format!("http://{addr}/token"),
+            &[("grant_type", "urn:ietf:params:oauth:grant-type:device_code")],
+            false,
+        ) {
+            Ok(_) => panic!("a stalled response body must time out"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), crate::oidc::error::OidcErrorKind::Network);
+        assert!(
+            error.request_timed_out(),
+            "a timeout while reading the response body lost its provenance: {error}"
+        );
+        assert!(
+            !error.request_unsent(),
+            "response headers prove the request reached the peer"
+        );
+        server.join().unwrap();
+    }
+}

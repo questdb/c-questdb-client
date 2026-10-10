@@ -3340,21 +3340,21 @@ fn standalone_direct_sender_force_drop_discards_in_flight() {
         "deferred flush must be in-flight"
     );
 
+    // The second flush is asynchronous. Wait until the server has actually
+    // received its deferred frame before dropping; otherwise on a slow runner
+    // the last captured frame may still be the first (committed) flush.
+    let committed = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(committed[5] & FLAG_DEFER_COMMIT, 0);
+    let deferred = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(deferred[5] & FLAG_DEFER_COMMIT, 0);
+
     // `questdb_db_drop_direct_sender` sets must_close before dropping the
     // box (via `on_deferred_close`); replicate that to drive the discard arm.
     sender.mark_must_close();
     drop(sender);
-
-    let mut captured = Vec::new();
-    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
-        captured.push(frame);
-    }
-    let last = captured.last().expect("server must have received frames");
-    assert_ne!(
-        last[5] & FLAG_DEFER_COMMIT,
-        0,
-        "force-drop must leave the deferred tail uncommitted (discarded), \
-         not send a commit boundary"
+    assert!(
+        frames.recv_timeout(Duration::from_secs(2)).is_err(),
+        "force-drop must not send a commit boundary for the deferred tail"
     );
 }
 
@@ -9804,4 +9804,208 @@ mod sender_conn_event_tests {
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
+}
+
+/// Every connect answers `421` with `X-QuestDB-Role: REPLICA`, until `done`.
+#[cfg(feature = "ffi-support")]
+fn spawn_replica_role_rejector(done: Arc<AtomicBool>) -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let mut attempts = 0usize;
+        while !done.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    attempts += 1;
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte) {
+                            Ok(1) => request.push(byte[0]),
+                            _ => break,
+                        }
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\
+                          Content-Length: 0\r\nX-QuestDB-Role: REPLICA\r\n\r\n",
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        attempts
+    });
+    (port, handle)
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn sf_pool_borrow_with_retry_retries_an_all_replica_role_reject_until_budget() {
+    // A durable-ack (store-and-forward) pool whose nodes are all replicas is
+    // retried for the whole budget -- a failover can promote a primary -- the
+    // same as a direct sender, and the final error keeps the role payload.
+    let done = Arc::new(AtomicBool::new(false));
+    let (p1, h1) = spawn_replica_role_rejector(Arc::clone(&done));
+    let (p2, h2) = spawn_replica_role_rejector(Arc::clone(&done));
+    let conf = format!(
+        "ws::addr=127.0.0.1:{p1},127.0.0.1:{p2};request_durable_ack=on;\
+         reconnect_initial_backoff_millis=50;reconnect_max_backoff_millis=100;\
+         sender_pool_min=0;query_pool_min=0;"
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let budget = Duration::from_millis(800);
+    let started = Instant::now();
+    let err = match db.borrow_sender_owned_with_retry(budget) {
+        Ok(_) => panic!("an all-replica cluster must not yield a sender"),
+        Err(err) => err,
+    };
+    let elapsed = started.elapsed();
+    drop(db);
+    done.store(true, Ordering::Release);
+    let attempts = h1.join().unwrap() + h2.join().unwrap();
+    assert_eq!(err.code(), ErrorCode::ProtocolVersionError, "{}", err.msg());
+    assert!(err.qwp_ws_role_reject().is_some());
+    assert!(elapsed >= budget, "gave up after {elapsed:?}");
+    assert!(attempts > 2, "only {attempts} connect attempts");
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn pooled_lease_wait_names_a_credential_that_blocks_its_reconnect() {
+    // A pooled store-and-forward lease whose reconnect cannot get a token --
+    // the credential needs a new sign-in -- must time out naming that, with the
+    // OIDC detail, rather than blaming a live server for not acknowledging.
+    let server = MockServer::spawn_reconnecting(8);
+    let conf = conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;",
+    );
+    let lapsed = Arc::new(AtomicBool::new(false));
+    let db = QuestDb::connect_with_handlers_and_token_provider(
+        &conf,
+        crate::db::ConnectHandlers::default(),
+        {
+            let lapsed = Arc::clone(&lapsed);
+            move || {
+                if lapsed.load(Ordering::SeqCst) {
+                    Err(crate::Error::from(
+                        crate::oidc::OidcError::interaction_required(
+                            "No usable cached or refreshable OIDC token is available. \
+                             Call sign_in() explicitly before starting the transport.",
+                        ),
+                    ))
+                } else {
+                    Ok("tok".to_string())
+                }
+            }
+        },
+    )
+    .unwrap();
+    let mut sender = db.borrow_sender().expect("SFA borrow");
+    let mut buffer = one_symbol_buffer(&db, "alpha");
+
+    // The mock reads the frame and drops the connection, so the lease must
+    // reconnect -- with a credential that has lapsed meanwhile.
+    lapsed.store(true, Ordering::SeqCst);
+    sender.flush_buffer_and_get_fsn(&mut buffer).unwrap();
+    let err = sender
+        .wait(AckLevel::Ok, Duration::from_millis(800))
+        .expect_err("no ACK can arrive while the lease cannot reconnect");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{err}");
+    assert!(!err.in_doubt(), "{err}");
+    assert_eq!(
+        err.oidc_error().map(crate::oidc::OidcError::kind),
+        Some(crate::oidc::OidcErrorKind::InteractionRequired),
+        "{err}"
+    );
+    assert!(err.msg().contains("reconnecting keeps failing"), "{err}");
+    assert!(!err.msg().contains("the connection is alive"), "{err}");
+
+    // Signed in again: the queued frame drains.
+    lapsed.store(false, Ordering::SeqCst);
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(10))
+        .expect("the frame must drain once a token is available");
+}
+
+#[test]
+fn pooled_lease_wait_inside_auth_callback_is_rejected() {
+    // A pooled store-and-forward lease waits through its own ACK loop. When
+    // the waiting thread is inside the auth's callback and the lease's
+    // reconnect needs a token the auth cannot supply until that callback
+    // returns, the wait must be rejected rather than spin until its timeout
+    // (forever with none). The provider refuses while the simulated callback
+    // runs, as a real OIDC auth refuses such an acquisition.
+    thread_local! {
+        static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    const REFUSAL: &str = "simulated auth callback is running; no token";
+    let active = Arc::new(AtomicBool::new(false));
+    let isolation = crate::TokenProviderIsolation::with_callback_guards(
+        {
+            let active = Arc::clone(&active);
+            move || active.load(Ordering::SeqCst)
+        },
+        || IN_CALLBACK.with(std::cell::Cell::get),
+    );
+    let server = MockServer::spawn_reconnecting(8);
+    let conf = conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;",
+    );
+    let db = QuestDb::connect_with_handlers_and_token_provider_with_isolation(
+        &conf,
+        crate::db::ConnectHandlers::default(),
+        {
+            let active = Arc::clone(&active);
+            move || {
+                if active.load(Ordering::SeqCst) {
+                    Err(crate::Error::new(ErrorCode::AuthError, REFUSAL))
+                } else {
+                    Ok::<_, crate::Error>("tok".to_string())
+                }
+            }
+        },
+        isolation,
+    )
+    .unwrap();
+    let mut sender = db.borrow_sender().expect("SFA borrow");
+    let mut buffer = one_symbol_buffer(&db, "alpha");
+
+    // Enter the callback on this thread, then publish: the mock reads the
+    // frame and drops the connection, so the lease must reconnect -- with a
+    // token the callback is withholding.
+    active.store(true, Ordering::SeqCst);
+    IN_CALLBACK.with(|c| c.set(true));
+    sender.flush_buffer_and_get_fsn(&mut buffer).unwrap();
+    let started = Instant::now();
+    let result = sender.wait(AckLevel::Ok, Duration::from_secs(10));
+    let elapsed = started.elapsed();
+    IN_CALLBACK.with(|c| c.set(false));
+    active.store(false, Ordering::SeqCst);
+
+    let err = result.expect_err("the in-callback wait must be rejected");
+    assert!(
+        err.msg().contains(REFUSAL),
+        "expected the provider's refusal, got: {}",
+        err.msg()
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the wait spun for {elapsed:?} instead of being rejected"
+    );
+
+    // The rejected wait kept the frame queued; it drains once the callback
+    // has returned.
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(10))
+        .expect("the frame must drain after the callback returns");
 }

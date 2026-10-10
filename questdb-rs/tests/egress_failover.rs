@@ -33,14 +33,15 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use questdb::ErrorCode;
 use questdb::egress::{
-    ColumnView, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader, ServerRole,
+    ColumnView, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader, ReaderConfig,
+    ServerRole,
 };
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::http::HeaderValue;
@@ -2793,6 +2794,209 @@ fn initial_connect_bails_immediately_on_auth_error() {
 }
 
 #[test]
+fn initial_connect_does_not_replay_a_401_with_an_unchanged_token() {
+    // The other half of `initial_connect_retries_same_endpoint_once_with_
+    // rotated_token`. Only the changed-token branch was covered, so replaying
+    // unconditionally failed nothing -- and a genuine rejection would cost a
+    // second full connect per endpoint on every walk.
+    let srv = MockServer::start(vec![
+        vec![Action::Reject401],
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = questdb::egress::ReaderConfig::from_conf(format!("ws::addr={}", srv.url()))
+        .unwrap()
+        .token_provider({
+            let calls = Arc::clone(&calls);
+            // Byte-identical every time, so the 401 is a real rejection rather
+            // than an expiry the provider can rotate out of.
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, questdb::Error>("same".to_string())
+            }
+        })
+        .unwrap();
+
+    let err = match Reader::from_config(&cfg) {
+        Err(err) => err,
+        Ok(_) => panic!("an unchanged token must not recover a 401"),
+    };
+    assert_eq!(err.code(), ErrorCode::AuthError, "{err}");
+    // The provider is re-asked once to learn whether the credential rotated; it
+    // is the replay, not the re-resolution, that the guard prevents. The second
+    // scripted script stays untouched.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        srv.accepts(),
+        1,
+        "the endpoint was replayed after a real reject"
+    );
+}
+
+#[test]
+fn initial_connect_retries_same_endpoint_once_with_rotated_token() {
+    let srv = MockServer::start(vec![
+        vec![Action::Reject401],
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = questdb::egress::ReaderConfig::from_conf(format!("ws::addr={}", srv.url()))
+        .unwrap()
+        .token_provider({
+            let calls = Arc::clone(&calls);
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, questdb::Error>(if n == 0 { "stale" } else { "fresh" }.to_string())
+            }
+        })
+        .unwrap();
+
+    let _reader = Reader::from_config(&cfg).expect("changed token should recover one 401");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(srv.accepts(), 2, "the same endpoint must be replayed once");
+}
+
+#[test]
+fn initial_provider_failure_does_not_dial_any_endpoint() {
+    let srv_a = MockServer::start(vec![happy_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!("ws::addr={}", build_addr_list(&[&srv_a, &srv_b]));
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                Err::<String, _>(questdb::Error::new(
+                    ErrorCode::SocketError,
+                    "provider unavailable",
+                ))
+            }
+        })
+        .unwrap();
+
+    let err = match Reader::from_config(&cfg) {
+        Err(err) => err,
+        Ok(_) => panic!("provider failure must abort the initial endpoint walk"),
+    };
+
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("provider unavailable"));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(srv_a.accepts(), 0, "provider failure must precede A's dial");
+    assert_eq!(srv_b.accepts(), 0, "provider failure must precede B's dial");
+}
+
+#[test]
+fn reconnect_provider_failure_is_resolved_once_per_walk_without_dials() {
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=3;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                let call = provider_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok("initial-token".to_string())
+                } else {
+                    Err(questdb::Error::new(
+                        ErrorCode::SocketError,
+                        "provider unavailable",
+                    ))
+                }
+            }
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("initial provider call succeeds");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    match cursor.next_batch() {
+        Err(_) => {}
+        Ok(_) => panic!("reconnect provider failures must exhaust the retry budget"),
+    }
+
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        3,
+        "one initial acquisition plus one for each of two reconnect walks"
+    );
+    assert_eq!(srv_a.accepts(), 1, "only the initial connection reaches A");
+    assert_eq!(
+        srv_b.accepts(),
+        0,
+        "failed reconnect acquisitions must not create sockets to B"
+    );
+}
+
+#[test]
+fn reconnect_deadline_abandons_blocked_provider_before_dial() {
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let blocked_provider_returned = Arc::new(AtomicBool::new(false));
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=3;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+         failover_max_duration_ms=1000",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            let blocked_provider_returned = Arc::clone(&blocked_provider_returned);
+            move || {
+                if provider_calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                    // Give the initial socket close and reconnect ample time
+                    // on loaded Windows CI runners. The provider must remain
+                    // blocked well beyond the failover deadline.
+                    std::thread::sleep(Duration::from_secs(5));
+                    blocked_provider_returned.store(true, Ordering::SeqCst);
+                }
+                Ok::<_, questdb::Error>("token".to_string())
+            }
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("initial provider call succeeds");
+    let (capture, gave_up) = gave_up_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
+
+    let error = match cursor.next_batch() {
+        Err(error) => error,
+        Ok(_) => panic!("blocked reconnect provider must exhaust the Execute deadline"),
+    };
+    assert!(
+        !blocked_provider_returned.load(Ordering::SeqCst),
+        "next_batch waited for the synchronous provider past its failover deadline"
+    );
+    // No walk dialled anything, so the trigger stays the surfaced error.
+    assert_eq!(
+        error.code(),
+        ErrorCode::SocketError,
+        "unexpected error: {error}"
+    );
+    assert!(
+        !error.msg().contains("wall-clock budget exhausted"),
+        "unexpected error: {error}"
+    );
+    assert_gave_up_on_deadline(&gave_up);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(srv_b.accepts(), 0, "deadline expiry must precede B's dial");
+}
+
+#[test]
 fn initial_connect_auth_terminal_regardless_of_position_in_addr_list() {
     // Counterpart pinning: the bail-on-AuthError invariant holds even
     // when a healthy endpoint precedes the auth-rejecting one in the
@@ -3063,11 +3267,13 @@ fn failover_duration_budget_spans_successful_resets() {
 
     let resets = Arc::new(AtomicUsize::new(0));
     let resets_cb = Arc::clone(&resets);
+    let (capture, gave_up) = gave_up_capture();
     let mut cursor = reader
         .prepare("select 1")
         .on_failover_reset(move |_| {
             resets_cb.fetch_add(1, Ordering::SeqCst);
         })
+        .on_failover_progress(capture)
         .execute()
         .expect("execute");
 
@@ -3075,17 +3281,15 @@ fn failover_duration_budget_spans_successful_resets() {
         Err(e) => e,
         Ok(_) => panic!("second failure must exhaust the original deadline"),
     };
-    assert!(
-        err.msg().contains("failover_max_duration_ms")
-            || err.msg().contains("wall-clock budget exhausted")
-            || matches!(
-                err.code(),
-                ErrorCode::SocketError | ErrorCode::ProtocolError
-            ),
-        "unexpected error: code={:?} msg={}",
+    // The spent deadline admits no reconnect, so the transport trigger is
+    // the surfaced error; the reconnect loop gave up on the deadline.
+    assert_eq!(
         err.code(),
+        ErrorCode::SocketError,
+        "unexpected error: {}",
         err.msg()
     );
+    assert_gave_up_on_deadline(&gave_up);
     assert_eq!(
         resets.load(Ordering::SeqCst),
         1,
@@ -4447,27 +4651,24 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+    let (capture, gave_up) = gave_up_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
     let err = match cursor.next_batch() {
         Err(e) => e,
         Ok(_) => panic!("must fail"),
     };
-    // The deadline branch surfaces a specific message including the
-    // configured `failover_max_duration_ms` value. The `prefer_over_trigger`
-    // logic may pick the trigger over the deadline-error if the
-    // trigger is more diagnostic — but in this test the trigger is a
-    // plain SocketError, so the deadline message should win.
-    assert!(
-        err.msg().contains("failover_max_duration_ms")
-            || err.msg().contains("wall-clock budget exhausted")
-            || matches!(
-                err.code(),
-                ErrorCode::SocketError | ErrorCode::ProtocolError
-            ),
-        "unexpected error: code={:?} msg={}",
-        err.code(),
-        err.msg()
-    );
+    // The deadline diagnostic names the configured duration knob. The
+    // last walk failed on a transport error, which is no more diagnostic
+    // than the trigger, so `next_batch` keeps surfacing the trigger.
+    assert_eq!(err.code(), ErrorCode::SocketError, "msg={}", err.msg());
+    assert!(!err.msg().contains("wall-clock budget exhausted"));
+    let (code, msg) = gave_up.lock().unwrap().clone().expect("GaveUp");
+    assert_eq!(code, ErrorCode::SocketError);
+    assert!(msg.contains("failover_max_duration_ms=50"), "msg={msg}");
 }
 
 /// Regression for `reconnect_with_failover`'s exhaustion-error counter:
@@ -4493,36 +4694,37 @@ fn deadline_exhaustion_reports_actual_attempt_count_not_configured_cap() {
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.prepare("select 1").execute().expect("execute");
-    let err = match cursor.next_batch() {
-        Err(e) => e,
-        Ok(_) => panic!("must fail"),
-    };
-    // The `prefer_over_trigger` logic may still surface the trigger
-    // error instead of the deadline wrapper. Only enforce the
-    // count-accuracy invariant when we actually got the deadline
-    // message — otherwise the test's premise doesn't hold.
-    if err.msg().contains("wall-clock budget exhausted") {
-        // Extract the "after N attempt(s)" number.
-        let msg = err.msg();
-        let needle = "after ";
-        let start = msg.find(needle).expect("missing 'after N attempt' phrase");
-        let rest = &msg[start + needle.len()..];
-        let end = rest.find(' ').expect("malformed attempt-count phrase");
-        let n: u32 = rest[..end].parse().expect("attempt count not a u32");
-        // Hard upper bound: anything ≥ CONFIGURED_CAP would mean the
-        // bug is back (or the message is once again hard-coding the
-        // configured cap). A handful of attempts is plausible if the
-        // first walk and one retry both fired before the 50 ms budget
-        // expired; CONFIGURED_CAP itself must never appear here.
-        assert!(
-            n < CONFIGURED_CAP,
-            "attempt count {n} ≥ configured cap {CONFIGURED_CAP} — \
-             message is reporting the configured cap instead of \
-             the actual count. msg={msg}",
-        );
-        assert!(n >= 1, "attempt count must be ≥ 1, got {n}. msg={msg}");
+    let (capture, gave_up) = gave_up_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
+    if cursor.next_batch().is_ok() {
+        panic!("must fail");
     }
+    // Extract the "after N attempt(s)" number from the deadline diagnostic
+    // the reconnect loop gave up with.
+    let (_, msg) = gave_up.lock().unwrap().clone().expect("GaveUp");
+    let msg = msg.as_str();
+    assert!(msg.contains("wall-clock budget exhausted"), "msg={msg}");
+    let needle = "after ";
+    let start = msg.find(needle).expect("missing 'after N attempt' phrase");
+    let rest = &msg[start + needle.len()..];
+    let end = rest.find(' ').expect("malformed attempt-count phrase");
+    let n: u32 = rest[..end].parse().expect("attempt count not a u32");
+    // Hard upper bound: anything ≥ CONFIGURED_CAP would mean the
+    // bug is back (or the message is once again hard-coding the
+    // configured cap). A handful of attempts is plausible if the
+    // first walk and one retry both fired before the 50 ms budget
+    // expired; CONFIGURED_CAP itself must never appear here.
+    assert!(
+        n < CONFIGURED_CAP,
+        "attempt count {n} ≥ configured cap {CONFIGURED_CAP} — \
+         message is reporting the configured cap instead of \
+         the actual count. msg={msg}",
+    );
+    assert!(n >= 1, "attempt count must be ≥ 1, got {n}. msg={msg}");
 }
 
 // ---------------------------------------------------------------------------
@@ -4776,6 +4978,33 @@ fn progress_capture() -> (
             .push(ProgressSnapshot::from_event(ev));
     };
     (closure, observed)
+}
+
+/// The `GaveUp` event's `final_error` code and message, once it fired.
+type GaveUpError = Arc<Mutex<Option<(ErrorCode, String)>>>;
+
+/// Capture the `GaveUp` event's `final_error` (code and message): the error
+/// the reconnect loop itself gave up with, which `next_batch` may replace
+/// with the original trigger when it is not more diagnostic.
+fn gave_up_capture() -> (impl FnMut(&FailoverProgressEvent), GaveUpError) {
+    let observed = Arc::new(Mutex::new(None));
+    let observed_clone = Arc::clone(&observed);
+    let closure = move |ev: &FailoverProgressEvent| {
+        if ev.phase == FailoverPhase::GaveUp {
+            let err = ev.final_error.as_ref().expect("GaveUp carries final_error");
+            *observed_clone.lock().unwrap() = Some((err.code(), err.msg().to_string()));
+        }
+    };
+    (closure, observed)
+}
+
+fn assert_gave_up_on_deadline(observed: &GaveUpError) {
+    let gave_up = observed.lock().unwrap().clone();
+    let (_, msg) = gave_up.expect("GaveUp must fire");
+    assert!(
+        msg.contains("wall-clock budget exhausted"),
+        "reconnect must give up on the deadline: {msg}"
+    );
 }
 
 #[test]
@@ -5396,4 +5625,417 @@ fn failover_replay_resets_symbol_cache_to_new_node_values() {
         cursor.next_arrow_batch().expect("terminal").is_none(),
         "B's RESULT_END must terminate the cursor"
     );
+}
+
+/// Answer every upgrade with 421 + `X-QuestDB-Role: REPLICA`, but only after
+/// `delay`, so a failover deadline can expire while a walk waits on it.
+fn slow_421_replica_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\n\
+                      Connection: close\r\nX-QuestDB-Role: REPLICA\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
+}
+
+/// Regression: when the final permitted reconnect round fails with a role
+/// mismatch on every endpoint AND the wall-clock deadline expires during that
+/// round, the caller must still see `RoleMismatch` -- the code it saw before
+/// the deadline was re-checked right after a failed walk. Re-coding it as a
+/// `SocketError` changed the error of existing static-auth readers.
+#[test]
+fn final_round_role_mismatch_past_deadline_surfaces_role_mismatch() {
+    for auth in ["", "username=u;password=p;"] {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Primary, "a-primary"),
+            vec![Action::Reject421 {
+                role: Some("REPLICA".into()),
+                zone: None,
+            }],
+        ]);
+        let b = slow_421_replica_server(Duration::from_millis(300));
+        let conf = format!(
+            "ws::addr={},{};target=primary;{auth}failover_max_attempts=2;\
+             failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+             failover_max_duration_ms=100",
+            a.url(),
+            b
+        );
+        let mut reader = Reader::from_conf(&conf).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::RoleMismatch,
+            "auth={auth:?}: msg={}",
+            err.msg()
+        );
+        assert!(
+            err.upgrade_reject().is_some(),
+            "the role reject must stay attached"
+        );
+    }
+}
+
+/// Regression: a token-provider reader whose last reconnect round was admitted
+/// at the deadline had its provider acquisition cancelled before any dial, and
+/// that cancellation ("transport is shutting down") replaced the
+/// `RoleMismatch` the earlier rounds had recorded. The exhaustion error must
+/// keep the role reject exactly as a static-auth reader's does.
+#[test]
+fn provider_reader_keeps_role_mismatch_when_deadline_cuts_off_a_round() {
+    // The budget starts at `execute()`, so the first round has to dial well
+    // before the deadline even on a slow CI agent; with 100ms, a stall of a
+    // few tens of ms cut off round one before it recorded any RoleMismatch.
+    // A short, doubling full-jitter backoff means the run still usually ends
+    // on a sleep clamped to the deadline, which leaves the next admitted
+    // round's provider acquisition to be cut off -- the regression here.
+    for _ in 0..5 {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Primary, "a-primary"),
+            vec![Action::Reject421 {
+                role: Some("REPLICA".into()),
+                zone: None,
+            }],
+        ]);
+        let b = slow_421_replica_server(Duration::ZERO);
+        let conf = format!(
+            "ws::addr={},{};target=primary;failover_max_attempts=20;\
+             failover_backoff_initial_ms=10;failover_backoff_max_ms=5000;\
+             failover_max_duration_ms=500",
+            a.url(),
+            b
+        );
+        let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+            .unwrap()
+            .token_provider(|| Ok::<_, questdb::Error>("tok".to_string()))
+            .unwrap();
+        let mut reader = Reader::from_config(&cfg).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(err.code(), ErrorCode::RoleMismatch, "msg={}", err.msg());
+        assert!(
+            err.upgrade_reject().is_some(),
+            "the role reject must stay attached"
+        );
+        assert!(
+            !err.msg().contains("shutting down"),
+            "a deadline cut-off must not be reported as a shutdown: {}",
+            err.msg()
+        );
+    }
+}
+
+fn slow_503_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
+}
+
+fn slow_401_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
+}
+
+/// A late 401 must remain an AuthError even if there is no time left to
+/// acquire another token. Replacing it with a deadline error makes failover
+/// report the earlier, transient failure on the other endpoint instead.
+#[test]
+fn late_401_at_failover_deadline_surfaces_auth_error() {
+    for provider in [false, true] {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Standalone, "a"),
+            vec![Action::HardDrop],
+        ]);
+        let b = slow_401_server(Duration::from_millis(300));
+        let conf = format!(
+            "ws::addr={},{};failover_max_attempts=2;\
+             failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+             failover_max_duration_ms=100",
+            a.url(),
+            b
+        );
+        let cfg = ReaderConfig::from_conf(&conf).unwrap();
+        let cfg = if provider {
+            cfg.token_provider(|| Ok::<_, questdb::Error>("tok".to_string()))
+                .unwrap()
+        } else {
+            cfg
+        };
+        let mut reader = Reader::from_config(&cfg).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("401 must reject the query"),
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::AuthError,
+            "provider={provider}: {err}"
+        );
+    }
+}
+
+/// A real HTTP 401 stays the terminal failure even when the rotating token
+/// provider starts its one permitted refetch before the failover deadline but
+/// cannot finish until after it. The initial socket close must not win merely
+/// because acquiring a replacement credential consumed the remaining time.
+#[test]
+fn provider_reader_preserves_401_when_refetch_crosses_deadline() {
+    let a = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        vec![Action::HardDrop],
+    ]);
+    let b = slow_401_server(Duration::ZERO);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr={},{};failover_max_attempts=2;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+         failover_max_duration_ms=1000",
+        a.url(),
+        b
+    );
+    let provider_calls = Arc::clone(&calls);
+    let cfg = ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider(move || {
+            let n = provider_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            // Initial connect, reconnect walk, then post-401 refetch.
+            if n == 3 {
+                thread::sleep(Duration::from_millis(3000));
+            }
+            Ok::<_, questdb::Error>(format!("tok{n}"))
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("initial connect to A");
+    let (capture, gave_up) = gave_up_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
+    let err = match cursor.next_batch() {
+        Err(err) => err,
+        Ok(_) => panic!("HTTP 401 must reject the query"),
+    };
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "msg={}", err.msg());
+    assert_eq!(err.code(), ErrorCode::AuthError, "msg={}", err.msg());
+    assert!(err.msg().contains("HTTP 401"), "msg={}", err.msg());
+    let (code, msg) = gave_up.lock().unwrap().clone().expect("GaveUp event");
+    assert_eq!(code, ErrorCode::AuthError, "msg={msg}");
+    assert!(msg.contains("HTTP 401"), "msg={msg}");
+}
+
+/// Regression: the `RoleMismatch` case above applies equally to the other
+/// diagnostic codes a final round can end on. When every endpoint rejects the
+/// WS upgrade on the last permitted round and the deadline expires during it,
+/// a static-auth reader must still see `HandshakeError`, as it did before the
+/// deadline was re-checked right after a failed walk.
+#[test]
+fn final_round_handshake_error_past_deadline_surfaces_handshake_error() {
+    for auth in ["", "username=u;password=p;"] {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Standalone, "a"),
+            vec![Action::Reject421 {
+                role: None,
+                zone: None,
+            }],
+        ]);
+        let b = slow_503_server(Duration::from_millis(300));
+        let conf = format!(
+            "ws::addr={},{};{auth}failover_max_attempts=2;\
+             failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+             failover_max_duration_ms=100",
+            a.url(),
+            b
+        );
+        let mut reader = Reader::from_conf(&conf).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::HandshakeError,
+            "auth={auth:?}: msg={}",
+            err.msg()
+        );
+        assert!(
+            err.msg().contains("HTTP 503"),
+            "the last handshake failure must stay in the message: {}",
+            err.msg()
+        );
+    }
+}
+
+/// A static-auth reader whose query outlives `failover_max_duration_ms`
+/// before its first mid-stream failure has no reconnect budget left. The
+/// reconnect loop gives up on the deadline without dialling, so it learned
+/// nothing: `next_batch` must surface the original trigger -- its code and its
+/// message -- not an exhaustion error with no cause attached.
+#[test]
+fn deadline_spent_before_first_failure_surfaces_the_trigger() {
+    let bogus_frame = framed(1, 0, 0, &[0xEE, 0, 0, 0, 0, 0, 0, 0, 0]);
+    for (trigger, expected) in [
+        (Action::HardDrop, ErrorCode::SocketError),
+        (Action::SendRaw(bogus_frame), ErrorCode::ProtocolError),
+    ] {
+        let srv = MockServer::start(vec![
+            vec![
+                Action::SendServerInfo {
+                    role: ServerRole::Standalone,
+                    node_id: "a".into(),
+                },
+                Action::AwaitQueryRequest,
+                Action::Sleep(Duration::from_millis(200)),
+                trigger,
+                Action::Sleep(Duration::from_millis(200)),
+            ],
+            // Tripwire: the spent deadline must not admit a reconnect.
+            happy_script(ServerRole::Standalone, "a-recovered"),
+        ]);
+        let conf = format!(
+            "ws::addr={};failover_max_attempts=5;failover_backoff_initial_ms=0;\
+             failover_backoff_max_ms=0;failover_max_duration_ms=50",
+            srv.url()
+        );
+        let mut reader = Reader::from_conf(&conf).expect("connect");
+        let (capture, gave_up) = gave_up_capture();
+        let mut cursor = reader
+            .prepare("select 1")
+            .on_failover_progress(capture)
+            .execute()
+            .expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(err.code(), expected, "msg={}", err.msg());
+        assert!(
+            !err.msg().contains("wall-clock budget exhausted")
+                && !err.msg().contains("<no error captured>"),
+            "the trigger must stay the surfaced error: {}",
+            err.msg()
+        );
+        assert_gave_up_on_deadline(&gave_up);
+        assert_eq!(srv.accepts(), 1, "the spent deadline admits no reconnect");
+    }
+}
+
+fn replica_then_401_server(provider_calls: Arc<AtomicUsize>, switch_at: usize) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let calls = Arc::clone(&provider_calls);
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp: &[u8] = if calls.load(Ordering::SeqCst) >= switch_at {
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\n\
+                      Connection: close\r\nX-QuestDB-Role: REPLICA\r\n\r\n"
+                };
+                let _ = stream.write_all(resp);
+            });
+        }
+    });
+    addr
+}
+
+/// A previous round found a role mismatch, but a later endpoint definitely
+/// rejected the credential with 401. If the post-401 refetch hits the failover
+/// deadline, the definite 401 is terminal, not the earlier role mismatch or a
+/// generic transport "shutting down" error.
+#[test]
+fn provider_reader_preserves_401_over_earlier_role_mismatch_on_refetch_deadline() {
+    let a = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Primary, "a-primary"),
+        vec![Action::Reject421 {
+            role: Some("REPLICA".into()),
+            zone: None,
+        }],
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    // Call 1: initial connect; 2: reconnect round 1 (B answers 421 REPLICA);
+    // 3: round 2 (B answers 401); 4: the post-401 re-fetch, which blocks past
+    // the deadline.
+    let b = replica_then_401_server(Arc::clone(&calls), 3);
+    let conf = format!(
+        "ws::addr={},{};target=primary;failover_max_attempts=20;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+         failover_max_duration_ms=1000",
+        a.url(),
+        b
+    );
+    let provider_calls = Arc::clone(&calls);
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider(move || {
+            let n = provider_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 4 {
+                thread::sleep(Duration::from_millis(3000));
+            }
+            Ok::<_, questdb::Error>(format!("tok{n}"))
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("initial connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("must fail"),
+    };
+    assert_eq!(calls.load(Ordering::SeqCst), 4, "msg={}", err.msg());
+    assert_eq!(err.code(), ErrorCode::AuthError, "msg={}", err.msg());
+    assert!(err.msg().contains("HTTP 401"), "msg={}", err.msg());
+    assert!(!err.msg().contains("shutting down"), "msg={}", err.msg());
 }

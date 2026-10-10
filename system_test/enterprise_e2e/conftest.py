@@ -20,6 +20,7 @@ sibling crates / C / C++ sources under ``system_test/``.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -82,6 +83,68 @@ from c_client_sidecar import (  # noqa: E402
     build_qwp_egress_sidecar,
     build_qwp_sidecar,
 )
+
+
+# --------------------------------------------------------------------
+# Forked-JVM temp dir hygiene.
+# --------------------------------------------------------------------
+
+_JAVA_TOOL_OPTIONS = "JAVA_TOOL_OPTIONS"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _forked_jvm_tmpdir(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Path]:
+    """Point every forked JVM's ``java.io.tmpdir`` at a dedicated dir.
+
+    On each start, a forked server unpacks its native libraries
+    (``libqdb_ent``, ``libquestdb``) from the jar into a fresh
+    ``java.io.tmpdir`` file. ``File.deleteOnExit`` removes that file on
+    a graceful exit only. Many scenarios SIGKILL servers on purpose,
+    which leaked tens of MB of ``/tmp`` per kill (~40 kills per run).
+    That eventually filled the CI agent's disk, failing late tests with
+    ``cannot unpack /tmp/libqdb_ent*.so`` or ``[28] No space left``.
+
+    ``JAVA_TOOL_OPTIONS`` (inherited via the harness's ``os.environ``
+    passthrough) is used rather than ``JAVA_OPTS_FORK`` so the
+    harness's per-launcher ``-Xmx`` defaults stay intact.
+    """
+    jvm_tmp = tmp_path_factory.mktemp("jvm-tmp", numbered=False)
+    if any(c.isspace() for c in str(jvm_tmp)):
+        # The JVM splits JAVA_TOOL_OPTIONS on whitespace; don't risk it.
+        yield jvm_tmp
+        return
+    prev = os.environ.get(_JAVA_TOOL_OPTIONS)
+    opt = f"-Djava.io.tmpdir={jvm_tmp}"
+    os.environ[_JAVA_TOOL_OPTIONS] = f"{prev} {opt}" if prev else opt
+    try:
+        yield jvm_tmp
+    finally:
+        if prev is None:
+            os.environ.pop(_JAVA_TOOL_OPTIONS, None)
+        else:
+            os.environ[_JAVA_TOOL_OPTIONS] = prev
+        shutil.rmtree(jvm_tmp, ignore_errors=True)
+
+
+@pytest.fixture(scope="function", autouse=True)
+def _wipe_forked_jvm_tmpdir(_forked_jvm_tmpdir: Path) -> Iterator[None]:
+    """Remove native-lib copies left by servers the test SIGKILLed.
+
+    This fixture is autouse, so it is set up before the test's
+    server/sidecar fixtures and torn down after them, once every forked
+    JVM is gone. Even if a JVM survived, unlinking its mapped ``.so`` is
+    harmless."""
+    yield
+    for entry in _forked_jvm_tmpdir.iterdir():
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------

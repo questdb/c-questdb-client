@@ -293,6 +293,12 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         line_sender_cpp_example_from_env
         examples/line_sender_cpp_example_from_env.cpp)
     compile_example(
+        oidc_c_example
+        examples/oidc_c_example.c)
+    compile_example(
+        oidc_cpp_example
+        examples/oidc_cpp_example.cpp)
+    compile_example(
         line_sender_cpp_example_udp
         examples/line_sender_cpp_example_udp.cpp)
     compile_example(
@@ -397,6 +403,23 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         endif()
     endfunction()
 
+    # This probe must compile with only include/questdb/ingress on the include
+    # path, as the line_sender headers always have.
+    try_compile(
+        INGRESS_DIR_INCLUDES_COMPILED
+        ${CMAKE_CURRENT_BINARY_DIR}/compile_probe/ingress_dir_includes
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpp_test/compile_ingress_dir_includes.cpp
+        CMAKE_FLAGS
+            -DCMAKE_CXX_STANDARD=${CMAKE_CXX_STANDARD}
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON
+            -DCMAKE_CXX_EXTENSIONS=OFF
+            -DINCLUDE_DIRECTORIES=${CMAKE_CURRENT_SOURCE_DIR}/include/questdb/ingress
+        OUTPUT_VARIABLE INGRESS_DIR_INCLUDES_OUTPUT)
+    if(NOT INGRESS_DIR_INCLUDES_COMPILED)
+        message(FATAL_ERROR
+            "line_sender headers need more than include/questdb/ingress:\n${INGRESS_DIR_INCLUDES_OUTPUT}")
+    endif()
+
     expect_cxx_compile_failure(
         borrowed_sender_copy
         cpp_test/compile_fail_borrowed_sender_copy.cpp)
@@ -408,6 +431,11 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_line_sender
         cpp_test/mock_server.cpp
         cpp_test/test_line_sender.cpp)
+
+    # Broker-independent OIDC ABI and C++ RAII/error-surface coverage.
+    compile_test(
+        test_oidc
+        cpp_test/test_oidc.cpp)
 
     # Live-broker integration tests for the egress reader. Skips per-test
     # if no broker is reachable on QDB_LIVE_BROKER_HOST:QDB_LIVE_BROKER_HTTP_PORT

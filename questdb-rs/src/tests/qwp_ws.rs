@@ -660,6 +660,105 @@ fn spawn_one_response_server(response: MockQwpResponse) -> (u16, mpsc::Receiver<
     (port, rx)
 }
 
+fn spawn_401_then_response_server() -> (u16, mpsc::Receiver<MockResult>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let request = read_request_until_blank(&mut first).unwrap();
+        let request_lines = String::from_utf8_lossy(&request)
+            .split("\r\n")
+            .take_while(|line| !line.is_empty())
+            .map(String::from)
+            .collect();
+        first
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        tx.send(MockResult {
+            request_lines,
+            received_frames: Vec::new(),
+        })
+        .unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        let request_lines = perform_server_upgrade(&mut second).unwrap();
+        let mut received_frames = Vec::new();
+        if let Ok((_fin, _opcode, payload)) = read_frame(&mut second) {
+            received_frames.push(payload);
+            let _ = write_qwp_error_response(
+                &mut second,
+                QWP_STATUS_SCHEMA_MISMATCH,
+                FIRST_WIRE_SEQUENCE,
+                b"done",
+            );
+        }
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
+    });
+    (port, rx)
+}
+
+/// Captures the upgrade `Authorization` header on every connection and NACKs each
+/// posted frame with a retryable `WRITE_ERROR`, so a background drainer keeps
+/// reconnecting (re-running the handshake). Streams one [`MockResult`] per
+/// connection so a test can compare the auth header across reconnects.
+fn spawn_reconnect_auth_capture_server() -> (u16, mpsc::Receiver<MockResult>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let Ok(request_lines) = perform_server_upgrade(&mut stream) else {
+                        continue;
+                    };
+                    let mut received_frames = Vec::new();
+                    if let Ok((_fin, _opcode, payload)) = read_frame(&mut stream) {
+                        received_frames.push(payload);
+                        let _ = write_qwp_error_response(
+                            &mut stream,
+                            QWP_STATUS_WRITE_ERROR,
+                            FIRST_WIRE_SEQUENCE,
+                            b"retry later",
+                        );
+                    }
+                    if tx
+                        .send(MockResult {
+                            request_lines,
+                            received_frames,
+                        })
+                        .is_err()
+                    {
+                        break; // the test finished and dropped the receiver
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (port, rx)
+}
+
 #[derive(Clone, Copy)]
 enum MockQwpResponse {
     Error {
@@ -2278,6 +2377,987 @@ fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
 }
 
 #[test]
+fn qwp_ws_token_provider_reaches_upgrade_handshake() {
+    // The rotating Bearer provider is pulled at connect and its token reaches the
+    // WS upgrade as `Authorization: Bearer <tok>` — the ingress-side counterpart of
+    // the HTTP (`provider_token_reaches_wire_and_rotates`) and reader
+    // (`token_provider_pulled_fresh_each_header_resolution`) coverage. Per-connect
+    // resolution is what makes a rotating token rotate across reconnects.
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {
+        status: QWP_STATUS_SCHEMA_MISMATCH,
+        wire_seq: FIRST_WIRE_SEQUENCE,
+        message: b"n/a",
+    });
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>("rotating-tok".to_string())
+            }
+        })
+        .unwrap();
+    // Background progress: the drainer connects on its own after the flush.
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let _ = sender.flush_and_get_fsn(&mut buf);
+
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let auth = result
+        .request_lines
+        .iter()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| v.trim().to_string())
+        })
+        .expect("the WS upgrade must carry an Authorization header");
+    assert_eq!(auth, "Bearer rotating-tok");
+    assert!(
+        provider_calls.load(Ordering::SeqCst) >= 1,
+        "the token provider must be pulled at connect"
+    );
+}
+
+#[test]
+fn qwp_ws_does_not_replay_a_401_with_an_unchanged_provider_token() {
+    // The other half of `qwp_ws_retries_one_401_with_a_changed_provider_token`.
+    // Only the changed-token branch was covered, so neutralising the guard --
+    // replaying unconditionally -- failed nothing, and a genuine rejection
+    // would cost a second full TCP+TLS+upgrade round trip per connect round.
+    // The HTTP sender has both halves (`a_401_with_an_unchanged_token_is_not_
+    // retried`); this brings QWP/WebSocket up to the same level.
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let (port, rx) = spawn_401_then_response_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            // Byte-identical every time: the IdP re-issuing the same credential
+            // means the 401 is a real rejection, not an expiry to rotate out of.
+            move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>("same".to_string())
+            }
+        })
+        .unwrap();
+    // Unlike the changed-token case, no attempt here succeeds, so the connect
+    // itself is what returns -- and it must return the server's rejection
+    // rather than a second attempt's.
+    let err = builder.build().unwrap_err();
+    assert_eq!(err.code(), crate::ErrorCode::AuthError);
+    assert_eq!(err.ws_http_status(), Some(401));
+
+    // Exactly one upgrade attempt reaches the server.
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("the first upgrade attempt");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "an unchanged token bought a second upgrade attempt"
+    );
+    // The provider is re-asked once to find out whether the credential rotated;
+    // it is the replay, not the re-resolution, that the guard prevents.
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn qwp_ws_provider_failure_after_401_retains_rejected_endpoint() {
+    use crate::ingress::ConnectionEventKind;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = read_request_until_blank(&mut stream).unwrap();
+        assert!(
+            String::from_utf8_lossy(&request)
+                .to_ascii_lowercase()
+                .contains("authorization: bearer stale"),
+            "the rejected credential must have reached the server"
+        );
+        stream
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider_calls = Arc::clone(&calls);
+    let (tx, rx) = mpsc::channel();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider(move || {
+            if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok("stale".to_string())
+            } else {
+                Err(crate::Error::new(ErrorCode::SocketError, "refresh failed"))
+            }
+        })
+        .unwrap()
+        .connection_listener(Arc::new(move |event| tx.send(event.clone()).unwrap()), 0)
+        .unwrap();
+    let _keep_events_alive = builder.connection_event_source_for_test().unwrap();
+    let err = builder.build().unwrap_err();
+    server.join().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("HTTP 401"), "{err}");
+    assert!(err.msg().contains("refresh failed"), "{err}");
+
+    let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(event.kind, ConnectionEventKind::CredentialUnavailable);
+    assert_eq!(event.host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(event.port.as_deref(), Some(port.to_string().as_str()));
+    assert_eq!(event.cause_code, Some(ErrorCode::SocketError));
+    assert!(event.cause_msg.as_deref().unwrap().contains("HTTP 401"));
+    assert!(
+        rx.try_iter()
+            .all(|event| event.kind != ConnectionEventKind::AuthFailed)
+    );
+}
+
+/// Closing a sender whose token provider is still resolving cancels that
+/// acquisition. That is the user's own close, not a credential outage: no
+/// `CredentialUnavailable` event may reach the listener.
+#[test]
+fn qwp_ws_close_during_provider_acquisition_reports_no_credential_event() {
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let (event_tx, event_rx) = mpsc::channel();
+    let builder = SenderBuilder::from_conf("ws::addr=127.0.0.1:1;initial_connect_retry=async;")
+        .unwrap()
+        .qwp_ws_token_provider(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+            Ok::<_, crate::Error>("token".to_string())
+        })
+        .unwrap()
+        .connection_listener(
+            Arc::new(move |event| {
+                let _ = event_tx.send(event.clone());
+            }),
+            0,
+        )
+        .unwrap();
+    let _keep_events_alive = builder.connection_event_source_for_test().unwrap();
+    let sender = builder.build().unwrap();
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the provider must be called");
+    drop(sender);
+    release_tx.send(()).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let events: Vec<_> = event_rx.try_iter().map(|event| event.kind).collect();
+    assert!(
+        !events.contains(&crate::ingress::ConnectionEventKind::CredentialUnavailable),
+        "a close must not be reported as an unavailable credential: {events:?}"
+    );
+}
+
+#[test]
+fn qwp_ws_provider_failure_before_dial_has_no_endpoint() {
+    use crate::ingress::ConnectionEventKind;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider(|| {
+            Err::<String, _>(crate::Error::new(ErrorCode::SocketError, "refresh failed"))
+        })
+        .unwrap()
+        .connection_listener(Arc::new(move |event| tx.send(event.clone()).unwrap()), 0)
+        .unwrap();
+    let _keep_events_alive = builder.connection_event_source_for_test().unwrap();
+    let err = builder.build().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(!err.msg().contains("HTTP 401"), "{err}");
+    let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(event.kind, ConnectionEventKind::CredentialUnavailable);
+    assert_eq!(event.host, None);
+    assert_eq!(event.port, None);
+    assert_eq!(event.cause_code, Some(ErrorCode::SocketError));
+    listener.set_nonblocking(true).unwrap();
+    assert!(matches!(
+        listener.accept(),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
+#[test]
+fn qwp_ws_retries_one_401_with_a_changed_provider_token() {
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let (port, rx) = spawn_401_then_response_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                let n = provider_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>(if n == 0 { "stale" } else { "fresh" }.to_string())
+            }
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let _ = sender.flush_and_get_fsn(&mut buf);
+
+    let auth_of = |result: &MockResult| {
+        result
+            .request_lines
+            .iter()
+            .find_map(|line| line.split_once(':'))
+            .and_then(|_| {
+                result.request_lines.iter().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                })
+            })
+            .expect("authorization header")
+    };
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(auth_of(&first), "Bearer stale");
+    assert_eq!(auth_of(&second), "Bearer fresh");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_401_re_resolution_names_the_rejected_token() {
+    // As above, but the provider changes its answer only when told which token
+    // the server refused -- the cache-first behaviour of `OidcDeviceAuth`,
+    // which would otherwise hand the rejected token straight back and leave
+    // the 401 standing until that token neared expiry.
+    let (port, rx) = spawn_401_then_response_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider(|| {
+            Ok::<_, crate::Error>(crate::token_provider::inspect_rejected_token(|rejected| {
+                if rejected == Some("stale") {
+                    "fresh".to_string()
+                } else {
+                    "stale".to_string()
+                }
+            }))
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let _ = sender.flush_and_get_fsn(&mut buf);
+
+    let authorization = |result: &MockResult| {
+        result
+            .request_lines
+            .iter()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_string())
+            })
+            .expect("authorization header")
+    };
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the rejected token was handed back, so the endpoint was not replayed");
+    assert_eq!(authorization(&first), "Bearer stale");
+    assert_eq!(authorization(&second), "Bearer fresh");
+}
+
+#[cfg(all(feature = "sync-reader-qwp-ws", feature = "_oidc"))]
+#[test]
+fn reader_401_re_resolution_names_the_rejected_token() {
+    // The egress reader replays an endpoint after a 401 only when its provider
+    // hands back a different token, so it must say which token was refused.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let request = read_request_until_blank(&mut first).unwrap();
+        tx.send(String::from_utf8_lossy(&request).into_owned())
+            .unwrap();
+        first
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        drop(first);
+        let (mut second, _) = listener.accept().unwrap();
+        // Version 0 lets the reader connect without a SERVER_INFO frame.
+        let request_lines = perform_server_upgrade_with_version(&mut second, 0).unwrap();
+        tx.send(request_lines.join("\r\n")).unwrap();
+        let mut sink = [0u8; 256];
+        let _ = second.read(&mut sink);
+    });
+    let cfg = crate::egress::ReaderConfig::from_conf(format!("ws::addr=127.0.0.1:{port};"))
+        .unwrap()
+        .token_provider(|| {
+            Ok::<_, crate::Error>(crate::token_provider::inspect_rejected_token(|rejected| {
+                if rejected == Some("stale") {
+                    "fresh".to_string()
+                } else {
+                    "stale".to_string()
+                }
+            }))
+        })
+        .unwrap();
+    let reader = crate::egress::Reader::from_config(&cfg);
+
+    let has_authorization = |request: &str, value: &str| {
+        request.split("\r\n").any(|line| {
+            line.split_once(':').is_some_and(|(key, found)| {
+                key.eq_ignore_ascii_case("authorization") && found.trim() == value
+            })
+        })
+    };
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(has_authorization(&first, "Bearer stale"), "{first}");
+    let second = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the rejected token was handed back, so the endpoint was not replayed");
+    assert!(has_authorization(&second, "Bearer fresh"), "{second}");
+    let reader = reader.expect("the replay with the fresh token connects");
+    drop(reader);
+    server.join().unwrap();
+}
+
+/// An ACK wait that ran out of time while the sender could not reconnect,
+/// because its OIDC credential needs a new sign-in, must say so: with the OIDC
+/// detail `line_sender_opts_oidc_auth` promises, and without blaming a live
+/// server for not acknowledging.
+#[cfg(feature = "_oidc")]
+fn assert_wait_names_the_lapsed_credential(err: &crate::Error) {
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{err}");
+    assert!(!err.in_doubt(), "{err}");
+    let oidc = err
+        .oidc_error()
+        .unwrap_or_else(|| panic!("no OIDC detail on: {err}"));
+    assert_eq!(oidc.kind(), crate::oidc::OidcErrorKind::InteractionRequired);
+    assert!(!oidc.acquisition_busy());
+    assert!(err.msg().contains("no ack progress"), "{err}");
+    assert!(err.msg().contains("reconnecting keeps failing"), "{err}");
+    assert!(err.msg().contains("sign_in()"), "{err}");
+    assert!(!err.msg().contains("the connection is alive"), "{err}");
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_wait_names_a_credential_that_blocks_the_initial_connect() {
+    // `initial_connect_retry=async` builds the sender before any connection,
+    // and nobody has signed in for the token the runner's first connect needs.
+    let auth = Arc::new(
+        crate::oidc::OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example.com/device")
+            .token_endpoint("https://idp.example.com/token")
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .build()
+            .unwrap(),
+    );
+    let mut sender = SenderBuilder::from_conf("ws::addr=127.0.0.1:1;initial_connect_retry=async;")
+        .unwrap()
+        .qwp_ws_token_provider({
+            let auth = Arc::clone(&auth);
+            move || auth.token()
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("x", 1)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    sender.flush(&mut buffer).unwrap();
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(500))
+        .unwrap_err();
+    assert_wait_names_the_lapsed_credential(&err);
+}
+
+/// Connect once, have the server drop the connection, and wait for an ACK
+/// while every reconnect fails because the credential needs a new sign-in.
+#[cfg(feature = "_oidc")]
+fn wait_after_the_credential_lapses_mid_stream(progress: ProgressCase) -> crate::Error {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+    });
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider({
+            let pulls = Arc::clone(&pulls);
+            move || {
+                if pulls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok("tok".to_string())
+                } else {
+                    Err(crate::Error::from(
+                        crate::oidc::OidcError::interaction_required(
+                            "No usable cached or refreshable OIDC token is available. \
+                             Call sign_in() explicitly before starting the transport.",
+                        ),
+                    ))
+                }
+            }
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+    // The server drops the connection once the upgrade is done.
+    server.join().unwrap();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("x", 1)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    sender.flush(&mut buffer).unwrap();
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(800))
+        .unwrap_err();
+    assert!(pulls.load(Ordering::SeqCst) >= 2, "no reconnect was tried");
+    err
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_wait_names_a_credential_that_blocks_a_background_reconnect() {
+    let err = wait_after_the_credential_lapses_mid_stream(ProgressCase::Background);
+    assert_wait_names_the_lapsed_credential(&err);
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_wait_names_a_credential_that_blocks_a_manual_reconnect() {
+    let err = wait_after_the_credential_lapses_mid_stream(ProgressCase::Manual);
+    assert_wait_names_the_lapsed_credential(&err);
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn qwp_ws_wait_forgets_a_reconnect_failure_once_reconnected() {
+    // One reconnect fails for want of a credential, the next succeeds, and then
+    // the server stays silent. The wait's timeout is the server's again: it
+    // must not report a reconnect failure that has since been overcome.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (reconnected_tx, reconnected_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut first).unwrap();
+        drop(first);
+        let (mut second, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut second).unwrap();
+        reconnected_tx.send(()).unwrap();
+        // Read whatever arrives and never acknowledge it.
+        let mut sink = [0u8; 4096];
+        while matches!(second.read(&mut sink), Ok(n) if n > 0) {}
+    });
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{port};reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=10;"
+    ))
+    .unwrap()
+    .qwp_ws_token_provider({
+        let pulls = Arc::clone(&pulls);
+        move || {
+            if pulls.fetch_add(1, Ordering::SeqCst) == 1 {
+                Err(crate::Error::from(
+                    crate::oidc::OidcError::interaction_required("sign in"),
+                ))
+            } else {
+                Ok("tok".to_string())
+            }
+        }
+    })
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("x", 1)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    // Sending finds the dropped connection and starts the reconnect.
+    sender.flush(&mut buffer).unwrap();
+    reconnected_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the sender reconnected");
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(300))
+        .unwrap_err();
+    assert!(pulls.load(Ordering::SeqCst) >= 3, "no successful reconnect");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{err}");
+    assert!(err.oidc_error().is_none(), "{err}");
+    assert!(err.msg().contains("the connection is alive"), "{err}");
+    drop(sender);
+    server.join().unwrap();
+}
+
+#[test]
+fn qwp_ws_token_provider_rotates_across_reconnects() {
+    // The rotating provider must be re-pulled on each (re)connect handshake, so a
+    // reconnect carries a freshly rotated token — not the one captured at first
+    // connect. Strengthens `qwp_ws_token_provider_reaches_upgrade_handshake`
+    // (which only proves the token reaches the FIRST handshake) up to the level
+    // of the HTTP (`provider_token_reaches_wire_and_rotates`) and reader
+    // (`token_provider_pulled_fresh_each_header_resolution`) rotation guards.
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let (port, rx) = spawn_reconnect_auth_capture_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        // Reconnect fast and tolerate many NACK recycles without poisoning, so a
+        // couple of reconnect handshakes happen well within the test window.
+        .max_frame_rejections(1000)
+        .unwrap()
+        .poison_min_escalation_window(Duration::from_secs(60))
+        .unwrap()
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(5))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(10))
+        .unwrap()
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                let n = provider_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>(format!("rotating-tok-{n}"))
+            }
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let _ = sender.flush_and_get_fsn(&mut buf);
+
+    // Two successive (re)connect handshakes, each carrying the next rotated token.
+    let auth_of = |result: &MockResult| {
+        result
+            .request_lines
+            .iter()
+            .find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("authorization")
+                    .then(|| v.trim().to_string())
+            })
+            .expect("the WS upgrade must carry an Authorization header")
+    };
+    let first = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first handshake");
+    let second = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reconnect handshake");
+    assert_eq!(auth_of(&first), "Bearer rotating-tok-0");
+    assert_eq!(
+        auth_of(&second),
+        "Bearer rotating-tok-1",
+        "the reconnect handshake must re-pull the provider for a rotated token"
+    );
+    assert!(provider_calls.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
+fn qwp_ws_provider_failure_keeps_sf_frames_recoverable() {
+    // The QWP/WebSocket ingress counterpart of the ILP/HTTP
+    // `provider_error_leaves_buffer_intact_for_retry`, for the initial connect:
+    // the reconnect knobs below select the synchronous initial-connect retry, so
+    // the provider failure is absorbed inside `build()` -- before any frame is
+    // queued -- and must be retried rather than failing the build. The queued
+    // frame then drains against the real connect path carrying the recovered
+    // token. A provider failure on a *reconnect* with a frame already queued is
+    // `qwp_ws_reconnect_provider_failure_keeps_queued_frame_recoverable`.
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let (port, rx) = spawn_mock_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(5))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(10))
+        .unwrap()
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                // Fail the first connect round's provider resolution, then recover.
+                if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(crate::Error::new(
+                        crate::ErrorCode::AuthError,
+                        "token source temporarily unavailable",
+                    ))
+                } else {
+                    Ok::<_, crate::Error>("recovered-tok".to_string())
+                }
+            }
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    // The failed provider round and its retry both ran inside `build()`.
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+    sender.flush_and_get_fsn(&mut buf).unwrap();
+
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+        .expect("the frame must drain once the initial connect recovered");
+
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        result.received_frames.len(),
+        1,
+        "the queued frame drained after the provider recovered"
+    );
+    assert_eq!(&result.received_frames[0][0..4], b"QWP1");
+    let auth = result
+        .request_lines
+        .iter()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| v.trim().to_string())
+        })
+        .expect("the recovered handshake must carry an Authorization header");
+    assert_eq!(auth, "Bearer recovered-tok");
+
+    // The provider was re-pulled after its failure (the failed round + the
+    // recovered round), proving the failure was retried, not terminalized.
+    assert!(
+        provider_calls.load(Ordering::SeqCst) >= 2,
+        "the provider must be re-pulled on the reconnect after a failed round"
+    );
+}
+
+#[test]
+fn qwp_ws_reconnect_provider_failure_keeps_queued_frame_recoverable() {
+    // A token-provider failure on a real background *reconnect*, with a frame
+    // already sent and unacked, must NOT terminalize the queued
+    // store-and-forward frame: the provider failure is a retryable
+    // `SocketError`, so the drainer keeps reconnecting and replays the frame
+    // once the provider recovers. Connection 0 accepts the frame and drops it
+    // unacked; the reconnect's first provider pull fails; connection 1 receives
+    // the replayed frame and acks it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel::<(usize, Vec<String>, usize)>();
+    thread::spawn(move || {
+        for conn in 0..2usize {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let lines = perform_server_upgrade(&mut stream).unwrap();
+            let mut frames = 0;
+            if read_frame(&mut stream).is_ok() {
+                frames += 1;
+                if conn == 1 {
+                    let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+                }
+            }
+            let _ = tx.send((conn, lines, frames));
+            if conn == 0 {
+                // Unacked: forces a real mid-stream reconnect.
+                drop(stream);
+            } else {
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    });
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(5))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(10))
+        .unwrap()
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                // Call 0 is the initial connect; call 1 is the reconnect.
+                match provider_calls.fetch_add(1, Ordering::SeqCst) {
+                    1 => Err(crate::Error::new(
+                        crate::ErrorCode::AuthError,
+                        "reconnect-time provider outage",
+                    )),
+                    n => Ok::<_, crate::Error>(format!("tok-{n}")),
+                }
+            }
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush_and_get_fsn(&mut buf).unwrap();
+
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+        .expect("a reconnect-time provider failure must keep the queued frame recoverable");
+
+    let (conn0, _, frames0) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        (conn0, frames0),
+        (0, 1),
+        "the frame was sent before the drop"
+    );
+    let (conn1, lines1, frames1) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        (conn1, frames1),
+        (1, 1),
+        "the frame was replayed after recovery"
+    );
+    let auth = lines1
+        .iter()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| v.trim().to_string())
+        })
+        .expect("the recovered handshake must carry an Authorization header");
+    assert_eq!(auth, "Bearer tok-2", "the failed pull was retried");
+}
+
+#[test]
+fn qwp_ws_reconnect_401_rotates_token_and_completes_pending_durable_ack() {
+    // Ordinary OK does not make an SFA publication durable. Drop that session,
+    // reject the first reconnect's stale token, then accept the retry with a
+    // rotated token and durably ACK the replay. Each gate is channel-driven so
+    // the reconnect cannot race ahead of the withheld durable watermark.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (disconnect_tx, disconnect_rx) = mpsc::channel();
+    let (replayed_tx, replayed_rx) = mpsc::channel();
+    let (release_durable_tx, release_durable_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut initial, _) = listener.accept().unwrap();
+        let initial_lines = perform_server_upgrade_durable(&mut initial).unwrap();
+        assert_eq!(
+            parse_header(&initial_lines.join("\r\n"), "Authorization").as_deref(),
+            Some("Bearer initial")
+        );
+        assert!(
+            initial_lines
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("X-QWP-Request-Durable-Ack: true"))
+        );
+
+        let mut wire_seq = FIRST_WIRE_SEQUENCE;
+        loop {
+            let (_, opcode, payload) = read_frame(&mut initial).unwrap();
+            match opcode {
+                0x2 => {
+                    let seq = wire_seq;
+                    wire_seq += 1;
+                    if !qwp_frame_has_tables(&payload) {
+                        continue; // A dictionary catch-up frame is not the publication.
+                    }
+                    write_qwp_ok_response_with_table_entries(&mut initial, seq, &[("trades", 10)])
+                        .unwrap();
+                    break;
+                }
+                0x9 => write_server_frame(&mut initial, 0xA, &payload, false).unwrap(),
+                _ => panic!("unexpected opcode {opcode} before the first publication"),
+            }
+        }
+        disconnect_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(initial); // A real mid-stream reconnect with no durable ACK.
+
+        let (mut rejected, _) = listener.accept().unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = read_request_until_blank(&mut rejected).unwrap();
+        assert_eq!(
+            parse_header(&String::from_utf8_lossy(&request), "Authorization").as_deref(),
+            Some("Bearer stale")
+        );
+        rejected
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        drop(rejected);
+
+        let (mut replay, _) = listener.accept().unwrap();
+        let replay_lines = perform_server_upgrade_durable(&mut replay).unwrap();
+        assert_eq!(
+            parse_header(&replay_lines.join("\r\n"), "Authorization").as_deref(),
+            Some("Bearer fresh")
+        );
+        assert!(
+            replay_lines
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("X-QWP-Request-Durable-Ack: true"))
+        );
+
+        let mut wire_seq = FIRST_WIRE_SEQUENCE;
+        loop {
+            let (_, opcode, payload) = read_frame(&mut replay).unwrap();
+            match opcode {
+                0x2 => {
+                    let seq = wire_seq;
+                    wire_seq += 1;
+                    if !qwp_frame_has_tables(&payload) {
+                        continue;
+                    }
+                    write_qwp_ok_response_with_table_entries(&mut replay, seq, &[("trades", 10)])
+                        .unwrap();
+                    replayed_tx.send(()).unwrap();
+                    break;
+                }
+                0x9 => write_server_frame(&mut replay, 0xA, &payload, false).unwrap(),
+                _ => panic!("unexpected opcode {opcode} before the replay"),
+            }
+        }
+        release_durable_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        write_qwp_durable_ack_response(&mut replay, &[("trades", 10)]).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};\
+         request_durable_ack=on;\
+         durable_ack_keepalive_interval_millis=10;\
+         reconnect_initial_backoff_millis=1;\
+         reconnect_max_backoff_millis=1;\
+         reconnect_max_duration_millis=5000;"
+    );
+    let builder = SenderBuilder::from_conf(conf)
+        .unwrap()
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                let credential = match provider_calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => "initial",
+                    1 => "stale",
+                    _ => "fresh",
+                };
+                Ok::<_, crate::Error>(credential.to_string())
+            }
+        })
+        .unwrap();
+    let mut sender = builder.build().unwrap();
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(fsn)
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
+
+    disconnect_tx.send(()).unwrap();
+    replayed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let err = sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_millis(50))
+        .expect_err("ordinary OK on the replay must not complete the durable watermark");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry);
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(fsn),
+        "the replay must have received an ordinary OK"
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
+    release_durable_tx.send(()).unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .expect("a rotated token must keep the pending publication drainable");
+    assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 3);
+    done_tx.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {
@@ -3285,6 +4365,73 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
 }
 
 #[test]
+fn qwp_ws_manual_close_honors_deadline_while_reconnect_is_waiting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+        // Drop the only listener with the frame still unacknowledged. The next
+        // drive enters the retryable reconnect/provider Waiting state.
+    });
+
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         close_flush_timeout_millis=120;reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=20;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || match provider_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok("initial-token".to_string()),
+                _ => Err(crate::Error::new(
+                    crate::ErrorCode::SocketError,
+                    "refresh failed while closing",
+                )),
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+    assert!(sender.drive_once().unwrap());
+    frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    server.join().unwrap();
+
+    let started = Instant::now();
+    let err = sender
+        .close_drain()
+        .expect_err("unacknowledged close must stop at its configured deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "manual close ignored its deadline: {elapsed:?}"
+    );
+    assert!(err.msg().contains("close drain timed out"), "{err}");
+    assert!(
+        err.msg().contains("refresh failed while closing"),
+        "the timeout must carry the reconnect failure: {err}"
+    );
+    assert!(provider_calls.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
 fn qwp_ws_drop_interrupts_blocked_background_send() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -3297,8 +4444,10 @@ fn qwp_ws_drop_interrupts_blocked_background_send() {
             .set_recv_buffer_size(4096)
             .unwrap();
         upgrade_mock_stream(&mut stream);
+        // Generous: the client's first byte can lag by seconds on a loaded CI
+        // runner even though it is milliseconds locally.
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
 
         // Observe the first data byte without consuming it, then leave the
@@ -3325,8 +4474,11 @@ fn qwp_ws_drop_interrupts_blocked_background_send() {
         .unwrap();
     sender.flush(&mut buf).unwrap();
 
+    // Only synchronises setup: wait for the blocked 8 MiB send to reach the
+    // server. Keep it generous so a slow-but-correct send on a loaded CI runner is
+    // never mistaken for the drop failing to interrupt the write.
     send_started_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(30))
         .unwrap();
 
     let started = Instant::now();
@@ -3368,6 +4520,15 @@ fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str
             // waiting for the ServerHello. This delay is outside the measured
             // sender shutdown interval.
             thread::sleep(Duration::from_millis(200));
+        } else {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_request_until_blank(&mut stream).unwrap();
+            assert!(
+                request.windows(4).any(|window| window == b"\r\n\r\n"),
+                "expected a complete WebSocket upgrade request"
+            );
         }
         connect_stalled_tx.send(()).unwrap();
         let _ = release_rx.recv_timeout(Duration::from_secs(10));
@@ -4374,6 +5535,123 @@ fn qwp_ws_manual_orphan_drainer_terminal_reject_leaves_slot_recoverable() {
     assert!(!orphan_slot.join(".failed").exists());
     assert!(orphan_slot.join(".last_error").exists());
     assert!(slot_has_sfa_file(&orphan_slot));
+}
+
+#[test]
+fn qwp_ws_background_orphan_retries_transient_provider_failure() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+    let orphan_slot = sf_dir.path().join("orphan");
+    assert!(slot_has_sfa_file(&orphan_slot));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (foreground_tx, foreground_rx) = mpsc::channel();
+    let (failed_tx, failed_rx) = mpsc::channel();
+    let (orphan_failed_tx, orphan_failed_rx) = mpsc::channel();
+    let (acked_tx, acked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let accept_until = |deadline: Instant| loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "sender did not connect before deadline"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        };
+        let mut foreground = accept_until(Instant::now() + Duration::from_secs(5));
+        foreground.set_nonblocking(false).unwrap();
+        foreground
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let headers = perform_server_upgrade(&mut foreground).unwrap();
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("Authorization: Bearer bootstrap"))
+        );
+        foreground_tx.send(()).unwrap();
+
+        // No orphan connection is made until the provider has failed once.
+        orphan_failed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let mut orphan = accept_until(Instant::now() + Duration::from_secs(5));
+        orphan.set_nonblocking(false).unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let headers = perform_server_upgrade(&mut orphan).unwrap();
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("Authorization: Bearer recovered"))
+        );
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
+        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        acked_tx.send(payload).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+    });
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=20;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .qwp_ws_token_provider({
+            let calls = Arc::clone(&calls);
+            move || match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok::<String, crate::Error>("bootstrap".to_string()),
+                1 => {
+                    failed_tx.send(()).unwrap();
+                    orphan_failed_tx.send(()).unwrap();
+                    Err(crate::Error::new(
+                        ErrorCode::SocketError,
+                        "transient orphan provider failure",
+                    ))
+                }
+                _ => Ok("recovered".to_string()),
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    foreground_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("foreground upgrade did not complete");
+    failed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("orphan provider was not called");
+    let payload = acked_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("orphan did not reconnect and deliver its queued frame");
+    assert!(
+        qwp_frame_has_tables(&payload),
+        "ACK must cover the data frame"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !slot_has_sfa_file(&orphan_slot) && !orphan_slot.join(".last_error").exists()
+        }),
+        "orphan SFA or its error breadcrumb remains after ACK"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(!orphan_slot.join(".failed").exists());
+    drop(sender);
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
 }
 
 #[test]
@@ -8004,3 +9282,235 @@ fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
         );
     }
 }
+
+/// Simulated OIDC callback state for the in-callback ACK-wait tests: one
+/// "auth" whose callback is either running or not, and a per-thread marker for
+/// the thread it runs on. The provider refuses a token while the callback runs,
+/// as a real OIDC auth refuses an acquisition that would need its callback to
+/// return first.
+struct SimulatedAuthCallback {
+    active: Arc<AtomicBool>,
+}
+
+thread_local! {
+    static IN_SIMULATED_AUTH_CALLBACK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+const SIMULATED_CALLBACK_REFUSAL: &str = "simulated auth callback is running; no token";
+
+impl SimulatedAuthCallback {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn provider(&self) -> crate::token_provider::TokenProvider {
+        let isolation = crate::TokenProviderIsolation::with_callback_guards(
+            {
+                let active = Arc::clone(&self.active);
+                move || active.load(Ordering::SeqCst)
+            },
+            || IN_SIMULATED_AUTH_CALLBACK.with(std::cell::Cell::get),
+        );
+        let active = Arc::clone(&self.active);
+        crate::token_provider::TokenProvider::new_with_isolation(
+            move || {
+                if active.load(Ordering::SeqCst) {
+                    Err(crate::Error::new(
+                        crate::ErrorCode::AuthError,
+                        SIMULATED_CALLBACK_REFUSAL,
+                    ))
+                } else {
+                    Ok::<_, crate::Error>("tok".to_string())
+                }
+            },
+            isolation,
+        )
+    }
+
+    /// Enter the callback on the calling thread.
+    fn enter(&self) {
+        self.active.store(true, Ordering::SeqCst);
+        IN_SIMULATED_AUTH_CALLBACK.with(|c| c.set(true));
+    }
+
+    fn exit(&self) {
+        IN_SIMULATED_AUTH_CALLBACK.with(|c| c.set(false));
+        self.active.store(false, Ordering::SeqCst);
+    }
+}
+
+fn one_row_buffer(sender: &crate::ingress::Sender) -> Buffer {
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    buf
+}
+
+fn fast_reconnect_builder(port: u16) -> SenderBuilder {
+    SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(5))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(10))
+        .unwrap()
+}
+
+/// Accept connections forever: the first reads one frame and drops it unacked,
+/// every later one reads one frame, acks it and parks.
+fn spawn_drop_first_then_ack_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for conn in 0.. {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                if perform_server_upgrade(&mut stream).is_err() || read_frame(&mut stream).is_err()
+                {
+                    return;
+                }
+                if conn == 0 {
+                    return; // unacked: forces a reconnect
+                }
+                let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+                let mut sink = [0u8; 256];
+                while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+            });
+        }
+    });
+    port
+}
+
+fn assert_rejected_promptly(result: crate::Result<()>, started: Instant, label: &str) {
+    let elapsed = started.elapsed();
+    let err = result.expect_err(label);
+    assert!(
+        err.msg().contains(SIMULATED_CALLBACK_REFUSAL),
+        "{label}: expected the provider's refusal, got: {}",
+        err.msg()
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "{label}: the wait spun for {elapsed:?} instead of being rejected"
+    );
+}
+
+#[test]
+fn qwp_ws_manual_progress_wait_inside_auth_callback_is_rejected() {
+    // A manual-progress sender has no traffic gate, so its reconnect pulls the
+    // token on the thread driving progress -- here, an ACK wait made inside
+    // the auth's callback. That pull must be recorded as callback-blocked so
+    // the wait is rejected; otherwise it spins until its timeout (forever with
+    // none) while the callback it runs in waits on it.
+    let auth = SimulatedAuthCallback::new();
+    let port = spawn_drop_first_then_ack_server();
+    let builder = fast_reconnect_builder(port)
+        .qwp_ws_token_provider_object(auth.provider())
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Manual, builder);
+    let mut buf = one_row_buffer(&sender);
+    sender.flush_and_get_fsn(&mut buf).unwrap();
+
+    auth.enter();
+    let started = Instant::now();
+    let result = sender.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10));
+    auth.exit();
+    assert_rejected_promptly(result, started, "in-callback manual wait");
+
+    // The rejected wait kept the frame queued; it drains once the callback
+    // has returned.
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+        .expect("the frame must drain after the callback returns");
+}
+
+#[test]
+fn qwp_ws_in_callback_wait_rejects_only_the_blocked_sibling() {
+    // Two background senders share one provider (as pooled or option-sharing
+    // siblings do). B's reconnect fails inside the callback, so B's in-callback
+    // wait is rejected; A is connected and needs no token, so A's wait must
+    // complete. A's ACK is held back until after A starts waiting, so its wait
+    // loop provably consults the blocked state at least once.
+    let auth = SimulatedAuthCallback::new();
+    let provider = auth.provider();
+
+    let release_a = Arc::new(AtomicBool::new(false));
+    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    thread::spawn({
+        let release_a = Arc::clone(&release_a);
+        move || {
+            let Ok((mut stream, _)) = listener_a.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            if perform_server_upgrade(&mut stream).is_err() || read_frame(&mut stream).is_err() {
+                return;
+            }
+            while !release_a.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+            let mut sink = [0u8; 256];
+            while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+        }
+    });
+    let port_b = spawn_drop_first_then_ack_server();
+
+    let mut a = build_qwp_ws_sender_from_builder(
+        ProgressCase::Background,
+        fast_reconnect_builder(port_a)
+            .qwp_ws_token_provider_object(provider.clone())
+            .unwrap(),
+    );
+    let mut b = build_qwp_ws_sender_from_builder(
+        ProgressCase::Background,
+        fast_reconnect_builder(port_b)
+            .qwp_ws_token_provider_object(provider)
+            .unwrap(),
+    );
+
+    auth.enter();
+    let mut buf_b = one_row_buffer(&b);
+    b.flush_and_get_fsn(&mut buf_b).unwrap();
+    let started = Instant::now();
+    let result_b = b.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10));
+    assert_rejected_promptly(result_b, started, "blocked sibling's in-callback wait");
+
+    let mut buf_a = one_row_buffer(&a);
+    a.flush_and_get_fsn(&mut buf_a).unwrap();
+    let releaser = thread::spawn({
+        let release_a = Arc::clone(&release_a);
+        move || {
+            thread::sleep(Duration::from_millis(200));
+            release_a.store(true, Ordering::SeqCst);
+        }
+    });
+    let result_a = a.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10));
+    auth.exit();
+    releaser.join().unwrap();
+    result_a.expect("a connected sibling's in-callback wait must not be rejected");
+
+    b.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+        .expect("the blocked sibling's frame must drain after the callback returns");
+}
+
+#[cfg(feature = "_oidc")]
+mod closed_provider_sf;
+
+#[cfg(feature = "_oidc")]
+mod oidc_foreground;

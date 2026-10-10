@@ -177,6 +177,7 @@ typedef struct qwp_reader_query qwp_reader_query;
  * `line_sender_utf8` carrying invalid bytes (i.e. one not built via
  * `line_sender_utf8_init`) surfaces as `questdb_error_invalid_utf8`
  * instead of triggering undefined behaviour.
+ * The config string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  *
  * @param[in] config UTF-8 config string.
  * @param[out] err_out Set on error.
@@ -185,6 +186,29 @@ typedef struct qwp_reader_query qwp_reader_query;
 QUESTDB_CLIENT_API
 qwp_reader* qwp_reader_from_conf(
     line_sender_utf8 config, questdb_error** err_out);
+
+/**
+ * Construct a reader whose WebSocket handshake uses `auth` as a rotating
+ * Bearer-token provider. The reader retains shared ownership of the auth state,
+ * so the caller may free its auth handle after this call returns. Provider
+ * calls may load or silently refresh a token but never start an interactive
+ * device flow; call questdb_oidc_auth_sign_in before opening the reader. After
+ * a handshake 401 for a token that had not expired, the one re-resolution a
+ * connect makes refreshes it rather than presenting it again (at most once
+ * every 30 seconds per auth).
+ * Mutually exclusive with static credentials: `config` must not also set
+ * `username`/`password` or `token`. Setting both fails with
+ * `questdb_error_config_error`. An `auth` already closed with
+ * `questdb_oidc_auth_close` is rejected with QUESTDB_OIDC_ERROR_CANCELLED.
+ * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer token
+ * is sent in cleartext and can be captured in transit.
+ * The config string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
+ */
+QUESTDB_CLIENT_API
+qwp_reader* qwp_reader_from_conf_with_oidc(
+    line_sender_utf8 config,
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
 
 /**
  * Construct a reader from the configuration stored in the
@@ -549,7 +573,15 @@ typedef enum qwp_reader_failover_phase
     qwp_reader_failover_phase_reset = 2,
     /** The retry budget is exhausted. The cursor is terminal; the
      *  error returned to the caller is available via
-     *  `qwp_reader_failover_progress_event_final_error_*`. */
+     *  `qwp_reader_failover_progress_event_final_error_*`.
+     *
+     *  When `failover_max_duration_ms` runs out, this final error is
+     *  `questdb_error_socket_error`, unless the last reconnect round ended
+     *  with `questdb_error_role_mismatch` (every endpoint rejected on role),
+     *  `questdb_error_handshake_error` (every endpoint rejected the WebSocket
+     *  upgrade) or `questdb_error_tls_error`: that code is kept. Either way
+     *  its message starts with "failover wall-clock budget exhausted". See
+     *  `qwp_reader_cursor_next_batch` for the error the caller receives. */
     qwp_reader_failover_phase_gave_up = 3,
     /** Sentinel for phases the running FFI build doesn't recognise.
      *  Emitted when the upstream Rust crate adds a new
@@ -1083,6 +1115,19 @@ typedef struct qwp_reader_batch qwp_reader_batch;
  * @return NULL with `*err_out` left untouched when the stream has
  *         terminated normally — no batch is available.
  * @return NULL with `*err_out` set on error; the cursor must be freed.
+ *
+ * When a mid-query failover gives up, `*err_out` is the error that names
+ * what to fix if the reconnect rounds found one, else the error that
+ * started the failover. A reconnect error naming what to fix is one coded
+ * `questdb_error_auth_error`, `questdb_error_role_mismatch`,
+ * `questdb_error_config_error`, `questdb_error_unsupported_server`,
+ * `questdb_error_handshake_error` or `questdb_error_tls_error`, or one
+ * carrying an OIDC payload (`questdb_error_oidc_get_view`). This includes a
+ * give-up caused by `failover_max_duration_ms` running out while attempts
+ * remain: if the last round was rejected on role, at the WebSocket upgrade
+ * or at TLS, that code is returned (message prefixed with "failover
+ * wall-clock budget exhausted"), not the `questdb_error_socket_error` or
+ * `questdb_error_protocol_error` that started the failover.
  */
 QUESTDB_CLIENT_API
 const qwp_reader_batch* qwp_reader_cursor_next_batch(
@@ -1146,7 +1191,15 @@ bool qwp_reader_batch_column_name(
  * borrows from the batch (see the section-level lifetime note).
  *
  * `values` holds the wire's little-endian bytes — the decoder does not
- * byte-swap. A fixed-width slot whose `validity` bit is set still contains
+ * byte-swap — with ONE exception: a `qwp_reader_column_kind_uuid` column is
+ * handed over as canonical RFC-4122 big-endian, because the decoder has
+ * already reversed it out of the wire's (lo LE, hi LE) pair order. LONG256 is
+ * not reversed: it stays little-endian limbs, low limb first. See
+ * `qwp_reader_column_data_get_bytes`, which states the same contract for the
+ * two 16/32-byte kinds. Reading a UUID as if it were still in wire order
+ * yields a byte-reversed value, not an error.
+ *
+ * A fixed-width slot whose `validity` bit is set still contains
  * a value (QuestDB's NULL sentinel); consult `validity` first.
  */
 typedef struct qwp_reader_column_data

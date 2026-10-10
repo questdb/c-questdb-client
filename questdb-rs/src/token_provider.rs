@@ -1,0 +1,1946 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+//! A caller-supplied source of a fresh Bearer token, pulled on each (re)connect,
+//! for the QWP/WebSocket ingress sender and the egress reader (the ILP/HTTP
+//! sender has its own per-request provider in `ingress::sender::http`).
+//!
+//! Wire `OidcDeviceAuth::token` here so a
+//! long-lived client keeps working as the OIDC token silently rotates.
+
+use std::sync::Arc;
+#[cfg(feature = "_sender-qwp-ws")]
+use std::sync::atomic::AtomicBool;
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+use std::time::Duration;
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+const ISOLATED_PROVIDER_POLL: Duration = Duration::from_millis(5);
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+const MAX_ISOLATED_PROVIDER_WORKERS: usize = 16;
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+static ISOLATED_PROVIDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// How long a provider waits for a worker permit while every permit is held.
+///
+/// Permits are held for the duration of a provider call, so the cap fills when
+/// more than [`MAX_ISOLATED_PROVIDER_WORKERS`] distinct providers are inside a
+/// slow call at once -- typically many senders reconnecting while their OIDC
+/// refresh is in flight. Failing a healthy provider immediately there reported
+/// a spurious `credential_unavailable` for a credential that was obtainable
+/// moments later. Waiting out an ordinary slow call instead matches the OIDC
+/// client's default HTTP timeout; past it, the busy error is reported.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+const ISOLATED_PERMIT_WAIT: Duration = Duration::from_secs(30);
+
+/// The result of one isolated acquisition, shared by every caller that joined
+/// it.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+#[derive(Default)]
+struct IsolatedResult {
+    done: std::sync::Mutex<IsolatedOutcome>,
+    ready: std::sync::Condvar,
+}
+
+/// What the callers that joined an isolated acquisition receive.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+#[derive(Default)]
+enum IsolatedOutcome {
+    #[default]
+    Pending,
+    /// The acquisition's result, shared by every caller that joined it.
+    Done(crate::Result<String>),
+    /// The lead gave up before starting a worker, for a reason of its own:
+    /// its transport shut down. Joiners do not share that reason -- they may
+    /// belong to another transport attached to the same provider -- so each
+    /// starts over, leading a fresh acquisition or joining another one.
+    Abandoned,
+}
+
+/// Single-flight state for one provider's isolated acquisitions.
+///
+/// Shared by every clone of a [`TokenProvider`], so the repeated reconnect
+/// attempts of one transport coalesce onto one worker instead of each taking
+/// its own slice of the process-global worker budget.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+struct IsolatedAcquisition {
+    current: std::sync::Mutex<Option<Arc<IsolatedResult>>>,
+    /// The worker budget permits are drawn from: always the process-wide one,
+    /// except in tests that must fill a budget without starving their peers.
+    workers: &'static AtomicUsize,
+    /// How long a lead waits for a permit: always [`ISOLATED_PERMIT_WAIT`],
+    /// except in tests that must reach the busy exit without waiting it out.
+    permit_wait: Duration,
+}
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+impl Default for IsolatedAcquisition {
+    fn default() -> Self {
+        Self {
+            current: std::sync::Mutex::default(),
+            workers: &ISOLATED_PROVIDER_WORKERS,
+            permit_wait: ISOLATED_PERMIT_WAIT,
+        }
+    }
+}
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+#[derive(Debug)]
+struct IsolatedProviderPermit<'a>(&'a AtomicUsize);
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+impl<'a> IsolatedProviderPermit<'a> {
+    fn acquire(counter: &'a AtomicUsize, limit: usize) -> crate::Result<Self> {
+        // Hand-rolled CAS loop rather than `fetch_update`, which is deprecated
+        // on newer toolchains while its replacement (`try_update`) is
+        // unavailable on the crate's MSRV.
+        let mut active = counter.load(Ordering::Acquire);
+        while active < limit {
+            match counter.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self(counter)),
+                Err(actual) => active = actual,
+            }
+        }
+        Err(Self::busy_error(limit))
+    }
+
+    fn busy_error(limit: usize) -> crate::Error {
+        crate::error::fmt!(
+            SocketError,
+            "The isolated token-provider worker limit ({limit}) is busy; retry later"
+        )
+    }
+
+    /// [`Self::acquire`], waiting up to `max_wait` for a permit to free up.
+    ///
+    /// Returns `Ok(None)` when `interrupted` becomes true first, so the caller
+    /// can report its own reason (shutdown, or a callback that became active).
+    fn acquire_waiting(
+        counter: &'a AtomicUsize,
+        limit: usize,
+        max_wait: Duration,
+        interrupted: impl Fn() -> bool,
+    ) -> crate::Result<Option<Self>> {
+        let deadline = std::time::Instant::now() + max_wait;
+        loop {
+            if let Ok(permit) = Self::acquire(counter, limit) {
+                return Ok(Some(permit));
+            }
+            if interrupted() {
+                return Ok(None);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(Self::busy_error(limit));
+            }
+            std::thread::sleep(ISOLATED_PROVIDER_POLL.min(deadline - now));
+        }
+    }
+}
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+impl Drop for IsolatedProviderPermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+thread_local! {
+    static NONBLOCKING_TOKEN_PULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `pull` with the calling thread marked as making a token pull that must
+/// not block on the provider's acquisition lock. See
+/// [`token_pull_must_not_block`].
+#[doc(hidden)]
+pub fn with_nonblocking_token_pull<R>(pull: impl FnOnce() -> R) -> R {
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    {
+        struct Restore(Option<bool>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(previous) = self.0 {
+                    let _ = NONBLOCKING_TOKEN_PULL.try_with(|flag| flag.set(previous));
+                }
+            }
+        }
+        let _restore = Restore(
+            NONBLOCKING_TOKEN_PULL
+                .try_with(|flag| flag.replace(true))
+                .ok(),
+        );
+        pull()
+    }
+    #[cfg(not(any(feature = "_sender-qwp-ws", feature = "_egress")))]
+    pull()
+}
+
+/// Whether the provider closure now running was invoked by a transport that
+/// observed one of the auth's callbacks running and pulls on its own thread,
+/// where a blocking acquisition cannot be interrupted by the transport's
+/// shutdown. A binding's provider must then serve a valid cached token or fail
+/// with a retryable "busy" error instead of waiting for its acquisition lock,
+/// even if the callback has returned in the meantime.
+#[doc(hidden)]
+pub fn token_pull_must_not_block() -> bool {
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    {
+        NONBLOCKING_TOKEN_PULL
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(feature = "_sender-qwp-ws", feature = "_egress")))]
+    false
+}
+
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+thread_local! {
+    /// The token a server has just rejected with HTTP 401, while the transport
+    /// that presented it pulls a replacement. See [`with_rejected_credential`].
+    static REJECTED_TOKEN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `pull` -- a transport re-resolving its credential after a server
+/// answered HTTP 401 -- with the calling thread marked as replacing
+/// `rejected`, the `Authorization` value it had presented (`Bearer <token>`).
+///
+/// A provider is a plain closure, so this is how the rejection reaches an
+/// [`OidcDeviceAuth`](crate::oidc::OidcDeviceAuth) the closure calls: its
+/// cache stops serving that token and it refreshes instead (see
+/// `OidcDeviceAuth::token`). Without it the re-resolution was answered from
+/// the same cache, every 401 for a token the client still considered valid
+/// stood, and the client kept presenting the rejected token until it neared
+/// expiry. Isolated acquisitions carry the mark to their worker thread.
+/// A provider that never consults it is unaffected.
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+pub(crate) fn with_rejected_credential<R>(rejected: Option<&str>, pull: impl FnOnce() -> R) -> R {
+    let token = rejected
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    with_rejected_token(token, pull)
+}
+
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+fn with_rejected_token<R>(token: Option<String>, pull: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                let _ = REJECTED_TOKEN.try_with(|cell| *cell.borrow_mut() = previous);
+            }
+        }
+    }
+    let _restore = Restore(REJECTED_TOKEN.try_with(|cell| cell.replace(token)).ok());
+    pull()
+}
+
+/// The token a server rejected, if the calling thread is pulling its
+/// replacement (see [`with_rejected_credential`]).
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+fn rejected_token() -> Option<String> {
+    REJECTED_TOKEN
+        .try_with(|cell| cell.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Call `inspect` with the token a server rejected, if the calling thread is
+/// pulling its replacement (see [`with_rejected_credential`]).
+#[cfg(feature = "_oidc")]
+pub(crate) fn inspect_rejected_token<R>(inspect: impl FnOnce(Option<&str>) -> R) -> R {
+    let mut inspect = Some(inspect);
+    let seen = REJECTED_TOKEN.try_with(|cell| {
+        let inspect = inspect.take().expect("inspect runs once");
+        inspect(cell.borrow().as_deref())
+    });
+    match seen {
+        Ok(result) => result,
+        // The thread is shutting down: no rejection to report.
+        Err(_) => (inspect.take().expect("inspect runs once"))(None),
+    }
+}
+
+/// User-facing text for "a rotating token provider and static credentials were
+/// both configured".
+///
+/// Phrased in terms of the public surfaces rather than the internal builder
+/// field. `http_token_provider`, `qwp_ws_token_provider` and `token_provider`
+/// appear in no C or C++ header, so a caller who arrived here through
+/// `line_sender_opts_oidc_auth`, `questdb_db_connect_options.oidc_auth`,
+/// `qwp_reader_from_conf_with_oidc` or Python's `oidc_auth=` was told to go
+/// looking for a symbol that does not exist on their surface.
+pub(crate) const PROVIDER_CONFLICTS_WITH_STATIC_AUTH: &str = "A rotating token provider is mutually exclusive with the static \
+     username/password and token authentication. Configure exactly one: an OIDC \
+     or token provider (Python `oidc_auth=`; C/C++ `line_sender_opts_oidc_auth`, \
+     `questdb_db_connect_options.oidc_auth` or `qwp_reader_from_conf_with_oidc`; \
+     Rust `SenderBuilder::http_token_provider` / `qwp_ws_token_provider` or \
+     `ReaderConfig::token_provider`), or the `username` / `password` / `token` \
+     settings.";
+
+/// The boxed provider closure. Returns a fresh token (the raw token, *not* the
+/// `Bearer` header) or an error that fails the connection attempt.
+pub(crate) type TokenProviderFn = Arc<dyn Fn() -> crate::Result<String> + Send + Sync>;
+
+/// Shared single-flight identity for isolated QWP token acquisition.
+///
+/// This is exposed only so language bindings can attach one authentication
+/// object to multiple senders/readers without letting each attachment consume
+/// a separate process-global worker when its synchronous provider blocks.
+/// Ordinary Rust callers should use the public builder methods, which create an
+/// independent identity for each provider closure.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct TokenProviderIsolation {
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    isolated: Arc<IsolatedAcquisition>,
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    callback_guard: Option<CallbackGuard>,
+}
+
+/// How an isolated transport observes its shared auth's callbacks.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+#[derive(Clone)]
+struct CallbackGuard {
+    /// A callback for the auth is running on some thread.
+    active: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// The calling thread is itself inside one of the auth's callbacks. Only
+    /// QWP ACK waits consult it.
+    #[cfg_attr(not(feature = "_sender-qwp-ws"), allow(dead_code))]
+    on_this_thread: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl TokenProviderIsolation {
+    /// Tell isolated transports when their shared auth is inside a callback,
+    /// and whether the calling thread is the one running it.
+    ///
+    /// The closures must not retain the auth's isolation state (which would
+    /// create a reference cycle); capture only its callback targets.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    #[doc(hidden)]
+    pub fn with_callback_guards(
+        active: impl Fn() -> bool + Send + Sync + 'static,
+        on_this_thread: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            isolated: Arc::new(IsolatedAcquisition::default()),
+            callback_guard: Some(CallbackGuard {
+                active: Arc::new(active),
+                on_this_thread: Arc::new(on_this_thread),
+            }),
+        }
+    }
+
+    /// An identity drawing its worker permits from `workers` instead of the
+    /// process-wide budget, so a test can fill it in isolation.
+    #[cfg(all(test, any(feature = "_sender-qwp-ws", feature = "_egress")))]
+    fn with_worker_budget(workers: &'static AtomicUsize) -> Self {
+        Self::with_worker_budget_and_permit_wait(workers, ISOLATED_PERMIT_WAIT, None)
+    }
+
+    /// [`Self::with_worker_budget`] with a shorter permit wait and, optionally,
+    /// a callback guard reporting whether a callback is active.
+    #[cfg(all(test, any(feature = "_sender-qwp-ws", feature = "_egress")))]
+    fn with_worker_budget_and_permit_wait(
+        workers: &'static AtomicUsize,
+        permit_wait: Duration,
+        callback_active: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Self {
+        Self {
+            isolated: Arc::new(IsolatedAcquisition {
+                current: std::sync::Mutex::default(),
+                workers,
+                permit_wait,
+            }),
+            callback_guard: callback_active.map(|active| CallbackGuard {
+                active,
+                on_this_thread: Arc::new(|| false),
+            }),
+        }
+    }
+}
+
+/// A cloneable, thread-safe token provider whose [`Debug`] never renders the
+/// closure (or any captured token).
+#[derive(Clone)]
+pub(crate) struct TokenProvider {
+    provide: TokenProviderFn,
+    /// Shared by every clone so one provider never holds more than one
+    /// isolated worker. See [`IsolatedAcquisition`].
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    isolated: Arc<IsolatedAcquisition>,
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    callback_guard: Option<CallbackGuard>,
+    /// Set when this attachment's token pull failed while an auth callback
+    /// was running, i.e. its reconnect cannot complete until the callback
+    /// returns. Shared by the clones of one attachment (a sender's state and
+    /// its I/O runner) but not across attachments: see
+    /// [`Self::for_attachment`]. A healthy, connected sender must not have its
+    /// otherwise-ackable wait rejected because a different sender failed to
+    /// refresh the same provider.
+    #[cfg(feature = "_sender-qwp-ws")]
+    callback_blocked: Arc<AtomicBool>,
+}
+
+impl TokenProvider {
+    /// Wrap a caller closure, mapping its error into the crate error type.
+    pub(crate) fn new<F, E>(provider: F) -> Self
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        Self::new_with_isolation(provider, TokenProviderIsolation::default())
+    }
+
+    pub(crate) fn new_with_isolation<F, E>(provider: F, isolation: TokenProviderIsolation) -> Self
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        // Only the QWP/WebSocket and egress transports isolate acquisitions.
+        #[cfg(not(any(feature = "_sender-qwp-ws", feature = "_egress")))]
+        let _ = isolation;
+        TokenProvider {
+            provide: Arc::new(move || provider().map_err(Into::into)),
+            #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+            isolated: isolation.isolated,
+            #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+            callback_guard: isolation.callback_guard,
+            #[cfg(feature = "_sender-qwp-ws")]
+            callback_blocked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A clone for one transport attachment (one sender): it shares the
+    /// provider closure and single-flight acquisition, but tracks its own
+    /// callback-blocked state. Senders cloned from one pool or one options
+    /// object must not see each other's failed reconnects.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn for_attachment(&self) -> Self {
+        Self {
+            callback_blocked: Arc::new(AtomicBool::new(false)),
+            ..self.clone()
+        }
+    }
+
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn callback_is_active(&self) -> bool {
+        self.callback_guard
+            .as_ref()
+            .is_some_and(|guard| (guard.active)())
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn callback_on_this_thread(&self) -> bool {
+        self.callback_guard
+            .as_ref()
+            .is_some_and(|guard| (guard.on_this_thread)())
+    }
+
+    /// Reject an ACK wait that can never complete: the waiting thread is
+    /// inside one of this auth's callbacks, and this sender's reconnect needs
+    /// a token that the auth cannot supply until that same callback returns.
+    /// That holds whether the callback was raised by this sender's own token
+    /// worker or by a peer's.
+    ///
+    /// A wait on any other thread keeps waiting: the callback will return, and
+    /// the reconnect then completes. A connected sender's wait is unaffected,
+    /// because it needs no token. The provider's own cached-token/re-entry
+    /// check supplies the error, so a valid cache still lets the wait proceed
+    /// and the structured, retryable OIDC error is preserved.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn callback_wait_error(&self) -> Option<crate::Error> {
+        if !self.callback_is_active() {
+            self.callback_blocked.store(false, Ordering::Release);
+            return None;
+        }
+        if self.callback_on_this_thread() && self.callback_blocked.load(Ordering::Acquire) {
+            self.bearer_header().err()
+        } else {
+            None
+        }
+    }
+
+    /// Pull a token on the calling thread, as a transport without a traffic
+    /// gate (manual progress) does, while recording whether the pull failed
+    /// during one of the auth's callbacks. Without that record an ACK wait
+    /// made inside the callback -- which drives this very reconnect on the
+    /// callback thread -- could never be rejected, and would spin until its
+    /// timeout (forever with none) while the callback it runs in waits on it.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn bearer_header_on_caller(&self) -> crate::Result<String> {
+        if self.callback_is_active() {
+            return self.resolve_during_callback();
+        }
+        self.callback_blocked.store(false, Ordering::Release);
+        self.bearer_header()
+    }
+
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn resolve_during_callback(&self) -> crate::Result<String> {
+        // This pull runs on the transport's own thread, outside the isolated
+        // worker, so nothing can interrupt it if it blocks: a transport
+        // shutdown is observed only between pulls. The binding's own
+        // callback check serves a valid cache or fails fast, but the callback
+        // seen above may already have returned by the time the binding looks,
+        // and the pull would then wait for the acquisition lock (up to the
+        // auth's bounded acquisition wait). Tell the binding that this pull
+        // must not block, whatever its own check now sees.
+        let result = with_nonblocking_token_pull(|| self.bearer_header());
+        #[cfg(feature = "_sender-qwp-ws")]
+        self.callback_blocked
+            .store(result.is_err(), Ordering::Release);
+        result
+    }
+
+    /// Pull the raw token without transport classification. Used when one
+    /// provider instance is shared across independently configured sender and
+    /// reader connection factories; each transport applies its own validation
+    /// and retry classification when it formats the Bearer header.
+    pub(crate) fn provide(&self) -> crate::Result<String> {
+        (self.provide)()
+    }
+
+    /// Pull a token and format it as a validated `Authorization: Bearer` value.
+    ///
+    /// A control / non-ASCII byte (a decoded CR/LF is a header-injection vector)
+    /// or a blank value is rejected — the token never reaches the wire. Mirrors
+    /// the ILP/HTTP `HttpAuth::resolve` gate and the device flow's `safe_token`.
+    ///
+    /// Provider acquisition and validation failures are normally retryable: the
+    /// callback can return a different token on its next invocation, and a QWP
+    /// store-and-forward sender must not abandon accepted frames because one
+    /// refresh attempt failed. A caller contract violation (`InvalidApiCall`)
+    /// stays terminal but is carried out as `ConfigError`, so the bare code --
+    /// which the connection pool also uses for ordinary exhaustion -- is not
+    /// dragged into the terminal set with it. Server authentication rejections
+    /// remain separate terminal `AuthError`s because they occur after this
+    /// method succeeds.
+    ///
+    /// # Known residual: the credential is not scrubbed past this point
+    ///
+    /// `oidc` zeroizes its own copies (`TokenSet`, `PersistedToken`, the store
+    /// buffers, the `Zeroizing<String>` the FFI hands out), but the token this
+    /// method receives from the provider closure, and the `Bearer …` value it
+    /// returns, are ordinary `String`s dropped unwiped -- once per flush, and
+    /// again per 401 rotation. Accepted deliberately rather than overlooked:
+    ///
+    /// * `TokenProvider` is transport-generic and compiles without the `_oidc`
+    ///   feature, which is what gates the `zeroize` dependency, so `Zeroizing`
+    ///   is not available on this path without cfg-splitting every signature.
+    /// * The value is copied onward into buffers this crate does not own --
+    ///   ureq's request headers, the WebSocket upgrade request, and the
+    ///   `Vec<(&str, String)>` header lists the egress reader builds -- so
+    ///   scrubbing here would narrow the exposure without removing it.
+    ///
+    /// The same applies to `oidc::http::post_form`, whose `form` slice carries
+    /// the refresh token and device code into a URL-encoded body that ureq
+    /// allocates internally.
+    pub(crate) fn bearer_header(&self) -> crate::Result<String> {
+        // Only reachable in an UNWIND-enabled build. `questdb-rs-ffi` sets
+        // `panic = "abort"` in both profiles, and a Cargo profile is chosen by
+        // the top-level artifact, so in the shipped cdylib -- and therefore in
+        // the C, C++ and Python clients -- a panic here aborts the process and
+        // this guard never runs. Kept for `questdb-rs` used directly as a
+        // library, where a caller's closure panicking should not take the
+        // sender down with it. Mirrors the qualification on
+        // `run_qwp_ws_worker_guarded`.
+        let provided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.provide()))
+            .map_err(|_| {
+                crate::error::fmt!(
+                    SocketError,
+                    "The token provider panicked while acquiring a Bearer token; \
+                     it will be polled again on the next connection attempt. \
+                     (Unwind-enabled builds only: under `panic = \"abort\"` the \
+                     panic terminates the process instead.)"
+                )
+            })?;
+        let token = provided.map_err(classify_provider_error)?;
+        if !crate::is_printable_ascii_token(&token) {
+            return Err(crate::error::fmt!(
+                SocketError,
+                "The token provider returned an empty token or one containing a \
+                 non-printable-ASCII character; refusing to send it as a Bearer header. \
+                 The provider will be polled again on the next connection attempt."
+            ));
+        }
+        Ok(format!("Bearer {token}"))
+    }
+
+    /// Run acquisition on an isolated thread while the caller waits
+    /// cancellation-aware for its result.
+    ///
+    /// A synchronous caller-supplied closure cannot be forcibly cancelled.
+    /// Once `cancelled` becomes true this method abandons its wait; the
+    /// provider invocation may finish later, but it retains only this provider
+    /// clone rather than the transport runner or its durable queue.
+    ///
+    /// Acquisitions for one provider are single-flight: a caller arriving while
+    /// a worker is already running joins it instead of starting another. The
+    /// permit is therefore held per provider, not per call. Without that, a
+    /// reconnect loop behind one blocked callback took a fresh permit on every
+    /// attempt until it held all of them, and an unrelated healthy provider --
+    /// which would have returned a token immediately -- was refused one and
+    /// failed its own connect before dialling an endpoint.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    pub(crate) fn bearer_header_isolated_until(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> crate::Result<String> {
+        let rejected = rejected_token();
+        let mut restarted_after_rejection = false;
+        loop {
+            let Some(result) = self.bearer_header_isolated_attempt(&cancelled) else {
+                continue;
+            };
+            // Re-resolving after a 401, this caller may have joined an
+            // acquisition that started before the rejection and so hands back
+            // the rejected token. Lead one fresh acquisition, which carries the
+            // rejection to its worker; if the provider still answers with the
+            // same token, that is its answer.
+            if !restarted_after_rejection
+                && let (Some(rejected), Ok(header)) = (rejected.as_deref(), &result)
+                && header.strip_prefix("Bearer ") == Some(rejected)
+            {
+                restarted_after_rejection = true;
+                continue;
+            }
+            return result;
+        }
+    }
+
+    /// One pass of [`Self::bearer_header_isolated_until`]: `None` when the
+    /// joined acquisition was abandoned by its lead and must be started over.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn bearer_header_isolated_attempt(
+        &self,
+        cancelled: &impl Fn() -> bool,
+    ) -> Option<crate::Result<String>> {
+        if cancelled() {
+            return Some(Err(provider_shutdown_error()));
+        }
+        // The provider's callback may be waiting for this caller. Go straight
+        // to the closure instead of joining its in-flight worker: OIDC serves
+        // a valid cache or rejects a lock-taking token pull immediately.
+        if self.callback_is_active() {
+            return Some(self.resolve_during_callback());
+        }
+        #[cfg(feature = "_sender-qwp-ws")]
+        self.callback_blocked.store(false, Ordering::Release);
+
+        let (slot, lead) = {
+            let mut current = self
+                .isolated
+                .current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match current.as_ref() {
+                Some(existing) => (Arc::clone(existing), false),
+                None => {
+                    let fresh = Arc::new(IsolatedResult::default());
+                    *current = Some(Arc::clone(&fresh));
+                    (fresh, true)
+                }
+            }
+        };
+        if lead {
+            // Wait for a worker permit rather than failing at once while the
+            // process-wide cap is full: see `ISOLATED_PERMIT_WAIT`. Every exit
+            // without a worker retires `slot`, so a caller that joined it is
+            // never left waiting on a worker that will not run.
+            let permit = IsolatedProviderPermit::acquire_waiting(
+                self.isolated.workers,
+                MAX_ISOLATED_PROVIDER_WORKERS,
+                self.isolated.permit_wait,
+                || cancelled() || self.callback_is_active(),
+            );
+            match permit {
+                Ok(Some(permit)) => {
+                    if let Err(err) = self.spawn_isolated_worker(&slot, permit) {
+                        return Some(Err(err));
+                    }
+                }
+                Ok(None) if cancelled() => {
+                    // This caller's transport is shutting down. That is no
+                    // reason for a joiner from another transport to fail, so
+                    // hand the acquisition back rather than this error.
+                    self.retire_isolated(&slot, IsolatedOutcome::Abandoned);
+                    return Some(Err(provider_shutdown_error()));
+                }
+                Ok(None) => {
+                    // A callback became active while we waited: resolve on
+                    // this thread as the callback-active path above does.
+                    let result = self.resolve_during_callback();
+                    self.publish_isolated(&slot, result.clone());
+                    return Some(result);
+                }
+                Err(err) => {
+                    self.publish_isolated(&slot, Err(err.clone()));
+                    return Some(Err(err));
+                }
+            }
+        }
+
+        let mut done = slot
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match &*done {
+                IsolatedOutcome::Done(result) => return Some(result.clone()),
+                IsolatedOutcome::Abandoned => return None,
+                IsolatedOutcome::Pending => {}
+            }
+            if self.callback_is_active() {
+                drop(done);
+                return Some(self.resolve_during_callback());
+            }
+            let (guard, wait) = slot
+                .ready
+                .wait_timeout(done, ISOLATED_PROVIDER_POLL)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            done = guard;
+            if matches!(*done, IsolatedOutcome::Pending) && wait.timed_out() && cancelled() {
+                return Some(Err(provider_shutdown_error()));
+            }
+        }
+    }
+
+    /// Start the single in-flight acquisition for this provider on `permit`.
+    /// A spawn failure is published to `slot` as well as returned, so a caller
+    /// that joined it is never left waiting on a worker that will not run.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn spawn_isolated_worker(
+        &self,
+        slot: &Arc<IsolatedResult>,
+        permit: IsolatedProviderPermit<'static>,
+    ) -> crate::Result<()> {
+        // A blocked synchronous callback cannot be killed, but it must not
+        // permit repeated sender teardown to grow process-global thread count
+        // without bound. The permit lives on the worker and is released on
+        // normal return, unwind-enabled panic, or spawn failure.
+        let provider = self.clone();
+        let published = Arc::clone(slot);
+        // A pull that replaces a rejected credential must say so on the
+        // worker's thread too: that is where the provider runs.
+        let rejected = rejected_token();
+        if let Err(err) = std::thread::Builder::new()
+            .name("questdb-token-provider".to_string())
+            .spawn(move || {
+                let _permit = permit;
+                let result = with_rejected_token(rejected, || provider.bearer_header());
+                provider.publish_isolated(&published, result);
+            })
+        {
+            let err = crate::error::fmt!(
+                SocketError,
+                "Could not start the isolated token-provider worker: {err}"
+            );
+            self.publish_isolated(slot, Err(err.clone()));
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Publish `result` to everyone waiting on the in-flight slot.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn publish_isolated(&self, slot: &Arc<IsolatedResult>, result: crate::Result<String>) {
+        self.retire_isolated(slot, IsolatedOutcome::Done(result));
+    }
+
+    /// Retire the in-flight slot and wake everyone waiting on it.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn retire_isolated(&self, slot: &Arc<IsolatedResult>, outcome: IsolatedOutcome) {
+        // Clear the slot before publishing so the next acquisition starts a
+        // fresh worker rather than joining -- and re-reading the result of --
+        // one that has already finished. Compare by identity: a slot retired
+        // earlier must not clear its successor.
+        {
+            let mut current = self
+                .isolated
+                .current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current
+                .as_ref()
+                .is_some_and(|existing| Arc::ptr_eq(existing, slot))
+            {
+                *current = None;
+            }
+        }
+        let mut done = slot
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*done, IsolatedOutcome::Pending) {
+            *done = outcome;
+        }
+        slot.ready.notify_all();
+    }
+}
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+const PROVIDER_SHUTDOWN_MSG: &str =
+    "Token-provider acquisition was abandoned because the transport is shutting down";
+
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+fn provider_shutdown_error() -> crate::Error {
+    crate::Error::new(crate::ErrorCode::SocketError, PROVIDER_SHUTDOWN_MSG)
+}
+
+/// Whether `err` is the error [`TokenProvider::bearer_header_isolated_until`]
+/// returns when its cancellation predicate fired before the provider answered.
+/// It says nothing about the provider or the server, so a caller that
+/// cancelled on a deadline can prefer the diagnostic it already holds.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+pub(crate) fn is_provider_shutdown_error(err: &crate::Error) -> bool {
+    err.code() == crate::ErrorCode::SocketError && err.msg() == PROVIDER_SHUTDOWN_MSG
+}
+
+/// Classify a token-provider acquisition error separately from a server
+/// authentication rejection. The provider is caller-controlled and may recover
+/// on its next invocation, so every such failure is retryable. This is especially
+/// important for QWP store-and-forward: a provider failure must retain and keep
+/// draining already-accepted frames rather than terminalizing the publication
+/// store. An actual server rejection is produced later by the handshake path as
+/// a terminal [`AuthError`](crate::ErrorCode::AuthError).
+///
+/// The exceptions are the failures for which "may recover on its next
+/// invocation" is false, which must stay terminal: a caller contract violation
+/// (`InvalidApiCall`, re-carried as `ConfigError`), a permanently closed
+/// provider (`close()` is monotonic, so `token()` returns `Cancelled` for the
+/// rest of the process) and a misconfiguration (`Config` — the configured scope
+/// cannot yield the required token kind, and no call inside this process
+/// changes that). Marking either retryable puts the reconnect loop on state
+/// that can never recover, and because
+/// `RetryState::next_after_retryable_terminal` starts a fresh budget each round
+/// the loop never ends and never surfaces the real cause.
+///
+/// `InteractionRequired` deliberately stays **retryable**: a lapsed credential
+/// is recoverable — a `sign_in()` on another thread clears it — and marking it
+/// terminal would stop the store-and-forward drainer on a condition a human can
+/// fix, abandoning queued frames. It is reported through the connection-event
+/// stream instead (see `ConnectionEvents::token_provider_failed`), so the
+/// retrying is visible rather than silent. Only a connect the caller waits for
+/// treats a non-busy `InteractionRequired` as final, through
+/// `reconnect_error_is_foreground_terminal`.
+fn classify_provider_error(e: crate::Error) -> crate::Error {
+    if e.code() == crate::ErrorCode::InvalidApiCall {
+        // Keep it terminal, but carry it as `ConfigError` rather than leaving
+        // `InvalidApiCall` for `reconnect_error_is_terminal` to match on.
+        // `InvalidApiCall` is not a provider-private code: the connection pool
+        // raises it for ordinary exhaustion ("Connection pool exhausted: N
+        // sender(s) in use at the sender_pool_max cap"), which is transient
+        // contention that resolves when a peer returns its handle. Adding the
+        // bare code to the terminal set therefore stopped
+        // `borrow_sender_owned_with_retry` and `reborrow_with_retry` retrying
+        // it at all -- they now returned on the first `acquire_timeout`
+        // expiry. `ConfigError` is already in that set, so a genuine provider
+        // contract violation stays terminal without the collateral. Preserve
+        // that classification independently of the message: a 401 adds
+        // endpoint context before an orphan drainer examines the error.
+        let msg = format!("{PROVIDER_FAILED_PREFIX}{}", e.msg());
+        let err = e.reclassified(crate::ErrorCode::ConfigError, msg);
+        #[cfg(feature = "_sender-qwp-ws")]
+        let err = err.with_terminal_token_provider_failure();
+        return err;
+    }
+    if is_terminal_oidc_provider_error(&e) {
+        return e;
+    }
+    if e.code() == crate::ErrorCode::SocketError {
+        e
+    } else {
+        let msg = format!("{PROVIDER_FAILED_PREFIX}{}", e.msg());
+        e.reclassified(crate::ErrorCode::SocketError, msg)
+    }
+}
+
+/// Message prefix [`classify_provider_error`] puts on a re-coded provider error.
+const PROVIDER_FAILED_PREFIX: &str = "Token provider failed: ";
+
+/// Whether `e` is a token-provider failure no later invocation can resolve:
+/// a terminal OIDC failure ([`is_terminal_oidc_provider_error`]) or a provider
+/// that returned `InvalidApiCall`, which [`classify_provider_error`] carries as
+/// a terminal `ConfigError`. A background loop that pulls a token (an orphan
+/// drainer) must stop on these exactly as the foreground reconnect loop does.
+/// Do not infer this from the message: a rejected handshake can wrap it with
+/// HTTP 401 and endpoint context without changing the provider's failure.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) fn is_terminal_provider_error(e: &crate::Error) -> bool {
+    is_terminal_oidc_provider_error(e) || e.is_terminal_token_provider_failure()
+}
+
+/// Whether `e` is an OIDC provider failure that no later invocation can
+/// resolve: a closed provider (`close()` is monotonic) or a misconfiguration.
+/// [`classify_provider_error`] keeps these terminal, and every reconnect loop
+/// that pulls a token -- including background orphan drainers -- must stop on
+/// them rather than retry.
+pub(crate) fn is_terminal_oidc_provider_error(e: &crate::Error) -> bool {
+    #[cfg(feature = "_oidc")]
+    {
+        e.oidc_error().is_some_and(|oidc| {
+            matches!(
+                oidc.kind(),
+                // `close()` is monotonic: `token()` returns this for the rest
+                // of the process.
+                crate::oidc::OidcErrorKind::Cancelled
+                    // A misconfiguration is fixed at build time, so `token()`
+                    // cannot resolve it either: `select()` raises this when the
+                    // configured scope cannot yield the required token kind (no
+                    // `id_token` in groups mode, or no `access_token`), and it
+                    // recurs identically on every invocation. Retrying it
+                    // forever is the same trap the `Cancelled` carve-out exists
+                    // to avoid, and unlike an expired credential no human action
+                    // inside this process can clear it.
+                    | crate::oidc::OidcErrorKind::Config
+            )
+        })
+    }
+    #[cfg(not(feature = "_oidc"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+impl std::fmt::Debug for TokenProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenProvider { .. }")
+    }
+}
+
+// `ReaderConfig` and `SenderBuilder` were `UnwindSafe` and `RefUnwindSafe`
+// before they could hold a provider; the `dyn Fn` closures inside one would
+// otherwise remove both auto traits from those public types, breaking callers
+// that keep a config across `catch_unwind`. Asserting them here is sound: a
+// provider is an opaque callable, and the state it shares across a call (the
+// single-flight cell and the blocked flag) lives behind mutexes and atomics,
+// which tolerate a panic mid-call. A panic inside the caller's own closure
+// leaves only that closure's captures in question, exactly as for any closure
+// a caller hands across an unwind boundary.
+impl std::panic::UnwindSafe for TokenProvider {}
+impl std::panic::RefUnwindSafe for TokenProvider {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+    #[test]
+    fn provider_holders_stay_unwind_safe() {
+        assert_unwind_safe::<TokenProvider>();
+        #[cfg(feature = "_egress")]
+        assert_unwind_safe::<crate::egress::ReaderConfig>();
+        // A QWP/WS connection listener (`Arc<dyn Fn>`) already made the
+        // builder non-unwind-safe before providers existed.
+        #[cfg(all(feature = "_sync-sender", not(feature = "_sender-qwp-ws")))]
+        assert_unwind_safe::<crate::ingress::SenderBuilder>();
+    }
+
+    #[test]
+    fn bearer_header_formats_and_validates() {
+        let ok = TokenProvider::new(|| Ok::<_, crate::Error>("tok-123".to_string()));
+        assert_eq!(ok.bearer_header().unwrap(), "Bearer tok-123");
+
+        // Blank / all-whitespace is rejected.
+        let blank = TokenProvider::new(|| Ok::<_, crate::Error>("   ".to_string()));
+        assert!(blank.bearer_header().is_err());
+
+        // A CR/LF (header-injection vector) is rejected.
+        let injected = TokenProvider::new(|| Ok::<_, crate::Error>("bad\r\ntoken".to_string()));
+        assert!(injected.bearer_header().is_err());
+
+        // A provider error propagates.
+        let failing =
+            TokenProvider::new(|| Err::<String, _>(crate::error::fmt!(AuthError, "no token")));
+        assert!(failing.bearer_header().is_err());
+    }
+
+    #[test]
+    fn provider_failures_are_retryable_across_connection_attempts() {
+        use crate::ErrorCode;
+        // A SocketError is preserved, including its original diagnostic.
+        let transient = TokenProvider::new(|| {
+            Err::<String, _>(crate::Error::new(ErrorCode::SocketError, "network blip"))
+        });
+        let err = transient.bearer_header().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert_eq!(err.msg(), "network blip");
+
+        // Even a non-socket provider error is acquisition-local: a later callback
+        // invocation can recover, so transports must not confuse it with a server
+        // authentication rejection and terminalize queued data.
+        let acquisition = TokenProvider::new(|| {
+            Err::<String, _>(crate::Error::new(ErrorCode::ConfigError, "bad config"))
+        });
+        assert_eq!(
+            acquisition.bearer_header().unwrap_err().code(),
+            ErrorCode::SocketError
+        );
+
+        // Validation is also provider-local and is retried: the next invocation
+        // may return a rotated, valid token.
+        let blank = TokenProvider::new(|| Ok::<_, crate::Error>("   ".to_string()));
+        assert_eq!(
+            blank.bearer_header().unwrap_err().code(),
+            ErrorCode::SocketError
+        );
+    }
+
+    #[test]
+    fn invalid_api_call_provider_error_stays_terminal_as_config_error() {
+        // A provider contract violation must stay terminal, but it must NOT
+        // stay `InvalidApiCall`. That code is not provider-private: the
+        // connection pool raises it for ordinary exhaustion, so putting the
+        // bare code in `reconnect_error_is_terminal` stopped `db.rs`'s borrow
+        // retry loops retrying transient contention. Carry it as `ConfigError`,
+        // which is already in that terminal set.
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::Error::new(
+                crate::ErrorCode::InvalidApiCall,
+                "provider callback contract violated",
+            ))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ConfigError);
+        assert!(err.msg().contains("provider callback contract violated"));
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn terminal_provider_failure_survives_transport_context_without_message_matching() {
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::Error::new(
+                crate::ErrorCode::InvalidApiCall,
+                "broken",
+            ))
+        });
+        let err = provider.bearer_header().unwrap_err();
+        assert!(is_terminal_provider_error(&err));
+        let wrapped = err.reclassified(
+            crate::ErrorCode::ConfigError,
+            "WebSocket credential rejected (HTTP 401): broken",
+        );
+        assert!(is_terminal_provider_error(&wrapped));
+        assert!(!is_terminal_provider_error(&crate::Error::new(
+            crate::ErrorCode::ConfigError,
+            "Token provider failed: not actually from a provider",
+        )));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn cancelled_provider_stays_terminal() {
+        // Regression: `close()` is permanent and monotonic, so `token()` returns
+        // `Cancelled` forever after. Reclassifying that as a retryable
+        // `SocketError` made the QWP/WS reconnect loop treat it as transient --
+        // and because `next_after_retryable_terminal` starts a fresh budget each
+        // round, the sender retried indefinitely and never surfaced the close.
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::oidc::OidcError::cancelled("provider closed"))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::AuthError,
+            "a permanently closed provider must not be reported as retryable"
+        );
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::Cancelled)
+        );
+        // `AuthError` is in `reconnect_error_is_terminal`'s terminal set, which
+        // is what stops the reconnect loop; `SocketError` is not.
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn misconfigured_provider_stays_terminal() {
+        // Regression, same trap as `cancelled_provider_stays_terminal`: a
+        // `Config` failure is raised by `select()` when the configured scope
+        // cannot yield the required token kind (no `id_token` in groups mode,
+        // or no `access_token`). It recurs identically on every invocation and
+        // no call inside this process clears it, so demoting it to a retryable
+        // `SocketError` put the QWP/WS reconnect loop on state that can never
+        // recover -- and `next_after_retryable_terminal` restarts the budget
+        // each round, so it never ended and never surfaced the misconfiguration.
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::oidc::OidcError::config(
+                "Server expects groups encoded in the token but the IdP \
+                 returned no id_token.",
+            ))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::ConfigError,
+            "a misconfigured provider must not be reported as retryable"
+        );
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::Config)
+        );
+        // `ConfigError`, like `AuthError`, is in `reconnect_error_is_terminal`'s
+        // terminal set; `SocketError` is not.
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn interaction_required_stays_retryable() {
+        // The deliberate counter-case to the two carve-outs above: a lapsed
+        // credential IS recoverable -- a `sign_in()` on another thread clears
+        // it -- so it must stay retryable, or the store-and-forward drainer
+        // would abandon queued frames on a condition a human can fix. Its
+        // visibility is provided by `ConnectionEvents::token_provider_failed`
+        // instead, not by terminalizing the loop.
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::oidc::OidcError::interaction_required("sign in"))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn retry_classification_preserves_oidc_detail() {
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::oidc::OidcError::interaction_required("sign in"))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
+    }
+
+    // `questdb-rs`'s own test profile unwinds, so this passes here -- but the
+    // behaviour it pins does not exist in the shipped `questdb-rs-ffi` cdylib,
+    // which is `panic = "abort"`. Ignore it in an abort build rather than let
+    // a green test imply a guarantee the artifact cannot give.
+    #[cfg_attr(panic = "abort", ignore)]
+    #[test]
+    fn provider_panic_is_retryable_and_provider_is_polled_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = TokenProvider::new({
+            let calls = Arc::clone(&calls);
+            move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("synthetic provider panic");
+                }
+                Ok::<_, crate::Error>("recovered-token".to_string())
+            }
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("token provider panicked"));
+        assert_eq!(provider.bearer_header().unwrap(), "Bearer recovered-token");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Coverage for `bearer_header_isolated_until` — the QWP/WebSocket path that
+    /// runs an uncancellable synchronous provider closure on a throwaway thread so
+    /// a slow or blocking closure can never wedge sender shutdown. Only its
+    /// success path was previously exercised (via the connect handshake tests);
+    /// the cancellation branches — the whole reason the method exists — were not.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    mod isolated {
+        use super::super::{
+            IsolatedProviderPermit, MAX_ISOLATED_PROVIDER_WORKERS, TokenProvider,
+            TokenProviderIsolation,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
+
+        /// A one-shot manual-reset event usable from a `Fn + Send + Sync` provider.
+        #[derive(Default)]
+        struct Gate {
+            set: Mutex<bool>,
+            cv: Condvar,
+        }
+        impl Gate {
+            fn signal(&self) {
+                *self.set.lock().unwrap() = true;
+                self.cv.notify_all();
+            }
+            fn wait(&self) {
+                let mut set = self.set.lock().unwrap();
+                while !*set {
+                    set = self.cv.wait(set).unwrap();
+                }
+            }
+
+            fn is_signalled(&self) -> bool {
+                *self.set.lock().unwrap()
+            }
+        }
+
+        #[test]
+        fn worker_permits_are_bounded_and_released() {
+            let counter = AtomicUsize::new(0);
+            let first = IsolatedProviderPermit::acquire(&counter, 1).unwrap();
+            let err = IsolatedProviderPermit::acquire(&counter, 1).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.msg().contains("worker limit"));
+            drop(first);
+            assert!(IsolatedProviderPermit::acquire(&counter, 1).is_ok());
+        }
+
+        #[test]
+        fn a_full_worker_cap_waits_for_a_permit_instead_of_failing() {
+            // While every permit is held by a slow provider call, another
+            // provider -- whose credential is obtainable -- used to fail at once
+            // and report a spurious credential_unavailable. It now waits for a
+            // permit to free up.
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let held = IsolatedProviderPermit::acquire(&COUNTER, 1).unwrap();
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                drop(held);
+            });
+            let permit = IsolatedProviderPermit::acquire_waiting(
+                &COUNTER,
+                1,
+                std::time::Duration::from_secs(10),
+                || false,
+            )
+            .unwrap();
+            assert!(permit.is_some(), "the waiter must take the released permit");
+            releaser.join().unwrap();
+        }
+
+        #[test]
+        fn a_full_worker_cap_reports_busy_after_the_wait_and_honours_interrupts() {
+            let counter = AtomicUsize::new(0);
+            let _held = IsolatedProviderPermit::acquire(&counter, 1).unwrap();
+            let started = std::time::Instant::now();
+            let err = IsolatedProviderPermit::acquire_waiting(
+                &counter,
+                1,
+                std::time::Duration::from_millis(50),
+                || false,
+            )
+            .unwrap_err();
+            assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.msg().contains("worker limit"), "{}", err.msg());
+
+            // An interrupt (shutdown, or a callback becoming active) ends the
+            // wait without a permit and without the busy error.
+            let interrupted = IsolatedProviderPermit::acquire_waiting(
+                &counter,
+                1,
+                std::time::Duration::from_secs(10),
+                || true,
+            )
+            .unwrap();
+            assert!(interrupted.is_none());
+        }
+
+        /// Fill a private worker budget so a lead has to wait for a permit.
+        fn fill_budget(workers: &'static AtomicUsize) -> Vec<IsolatedProviderPermit<'static>> {
+            (0..MAX_ISOLATED_PROVIDER_WORKERS)
+                .map(|_| {
+                    IsolatedProviderPermit::acquire(workers, MAX_ISOLATED_PROVIDER_WORKERS).unwrap()
+                })
+                .collect()
+        }
+
+        fn wait_for_lead(provider: &TokenProvider) {
+            while provider.isolated.current.lock().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        #[test]
+        fn a_lead_whose_callback_starts_during_the_permit_wait_retires_the_slot() {
+            // The lead leaves without a worker when a callback becomes active
+            // while it waits for a permit. If it did not retire the slot, every
+            // later isolated acquisition for this provider would join a slot
+            // no worker completes, and never get a token again.
+            static WORKERS: AtomicUsize = AtomicUsize::new(0);
+            let held = fill_budget(&WORKERS);
+            let active = Arc::new(AtomicBool::new(false));
+            let isolation = TokenProviderIsolation::with_worker_budget_and_permit_wait(
+                &WORKERS,
+                Duration::from_secs(30),
+                Some({
+                    let active = Arc::clone(&active);
+                    Arc::new(move || active.load(Ordering::SeqCst))
+                }),
+            );
+            let provider = TokenProvider::new_with_isolation(
+                {
+                    let active = Arc::clone(&active);
+                    move || {
+                        if active.load(Ordering::SeqCst) {
+                            Err(crate::error::fmt!(
+                                SocketError,
+                                "callback must return first"
+                            ))
+                        } else {
+                            Ok::<_, crate::Error>("tok-callback".to_string())
+                        }
+                    }
+                },
+                isolation,
+            );
+            let lead = {
+                let provider = provider.clone();
+                std::thread::spawn(move || provider.bearer_header_isolated_until(|| false))
+            };
+            wait_for_lead(&provider);
+            active.store(true, Ordering::SeqCst);
+            let lead_result = lead.join().unwrap();
+            assert!(
+                lead_result
+                    .unwrap_err()
+                    .msg()
+                    .contains("callback must return first")
+            );
+            active.store(false, Ordering::SeqCst);
+            drop(held);
+
+            assert!(
+                provider.isolated.current.lock().unwrap().is_none(),
+                "the callback-active exit left the slot in flight"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let later = provider.bearer_header_isolated_until(|| Instant::now() >= deadline);
+            assert_eq!(later.unwrap(), "Bearer tok-callback");
+        }
+
+        #[test]
+        fn a_lead_that_times_out_on_a_full_cap_shares_busy_and_retires_the_slot() {
+            // The lead leaves without a worker once the permit wait expires.
+            // Its joiners must receive that busy result, and the slot must be
+            // retired so a later acquisition can lead a fresh one.
+            static WORKERS: AtomicUsize = AtomicUsize::new(0);
+            let held = fill_budget(&WORKERS);
+            let provider = TokenProvider::new_with_isolation(
+                || Ok::<_, crate::Error>("tok-busy".to_string()),
+                TokenProviderIsolation::with_worker_budget_and_permit_wait(
+                    &WORKERS,
+                    Duration::from_millis(300),
+                    None,
+                ),
+            );
+            let lead = {
+                let provider = provider.clone();
+                std::thread::spawn(move || provider.bearer_header_isolated_until(|| false))
+            };
+            wait_for_lead(&provider);
+            let joiner = {
+                let provider = provider.clone();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                std::thread::spawn(move || {
+                    provider.bearer_header_isolated_until(|| Instant::now() >= deadline)
+                })
+            };
+            let lead_result = lead.join().unwrap();
+            let joiner_result = joiner.join().unwrap();
+            assert!(lead_result.unwrap_err().msg().contains("worker limit"));
+            assert!(
+                joiner_result
+                    .as_ref()
+                    .is_err_and(|err| err.msg().contains("worker limit")),
+                "the joiner did not share the lead's busy result: {joiner_result:?}"
+            );
+            drop(held);
+
+            assert!(
+                provider.isolated.current.lock().unwrap().is_none(),
+                "the busy exit left the slot in flight"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let later = provider.bearer_header_isolated_until(|| Instant::now() >= deadline);
+            assert_eq!(later.unwrap(), "Bearer tok-busy");
+        }
+
+        #[test]
+        fn a_lead_shutting_down_does_not_fail_a_joiner_from_another_transport() {
+            // Fill the worker cap so the lead waits for a permit.
+            static WORKERS: AtomicUsize = AtomicUsize::new(0);
+            let held: Vec<_> = (0..MAX_ISOLATED_PROVIDER_WORKERS)
+                .map(|_| {
+                    IsolatedProviderPermit::acquire(&WORKERS, MAX_ISOLATED_PROVIDER_WORKERS)
+                        .unwrap()
+                })
+                .collect();
+
+            let provider = TokenProvider::new_with_isolation(
+                || Ok::<_, crate::Error>("tok-iso".to_string()),
+                TokenProviderIsolation::with_worker_budget(&WORKERS),
+            );
+            // Another transport attached to the same provider.
+            let peer = provider.clone();
+
+            let lead_cancelled = Arc::new(AtomicBool::new(false));
+            let lead = {
+                let provider = provider.clone();
+                let lead_cancelled = Arc::clone(&lead_cancelled);
+                std::thread::spawn(move || {
+                    provider.bearer_header_isolated_until(|| lead_cancelled.load(Ordering::SeqCst))
+                })
+            };
+            while provider.isolated.current.lock().unwrap().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let joiner_done = Arc::new(AtomicBool::new(false));
+            let joiner = {
+                let joiner_done = Arc::clone(&joiner_done);
+                std::thread::spawn(move || {
+                    let result = peer.bearer_header_isolated_until(|| false);
+                    joiner_done.store(true, Ordering::SeqCst);
+                    result
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            // The lead's transport shuts down while the cap is still full.
+            lead_cancelled.store(true, Ordering::SeqCst);
+            let err = lead.join().unwrap().unwrap_err();
+            assert!(super::super::is_provider_shutdown_error(&err), "{err}");
+
+            // The joiner's transport did not shut down: it keeps waiting for a
+            // permit instead of reporting the lead's shutdown as its own.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                !joiner_done.load(Ordering::SeqCst),
+                "the joiner inherited the lead's shutdown"
+            );
+            drop(held);
+            assert_eq!(joiner.join().unwrap().unwrap(), "Bearer tok-iso");
+        }
+
+        #[test]
+        fn returns_the_token_on_fast_success() {
+            let provider = TokenProvider::new(|| Ok::<_, crate::Error>("tok-iso".to_string()));
+            assert_eq!(
+                provider.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer tok-iso"
+            );
+        }
+
+        /// Regression: a pull resolved on the transport's own thread because a
+        /// callback was running reached the binding as an ordinary, blocking
+        /// pull whenever that callback returned before the binding's own
+        /// check. Nothing interrupts that thread, so a sender close stalled
+        /// behind a peer's slow refresh. Only that path is marked non-blocking;
+        /// the isolated worker, which shutdown can abandon, is not.
+        #[test]
+        fn callback_path_pull_is_marked_nonblocking_but_worker_pull_is_not() {
+            let callback_active = Arc::new(AtomicBool::new(true));
+            let isolation = TokenProviderIsolation::with_callback_guards(
+                {
+                    let callback_active = Arc::clone(&callback_active);
+                    move || callback_active.load(Ordering::SeqCst)
+                },
+                || false,
+            );
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = TokenProvider::new_with_isolation(
+                {
+                    let seen = Arc::clone(&seen);
+                    move || {
+                        seen.lock()
+                            .unwrap()
+                            .push(crate::token_provider::token_pull_must_not_block());
+                        Ok::<_, crate::Error>("tok".to_string())
+                    }
+                },
+                isolation,
+            );
+
+            assert!(!crate::token_provider::token_pull_must_not_block());
+            provider.bearer_header_isolated_until(|| false).unwrap();
+            assert!(
+                !crate::token_provider::token_pull_must_not_block(),
+                "the mark must not outlive the pull"
+            );
+            callback_active.store(false, Ordering::SeqCst);
+            provider.bearer_header_isolated_until(|| false).unwrap();
+            assert_eq!(*seen.lock().unwrap(), vec![true, false]);
+        }
+
+        #[cfg(feature = "_sender-qwp-ws")]
+        #[test]
+        fn callback_wait_rejects_only_on_the_callback_thread() {
+            std::thread_local! {
+                static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            fn on_callback_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+                std::thread::spawn(move || {
+                    IN_CALLBACK.with(|c| c.set(true));
+                    f()
+                })
+                .join()
+                .unwrap()
+            }
+
+            let callback_active = Arc::new(AtomicBool::new(false));
+            let isolation = TokenProviderIsolation::with_callback_guards(
+                {
+                    let callback_active = Arc::clone(&callback_active);
+                    move || callback_active.load(Ordering::SeqCst)
+                },
+                || IN_CALLBACK.with(|c| c.get()),
+            );
+            let started = Arc::new(Gate::default());
+            let release = Arc::new(Gate::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            // The first pull is the worker that delivers the callback: it
+            // blocks until released. Any pull made while the callback runs is
+            // refused, as OIDC refuses an uncached token pull.
+            let owner = TokenProvider::new_with_isolation(
+                {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    let callback_active = Arc::clone(&callback_active);
+                    let calls = Arc::clone(&calls);
+                    move || {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            started.signal();
+                            release.wait();
+                            return Ok("fresh-token".to_string());
+                        }
+                        if callback_active.load(Ordering::SeqCst) {
+                            Err(crate::error::fmt!(
+                                SocketError,
+                                "callback must return first"
+                            ))
+                        } else {
+                            Ok("fresh-token".to_string())
+                        }
+                    }
+                },
+                isolation,
+            );
+            let peer = owner.for_attachment();
+            let healthy = owner.for_attachment();
+
+            // The owner starts the acquisition whose worker raises the callback.
+            let owner_runner = owner.clone();
+            let owner_call =
+                std::thread::spawn(move || owner_runner.bearer_header_isolated_until(|| false));
+            started.wait();
+            callback_active.store(true, Ordering::SeqCst);
+            // Neither attachment joins the worker delivering the callback.
+            let err = owner_call.join().unwrap().unwrap_err();
+            assert!(err.msg().contains("callback must return first"), "{err}");
+            let err = peer.bearer_header_isolated_until(|| false).unwrap_err();
+            assert!(err.msg().contains("callback must return first"), "{err}");
+
+            // A wait on an ordinary thread keeps waiting: the callback returns.
+            assert!(owner.callback_wait_error().is_none());
+            assert!(peer.callback_wait_error().is_none());
+            // Inside the callback, a wait whose reconnect is blocked is
+            // rejected -- for the worker's own attachment as well as a peer.
+            let (o, p) = (owner.clone(), peer.clone());
+            assert!(on_callback_thread(move || o.callback_wait_error()).is_some());
+            assert!(on_callback_thread(move || p.callback_wait_error()).is_some());
+            // An attachment that did not need a token is unaffected, even
+            // though it shares the provider with the blocked ones.
+            let h = healthy.clone();
+            assert!(on_callback_thread(move || h.callback_wait_error()).is_none());
+
+            callback_active.store(false, Ordering::SeqCst);
+            release.signal();
+            let o = owner.clone();
+            assert!(on_callback_thread(move || o.callback_wait_error()).is_none());
+            assert!(!owner.callback_blocked.load(Ordering::SeqCst));
+        }
+
+        #[cfg(feature = "_sender-qwp-ws")]
+        #[test]
+        fn caller_thread_pull_inside_callback_rejects_its_wait() {
+            // A manual-progress sender has no traffic gate: its reconnect pulls
+            // the token on the thread driving progress, which is the callback
+            // thread when the ACK wait runs inside a callback.
+            std::thread_local! {
+                static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            let callback_active = Arc::new(AtomicBool::new(false));
+            let isolation = TokenProviderIsolation::with_callback_guards(
+                {
+                    let callback_active = Arc::clone(&callback_active);
+                    move || callback_active.load(Ordering::SeqCst)
+                },
+                || IN_CALLBACK.with(|c| c.get()),
+            );
+            let provider = TokenProvider::new_with_isolation(
+                {
+                    let callback_active = Arc::clone(&callback_active);
+                    move || {
+                        if callback_active.load(Ordering::SeqCst) {
+                            Err(crate::error::fmt!(
+                                SocketError,
+                                "callback must return first"
+                            ))
+                        } else {
+                            Ok("fresh-token".to_string())
+                        }
+                    }
+                },
+                isolation,
+            )
+            .for_attachment();
+
+            let (active, p) = (Arc::clone(&callback_active), provider.clone());
+            let (pulled, rejected) = std::thread::spawn(move || {
+                IN_CALLBACK.with(|c| c.set(true));
+                active.store(true, Ordering::SeqCst);
+                let pulled = p.bearer_header_on_caller();
+                let rejected = p.callback_wait_error();
+                active.store(false, Ordering::SeqCst);
+                (pulled, rejected)
+            })
+            .join()
+            .unwrap();
+            assert!(pulled.is_err());
+            let err = rejected.expect("an in-callback wait must be rejected");
+            assert!(err.msg().contains("callback must return first"), "{err}");
+
+            // Once the callback has returned, the next pull clears the record.
+            assert_eq!(
+                provider.bearer_header_on_caller().unwrap(),
+                "Bearer fresh-token"
+            );
+            assert!(!provider.callback_blocked.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn cancelled_up_front_returns_shutdown_error_without_invoking_provider() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = TokenProvider::new({
+                let calls = Arc::clone(&calls);
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, crate::Error>("unused".to_string())
+                }
+            });
+
+            let err = provider.bearer_header_isolated_until(|| true).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.msg().contains("shutting down"), "{}", err.msg());
+            // Cancellation short-circuits before any worker thread is spawned.
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn cancel_while_a_blocked_provider_runs_returns_promptly() {
+            // The provider blocks indefinitely; once cancellation is observed the
+            // call must return the shutdown error without waiting for it — the whole
+            // reason acquisition runs on an isolated thread. A regression that
+            // failed to observe cancellation in the poll loop would never return;
+            // the bounded `recv_timeout` below turns that wedge into a clear failure
+            // instead of a hang.
+            let started = Arc::new(Gate::default());
+            let release = Arc::new(Gate::default());
+            let provider = TokenProvider::new({
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                move || {
+                    started.signal();
+                    release.wait();
+                    Ok::<_, crate::Error>("late-token".to_string())
+                }
+            });
+
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let call = std::thread::spawn({
+                let cancelled = Arc::clone(&cancelled);
+                move || {
+                    let result = provider
+                        .bearer_header_isolated_until(move || cancelled.load(Ordering::SeqCst));
+                    let _ = done_tx.send(result);
+                }
+            });
+
+            // Only cancel once the worker is provably inside the blocked provider,
+            // so this exercises the poll-loop cancellation branch, not the entry
+            // guard.
+            started.wait();
+            cancelled.store(true, Ordering::SeqCst);
+
+            let result = done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("cancellation must abandon the blocked provider promptly, not hang");
+            let err = result.unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.msg().contains("shutting down"), "{}", err.msg());
+
+            // Release the abandoned worker so it exits cleanly; publishing to a
+            // slot nobody is waiting on is ignored (no panic, no leak).
+            release.signal();
+            call.join().unwrap();
+        }
+
+        #[test]
+        fn separately_wrapped_attachments_share_one_isolated_acquisition() {
+            // Language bindings wrap one OIDC auth in a fresh closure for each
+            // sender/reader. Sharing only the callback target is insufficient:
+            // the isolated single-flight identity must cross those wrappers or
+            // one blocked auth can consume the whole global worker budget.
+            let isolation = TokenProviderIsolation::default();
+            let started = Arc::new(Gate::default());
+            let release = Arc::new(Gate::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            for _ in 0..(MAX_ISOLATED_PROVIDER_WORKERS + 2) {
+                let provider = TokenProvider::new_with_isolation(
+                    {
+                        let started = Arc::clone(&started);
+                        let release = Arc::clone(&release);
+                        let calls = Arc::clone(&calls);
+                        move || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            started.signal();
+                            release.wait();
+                            Ok::<_, crate::Error>("shared-token".to_string())
+                        }
+                    },
+                    isolation.clone(),
+                );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+                let err = provider
+                    .bearer_header_isolated_until(|| std::time::Instant::now() >= deadline)
+                    .unwrap_err();
+                assert!(err.msg().contains("shutting down"), "{}", err.msg());
+            }
+            assert!(started.is_signalled());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "all attachments of one auth must join one worker"
+            );
+
+            let healthy = TokenProvider::new(|| Ok::<_, crate::Error>("other-token".to_string()));
+            assert_eq!(
+                healthy.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer other-token"
+            );
+
+            release.signal();
+            let drained = TokenProvider::new_with_isolation(
+                || Ok::<_, crate::Error>("unused".to_string()),
+                isolation,
+            );
+            let token = drained.bearer_header_isolated_until(|| false).unwrap();
+            assert!(
+                token == "Bearer shared-token" || token == "Bearer unused",
+                "unexpected drained token: {token}"
+            );
+        }
+
+        /// A provider that answers `fresh` only when told the server refused
+        /// `stale`, as a cache-first `OidcDeviceAuth` does.
+        #[cfg(feature = "_oidc")]
+        fn answer(rejected: Option<&str>) -> String {
+            if rejected == Some("stale") {
+                "fresh".to_string()
+            } else {
+                "stale".to_string()
+            }
+        }
+
+        #[cfg(feature = "_oidc")]
+        #[test]
+        fn an_isolated_pull_after_a_401_names_the_rejected_token_on_its_worker() {
+            // The provider runs on the worker thread, so that is where it must
+            // learn which token the server refused.
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let provider = TokenProvider::new({
+                let seen = Arc::clone(&seen);
+                move || {
+                    let rejected = crate::token_provider::inspect_rejected_token(|rejected| {
+                        rejected.map(str::to_owned)
+                    });
+                    let on_worker = std::thread::current().name() == Some("questdb-token-provider");
+                    seen.lock().unwrap().push((rejected.clone(), on_worker));
+                    Ok::<_, crate::Error>(answer(rejected.as_deref()))
+                }
+            });
+            let header =
+                crate::token_provider::with_rejected_credential(Some("Bearer stale"), || {
+                    provider.bearer_header_isolated_until(|| false)
+                })
+                .unwrap();
+            assert_eq!(header, "Bearer fresh");
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![(Some("stale".to_string()), true)]
+            );
+            // An ordinary pull tells the worker nothing.
+            assert_eq!(
+                provider.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer stale"
+            );
+        }
+
+        #[cfg(feature = "_oidc")]
+        #[test]
+        fn a_re_resolution_that_joins_an_older_acquisition_starts_a_fresh_one() {
+            // An acquisition that began before the server refused its token
+            // was told nothing, and hands that token to every caller that
+            // joined it. A re-resolution after the 401 must not take it as the
+            // provider's answer.
+            let started = Arc::new(Gate::default());
+            let release = Arc::new(Gate::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = TokenProvider::new({
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                let calls = Arc::clone(&calls);
+                move || {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        started.signal();
+                        release.wait();
+                    }
+                    Ok::<_, crate::Error>(answer(
+                        crate::token_provider::inspect_rejected_token(|rejected| {
+                            rejected.map(str::to_owned)
+                        })
+                        .as_deref(),
+                    ))
+                }
+            });
+            let lead = {
+                let provider = provider.clone();
+                std::thread::spawn(move || provider.bearer_header_isolated_until(|| false))
+            };
+            started.wait();
+            let re_resolution = {
+                let provider = provider.clone();
+                std::thread::spawn(move || {
+                    crate::token_provider::with_rejected_credential(Some("Bearer stale"), || {
+                        provider.bearer_header_isolated_until(|| false)
+                    })
+                })
+            };
+            // Let the re-resolution join the acquisition still in flight.
+            std::thread::sleep(Duration::from_millis(100));
+            release.signal();
+
+            assert_eq!(lead.join().unwrap().unwrap(), "Bearer stale");
+            assert_eq!(re_resolution.join().unwrap().unwrap(), "Bearer fresh");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn one_blocked_provider_cannot_starve_another() {
+            // Every cancelled call used to abandon a worker that kept its
+            // permit, so one blocked provider could take the whole global
+            // budget and an unrelated healthy provider was then refused a token
+            // it would have returned immediately -- failing its connect before
+            // it dialled an endpoint.
+            let started = Arc::new(Gate::default());
+            let release = Arc::new(Gate::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let blocked = TokenProvider::new({
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                let calls = Arc::clone(&calls);
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    started.signal();
+                    release.wait();
+                    Ok::<_, crate::Error>("late-token".to_string())
+                }
+            });
+
+            // Each call must get past the entry guard and actually reach
+            // acquisition before it cancels, or it would prove nothing: a
+            // predicate already true on entry short-circuits at the top of
+            // `bearer_header_isolated_until` and takes no permit even without
+            // single-flight. A deadline sampled per call is false on entry and
+            // true only after the wait loop has run.
+            for _ in 0..(MAX_ISOLATED_PROVIDER_WORKERS + 2) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+                let err = blocked
+                    .bearer_header_isolated_until(|| std::time::Instant::now() >= deadline)
+                    .unwrap_err();
+                // Without single-flight this becomes the permit-exhaustion
+                // error once the budget is gone, not a cancellation.
+                assert_eq!(err.code(), crate::ErrorCode::SocketError);
+                assert!(err.msg().contains("shutting down"), "{}", err.msg());
+            }
+            assert!(started.is_signalled(), "the worker must have run");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "one provider must coalesce onto a single isolated worker"
+            );
+
+            // The unrelated provider must still be invoked and succeed.
+            let healthy = TokenProvider::new(|| Ok::<_, crate::Error>("tok-b".to_string()));
+            assert_eq!(
+                healthy.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer tok-b"
+            );
+
+            // Drain the abandoned worker so its permit is released.
+            release.signal();
+            assert_eq!(
+                blocked.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer late-token"
+            );
+        }
+    }
+}

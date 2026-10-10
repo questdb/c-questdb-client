@@ -454,6 +454,12 @@ const char* questdb_error_msg(const questdb_error*, size_t* len_out);
 QUESTDB_CLIENT_API
 bool questdb_error_in_doubt(const questdb_error*);
 
+/** Whether the error carries a QWP/WebSocket server-role rejection (including
+ *  a 421 with an unrecognized role header). Unlike a plain protocol-version
+ *  error, this can be retried while server roles change. NULL-safe. */
+QUESTDB_CLIENT_API
+bool questdb_error_is_qwp_ws_role_reject(const questdb_error*);
+
 /** Clean up a client-wide error. Idempotent on NULL. */
 QUESTDB_CLIENT_API
 void questdb_error_free(questdb_error*);
@@ -502,6 +508,10 @@ typedef struct line_sender_utf8
     size_t len;
     const char* buf;
 } line_sender_utf8;
+
+/** Maximum accepted byte length for any caller-supplied connection/config
+ * string passed to a `_from_conf` or `questdb_db_connect*` constructor. */
+#define QUESTDB_CONFIG_MAX_BYTES ((size_t)(1 << 20))
 
 /**
  * Check the provided buffer is a valid UTF-8 encoded string.
@@ -1568,6 +1578,7 @@ typedef struct line_sender_opts line_sender_opts;
  *
  * For the full list of keys, search this header for `bool
  * line_sender_opts_`.
+ * The string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  */
 QUESTDB_CLIENT_API
 line_sender_opts* line_sender_opts_from_conf(
@@ -1950,6 +1961,7 @@ line_sender* line_sender_build(
  *
  * For the full list of keys, search this header for `bool
  * line_sender_opts_`.
+ * The string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  *
  * In the case of TCP, this synchronously establishes the TCP connection,
  * and returns once the connection is fully established. If the connection
@@ -2118,7 +2130,11 @@ typedef enum qwpws_ack_level
  * Returns `false` and sets `err_out` on the no-progress timeout
  * (`line_sender_error_failover_retry`), a server rejection, a transport
  * failure, or an invalid `ack_level`. With nothing published yet it succeeds
- * immediately.
+ * immediately. A timeout while the sender is disconnected and reconnecting
+ * keeps failing names that failure, and carries its OIDC detail when an
+ * attached OIDC auth could not supply a token (`questdb_error_oidc_get_view`
+ * reports `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` when a new sign-in is
+ * needed). The published frames stay queued either way.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_wait(
@@ -2304,7 +2320,30 @@ int64_t line_sender_now_micros(void);
 #define questdb_connection_event_failed_over 3u
 #define questdb_connection_event_endpoint_attempt_failed 4u
 #define questdb_connection_event_all_endpoints_unreachable 5u
+/** Terminal: the server rejected a credential the client presented.
+ *  `host` / `port` are set. A 401 followed by a failed replacement-token
+ *  acquisition is instead `credential_unavailable` with the endpoint set. */
 #define questdb_connection_event_auth_failed 6u
+/** The token provider failed while acquiring a credential. Before dialling,
+ *  `host` / `port` are NULL. If this follows a server HTTP 401, they identify
+ *  the endpoint that rejected the previous token and `cause_msg` includes the
+ *  401; `cause_code` still classifies the provider failure. Read `cause_code`
+ *  to tell a retry from a stop:
+ *
+ *  - `line_sender_error_socket_error` -- the ordinary case, retryable.
+ *    The sender keeps reconnecting and store-and-forward keeps its queued
+ *    frames; only a foreground/initial connect fails fast.
+ *  - `line_sender_error_auth_error` / `line_sender_error_config_error` --
+ *    the provider cannot recover in this process (a permanently closed
+ *    OIDC provider, or a scope that cannot yield the required token kind),
+ *    so the reconnect is TERMINAL and the runner stops. Queued frames are
+ *    not deleted and a disk-backed slot stays drainable by a later
+ *    process, but this process will not send them.
+ *
+ *  A listener that pages on a permanent stop must qualify on `cause_code`,
+ *  not on the kind alone. `questdb_connection_event_auth_failed` remains
+ *  the terminal server-rejection signal. */
+#define questdb_connection_event_credential_unavailable 7u
 
 /** One connection-state transition. String fields are borrowed UTF-8
  * slices valid only for the duration of the callback; absent strings are
@@ -2342,9 +2381,14 @@ typedef void (*questdb_connection_event_cb)(
 
 /** Register a connection lifecycle listener on the sender being built.
  * Events are delivered on a dedicated dispatcher thread through a bounded
- * inbox (`inbox_capacity`; 0 = default 64) with a drop-oldest overflow
- * policy. The caller guarantees `user_data` is safe to use from that
- * thread. QWP/WebSocket only; at most one listener per builder. */
+ * inbox (`inbox_capacity`; 0 = default 64, maximum 65536) with a
+ * drop-oldest overflow policy. The caller guarantees `user_data` is safe to
+ * use from that thread. QWP/WebSocket only; at most one listener per builder.
+ *
+ * Returns `false` with a config error when a listener is already registered,
+ * or when `inbox_capacity` exceeds 65536: the capacity reaches an allocation
+ * whose failure aborts the process, so an absurd value is refused here
+ * instead. */
 QUESTDB_CLIENT_API
 bool line_sender_opts_connection_event_handler(
     line_sender_opts* opts,

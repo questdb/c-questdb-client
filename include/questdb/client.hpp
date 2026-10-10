@@ -43,6 +43,7 @@
 
 #include <questdb/client.h>
 #include <questdb/ingress/line_sender_core.hpp>
+#include <questdb/oidc.hpp>
 
 // Forward declarations so `pool` can hand out leases of either direction while
 // keeping both lease headers off its own include path. The corresponding
@@ -96,6 +97,27 @@ public:
     {
         _raw = ::questdb::error::wrapped_call(
             ::questdb_db_connect, conf.data(), conf.size());
+    }
+
+    /**
+     * Open a pool whose sender and reader connections share one rotating OIDC
+     * token provider. The pool retains the auth state internally. Provider
+     * calls may silently refresh but never prompt; call auth.sign_in() first.
+     * Mutually exclusive with static credentials: `conf` must not also set
+     * `username`/`password` or `token`.
+     * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer
+     * token is sent in cleartext and can be captured in transit.
+     * @throws questdb::error with `config_error` if it does.
+     * @throws questdb::oidc::error with kind `cancelled` if `auth` was
+     *         already closed.
+     */
+    pool(std::string_view conf, const ::questdb::oidc::device_auth& auth)
+    {
+        ::questdb_db_connect_options options;
+        ::questdb_db_connect_options_init(&options, sizeof options);
+        options.oidc_auth = auth.raw();
+        _raw = ::questdb::oidc::detail::wrapped_call(
+            ::questdb_db_connect_ex, conf.data(), conf.size(), &options);
     }
 
     pool(const pool&) = delete;
