@@ -363,6 +363,8 @@ const EGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "failover_backoff_initial_ms",
     "failover_backoff_max_ms",
     "failover_max_duration_ms",
+    // Egress-only per-query timeout default
+    "query_timeout_ms",
     // Java-egress-only decoded-batch pool size (Rust egress is sync/pull,
     // see comment in `egress/config.rs`); still ignored on ingress
     // because that's an egress-side concern either way.
@@ -427,6 +429,36 @@ fn ingress_accepts_full_egress_connect_string_unchanged() {
     assert_specified_eq(&builder.port, "9000");
     assert_specified_eq(&builder.username, Some("u".to_string()));
     assert_specified_eq(&builder.password, Some("p".to_string()));
+}
+
+#[cfg(all(feature = "sync-sender-http", feature = "sync-sender-qwp-ws"))]
+#[test]
+fn qwpws_config_knows_every_egress_only_key() {
+    // `ingress_silently_accepts_every_egress_only_key` only covers
+    // `http::`, where the parser's catch-all ignores anything it does not
+    // recognise. On `ws::` the parser REJECTS unknown keys, so an
+    // egress-only key missing from `QWP_WS_PORTABLE_CONFIG_KEYS` breaks
+    // every connect string shared between a sender and a reader — which is
+    // the normal shape for `questdb.connect()`, where one string configures
+    // both pools.
+    //
+    // The assertion is on the failure MODE, not on success: a key may still
+    // be rejected for its value (`compression=1` is not a valid codec), and
+    // that is fine. What must never happen is "Unknown config key".
+    for key in EGRESS_ONLY_CONFIG_KEYS {
+        for val in ["1", "primary", "halt", ""] {
+            let conf = format!("ws::addr=localhost:9000;{key}={val};");
+            if let Err(e) = SenderBuilder::from_conf(&conf) {
+                assert!(
+                    !e.msg().contains("Unknown config key"),
+                    "egress-only key {key:?} is missing from \
+                     QWP_WS_PORTABLE_CONFIG_KEYS, so a shared ws:: connect \
+                     string carrying it fails to parse: {}",
+                    e.msg()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]

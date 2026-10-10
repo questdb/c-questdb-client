@@ -338,6 +338,10 @@ pub enum line_sender_error_code {
     /// HTTP-upgrade or WebSocket handshake failure.
     line_sender_error_handshake_error = 20,
     /// Server returned an unsupported QWP version, encoding, or capability.
+    /// Also raised client-side, before anything is written, when a query
+    /// carries a per-query timeout and the server does not advertise
+    /// `CAP_QUERY_TIMEOUT` (see `qwp_reader_query_set_timeout_ms`); the
+    /// connection is untouched by that refusal.
     line_sender_error_unsupported_server = 21,
     /// Wire-format violation: bad magic, truncated frame, unknown
     /// discriminant, invalid varint, symbol-dict reference miss, etc.
@@ -443,6 +447,24 @@ pub enum line_sender_error_code {
     /// check `line_sender_error_in_doubt` before resending, or the rows the
     /// queued prefix already carried are duplicated.
     line_sender_error_symbol_dict_full = 37,
+
+    /// The query ran past the timeout it carried: server-reported QWP
+    /// `QUERY_TIMEOUT` (status `0x0E`), produced only for a request that
+    /// supplied `timeout_ms` (see `qwp_reader_query_set_timeout_ms`). A
+    /// timeout requested against a server that does not advertise
+    /// `CAP_QUERY_TIMEOUT` is refused with
+    /// `line_sender_error_unsupported_server` instead, so retrying a timeout
+    /// with a larger budget cannot loop against a server that ignores it.
+    ///
+    /// Per-query, not per-connection: the connection stays open and
+    /// authenticated, so the next query runs on it without reconnecting.
+    ///
+    /// Do not retry a write on this error. A statement that completes past its
+    /// timeout is reported as `EXEC_DONE` with its row count rather than as a
+    /// timeout, precisely so a retrying client cannot apply it twice; and a
+    /// DDL / INSERT / UPDATE that timed out waiting for the table writer may
+    /// still be applied by that writer afterwards.
+    line_sender_error_query_timeout = 38,
 }
 
 /// Neutral spelling of the client-wide error category. The released
@@ -534,6 +556,7 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_store_resend_required
             }
             ErrorCode::SymbolDictFull => line_sender_error_code::line_sender_error_symbol_dict_full,
+            ErrorCode::QueryTimeout => line_sender_error_code::line_sender_error_query_timeout,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -4983,6 +5006,7 @@ mod tests {
                 36,
             ),
             (E::SymbolDictFull, line_sender_error_symbol_dict_full, 37),
+            (E::QueryTimeout, line_sender_error_query_timeout, 38),
         ]
     }
 

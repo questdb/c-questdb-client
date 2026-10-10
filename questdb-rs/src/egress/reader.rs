@@ -52,7 +52,7 @@ use crate::egress::config::{Endpoint, ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
 use crate::egress::decoder::ZstdScratch;
 use crate::egress::query_request::{
-    QUERY_FLAG_RESET_DICT, QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET,
+    QUERY_FLAG_RESET_DICT, QUERY_FLAG_TIMEOUT, QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET,
 };
 use crate::egress::schema::Schema;
 use crate::egress::server_event::UpgradeReject;
@@ -60,7 +60,7 @@ use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_fr
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::tracker::HostHealthTracker;
 use crate::egress::transport::{CLOSE_TIMEOUT, WRITE_TIMEOUT, WsTransport};
-use crate::egress::wire::capabilities::has_query_flags;
+use crate::egress::wire::capabilities::{has_query_flags, has_query_timeout};
 use crate::egress::wire::header::HEADER_LEN;
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::egress::wire::varint;
@@ -696,10 +696,12 @@ impl Reader {
     /// exclusively borrows the reader; only one in-flight cursor at a
     /// time. Append binds in placeholder order, then call `.execute()`.
     pub fn prepare<S: Into<String>>(&mut self, sql: S) -> ReaderQuery<'_> {
+        let timeout_ms = self.cfg.query_timeout_ms;
         ReaderQuery {
             reader: self,
             builder: QueryRequest::builder(sql),
             reset_symbol_dict: false,
+            timeout_ms,
             on_failover_reset: None,
             on_failover_progress: None,
         }
@@ -876,6 +878,12 @@ pub struct ReaderQuery<'r> {
     /// `query_flags` trailer at [`Self::execute`] iff the server advertised
     /// `CAP_QUERY_FLAGS`.
     reset_symbol_dict: bool,
+    /// Per-query timeout in milliseconds; `0` = none. Seeded from
+    /// [`ReaderConfig::query_timeout_ms`] by [`Reader::prepare`] and
+    /// overridden by [`Self::timeout`]. Turned into a `timeout_ms` field at
+    /// [`Self::execute`], which also rejects a non-zero value against a
+    /// server that does not advertise `CAP_QUERY_TIMEOUT`.
+    timeout_ms: u64,
     /// Optional handler called every time the cursor reconnects after a
     /// transport-level failure (see [`FailoverResetEvent`]).
     on_failover_reset: Option<FailoverResetCallback<'r>>,
@@ -909,6 +917,55 @@ impl<'r> ReaderQuery<'r> {
     /// that does not advertise `CAP_QUERY_FLAGS`.
     pub fn reset_symbol_dict(mut self, reset: bool) -> Self {
         self.reset_symbol_dict = reset;
+        self
+    }
+
+    /// Run this query under its own timeout instead of the server-wide
+    /// `query.timeout`, overriding the connection's
+    /// [`ReaderConfig::query_timeout_ms`] default.
+    ///
+    /// [`Duration::ZERO`] means "no client timeout" and clears a default
+    /// inherited from the connect string. The server sets no ceiling, so a
+    /// value above `query.timeout` is honoured — which is the point for a
+    /// long transform. A sub-millisecond non-zero duration is rounded *up*
+    /// to 1 ms: truncating it to zero would silently mean "no timeout".
+    ///
+    /// # Errors
+    ///
+    /// [`Self::execute`] fails with [`crate::ErrorCode::UnsupportedServer`]
+    /// when a non-zero timeout is set and the server does not advertise
+    /// `CAP_QUERY_TIMEOUT`, rather than running the query under the server
+    /// default and letting the caller believe its timeout applied. The
+    /// refusal happens before anything is written, so the connection is
+    /// untouched. Raise the server's `query.timeout` instead, or clear the
+    /// timeout here. A mid-query failover onto such a server fails the same
+    /// way instead of replaying the query. The code is deliberately not
+    /// [`crate::ErrorCode::QueryTimeout`]: that one means the budget ran
+    /// out, and retrying it with a larger budget is a reasonable reaction
+    /// that would never succeed here.
+    ///
+    /// # Behaviour on expiry
+    ///
+    /// The query ends with [`crate::ErrorCode::QueryTimeout`] and the
+    /// connection stays open and authenticated, so the next query runs on
+    /// it without reconnecting. **Do not retry a write on that error:** a
+    /// statement that finishes past its timeout is reported as `EXEC_DONE`
+    /// instead (so a retry cannot apply it twice), and a DDL / `INSERT` /
+    /// `UPDATE` that timed out waiting for the table writer may still be
+    /// applied afterwards.
+    ///
+    /// The server enforces it per request, so a failover replay re-sends
+    /// the full timeout rather than the remainder. Nothing bounds the
+    /// query's end-to-end wall-clock:
+    /// [`ReaderConfig::failover_max_duration_ms`] only limits when a new
+    /// failover round may start.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        let ms = timeout.as_millis();
+        self.timeout_ms = if ms == 0 && !timeout.is_zero() {
+            1
+        } else {
+            ms.min(u64::MAX as u128) as u64
+        };
         self
     }
 
@@ -1144,20 +1201,18 @@ impl<'r> ReaderQuery<'r> {
         // Cap-gate the query_flags trailer: only emit it when the server
         // advertised CAP_QUERY_FLAGS, so an older server sees the baseline
         // QUERY_REQUEST layout and the reset request silently degrades.
-        let server_supports_query_flags = self
+        let capabilities = self
             .reader
             .server_info()
-            .map(|info| has_query_flags(info.capabilities))
-            .unwrap_or(false);
-        let query_flags = if self.reset_symbol_dict && server_supports_query_flags {
-            QUERY_FLAG_RESET_DICT
-        } else {
-            0
-        };
+            .map(|info| info.capabilities)
+            .unwrap_or(0);
+        let query_flags =
+            derive_query_flags(capabilities, self.reset_symbol_dict, self.timeout_ms)?;
         let req = self
             .builder
             .request_id(request_id)
             .query_flags(query_flags)
+            .timeout_ms(self.timeout_ms)
             .build()?;
         let credit_enabled = req.initial_credit() > 0;
         // Encode the QUERY_REQUEST once and stash the bytes on the
@@ -1223,6 +1278,7 @@ impl<'r> ReaderQuery<'r> {
             done: false,
             terminal_error: None,
             encoded_request,
+            timeout_ms: self.timeout_ms,
             on_failover_reset: self.on_failover_reset,
             on_failover_progress: self.on_failover_progress,
             failover_budget,
@@ -1242,6 +1298,49 @@ impl<'r> ReaderQuery<'r> {
             symbol_delta_modes: Vec::new(),
         })
     }
+}
+
+/// The `query_flags` word for a query sent to a server advertising
+/// `capabilities`.
+fn derive_query_flags(capabilities: u32, reset_symbol_dict: bool, timeout_ms: u64) -> Result<u64> {
+    let mut query_flags = 0u64;
+    if reset_symbol_dict && has_query_flags(capabilities) {
+        query_flags |= QUERY_FLAG_RESET_DICT;
+    }
+    if timeout_ms > 0 {
+        // A timeout is a correctness request, not a hint, so it does
+        // NOT degrade the way `reset_symbol_dict` does: silently
+        // dropping it would leave the caller believing it had a long
+        // budget while the server kills the query at `query.timeout`.
+        // The field rides *inside* the query_flags trailer, so both
+        // bits are required — a server advertising the timeout bit
+        // without the flags bit could not parse the frame we would
+        // send.
+        require_query_timeout(capabilities, timeout_ms)?;
+        query_flags |= QUERY_FLAG_TIMEOUT;
+    }
+    Ok(query_flags)
+}
+
+/// Fails with `UnsupportedServer` when `capabilities` cannot carry a
+/// non-zero `timeout_ms`. Checked on every connection a query is sent to,
+/// so a failover replay cannot land the timeout on a server that ignores it.
+fn require_query_timeout(capabilities: u32, timeout_ms: u64) -> Result<()> {
+    if timeout_ms > 0 && !(has_query_flags(capabilities) && has_query_timeout(capabilities)) {
+        return Err(fmt!(
+            UnsupportedServer,
+            "server does not support per-query timeouts \
+             (SERVER_INFO capabilities 0x{:08X}, need CAP_QUERY_TIMEOUT 0x{:08X} \
+             and CAP_QUERY_FLAGS 0x{:08X}): the requested {} ms timeout cannot be \
+             honoured. Raise the server's `query.timeout` instead, or clear the \
+             per-query timeout.",
+            capabilities,
+            crate::egress::wire::capabilities::CAP_QUERY_TIMEOUT,
+            crate::egress::wire::capabilities::CAP_QUERY_FLAGS,
+            timeout_ms,
+        ));
+    }
+    Ok(())
 }
 
 /// Patch the request_id span of a stashed `QUERY_REQUEST` payload in
@@ -1423,8 +1522,19 @@ pub enum Terminal {
     /// `RESULT_END` (`0x12`).
     End { final_seq: u64, total_rows: u64 },
     /// `EXEC_DONE` (`0x16`) — non-SELECT acknowledgement.
+    ///
+    /// `rows_affected` is the row count of an `INSERT` / `UPDATE`. The
+    /// server reports no count for statements it executes at parse time
+    /// (`TRUNCATE`, `RENAME TABLE`, `SET`, ...): it sends `-1`, which the
+    /// unsigned varint carries as [`ROWS_AFFECTED_UNKNOWN`]. `op_type` is
+    /// the server's operation-type byte, carried through opaquely.
     ExecDone { op_type: u8, rows_affected: u64 },
 }
+
+/// The `rows_affected` value of a [`Terminal::ExecDone`] whose statement
+/// reports no row count (`u64::MAX`, the server's `-1` as an unsigned
+/// varint). Compare against it rather than against the literal.
+pub const ROWS_AFFECTED_UNKNOWN: u64 = u64::MAX;
 
 /// Streaming cursor over `RESULT_BATCH` frames.
 ///
@@ -1453,6 +1563,8 @@ pub struct Cursor<'r> {
     /// across reconnects, only the 8-byte request_id span is mutated
     /// in place.
     encoded_request: Bytes,
+    /// Per-query timeout baked into `encoded_request`; `0` = none.
+    timeout_ms: u64,
     /// User callback fired right before replayed batches arrive on a
     /// new connection. See [`ReaderQuery::on_failover_reset`].
     on_failover_reset: Option<FailoverResetCallback<'r>>,
@@ -1572,9 +1684,17 @@ impl<'r> Cursor<'r> {
         self.terminal.as_ref()
     }
 
-    /// Whether dropping this cursor leaves its reader connection reusable.
+    /// Whether dropping this cursor leaves its reader connection reusable:
+    /// the stream reached a terminal frame (or was cancelled to one), no
+    /// query is still active on the connection, and the transport is up.
+    ///
+    /// `done` alone is not enough. A cursor ended mid-stream by a
+    /// client-side error (an Arrow conversion failure, say) is `done` but
+    /// still has the query's frames in flight; [`Drop`] sends `CANCEL` and
+    /// tears the transport down for it, so it must report `false` here
+    /// rather than let a pool recycle a connection that is about to die.
     pub fn connection_reusable(&self) -> bool {
-        self.done && !self.reader.transport_torn_down()
+        self.done && !self.reader.cursor_active && !self.reader.transport_torn_down()
     }
 
     /// Pass-through to [`Reader::credit_granted_total`]. Exists so
@@ -2095,8 +2215,7 @@ impl<'r> Cursor<'r> {
                         match self.replay_query_same_connection() {
                             Ok(()) => continue,
                             Err(e) => {
-                                self.reader.cursor_active = false;
-                                self.done = true;
+                                self.terminate_with_close();
                                 return Err(e);
                             }
                         }
@@ -2448,6 +2567,33 @@ impl<'r> Cursor<'r> {
             // and queries that may carry multi-MB `Bind::Binary`
             // payloads, this is the difference between a few bytes
             // and gigabytes of churn per failure event.
+            // The stashed bytes carry the timeout the *original* server
+            // accepted; a replacement that lacks the capability would run
+            // the query under its own default instead.
+            let capabilities = self
+                .reader
+                .server_info()
+                .map(|info| info.capabilities)
+                .unwrap_or(0);
+            if let Err(e) = require_query_timeout(capabilities, self.timeout_ms) {
+                if let Some(cb) = self.on_failover_progress.as_mut() {
+                    let event = FailoverProgressEvent {
+                        phase: FailoverPhase::GaveUp,
+                        failed_addr: failed_addr.clone(),
+                        new_addr: None,
+                        new_server_info: None,
+                        new_request_id: None,
+                        attempt: attempts,
+                        trigger: trigger.clone(),
+                        elapsed: started.elapsed(),
+                        final_error: Some(e.clone()),
+                    };
+                    cb(&event);
+                }
+                self.reader.cursor_active = false;
+                self.done = true;
+                return Err(e);
+            }
             let new_rid = self.reader.alloc_request_id();
             self.request_id = new_rid;
             self.encoded_request =
@@ -2681,6 +2827,19 @@ impl<'r> Cursor<'r> {
                 None => fmt!(InvalidApiCall, "cursor is terminal; add_credit not allowed"),
             });
         }
+        // Same first-cause capture as `next_batch`: without it a cursor
+        // killed here reads as a clean EOF on the next `next_batch`.
+        let result = self.add_credit_inner(additional_bytes);
+        if let Err(e) = &result
+            && self.done
+            && self.terminal_error.is_none()
+        {
+            self.terminal_error = Some(e.clone());
+        }
+        result
+    }
+
+    fn add_credit_inner(&mut self, additional_bytes: u64) -> Result<()> {
         let first_err = match self.send_credit_frame(additional_bytes) {
             Ok(()) => return Ok(()),
             Err(e) => e,
@@ -3261,6 +3420,7 @@ fn map_server_status(
         S::SecurityError => C::ServerSecurityError,
         S::Cancelled => C::Cancelled,
         S::LimitExceeded => C::ServerLimitExceeded,
+        S::QueryTimeout => C::QueryTimeout,
     };
     crate::Error::new(code, message)
 }
@@ -3367,6 +3527,90 @@ mod tests {
         assert_eq!(i64::from_le_bytes(id_bytes), OLD_RID);
     }
 
+    /// The flag word `execute()` derives from the capability bits. Pinned
+    /// here as a truth table so the cap-gating cannot regress into
+    /// "always send" (which an older server rejects) or "never send".
+    #[test]
+    fn query_flag_derivation_matrix() {
+        use crate::egress::wire::capabilities::{CAP_QUERY_FLAGS, CAP_QUERY_TIMEOUT, CAP_ZONE};
+
+        /// `None` = execute() must fail fast.
+        fn derive(caps: u32, reset_dict: bool, timeout_ms: u64) -> Option<u64> {
+            derive_query_flags(caps, reset_dict, timeout_ms).ok()
+        }
+
+        let both = CAP_QUERY_FLAGS | CAP_QUERY_TIMEOUT;
+
+        // No timeout requested: unchanged behaviour on every server.
+        assert_eq!(derive(0, false, 0), Some(0));
+        assert_eq!(
+            derive(0, true, 0),
+            Some(0),
+            "no caps -> dict reset degrades"
+        );
+        assert_eq!(
+            derive(CAP_QUERY_FLAGS, true, 0),
+            Some(QUERY_FLAG_RESET_DICT)
+        );
+
+        // Timeout requested against a capable server.
+        assert_eq!(derive(both, false, 1_000), Some(QUERY_FLAG_TIMEOUT));
+        assert_eq!(
+            derive(both, true, 1_000),
+            Some(QUERY_FLAG_RESET_DICT | QUERY_FLAG_TIMEOUT),
+            "both bits ride in one flags word"
+        );
+        assert_eq!(
+            derive(both | CAP_ZONE, false, 1_000),
+            Some(QUERY_FLAG_TIMEOUT),
+            "unrelated capability bits must not disturb the derivation"
+        );
+
+        // Timeout requested against a server that cannot honour it.
+        assert_eq!(derive(0, false, 1_000), None, "no capabilities at all");
+        assert_eq!(
+            derive(CAP_QUERY_FLAGS, false, 1_000),
+            None,
+            "flags trailer but no timeout support"
+        );
+        assert_eq!(
+            derive(CAP_QUERY_TIMEOUT, false, 1_000),
+            None,
+            "timeout bit without the flags trailer it rides in"
+        );
+    }
+
+    #[test]
+    fn missing_timeout_capability_is_unsupported_server_not_query_timeout() {
+        use crate::egress::wire::capabilities::{CAP_QUERY_FLAGS, CAP_QUERY_TIMEOUT};
+
+        for caps in [0, CAP_QUERY_FLAGS, CAP_QUERY_TIMEOUT] {
+            let err = require_query_timeout(caps, 1_000).expect_err("must refuse");
+            assert_eq!(
+                err.code(),
+                ErrorCode::UnsupportedServer,
+                "caps 0x{caps:08X}"
+            );
+            assert!(err.msg().contains("CAP_QUERY_TIMEOUT"), "{}", err.msg());
+            assert!(err.msg().contains("query.timeout"), "{}", err.msg());
+        }
+        assert!(require_query_timeout(CAP_QUERY_FLAGS | CAP_QUERY_TIMEOUT, 1_000).is_ok());
+        assert!(require_query_timeout(0, 0).is_ok());
+    }
+
+    /// A timeout error must never be in-doubt-free silence: a write that
+    /// timed out may still land, so the code has to be distinguishable
+    /// from a cancel and from a server limit.
+    #[test]
+    fn query_timeout_is_its_own_code() {
+        use crate::egress::wire::msg_kind::StatusCode as S;
+        let timeout = map_server_status(S::QueryTimeout, "too slow".to_string());
+        assert_eq!(timeout.code(), ErrorCode::QueryTimeout);
+        assert_ne!(timeout.code(), ErrorCode::Cancelled);
+        assert_ne!(timeout.code(), ErrorCode::ServerLimitExceeded);
+        assert_eq!(timeout.msg(), "too slow");
+    }
+
     /// Exhaustively pin `is_failover_eligible` against every
     /// `ErrorCode` variant. The function is a single `matches!` arm
     /// today; this guards against (a) silently dropping an arm
@@ -3414,6 +3658,11 @@ mod tests {
             LimitExceeded,
             ServerLimitExceeded,
             Cancelled,
+            // A timeout is the server having done exactly what it was
+            // told. Replaying it on another endpoint would re-run the
+            // work under the same budget and, for a write, risk applying
+            // a statement the first attempt may already have applied.
+            QueryTimeout,
         ] {
             assert!(
                 !is_failover_eligible(code),
@@ -3441,6 +3690,7 @@ mod tests {
             (S::SecurityError, C::ServerSecurityError),
             (S::Cancelled, C::Cancelled),
             (S::LimitExceeded, C::ServerLimitExceeded),
+            (S::QueryTimeout, C::QueryTimeout),
         ];
 
         for (status, expected_code) in cases {
