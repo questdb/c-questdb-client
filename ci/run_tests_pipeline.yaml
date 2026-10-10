@@ -468,8 +468,8 @@ stages:
           - bash: |
               set -eux
               sudo apt-get update
-              sudo apt-get install -y --no-install-recommends cmake python3-numpy python3-pip
-              sudo python3 -m pip install --break-system-packages pyarrow polars
+              sudo apt-get install -y --no-install-recommends cmake python3-pip
+              sudo python3 -m pip install --break-system-packages 'numpy>=2' pyarrow polars
               JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
               JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
               for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
