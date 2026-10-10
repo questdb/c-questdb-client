@@ -51,9 +51,10 @@ pub enum OidcErrorKind {
     /// cannot be discovered, or a required argument is missing).
     Config,
 
-    /// A retryable network or refresh-coordination failure. After an ambiguous
-    /// refresh response, the parent token is discarded and a later retry may
-    /// require a fresh interactive sign-in.
+    /// A retryable network or refresh-coordination failure. Transient HTTP
+    /// refresh responses retain the parent token for a later backed-off retry.
+    /// A genuinely ambiguous post-dispatch refresh failure instead discards the
+    /// parent and is reported as [`InteractionRequired`](Self::InteractionRequired).
     Network,
 
     /// The OAuth 2.0 device authorization grant failed; the IdP

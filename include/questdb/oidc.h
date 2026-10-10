@@ -912,7 +912,19 @@ bool questdb_error_oidc_get_view(
  * more and replay the request or handshake if it changed. If the server
  * rejected a token before it expired -- it was revoked, or the server rotated
  * its signing key -- that re-resolution refreshes it instead of presenting it
- * again, at most once every 30 seconds per auth.
+ * again, at most once every 30 seconds per auth, when a refresh token exists.
+ * Without one, the provider keeps the still-valid cached token until expiry: a
+ * 401 can also mean that QuestDB's own userinfo lookup failed temporarily.
+ *
+ * A refresh response with HTTP 408, 429 or 5xx, or the OAuth
+ * `temporarily_unavailable` error, retains the refresh token in memory and in
+ * the configured store and is retried by later calls under backoff (including
+ * Retry-After when supplied). A status-less transport
+ * failure after request dispatch is genuinely ambiguous: the identity
+ * provider may have rotated the parent but lost the response. In that case the
+ * parent is discarded and QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED explicitly
+ * reports that a new sign-in is required. A non-transient refresh rejection
+ * also discards the rejected parent and reports the same non-retryable kind.
  *
  * Mutually exclusive with static credentials: the opts must not also carry
  * `username`/`password` or `token` (whether set through the config string or
@@ -927,6 +939,10 @@ bool questdb_error_oidc_get_view(
  * sent in cleartext on every flush or connect and can be captured in transit.
  * Nothing rejects or warns about that configuration; reserve plaintext for a
  * loopback server.
+ *
+ * Identity-provider and QuestDB discovery requests connect directly. They do
+ * not honor HTTPS_PROXY, ALL_PROXY, or their lowercase variants, and this API
+ * has no OIDC proxy setting.
  *
  * A flush or connect that needs a fresh credential resolves it BEFORE its
  * first request, and that resolution can wait behind a refresh already running

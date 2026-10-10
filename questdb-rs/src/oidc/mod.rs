@@ -99,10 +99,22 @@
 //! token, a JWT is bounded by its own signed `exp` claim and the IdP's reported
 //! lifetime, with no arbitrary one-hour ceiling. An opaque token has no signed
 //! expiry the client can verify, so its believed lifetime is capped at one hour
-//! even without a refresh token. Token-provider callbacks never start a device
+//! even without a refresh token. An already-cached credential remains on the
+//! immediate fast path until that believed lifetime actually expires; the
+//! 30-second issuance/refresh skew does not stall transports while the token is
+//! still valid. Token-provider callbacks never start a device
 //! flow: after either expiry bound, the transport operation receives
 //! `InteractionRequired` instead of displaying a prompt or waiting for user
 //! input. Request `offline_access` (above) for unattended, long-running clients.
+//!
+//! A silent refresh that receives HTTP 408, 429 or 5xx, or the OAuth
+//! `temporarily_unavailable` error, retains its refresh token (including in a
+//! configured store) and later retries under bounded exponential/`Retry-After`
+//! backoff. A status-less failure after the request
+//! may have been dispatched is genuinely ambiguous: the IdP may have rotated
+//! the parent and lost the response, so the provider discards it and returns
+//! `InteractionRequired` with an explicit sign-in instruction rather than
+//! suggesting an unsafe blind retry.
 //!
 //! # Persisting the token across restarts
 //!

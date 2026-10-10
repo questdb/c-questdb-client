@@ -2891,10 +2891,10 @@ fn allow_insecure_does_not_relax_idp_endpoints() {
 // -- refresh branches --------------------------------------------------------
 
 #[test]
-fn refresh_transient_error_discards_ambiguous_parent() {
-    // A 5xx can be synthesized by an intermediary after the IdP consumed the
-    // rotating parent. Surface a Network error, discard the ambiguous parent,
-    // and require a fresh explicit sign-in on the next lookup.
+fn refresh_transient_error_keeps_parent_for_backoff_retry() {
+    // A routine provider outage must not destroy an unattended session. Surface
+    // a retryable error, retain the rotating parent, and let the refresh backoff
+    // pace the next attempt.
     let device_calls = Arc::new(AtomicUsize::new(0));
     let refresh_calls = Arc::new(AtomicUsize::new(0));
     let mock = {
@@ -2922,23 +2922,71 @@ fn refresh_transient_error_discards_ambiguous_parent() {
     };
     let auth = explicit_auth(&mock, false);
     assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
-    // Force the cached token to look expired so the next call must refresh.
-    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
-    let err = auth.token().unwrap_err();
+    // Model the transport's retry after QuestDB answered a still-valid token
+    // with 401. The forced refresh must not destroy the session when the IdP is
+    // temporarily unavailable.
+    let err = token_after_401(&auth, "AT-initial").unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Network);
     assert_eq!(err.status(), Some(503));
-    assert!(err.message().contains("refresh token was discarded"));
-    assert!(err.message().contains("Sign in again"));
-    assert_eq!(auth.token_set().unwrap().refresh_token, None);
+    assert!(err.message().contains("refresh token was retained"));
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-1")
+    );
     let next = auth.token().unwrap_err();
-    assert_eq!(next.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(next.kind(), OidcErrorKind::Network);
+    assert!(next.message().contains("backed off"));
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
+fn cached_token_is_served_until_actual_expiry_without_proactive_stall() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#
+                    .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+
+    // The old 30-second skew made this synchronous token lookup perform an IdP
+    // round-trip. A credential that has not actually expired must stay on the
+    // cache-only fast path.
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = now_epoch() + 5.0;
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
+
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    assert_eq!(auth.token().unwrap(), "AT-refreshed");
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn refresh_transient_responses_preserve_structured_metadata() {
     let cases = [
+        (
+            400,
+            r#"{"error":"temporarily_unavailable","error_description":"provider maintenance"}"#,
+            Some("temporarily_unavailable"),
+            Some("provider maintenance"),
+        ),
         (
             408,
             r#"{"error":"temporarily_unavailable","error_description":"request timed out"}"#,
@@ -2990,7 +3038,10 @@ fn refresh_transient_responses_preserve_structured_metadata() {
         assert_eq!(err.idp_error(), expected_error);
         assert_eq!(err.idp_error_description(), expected_description);
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(auth.token_set().unwrap().refresh_token, None);
+        assert_eq!(
+            auth.token_set().unwrap().refresh_token.as_deref(),
+            Some("RT-1")
+        );
         assert_eq!(
             device_calls.load(Ordering::SeqCst),
             1,
@@ -3097,6 +3148,8 @@ fn refresh_rejected_requires_explicit_device_flow() {
     auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
     let err = auth.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(err.status(), Some(400));
+    assert!(err.message().contains("refresh token was discarded"));
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
     auth.sign_in().unwrap();
     assert_eq!(auth.token().unwrap(), "AT-2");
@@ -3851,6 +3904,7 @@ struct FailingSaveStore {
     /// Publish the entry, then fail as if a post-publish durability step had.
     publish_then_fail_save: Arc<AtomicBool>,
     fail_clear: Arc<AtomicBool>,
+    fail_clear_after_delete: Arc<AtomicBool>,
     operations: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
@@ -3899,6 +3953,11 @@ impl TokenStore for FailingSaveStore {
             return Err(Box::new(std::io::Error::other("injected clear failure")));
         }
         *self.token.lock().unwrap() = None;
+        if self.fail_clear_after_delete.load(Ordering::SeqCst) {
+            return Err(Box::new(std::io::Error::other(
+                "injected post-delete clear failure",
+            )));
+        }
         Ok(())
     }
 
@@ -4607,7 +4666,7 @@ fn refresh_only_persisted_entry_is_rejected_in_both_token_modes() {
 }
 
 #[test]
-fn transient_refresh_failure_rechecks_shared_store_then_throttles() {
+fn transient_refresh_failure_rechecks_retained_shared_store_then_backs_off() {
     let mock = MockServer::start(move |method, path, body| match (method, path) {
         ("POST", "/token") if body.contains("grant_type=refresh_token") => {
             (503, r#"{"error":"temporarily_unavailable"}"#.to_string())
@@ -4638,18 +4697,16 @@ fn transient_refresh_failure_rechecks_shared_store_then_throttles() {
         );
     }
 
-    // The first re-read is immediate, even though the refresh just failed. If
-    // it finds nothing, only then does the ordinary empty-store throttle start.
-    assert_eq!(
-        auth.token().unwrap_err().kind(),
-        OidcErrorKind::InteractionRequired
-    );
+    // The first re-read is immediate, even though the refresh just failed. It
+    // finds the restored parent; refresh backoff then prevents a second request
+    // from turning every flush into IdP traffic during the outage.
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Network);
     assert!(
         auth.store_state
             .lock()
             .unwrap()
             .next_empty_load_recheck
-            .is_some()
+            .is_none()
     );
     let load_count = || {
         store
@@ -4660,12 +4717,13 @@ fn transient_refresh_failure_rechecks_shared_store_then_throttles() {
             .filter(|&&op| op == "load")
             .count()
     };
-    assert_eq!(load_count(), 3); // initial load, refresh re-read, empty re-check
+    assert_eq!(load_count(), 3); // initial load, refresh re-read, retained-parent re-check
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Network);
     assert_eq!(
-        auth.token().unwrap_err().kind(),
-        OidcErrorKind::InteractionRequired
+        load_count(),
+        3,
+        "the retained store was re-read on every flush"
     );
-    assert_eq!(load_count(), 3, "an empty store was re-read on every flush");
 }
 
 #[test]
@@ -5527,7 +5585,7 @@ fn clear_deletes_the_persisted_entry() {
     sign_in_and_token(&auth).unwrap();
     assert!(reader.load(&key).unwrap().is_some());
 
-    auth.clear();
+    auth.clear().unwrap();
     assert!(
         reader.load(&key).unwrap().is_none(),
         "clear() must delete the persisted entry"
@@ -6040,7 +6098,7 @@ fn a_rejected_refresh_does_not_strand_the_provider_against_a_peer_sign_in() {
     // `load_attempted` means "the store has been folded into this cache", which
     // holds only while the adopted credential still exists. A refresh the IdP
     // rejects ends that: `refresh_under_lock` consumes and deletes the persisted
-    // parent before submitting it, to prevent refresh-token reuse, and scrubs
+    // parent at request dispatch, to prevent refresh-token reuse, and scrubs
     // the in-memory copy alongside it. The provider was then left holding
     // nothing while the latch still claimed the store had been consumed, so
     // every later `token()` short-circuited the read and returned
@@ -6213,8 +6271,9 @@ fn lost_refresh_response_consumes_parent_before_retry() {
                 // 0 == drop the connection: an ambiguous post-send transport
                 // failure with NO HTTP status. The IdP may have consumed and
                 // rotated RT-1 before the response was lost, so the parent must
-                // stay discarded. A received transient status is ambiguous for
-                // the same reason: an intermediary may have generated it.
+                // stay discarded. Unlike an explicit retryable HTTP status,
+                // this gives the client no evidence that a later retry is the
+                // provider's requested recovery path.
                 return (0, String::new());
             }
             (404, "{}".to_string())
@@ -6231,7 +6290,8 @@ fn lost_refresh_response_consumes_parent_before_retry() {
     let auth = auth_with_failing_store(&mock, store.clone(), false);
 
     let err = auth.token().unwrap_err();
-    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert!(err.message().contains("refresh token was discarded"));
     assert!(store.token().is_none());
     assert_eq!(auth.token_set().unwrap().refresh_token, None);
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
@@ -6267,7 +6327,8 @@ fn refresh_ambiguous_transport_failure_discards_in_memory_parent() {
     *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
 
     let err = auth.token().unwrap_err();
-    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert!(err.message().contains("refresh token was discarded"));
     assert_eq!(
         auth.token_set().unwrap().refresh_token,
         None,
@@ -6566,9 +6627,48 @@ fn refresh_pre_send_failure_keeps_persisted_parent() {
 }
 
 #[test]
-fn transient_status_refresh_discards_persisted_parent() {
-    // A proxy can return 503 after the IdP consumed and rotated RT-1. The parent
-    // is therefore ambiguous and must remain tombstoned on disk and in memory.
+fn refresh_repersists_parent_when_dispatch_delete_reports_an_error() {
+    let refresh_posts = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_posts = Arc::clone(&refresh_posts);
+        MockServer::start(move |method, path, _body| {
+            if (method, path) == ("POST", "/token") {
+                refresh_posts.fetch_add(1, Ordering::SeqCst);
+            }
+            (500, "{}".to_string())
+        })
+    };
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-parent".to_string()),
+        1.0,
+        300.0,
+    ));
+    // Model a directory-fsync/lease-style failure reported after the entry was
+    // already removed. The dispatch callback must restore the credential and
+    // abort before a request byte is sent.
+    store.fail_clear_after_delete.store(true, Ordering::SeqCst);
+    let auth = auth_with_failing_store(&mock, store.clone(), false);
+
+    let error = auth.token().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Network);
+    assert!(error.request_unsent());
+    assert!(error.message().contains("post-delete clear failure"));
+    assert_eq!(refresh_posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store
+            .token()
+            .and_then(|token| token.refresh_token().map(str::to_string)),
+        Some("RT-parent".to_string())
+    );
+}
+
+#[test]
+fn transient_status_refresh_restores_persisted_parent() {
+    // A retryable status restores the dispatch-time tombstone before releasing
+    // the cross-process lock, so this process, peers and restarts can recover.
     let refresh_calls = Arc::new(AtomicUsize::new(0));
     let mock = {
         let refresh_calls = Arc::clone(&refresh_calls);
@@ -6590,25 +6690,71 @@ fn transient_status_refresh_discards_persisted_parent() {
     ));
     let auth = auth_with_failing_store(&mock, store.clone(), false);
 
-    // The transient 503 surfaces a Network error, and RT-1 stays consumed.
+    // The transient 503 surfaces a Network error, and RT-1 remains available.
     let err = auth.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Network);
     assert_eq!(err.status(), Some(503));
-    assert!(err.message().contains("refresh token was discarded"));
-    assert!(err.message().contains("Sign in again"));
+    assert!(err.message().contains("refresh token was retained"));
     assert_eq!(
         store
             .token()
             .and_then(|t| t.refresh_token().map(str::to_string)),
-        None,
-        "a transient 503 must consume the ambiguous persisted refresh token"
+        Some("RT-1".to_string()),
+        "a transient 503 must restore the persisted refresh token"
     );
     assert_eq!(
         auth.token_set().and_then(|t| t.refresh_token.clone()),
-        None,
-        "the in-memory refresh token must not survive a transient 503"
+        Some("RT-1".to_string()),
+        "the in-memory refresh token must survive a transient 503"
     );
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn transient_status_refresh_keeps_file_store_entry_for_restart() {
+    let mock = MockServer::start(move |method, path, body| {
+        if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+            return (503, r#"{"error":"temporarily_unavailable"}"#.to_string());
+        }
+        (404, "{}".to_string())
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let store = test_file_store(dir.path());
+    store
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT-current".to_string()),
+                None,
+                Some("RT-file".to_string()),
+                now_epoch() + 300.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(auth.token().unwrap(), "AT-current");
+    let error = token_after_401(&auth, "AT-current").unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Network);
+    assert_eq!(error.status(), Some(503));
+    drop(auth);
+
+    let persisted = store
+        .load(&key)
+        .unwrap()
+        .expect("transient refresh deleted the file-store entry");
+    assert_eq!(persisted.refresh_token(), Some("RT-file"));
+
+    // A new provider can still adopt the persisted session after a
+    // process-style restart; recovery no longer needs a human sign-in.
+    let restarted = auth_with_store(&mock, dir.path());
+    assert_eq!(restarted.token().unwrap(), "AT-current");
+    assert_eq!(
+        store.load(&key).unwrap().unwrap().refresh_token(),
+        Some("RT-file")
+    );
 }
 
 #[test]
@@ -7142,7 +7288,7 @@ fn refresh_backoff_escalates_and_caps() {
     let start = Instant::now();
 
     for expected in [5u64, 10, 20, 40, 60, 60] {
-        state.record_refresh_failure(start);
+        state.record_refresh_failure(start, None);
         assert!(
             state.refresh_backed_off(
                 start + Duration::from_secs(expected) - Duration::from_millis(1)
@@ -7159,8 +7305,16 @@ fn refresh_backoff_escalates_and_caps() {
     // provider is not left waiting a minute between attempts.
     state.reset_refresh_backoff();
     assert!(!state.refresh_backed_off(start));
-    state.record_refresh_failure(start);
+    state.record_refresh_failure(start, None);
     assert!(!state.refresh_backed_off(start + Duration::from_secs(5)));
+
+    state.reset_refresh_backoff();
+    state.record_refresh_failure(start, Some(11));
+    assert!(state.refresh_backed_off(start + Duration::from_secs(10)));
+    assert!(
+        !state.refresh_backed_off(start + Duration::from_secs(11)),
+        "Retry-After must extend the first refresh delay"
+    );
 }
 
 // -- review fixes ------------------------------------------------------------
@@ -7792,6 +7946,40 @@ fn a_token_the_server_rejected_is_refreshed_instead_of_served_again() {
     // The replacement is cached like any other token.
     assert_eq!(auth.token().unwrap(), "AT-refreshed-1");
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_401_does_not_drop_a_valid_token_without_a_refresh_token() {
+    // QuestDB can answer 401 when its own userinfo lookup is temporarily down.
+    // Entra, Okta and Auth0 commonly issue no refresh token for the default
+    // `openid` scope, so there is no silent replacement to force. Keep the
+    // still-valid token until expiry instead of locking every shared transport
+    // out behind InteractionRequired.
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refreshes = Arc::clone(&refreshes);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                (500, r#"{"error":"must_not_refresh"}"#.to_string())
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-no-refresh","expires_in":300}"#.to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    auth.sign_in().unwrap();
+
+    assert_eq!(
+        token_after_401(&auth, "AT-no-refresh").unwrap(),
+        "AT-no-refresh"
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    assert!(auth.lock_rejected().digest.is_none());
 }
 
 #[test]

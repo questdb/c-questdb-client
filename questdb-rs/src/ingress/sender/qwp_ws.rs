@@ -4536,14 +4536,19 @@ pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> 
                 sleep_for,
                 deadline: reconnect_deadline,
             }) => {
+                // A retryable provider/connect failure keeps the driver in
+                // `Waiting`. Once the outer close budget expires, the sleep
+                // helper returns immediately; without this check the loop
+                // drives reconnect continuously, spins a core and never lets
+                // close (or a language runtime's Ctrl-C handling) return.
+                if backpressure_deadline_expired(deadline) {
+                    return Err(qwp_ws_manual_close_timeout_error(state));
+                }
                 sleep_before_manual_reconnect(reconnect_deadline, sleep_for, deadline);
             }
             Ok(CloseOutcome::Timeout) => {
                 if backpressure_deadline_expired(deadline) {
-                    return Err(error::fmt!(
-                        SocketError,
-                        "QWP/WebSocket close drain timed out before all published frames were acknowledged"
-                    ));
+                    return Err(qwp_ws_manual_close_timeout_error(state));
                 }
                 thread::sleep(BACKPRESSURE_PARK);
             }
@@ -4648,6 +4653,18 @@ fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Re
         .terminal_error()
         .cloned()
         .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")))
+}
+
+fn qwp_ws_manual_close_timeout_error(state: &ManualQwpWsHandlerState) -> crate::Error {
+    let prefix =
+        "QWP/WebSocket close drain timed out before all published frames were acknowledged";
+    match state.store.reconnect_failure() {
+        Some(cause) => cause.clone().reclassified(
+            crate::ErrorCode::SocketError,
+            format!("{prefix}; the latest reconnect failed: {}", cause.msg()),
+        ),
+        None => error::fmt!(SocketError, "{prefix}"),
+    }
 }
 
 fn double_duration(duration: Duration) -> Duration {

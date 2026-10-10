@@ -29,12 +29,13 @@
 //! redirects, bounding the response body, and holding every IdP call to `https`
 //! (or loopback `http`).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
 use std::io::{Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
@@ -134,7 +135,7 @@ pub(crate) struct HttpClient {
 /// to the connector: trusting the name alone lets a poisoned hosts/NSS/DNS
 /// configuration send device or refresh credentials off-machine in plaintext.
 #[derive(Debug, Default)]
-struct OidcResolver(DefaultResolver);
+struct OidcResolver;
 
 impl Resolver for OidcResolver {
     fn resolve(
@@ -143,7 +144,55 @@ impl Resolver for OidcResolver {
         config: &ureq::config::Config,
         timeout: NextTimeout,
     ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
-        let addresses = self.0.resolve(uri, config, timeout)?;
+        let scheme = uri.scheme().ok_or(ureq::Error::HostNotFound)?;
+        let authority = uri.authority().ok_or(ureq::Error::HostNotFound)?;
+        let address =
+            DefaultResolver::host_and_port(scheme, authority).ok_or(ureq::Error::HostNotFound)?;
+
+        // ureq's DefaultResolver uses `thread::spawn` for every timed lookup;
+        // that panics when the OS refuses a thread. The shipped FFI uses
+        // panic=abort, turning ordinary resource exhaustion into termination of
+        // the host process. The same bounded resolver with Builder::spawn makes
+        // creation failure an ordinary retryable I/O error instead.
+        let resolved: Vec<SocketAddr> = if timeout.after.is_not_happening() {
+            address.to_socket_addrs()?.collect()
+        } else {
+            let (tx, rx) = mpsc::sync_channel(1);
+            thread::Builder::new()
+                .name("questdb-oidc-dns".to_string())
+                .spawn(move || {
+                    let _ = tx.send(
+                        address
+                            .to_socket_addrs()
+                            .map(|addresses| addresses.collect::<Vec<_>>()),
+                    );
+                })
+                .map_err(ureq::Error::Io)?;
+            match rx.recv_timeout(*timeout.after) {
+                Ok(addresses) => addresses?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(ureq::Error::Timeout(timeout.reason));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ureq::Error::Io(std::io::Error::other(
+                        "OIDC DNS resolver worker exited without a result",
+                    )));
+                }
+            }
+        };
+
+        let mut addresses = self.empty();
+        // `ResolvedSocketAddrs` is ureq's fixed 16-address ArrayVec.
+        for address in config
+            .ip_family()
+            .keep_wanted(resolved.into_iter())
+            .take(16)
+        {
+            addresses.push(address);
+        }
+        if addresses.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
         enforce_plaintext_localhost_resolution(uri, &addresses)?;
         Ok(addresses)
     }
@@ -225,7 +274,7 @@ impl HttpClient {
             .timeout_global(Some(timeout))
             .timeout_connect(Some(timeout))
             .build();
-        let agent = ureq::Agent::with_parts(config, connector, OidcResolver::default());
+        let agent = ureq::Agent::with_parts(config, connector, OidcResolver);
         Ok(HttpClient { agent, timeout })
     }
 
@@ -270,7 +319,28 @@ impl HttpClient {
         form: &[(&str, &str)],
         allow_insecure: bool,
     ) -> Result<PostResult> {
-        self.post_form_within(url, form, allow_insecure, None)
+        self.post_form_within_inner::<fn() -> Result<()>>(url, form, allow_insecure, None, None)
+    }
+
+    /// As [`post_form`](Self::post_form), but run `before_dispatch` immediately
+    /// before the first HTTP request byte is handed to the transport.
+    ///
+    /// Refresh-token persistence uses this boundary to publish its durable
+    /// anti-replay tombstone as late as possible: DNS, TCP and TLS failures do
+    /// not consume the stored parent, while no request byte can leave before a
+    /// successful tombstone. If the callback fails, the request is aborted and
+    /// its original structured [`OidcError`] is returned.
+    pub(crate) fn post_form_at_dispatch<F>(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+        allow_insecure: bool,
+        before_dispatch: F,
+    ) -> Result<PostResult>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.post_form_within_inner(url, form, allow_insecure, None, Some(before_dispatch))
     }
 
     /// As [`post_form`](Self::post_form), but additionally bounds this one
@@ -290,6 +360,20 @@ impl HttpClient {
         allow_insecure: bool,
         budget: Option<Duration>,
     ) -> Result<PostResult> {
+        self.post_form_within_inner::<fn() -> Result<()>>(url, form, allow_insecure, budget, None)
+    }
+
+    fn post_form_within_inner<F>(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+        allow_insecure: bool,
+        budget: Option<Duration>,
+        before_dispatch: Option<F>,
+    ) -> Result<PostResult>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         require_secure(url, allow_insecure)?;
         let request = self.agent.post(url).header("Accept", "application/json");
         let request = match budget {
@@ -300,17 +384,31 @@ impl HttpClient {
             None => request,
         };
         REQUEST_DISPATCHED.with(|dispatched| dispatched.set(false));
-        let response = request.send_form(form.iter().copied()).map_err(|e| {
-            // Record whether the request provably never left the client, so a
-            // refresh caller can safely keep a refresh token that the IdP
-            // cannot have seen (vs. an ambiguous mid-flight drop, where the
-            // parent may have been consumed and rotated).
-            let unsent = !REQUEST_DISPATCHED.with(Cell::get);
-            let timed_out = request_timed_out(&e);
-            OidcError::network(format!("Failed to reach {url}: {e}"))
-                .with_request_unsent(unsent)
-                .with_request_timed_out(timed_out)
-        })?;
+        let mut hook_state = DispatchHookState::new(before_dispatch);
+        let response = {
+            let _hook = DispatchHookGuard::install(&mut hook_state);
+            request.send_form(form.iter().copied())
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(e) => {
+                // A failure in the dispatch callback is local and the transport
+                // has received no request byte. Preserve its exact diagnostic
+                // instead of replacing it with ureq's synthetic I/O error.
+                if let Some(error) = hook_state.error.take() {
+                    return Err(error);
+                }
+                // Record whether the request provably never left the client, so a
+                // refresh caller can safely keep a refresh token that the IdP
+                // cannot have seen (vs. an ambiguous mid-flight drop, where the
+                // parent may have been consumed and rotated).
+                let unsent = !REQUEST_DISPATCHED.with(Cell::get);
+                let timed_out = request_timed_out(&e);
+                return Err(OidcError::network(format!("Failed to reach {url}: {e}"))
+                    .with_request_unsent(unsent)
+                    .with_request_timed_out(timed_out));
+            }
+        };
         let status = response.status().as_u16();
         let retry_after = parse_retry_after(response.headers());
         // Keep the raw response allocation under RAII zeroization as well as the
@@ -526,6 +624,93 @@ thread_local! {
     /// Thread-local is sound here: `ureq` runs the connector chain and every
     /// transport write of a request on the thread that issued it.
     static REQUEST_DISPATCHED: Cell<bool> = const { Cell::new(false) };
+
+    /// Request-scoped callback installed by [`HttpClient::post_form_at_dispatch`].
+    ///
+    /// ureq's connector and transport traits are `'static`, while the token
+    /// store and key borrowed by a refresh are not. Keep only a type-erased
+    /// pointer for the strictly synchronous `send_form` call, with an RAII guard
+    /// that removes it before the borrowed callback leaves scope. ureq performs
+    /// every write on the calling thread, the same invariant used by
+    /// [`REQUEST_DISPATCHED`].
+    static BEFORE_REQUEST_DISPATCH: RefCell<Option<ErasedDispatchHook>> = const {
+        RefCell::new(None)
+    };
+}
+
+struct DispatchHookState<F> {
+    hook: Option<F>,
+    error: Option<OidcError>,
+}
+
+impl<F> DispatchHookState<F> {
+    fn new(hook: Option<F>) -> Self {
+        Self { hook, error: None }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ErasedDispatchHook {
+    state: *mut (),
+    invoke: unsafe fn(*mut ()) -> bool,
+}
+
+fn invoke_dispatch_hook<F>(state: *mut ()) -> bool
+where
+    F: FnOnce() -> Result<()>,
+{
+    // SAFETY: `DispatchHookGuard` installs a pointer to a live
+    // `DispatchHookState<F>` only for the synchronous `send_form` call on this
+    // thread, and clears it before that state can leave scope.
+    let state = unsafe { &mut *state.cast::<DispatchHookState<F>>() };
+    let Some(hook) = state.hook.take() else {
+        return true;
+    };
+    match hook() {
+        Ok(()) => true,
+        Err(error) => {
+            state.error = Some(error);
+            false
+        }
+    }
+}
+
+struct DispatchHookGuard;
+
+impl DispatchHookGuard {
+    fn install<F>(state: &mut DispatchHookState<F>) -> Option<Self>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        state.hook.as_ref()?;
+        BEFORE_REQUEST_DISPATCH.with(|slot| {
+            let previous = slot.borrow_mut().replace(ErasedDispatchHook {
+                state: std::ptr::from_mut(state).cast(),
+                invoke: invoke_dispatch_hook::<F>,
+            });
+            debug_assert!(previous.is_none(), "nested OIDC dispatch hook");
+        });
+        Some(Self)
+    }
+}
+
+impl Drop for DispatchHookGuard {
+    fn drop(&mut self) {
+        BEFORE_REQUEST_DISPATCH.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+fn run_before_request_dispatch() -> bool {
+    BEFORE_REQUEST_DISPATCH.with(|slot| {
+        let hook = *slot.borrow();
+        hook.is_none_or(|hook| {
+            // SAFETY: see `invoke_dispatch_hook`; the guard owns the scoped
+            // validity proof for this erased pointer.
+            unsafe { (hook.invoke)(hook.state) }
+        })
+    })
 }
 
 /// Outermost connector: wraps the finished transport (TCP, or TCP + TLS with
@@ -567,6 +752,39 @@ fn refuse_elapsed_deadline(timeout: NextTimeout) -> std::result::Result<(), ureq
     }
 }
 
+/// Retry a signal-interrupted transport read without restarting its relative
+/// timeout. Plain TCP can surface `EINTR` while ureq is reading the response
+/// head; treating it as a request failure makes a dispatched refresh ambiguous
+/// and forces the parent token to be discarded. TLS happens to retry this in
+/// its own stack. Give plaintext the same behaviour, recomputing the remaining
+/// time against one absolute deadline on every attempt.
+fn retry_interrupted_transport_io<R>(
+    mut timeout: NextTimeout,
+    mut operation: impl FnMut(NextTimeout) -> std::result::Result<R, ureq::Error>,
+) -> std::result::Result<R, ureq::Error> {
+    let deadline = match timeout.after {
+        TimeoutAfter::Exact(after) => Instant::now().checked_add(after),
+        TimeoutAfter::NotHappening => None,
+    };
+    loop {
+        match operation(timeout) {
+            Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                timeout.after = match deadline {
+                    None => TimeoutAfter::NotHappening,
+                    Some(deadline) => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return Err(ureq::Error::Timeout(timeout.reason));
+                        }
+                        TimeoutAfter::Exact(left)
+                    }
+                };
+            }
+            result => return result,
+        }
+    }
+}
+
 impl<T: Transport> Transport for DispatchTrackingTransport<T> {
     fn buffers(&mut self) -> &mut dyn Buffers {
         self.inner.buffers()
@@ -581,6 +799,11 @@ impl<T: Transport> Transport for DispatchTrackingTransport<T> {
             // Before marking the request dispatched: a request that times out
             // here has provably sent nothing.
             refuse_elapsed_deadline(timeout)?;
+            if !run_before_request_dispatch() {
+                return Err(ureq::Error::Io(std::io::Error::other(
+                    "OIDC pre-dispatch callback failed",
+                )));
+            }
             // Set before the write: a write that fails part-way may already
             // have delivered the request.
             REQUEST_DISPATCHED.with(|dispatched| dispatched.set(true));
@@ -597,14 +820,14 @@ impl<T: Transport> Transport for DispatchTrackingTransport<T> {
         if !self.inner.buffers().can_use_input() {
             refuse_elapsed_deadline(timeout)?;
         }
-        self.inner.maybe_await_input(timeout)
+        retry_interrupted_transport_io(timeout, |remaining| self.inner.maybe_await_input(remaining))
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
         if !self.inner.buffers().can_use_input() {
             refuse_elapsed_deadline(timeout)?;
         }
-        self.inner.await_input(timeout)
+        retry_interrupted_transport_io(timeout, |remaining| self.inner.await_input(remaining))
     }
 
     fn is_open(&mut self) -> bool {
@@ -1551,6 +1774,76 @@ mod tests {
         fn is_open(&mut self) -> bool {
             true
         }
+    }
+
+    #[derive(Debug)]
+    struct InterruptedOnceTransport {
+        buffers: LazyBuffers,
+        timeouts: Vec<NextTimeout>,
+    }
+
+    impl InterruptedOnceTransport {
+        fn new() -> Self {
+            Self {
+                buffers: LazyBuffers::new(64, 64),
+                timeouts: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for InterruptedOnceTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(
+            &mut self,
+            _amount: usize,
+            _timeout: NextTimeout,
+        ) -> std::result::Result<(), ureq::Error> {
+            Ok(())
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+            self.timeouts.push(timeout);
+            if self.timeouts.len() == 1 {
+                thread::sleep(Duration::from_millis(10));
+                return Err(ureq::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::Interrupted,
+                )));
+            }
+            Ok(true)
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn interrupted_plaintext_response_head_retries_against_one_deadline() {
+        let timeout = NextTimeout {
+            after: TimeoutAfter::Exact(Duration::from_millis(100)),
+            reason: ureq::Timeout::Global,
+        };
+        let mut transport = DispatchTrackingTransport {
+            inner: InterruptedOnceTransport::new(),
+        };
+        REQUEST_DISPATCHED.with(|dispatched| dispatched.set(true));
+
+        assert!(transport.await_input(timeout).unwrap());
+        assert_eq!(transport.inner.timeouts.len(), 2);
+        let TimeoutAfter::Exact(first) = transport.inner.timeouts[0].after else {
+            panic!("test timeout unexpectedly has no deadline")
+        };
+        let TimeoutAfter::Exact(second) = transport.inner.timeouts[1].after else {
+            panic!("retried timeout unexpectedly has no deadline")
+        };
+        assert!(second < first, "EINTR restarted the response-head timeout");
+        assert!(
+            REQUEST_DISPATCHED.with(Cell::get),
+            "an interrupted response read must not make the refresh look unsent"
+        );
     }
 
     #[test]

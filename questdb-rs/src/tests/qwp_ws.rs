@@ -4365,6 +4365,73 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
 }
 
 #[test]
+fn qwp_ws_manual_close_honors_deadline_while_reconnect_is_waiting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+        // Drop the only listener with the frame still unacknowledged. The next
+        // drive enters the retryable reconnect/provider Waiting state.
+    });
+
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         close_flush_timeout_millis=120;reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=20;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || match provider_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok("initial-token".to_string()),
+                _ => Err(crate::Error::new(
+                    crate::ErrorCode::SocketError,
+                    "refresh failed while closing",
+                )),
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+    assert!(sender.drive_once().unwrap());
+    frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    server.join().unwrap();
+
+    let started = Instant::now();
+    let err = sender
+        .close_drain()
+        .expect_err("unacknowledged close must stop at its configured deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "manual close ignored its deadline: {elapsed:?}"
+    );
+    assert!(err.msg().contains("close drain timed out"), "{err}");
+    assert!(
+        err.msg().contains("refresh failed while closing"),
+        "the timeout must carry the reconnect failure: {err}"
+    );
+    assert!(provider_calls.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
 fn qwp_ws_drop_interrupts_blocked_background_send() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();

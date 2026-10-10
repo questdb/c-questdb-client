@@ -213,7 +213,7 @@ impl StoreState {
     /// `load_attempted` means "the store has already been folded into this
     /// cache", which is true only while the adopted credential still exists. A
     /// refresh the IdP rejects ends that: `refresh_under_lock` consumes and
-    /// deletes the persisted parent before submitting it, to prevent
+    /// deletes the persisted parent at the request-dispatch boundary, to prevent
     /// refresh-token reuse, and scrubs the in-memory copy alongside it. The
     /// provider then holds nothing while the latch still claims the store was
     /// consumed, so every later `token()` short-circuits the read and returns
@@ -258,13 +258,23 @@ impl StoreState {
     /// `record_store_load_failure` the first failure already waits: this guard
     /// exists to stop one POST per flush, so an immediate first retry would
     /// defeat it.
-    fn record_refresh_failure(&mut self, now: Instant) {
-        let delay = if self.refresh_retry_interval.is_zero() {
+    fn record_refresh_failure(&mut self, now: Instant, retry_after_secs: Option<u64>) {
+        let ladder_delay = if self.refresh_retry_interval.is_zero() {
             MIN_REFRESH_RETRY_INTERVAL
         } else {
             self.refresh_retry_interval
         };
-        self.refresh_retry_interval = delay.saturating_mul(2).min(MAX_REFRESH_RETRY_INTERVAL);
+        self.refresh_retry_interval = ladder_delay
+            .saturating_mul(2)
+            .min(MAX_REFRESH_RETRY_INTERVAL);
+        // Respect a provider/WAF rate-limit hint without letting an untrusted
+        // header suspend an unattended client for years. The same 60-second
+        // ceiling bounds the exponential ladder.
+        let retry_after = retry_after_secs
+            .map(Duration::from_secs)
+            .unwrap_or_default()
+            .min(MAX_REFRESH_RETRY_INTERVAL);
+        let delay = ladder_delay.max(retry_after);
         self.next_refresh_attempt = Some(now + delay);
     }
 }
@@ -1096,22 +1106,17 @@ impl OidcDeviceAuth {
         self.obtain_tokens(true, abort_wait).map(|_| ())
     }
 
-    /// Best-effort form of [`try_clear`](Self::try_clear): every failure is
-    /// logged rather than returned.
-    ///
     /// It forgets the in-memory token even when deleting the persisted entry
     /// fails. It clears **nothing** while an interactive
     /// [`sign_in`](Self::sign_in) runs on another thread -- that sign-in then
     /// caches and persists a fresh credential -- because it will not wait
-    /// behind a device flow. The C, C++ and Python bindings report that case as
-    /// an error; use [`try_clear`](Self::try_clear) whenever the caller must know
-    /// whether anything was cleared, and call
+    /// behind a device flow. Persistence and coordination failures are returned
+    /// so a Rust sign-out cannot silently leave a plaintext refresh token on
+    /// disk. Call
     /// [`cancel_sign_in`](Self::cancel_sign_in) first to sign out during a
     /// sign-in.
-    pub fn clear(&self) {
-        if let Err(error) = self.try_clear() {
-            log::warn!("questdb oidc: {error}");
-        }
+    pub fn clear(&self) -> Result<()> {
+        self.try_clear()
     }
 
     /// Forget the cached token and delete any persisted [`TokenStore`] entry.
@@ -1324,6 +1329,14 @@ impl OidcDeviceAuth {
             let serving = self
                 .lock_tokens()
                 .as_ref()
+                // A 401 can be QuestDB reporting its own transient userinfo
+                // failure, not a rejected bearer token. Without a refresh token
+                // there is no silent replacement to ask the IdP for anyway, so
+                // rejecting this still-valid token only locks every transport
+                // sharing the provider out until a human signs in. Keep serving
+                // it until its real expiry; a restart would do the same from the
+                // persisted entry.
+                .filter(|tokens| tokens.refresh_token.is_some())
                 .and_then(|tokens| self.selected_credential(tokens))
                 .is_some_and(|credential| credential == rejected);
             if !serving {
@@ -1341,8 +1354,23 @@ impl OidcDeviceAuth {
         });
     }
 
+    /// Whether a newly obtained or peer-persisted token is fresh enough to
+    /// adopt as the result of acquisition. The skew keeps a refresh from
+    /// publishing a credential that is already too close to expiry.
     fn is_usable(&self, tokens: &TokenSet) -> bool {
         tokens.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS)
+            && self.has_required_token(tokens)
+            && !self.is_rejected(tokens)
+    }
+
+    /// Whether an already-cached token can be sent right now. Do not apply the
+    /// proactive-refresh skew here: doing so made the first flush in the final
+    /// 30 seconds block on the IdP and made every concurrent flush wait behind
+    /// the same refresh, despite the credential still being valid. An actual
+    /// expiry (or a server rejection when refresh is possible) takes the slow
+    /// acquisition path below.
+    fn is_servable_now(&self, tokens: &TokenSet) -> bool {
+        tokens.is_valid(now_epoch(), 0.0)
             && self.has_required_token(tokens)
             && !self.is_rejected(tokens)
     }
@@ -1620,7 +1648,7 @@ impl OidcDeviceAuth {
     fn cached_if_valid(&self) -> Option<TokenSet> {
         let guard = self.lock_tokens();
         let tokens = guard.as_ref()?;
-        if self.is_usable(tokens) {
+        if self.is_servable_now(tokens) {
             Some(tokens.clone())
         } else {
             None
@@ -1633,7 +1661,7 @@ impl OidcDeviceAuth {
     fn cached_selected_if_valid(&self) -> Option<Result<String>> {
         let guard = self.lock_tokens();
         let tokens = guard.as_ref()?;
-        if self.is_usable(tokens) {
+        if self.is_servable_now(tokens) {
             Some(self.select(tokens))
         } else {
             None
@@ -1767,7 +1795,7 @@ impl OidcDeviceAuth {
                     // token() call would burn another refresh-token rotation to
                     // reach the same InteractionRequired.
                     self.lock_store_state()
-                        .record_refresh_failure(Instant::now());
+                        .record_refresh_failure(Instant::now(), None);
                     refreshed_unusable = Some(refreshed);
                 }
                 // A retryable transport or persistence failure must not trigger
@@ -1777,7 +1805,7 @@ impl OidcDeviceAuth {
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Network => {
                     let now = Instant::now();
                     let mut state = self.lock_store_state();
-                    state.record_refresh_failure(now);
+                    state.record_refresh_failure(now, e.retry_after_secs());
                     // A peer may have persisted a new token while we waited
                     // unsuccessfully for its refresh lock. Re-read the store
                     // on the next call rather than treating this as a known
@@ -1791,6 +1819,23 @@ impl OidcDeviceAuth {
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Cancelled => {
                     return Err(e);
                 }
+                // A terminal refresh rejection, or a post-dispatch transport
+                // failure that may have lost a rotated child, deliberately
+                // returns InteractionRequired with the discard reason. Keep
+                // that useful diagnosis for token-provider calls. An explicit
+                // sign_in() is already authorized to fall through and start a
+                // fresh device flow instead.
+                Err(e)
+                    if !allow_interaction
+                        && e.kind() == crate::oidc::error::OidcErrorKind::InteractionRequired =>
+                {
+                    // The parent was removed from this provider and its store.
+                    // Re-arm the shared-store read before surfacing the precise
+                    // discard reason, so a peer process can repair the session
+                    // with an explicit sign-in without restarting this one.
+                    self.lock_store_state().rearm_store_load(Instant::now());
+                    return Err(e);
+                }
                 // A successful token response using an unsupported
                 // authorization scheme is a terminal client/IdP capability
                 // mismatch, not an expired refresh token. Do not hide it by
@@ -1800,7 +1845,7 @@ impl OidcDeviceAuth {
                 }
                 // Refresh token rejected (expired/revoked): fall through.
                 Err(_) => {
-                    // The parent was consumed and deleted before the request and
+                    // The parent was consumed and deleted at request dispatch and
                     // the in-memory copy is scrubbed, so this provider now holds
                     // no credential anywhere. Re-arm the lazy store read: the
                     // latch set when that entry was adopted describes a store
@@ -2185,19 +2230,21 @@ impl OidcDeviceAuth {
 
     /// A silent refresh with no persistent store: mirror
     /// [`refresh_under_lock`](Self::refresh_under_lock)'s in-memory safety without
-    /// the cross-process lock or disk I/O. Drop the cached refresh token before
-    /// the request so an ambiguous transport failure cannot resubmit a
-    /// possibly-rotated parent to a reuse-detecting IdP, then restore it only when
-    /// the failure proves the request never left the client.
+    /// the cross-process lock or disk I/O. Drop the cached refresh token at the
+    /// transport's dispatch boundary so a pre-send DNS/connect/TLS failure keeps
+    /// it, while a process exit after the first request byte cannot leave a
+    /// possibly-rotated parent available for reuse.
     fn refresh_no_store(&self, existing: &TokenSet) -> Result<TokenSet> {
-        self.discard_cached_refresh();
-        match self.refresh(existing) {
+        match self.refresh_at_dispatch(existing, true, || {
+            self.discard_cached_refresh();
+            Ok(())
+        }) {
             Ok(refreshed) => Ok(refreshed),
             Err(e) => {
                 if refresh_preserves_token(&e) && !self.is_closed() {
                     *self.lock_tokens() = Some(existing.clone());
                 }
-                Err(e)
+                Err(refresh_failure_after_dispatch(e))
             }
         }
     }
@@ -2205,8 +2252,9 @@ impl OidcDeviceAuth {
     /// Runs inside the store's cross-process lock: re-read the store (a peer may
     /// have refreshed since our load), adopt a fresher valid token and skip the
     /// network, else consume the freshest persisted refresh token before using it.
-    /// Removing the parent first is a durable tombstone: if the IdP rotates it but
-    /// the response or replacement save is lost, no process can replay the parent.
+    /// Removing the parent at the request-dispatch boundary is a durable
+    /// tombstone: if the IdP rotates it but the response or replacement save is
+    /// lost, no process can replay the parent.
     fn refresh_under_lock(
         &self,
         store: &dyn TokenStore,
@@ -2265,30 +2313,54 @@ impl OidcDeviceAuth {
             (existing.clone(), false)
         };
 
-        if current_is_persisted {
-            // Bail BEFORE deleting anything. Checking afterwards meant a close
-            // landing here returned `Cancelled` with the parent already gone
-            // from disk -- and the clear was itself cancellable, so it was not
-            // even knowable whether it had happened. The clear is bounded local
-            // filesystem work; `close()` is documented to cancel network waits,
-            // not this.
+        let refreshed = match self.refresh_at_dispatch(&current, false, || {
+            // Publish the durable tombstone at the latest safe point: DNS, TCP
+            // connect and TLS have completed, but DispatchTracker has not handed
+            // the first HTTP byte to the transport. This keeps the credential
+            // through local setup failures and leaves no post-dispatch crash
+            // window in which a peer can replay a rotating parent.
             self.ensure_open()?;
-            let clear_result = store.clear_cancellable(key, &|| false);
-            if let Err(e) = clear_result {
-                self.discard_cached_refresh();
+            if current_is_persisted {
+                if let Err(clear_error) = store.clear_cancellable(key, &|| false) {
+                    // A custom store may fail after removing the entry. Put the
+                    // parent back before aborting the still-unsent request; do
+                    // not rely on `last_persisted_refresh`, which deliberately
+                    // suppresses ordinary rewrites of an unchanged token.
+                    let restore = store.save_cancellable(key, &snapshot(&current), &|| false);
+                    if restore.is_ok() {
+                        self.lock_store_state()
+                            .set_last_persisted_refresh(current.refresh_token.clone());
+                    } else {
+                        // Do not leave the bookkeeping claiming the parent is
+                        // still durable. The outer unsent-failure path will make
+                        // its own best-effort save rather than suppressing it as
+                        // an unchanged token.
+                        self.lock_store_state().set_last_persisted_refresh(None);
+                    }
+                    let restore_detail = restore
+                        .err()
+                        .map_or_else(String::new, |error| {
+                            format!(" Restoring the entry also failed: {error}.")
+                        });
+                    return Err(OidcError::network(format!(
+                        "Could not consume the persisted OIDC refresh token at request dispatch: \
+                         {clear_error}.{restore_detail} The refresh request was not sent; retry later."
+                    ))
+                    .with_request_unsent(true));
+                }
                 self.lock_store_state().set_last_persisted_refresh(None);
-                return Err(OidcError::network(format!(
-                    "Could not consume the persisted OIDC refresh token before use: {e}. Refusing to risk refresh-token reuse; retry later."
-                )));
             }
-            self.lock_store_state().set_last_persisted_refresh(None);
-        }
 
-        // Once submitted, a transport failure can mean the IdP consumed the
-        // parent and its response was lost. Remove every cached copy before the
-        // request so a later call cannot retry an ambiguous parent.
-        self.discard_cached_refresh();
-        let refreshed = match self.refresh_for_durable_store(&current) {
+            // Clearing a custom store can block. If close won that race, abort
+            // while the request is still unsent; the outer failure path restores
+            // the durable parent before returning Cancelled.
+            self.ensure_open()?;
+
+            // Once the callback returns, the very next operation can write a
+            // request byte. Remove the in-memory copy under the same boundary.
+            self.discard_cached_refresh();
+            Ok(())
+        }) {
             Ok(refreshed) => refreshed,
             Err(e) => {
                 // Restore the refresh token only when the failure proves the IdP
@@ -2300,11 +2372,11 @@ impl OidcDeviceAuth {
                 // in-memory cache; otherwise close between tombstoning and the
                 // request would destroy the persisted credential family.
                 //
-                // Everything else stays discarded. Even a received transient
-                // status can be synthesized by an intermediary after the IdP
-                // consumed and rotated the parent, so it does not prove safety.
-                // A terminal rejection likewise means the parent must not be
-                // replayed.
+                // A transient HTTP response is also restored: it definitively
+                // rejects this grant without issuing a child, and preserving the
+                // parent is what lets a routine IdP outage heal under backoff.
+                // A terminal rejection and a genuinely ambiguous status-less
+                // post-dispatch failure remain discarded.
                 let safe_to_restore = refresh_preserves_token(&e)
                     || e.kind() == crate::oidc::error::OidcErrorKind::Cancelled;
                 if safe_to_restore {
@@ -2318,7 +2390,7 @@ impl OidcDeviceAuth {
                         self.persist_if_changed_durable(store, key, &current)?;
                     }
                 }
-                return Err(e);
+                return Err(refresh_failure_after_dispatch(e));
             }
         };
         // Persist the replacement whenever it contains a servable token kind.
@@ -3003,19 +3075,34 @@ impl OidcDeviceAuth {
     }
 
     fn refresh(&self, tokens: &TokenSet) -> Result<TokenSet> {
-        self.refresh_inner(tokens, true)
+        self.refresh_inner::<fn() -> Result<()>>(tokens, true, None)
     }
 
-    /// Refresh for a caller that has already durably consumed the persisted
-    /// parent. Once the token endpoint returns a successful response, parse and
-    /// persist its child before allowing a concurrent `close()` to win. The
-    /// ordinary memory-only path remains cancellation-first because it has no
-    /// durable credential family to protect.
-    fn refresh_for_durable_store(&self, tokens: &TokenSet) -> Result<TokenSet> {
-        self.refresh_inner(tokens, false)
+    fn refresh_at_dispatch<F>(
+        &self,
+        tokens: &TokenSet,
+        cancel_after_response: bool,
+        before_dispatch: F,
+    ) -> Result<TokenSet>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.refresh_inner(tokens, cancel_after_response, Some(before_dispatch))
     }
 
-    fn refresh_inner(&self, tokens: &TokenSet, cancel_after_response: bool) -> Result<TokenSet> {
+    /// Once a durable refresh request has been dispatched, parse and persist its
+    /// child before allowing a concurrent `close()` to win. The ordinary
+    /// memory-only path remains cancellation-first because it has no durable
+    /// credential family to protect.
+    fn refresh_inner<F>(
+        &self,
+        tokens: &TokenSet,
+        cancel_after_response: bool,
+        before_dispatch: Option<F>,
+    ) -> Result<TokenSet>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         self.ensure_open()?;
         // Callers gate on a present refresh token, but a persisted entry
         // (untrusted input) can reach here without one; return an error rather
@@ -3043,9 +3130,17 @@ impl OidcDeviceAuth {
         // Preserve the complete structured error from the HTTP layer. In
         // particular, a non-JSON transient response carries status and
         // Retry-After metadata that callers use to schedule a later retry.
-        let result = self
-            .http
-            .post_form(&self.config.token_endpoint, &form, false)?;
+        let result = match before_dispatch {
+            Some(before_dispatch) => self.http.post_form_at_dispatch(
+                &self.config.token_endpoint,
+                &form,
+                false,
+                before_dispatch,
+            ),
+            None => self
+                .http
+                .post_form(&self.config.token_endpoint, &form, false),
+        }?;
         if cancel_after_response {
             self.ensure_open()?;
         }
@@ -3056,20 +3151,23 @@ impl OidcDeviceAuth {
             // `tokenset_from_response`.
             return self.tokenset_from_response(&result.body, Some(refresh_token));
         }
-        if is_transient_http_status(result.status) {
-            let error = result.body.get("error").and_then(Value::as_str);
+        let error = result.body.get("error").and_then(Value::as_str);
+        // RFC 6749 defines `temporarily_unavailable` as a transient OAuth
+        // endpoint failure, and providers commonly carry it in an HTTP 400
+        // response. Treat the structured code as authoritative even when the
+        // surrounding status is not itself in the generic transient set.
+        if is_transient_http_status(result.status) || error == Some("temporarily_unavailable") {
             let error_description = result.body.get("error_description").and_then(Value::as_str);
             return Err(OidcError::network(format!(
-                "Token refresh received an ambiguous transient IdP response (HTTP {}); \
-                     the refresh token was discarded to prevent unsafe reuse. Sign in \
-                     again before retrying.",
+                "Token refresh received a transient IdP response (HTTP {}); the \
+                 refresh token was retained and the next refresh attempt will be \
+                 delayed by backoff.",
                 result.status
             ))
             .with_idp_error(error, error_description)
             .with_status(Some(result.status))
             .with_retry_after(result.retry_after));
         }
-        let error = result.body.get("error").and_then(Value::as_str);
         // Length-cap the untrusted "error" code before interpolating it.
         let error_msg = strip_control_capped(error.unwrap_or("unknown error"), MAX_IDP_FIELD_CHARS);
         Err(
@@ -3317,14 +3415,52 @@ fn store_error_is_permanent(error: &(dyn std::error::Error + Send + Sync + 'stat
     }
 }
 
-/// True when a failed [`refresh`](OidcDeviceAuth::refresh) proves the refresh
-/// token was NOT consumed by the IdP, so keeping it for a later retry cannot
-/// trigger rotating-refresh-token reuse detection. Only a request that provably
-/// never reached the IdP (a pre-send connect / DNS / TLS failure, flagged via
-/// [`OidcError::request_unsent`]) qualifies. A received status can be generated
-/// by an intermediary after the IdP consumed the parent, so it is ambiguous too.
+/// True when a failed [`refresh`](OidcDeviceAuth::refresh) should retain the
+/// refresh token for a later, backoff-governed retry.
+///
+/// A request that provably never left the client is always safe. A received
+/// retryable HTTP status (408, 429 or 5xx), or the OAuth
+/// `temporarily_unavailable` error, is also retained: these are explicit
+/// timeout/rate-limit/temporary-provider responses, and destroying a long-lived
+/// session on the first such response is substantially worse than the bounded
+/// replay risk. This matches the reference client's recovery behaviour.
 fn refresh_preserves_token(e: &OidcError) -> bool {
-    e.kind() == crate::oidc::error::OidcErrorKind::Network && e.request_unsent()
+    e.kind() == crate::oidc::error::OidcErrorKind::Network
+        && (e.request_unsent()
+            || e.status().is_some_and(is_transient_http_status)
+            || e.idp_error() == Some("temporarily_unavailable"))
+}
+
+/// Convert a consumed refresh parent into the non-retryable state it created.
+/// Returning `Network` after a genuinely ambiguous post-dispatch failure would
+/// suggest a blind retry is safe; returning `DeviceFlow` after a terminal IdP
+/// rejection hides that the next non-interactive step is a fresh sign-in. Both
+/// paths deliberately discarded the parent and must say so.
+fn refresh_failure_after_dispatch(error: OidcError) -> OidcError {
+    if refresh_preserves_token(&error) {
+        return error;
+    }
+    let message = match error.kind() {
+        crate::oidc::error::OidcErrorKind::Network => format!(
+            "The token refresh failed after its request may have reached the identity \
+             provider, so the refresh token was discarded to prevent reuse of a \
+             possibly rotated credential. Call sign_in() before retrying. Original \
+             failure: {}",
+            error.message()
+        ),
+        crate::oidc::error::OidcErrorKind::DeviceFlow if error.status().is_some() => format!(
+            "The identity provider rejected the token refresh (HTTP {}), so the \
+             refresh token was discarded. Call sign_in() before retrying. Original \
+             failure: {}",
+            error.status().unwrap_or_default(),
+            error.message()
+        ),
+        _ => return error,
+    };
+    OidcError::interaction_required(message)
+        .with_idp_error(error.idp_error(), error.idp_error_description())
+        .with_status(error.status())
+        .with_retry_after(error.retry_after_secs())
 }
 
 /// The advertised poll interval, floored at [`MIN_POLL_INTERVAL`] and capped at

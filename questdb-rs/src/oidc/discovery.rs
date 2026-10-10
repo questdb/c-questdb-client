@@ -136,6 +136,21 @@ pub(crate) fn same_origin(a: &str, b: &str) -> bool {
     )
 }
 
+/// Whether two endpoint URLs name the same origin and exact request target,
+/// folding only a scheme's default port. QuestDB serializes HTTPS settings with
+/// an explicit `:443`, while Entra and Google commonly omit it from discovery;
+/// a raw-string comparison incorrectly treats those as different endpoints.
+fn same_endpoint_location(a: &str, b: &str) -> bool {
+    let (Ok(a_uri), Ok(b_uri)) = (a.parse::<Uri>(), b.parse::<Uri>()) else {
+        return false;
+    };
+    normalized_origin(a).is_ok_and(|a_origin| {
+        normalized_origin(b).is_ok_and(|b_origin| {
+            a_origin == b_origin && a_uri.path_and_query() == b_uri.path_and_query()
+        })
+    })
+}
+
 /// True if the `/settings` channel is plaintext http to a non-loopback host — a
 /// MITM-tamperable channel (only reachable with `allow_insecure_transport`).
 fn settings_channel_is_plaintext(questdb_url: &str) -> bool {
@@ -744,7 +759,11 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
                 &doc_device_endpoint,
             ),
         ] {
-            if !from_settings || confirmed.as_deref() == Some(url.as_str()) {
+            if !from_settings
+                || confirmed
+                    .as_deref()
+                    .is_some_and(|confirmed| same_endpoint_location(confirmed, url))
+            {
                 continue;
             }
             let off_origin = normalized_origin(url)? != issuer_origin;
@@ -848,6 +867,26 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn default_port_folds_into_discovery_endpoint_confirmation() {
+        assert!(same_endpoint_location(
+            "https://login.microsoftonline.com/tid/oauth2/v2.0/token",
+            "https://login.microsoftonline.com:443/tid/oauth2/v2.0/token",
+        ));
+        assert!(same_endpoint_location(
+            "http://idp.example.com/device?tenant=prod",
+            "http://idp.example.com:80/device?tenant=prod",
+        ));
+        assert!(!same_endpoint_location(
+            "https://idp.example.com/token",
+            "https://idp.example.com/token/",
+        ));
+        assert!(!same_endpoint_location(
+            "https://idp.example.com/token?tenant=prod",
+            "https://idp.example.com/token?tenant=other",
+        ));
     }
 
     #[test]
