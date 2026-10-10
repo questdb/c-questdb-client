@@ -777,7 +777,7 @@ TEST_CASE("mock: chrono timeout rounds a sub-millisecond value up to 1 ms")
     CHECK(req[p + 1] == 1);
 }
 
-TEST_CASE("mock: chrono timeout rejects non-finite durations")
+TEST_CASE("mock: chrono timeout rejects negative and non-finite durations")
 {
     qm::Script s = {
         server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
@@ -786,14 +786,15 @@ TEST_CASE("mock: chrono timeout rejects non-finite durations")
     auto reader = connect_to(srv);
     using ms_f = std::chrono::duration<double, std::milli>;
     for (double v :
-         {std::numeric_limits<double>::quiet_NaN(),
+         {-1.0,
+          std::numeric_limits<double>::quiet_NaN(),
           std::numeric_limits<double>::infinity()})
     {
         auto q = reader.prepare("X"_utf8);
         try
         {
             q.timeout(ms_f{v});
-            FAIL("non-finite timeout must throw");
+            FAIL("negative or non-finite timeout must throw");
         }
         catch (const questdb::error& e)
         {
@@ -811,9 +812,8 @@ TEST_CASE("mock: chrono timeout saturates instead of overflowing")
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
-    // hours::max() in milliseconds overflows int64.
-    auto cur =
-        reader.prepare("X"_utf8).timeout(std::chrono::hours::max()).execute();
+    using hours64 = std::chrono::duration<int64_t, std::ratio<3600>>;
+    auto cur = reader.prepare("X"_utf8).timeout(hours64::max()).execute();
     while (cur.next_batch())
     {
     }
@@ -991,7 +991,7 @@ TEST_CASE("mock: timeout without CAP_QUERY_TIMEOUT fails before the wire")
     catch (const questdb::error& e)
     {
         threw = true;
-        CHECK(e.code() == questdb_error_query_timeout);
+        CHECK(e.code() == questdb_error_unsupported_server);
         // The message has to name the missing capability and point at the
         // server-side knob, or the operator cannot act on it.
         const std::string msg = e.what();
@@ -1025,7 +1025,7 @@ TEST_CASE("mock: timeout without any capabilities fails before the wire")
     catch (const questdb::error& e)
     {
         threw = true;
-        CHECK(e.code() == questdb_error_query_timeout);
+        CHECK(e.code() == questdb_error_unsupported_server);
     }
     CHECK(threw);
     CHECK(srv.captured_requests().empty());

@@ -140,6 +140,12 @@ pub enum ErrorCode {
     HandshakeError,
 
     /// Server returned an unsupported QWP version, encoding, or capability.
+    ///
+    /// Also raised client-side, before anything is written, when a query
+    /// carries a per-query timeout and the server does not advertise
+    /// `CAP_QUERY_TIMEOUT` — see
+    /// [`ReaderQuery::timeout`](crate::egress::ReaderQuery::timeout). The
+    /// connection is untouched by that refusal.
     UnsupportedServer,
 
     /// Wire-format violation: bad magic, truncated frame, unknown discriminant,
@@ -179,9 +185,10 @@ pub enum ErrorCode {
     /// supplied `timeout_ms`. Per-query, so the connection stays usable and
     /// a pooled client runs its next query on it.
     ///
-    /// Also raised client-side, without a round trip, when a timeout is
-    /// requested against a server that does not advertise
-    /// `CAP_QUERY_TIMEOUT` — see
+    /// A timeout requested against a server that does not advertise
+    /// `CAP_QUERY_TIMEOUT` is refused with [`Self::UnsupportedServer`]
+    /// instead, so a caller that retries a timeout with a larger budget
+    /// does not loop against a server that ignores every budget — see
     /// [`ReaderQuery::timeout`](crate::egress::ReaderQuery::timeout).
     ///
     /// **Do not retry a write on this error.** A DDL / `INSERT` / `UPDATE`

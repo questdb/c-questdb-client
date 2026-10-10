@@ -932,13 +932,17 @@ impl<'r> ReaderQuery<'r> {
     ///
     /// # Errors
     ///
-    /// [`Self::execute`] fails with [`crate::ErrorCode::QueryTimeout`] when
-    /// a non-zero timeout is set and the server does not advertise
+    /// [`Self::execute`] fails with [`crate::ErrorCode::UnsupportedServer`]
+    /// when a non-zero timeout is set and the server does not advertise
     /// `CAP_QUERY_TIMEOUT`, rather than running the query under the server
-    /// default and letting the caller believe its timeout applied. Raise
-    /// the server's `query.timeout` instead, or clear the timeout here.
-    /// A mid-query failover onto such a server fails the same way instead
-    /// of replaying the query.
+    /// default and letting the caller believe its timeout applied. The
+    /// refusal happens before anything is written, so the connection is
+    /// untouched. Raise the server's `query.timeout` instead, or clear the
+    /// timeout here. A mid-query failover onto such a server fails the same
+    /// way instead of replaying the query. The code is deliberately not
+    /// [`crate::ErrorCode::QueryTimeout`]: that one means the budget ran
+    /// out, and retrying it with a larger budget is a reasonable reaction
+    /// that would never succeed here.
     ///
     /// # Behaviour on expiry
     ///
@@ -1318,13 +1322,13 @@ fn derive_query_flags(capabilities: u32, reset_symbol_dict: bool, timeout_ms: u6
     Ok(query_flags)
 }
 
-/// Fails with `QueryTimeout` when `capabilities` cannot carry a non-zero
-/// `timeout_ms`. Checked on every connection a query is sent to, so a
-/// failover replay cannot land the timeout on a server that ignores it.
+/// Fails with `UnsupportedServer` when `capabilities` cannot carry a
+/// non-zero `timeout_ms`. Checked on every connection a query is sent to,
+/// so a failover replay cannot land the timeout on a server that ignores it.
 fn require_query_timeout(capabilities: u32, timeout_ms: u64) -> Result<()> {
     if timeout_ms > 0 && !(has_query_flags(capabilities) && has_query_timeout(capabilities)) {
         return Err(fmt!(
-            QueryTimeout,
+            UnsupportedServer,
             "server does not support per-query timeouts \
              (SERVER_INFO capabilities 0x{:08X}, need CAP_QUERY_TIMEOUT 0x{:08X} \
              and CAP_QUERY_FLAGS 0x{:08X}): the requested {} ms timeout cannot be \
@@ -1518,8 +1522,19 @@ pub enum Terminal {
     /// `RESULT_END` (`0x12`).
     End { final_seq: u64, total_rows: u64 },
     /// `EXEC_DONE` (`0x16`) — non-SELECT acknowledgement.
+    ///
+    /// `rows_affected` is the row count of an `INSERT` / `UPDATE`. The
+    /// server reports no count for statements it executes at parse time
+    /// (`TRUNCATE`, `RENAME TABLE`, `SET`, ...): it sends `-1`, which the
+    /// unsigned varint carries as [`ROWS_AFFECTED_UNKNOWN`]. `op_type` is
+    /// the server's operation-type byte, carried through opaquely.
     ExecDone { op_type: u8, rows_affected: u64 },
 }
+
+/// The `rows_affected` value of a [`Terminal::ExecDone`] whose statement
+/// reports no row count (`u64::MAX`, the server's `-1` as an unsigned
+/// varint). Compare against it rather than against the literal.
+pub const ROWS_AFFECTED_UNKNOWN: u64 = u64::MAX;
 
 /// Streaming cursor over `RESULT_BATCH` frames.
 ///
@@ -1669,9 +1684,17 @@ impl<'r> Cursor<'r> {
         self.terminal.as_ref()
     }
 
-    /// Whether dropping this cursor leaves its reader connection reusable.
+    /// Whether dropping this cursor leaves its reader connection reusable:
+    /// the stream reached a terminal frame (or was cancelled to one), no
+    /// query is still active on the connection, and the transport is up.
+    ///
+    /// `done` alone is not enough. A cursor ended mid-stream by a
+    /// client-side error (an Arrow conversion failure, say) is `done` but
+    /// still has the query's frames in flight; [`Drop`] sends `CANCEL` and
+    /// tears the transport down for it, so it must report `false` here
+    /// rather than let a pool recycle a connection that is about to die.
     pub fn connection_reusable(&self) -> bool {
-        self.done && !self.reader.transport_torn_down()
+        self.done && !self.reader.cursor_active && !self.reader.transport_torn_down()
     }
 
     /// Pass-through to [`Reader::credit_granted_total`]. Exists so
@@ -2192,8 +2215,7 @@ impl<'r> Cursor<'r> {
                         match self.replay_query_same_connection() {
                             Ok(()) => continue,
                             Err(e) => {
-                                self.reader.cursor_active = false;
-                                self.done = true;
+                                self.terminate_with_close();
                                 return Err(e);
                             }
                         }
@@ -3556,6 +3578,24 @@ mod tests {
             None,
             "timeout bit without the flags trailer it rides in"
         );
+    }
+
+    #[test]
+    fn missing_timeout_capability_is_unsupported_server_not_query_timeout() {
+        use crate::egress::wire::capabilities::{CAP_QUERY_FLAGS, CAP_QUERY_TIMEOUT};
+
+        for caps in [0, CAP_QUERY_FLAGS, CAP_QUERY_TIMEOUT] {
+            let err = require_query_timeout(caps, 1_000).expect_err("must refuse");
+            assert_eq!(
+                err.code(),
+                ErrorCode::UnsupportedServer,
+                "caps 0x{caps:08X}"
+            );
+            assert!(err.msg().contains("CAP_QUERY_TIMEOUT"), "{}", err.msg());
+            assert!(err.msg().contains("query.timeout"), "{}", err.msg());
+        }
+        assert!(require_query_timeout(CAP_QUERY_FLAGS | CAP_QUERY_TIMEOUT, 1_000).is_ok());
+        assert!(require_query_timeout(0, 0).is_ok());
     }
 
     /// A timeout error must never be in-doubt-free silence: a write that

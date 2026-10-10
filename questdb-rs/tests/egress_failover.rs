@@ -130,6 +130,9 @@ enum BatchColumn {
     /// its dict from scratch); `codes` are the per-row ids that index it.
     #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
     Symbol { dict: Vec<String>, codes: Vec<u32> },
+    /// DOUBLE_ARRAY column named `a`, one zero-filled array per shape.
+    #[cfg_attr(not(feature = "arrow-egress"), allow(dead_code))]
+    DoubleArray(Vec<Vec<u32>>),
 }
 
 /// Single-table `RESULT_BATCH` frame carrying one non-null column. The
@@ -141,6 +144,7 @@ fn result_batch_frame(request_id: i64, batch_seq: u64, column: &BatchColumn) -> 
     const KIND_LONG: u8 = 0x05;
     const KIND_DOUBLE: u8 = 0x07;
     const KIND_SYMBOL: u8 = 0x09;
+    const KIND_DOUBLE_ARRAY: u8 = 0x11;
     const NULL_FLAG_NONE: u8 = 0x00;
     // Frame header flag: SYMBOL columns ride the connection-scoped dict,
     // so the batch carries the delta-dict section (`flags::DELTA_SYMBOL_DICT`).
@@ -149,6 +153,7 @@ fn result_batch_frame(request_id: i64, batch_seq: u64, column: &BatchColumn) -> 
         BatchColumn::Long(v) => ("v", KIND_LONG, v.len()),
         BatchColumn::Double(v) => ("d", KIND_DOUBLE, v.len()),
         BatchColumn::Symbol { codes, .. } => ("s", KIND_SYMBOL, codes.len()),
+        BatchColumn::DoubleArray(shapes) => ("a", KIND_DOUBLE_ARRAY, shapes.len()),
     };
     let flags = match column {
         BatchColumn::Symbol { .. } => FLAG_DELTA_SYMBOL_DICT,
@@ -192,6 +197,16 @@ fn result_batch_frame(request_id: i64, batch_seq: u64, column: &BatchColumn) -> 
         BatchColumn::Symbol { codes, .. } => {
             for code in codes {
                 encode_varint_u64(*code as u64, &mut payload);
+            }
+        }
+        BatchColumn::DoubleArray(shapes) => {
+            for shape in shapes {
+                payload.push(shape.len() as u8);
+                for dim in shape {
+                    payload.extend_from_slice(&dim.to_le_bytes());
+                }
+                let elements: u32 = shape.iter().product();
+                payload.extend(std::iter::repeat_n(0u8, elements as usize * 8));
             }
         }
     }
@@ -1044,6 +1059,50 @@ fn non_stale_internal_error_still_surfaces_to_caller() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "WinSock send() to a peer that has RST'd can block for the full WRITE_TIMEOUT"
+)]
+fn stale_cached_plan_replay_onto_dead_peer_closes_the_connection() {
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendQueryError {
+            status: STATUS_INTERNAL_ERROR,
+            message: stale_plan_message(),
+        },
+        Action::AbortiveRst,
+    ]]);
+    let conf = format!("ws::addr={};failover=off", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let err = cursor
+        .next_batch()
+        .err()
+        .expect("a dead peer must surface as an error, not as rows");
+    assert_ne!(
+        err.code(),
+        ErrorCode::ServerInternalError,
+        "the stale-plan fault itself must never reach the caller: {}",
+        err.msg()
+    );
+    assert!(
+        !cursor.connection_reusable(),
+        "a connection whose replay hit a dead peer must not be recycled"
+    );
+    drop(cursor);
+    assert!(
+        reader.transport_torn_down(),
+        "the transport must be closed, not left half-written for the next query"
+    );
+    assert_eq!(srv.accepts(), 1, "failover is off, so no reconnect");
+}
+
+#[test]
 fn stale_cached_plan_after_rows_delivered_surfaces() {
     // The load-bearing `!data_delivered` guard: once a batch has been handed
     // to the caller, a later stale-plan error CANNOT be replayed (that would
@@ -1340,13 +1399,19 @@ fn timeout_failover_onto_server_without_timeout_cap_refuses_replay() {
         .expect("execute");
 
     let err = cursor.next_batch().err().expect("replay must be refused");
-    assert_eq!(err.code(), ErrorCode::QueryTimeout, "{}", err.msg());
+    assert_eq!(err.code(), ErrorCode::UnsupportedServer, "{}", err.msg());
     assert_eq!(cursor.failover_resets(), 0);
     drop(cursor);
     assert!(
         srv_b.captured_requests().is_empty(),
         "the timed query must never reach a server that would ignore the timeout"
     );
+
+    let mut cursor = reader.prepare("select 1").execute().expect("reuse B");
+    assert!(matches!(cursor.next_batch(), Ok(None)));
+    drop(cursor);
+    assert_eq!(reader.current_addr().port, srv_b.addr.port());
+    assert_eq!(srv_b.captured_requests().len(), 1);
 }
 
 #[test]
@@ -1382,15 +1447,15 @@ fn add_credit_refused_timeout_replay_stays_terminal() {
     let err = (0..50)
         .find_map(|_| cursor.add_credit(64).err())
         .expect("add_credit must eventually hit A's RST");
-    assert_eq!(err.code(), ErrorCode::QueryTimeout, "{}", err.msg());
+    assert_eq!(err.code(), ErrorCode::UnsupportedServer, "{}", err.msg());
 
     let next = cursor
         .next_batch()
         .err()
         .expect("must not read as clean EOF");
-    assert_eq!(next.code(), ErrorCode::QueryTimeout);
+    assert_eq!(next.code(), ErrorCode::UnsupportedServer);
     let again = cursor.add_credit(64).expect_err("cursor stays terminal");
-    assert_eq!(again.code(), ErrorCode::QueryTimeout);
+    assert_eq!(again.code(), ErrorCode::UnsupportedServer);
 }
 
 /// Mid-query failover *after* a batch was already delivered: with a
@@ -1630,6 +1695,35 @@ fn failover_arrow_reader_schema_drift_poisons() {
         );
     }
     assert_eq!(cursor.failover_resets(), 1);
+}
+
+#[cfg(feature = "arrow-egress")]
+#[test]
+fn arrow_conversion_error_mid_stream_is_not_reusable() {
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::DoubleArray(vec![vec![1], vec![1, 1]]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    let mut reader = Reader::from_conf(format!("ws::addr={}", srv.url())).expect("connect");
+    let mut cursor = reader
+        .prepare("select a from t")
+        .execute()
+        .expect("execute");
+
+    cursor
+        .next_arrow_batch()
+        .expect_err("mixed-rank rows cannot become one Arrow list column");
+    assert!(!cursor.connection_reusable());
+    drop(cursor);
+    assert!(reader.transport_torn_down());
 }
 
 /// Regression pin for the reconnect-path schema clear

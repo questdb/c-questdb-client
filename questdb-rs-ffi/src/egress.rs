@@ -2877,6 +2877,10 @@ pub unsafe extern "C" fn qwp_reader_cursor_terminal_end(
 /// If the cursor's terminal is `EXEC_DONE`, set `*out_op_type` and
 /// `*out_rows_affected` and return true. Otherwise zeroes both outputs and
 /// returns false. NULL handle also zeroes the outputs and returns false.
+///
+/// A statement the server executes at parse time reports no row count: it
+/// sends `-1`, which arrives as `ROWS_AFFECTED_UNKNOWN` (`u64::MAX`, the
+/// header's `QWP_READER_ROWS_AFFECTED_UNKNOWN`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_cursor_terminal_exec_done(
     cursor: *const qwp_reader_cursor,
@@ -3027,12 +3031,14 @@ pub unsafe extern "C" fn qwp_reader_query_set_reset_symbol_dict(
 /// Unlike `qwp_reader_query_set_reset_symbol_dict`, this does NOT silently
 /// degrade: against a server that does not advertise `CAP_QUERY_TIMEOUT`,
 /// `qwp_reader_query_execute` fails with
-/// `line_sender_error_query_timeout` rather than letting the caller believe
-/// a timeout applied. On expiry the query ends with that same code and the
-/// connection stays usable — but do not retry a write on it, because a
-/// statement that outlives its timeout is reported as `EXEC_DONE` instead,
-/// and a DDL / INSERT / UPDATE that timed out waiting for the table writer
-/// may still be applied afterwards.
+/// `line_sender_error_unsupported_server`, before anything is written,
+/// rather than letting the caller believe a timeout applied; the connection
+/// is untouched by that refusal. On expiry the query ends with
+/// `line_sender_error_query_timeout` and the connection stays usable — but
+/// do not retry a write on it, because a statement that outlives its
+/// timeout is reported as `EXEC_DONE` instead, and a DDL / INSERT / UPDATE
+/// that timed out waiting for the table writer may still be applied
+/// afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_query_set_timeout_ms(
     query: *mut qwp_reader_query,

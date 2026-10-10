@@ -338,6 +338,10 @@ pub enum line_sender_error_code {
     /// HTTP-upgrade or WebSocket handshake failure.
     line_sender_error_handshake_error = 20,
     /// Server returned an unsupported QWP version, encoding, or capability.
+    /// Also raised client-side, before anything is written, when a query
+    /// carries a per-query timeout and the server does not advertise
+    /// `CAP_QUERY_TIMEOUT` (see `qwp_reader_query_set_timeout_ms`); the
+    /// connection is untouched by that refusal.
     line_sender_error_unsupported_server = 21,
     /// Wire-format violation: bad magic, truncated frame, unknown
     /// discriminant, invalid varint, symbol-dict reference miss, etc.
@@ -446,9 +450,11 @@ pub enum line_sender_error_code {
 
     /// The query ran past the timeout it carried: server-reported QWP
     /// `QUERY_TIMEOUT` (status `0x0E`), produced only for a request that
-    /// supplied `timeout_ms` (see `qwp_reader_query_set_timeout_ms`). Also
-    /// raised client-side, without a round trip, when a timeout is requested
-    /// against a server that does not advertise `CAP_QUERY_TIMEOUT`.
+    /// supplied `timeout_ms` (see `qwp_reader_query_set_timeout_ms`). A
+    /// timeout requested against a server that does not advertise
+    /// `CAP_QUERY_TIMEOUT` is refused with
+    /// `line_sender_error_unsupported_server` instead, so retrying a timeout
+    /// with a larger budget cannot loop against a server that ignores it.
     ///
     /// Per-query, not per-connection: the connection stays open and
     /// authenticated, so the next query runs on it without reconnecting.

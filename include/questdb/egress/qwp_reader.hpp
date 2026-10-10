@@ -1202,8 +1202,9 @@ public:
      * `query.timeout`. Overrides the connect string's `query_timeout_ms`;
      * `0` clears it. Requires a server advertising `CAP_QUERY_TIMEOUT`
      * (`0x08`) — against an older one `execute()` throws
-     * `error_code::query_timeout` rather than silently running under the
-     * server default. The server applies no ceiling, so a value above
+     * `error_code::unsupported_server`, before anything is written, rather
+     * than silently running under the server default; the connection is
+     * untouched. The server applies no ceiling, so a value above
      * `query.timeout` is honoured.
      *
      * On expiry the cursor terminates with `error_code::query_timeout` and
@@ -1221,8 +1222,9 @@ public:
 
     /** `timeout_ms` taking a `std::chrono` duration. A non-zero duration
      *  below 1 ms rounds up to 1 ms, never down to "no timeout"; one too
-     *  large for `uint64_t` milliseconds saturates. A NaN or infinite
-     *  floating-point duration throws `error_code::invalid_api_call`. */
+     *  large for the wire saturates at its maximum. Only zero clears the
+     *  timeout: a negative, NaN or infinite duration throws
+     *  `error_code::invalid_api_call`. */
     template <typename Rep, typename Period>
     query& timeout(std::chrono::duration<Rep, Period> d)
     {
@@ -1233,7 +1235,11 @@ public:
             throw ::questdb::error{
                 error_code::invalid_api_call,
                 "query::timeout(): duration must be finite"};
-        if (ms <= 0.0)
+        if (ms < 0.0)
+            throw ::questdb::error{
+                error_code::invalid_api_call,
+                "query::timeout(): duration must not be negative"};
+        if (ms == 0.0)
             return timeout_ms(0);
         if (ms >= 18446744073709551616.0) // 2^64
             return timeout_ms(UINT64_MAX);

@@ -501,11 +501,11 @@ pub struct ReaderConfig {
     /// server-wide `query.timeout`.
     ///
     /// A non-zero value requires a server advertising `CAP_QUERY_TIMEOUT`;
-    /// against an older server every query fails fast with
-    /// [`crate::ErrorCode::QueryTimeout`] rather than silently running
-    /// under the server default. The server applies no ceiling, so this
-    /// may legitimately exceed `query.timeout` — which is the point for
-    /// long transforms. Connect-string key: `query_timeout_ms`.
+    /// against an older server every query is refused before anything is
+    /// sent, with [`crate::ErrorCode::UnsupportedServer`], rather than
+    /// silently running under the server default. The server applies no
+    /// ceiling, so this may legitimately exceed `query.timeout` — which is
+    /// the point for long transforms. Connect-string key: `query_timeout_ms`.
     pub query_timeout_ms: u64,
     /// Client's zone identifier — opaque case-insensitive string (e.g.
     /// `eu-west-1a`, `dc-amsterdam`). When set, the host-health tracker
