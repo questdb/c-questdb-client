@@ -2036,7 +2036,7 @@ mod tests {
     #[test]
     fn plaintext_localhost_resolution_must_remain_on_loopback() {
         fn resolved(values: &[&str]) -> ResolvedSocketAddrs {
-            let resolver = OidcResolver::default();
+            let resolver = OidcResolver;
             let mut result = resolver.empty();
             for value in values {
                 result.push(value.parse().unwrap());
