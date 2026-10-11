@@ -19,7 +19,9 @@ sibling crates / C / C++ sources under ``system_test/``.
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -82,6 +84,75 @@ from c_client_sidecar import (  # noqa: E402
     build_qwp_egress_sidecar,
     build_qwp_sidecar,
 )
+
+LOG = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------
+# Forked JVM temp files.
+# --------------------------------------------------------------------
+#
+# Each forked Enterprise server JVM unpacks its native libraries
+# (libquestdb, libquestdbr, libqdb_ent) into java.io.tmpdir and relies on
+# File.deleteOnExit() to remove them. ForkedEntServer.kill_9() SIGKILLs
+# the JVM, so every killed server leaves its copies behind, and
+# libqdb_ent is large (a release build with debuginfo). A full run kills
+# ~30 servers: on the CI agents, where /tmp is a 12 GiB tmpfs, the
+# leftovers fill /tmp and the last tests fail with ENOSPC (replicas stop
+# applying WAL, servers can't unpack libqdb_ent).
+#
+# So the forked JVMs get a session-private temp dir, via the harness's
+# JAVA_OPTS_FORK knob, which is emptied after every test -- the cleanup
+# SIGKILL skipped.
+
+_FORK_OPTS_ENV = "JAVA_OPTS_FORK"
+# ForkedEntServer's JVM options when JAVA_OPTS_FORK is unset
+# (questdb-ent/e2e/lib/server.py); setting the variable replaces them.
+_FORK_OPTS_DEFAULT = "-Xmx512m"
+_TMPDIR_OPT = "-Djava.io.tmpdir="
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _forked_jvm_tmpdir(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Path | None]:
+    """The forked JVMs' ``java.io.tmpdir``, or None if it isn't ours to
+    empty: JAVA_OPTS_FORK already sets one, or ours can't be passed."""
+    fork_opts = os.environ.get(_FORK_OPTS_ENV)
+    if fork_opts is not None and _TMPDIR_OPT in fork_opts:
+        yield None
+        return
+    tmpdir = tmp_path_factory.mktemp("forked-jvm-tmp")
+    if any(ch.isspace() for ch in str(tmpdir)):
+        # The harness splits JAVA_OPTS_FORK on whitespace.
+        LOG.warning("forked JVMs keep the default java.io.tmpdir: "
+                    "%s contains whitespace", tmpdir)
+        yield None
+        return
+    if fork_opts is None:
+        fork_opts = _FORK_OPTS_DEFAULT
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(_FORK_OPTS_ENV, f"{fork_opts} {_TMPDIR_OPT}{tmpdir}")
+        yield tmpdir
+
+
+@pytest.fixture(autouse=True)
+def _empty_forked_jvm_tmpdir(_forked_jvm_tmpdir: Path | None) -> Iterator[None]:
+    """Delete what the test's forked JVMs left in their temp dir. Autouse
+    fixtures are set up first and torn down last, so ``server_factory``
+    has already stopped every server the test started."""
+    yield
+    if _forked_jvm_tmpdir is None:
+        return
+    for leftover in _forked_jvm_tmpdir.iterdir():
+        try:
+            if leftover.is_dir() and not leftover.is_symlink():
+                shutil.rmtree(leftover)
+            else:
+                leftover.unlink()
+        except OSError as exc:
+            LOG.warning("could not delete forked JVM temp file %s: %s",
+                        leftover, exc)
 
 
 # --------------------------------------------------------------------
