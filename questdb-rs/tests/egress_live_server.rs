@@ -3681,7 +3681,12 @@ fn query_timeout_ends_query_and_keeps_connection() {
             Err(e) => break e,
         }
     };
-    assert_eq!(err.code(), questdb::ErrorCode::QueryTimeout, "{}", err.msg());
+    assert_eq!(
+        err.code(),
+        questdb::ErrorCode::QueryTimeout,
+        "{}",
+        err.msg()
+    );
     assert!(cur.connection_reusable());
     drop(cur);
 

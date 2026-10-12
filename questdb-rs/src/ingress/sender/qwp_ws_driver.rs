@@ -5774,15 +5774,8 @@ mod tests {
             .unwrap();
         let _server_streams = server.join().unwrap();
 
-        // A short read timeout plus a retry loop instead of one indefinitely
-        // blocking read: on Windows the gate's CancelIoEx only cancels a recv
-        // already in flight, and Winsock shutdown() does not wake one entered
-        // afterwards, so a single read can straddle the shutdown and miss
-        // both wake-ups. Retrying sidesteps the race: once the gate has shut
-        // the replacement socket down, the next read attempt fails
-        // immediately. A missing reconnect registration still fails the test,
-        // because the gate never touches this socket and every attempt times
-        // out until the deadline.
+        // Retry short reads so a missed wake-up fails at the deadline
+        // instead of hanging the test.
         transport
             .stream
             .set_timeouts(Some(Duration::from_millis(100)), None)
