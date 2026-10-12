@@ -777,6 +777,32 @@ TEST_CASE("mock: chrono timeout rounds a sub-millisecond value up to 1 ms")
     CHECK(req[p + 1] == 1);
 }
 
+TEST_CASE("mock: chrono timeout converts seconds to milliseconds")
+{
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS | qm::CAP_QUERY_TIMEOUT),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur =
+        reader.prepare("X"_utf8).timeout(std::chrono::seconds{2}).execute();
+    while (cur.next_batch())
+    {
+    }
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 1);
+    const auto& req = reqs[0];
+    const size_t p = trailer_offset(1);
+    // timeout_ms varint 2000 = 0xD0 0x0F.
+    REQUIRE(req.size() == p + 3);
+    CHECK(req[p] == qm::QUERY_FLAG_TIMEOUT);
+    CHECK(req[p + 1] == 0xD0);
+    CHECK(req[p + 2] == 0x0F);
+}
+
 TEST_CASE("mock: chrono timeout rejects negative and non-finite durations")
 {
     qm::Script s = {
