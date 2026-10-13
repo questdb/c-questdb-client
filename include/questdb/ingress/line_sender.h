@@ -2215,7 +2215,11 @@ bool line_sender_qwpws_close_drain(
  * With QWP-over-WebSocket, the function publishes the buffer into the local
  * sender queue and returns before the server necessarily ACKs the frame. Later
  * terminal diagnostics fail subsequent sender calls and are also observable
- * through the QWP/WebSocket diagnostic polling API.
+ * through the QWP/WebSocket diagnostic polling API. A QWP/WebSocket buffer is
+ * published as one frame, so it may hold at most 1,000,000 rows per table
+ * (the server's per-frame limit); a larger buffer fails with
+ * `line_sender_error_batch_too_large` before anything is published and is
+ * left intact: flush smaller batches.
  *
  * HTTP should be the first choice, but use TCP if you need to continuously
  * send data to the server at a high rate.

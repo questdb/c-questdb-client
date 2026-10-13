@@ -592,6 +592,13 @@ impl Sender {
     /// transport failures observed later are reported by subsequent sender
     /// calls.
     ///
+    /// A QWP/WebSocket buffer is published as one frame, so it may hold at
+    /// most 1,000,000 rows per table (the server's per-frame limit). A larger
+    /// buffer fails locally with
+    /// [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge) before
+    /// anything is published, and stays intact: flush smaller batches. The
+    /// same limit applies to every `flush*` variant of this sender.
+    ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.
     ///

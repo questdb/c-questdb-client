@@ -1134,6 +1134,23 @@ fn qwp_ws_replay_encoded_len(buf: &Buffer) -> usize {
     scratch.message.len()
 }
 
+/// Append rows `range` to `table`: one `bool` column plus a designated
+/// timestamp 1 ms apart, which Gorilla packs to about a bit per row. A million
+/// such rows encode to about 250 KB, far under every byte cap, so only the
+/// server's row limit can stop a flush.
+pub(crate) fn write_narrow_ts_rows(buf: &mut Buffer, table: &str, range: std::ops::Range<i64>) {
+    for i in range {
+        buf.table(table)
+            .unwrap()
+            .column_bool("b", true)
+            .unwrap()
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i * 1_000_000,
+            ))
+            .unwrap();
+    }
+}
+
 fn qwp_ws_public_bench_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -2092,6 +2109,49 @@ fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
         );
         assert!(!buf.is_empty(), "mode={}", progress.name());
     }
+}
+
+#[test]
+fn qwp_ws_flush_rejects_table_block_over_the_server_row_limit_and_keeps_the_buffer() {
+    // A `Buffer` is one indivisible frame, so a table block over the server's
+    // 1,000,000-row limit cannot be split like a chunk: the flush must fail
+    // locally, before anything is published, and keep the buffer. Without the
+    // guard the server rejects the frame with PARSE_ERROR and the sender goes
+    // terminal.
+    let mut buf = Buffer::qwp_ws_with_max_name_len(127);
+    write_narrow_ts_rows(&mut buf, "a", 0..1);
+    write_narrow_ts_rows(&mut buf, "t", 0..1_000_000);
+    let at_limit = buf.bookmark().unwrap();
+    write_narrow_ts_rows(&mut buf, "t", 1_000_000..1_000_001);
+    let len_before = buf.len();
+
+    let port = spawn_upgrade_only_server();
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .build()
+        .unwrap();
+    let err = sender.flush(&mut buf).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{err}");
+    assert_eq!(
+        err.msg(),
+        "Could not flush buffer: table \"t\" holds 1000001 rows, over the \
+         QWP/WebSocket limit of 1000000 rows per table per flush. Flush \
+         smaller batches."
+    );
+    assert_eq!(
+        buf.row_count(),
+        1_000_002,
+        "a rejected flush keeps every row"
+    );
+    assert_eq!(buf.len(), len_before);
+
+    // Exactly the limit encodes.
+    buf.rewind_to_bookmark(at_limit).unwrap();
+    let mut scratch = QwpWsEncodeScratch::new();
+    let mut global_dict = SymbolGlobalDict::new();
+    buf.as_qwp_ws()
+        .unwrap()
+        .encode_ws_replay_message(&mut scratch, &mut global_dict, 1)
+        .expect("a table block of exactly 1,000,000 rows encodes");
 }
 
 fn assert_durable_ack_without_opt_in(err: crate::Error, mode: ProgressCase) {
