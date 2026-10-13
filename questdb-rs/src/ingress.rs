@@ -71,6 +71,8 @@ use ring::{
 
 #[cfg(feature = "_sync-sender")]
 mod conf;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) use conf::DurableAckTiers;
 
 #[cfg(feature = "_sender-qwp-ws")]
 pub mod conn_events;
@@ -117,9 +119,14 @@ pub enum AckLevel {
     /// Wait for the server to accept every published frame.
     #[default]
     Ok,
-    /// Wait for durable-ACK coverage. This level requires QuestDB Enterprise
-    /// and the `request_durable_ack=on` connection-string setting.
+    /// Wait for replicated/object-store durable-ACK coverage. This level
+    /// requires `request_durable_ack=on`, `replicated`, or
+    /// `local,replicated`.
     Durable,
+    /// Wait for local-disk durable-ACK coverage. This level is available when
+    /// `request_durable_ack=local`. Local durability survives power loss, but
+    /// not loss of the server's disk.
+    LocalDurable,
 }
 
 /// Precision of a timestamp column, selecting the QWP wire type used by
@@ -515,7 +522,7 @@ impl QwpWsConnector {
         self.max_buf_size
     }
 
-    pub(crate) fn request_durable_ack(&self) -> bool {
+    pub(crate) fn request_durable_ack(&self) -> conf::DurableAckTiers {
         *self.qwp_ws.request_durable_ack
     }
 
@@ -615,7 +622,7 @@ impl QwpWsConnector {
             leftover: connected.leftover,
             max_buf_size,
             request_timeout: *self.qwp_ws.request_timeout,
-            durable_ack_opt_in: *self.qwp_ws.request_durable_ack,
+            durable_ack_tiers: *self.qwp_ws.request_durable_ack,
         };
         if let Some(events) = events
             && let Some(endpoint) = self.endpoints.get(raw.endpoint_idx)
@@ -698,7 +705,7 @@ pub(crate) struct RawQwpWsRoundStream {
     pub(crate) leftover: Vec<u8>,
     pub(crate) max_buf_size: usize,
     pub(crate) request_timeout: Duration,
-    pub(crate) durable_ack_opt_in: bool,
+    pub(crate) durable_ack_tiers: conf::DurableAckTiers,
 }
 
 /// Pre-scan a raw connect string for repeated `addr=...` params. Returns the
@@ -2085,23 +2092,16 @@ impl SenderBuilder {
                 "The \"request_durable_ack\" setting is only supported for QWP/WebSocket."
             ));
         };
-        if value.eq_ignore_ascii_case("off") {
-            qwp_ws
-                .request_durable_ack
-                .set_specified("request_durable_ack", false)?;
-            return Ok(self);
-        }
-        if value.eq_ignore_ascii_case("on") {
-            qwp_ws
-                .request_durable_ack
-                .set_specified("request_durable_ack", true)?;
-            return Ok(self);
-        }
-
-        Err(error::fmt!(
-            ConfigError,
-            "invalid request_durable_ack [value={value}, allowed-values=[on, off]]"
-        ))
+        let tiers = conf::DurableAckTiers::parse(value).ok_or_else(|| {
+            error::fmt!(
+                ConfigError,
+                "invalid request_durable_ack [value={value}, allowed-values=[on, off, local, replicated, local,replicated]]"
+            )
+        })?;
+        qwp_ws
+            .request_durable_ack
+            .set_specified("request_durable_ack", tiers)?;
+        Ok(self)
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

@@ -126,13 +126,14 @@ column-major store-and-forward `wait`.
 [`sender.completed_fsn()`](Sender::completed_fsn) provide non-blocking polls;
 `completed_fsn` is the only one that can report the server-accepted
 ([`AckLevel::Ok`](crate::ingress::AckLevel::Ok)) watermark separately from
-durable coverage — in background progress mode with `request_durable_ack=on`;
-in manual progress mode both levels report the completed watermark. Like
-`wait`, an
-[`AckLevel::Durable`](crate::ingress::AckLevel::Durable) poll requires
-QuestDB Enterprise and that opt-in, and is otherwise rejected; `acked_fsn`
-reports the watermark at the sender's configured level and is never
-rejected on that account.
+durable coverage. In background progress mode,
+[`AckLevel::LocalDurable`](crate::ingress::AckLevel::LocalDurable) is available
+with `request_durable_ack=local`, while
+[`AckLevel::Durable`](crate::ingress::AckLevel::Durable) is available with
+`on`, `replicated`, or `local,replicated`. In manual progress mode the selected
+durable level reports the completed watermark. Unsupported level/tier
+combinations are rejected; `acked_fsn` reports the sender's configured trim
+level and is never rejected on that account.
 
 Configure `sf_dir` to recover the local publication log after reconnects and
 producer-process restarts. The default `sf_durability=memory` mode relies on
@@ -145,9 +146,10 @@ publication may receive normal store-and-forward backpressure until a
 checkpoint makes the segment safe to rotate.
 
 Periodic durability protects the local replay log. It is independent of the
-QuestDB Enterprise server-side durable ACK barrier selected by
-`request_durable_ack=on`; configure both when end-to-end durability is
-required.
+server-side barrier selected by `request_durable_ack`: `local` covers the
+server's disk, while `replicated` (or legacy `on`) covers the configured
+replication/object-store boundary. Configure client and server durability
+independently for the failure modes you need to survive.
 
 In `manual` progress mode no background thread observes the transport.
 Server-side state — including terminal diagnostics — only becomes visible when the user

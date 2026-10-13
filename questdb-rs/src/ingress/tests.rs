@@ -475,8 +475,27 @@ fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
-    SenderBuilder::from_conf("ws::addr=localhost:9000;request_durable_ack=off;").unwrap();
-    SenderBuilder::from_conf("ws::addr=localhost:9000;request_durable_ack=on;").unwrap();
+    for (value, expected) in [
+        ("off", super::conf::DurableAckTiers::Off),
+        ("on", super::conf::DurableAckTiers::LegacyReplicated),
+        ("local", super::conf::DurableAckTiers::Local),
+        ("replicated", super::conf::DurableAckTiers::Replicated),
+        (
+            "local,replicated",
+            super::conf::DurableAckTiers::LocalAndReplicated,
+        ),
+        (
+            "replicated,local",
+            super::conf::DurableAckTiers::LocalAndReplicated,
+        ),
+    ] {
+        let conf = format!("ws::addr=localhost:9000;request_durable_ack={value};");
+        let builder = SenderBuilder::from_conf(conf).unwrap();
+        assert_specified_eq(
+            &builder.qwp_ws.as_ref().unwrap().request_durable_ack,
+            expected,
+        );
+    }
     SenderBuilder::from_conf(
         "ws::addr=localhost:9000;request_durable_ack=off;durable_ack_keepalive_interval_millis=5000;",
     )
@@ -538,7 +557,7 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
     }
     assert_conf_err(
         SenderBuilder::from_conf("ws::addr=localhost:9000;request_durable_ack=maybe;"),
-        "invalid request_durable_ack [value=maybe, allowed-values=[on, off]]",
+        "invalid request_durable_ack [value=maybe, allowed-values=[on, off, local, replicated, local,replicated]]",
     );
     assert_conf_err(
         SenderBuilder::from_conf("ws::addr=localhost:9000;drain_orphans=maybe;"),
