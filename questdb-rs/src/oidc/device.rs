@@ -3579,7 +3579,8 @@ fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// The `exp` (expiry) claim of a JWT as epoch seconds, or `None` for an opaque /
-/// invalid token or one without a positive, finite numeric `exp`.
+/// invalid token or one without a finite numeric `exp`. Zero and negative
+/// NumericDates are retained so they bound the token's lifetime to the past.
 ///
 /// Decoded **without** signature verification, so it is only ever used to *bound*
 /// the believed lifetime downward — never to grant validity (the server verifies
@@ -3587,10 +3588,7 @@ fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
 /// re-prompt, so a forged `exp` cannot extend a token past what the server accepts.
 fn jwt_exp(token: Option<&str>) -> Option<f64> {
     let claims = decode_jwt_claims(token)?;
-    claims
-        .get("exp")?
-        .as_f64()
-        .filter(|v| v.is_finite() && *v > 0.0)
+    claims.get("exp")?.as_f64().filter(|v| v.is_finite())
 }
 
 fn identity_from_tokens(tokens: &TokenSet) -> Option<String> {

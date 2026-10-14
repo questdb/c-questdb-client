@@ -375,13 +375,13 @@ bool questdb_oidc_builder_ca_bundle(
  * `.tmp` temporary) are deleted, whoever wrote them. Distrust is synchronized
  * before permissions are tightened; deletion is synchronized before the
  * distrust marker is removed, preserving that boundary across crashes.
- * Use a directory dedicated to the token store. The bundled file store currently rejects
- * persistence on non-Unix platforms before changing disk state because it
- * cannot provide the durable directory-entry replacement/deletion required for
- * rotating refresh tokens there. C callers should keep credentials in memory
- * on those platforms; custom keychain-backed stores are currently available
- * only through the Rust `TokenStore` API. Without this call, credentials remain
- * in memory only.
+ * Use a directory dedicated to the token store. The bundled file store
+ * currently rejects persistence on non-Unix platforms before changing disk
+ * state because it cannot provide the durable directory-entry
+ * replacement/deletion required for rotating refresh tokens there. C callers
+ * should keep credentials in memory on those platforms; custom keychain-backed
+ * stores are currently available only through the Rust `TokenStore` API.
+ * Without this call, credentials remain in memory only.
  *
  * `directory` is used verbatim. Nothing here expands `~` -- a shell does that,
  * a runtime does not -- so a value starting with `~` is REJECTED rather than

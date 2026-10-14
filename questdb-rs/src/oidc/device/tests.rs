@@ -7270,6 +7270,97 @@ fn jwt_with_exp(exp: i64) -> String {
 }
 
 #[test]
+fn non_positive_jwt_expiry_bounds_wire_and_persisted_tokens() {
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    for groups_in_token in [false, true] {
+        let auth = explicit_auth(&mock, groups_in_token);
+        for exp in [0, -1] {
+            let expired = jwt_with_exp(exp);
+            let (access_token, id_token) = if groups_in_token {
+                ("AT-unselected".to_string(), expired)
+            } else {
+                (expired, "ID-unselected".to_string())
+            };
+            let body = serde_json::json!({
+                "access_token": access_token,
+                "id_token": id_token,
+                "expires_in": 3600,
+            });
+            let wire = auth.tokenset_from_response(&body, None).unwrap();
+            assert_eq!(wire.expires_at(), exp as f64);
+            assert!(!auth.is_servable_now(&wire));
+
+            // Even a future stored deadline cannot revive an expired JWT.
+            let persisted = PersistedToken::new(
+                Some(access_token),
+                Some(id_token),
+                None,
+                now_epoch() + 3600.0,
+                3600.0,
+            );
+            let stored = auth.tokenset_from_persisted(&persisted).unwrap();
+            assert_eq!(stored.expires_at(), exp as f64);
+            assert!(!auth.is_servable_now(&stored));
+        }
+    }
+}
+
+#[test]
+fn non_positive_jwt_expiry_fails_sign_in_without_caching_or_persistence() {
+    for groups_in_token in [false, true] {
+        for exp in [0, -1] {
+            let expired = jwt_with_exp(exp);
+            let body = if groups_in_token {
+                serde_json::json!({
+                    "access_token": "AT-unselected",
+                    "id_token": expired,
+                    "expires_in": 3600,
+                })
+            } else {
+                serde_json::json!({
+                    "access_token": expired,
+                    "expires_in": 3600,
+                })
+            }
+            .to_string();
+            let mock = MockServer::start(move |method, path, _body| match (method, path) {
+                ("POST", "/device") => (200, device_response()),
+                ("POST", "/token") => (200, body.clone()),
+                _ => (404, "{}".to_string()),
+            });
+            let dir = TempDir::new().unwrap();
+            let auth = OidcDeviceAuth::builder()
+                .client_id("questdb")
+                .device_authorization_endpoint(mock.url("/device"))
+                .token_endpoint(mock.url("/token"))
+                .scope("openid")
+                .groups_in_token(groups_in_token)
+                .interactive(true)
+                .open_browser(false)
+                .timeout(Duration::from_secs(5))
+                .sleep_hook(no_sleep())
+                .token_store(test_file_store(dir.path()))
+                .build()
+                .unwrap();
+
+            let err = auth.sign_in().unwrap_err();
+            assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+            assert!(err.message().contains("already expired"), "{err}");
+            assert_eq!(
+                auth.token().unwrap_err().kind(),
+                OidcErrorKind::InteractionRequired
+            );
+            assert!(
+                test_file_store(dir.path())
+                    .load(auth.store_key.as_ref().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
 fn wire_expiry_bounded_by_jwt_exp() {
     // M3: a non-conformant `expires_in` with NO refresh token (so the rotation cap
     // doesn't apply) must not push the believed expiry past the served token's own
