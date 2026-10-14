@@ -34,7 +34,7 @@ as soon as it exists.
 
 | Surface | Minimum or supported version |
 | --- | --- |
-| Rust toolchain | 1.91.1 |
+| Rust toolchain | 1.91.0 |
 | C language | C11 |
 | C++ language | C++17 |
 | CMake | 3.15 |
@@ -42,7 +42,7 @@ as soon as it exists.
 | `questdb-rs-ffi` artifact Arrow crate | `=59.0.0` |
 | Polars crates | `>=0.52, <0.55` |
 
-Rust 1.91.1 applies to `questdb-rs`, all features advertised on docs.rs, and
+Rust 1.91.0 applies to `questdb-rs`, all features advertised on docs.rs, and
 the Rust FFI crate used by C and C++. CI also tests current stable, beta, and
 nightly Rust.
 

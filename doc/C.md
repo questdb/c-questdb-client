@@ -2,7 +2,7 @@
 
 The C client exposes QuestDB Wire Protocol (QWP) ingestion and queries through
 one shared connection pool. QWP over WebSocket requires QuestDB 10.0 or newer.
-The library itself is built with Rust 1.91.1 and exposes a C11 ABI.
+The library itself is built with Rust 1.91.0 and exposes a C11 ABI.
 
 See the repository [compatibility matrix](COMPATIBILITY.md), then follow the
 [build](BUILD.md) and [dependency](DEPENDENCY.md) instructions.
