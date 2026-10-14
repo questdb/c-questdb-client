@@ -815,7 +815,8 @@ void line_sender_buffer_clear_marker(line_sender_buffer* buffer);
 
 /**
  * Remove all accumulated data and prepare the buffer for new lines.
- * This does not affect the buffer's capacity.
+ * This does not affect the buffer's capacity. Any stored rewind point
+ * (marker or bookmark) is discarded.
  */
 QUESTDB_CLIENT_API
 void line_sender_buffer_clear(line_sender_buffer* buffer);
@@ -1038,6 +1039,10 @@ bool line_sender_buffer_column_dec_str(
 
 /**
  * Record a decimal value for the given column.
+ *
+ * This row API accepts big-endian mantissas; the chunk APIs
+ * qwp_chunk_column_decimal128 and qwp_chunk_column_decimal256 require
+ * little-endian bytes.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.

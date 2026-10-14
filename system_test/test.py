@@ -2544,6 +2544,127 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         conf = f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
         return qwp_egress_reader.query_table_sorted(conf, table_name)
 
+    def test_native_chunk_decimals_and_arrays(self):
+        import ctypes as c
+        from qwp_egress_reader import QwpEgressReader
+
+        # Bind only the native ABI: this test must also run without Arrow.
+        # Separate function objects avoid changing other suites' ctypes signatures.
+        def bind(name, result, *args):
+            return c.CFUNCTYPE(result, *args)((name, qls._DLL))
+
+        ptr, size, err = c.c_void_p, c.c_size_t, qls.c_line_sender_error_p_p
+        check = qls._error_wrapped_call
+        connect = bind('questdb_db_connect', ptr, c.c_char_p, size, err)
+        close = bind('questdb_db_close', None, ptr)
+        borrow = bind('questdb_db_borrow_sender', ptr, ptr, err)
+        give_back = bind('questdb_db_return_sender', None, ptr, ptr)
+        chunk_new = bind('qwp_chunk_new', ptr, c.c_char_p, size, err)
+        chunk_free = bind('qwp_chunk_free', None, ptr)
+        at_nanos = bind('qwp_chunk_at_nanos', c.c_bool, ptr,
+                        c.POINTER(c.c_int64), size, err)
+        flush = bind('qwp_sender_flush_chunk_and_wait', c.c_bool,
+                     ptr, ptr, c.c_uint32, err)
+
+        class Validity(c.Structure):
+            _fields_ = [('bits', c.POINTER(c.c_uint8)), ('bit_len', size)]
+
+        decimals = {
+            width: bind(f'qwp_chunk_column_decimal{width}', c.c_bool,
+                        ptr, c.c_char_p, size,
+                        c.POINTER(c.c_int64 if width == 64 else c.c_uint8),
+                        size, c.c_uint8, c.POINTER(Validity), err)
+            for width in (64, 128, 256)
+        }
+        array = bind('qwp_chunk_column_f64_array', c.c_bool,
+                     ptr, c.c_char_p, size, c.POINTER(c.c_double), size,
+                     size, c.POINTER(c.c_uint32), size, c.POINTER(Validity), err)
+
+        table = 'qwp_native_columns_' + uuid.uuid4().hex
+        columns = [('d64', 18, 9), ('d128', 38, 9), ('d256', 76, 38)]
+        sql_query(f'CREATE TABLE {table} (' + ','.join(
+            f'{name} DECIMAL({precision},{scale})'
+            for name, precision, scale in columns) +
+            ',book DOUBLE[][],null_book DOUBLE[][],ts TIMESTAMP_NS) '
+            'TIMESTAMP(ts) PARTITION BY DAY WAL')
+        # Explicit cleanup also applies to --existing fixtures.
+        self.addCleanup(sql_query, f'DROP TABLE IF EXISTS {table}')
+
+        # The native API borrows these buffers through flush, including NULL slots.
+        buffers = []
+        expected_decimals = []
+        bits = (c.c_uint8 * 1)(0b0111)
+        validity = Validity(bits, 4)
+        ts = (c.c_int64 * 4)(*(1_726_401_600_123_456_789 + i for i in range(4)))
+        book_rows = [
+            [[100.25 + row + level * 0.25 for level in range(10)],
+             [float(row * 10 + level) for level in range(10)]]
+            for row in range(4)
+        ]
+        for row in book_rows:
+            row[0][1] = None
+            row[1][-1] = float(2**32 - 1)
+        book = (c.c_double * 80)(*(
+            math.nan if value is None else value
+            for row in book_rows for side in row for value in side))
+        shape = (c.c_uint32 * 2)(2, 10)
+        # A NULL in the middle must not shift the following source rows.
+        book_bits = (c.c_uint8 * 1)(0b1101)
+        book_validity = Validity(book_bits, 4)
+        null_bits = (c.c_uint8 * 1)(0)
+        null_validity = Validity(null_bits, 4)
+        conf = f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
+        conf_bytes = conf.encode()
+        db = check(connect, conf_bytes, len(conf_bytes))
+        sender = chunk = None
+        try:
+            sender = check(borrow, db)
+            table_bytes = table.encode()
+            chunk = check(chunk_new, table_bytes, len(table_bytes))
+            for name, precision, scale in columns:
+                maximum = 10**precision - 1
+                values = [maximum, -maximum, 0, 0]
+                width = 64 if precision <= 18 else 128 if precision <= 38 else 256
+                if width == 64:
+                    data = (c.c_int64 * 4)(*values)
+                else:
+                    raw = b''.join(v.to_bytes(width // 8, 'little', signed=True)
+                                   for v in values)
+                    data = (c.c_uint8 * len(raw)).from_buffer_copy(raw)
+                buffers.append(data)
+                check(decimals[width], chunk, name.encode(), len(name),
+                      data, 4, scale, c.byref(validity))
+                # Construct the oracle exactly, without float or Decimal arithmetic
+                # (the default Decimal context rounds values longer than 28 digits).
+                expected_decimals.append([
+                    Decimal(f'{value}e-{scale}') for value in values[:3]] + [None])
+            check(array, chunk, b'book', 4, book, len(book), 4,
+                  shape, len(shape), c.byref(book_validity))
+            check(array, chunk, b'null_book', 9, book, len(book), 4,
+                  shape, len(shape), c.byref(null_validity))
+            check(at_nanos, chunk, ts, 4)
+            check(flush, sender, chunk, 0)  # qwpws_ack_level_ok
+        finally:
+            chunk_free(chunk)
+            give_back(db, sender)
+            close(db)
+
+        self._wait_for_row_count(table, 4)
+        expected_rows = [
+            [values[row] for values in expected_decimals] + [
+                book_rows[row] if row != 1 else None, None, ts[row]]
+            for row in range(4)
+        ]
+
+        # Read Decimal64/128/256 directly through the C reader, without SQL casts.
+        with QwpEgressReader(conf) as reader:
+            _, rows = reader.select(
+                f'SELECT d64,d128,d256,book,null_book,cast(ts as long) '
+                f'FROM {table} ORDER BY ts')
+        actual = [[Decimal(v) if v is not None else None for v in row[:3]] + row[3:]
+                  for row in rows]
+        self.assertEqual(actual, expected_rows)
+
     def test_uuid_with_zero_low_half_is_not_null(self):
         table_name = 'qwp_uuid_sentinel_' + uuid.uuid4().hex[:8]
         self._created_tables.append(table_name)

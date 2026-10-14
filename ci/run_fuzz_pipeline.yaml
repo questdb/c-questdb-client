@@ -91,7 +91,7 @@ stages:
       # which already installs openjdk-17-jdk, openjdk-25-jdk, maven,
       # build-essential, zip, curl, gh, and rustup (system-wide, with
       # /etc/profile.d/rust.sh sourcing the env). The job installs
-      # cmake/python3-numpy/python3-pip plus pyarrow/polars explicitly below
+      # cmake/python3-pip plus numpy>=2/pyarrow/polars (pip) explicitly below
       # so scheduled Arrow tests have the same deps as PR-time Linux fuzz.
       - job: TestQwpWsFuzzLinux
         displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
@@ -114,8 +114,8 @@ stages:
           - bash: |
               set -eux
               sudo apt-get update
-              sudo apt-get install -y --no-install-recommends cmake python3-numpy python3-pip
-              sudo python3 -m pip install --break-system-packages pyarrow polars
+              sudo apt-get install -y --no-install-recommends cmake python3-pip
+              sudo python3 -m pip install --break-system-packages 'numpy>=2' pyarrow polars
               # Image-provided JDK paths (see provision.sh's
               # `apt-get install -y openjdk-17-jdk openjdk-25-jdk maven`).
               JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"

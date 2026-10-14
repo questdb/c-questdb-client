@@ -295,7 +295,7 @@ class CClientRustSidecar(Sidecar):
                 raise TimeoutError(
                     f"sidecar {self.name!r} did not READY within {ready_timeout}s"
                 )
-            line = self._readline(self.process.stdout, 0.2)
+            line = self._readline(0.2)
             if line is None:
                 continue
             line = line.strip()
@@ -379,7 +379,7 @@ class CClientRustEgressSidecar(EgressSidecar):
                 raise TimeoutError(
                     f"egress sidecar {self.name!r} did not READY within {ready_timeout}s"
                 )
-            line = self._readline(self.process.stdout, 0.2)
+            line = self._readline(0.2)
             if line is None:
                 continue
             line = line.strip()

@@ -574,6 +574,87 @@ bool qwp_chunk_column_f64(
     line_sender_error** err_out);
 
 /**
+ * `DECIMAL64` column from native int64_t mantissas. Each value is mantissa *
+ * 10^(-scale); scale must be in 0..=18. Destination DECIMAL(p,s) determines
+ * precision and storage width, including DECIMAL8/16/32. NULL rows are
+ * specified by validity. Buffers stay live and unchanged through flush.
+ */
+QUESTDB_CLIENT_API
+bool qwp_chunk_column_decimal64(
+    qwp_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    const int64_t* data,
+    size_t row_count,
+    uint8_t scale,
+    const qwp_validity* validity,
+    line_sender_error** err_out);
+
+/**
+ * `DECIMAL128` column from row_count * 16 bytes of signed, two's-complement,
+ * little-endian mantissas. Only byte alignment is required; no compiler
+ * int128 type is needed. scale must be in 0..=38. NULL rows use validity.
+ * data includes 16 bytes for every row, including NULL rows, and remains
+ * live and unchanged through flush. Destination DECIMAL(p,s) checks range.
+ * Unlike line_sender_buffer_column_dec and line_sender_buffer_column_dec128,
+ * which accept big-endian mantissas, this function requires little-endian
+ * bytes.
+ */
+QUESTDB_CLIENT_API
+bool qwp_chunk_column_decimal128(
+    qwp_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    const uint8_t* data,
+    size_t row_count,
+    uint8_t scale,
+    const qwp_validity* validity,
+    line_sender_error** err_out);
+
+/**
+ * `DECIMAL256` column, like qwp_chunk_column_decimal128, with 32 LE bytes per
+ * mantissa and scale in 0..=76. No big-integer or Arrow dependency is required.
+ * Unlike line_sender_buffer_column_dec, which accepts big-endian mantissas,
+ * this function requires little-endian bytes.
+ */
+QUESTDB_CLIENT_API
+bool qwp_chunk_column_decimal256(
+    qwp_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    const uint8_t* data,
+    size_t row_count,
+    uint8_t scale,
+    const qwp_validity* validity,
+    line_sender_error** err_out);
+
+/**
+ * Dense `DOUBLE_ARRAY` column. shape[0..ndim] describes one row, excluding
+ * row_count; every row shares the shape. ndim must be in 1..=32 and all
+ * dimensions must be nonzero. product(shape) must not exceed 16,777,216
+ * elements per row; row_count must not exceed 16,777,216 either.
+ * data_len counts doubles and must equal row_count * product(shape),
+ * including the storage occupied by NULL rows. A zero-row append locks the
+ * chunk to zero rows; clear it before reuse or flush. Ragged/empty arrays
+ * are not supported by this fixed-shape interface.
+ * validity marks NULL array rows; NaN represents a NULL array element.
+ * shape is copied during this call. data and validity stay live and
+ * unchanged through flush. No Arrow or NumPy objects are required.
+ */
+QUESTDB_CLIENT_API
+bool qwp_chunk_column_f64_array(
+    qwp_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    const double* data,
+    size_t data_len,
+    size_t row_count,
+    const uint32_t* shape,
+    size_t ndim,
+    const qwp_validity* validity,
+    line_sender_error** err_out);
+
+/**
  * `BOOLEAN` column. `data` is an Arrow-style LSB-first packed bitmap
  * (1 = true). `data` must point to at least `ceil(row_count / 8)` bytes.
  *
