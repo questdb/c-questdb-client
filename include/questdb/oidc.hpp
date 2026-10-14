@@ -864,7 +864,8 @@ public:
      * (default 30s, maximum 120s), so a call can take twice that before
      * returning. Do not call it on a UI thread.
      *
-     * A builder configured with explicit endpoints performs no network I/O here.
+     * A builder configured with explicit endpoints performs no network I/O
+     * here.
      *
      * The builder is reusable; each call creates an independent auth state.
      */
