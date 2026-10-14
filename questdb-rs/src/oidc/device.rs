@@ -2920,7 +2920,7 @@ impl OidcDeviceAuth {
                     }
                     if e.request_timed_out() {
                         let previous = interval;
-                        interval = backoff(interval, None, true);
+                        interval = backoff(interval, e.retry_after_secs(), true);
                         interval_raised = interval > previous;
                     } else if e.status() == Some(429) || e.retry_after_secs().is_some() {
                         let previous = interval;

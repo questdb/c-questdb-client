@@ -6666,6 +6666,82 @@ fn refresh_repersists_parent_when_dispatch_delete_reports_an_error() {
 }
 
 #[test]
+fn oversized_transient_refresh_preserves_memory_and_file_parents() {
+    for status in [408, 429, 503] {
+        for persisted in [false, true] {
+            let oversized = "x".repeat((4 << 20) + 1);
+            let mock = MockServer::start_with_retry_after(7, move |method, path, body| {
+                if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token")
+                {
+                    return (status, oversized.clone());
+                }
+                match (method, path) {
+                    ("POST", "/device") => (200, device_response()),
+                    ("POST", "/token") => (200,
+                        r#"{"access_token":"AT-current","refresh_token":"RT-parent","expires_in":300}"#.to_string()),
+                    _ => (404, "{}".to_string()),
+                }
+            });
+            let dir = TempDir::new().unwrap();
+            let auth = if persisted {
+                auth_with_store(&mock, dir.path())
+            } else {
+                explicit_auth(&mock, false)
+            };
+            assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-current");
+            let error = token_after_401(&auth, "AT-current").unwrap_err();
+            assert_eq!(error.kind(), OidcErrorKind::Network);
+            assert_eq!(error.status(), Some(status));
+            assert_eq!(error.retry_after_secs(), Some(7));
+            assert_eq!(
+                auth.token_set().unwrap().refresh_token.as_deref(),
+                Some("RT-parent")
+            );
+            if persisted {
+                drop(auth);
+                let token = test_file_store(dir.path())
+                    .load(&key_for(&mock))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(token.refresh_token(), Some("RT-parent"));
+                let restarted = auth_with_store(&mock, dir.path());
+                assert_eq!(restarted.token().unwrap(), "AT-current");
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_successful_refresh_still_discards_the_parent() {
+    let mock = MockServer::start(move |method, path, body| {
+        if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+            return (200, "x".repeat((4 << 20) + 1));
+        }
+        match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-current","refresh_token":"RT-parent","expires_in":300}"#
+                    .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        }
+    });
+    let dir = TempDir::new().unwrap();
+    let auth = auth_with_store(&mock, dir.path());
+    sign_in_and_token(&auth).unwrap();
+    let error = token_after_401(&auth, "AT-current").unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(error.status(), Some(200));
+    assert!(
+        test_file_store(dir.path())
+            .load(&key_for(&mock))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn transient_status_refresh_restores_persisted_parent() {
     // A retryable status restores the dispatch-time tombstone before releasing
     // the cross-process lock, so this process, peers and restarts can recover.

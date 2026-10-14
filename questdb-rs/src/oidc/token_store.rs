@@ -1577,21 +1577,13 @@ impl TokenStore for FileTokenStore {
                 return Ok(None);
             }
             let path = self.token_file(key);
-            let (file, size) = match open_regular_bounded(&path)? {
+            let (file, _) = match open_regular_bounded(&path)? {
                 Some(f) => f,
                 None => return Ok(None), // missing / non-regular / empty / oversized
             };
-            // Read at most MAX_FILE_BYTES + 1 so an oversized file (grown after
-            // the metadata check) is rejected rather than read whole.
-            //
-            // Sized from the metadata `open_regular_bounded` already took, so
-            // the buffer does not grow: `Zeroizing` scrubs the buffer it holds
-            // at drop, and every superseded one a geometric growth left behind
-            // was freed with a plaintext prefix of the credential JSON.
-            let mut data = Zeroizing::new(Vec::with_capacity(size as usize));
-            file.take(MAX_FILE_BYTES + 1)
-                .read_to_end(&mut data)
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            // A noncooperating writer can grow the opened inode after fstat.
+            // Never reallocate a buffer that already contains credentials.
+            let data = read_bounded_token_bytes(file)?;
             if data.len() as u64 > MAX_FILE_BYTES {
                 return Ok(None);
             }
@@ -1814,6 +1806,13 @@ fn temp_path(dir: &Path, hash: &str) -> PathBuf {
 }
 
 fn create_lock_file_handle(lock: &Path, stamp: &str) -> std::io::Result<File> {
+    create_lock_file_handle_with(lock, |file| file.write_all(stamp.as_bytes()))
+}
+
+fn create_lock_file_handle_with(
+    lock: &Path,
+    write_stamp: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> std::io::Result<File> {
     // The exclusive create is the acquisition. The file necessarily exists
     // empty for a tiny create-to-stamp window; the shared empty-lock grace is
     // what protects a creator paused in that window.
@@ -1825,7 +1824,12 @@ fn create_lock_file_handle(lock: &Path, stamp: &str) -> std::io::Result<File> {
         opts.mode(0o600);
     }
     let mut f = opts.open(lock)?;
-    f.write_all(stamp.as_bytes())?;
+    if let Err(error) = write_stamp(&mut f) {
+        // HeldLock does not own this inode yet. Retire even a partially
+        // written stamp without touching a successor at the same pathname.
+        release_lock(&f);
+        return Err(error);
+    }
     Ok(f)
 }
 
@@ -2328,6 +2332,22 @@ fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> 
     }
 }
 
+/// Read a bounded credential file without ever reallocating plaintext.
+fn read_bounded_token_bytes(mut reader: impl Read) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let mut data = Zeroizing::new(vec![0; (MAX_FILE_BYTES + 1) as usize]);
+    let mut filled = 0;
+    while filled < data.len() {
+        match reader.read(&mut data[filled..]) {
+            Ok(0) => break,
+            Ok(amount) => filled += amount,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    data.truncate(filled);
+    Ok(data)
+}
+
 /// Open a file for reading only if it is a regular file within the size bound;
 /// `None` for a missing / non-regular / empty / oversized entry (per the load
 /// contract), `Err` only for a genuine I/O error.
@@ -2357,8 +2377,8 @@ fn open_regular_bounded(path: &Path) -> TokenStoreResult<Option<(File, u64)>> {
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_FILE_BYTES {
         return Ok(None);
     }
-    // The length comes back with the handle so the caller can size its read
-    // buffer exactly; it is already bounded by MAX_FILE_BYTES above.
+    // This bounded length is only a snapshot: it must not be used to justify
+    // reallocating plaintext if another writer later grows the opened inode.
     Ok(Some((file, meta.len())))
 }
 

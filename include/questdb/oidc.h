@@ -481,7 +481,7 @@ bool questdb_oidc_builder_diagnostic_handler(
  * binding holding a runtime lock should release it around this call, as the
  * Python binding does with the GIL.
  *
- * A builder configured with explicit endpoints performs no I/O here.
+ * A builder configured with explicit endpoints performs no network I/O here.
  *
  * The builder is reusable; each call creates an independent auth state.
  */

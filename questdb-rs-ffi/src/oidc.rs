@@ -196,17 +196,9 @@ impl OidcBuilderConfig {
                 builder = builder.token_store(FileTokenStore::at(directory.clone()));
             }
             FileStoreConfig::DefaultLocation => {
-                // Already a `ConfigError` carrying a full diagnostic; re-word
-                // it only to name the FFI-level operation that failed.
-                let store = FileTokenStore::at_default_location().map_err(|err| {
-                    Error::new(
-                        err.code(),
-                        format!(
-                            "Could not resolve the default OIDC token-store directory: {}",
-                            err.msg()
-                        ),
-                    )
-                })?;
+                // Keep the structured OIDC configuration cause as well as its
+                // diagnostic: C/C++ callers classify errors through that view.
+                let store = FileTokenStore::at_default_location()?;
                 builder = builder.token_store(store);
             }
         }
@@ -3661,6 +3653,53 @@ mod tests {
                 (*builder).config.file_store,
                 FileStoreConfig::DefaultLocation
             ));
+            questdb_oidc_builder_free(builder);
+        }
+    }
+
+    #[test]
+    fn default_file_token_store_failure_preserves_oidc_config_view() {
+        const CHILD: &str = "QUESTDB_TEST_DEFAULT_STORE_ERROR";
+        if std::env::var_os(CHILD).is_none() {
+            // Do not mutate process-global environment while other tests run.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "oidc::tests::default_file_token_store_failure_preserves_oidc_config_view",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR",
+                    "relative-token-directory",
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        unsafe {
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_builder_default_file_token_store(
+                builder, &mut error
+            ));
+            assert!(questdb_oidc_builder_build(builder, &mut error).is_null());
+            assert!(!error.is_null());
+            let mut view: questdb_oidc_error_view = std::mem::zeroed();
+            view.struct_size = std::mem::size_of::<questdb_oidc_error_view>();
+            assert!(questdb_error_oidc_get_view(error, &mut view));
+            assert_eq!(
+                view.kind,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_CONFIG
+            );
+            crate::questdb_error_free(error);
             questdb_oidc_builder_free(builder);
         }
     }

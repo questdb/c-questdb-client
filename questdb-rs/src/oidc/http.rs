@@ -416,7 +416,11 @@ impl HttpClient {
         // `read_body_zeroizing` also wipes every buffer it outgrows; ureq's own
         // transport buffers are outside this crate's control (see
         // `token_provider.rs`, "Known residual").
-        let body = read_body_zeroizing(url, response)?;
+        let body = read_body_zeroizing(url, response).map_err(|error| {
+            error
+                .with_status(Some(status))
+                .with_retry_after(retry_after)
+        })?;
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(mut value) => {
                 // Token-endpoint responses are untrusted and some IdPs, proxies,
@@ -2432,48 +2436,50 @@ mod tests {
 
     #[test]
     fn response_body_timeout_preserves_timeout_provenance() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let amount = stream.read(&mut chunk).unwrap();
-                assert_ne!(amount, 0, "client closed before sending request headers");
-                request.extend_from_slice(&chunk[..amount]);
-            }
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
-            stream.flush().unwrap();
-            thread::sleep(Duration::from_millis(500));
-        });
+        for status in [200, 408, 429, 503] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let amount = stream.read(&mut chunk).unwrap();
+                    assert_ne!(amount, 0, "client closed before sending request headers");
+                    request.extend_from_slice(&chunk[..amount]);
+                }
+                stream.write_all(format!(
+                "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\nRetry-After: 7\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).unwrap();
+                stream.flush().unwrap();
+                thread::sleep(Duration::from_millis(500));
+            });
 
-        let client = HttpClient::new(None, Duration::from_millis(100)).unwrap();
-        let error = match client.post_form(
-            &format!("http://{addr}/token"),
-            &[("grant_type", "urn:ietf:params:oauth:grant-type:device_code")],
-            false,
-        ) {
-            Ok(_) => panic!("a stalled response body must time out"),
-            Err(error) => error,
-        };
+            let client = HttpClient::new(None, Duration::from_millis(100)).unwrap();
+            let error = match client.post_form(
+                &format!("http://{addr}/token"),
+                &[("grant_type", "urn:ietf:params:oauth:grant-type:device_code")],
+                false,
+            ) {
+                Ok(_) => panic!("a stalled response body must time out"),
+                Err(error) => error,
+            };
 
-        assert_eq!(error.kind(), crate::oidc::error::OidcErrorKind::Network);
-        assert!(
-            error.request_timed_out(),
-            "a timeout while reading the response body lost its provenance: {error}"
-        );
-        assert!(
-            !error.request_unsent(),
-            "response headers prove the request reached the peer"
-        );
-        server.join().unwrap();
+            assert_eq!(error.kind(), crate::oidc::error::OidcErrorKind::Network);
+            assert!(
+                error.request_timed_out(),
+                "a timeout while reading the response body lost its provenance: {error}"
+            );
+            assert!(
+                !error.request_unsent(),
+                "response headers prove the request reached the peer"
+            );
+            assert_eq!(error.status(), Some(status));
+            assert_eq!(error.retry_after_secs(), Some(7));
+            server.join().unwrap();
+        }
     }
 }

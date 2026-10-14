@@ -22,9 +22,9 @@
  *
  ******************************************************************************/
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
-use std::sync::{Arc, Barrier};
 
 use tempfile::TempDir;
 
@@ -191,91 +191,47 @@ fn nested_lock_is_reentrant_during_thread_local_teardown() {
 
 #[test]
 fn cancellable_lock_wait_abandons_in_process_contention() {
-    let dir = TempDir::new().unwrap();
-    let store = Arc::new(test_file_store(dir.path()));
-    let key = test_key();
-    let release = Arc::new(Barrier::new(2));
-    let (locked_tx, locked_rx) = mpsc::sync_channel(1);
-
-    let holder_store = Arc::clone(&store);
-    let holder_key = key.clone();
-    let holder_release = Arc::clone(&release);
-    let holder = std::thread::spawn(move || {
-        holder_store
-            .in_lock(&holder_key, &mut || {
-                locked_tx.send(()).unwrap();
-                holder_release.wait();
-                Ok(())
-            })
-            .unwrap();
-    });
-    locked_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("holder did not acquire the store lock");
-
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let waiter_store = Arc::clone(&store);
-    let waiter_key = key.clone();
-    let waiter_cancelled = Arc::clone(&cancelled);
-    let waiter = std::thread::spawn(move || {
-        waiter_store.in_lock_cancellable(
-            &waiter_key,
-            &|| waiter_cancelled.load(Ordering::Acquire),
-            &mut || Ok(()),
-        )
-    });
-    std::thread::sleep(Duration::from_millis(100));
+    let lock = Mutex::new(());
+    let _holder = lock.lock().unwrap();
+    let polls = AtomicUsize::new(0);
+    // The first poll permits a failed try_lock; only the next loop iteration
+    // cancels. No thread scheduling or initial-cancellation shortcut is involved.
+    let cancelled = || polls.fetch_add(1, Ordering::SeqCst) > 0;
     let started = Instant::now();
-    cancelled.store(true, Ordering::Release);
-    let error = waiter.join().expect("waiter panicked").unwrap_err();
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "cancellable store wait did not stop promptly"
-    );
+    let error =
+        lock_process_cancellable(&lock, DEFAULT_LOCK_ACQUIRE_BUDGET, &cancelled).unwrap_err();
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(
         error
             .downcast_ref::<std::io::Error>()
             .map(std::io::Error::kind),
         Some(std::io::ErrorKind::Interrupted)
     );
-
-    release.wait();
-    holder.join().unwrap();
 }
 
 #[test]
 fn cancellable_lock_wait_abandons_filesystem_contention() {
     let dir = TempDir::new().unwrap();
     let store = test_file_store(dir.path());
-    let key = test_key();
     store.prepare_directory(&never_cancelled).unwrap();
-    let lock = store.lock_file(&key);
+    let lock = store.lock_file(&test_key());
     std::fs::write(&lock, holder_bytes().unwrap()).unwrap();
-
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let waiter_cancelled = Arc::clone(&cancelled);
-    let waiter = std::thread::spawn(move || {
-        store.in_lock_cancellable(
-            &key,
-            &|| waiter_cancelled.load(Ordering::Acquire),
-            &mut || Ok(()),
-        )
-    });
-    std::thread::sleep(Duration::from_millis(100));
+    let polls = AtomicUsize::new(0);
+    let cancelled = || polls.fetch_add(1, Ordering::SeqCst) > 0;
     let started = Instant::now();
-    cancelled.store(true, Ordering::Release);
-    let error = waiter.join().expect("waiter panicked").unwrap_err();
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "filesystem store wait did not stop promptly"
-    );
+    let error = match store.acquire_lock(&lock, DEFAULT_LOCK_STALE, EMPTY_LOCK_GRACE, &cancelled) {
+        Ok(_) => panic!("the fresh holder must prevent acquisition"),
+        Err(error) => error,
+    };
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(
         error
             .downcast_ref::<std::io::Error>()
             .map(std::io::Error::kind),
         Some(std::io::ErrorKind::Interrupted)
     );
-    let _ = std::fs::remove_file(lock);
 }
 
 #[cfg(not(unix))]
@@ -1349,6 +1305,71 @@ fn with_lock_timings_clamps_acquire_budget() {
     let store =
         test_file_store("/tmp/x").with_lock_timings(Duration::MAX, Duration::from_secs(600));
     assert_eq!(store.lock_acquire_budget, MAX_LOCK_ACQUIRE_BUDGET);
+}
+
+#[test]
+fn failed_stamp_initialization_retires_empty_and_partial_locks() {
+    for prefix in [b"".as_slice(), b"1".as_slice()] {
+        let dir = TempDir::new().unwrap();
+        let lock = dir.path().join("failed.lock");
+        let error = create_lock_file_handle_with(&lock, |file| {
+            file.write_all(prefix)?;
+            Err(std::io::Error::other("stamp write failed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "stamp write failed");
+        assert_eq!(std::fs::read(&lock).unwrap(), b"");
+        assert!(steal_if_stale(&lock, DEFAULT_LOCK_STALE, EMPTY_LOCK_GRACE));
+        let successor = create_lock_file_handle(&lock, "successor").unwrap();
+        assert_eq!(std::fs::read(&lock).unwrap(), b"successor");
+        release_lock(&successor);
+    }
+}
+
+#[test]
+fn bounded_token_read_never_reallocates_after_file_growth() {
+    for extra in [128, (MAX_FILE_BYTES + 1) as usize] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("token.json");
+        std::fs::write(&path, b"credential prefix").unwrap();
+        let (file, original_size) = open_regular_bounded(&path).unwrap().unwrap();
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(&vec![b' '; extra]).unwrap();
+        let bytes = read_bounded_token_bytes(file).unwrap();
+        assert!(bytes.len() > original_size as usize);
+        assert_eq!(bytes.capacity(), (MAX_FILE_BYTES + 1) as usize);
+        assert_eq!(
+            bytes.len(),
+            (original_size as usize + extra).min((MAX_FILE_BYTES + 1) as usize)
+        );
+        assert!(bytes.starts_with(b"credential prefix"));
+    }
+}
+
+#[test]
+fn bounded_token_read_retries_interrupted_short_reads() {
+    struct Fragmented {
+        interrupted: bool,
+        remaining: &'static [u8],
+    }
+    impl Read for Fragmented {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let amount = output.len().min(self.remaining.len()).min(2);
+            output[..amount].copy_from_slice(&self.remaining[..amount]);
+            self.remaining = &self.remaining[amount..];
+            Ok(amount)
+        }
+    }
+    let bytes = read_bounded_token_bytes(Fragmented {
+        interrupted: false,
+        remaining: b"secret",
+    })
+    .unwrap();
+    assert_eq!(&**bytes, b"secret");
 }
 
 #[cfg(unix)]
