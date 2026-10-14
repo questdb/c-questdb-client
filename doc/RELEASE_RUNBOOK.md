@@ -124,7 +124,7 @@ For 7.0.0, the approved compatibility decisions are:
 - HTTP Basic authentication and single-endpoint reconnect work with QuestDB
   Open Source and Enterprise, while bearer-token and OIDC authentication,
   multi-host failover, and durable acknowledgement require QuestDB Enterprise;
-- Rust 1.91.1 is the MSRV for default and advertised docs.rs features;
+- Rust 1.91.0 is the MSRV for default and advertised docs.rs features;
 - Arrow `>=58, <60` and Polars `>=0.52, <0.55` are the supported ranges;
 - C/C++ remains source-only; and
 - release tags remain lightweight.
@@ -395,7 +395,7 @@ docs.rs. Do not use `--all-features` if it enables mutually exclusive crypto
 backends.
 
 ```bash
-MSRV=1.91.1
+MSRV=1.91.0
 cargo generate-lockfile --manifest-path questdb-rs/Cargo.toml
 
 cargo +"$MSRV" check --manifest-path questdb-rs/Cargo.toml --locked
@@ -416,7 +416,7 @@ Do not document an untested lower version.
 Use the same feature set configured under `[package.metadata.docs.rs]`:
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo +1.91.1 doc \
+RUSTDOCFLAGS="-D warnings" cargo +1.91.0 doc \
   --manifest-path questdb-rs/Cargo.toml --no-deps --locked \
   --features almost-all-features,arrow,polars
 ```
