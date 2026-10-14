@@ -11,7 +11,7 @@ import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EXPECTED_QUESTDB_VERSION = "10.0"
-EXPECTED_RUST_VERSION = "1.91.1"
+EXPECTED_RUST_VERSION = "1.91.0"
 EXPECTED_ARROW_RANGE = ">=58, <60"
 EXPECTED_POLARS_RANGE = ">=0.52, <0.55"
 

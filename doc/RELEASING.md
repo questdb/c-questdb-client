@@ -44,7 +44,7 @@ bump-my-version replace --new-version 7.0.0
 
 Review every changed version and update the release notes, compatibility
 statements, and this repository's documentation. The QWP/WebSocket floor for
-7.0.0 is QuestDB 10.0 and the Rust MSRV is 1.91.1.
+7.0.0 is QuestDB 10.0 and the Rust MSRV is 1.91.0.
 
 Refresh every tracked lockfile containing this client:
 
@@ -65,12 +65,12 @@ runbook:
 python3 ci/check_docs.py
 python3 ci/format_cpp.py --check
 
-cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml
-cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml \
+cargo +1.91.0 check --manifest-path questdb-rs/Cargo.toml
+cargo +1.91.0 check --manifest-path questdb-rs/Cargo.toml \
   --features almost-all-features,arrow,polars
-cargo +1.91.1 check --manifest-path questdb-rs-ffi/Cargo.toml --all-features
+cargo +1.91.0 check --manifest-path questdb-rs-ffi/Cargo.toml --all-features
 
-RUSTDOCFLAGS="-D warnings" cargo +1.91.1 doc \
+RUSTDOCFLAGS="-D warnings" cargo +1.91.0 doc \
   --manifest-path questdb-rs/Cargo.toml \
   --no-deps --features almost-all-features,arrow,polars
 ```
@@ -153,7 +153,7 @@ Wait for docs.rs to build the exact crate version, then merge the prepared
 - the crates.io package and docs.rs API pages;
 - the GitHub Release and its source archives;
 - the C, C++, and Rust product guides and cross-links; and
-- the QuestDB 10.0 and Rust 1.91.1 compatibility statements.
+- the QuestDB 10.0 and Rust 1.91.0 compatibility statements.
 
 ReadTheDocs is used by the Python client and is not part of this release unless
 a separate Python-client release is also being coordinated.
