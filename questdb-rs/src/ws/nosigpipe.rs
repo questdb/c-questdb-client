@@ -131,15 +131,18 @@ impl NoSigpipeTcp {
         self.1 = deadline;
     }
 
+    /// Bound the next read or write by the recycle drain deadline. A deadline
+    /// that has already passed still bounds the call (the OS rejects a zero
+    /// timeout, so the smallest positive one is used) rather than failing it:
+    /// failing a read or write that was never attempted would make the
+    /// caller's bounded wait look like a transport failure and force a
+    /// spurious reconnect.
     fn apply_io_deadline(&self) -> io::Result<()> {
+        const MIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
         if let Some(deadline) = self.1 {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "recycle drain IO deadline expired",
-                ));
-            }
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(MIN_TIMEOUT);
             self.0.set_read_timeout(Some(remaining))?;
             self.0.set_write_timeout(Some(remaining))?;
         }
