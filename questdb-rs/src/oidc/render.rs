@@ -283,10 +283,16 @@ impl TerminalRenderer {
 /// otherwise it falls back to the plain URI already shown above, which is then
 /// suppressed here as redundant.
 fn defang_terminal_url(uri: &str) -> String {
-    if let Some(rest) = uri.strip_prefix("https://") {
-        format!("https[:]//{rest}")
-    } else if let Some(rest) = uri.strip_prefix("http://") {
-        format!("http[:]//{rest}")
+    if uri
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        format!("https[:]//{}", &uri[8..])
+    } else if uri
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        format!("http[:]//{}", &uri[7..])
     } else {
         uri.to_string()
     }
@@ -1022,6 +1028,38 @@ mod tests {
         let shown = format_prompt(&refused);
         assert!(shown.contains("https[:]//xn--80ak6aa92e.com/device"));
         assert!(!shown.contains("https://"));
+    }
+
+    #[test]
+    fn terminal_prompt_defangs_refused_schemes_case_insensitively() {
+        for (scheme, defanged) in [
+            ("HTTPS://", "https[:]//"),
+            ("HtTpS://", "https[:]//"),
+            ("HTTP://", "http[:]//"),
+            ("hTtP://", "http[:]//"),
+        ] {
+            let uri = format!("{scheme}trusted.example@evil.example/device");
+            let challenge = DeviceCodeChallenge {
+                user_code: "WXYZ".into(),
+                verification_uri: uri.clone(),
+                verification_uri_complete: None,
+                expires_in_seconds: 600,
+                interval_seconds: 5,
+                idp_is_loopback: false,
+            };
+            assert!(challenge.browser_target().is_none());
+            assert_eq!(challenge.display_verification_uri(), uri);
+            let prompt = format_prompt(&challenge);
+            assert!(prompt.contains(&format!("{defanged}trusted.example@evil.example/device")));
+            let lower = prompt.to_ascii_lowercase();
+            assert!(
+                !lower.contains("https://") && !lower.contains("http://"),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("or open directly"));
+        }
+        // UTF-8 prefixes must not make byte-indexing panic.
+        assert_eq!(defang_terminal_url("éééé://example"), "éééé://example");
     }
 
     #[test]

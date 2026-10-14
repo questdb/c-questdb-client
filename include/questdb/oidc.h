@@ -372,8 +372,10 @@ bool questdb_oidc_builder_ca_bundle(
  * on first use when it grants any group or other permission, and one that was
  * group- or other-writable is swept before its contents are trusted: entries
  * named like store records (64 lowercase hex characters then `.json`, or a
- * `.tmp` temporary) are deleted, whoever wrote them. Use a directory dedicated
- * to the token store. The bundled file store currently rejects
+ * `.tmp` temporary) are deleted, whoever wrote them. Distrust is synchronized
+ * before permissions are tightened; deletion is synchronized before the
+ * distrust marker is removed, preserving that boundary across crashes.
+ * Use a directory dedicated to the token store. The bundled file store currently rejects
  * persistence on non-Unix platforms before changing disk state because it
  * cannot provide the durable directory-entry replacement/deletion required for
  * rotating refresh tokens there. C callers should keep credentials in memory

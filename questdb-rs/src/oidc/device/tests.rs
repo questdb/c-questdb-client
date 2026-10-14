@@ -7652,7 +7652,7 @@ impl TokenStore for PreflightRefusingStore {
     fn preflight(&self, _cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
         self.preflights.fetch_add(1, Ordering::SeqCst);
         Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidInput,
             "refusing to persist: the directory could not be restricted",
         )))
     }
@@ -7778,6 +7778,88 @@ fn sign_in_reports_an_unusable_file_store_path_as_config() {
     // location may be repaired while the process runs.
     let err = auth.token().expect_err("no credential is available");
     assert_eq!(err.kind(), OidcErrorKind::Network, "{err}");
+}
+
+struct TransientPreflightStore {
+    inner: SilentStore,
+    kind: std::io::ErrorKind,
+    preflights: Arc<AtomicUsize>,
+}
+
+impl TokenStore for TransientPreflightStore {
+    fn load(&self, key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        self.inner.load(key)
+    }
+    fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        self.inner.save(key, token)
+    }
+    fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+        self.inner.clear(key)
+    }
+    fn in_lock(
+        &self,
+        key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        self.inner.in_lock(key, action)
+    }
+    fn preflight(&self, _cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
+        if self.preflights.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(Box::new(std::io::Error::new(
+                self.kind,
+                "temporary preflight failure",
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn transient_preflight_failure_warns_and_sign_in_can_retry() {
+    for kind in [
+        std::io::ErrorKind::WouldBlock,
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::Other,
+        // A lost lease uses synthetic PermissionDenied, not an OS denial.
+        std::io::ErrorKind::PermissionDenied,
+    ] {
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let mock = persistence_mock(Arc::clone(&device_calls), || {
+            r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+        });
+        let preflights = Arc::new(AtomicUsize::new(0));
+        let saves = Arc::new(AtomicUsize::new(0));
+        let diagnostic = RecordingDiagnostic::default();
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .diagnostic_handler(diagnostic.clone())
+            .token_store(TransientPreflightStore {
+                inner: SilentStore {
+                    saves: Arc::clone(&saves),
+                },
+                kind,
+                preflights: Arc::clone(&preflights),
+            })
+            .build()
+            .unwrap();
+        auth.sign_in()
+            .unwrap_or_else(|error| panic!("{kind:?}: {error}"));
+        auth.clear().unwrap();
+        auth.sign_in()
+            .expect("the same provider survives the transient failure");
+        assert_eq!(preflights.load(Ordering::SeqCst), 2);
+        assert_eq!(device_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(saves.load(Ordering::SeqCst), 2);
+        let warnings = diagnostic.0.lock().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("preflight"), "{warnings:?}");
+    }
 }
 
 #[test]

@@ -2435,13 +2435,27 @@ impl OidcDeviceAuth {
         // A `close()` landing during the preflight is a cancellation, not a
         // misconfigured store; let `ensure_open` classify it.
         self.ensure_open()?;
-        result.map_err(|e| {
-            OidcError::config(format!(
-                "The configured OIDC token store cannot persist a credential, so \
-                 signing in would store nothing and the device flow would run \
-                 again on every start: {e}"
-            ))
-        })
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Custom non-I/O refusals are explicit preflight policy. For
+                // I/O errors use the same permanent/transient distinction as
+                // the preceding load, rather than turning lock contention or
+                // a failed fsync into a standing configuration error.
+                let permanent =
+                    e.downcast_ref::<std::io::Error>().is_none() || store_error_is_permanent(&*e);
+                if permanent {
+                    return Err(OidcError::config(format!(
+                        "The configured OIDC token store cannot persist a credential, so \
+                         signing in would store nothing and the device flow would run \
+                         again on every start: {e}"
+                    )));
+                }
+                self.warn_persistence("preflight", &*e);
+                // A diagnostic handler may close the provider.
+                self.ensure_open()
+            }
+        }
     }
 
     fn persist_fresh_durable(&self, tokens: &TokenSet) -> Result<()> {
@@ -3409,7 +3423,8 @@ fn store_error_is_permanent(error: &(dyn std::error::Error + Send + Sync + 'stat
     match io.kind() {
         std::io::ErrorKind::InvalidInput
         | std::io::ErrorKind::NotADirectory
-        | std::io::ErrorKind::ReadOnlyFilesystem => true,
+        | std::io::ErrorKind::ReadOnlyFilesystem
+        | std::io::ErrorKind::Unsupported => true,
         std::io::ErrorKind::PermissionDenied => cfg!(unix) && io.raw_os_error().is_some(),
         _ => false,
     }

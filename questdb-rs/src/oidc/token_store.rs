@@ -582,7 +582,11 @@ pub trait TokenStore: Send + Sync {
     /// The default is `Ok(())`: a custom store managing its own medium has
     /// nothing to pre-check, and a store that only fails transiently should
     /// keep failing at write time, where the failure is warned and the
-    /// in-process credential still works.
+    /// in-process credential still works. I/O contention and transient failures
+    /// are warned rather than treated as permanent refusal. Use `InvalidInput`
+    /// or `Unsupported` for an explicit configuration refusal; operating-system
+    /// permission, read-only filesystem, and invalid-directory errors are also
+    /// permanent. A custom non-I/O error is an explicit refusal.
     fn preflight(&self, _cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
         Ok(())
     }
@@ -1242,7 +1246,9 @@ impl FileTokenStore {
     /// flow starts or on the write that follows it.
     fn persist_refused_error(&self) -> Box<dyn std::error::Error + Send + Sync> {
         Box::new(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
+            // An explicit configuration refusal, unlike the synthetic
+            // PermissionDenied used for a transient lost filesystem lease.
+            std::io::ErrorKind::InvalidInput,
             format!(
                 "refusing to persist an OIDC token into {}: the directory is \
                  writable by users other than its owner and could not be \
@@ -1290,8 +1296,13 @@ impl FileTokenStore {
         let heartbeat = self.start_directory_lock_heartbeat(lock.clone(), held.stamp.clone())?;
         heartbeat.check_owned()?;
 
-        let trusted =
-            prepare_directory_trust(&self.directory, &self.untrusted_sentinel(), &heartbeat)?;
+        let sync_directory = || self.sync_directory();
+        let trusted = prepare_directory_trust(
+            &self.directory,
+            &self.untrusted_sentinel(),
+            &heartbeat,
+            &sync_directory,
+        )?;
         if !lock_is_owned(&lock, &held.stamp) {
             drop(scope);
             drop(held);
@@ -1307,6 +1318,7 @@ impl FileTokenStore {
                 &self.directory,
                 &self.untrusted_sentinel(),
                 &heartbeat,
+                &sync_directory,
             )?;
         }
         let result = if cancelled() {
@@ -2646,7 +2658,9 @@ fn create_empty_private(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    opts.open(path).map(|_| ())
+    // The marker's inode must survive alongside its directory entry before
+    // chmod can make the previously writable directory look trustworthy.
+    opts.open(path)?.sync_all()
 }
 
 /// Publish distrust before chmod makes a previously writable directory appear
@@ -2660,7 +2674,23 @@ fn mark_untrusted(sentinel: &Path) -> std::io::Result<()> {
                 .map(|meta| meta.is_file() && !meta.file_type().is_symlink())
                 .unwrap_or(false);
             if usable {
-                return Ok(());
+                // A previous attempt may have created the marker but failed
+                // its inode sync. Do not assume an existing name is durable.
+                let mut opts = OpenOptions::new();
+                opts.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+                }
+                let file = opts.open(sentinel)?;
+                if !file.metadata()?.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "OIDC distrust marker is not a regular file",
+                    ));
+                }
+                return file.sync_all();
             }
             if fs::remove_file(sentinel).is_err() {
                 let _ = fs::remove_dir(sentinel);
@@ -2676,22 +2706,27 @@ fn prepare_directory_trust(
     dir: &Path,
     sentinel: &Path,
     heartbeat: &DirectoryLockHeartbeat,
+    sync_directory: &dyn Fn() -> std::io::Result<()>,
 ) -> std::io::Result<bool> {
     use std::os::unix::fs::PermissionsExt;
     let meta = fs::symlink_metadata(dir)?;
     let mode = meta.permissions().mode();
     let was_other_writable = mode & 0o022 != 0;
-    if was_other_writable {
-        // Best effort, matching Java: this caller retains the untrusted verdict
-        // even if publishing it for a concurrent caller fails.
+    let had_sentinel = !path_is_definitely_absent(sentinel);
+    if was_other_writable || had_sentinel {
+        // Publish distrust durably BEFORE chmod. Otherwise a crash could
+        // preserve 0700 but lose the marker, trusting a planted record on the
+        // next start. Failure leaves permissions untightened and fails closed.
         heartbeat.check_owned()?;
-        let _ = mark_untrusted(sentinel);
+        mark_untrusted(sentinel)?;
+        heartbeat.check_owned()?;
+        sync_directory()?;
     }
     if mode & 0o077 != 0 {
         heartbeat.check_owned()?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    Ok(!was_other_writable && path_is_definitely_absent(sentinel))
+    Ok(!was_other_writable && !had_sentinel && path_is_definitely_absent(sentinel))
 }
 
 #[cfg(not(unix))]
@@ -2699,6 +2734,7 @@ fn prepare_directory_trust(
     _dir: &Path,
     sentinel: &Path,
     heartbeat: &DirectoryLockHeartbeat,
+    _sync_directory: &dyn Fn() -> std::io::Result<()>,
 ) -> std::io::Result<bool> {
     heartbeat.check_owned()?;
     warn_no_posix_perms_once();
@@ -2721,6 +2757,7 @@ fn discard_untrusted_directory_contents(
     dir: &Path,
     sentinel: &Path,
     heartbeat: &DirectoryLockHeartbeat,
+    sync_directory: &dyn Fn() -> std::io::Result<()>,
 ) -> TokenStoreResult<()> {
     let mut swept_clean = true;
     match fs::read_dir(dir) {
@@ -2748,14 +2785,29 @@ fn discard_untrusted_directory_contents(
         Err(_) => swept_clean = false,
     }
     if swept_clean {
+        // Make the deletions (and repaired directory mode) durable while the
+        // distrust marker is still present. A crash must not resurrect an
+        // untrusted credential after durable marker removal.
         heartbeat.check_owned()?;
+        #[cfg(unix)]
+        sync_directory()?;
         if fs::remove_file(sentinel).is_err() && !path_is_definitely_absent(sentinel) {
-            // Preserve the marker if it cannot be lifted. A later load must remain
-            // fail-closed and retry the sweep rather than trust partial recovery.
-            heartbeat.check_owned()?;
+            // An undisplaceable sentinel continues to deny trust/persistence.
+            return Ok(());
+        }
+        heartbeat.check_owned()?;
+        #[cfg(unix)]
+        if let Err(error) = sync_directory() {
+            // The sweep is already durable, so old records cannot come back.
+            // Retain distrust in the running filesystem as well, allowing a
+            // later operation to retry the interrupted recovery.
             let _ = mark_untrusted(sentinel);
+            let _ = sync_directory();
+            return Err(Box::new(error));
         }
     }
+    #[cfg(not(unix))]
+    let _ = sync_directory;
     Ok(())
 }
 

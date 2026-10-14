@@ -1140,6 +1140,156 @@ fn preexisting_loose_permissions_directory_is_retightened() {
 }
 
 #[cfg(unix)]
+fn recovery_lease(store: &FileTokenStore) -> (HeldLock, DirectoryLockHeartbeat) {
+    let lock = store.directory_lock_file();
+    let held = store
+        .acquire_lock(
+            &lock,
+            DIRECTORY_LOCK_STALE,
+            DIRECTORY_LOCK_EMPTY_GRACE,
+            &never_cancelled,
+        )
+        .unwrap();
+    let heartbeat = store
+        .start_directory_lock_heartbeat(lock, held.stamp.clone())
+        .unwrap();
+    (held, heartbeat)
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_recovery_syncs_distrust_before_chmod_and_sweep_before_unmarking() {
+    use std::cell::Cell;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let store = test_file_store(dir.path());
+    let key = test_key();
+    store.save(&key, &test_token()).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let (held, heartbeat) = recovery_lease(&store);
+    let sentinel = store.untrusted_sentinel();
+    let synced = Cell::new(0);
+    let sync = || {
+        let mode = std::fs::metadata(dir.path())?.permissions().mode() & 0o777;
+        match synced.get() {
+            0 => {
+                assert_eq!(mode, 0o777, "chmod preceded durable distrust");
+                assert!(sentinel.is_file());
+                assert!(store.token_file(&key).exists());
+            }
+            1 => {
+                assert_eq!(mode, 0o700);
+                assert!(sentinel.exists(), "sentinel lifted before durable sweep");
+                assert!(!store.token_file(&key).exists());
+            }
+            2 => {
+                assert_eq!(mode, 0o700);
+                assert!(!sentinel.exists());
+                assert!(!store.token_file(&key).exists());
+            }
+            _ => panic!("unexpected recovery barrier"),
+        }
+        fsync_directory(dir.path())?;
+        synced.set(synced.get() + 1);
+        Ok(())
+    };
+    assert!(!prepare_directory_trust(dir.path(), &sentinel, &heartbeat, &sync).unwrap());
+    discard_untrusted_directory_contents(dir.path(), &sentinel, &heartbeat, &sync).unwrap();
+    assert_eq!(synced.get(), 3);
+    heartbeat.finish().unwrap();
+    drop(held);
+    assert!(store.load(&key).unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_recovery_barrier_failures_preserve_distrust() {
+    use std::cell::Cell;
+    use std::os::unix::fs::PermissionsExt;
+    for fail_on in 1..=3 {
+        let dir = TempDir::new().unwrap();
+        let store = test_file_store(dir.path());
+        let key = test_key();
+        store.save(&key, &test_token()).unwrap();
+        let old_record = std::fs::read(store.token_file(&key)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let (held, heartbeat) = recovery_lease(&store);
+        let sentinel = store.untrusted_sentinel();
+        let attempts = Cell::new(0);
+        let sync = || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == fail_on {
+                return Err(std::io::Error::other("injected recovery barrier failure"));
+            }
+            fsync_directory(dir.path())
+        };
+        let result = prepare_directory_trust(dir.path(), &sentinel, &heartbeat, &sync)
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+            .and_then(|_| {
+                discard_untrusted_directory_contents(dir.path(), &sentinel, &heartbeat, &sync)
+            });
+        assert!(result.is_err(), "barrier {fail_on} failure was ignored");
+        assert!(
+            sentinel.exists(),
+            "barrier {fail_on} left no distrust marker"
+        );
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, if fail_on == 1 { 0o777 } else { 0o700 });
+        if fail_on == 2 {
+            // Model an unlink lost with the failed sweep barrier. The durable
+            // sentinel must force the next load to discard the old record.
+            std::fs::write(store.token_file(&key), &old_record).unwrap();
+        }
+        heartbeat.finish().unwrap();
+        drop(held);
+        assert!(
+            store.load(&key).unwrap().is_none(),
+            "barrier {fail_on} adopted an untrusted record"
+        );
+        assert!(!store.token_file(&key).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_marker_sync_in_repaired_directory_does_not_start_sweep() {
+    let dir = TempDir::new().unwrap();
+    let store = test_file_store(dir.path());
+    let key = test_key();
+    store.save(&key, &test_token()).unwrap();
+    // Model a predecessor that tightened permissions but left an unsynced
+    // marker. Make its presence durable before touching any old records.
+    std::fs::write(store.untrusted_sentinel(), b"").unwrap();
+    store.fail_next_directory_syncs(1);
+    assert!(store.load(&key).is_err());
+    assert!(store.untrusted_sentinel().exists());
+    assert!(
+        store.token_file(&key).exists(),
+        "sweep began before marker sync"
+    );
+    assert!(store.load(&key).unwrap().is_none());
+    assert!(!store.token_file(&key).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_distrust_publication_does_not_tighten_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let store = test_file_store(dir.path());
+    store.save(&test_key(), &test_token()).unwrap();
+    std::fs::create_dir(store.untrusted_sentinel()).unwrap();
+    std::fs::write(store.untrusted_sentinel().join("squatter"), b"x").unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(store.load(&test_key()).is_err());
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+    assert!(store.token_file(&test_key()).exists());
+}
+
+#[cfg(unix)]
 #[test]
 fn insecure_directory_discards_java_golden_then_recovers_for_native_writes() {
     use std::os::unix::fs::PermissionsExt;
