@@ -112,6 +112,11 @@ def run_integration_tests():
     before that server release exists, test the approved 10.0 RC checkout with
     `--repo`. After publication, the `--versions` alternative exercises the
     exact downloadable release artifact."""
+    # Run the pure-Python cleanup regressions on every host. Do not select
+    # the entire fixture module on Windows: its stand-in processes do not
+    # have the isolated consoles that JVM shutdown expects.
+    run_cmd('python3', '-m', 'unittest', '-v',
+            'test_fixture_unit.SqlCleanupTest', cwd='system_test')
     system_test_path = pathlib.Path('system_test') / 'test.py'
     run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
     # qdb_v = '<exact QuestDB 10.0 release tag>'

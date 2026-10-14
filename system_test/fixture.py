@@ -328,7 +328,7 @@ class QuestDbFixtureBase:
         encoded = base64.b64encode(credentials).decode('ascii')
         return {'Authorization': f'Basic {encoded}'}
 
-    def http_sql_query(self, sql_query):
+    def http_sql_query(self, sql_query, *, timeout_sec=5):
         url = (
                 f'http://{self.host}:{self.http_server_port}/exec?' +
                 urllib.parse.urlencode({'query': sql_query}))
@@ -338,7 +338,7 @@ class QuestDbFixtureBase:
                 url,
                 headers=self.http_headers(),
                 method='GET')
-            resp = urllib.request.urlopen(req, timeout=5)
+            resp = urllib.request.urlopen(req, timeout=timeout_sec)
             buf = resp.read()
         except urllib.error.HTTPError as http_error:
             buf = http_error.read()
@@ -439,7 +439,10 @@ class QuestDbFixtureBase:
             raise qe
         
     def drop_table(self, table_name):
-        self.http_sql_query(f"drop table '{table_name}'")
+        # WAL writer cleanup can exceed the normal 5s query/poll timeout,
+        # particularly on Windows. Give this DDL a bounded cleanup budget;
+        # do not retry it, since a timed-out request may already have applied.
+        self.http_sql_query(f"drop table '{table_name}'", timeout_sec=30)
 
     def drop_all_tables(self):
         """Drop all tables in the database."""
