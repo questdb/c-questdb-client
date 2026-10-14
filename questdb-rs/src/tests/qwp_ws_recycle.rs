@@ -41,11 +41,50 @@ pub(crate) struct Server {
     pub(crate) port: u16,
     frames: mpsc::Receiver<(usize, Vec<u8>)>,
     stop: Arc<AtomicBool>,
-    acks_released: Arc<AtomicBool>,
+    pub(crate) acks_released: Arc<AtomicBool>,
     connections: Arc<AtomicUsize>,
+    /// Connections whose server side has ended, which happens once the client
+    /// closes its socket. Used to observe connection release without `drop`.
+    closed: Arc<AtomicUsize>,
     upgrade_fault: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
 }
+
+/// Counts a connection as closed when its server-side worker ends.
+struct ConnectionEnd(Arc<AtomicUsize>);
+
+impl Drop for ConnectionEnd {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Abort the connection with a TCP RST instead of an orderly FIN, which is what
+/// a crashed or rebooted peer produces. macOS then rejects `setsockopt` on the
+/// client socket with EINVAL.
+#[cfg(unix)]
+fn reset_connection(stream: &std::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: the descriptor is live for the duration of the call and `linger`
+    // is a valid, fully initialized option value of the stated size.
+    unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&linger as *const libc::linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_connection(_stream: &std::net::TcpStream) {}
+
 impl Server {
     pub(crate) fn new() -> Self {
         Self::with_ack_delay(Duration::ZERO)
@@ -64,6 +103,8 @@ impl Server {
         let (tx, frames) = mpsc::channel();
         let connections = Arc::new(AtomicUsize::new(0));
         let accepted = Arc::clone(&connections);
+        let closed = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::clone(&closed);
         let upgrade_fault = Arc::new(AtomicUsize::new(0));
         let faults = Arc::clone(&upgrade_fault);
         let worker = thread::spawn(move || {
@@ -77,10 +118,12 @@ impl Server {
                         let wire_fault = Arc::clone(&faults);
                         let release_acks = Arc::clone(&release_acks);
                         let stop = Arc::clone(&stopped);
+                        let ended = Arc::clone(&ended);
                         let id = connection;
                         connection += 1;
                         accepted.fetch_add(1, Ordering::Release);
                         workers.push(thread::spawn(move || {
+                            let _end = ConnectionEnd(ended);
                             stream.set_nonblocking(false).unwrap();
                             if fault == 1 { return; }
                             if fault == 2 {
@@ -109,6 +152,19 @@ impl Server {
                                 }
                                 if wire_fault.compare_exchange(3, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                                     return; // Received, deliberately unacknowledged, then disconnected.
+                                }
+                                if wire_fault.compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                                    // Received, unacknowledged, then reset once the test
+                                    // releases ACKs, so the reset cannot race the client's
+                                    // own receive poll. Later connections behave.
+                                    while !release_acks.load(Ordering::Acquire) {
+                                        if stop.load(Ordering::Acquire) {
+                                            return;
+                                        }
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
+                                    reset_connection(&stream);
+                                    return;
                                 }
                                 if frame_deferred {
                                     seq += 1;
@@ -154,12 +210,28 @@ impl Server {
             stop,
             acks_released,
             connections,
+            closed,
             upgrade_fault,
             worker: Some(worker),
         }
     }
     pub(crate) fn connection_count(&self) -> usize {
         self.connections.load(Ordering::Acquire)
+    }
+    fn closed_count(&self) -> usize {
+        self.closed.load(Ordering::Acquire)
+    }
+    /// Block until `closed_count()` reaches `expected`, or panic after 5 s.
+    fn wait_closed(&self, expected: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while self.closed_count() < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected {expected} closed connections, saw {}",
+                self.closed_count()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
     pub(crate) fn frame(&self) -> (usize, Vec<u8>) {
         self.frames.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -187,6 +259,21 @@ fn varint(frame: &[u8], pos: &mut usize) -> usize {
 
 fn assert_fresh(frame: &[u8], symbol: &str) {
     assert_symbol(frame, symbol, 0);
+}
+
+/// Read frames until one carries `symbol`. A dictionary catch-up or a replayed
+/// earlier frame may precede it after a reconnect or a slot reopen.
+fn frame_with_symbol(server: &Server, symbol: &str) -> (usize, Vec<u8>) {
+    for _ in 0..8 {
+        let (connection, frame) = server.frame();
+        if frame
+            .windows(symbol.len())
+            .any(|window| window == symbol.as_bytes())
+        {
+            return (connection, frame);
+        }
+    }
+    panic!("no frame carried {symbol}");
 }
 
 fn assert_symbol(frame: &[u8], symbol: &str, expected_id: usize) {
@@ -413,7 +500,11 @@ fn recycle_boundary_split_and_deferred() {
 #[test]
 fn recycle_boundary_bounded_wait_times_out_without_changing_namespace() {
     for progress in [QwpWsProgress::Background, QwpWsProgress::Manual] {
-        let server = Server::with_ack_delay(Duration::from_millis(150));
+        let server = Server::new();
+        // Withhold every ACK until the bounded wait has returned, so the first
+        // frame is still unresolved when the second flush arms its wait. A
+        // timed ACK delay would race the wait on a loaded CI host.
+        server.acks_released.store(false, Ordering::Release);
         let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=20;", server.port)).unwrap().qwp_ws_progress(progress).unwrap().build().unwrap();
         let mut buffer = sender.new_buffer();
         buffer
@@ -428,6 +519,7 @@ fn recycle_boundary_bounded_wait_times_out_without_changing_namespace() {
             sender.drive_once().unwrap();
         }
         let (old, _) = server.frame();
+        // Age the arm past `max_wait` so the second flush takes its wait budget.
         thread::sleep(Duration::from_millis(25));
         buffer
             .table("trades")
@@ -438,7 +530,10 @@ fn recycle_boundary_bounded_wait_times_out_without_changing_namespace() {
             .unwrap();
         let started = std::time::Instant::now();
         assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(1));
-        assert!(started.elapsed() < Duration::from_millis(100));
+        // The wait is bounded by `max_wait`; with ACKs withheld an unbounded
+        // wait would never return. Keep the bound loose for slow hosts.
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.acks_released.store(true, Ordering::Release);
         sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
         let (same, second) = server.frame();
         assert_eq!(old, same);
@@ -1388,4 +1483,385 @@ fn recycle_resources_repeated() {
             }
         }
     }
+}
+
+/// A terminal worker exits by dropping its session, so the server connection
+/// closes right away. Parking it would pin the connection until the sender
+/// itself is dropped, which an application that keeps a terminal sender around
+/// to read its errors may never do promptly.
+#[test]
+fn terminal_background_sender_releases_connection_before_drop() {
+    let server = Server::with_behavior(Duration::ZERO, Some((0, 0)));
+    let mut sender = SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{};", server.port))
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buffer = sender.new_buffer();
+    symbol_buffer(&mut buffer, "alpha");
+    sender.flush(&mut buffer).unwrap();
+    assert_eq!(
+        sender
+            .wait(AckLevel::Ok, Duration::from_secs(5))
+            .unwrap_err()
+            .code(),
+        crate::ErrorCode::ServerRejection
+    );
+    server.frame();
+    server.wait_closed(1);
+    assert!(sender.must_close());
+    drop(sender);
+}
+
+/// The pending-connect worker behind a lazily connected pool exits the same way.
+#[test]
+fn terminal_lazy_pool_sender_releases_connection_before_return() {
+    let server = Server::with_behavior(Duration::ZERO, Some((0, 0)));
+    let db = crate::QuestDb::connect(&format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;sender_pool_max=1;pool_reap=manual;",
+        server.port
+    ))
+    .unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let mut buffer = db.new_buffer();
+    symbol_buffer(&mut buffer, "alpha");
+    sender.flush_buffer(&mut buffer).unwrap();
+    assert_eq!(
+        sender
+            .wait(AckLevel::Ok, Duration::from_secs(5))
+            .unwrap_err()
+            .code(),
+        crate::ErrorCode::ServerRejection
+    );
+    server.frame();
+    server.wait_closed(1);
+    assert!(sender.must_close_for_test());
+    drop(sender);
+    db.close();
+}
+
+/// A storage fault during a recycle is maintenance, not an unhealthy endpoint.
+/// The standalone sender must not report `must_close()` for it, and the next
+/// flush resumes the recycle, as the pooled sender already did.
+#[test]
+fn recycle_storage_fault_keeps_standalone_sender_open() {
+    for progress in [QwpWsProgress::Background, QwpWsProgress::Manual] {
+        for disk in [false, true] {
+            let server = Server::new();
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = if disk {
+                format!("sf_dir={};sender_id=fault;", dir.path().display())
+            } else {
+                String::new()
+            };
+            let mut sender = SenderBuilder::from_conf(format!(
+                "ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;{storage}",
+                server.port
+            ))
+            .unwrap()
+            .qwp_ws_progress(progress)
+            .unwrap()
+            .build()
+            .unwrap();
+            let mut buffer = sender.new_buffer();
+            symbol_buffer(&mut buffer, "alpha");
+            sender.flush(&mut buffer).unwrap();
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+            let (old, _) = server.frame();
+            crate::ingress::sender::fail_next_recycle_storage_for_test();
+            symbol_buffer(&mut buffer, "beta");
+            let err = sender.flush(&mut buffer).unwrap_err();
+            assert!(
+                err.msg().contains("injected recycle failure"),
+                "{}",
+                err.msg()
+            );
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(
+                !sender.must_close(),
+                "a recoverable recycle fault must not retire the sender"
+            );
+            assert!(!buffer.is_empty());
+            sender.flush(&mut buffer).unwrap();
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+            let (fresh, frame) = server.frame();
+            assert_ne!(fresh, old);
+            assert_fresh(&frame, "beta");
+            assert!(!sender.must_close());
+            sender.close_drain().unwrap();
+        }
+    }
+}
+
+/// A storage fault that interrupts the drained reset must not block close.
+/// Every frame is acknowledged, so close abandons the reset, runs its ordinary
+/// drained close and releases the slot: a replacement sender can own the slot
+/// while the closed one is still alive, and keeps publishing.
+#[test]
+fn recycle_storage_fault_close_releases_slot() {
+    for progress in [QwpWsProgress::Background, QwpWsProgress::Manual] {
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let conf = format!(
+            "ws::addr=127.0.0.1:{};sf_dir={};sender_id=interrupted;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;",
+            server.port,
+            dir.path().display()
+        );
+        let mut sender = SenderBuilder::from_conf(&conf)
+            .unwrap()
+            .qwp_ws_progress(progress)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut buffer = sender.new_buffer();
+        symbol_buffer(&mut buffer, "alpha");
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        server.frame();
+        crate::ingress::sender::fail_next_recycle_storage_for_test();
+        symbol_buffer(&mut buffer, "beta");
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("injected recycle failure")
+        );
+        let started = std::time::Instant::now();
+        sender.close_drain().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "close must not wait out the drain timeout on an interrupted reset"
+        );
+        // The slot lock is released by close, not by drop.
+        let mut replacement = SenderBuilder::from_conf(&conf)
+            .unwrap()
+            .qwp_ws_progress(progress)
+            .unwrap()
+            .build()
+            .unwrap();
+        replacement.flush(&mut buffer).unwrap();
+        replacement
+            .wait(AckLevel::Ok, Duration::from_secs(5))
+            .unwrap();
+        frame_with_symbol(&server, "beta");
+        drop(sender);
+        replacement.close_drain().unwrap();
+    }
+}
+
+/// Manual `drive_once` resumes a recycle that a storage fault left parked,
+/// instead of refusing to make progress until a flush arrives.
+#[test]
+fn recycle_storage_fault_manual_drive_once_resumes() {
+    for disk in [false, true] {
+        let server = Server::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = if disk {
+            format!("sf_dir={};sender_id=driven;", dir.path().display())
+        } else {
+            String::new()
+        };
+        let mut sender = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;{storage}",
+            server.port
+        ))
+        .unwrap()
+        .qwp_ws_progress(QwpWsProgress::Manual)
+        .unwrap()
+        .build()
+        .unwrap();
+        let mut buffer = sender.new_buffer();
+        symbol_buffer(&mut buffer, "alpha");
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (old, _) = server.frame();
+        crate::ingress::sender::fail_next_recycle_storage_for_test();
+        symbol_buffer(&mut buffer, "beta");
+        assert!(
+            sender
+                .flush(&mut buffer)
+                .unwrap_err()
+                .msg()
+                .contains("injected recycle failure")
+        );
+        // Resumes the parked recycle (it used to fail with "parked for
+        // dictionary recycling") and then drives the fresh session.
+        sender.drive_once().unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let (fresh, frame) = server.frame();
+        assert_ne!(fresh, old);
+        assert_fresh(&frame, "beta");
+        sender.close_drain().unwrap();
+    }
+}
+
+/// A periodic-sync failure latched while a recycle claim parks the worker must
+/// not strand the sender. The claim gives the session back, the restarted
+/// worker clears the latch as it does without recycling, and a later flush
+/// recycles normally.
+#[test]
+fn recycle_durability_latch_during_park_unparks_worker() {
+    let server = Server::new();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{};sf_dir={};sender_id=latched;sf_durability=periodic;sf_sync_interval_millis=20;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;",
+        server.port,
+        dir.path().display()
+    ))
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    symbol_buffer(&mut buffer, "alpha");
+    sender.flush(&mut buffer).unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    let (old, _) = server.frame();
+    crate::ingress::sender::durability_failure_after_recycle_park_for_test();
+    symbol_buffer(&mut buffer, "beta");
+    let err = sender.flush(&mut buffer).unwrap_err();
+    assert!(
+        err.msg().contains("injected periodic sync failure"),
+        "{}",
+        err.msg()
+    );
+    assert!(!sender.must_close());
+    assert!(!buffer.is_empty());
+    // Flushes keep reporting the latch until the restarted worker's retry
+    // clears it, exactly as they do when no recycle is involved.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match sender.flush(&mut buffer) {
+            Ok(_) => break,
+            Err(err) => {
+                assert!(
+                    err.msg().contains("injected periodic sync failure"),
+                    "{}",
+                    err.msg()
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the durability latch never cleared"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    frame_with_symbol(&server, "beta");
+    assert!(
+        server.connection_count() >= 2,
+        "the abandoned claim reconnects the retained session"
+    );
+    sender.reset_symbol_dictionary().unwrap();
+    symbol_buffer(&mut buffer, "gamma");
+    sender.flush(&mut buffer).unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    let (fresh, frame) = server.frame();
+    assert_ne!(fresh, old);
+    assert_fresh(&frame, "gamma");
+    sender.close_drain().unwrap();
+}
+
+/// Reset back-pressure (segment budget exhausted at the drained boundary) trims
+/// the acknowledged prefix and completes, instead of surfacing `InvalidApiCall`
+/// because a due periodic sync took the single maintenance step on every retry.
+#[test]
+fn recycle_reset_backpressure_trims_acknowledged_segments() {
+    let server = Server::new();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{};sf_dir={};sender_id=capfull;sf_durability=periodic;sf_sync_interval_millis=1;sf_max_segment_bytes=4096;sf_max_total_bytes=8192;symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;",
+        server.port,
+        dir.path().display()
+    ))
+    .unwrap()
+    .qwp_ws_progress(QwpWsProgress::Manual)
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    // Two frames that cannot share a 4 KiB segment: the first seals segment
+    // one, the second opens segment two and exhausts the two-segment budget.
+    let padding = "x".repeat(2500);
+    for _ in 0..2 {
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .column_str("pad", &padding)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+    }
+    // Drive with every tick at least one sync interval apart, so each tick's
+    // single maintenance step is the due sync and the acknowledged segment
+    // stays untrimmed when the recycle's storage reset needs its budget.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sender.acked_fsn().unwrap() != Some(1) {
+        assert!(std::time::Instant::now() < deadline);
+        sender.drive_once().unwrap();
+        thread::sleep(Duration::from_millis(2));
+    }
+    server.frame();
+    server.frame();
+    thread::sleep(Duration::from_millis(2));
+    symbol_buffer(&mut buffer, "beta");
+    sender.flush(&mut buffer).unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    let (fresh, frame) = server.frame();
+    assert_eq!(fresh, 1);
+    assert_fresh(&frame, "beta");
+    sender.close_drain().unwrap();
+}
+
+/// A peer reset during the bounded drain wait is a disconnect, not a flush
+/// failure. macOS rejects restoring the socket timeouts on a reset socket with
+/// EINVAL; that must join the reconnect instead of surfacing as an API error.
+#[cfg(unix)]
+#[test]
+fn recycle_bounded_wait_survives_peer_reset() {
+    let server = Server::new();
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=100;",
+        server.port
+    ))
+    .unwrap()
+    .qwp_ws_progress(QwpWsProgress::Manual)
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    symbol_buffer(&mut buffer, "alpha");
+    sender.flush(&mut buffer).unwrap();
+    // Hold the reset until `drive_once` has returned: a reset the send's own
+    // receive poll already sees is handled there, and the first frame would be
+    // replayed and acknowledged before the bounded wait ever starts.
+    server.acks_released.store(false, Ordering::Release);
+    server.upgrade_fault.store(4, Ordering::Release);
+    sender.drive_once().unwrap();
+    let (old, _) = server.frame();
+    server.acks_released.store(true, Ordering::Release);
+    // Let the reset arrive and the arm age past `max_wait`.
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        server.connection_count(),
+        1,
+        "the reset must be first observed inside the bounded wait"
+    );
+    symbol_buffer(&mut buffer, "beta");
+    assert_eq!(sender.flush_and_get_fsn(&mut buffer).unwrap(), Some(1));
+    assert!(!sender.must_close());
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    // The reconnect re-registers the dictionary, replays the unacknowledged
+    // first frame and then delivers the second, all on the new connection; no
+    // recycle ran because the queue was not drained during the bounded wait.
+    let (replayed, _) = frame_with_symbol(&server, "alpha");
+    assert_ne!(replayed, old);
+    let (same, frame) = frame_with_symbol(&server, "beta");
+    assert_eq!(same, replayed);
+    assert_symbol(&frame, "beta", 1);
+    sender.close_drain().unwrap();
 }

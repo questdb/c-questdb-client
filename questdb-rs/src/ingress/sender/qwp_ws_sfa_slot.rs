@@ -59,8 +59,8 @@ use super::qwp_ws_driver::{DriverError, PublicationLog};
 use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_manifest::sync_directory;
 use super::qwp_ws_sfa_queue::{
-    SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaQueueError,
-    SfaQueueOptions, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
+    DrainedResetMaintenance, SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer,
+    SfaQueueError, SfaQueueOptions, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
 use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
@@ -137,6 +137,13 @@ impl SfaSlotQueue {
         self.queue.reset_drained(producer)
     }
 
+    /// Trim-only maintenance for a drained reset waiting on allocation room.
+    pub(crate) fn take_drained_reset_maintenance_step(
+        &mut self,
+    ) -> Result<DrainedResetMaintenance, DriverError> {
+        Ok(self.queue.take_drained_reset_maintenance_step()?)
+    }
+
     pub(crate) fn restore_producer(&mut self, producer: SfaProducer) {
         self.queue.restore_producer(producer);
     }
@@ -195,6 +202,15 @@ impl PublicationLog for SfaSlotQueue {
 
     fn storage_maintenance_in_flight(&self) -> Result<bool, DriverError> {
         Ok(self.queue.storage_maintenance_in_flight()?)
+    }
+
+    #[cfg(test)]
+    fn latch_durability_failure_for_test(&mut self, message: &str) {
+        self.queue.latch_durability_failure_for_test(message);
+    }
+
+    fn abandon_drained_reset(&mut self) -> Result<(), DriverError> {
+        Ok(self.queue.abandon_drained_reset()?)
     }
 
     fn take_storage_maintenance_step(

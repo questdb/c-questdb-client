@@ -184,6 +184,19 @@ impl From<SfaQueueError> for DriverError {
     }
 }
 
+/// What a parked drained reset can still do to free the segment budget it
+/// needs. Nothing else runs while the session is parked, so only these three
+/// outcomes exist.
+#[derive(Debug)]
+pub(crate) enum DrainedResetMaintenance {
+    /// A trim of acknowledged segments is ready to run.
+    Step(SfaStorageStep),
+    /// A failed trim barrier is waiting for its retry time.
+    RetryAt(Instant),
+    /// No acknowledged prefix is left to trim; the budget cannot change.
+    Exhausted,
+}
+
 #[derive(Debug)]
 pub(crate) enum SfaStorageStep {
     Trim(SfaStorageCleanup),
@@ -1334,6 +1347,46 @@ impl SfaFrameQueue {
         self.engine.close(&mut self.ack_watermark)
     }
 
+    /// Give up a drained reset that a storage fault left half done, so a close
+    /// that will never resume it can run its ordinary drained path. `close`
+    /// itself keeps refusing while a reset is pending: a resumable reset must
+    /// not be discarded by accident. Valid only at the drained boundary the
+    /// reset was claimed at, which is the only place a reset exists: every
+    /// frame the old topology holds is acknowledged, so whichever phase the
+    /// reset reached, close's covering watermark barrier and drained cleanup
+    /// leave the slot in its normal closed state (a process death at the same
+    /// phase is recovered the same way). The topology reservation is dropped,
+    /// the reset's own segment budget is given back and a borrowed spare is
+    /// returned; an installed candidate is already the active segment.
+    pub(crate) fn abandon_drained_reset(&mut self) -> Result<(), SfaQueueError> {
+        let Some(mut reset) = self.drained_reset.take() else {
+            return Ok(());
+        };
+        let mut state = self.engine.lock_state()?;
+        if let Some(manifest) = reset.manifest.take() {
+            state.manifest = Some(manifest);
+        }
+        let candidate = reset.candidate.take();
+        let installed = candidate
+            .as_ref()
+            .zip(state.active.as_ref())
+            .is_some_and(|(candidate, active)| Arc::ptr_eq(candidate, active));
+        if !installed {
+            if reset.candidate_path.is_some() {
+                state.allocated_segment_bytes = state
+                    .allocated_segment_bytes
+                    .saturating_sub(self.engine.segment_size_bytes);
+            } else if let Some(candidate) = candidate
+                && state.hot_spare.is_none()
+            {
+                state.hot_spare = Some(candidate);
+            }
+        }
+        state.topology_io_in_flight = false;
+        self.engine.resetting.store(false, Ordering::Release);
+        Ok(())
+    }
+
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
         let Some(producer) = self.producer.as_mut() else {
             return Err(SfaQueueError::Closed);
@@ -1421,6 +1474,16 @@ impl SfaFrameQueue {
             .take_storage_maintenance_step(allow_create, self.ack_watermark.as_mut())
     }
 
+    /// The maintenance a drained reset may run while it waits for allocation
+    /// room: trims (and their barrier retries) only, never a spare, never the
+    /// cadence sync (see [`SfaEngine::take_storage_maintenance_step_with`]).
+    pub(crate) fn take_drained_reset_maintenance_step(
+        &mut self,
+    ) -> Result<DrainedResetMaintenance, SfaQueueError> {
+        self.engine
+            .take_drained_reset_maintenance_step(self.ack_watermark.as_mut())
+    }
+
     pub(crate) fn finish_storage_maintenance(
         &mut self,
         result: SfaStorageResult,
@@ -1461,6 +1524,11 @@ impl SfaFrameQueue {
 
     pub(crate) fn storage_maintenance_in_flight(&self) -> Result<bool, SfaQueueError> {
         self.engine.storage_maintenance_in_flight()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latch_durability_failure_for_test(&mut self, message: &str) {
+        self.engine.latch_durability_failure_for_test(message);
     }
 
     pub(crate) fn recovery_diagnostics(&self) -> Vec<SfaRecoveryDiagnostic> {
@@ -2217,6 +2285,24 @@ impl SfaEngine {
         Ok(())
     }
 
+    /// Mirror [`Self::finish_periodic_sync`]'s failure branch: the latch, its
+    /// bounded retry delay and the public flag, without touching any segment.
+    #[cfg(test)]
+    fn latch_durability_failure_for_test(&self, message: &str) {
+        let Some(interval) = self.periodic_sync_interval else {
+            return;
+        };
+        let Ok(mut state) = self.lock_state() else {
+            return;
+        };
+        state.durability_failure = Some(SfaDurabilityFailure {
+            message: message.into(),
+        });
+        state.last_sync_completed = Some(Instant::now());
+        state.next_sync_delay = interval.min(PERIODIC_SYNC_RETRY_MAX);
+        self.durability_failed.store(true, Ordering::Release);
+    }
+
     fn check_durability(&self) -> Result<(), SfaQueueError> {
         if !self.durability_failed.load(Ordering::Acquire) {
             return Ok(());
@@ -2331,12 +2417,63 @@ impl SfaEngine {
         allow_create: bool,
         ack_watermark: Option<&mut SfaAckWatermark>,
     ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
+        self.take_storage_maintenance_step_with(allow_create, ack_watermark, true)
+    }
+
+    /// Trim-only maintenance on behalf of a parked drained reset, with an
+    /// explicit answer when nothing is due: the caller sleeps until a deferred
+    /// trim barrier retries, or stops waiting when no acknowledged segment is
+    /// left to trim, instead of polling the append deadline out.
+    fn take_drained_reset_maintenance_step(
+        &self,
+        ack_watermark: Option<&mut SfaAckWatermark>,
+    ) -> Result<DrainedResetMaintenance, SfaQueueError> {
+        {
+            let state = self.lock_state()?;
+            if state.closed || state.storage_maintenance_in_flight || state.topology_io_in_flight {
+                return Ok(DrainedResetMaintenance::Exhausted);
+            }
+            if let Some(retry_at) = state.trim_retry_at
+                && Instant::now() < retry_at
+            {
+                return Ok(DrainedResetMaintenance::RetryAt(retry_at));
+            }
+            if self
+                .trimmable_prefix(&state, MAX_TRIMS_PER_STORAGE_STEP)?
+                .is_empty()
+            {
+                return Ok(DrainedResetMaintenance::Exhausted);
+            }
+        }
+        match self.take_storage_maintenance_step_with(false, ack_watermark, false)? {
+            Some(step) => Ok(DrainedResetMaintenance::Step(step)),
+            None => {
+                // The trim barrier failed just now and deferred itself.
+                let state = self.lock_state()?;
+                Ok(state.trim_retry_at.map_or(
+                    DrainedResetMaintenance::Exhausted,
+                    DrainedResetMaintenance::RetryAt,
+                ))
+            }
+        }
+    }
+
+    /// `periodic_sync = false` skips the cadence sync. A drained reset uses it:
+    /// every frame the old segments hold is acknowledged, so syncing them only
+    /// delays the trim that frees the reset's allocation, and a sync failure
+    /// there would latch durability with no worker left to clear it.
+    fn take_storage_maintenance_step_with(
+        &self,
+        allow_create: bool,
+        ack_watermark: Option<&mut SfaAckWatermark>,
+        periodic_sync: bool,
+    ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
         let state = self.lock_state()?;
         if state.storage_maintenance_in_flight || state.topology_io_in_flight {
             return Ok(None);
         }
         drop(state);
-        if let Some(step) = self.take_periodic_sync_step()? {
+        if periodic_sync && let Some(step) = self.take_periodic_sync_step()? {
             return Ok(Some(step));
         }
         let trim_candidates = {
@@ -2927,6 +3064,15 @@ impl PublicationLog for SfaFrameQueue {
 
     fn storage_maintenance_in_flight(&self) -> Result<bool, DriverError> {
         Ok(SfaFrameQueue::storage_maintenance_in_flight(self)?)
+    }
+
+    #[cfg(test)]
+    fn latch_durability_failure_for_test(&mut self, message: &str) {
+        SfaFrameQueue::latch_durability_failure_for_test(self, message);
+    }
+
+    fn abandon_drained_reset(&mut self) -> Result<(), DriverError> {
+        Ok(SfaFrameQueue::abandon_drained_reset(self)?)
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {

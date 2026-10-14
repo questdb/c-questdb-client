@@ -1600,14 +1600,25 @@ impl RecycleForeground for SfaRecycleForeground<'_> {
 }
 
 impl SfaBackend {
-    fn before_publication(&mut self, nonempty: bool) -> Result<()> {
+    /// `validate` checks the pending input and runs only when a recycle is about
+    /// to run, so a rejected chunk or batch never triggers the maintenance it
+    /// would then fail to use, and an armed-but-blocked policy costs nothing.
+    fn before_publication(
+        &mut self,
+        nonempty: bool,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let mut foreground = SfaRecycleForeground {
             foreground: &mut self.foreground,
             buffer_scratch: &mut self.buffer_scratch,
             scratch: &mut self.scratch,
         };
-        self.state
-            .before_publication(&mut foreground, nonempty, self.sfa_deferred_group_open)
+        self.state.before_publication(
+            &mut foreground,
+            nonempty,
+            self.sfa_deferred_group_open,
+            validate,
+        )
     }
 
     fn after_publication(&mut self) {
@@ -1669,7 +1680,8 @@ impl SfaBackend {
         buffer
             .check_can_flush()
             .map_err(FlushFailure::NotDelivered)?;
-        self.before_publication(!buffer.is_empty())
+        // Buffer rows were validated as they were appended; nothing to recheck.
+        self.before_publication(!buffer.is_empty(), || Ok(()))
             .map_err(FlushFailure::NotDelivered)?;
         if buffer.is_empty() {
             return Ok(None);
@@ -1752,10 +1764,7 @@ impl SfaBackend {
         if let Err(e) = qwp_ws_check_error_background(&self.state) {
             return Err(FlushFailure::NotDelivered(e));
         }
-        if self.state.needs_recycle_boundary() {
-            encoder::validate_chunk(chunk).map_err(FlushFailure::NotDelivered)?;
-        }
-        self.before_publication(!chunk.is_empty())
+        self.before_publication(!chunk.is_empty(), || encoder::validate_chunk(chunk))
             .map_err(FlushFailure::NotDelivered)?;
         let caps = self.effective_frame_caps();
         // Whole-chunk fast path; only split when a single frame exceeds the cap.
@@ -2077,12 +2086,10 @@ impl SfaBackend {
         if let Err(e) = qwp_ws_check_error_background(&self.state) {
             return Err(FlushFailure::NotDelivered(e));
         }
-        if self.state.needs_recycle_boundary() {
+        self.before_publication(batch.num_rows() != 0, || {
             arrow_batch::validate_arrow_batch(table, batch, ts, overrides)
-                .map_err(FlushFailure::NotDelivered)?;
-        }
-        self.before_publication(batch.num_rows() != 0)
-            .map_err(FlushFailure::NotDelivered)?;
+        })
+        .map_err(FlushFailure::NotDelivered)?;
         let caps = self.effective_frame_caps();
         let spec = ArrowFrameSpec {
             table,

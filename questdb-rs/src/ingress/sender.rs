@@ -103,6 +103,13 @@ pub(crate) fn terminal_after_recycle_park_for_test() {
     qwp_ws::TERMINAL_AFTER_RECYCLE_PARK.with(|fault| fault.set(true));
 }
 
+/// Latch a periodic-sync failure the moment the next recycle claim has parked
+/// its worker, as a sync that was in flight during the park and failed would.
+#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+pub(crate) fn durability_failure_after_recycle_park_for_test() {
+    qwp_ws::DURABILITY_FAILURE_AFTER_RECYCLE_PARK.with(|fault| fault.set(true));
+}
+
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_slot;
 
@@ -385,7 +392,11 @@ impl Sender {
             ));
         }
 
-        let result = match &mut self.handler {
+        // `must_close()` follows the publication lifecycle for QWP/WebSocket: a
+        // `SocketError` here may be recoverable (back-pressure timeout, a
+        // durability latch, a storage fault during dictionary recycling) and
+        // must not retire a sender that the next flush will drive again.
+        match &mut self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => {
                 let max =
                     effective_qwp_ws_max_buf_size(self.max_buf_size, &state.server_max_batch_size);
@@ -397,14 +408,7 @@ impl Sender {
                 flush_qwp_ws_manual(state, qwp, max)
             }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
-        };
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
-        {
-            self.connected = false;
         }
-        result
     }
 
     #[allow(unused_variables)]
@@ -1027,23 +1031,19 @@ impl Sender {
         } else {
             Ok(())
         };
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
-        {
-            self.connected = false;
-        }
         result.and(drain_result)
     }
 
     /// Tell whether the sender is no longer usable and must be dropped.
     ///
     /// Returns `true` after an unrecoverable failure. For ILP-over-TCP this
-    /// is any socket error. For QWP/WebSocket this also covers a server
-    /// rejection or protocol violation that latches the publication
-    /// lifecycle to its terminal state. ILP-over-HTTP and QWP/UDP never
-    /// transition into a permanently-unusable state and always return
-    /// `false`.
+    /// is any socket error. For QWP/WebSocket it is a server rejection or
+    /// protocol violation that latches the publication lifecycle to its
+    /// terminal state; recoverable failures (a back-pressure timeout, a
+    /// periodic-sync durability latch, a storage fault during dictionary
+    /// recycling) do not retire the sender, and the next flush drives it
+    /// again. ILP-over-HTTP and QWP/UDP never transition into a
+    /// permanently-unusable state and always return `false`.
     ///
     /// In QWP/WebSocket manual progress mode the answer only refreshes when
     /// the user drives the sender (`drive_once` / `flush`), since no

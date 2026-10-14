@@ -66,8 +66,8 @@ use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_er
 use super::qwp_ws_queue::{OutboundFrame, SentFrame};
 use super::qwp_ws_recycle::{PendingRecycle, RecycleLink, RecyclePermit};
 use super::qwp_ws_sfa_queue::{
-    SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError, segment_payload_capacity,
-    two_frame_segment_payload_capacity,
+    DrainedResetMaintenance, SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError,
+    SfaStorageStep, segment_payload_capacity, two_frame_segment_payload_capacity,
 };
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
@@ -83,6 +83,7 @@ const QWP_WS_RUNNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 thread_local! {
     pub(super) static TERMINAL_AFTER_RECYCLE_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static DURABILITY_FAILURE_AFTER_RECYCLE_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_RECYCLE_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_RECOVERED_DICT_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -523,12 +524,17 @@ impl PublicationRecycle {
         }
     }
 
+    /// `validate` checks the publication that will follow the recycle. It runs
+    /// only when a recycle is about to be claimed or resumed, so an armed policy
+    /// that cannot run yet (undrained queue, link down, open deferred group)
+    /// costs each flush nothing beyond the snapshot.
     fn before_publication(
         &mut self,
         session: &mut impl RecycleSession,
         foreground: &mut impl RecycleForeground,
         nonempty: bool,
         deferred: bool,
+        validate: impl FnOnce() -> crate::Result<()>,
     ) -> crate::Result<()> {
         let pending = session.pending_boundary();
         if pending.is_none() && (!nonempty || deferred || !self.policy.is_armed()) {
@@ -537,21 +543,26 @@ impl PublicationRecycle {
         let boundary = if let Some(boundary) = pending {
             boundary
         } else {
-            let (boundary, drained, live) = session.recycle_snapshot()?;
+            let (mut boundary, mut drained, mut live) = session.recycle_snapshot()?;
             if !drained
                 && let Some(budget) = self.policy.take_wait_budget(Instant::now(), live, deferred)
                 && let Some(deadline) = Instant::now().checked_add(budget)
             {
                 while Instant::now() < deadline {
-                    let (_, drained, live) = session.recycle_snapshot()?;
+                    (boundary, drained, live) = session.recycle_snapshot()?;
                     if drained || !live {
                         break;
                     }
                     session.drain_recycle_once(deadline)?;
                 }
             }
+            if !drained || !live {
+                // No claim can succeed now; the policy stays armed for a later flush.
+                return Ok(());
+            }
             boundary
         };
+        validate()?;
         let Some(permit) = session.claim_recycle(boundary)? else {
             return Ok(());
         };
@@ -612,12 +623,13 @@ macro_rules! foreground_recycle_api {
             foreground: &mut impl RecycleForeground,
             nonempty: bool,
             deferred: bool,
+            validate: impl FnOnce() -> crate::Result<()>,
         ) -> crate::Result<()> {
             let mut recycle = self
                 .publication_recycle
                 .take()
                 .expect("exclusive foreground recycle owner");
-            let result = recycle.before_publication(self, foreground, nonempty, deferred);
+            let result = recycle.before_publication(self, foreground, nonempty, deferred, validate);
             self.publication_recycle = Some(recycle);
             result
         }
@@ -662,8 +674,9 @@ impl RecycleSession for SyncQwpWsHandlerState {
         &mut self,
         permit: &RecyclePermit,
     ) -> crate::Result<Option<std::path::PathBuf>> {
+        let append_deadline = self.runner.append_deadline;
         self.with_recycle_storage(permit, |queue, producer| {
-            reset_recycle_storage(queue, producer)?;
+            reset_recycle_storage(queue, producer, append_deadline)?;
             Ok(queue.slot_dir().map(std::path::Path::to_path_buf))
         })
     }
@@ -703,8 +716,9 @@ impl RecycleSession for ManualQwpWsHandlerState {
         &mut self,
         permit: &RecyclePermit,
     ) -> crate::Result<Option<std::path::PathBuf>> {
+        let append_deadline = self.append_deadline;
         self.with_recycle_storage(permit, |queue, producer| {
-            reset_recycle_storage(queue, producer)?;
+            reset_recycle_storage(queue, producer, append_deadline)?;
             Ok(queue.slot_dir().map(std::path::Path::to_path_buf))
         })
     }
@@ -782,6 +796,7 @@ impl SyncQwpWsHandlerState {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn needs_recycle_boundary(&self) -> bool {
         self.publication_recycle.as_ref().unwrap().policy.is_armed()
             || self.pending_recycle_boundary().is_some()
@@ -1050,64 +1065,120 @@ fn recheck_recycle_boundary<Q: PublicationLog>(
 }
 
 /// Capacity deferral happens before the storage reset reserves topology. Retire
-/// ordinary drained storage work off-lock, then retry without releasing the seal.
-/// The foreground must release its persisted dictionary before calling this.
+/// drained storage work off-lock (trims and their barrier retries) until the
+/// reset can reserve its segment or `append_deadline` passes, then report the
+/// residual back-pressure exactly as an append timeout does. Nothing else runs
+/// while the session is parked, so a deferred trim barrier is slept out rather
+/// than polled, and a budget with no acknowledged segment left to trim fails at
+/// once instead of after the deadline. The seal is never released. The
+/// foreground must release its persisted dictionary first.
 pub(crate) fn reset_recycle_storage(
     queue: &mut SfaSlotQueue,
     producer: &mut SfaProducer,
+    append_deadline: Duration,
 ) -> crate::Result<()> {
-    match queue.reset_drained(producer) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let err: DriverError = err.into();
-            if !driver_error_is_backpressure(&err) {
-                return Err(driver_error_to_error_without_state(err));
+    let deadline = Instant::now().checked_add(append_deadline);
+    loop {
+        let err: DriverError = match queue.reset_drained(producer) {
+            Ok(()) => return Ok(()),
+            Err(err) => err.into(),
+        };
+        let Some(backpressure) = driver_error_backpressure_queue(&err) else {
+            return Err(driver_error_to_error_without_state(err));
+        };
+        if backpressure_deadline_expired(deadline) {
+            return Err(driver_error_to_error_without_state(
+                DriverError::SubmitTimedOut {
+                    backpressure: Some(backpressure),
+                },
+            ));
+        }
+        match queue
+            .take_drained_reset_maintenance_step()
+            .map_err(driver_error_to_error_without_state)?
+        {
+            DrainedResetMaintenance::Step(task) => {
+                perform_drained_reset_maintenance_task(queue, task)?
             }
-            if let Some(task) = queue
-                .take_storage_maintenance_step(false)
-                .map_err(driver_error_to_error_without_state)?
-            {
-                let result = match task.perform() {
-                    Ok(result) => result,
-                    Err(err) => {
-                        queue
-                            .complete_storage_maintenance()
-                            .map_err(driver_error_to_error_without_state)?;
-                        return Err(driver_error_to_error_without_state(err.into()));
-                    }
-                };
-                let finish = match queue.finish_storage_maintenance(result, false) {
-                    Ok(finish) => finish,
-                    Err(err) => {
-                        queue
-                            .complete_storage_maintenance()
-                            .map_err(driver_error_to_error_without_state)?;
-                        return Err(driver_error_to_error_without_state(err));
-                    }
-                };
-                let failure = finish.into_cleanup().and_then(|cleanup| cleanup.perform());
-                let cleanup_result = if let Some(failure) = failure {
-                    queue.record_storage_cleanup_failure(failure)
-                } else {
-                    Ok(())
-                };
-                queue
-                    .complete_storage_maintenance()
-                    .map_err(driver_error_to_error_without_state)?;
-                cleanup_result.map_err(driver_error_to_error_without_state)?;
+            DrainedResetMaintenance::RetryAt(retry_at) => {
+                let wake = deadline.map_or(retry_at, |deadline| retry_at.min(deadline));
+                thread::sleep(wake.saturating_duration_since(Instant::now()));
             }
-            queue
-                .reset_drained(producer)
-                .map_err(DriverError::from)
-                .map_err(driver_error_to_error_without_state)
+            DrainedResetMaintenance::Exhausted => {
+                return Err(drained_reset_budget_error(backpressure));
+            }
         }
     }
+}
+
+/// The segment budget cannot hold the reset's fresh segment and nothing
+/// acknowledged is left to trim. Only the budget setting can change that.
+fn drained_reset_budget_error(backpressure: super::qwp_ws_queue::QueueError) -> crate::Error {
+    use super::qwp_ws_queue::QueueError;
+    match backpressure {
+        QueueError::StorageSegmentCapFull {
+            segment_size_bytes,
+            allocated_segment_bytes,
+            max_total_bytes,
+        }
+        | QueueError::StorageSpareNotReady {
+            segment_size_bytes,
+            allocated_segment_bytes,
+            max_total_bytes,
+        } => error::fmt!(
+            SocketError,
+            "QWP/WebSocket Store-and-Forward dictionary recycle cannot reserve a segment: the segment budget is exhausted and no acknowledged segment is left to trim; increase sf_max_total_bytes [segment_size_bytes={segment_size_bytes}, allocated_segment_bytes={allocated_segment_bytes}, max_total_bytes={max_total_bytes}]"
+        ),
+        other => error::fmt!(
+            SocketError,
+            "QWP/WebSocket Store-and-Forward dictionary recycle cannot reserve storage: {other:?}"
+        ),
+    }
+}
+
+/// Run one trim task on behalf of a parked drained reset, retiring its lease on
+/// every path.
+fn perform_drained_reset_maintenance_task(
+    queue: &mut SfaSlotQueue,
+    task: SfaStorageStep,
+) -> crate::Result<()> {
+    let result = match task.perform() {
+        Ok(result) => result,
+        Err(err) => {
+            queue
+                .complete_storage_maintenance()
+                .map_err(driver_error_to_error_without_state)?;
+            return Err(driver_error_to_error_without_state(err.into()));
+        }
+    };
+    let finish = match queue.finish_storage_maintenance(result, false) {
+        Ok(finish) => finish,
+        Err(err) => {
+            queue
+                .complete_storage_maintenance()
+                .map_err(driver_error_to_error_without_state)?;
+            return Err(driver_error_to_error_without_state(err));
+        }
+    };
+    let failure = finish.into_cleanup().and_then(|cleanup| cleanup.perform());
+    let cleanup_result = if let Some(failure) = failure {
+        queue.record_storage_cleanup_failure(failure)
+    } else {
+        Ok(())
+    };
+    queue
+        .complete_storage_maintenance()
+        .map_err(driver_error_to_error_without_state)?;
+    cleanup_result.map_err(driver_error_to_error_without_state)?;
+    Ok(())
 }
 
 /// Type erasure retains the actual transport (including endpoint history) when
 /// generic test runners and production runners hand their parked core back.
 trait ParkedRunner<Q>: Send {
     fn install(&mut self, delta_enabled: bool, gate: Arc<TrafficGate>);
+    /// Return the parked session to service unchanged (no new namespace).
+    fn resume(&mut self, gate: Arc<TrafficGate>);
     fn run(
         self: Box<Self>,
         shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
@@ -1150,6 +1221,10 @@ where
         self.send_core.install_recycled_session(delta_enabled, gate);
     }
 
+    fn resume(&mut self, gate: Arc<TrafficGate>) {
+        self.send_core.resume_parked_session(gate);
+    }
+
     fn run(
         mut self: Box<Self>,
         shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
@@ -1169,6 +1244,25 @@ where
             self.flush_cold_effects_locked(&mut store);
         } else {
             self.handle_poisoned_lock();
+        }
+        self.park_if_requested(stop.as_ref(), &parked);
+    }
+}
+
+impl<T> SyncQwpWsRunnerCore<T>
+where
+    T: QwpWsCoreTransport + Send + 'static,
+{
+    /// Hand the session back only when a recycle claim asked this worker to
+    /// stop. Any other exit (terminal error, close) drops the core here so the
+    /// server connection is released immediately instead of living in the
+    /// parked slot until the sender itself is dropped.
+    fn park_if_requested<Q>(mut self: Box<Self>, stop: &AtomicBool, parked: &ParkedRunnerSlot<Q>)
+    where
+        Q: PublicationLog + Send + 'static,
+    {
+        if !stop.load(Ordering::Acquire) {
+            return;
         }
         self.send_core.release_recycle_views();
         if let Ok(mut slot) = parked.lock() {
@@ -1381,10 +1475,7 @@ where
                 } else {
                     connected.handle_poisoned_lock();
                 }
-                connected.send_core.release_recycle_views();
-                if let Ok(mut slot) = thread_parked.lock() {
-                    *slot = Some(Box::new(connected));
-                }
+                Box::new(connected).park_if_requested(thread_stop.as_ref(), &thread_parked);
             }
         });
 
@@ -1473,9 +1564,39 @@ where
             self.lock_shared()?
                 .record_protocol_violation(Some(1002), "terminal during accepted park".into());
         }
+        #[cfg(test)]
+        if DURABILITY_FAILURE_AFTER_RECYCLE_PARK.with(|fault| fault.replace(false)) {
+            self.lock_shared()?
+                .latch_durability_failure_for_test("injected periodic sync failure during park");
+        }
         // Errors must win even when the captured completion boundary is empty.
         let store = self.lock_shared()?;
-        check_store_error(&store)?;
+        if let Err(err) = check_store_terminal_error(&store) {
+            drop(store);
+            // Nothing will ever resume this session: release its connection now
+            // instead of holding it in the parked slot until the sender drops.
+            self.drop_parked_session();
+            return Err(err);
+        }
+        if let Err(err) = store
+            .check_durability()
+            .map_err(driver_error_to_error_without_state)
+        {
+            drop(store);
+            if self.pending_recycle.as_ref().unwrap().quiesced {
+                // A resume probe: the foreground is already past the claim
+                // (dictionary handle released or replaced), so the session
+                // cannot be handed back. Not reachable today, because nothing
+                // syncs while the session is parked; the seal is retained.
+                return Err(err);
+            }
+            // The worker's in-flight periodic sync failed while it was being
+            // parked. Only a worker retries that sync, so a parked session would
+            // stay latched forever. Give the session back; the latch clears the
+            // way it does without recycling, and a later flush claims again.
+            self.unpark_recycle()?;
+            return Err(err);
+        }
         if self.lifecycle.load() != PublicationState::Open {
             return Err(driver_error_to_error_without_state(DriverError::Closing));
         }
@@ -1525,6 +1646,63 @@ where
             generation: self.recycle_generation,
             boundary,
         }))
+    }
+
+    /// Release a parked session that nothing will resume (the store went
+    /// terminal while the worker was being parked).
+    fn drop_parked_session(&self) {
+        if let Ok(mut slot) = self.parked.lock() {
+            slot.take();
+        }
+    }
+
+    /// Give the retained session back to a fresh worker after an accepted claim
+    /// failed for a recoverable reason. The claim already cancelled the old
+    /// socket, so the worker resumes through the ordinary reconnect path (new
+    /// gate, dictionary catch-up) with its namespace and sequence untouched.
+    fn unpark_recycle(&mut self) -> crate::Result<()> {
+        let mut slot = self
+            .parked
+            .lock()
+            .map_err(|_| error::fmt!(SocketError, "QWP/WebSocket parked runner lock poisoned"))?;
+        let Some(core) = slot.as_mut() else {
+            drop(slot);
+            let err = error::fmt!(
+                SocketError,
+                "QWP/WebSocket retired worker did not return its session"
+            );
+            self.lock_shared()?.mark_terminal(Some(err.clone()));
+            return Err(err);
+        };
+        let gate = Arc::new(TrafficGate::default());
+        core.resume(Arc::clone(&gate));
+        self.traffic_gate = gate;
+        self.stop = Arc::new(AtomicBool::new(false));
+        self.recycle.restart();
+        drop(slot);
+        match spawn_parked_runner(
+            Arc::clone(&self.shared),
+            Arc::clone(&self.stop),
+            Arc::clone(&self.parked),
+        ) {
+            Ok(thread) => {
+                self.thread = Some(thread);
+                self.pending_recycle = None;
+                Ok(())
+            }
+            Err(err) => {
+                // Without a worker nothing clears the latch, and the sealed
+                // claim would stop every later call at its error check before
+                // it could retry the spawn: the session is done, like a worker
+                // that panicked.
+                let err = error::fmt!(
+                    SocketError,
+                    "Could not restart recycled QWP/WebSocket worker: {err}"
+                );
+                self.lock_shared()?.mark_terminal(Some(err.clone()));
+                Err(err)
+            }
+        }
     }
 
     /// Consume a confirmed-exited maintenance worker off-lock. Both resume and
@@ -1864,10 +2042,30 @@ where
                     // create a hot-spare file, or unlink a retired segment, so
                     // wait for the entire task (including deferred cleanup) to
                     // retire before close tears down the slot.
-                    if !store
+                    let maintenance_in_flight = store
                         .storage_maintenance_in_flight()
-                        .map_err(driver_error_to_error_without_state)?
-                    {
+                        .map_err(driver_error_to_error_without_state)?;
+                    if maintenance_in_flight && self.pending_recycle.is_some() {
+                        // The joined worker left no task behind, so this is the
+                        // foreground's drained reset, interrupted by a storage
+                        // fault. Every frame is acknowledged and no worker
+                        // remains to finish it, so close abandons the reset
+                        // (the queue releases its topology reservation) and
+                        // runs its ordinary drained close, which releases the
+                        // slot for a replacement sender right away.
+                        log::warn!(
+                            "QWP/WebSocket close is abandoning a dictionary recycle that a \
+                             storage fault interrupted"
+                        );
+                        store
+                            .abandon_recycle_reset()
+                            .map_err(driver_error_to_error_without_state)?;
+                        store
+                            .close_queue()
+                            .map_err(driver_error_to_error_without_state)?;
+                        return Ok(());
+                    }
+                    if !maintenance_in_flight {
                         store
                             .close_queue()
                             .map_err(driver_error_to_error_without_state)?;
@@ -4872,7 +5070,8 @@ pub(crate) fn flush_qwp_ws(
 ) -> crate::Result<Option<u64>> {
     let mut encoder = state.encoder.take().expect("standalone foreground");
     let result = (|| {
-        state.before_publication(&mut encoder, !buffer.is_empty(), false)?;
+        // Buffer rows were validated as they were appended; nothing to recheck.
+        state.before_publication(&mut encoder, !buffer.is_empty(), false, || Ok(()))?;
         if buffer.is_empty() {
             return Ok(None);
         }
@@ -4934,7 +5133,8 @@ pub(crate) fn flush_qwp_ws_manual(
 ) -> crate::Result<Option<u64>> {
     let mut encoder = state.encoder.take().expect("standalone foreground");
     let result = (|| {
-        state.before_publication(&mut encoder, !buffer.is_empty(), false)?;
+        // Buffer rows were validated as they were appended; nothing to recheck.
+        state.before_publication(&mut encoder, !buffer.is_empty(), false, || Ok(()))?;
         if buffer.is_empty() {
             return Ok(None);
         }
@@ -4970,11 +5170,19 @@ fn publish_qwp_ws_buffer(
 }
 
 pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::Result<bool> {
+    // Orphan drainers own other slots; a parked foreground recycle must not
+    // stall them.
+    let orphan_progress = state
+        .orphan_drainers
+        .as_mut()
+        .is_some_and(ManualOrphanDrainers::drive_once);
     if state.recycle.pending.is_some() {
-        return Err(error::fmt!(
-            SocketError,
-            "QWP/WebSocket publication is parked for dictionary recycling"
-        ));
+        // A storage fault interrupted the recycle. Resume it here, as a flush
+        // would, instead of refusing to make progress until one arrives.
+        let mut encoder = state.encoder.take().expect("standalone foreground");
+        let resumed = state.before_publication(&mut encoder, false, false, || Ok(()));
+        state.encoder = Some(encoder);
+        resumed?;
     }
     let outcome = state.send_core.drive_once(&mut state.store);
     let foreground_progress = match outcome {
@@ -4996,10 +5204,6 @@ pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::R
         ) => Ok(true),
         Err(err) => Err(driver_error_to_error_from_store(&state.store, err)),
     }?;
-    let orphan_progress = state
-        .orphan_drainers
-        .as_mut()
-        .is_some_and(ManualOrphanDrainers::drive_once);
     Ok(foreground_progress || orphan_progress)
 }
 
@@ -5156,6 +5360,24 @@ pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> 
     if state.close_drain_timeout.is_zero() {
         state.store.set_closing();
         return Ok(());
+    }
+    if state.recycle.pending.is_some()
+        && state
+            .store
+            .storage_maintenance_in_flight()
+            .map_err(driver_error_to_error_without_state)?
+    {
+        // A storage fault interrupted the foreground's drained reset. Every
+        // frame is acknowledged and nothing will resume it, so give it up and
+        // let the ordinary drained close below release the slot.
+        log::warn!(
+            "QWP/WebSocket close is abandoning a dictionary recycle that a storage fault \
+             interrupted"
+        );
+        state
+            .store
+            .abandon_recycle_reset()
+            .map_err(driver_error_to_error_without_state)?;
     }
     let deadline = Instant::now().checked_add(state.close_drain_timeout);
     loop {
@@ -7420,7 +7642,7 @@ mod tests {
         queue.progress_view().complete_through_fsn(1).unwrap();
         queue.persist_completed_fsn(1);
         assert!(queue.reset_drained(&mut producer).is_err());
-        reset_recycle_storage(&mut queue, &mut producer).unwrap();
+        reset_recycle_storage(&mut queue, &mut producer, DEFAULT_APPEND_DEADLINE).unwrap();
         assert_eq!(producer.try_submit(b"new").unwrap().fsn, 2);
     }
 
@@ -7447,7 +7669,9 @@ mod tests {
         let observer = Arc::clone(&runner.shared);
         let permit = runner.request_recycle(None).unwrap().unwrap();
         let err = runner
-            .with_recycle_storage(&permit, reset_recycle_storage)
+            .with_recycle_storage(&permit, |queue, producer| {
+                reset_recycle_storage(queue, producer, DEFAULT_APPEND_DEADLINE)
+            })
             .unwrap_err();
         assert!(err.msg().contains("still has observers"));
         assert!(matches!(
@@ -7458,7 +7682,9 @@ mod tests {
         assert!(observer.try_lock().is_ok());
         drop(observer);
         runner
-            .with_recycle_storage(&permit, reset_recycle_storage)
+            .with_recycle_storage(&permit, |queue, producer| {
+                reset_recycle_storage(queue, producer, DEFAULT_APPEND_DEADLINE)
+            })
             .unwrap();
         assert!(matches!(
             SfaSlotQueue::open(options),
@@ -7544,6 +7770,7 @@ mod tests {
         reset_recycle_storage(
             store.recycle_queue_mut(),
             recycle.producer.as_mut().unwrap(),
+            DEFAULT_APPEND_DEADLINE,
         )
         .unwrap();
         recycle
@@ -7592,7 +7819,9 @@ mod tests {
         }
         let permit = runner.request_recycle(Some(fsn)).unwrap().unwrap();
         runner
-            .with_recycle_storage(&permit, reset_recycle_storage)
+            .with_recycle_storage(&permit, |queue, producer| {
+                reset_recycle_storage(queue, producer, DEFAULT_APPEND_DEADLINE)
+            })
             .unwrap();
         runner.finish_recycle(permit, false).unwrap();
         assert!(matches!(
@@ -8051,6 +8280,73 @@ mod publication_recycle_tests {
         }
     }
 
+    /// Input validation is part of the recycle, not of every armed flush: it
+    /// runs only once a claim is about to be made, and a rejected input never
+    /// claims.
+    #[test]
+    fn recycle_validation_runs_only_before_a_claim() {
+        use std::sync::atomic::Ordering;
+        let server = Server::new();
+        server.acks_released.store(false, Ordering::Release);
+        let mut sender = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{};symbol_dict_reset_threshold=1;symbol_dict_reset_max_wait_millis=0;",
+            server.port
+        ))
+        .unwrap()
+        .build()
+        .unwrap();
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+        server.frame();
+
+        let handler = state(&mut sender);
+        let mut encoder = handler.encoder.take().unwrap();
+        let mut validated = 0;
+        handler
+            .before_publication(&mut encoder, true, false, || {
+                validated += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(validated, 0, "armed but undrained: no claim, no validation");
+        assert!(handler.pending_recycle_boundary().is_none());
+        assert_eq!(encoder.symbol_count(), 1);
+        handler.encoder = Some(encoder);
+
+        server.acks_released.store(true, Ordering::Release);
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let handler = state(&mut sender);
+        let mut encoder = handler.encoder.take().unwrap();
+        let err = handler
+            .before_publication(&mut encoder, true, false, || {
+                Err(error::fmt!(InvalidApiCall, "rejected input"))
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(
+            handler.pending_recycle_boundary().is_none(),
+            "a rejected input never claims"
+        );
+        assert_eq!(encoder.symbol_count(), 1);
+        let mut validated = 0;
+        handler
+            .before_publication(&mut encoder, true, false, || {
+                validated += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(validated, 1, "drained and live: validated, then recycled");
+        assert_eq!(encoder.symbol_count(), 0);
+        handler.encoder = Some(encoder);
+    }
+
     #[test]
     fn recycle_crash_after_fresh_session_install_and_publication() {
         use crate::ingress::QwpWsProgress;
@@ -8080,7 +8376,7 @@ mod publication_recycle_tests {
             };
             let mut encoder = handler.encoder.take().unwrap();
             handler
-                .before_publication(&mut encoder, true, false)
+                .before_publication(&mut encoder, true, false, || Ok(()))
                 .unwrap();
             assert_eq!(encoder.symbol_count(), 0);
             assert!(handler.send_core.has_pending_reconnect());
@@ -8270,7 +8566,7 @@ mod publication_recycle_tests {
                 let handler = state(&mut sender);
                 let mut encoder = handler.encoder.take().unwrap();
                 handler
-                    .before_publication(&mut encoder, true, false)
+                    .before_publication(&mut encoder, true, false, || Ok(()))
                     .unwrap();
                 assert_eq!(encoder.symbol_count(), 0);
                 handler.encoder = Some(encoder);
@@ -8618,6 +8914,41 @@ mod publication_recycle_tests {
                 Some(Duration::from_secs(3))
             );
         }
+    }
+
+    /// The drain deadline can expire between the driver's time check and the
+    /// socket call. An idle read must then stay idle and a small write must
+    /// still go out; an error here would be reported as a disconnect and force
+    /// a spurious reconnect at the end of every bounded wait.
+    #[test]
+    fn recycle_boundary_expired_io_deadline_does_not_fail_idle_io() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut stream = WsStream::Plain(NoSigpipeTcp::new(client).unwrap());
+        stream
+            .set_timeouts(Some(Duration::from_secs(3)), Some(Duration::from_secs(3)))
+            .unwrap();
+        let saved = stream
+            .begin_io_deadline(Instant::now() - Duration::from_millis(1))
+            .unwrap();
+        let mut reader = WsFrameReader::new();
+        let mut scratch = Vec::new();
+        assert!(matches!(
+            reader.try_read_one(&mut stream, &mut scratch),
+            Ok(WsFrameRead::Idle)
+        ));
+        write_binary_frame(&mut stream, &mut scratch, b"payload").unwrap();
+        let mut received = [0u8; 2];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received[0], 0x82, "a binary frame reached the peer");
+        stream.end_io_deadline(saved).unwrap();
+        assert_eq!(
+            stream.tcp_stream().read_timeout().unwrap(),
+            Some(Duration::from_secs(3))
+        );
     }
 
     #[test]

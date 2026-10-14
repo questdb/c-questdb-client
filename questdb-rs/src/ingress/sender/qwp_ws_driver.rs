@@ -510,6 +510,16 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.storage_maintenance_in_flight()
     }
 
+    #[cfg(test)]
+    pub(crate) fn latch_durability_failure_for_test(&mut self, message: &str) {
+        self.queue.latch_durability_failure_for_test(message);
+    }
+
+    /// See [`PublicationLog::abandon_drained_reset`].
+    pub(crate) fn abandon_recycle_reset(&mut self) -> Result<(), DriverError> {
+        self.queue.abandon_drained_reset()
+    }
+
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         match self.lifecycle.load() {
             PublicationState::Open => {}
@@ -900,6 +910,22 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             "QWP/WebSocket recycled session",
             ReconnectReason::RetryableFailure,
             error::fmt!(SocketError, "QWP/WebSocket dictionary session retired"),
+        ));
+    }
+
+    /// Return a parked session to service without recycling it. The claim
+    /// cancelled the old socket, so the ordinary reconnect re-establishes the
+    /// connection and re-registers the retained dictionary through catch-up.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn resume_parked_session(&mut self, gate: Arc<TrafficGate>) {
+        self.transport.prepare_recycled_session(gate);
+        self.pending_reconnect = Some(self.begin_reconnect(
+            "QWP/WebSocket recycle abandoned",
+            ReconnectReason::RetryableFailure,
+            error::fmt!(
+                SocketError,
+                "QWP/WebSocket dictionary recycle abandoned before the storage reset"
+            ),
         ));
     }
 
@@ -2016,11 +2042,20 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         if self.has_pending_reconnect() || Instant::now() >= deadline || store.is_terminal() {
             return Ok(());
         }
-        let timeouts = self
-            .transport
-            .begin_recycle_io(deadline)
-            .map_err(DriverError::Transport)?;
+        // While `recycle_drain` is set, a transport failure schedules its
+        // reconnect without dialing; the caller's ordinary progress path dials
+        // once the bounded wait has returned.
         self.recycle_drain = true;
+        let timeouts = match self.transport.begin_recycle_io(deadline) {
+            Ok(timeouts) => timeouts,
+            Err(err) => {
+                // The socket is already unusable (for example, reset by the
+                // peer): that is a disconnect, not an API failure.
+                let outcome = self.apply_transport_failure(store, TransportFailure::Retryable(err));
+                self.recycle_drain = false;
+                return outcome.map(|_| ());
+            }
+        };
         let result = (|| {
             self.drive_send_available(store)?;
             if !self.has_pending_reconnect() && Instant::now() < deadline && !store.is_terminal() {
@@ -2031,12 +2066,21 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             }
             Ok(())
         })();
+        let restored = self.transport.end_recycle_io(timeouts);
+        let outcome = match (result, restored) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+            // macOS/BSD reject `setsockopt` on a socket the peer has reset. If a
+            // reconnect is already pending (or the store is terminal) the socket
+            // is being discarded and the failed restore is part of that
+            // disconnect; otherwise the socket is unusable, so disconnect now.
+            (Ok(()), Err(_)) if self.has_pending_reconnect() || store.is_terminal() => Ok(()),
+            (Ok(()), Err(err)) => self
+                .apply_transport_failure(store, TransportFailure::Retryable(err))
+                .map(|_| ()),
+        };
         self.recycle_drain = false;
-        let restored = self
-            .transport
-            .end_recycle_io(timeouts)
-            .map_err(DriverError::Transport);
-        result.and(restored)
+        outcome
     }
 
     pub(crate) fn drive_once<Q: PublicationLog>(
@@ -2828,6 +2872,15 @@ pub(crate) trait PublicationLog {
     // cleanup. Close must not tear down the publication log in between.
     fn storage_maintenance_in_flight(&self) -> Result<bool, DriverError> {
         Ok(false)
+    }
+    /// Latch a periodic-sync failure exactly as a failed sync would, so tests
+    /// can place the latch at a chosen point without a real device fault.
+    #[cfg(test)]
+    fn latch_durability_failure_for_test(&mut self, _message: &str) {}
+    /// Give up a half-done drained reset that nothing will resume, so close can
+    /// run. Only a close path that owns the reset may call this.
+    fn abandon_drained_reset(&mut self) -> Result<(), DriverError> {
+        Ok(())
     }
     fn take_storage_maintenance_step(
         &mut self,
