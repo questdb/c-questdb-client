@@ -421,3 +421,50 @@ fn the_reader_refreshes_a_rejected_token() {
     server.join().unwrap();
     provider.close();
 }
+
+/// This client selects no token provider from a connect string, so the keys
+/// the specification reserves for that are rejected on every schema, with a
+/// pointer to the in-code API (spec §7.2): a string that asked for a
+/// credential must never connect without one.
+#[test]
+fn the_reserved_token_provider_keys_are_rejected() {
+    for setting in [
+        "token_provider=azure",
+        "azure_resource=api://questdb",
+        "azure_client_id=00000000-0000-0000-0000-000000000000",
+        "azure_credential=managed_identity",
+    ] {
+        let key = setting.split('=').next().unwrap();
+        for schema in ["ws", "wss", "http", "https", "tcp"] {
+            let conf = format!("{schema}::addr=localhost:9000;{setting};");
+            let Err(err) = SenderBuilder::from_conf(&conf) else {
+                panic!("{conf} was accepted");
+            };
+            assert_eq!(err.code(), ErrorCode::ConfigError, "{conf}: {err}");
+            assert!(err.msg().contains(&format!("\"{key}\"")), "{err}");
+            assert!(
+                err.msg().contains("supported token_provider values: none"),
+                "{err}"
+            );
+            assert!(err.msg().contains("bearer_token_provider"), "{err}");
+        }
+        #[cfg(feature = "sync-reader-qwp-ws")]
+        {
+            let conf = format!("ws::addr=localhost:9000;{setting};");
+            let err = crate::egress::ReaderConfig::from_conf(&conf).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ConfigError, "{err}");
+            assert!(
+                err.msg().contains("supported token_provider values: none"),
+                "{err}"
+            );
+        }
+        let conf = format!("ws::addr=localhost:9000;lazy_connect=true;{setting};");
+        let Err(err) = crate::QuestDb::connect(&conf) else {
+            panic!("the pool accepted {conf}");
+        };
+        assert!(
+            err.msg().contains("supported token_provider values: none"),
+            "{err}"
+        );
+    }
+}

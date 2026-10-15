@@ -108,6 +108,35 @@ pub(crate) fn is_printable_ascii_token(s: &str) -> bool {
     !s.trim().is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
 
+/// Connect-string keys the dynamic-credential specification reserves for
+/// selecting a token provider (design/qwp-token-provider-spec.md §7.1).
+const RESERVED_TOKEN_PROVIDER_KEYS: &[&str] = &[
+    "token_provider",
+    "azure_resource",
+    "azure_client_id",
+    "azure_credential",
+];
+
+/// The error for a reserved token-provider key, or `None` for any other key.
+///
+/// This client selects no token provider from a connect string, so it rejects
+/// these keys on every schema with a pointer to the in-code API (§7.2): it must
+/// never connect without the credential the string asked for.
+pub(crate) fn reserved_token_provider_key_error(key: &str) -> Option<Error> {
+    RESERVED_TOKEN_PROVIDER_KEYS.contains(&key).then(|| {
+        error::fmt!(
+            ConfigError,
+            "\"{key}\" selects a connect-string token provider, which this client does not \
+             support (supported token_provider values: none). Attach a token provider in code \
+             instead: Python `bearer_token_provider=`; C/C++ `line_sender_opts_token_provider`, \
+             `questdb_db_connect_options.token_provider` or \
+             `qwp_reader_from_conf_with_token_provider`; Rust \
+             `SenderBuilder::bearer_token_provider` or `ReaderConfig::token_provider`. A \
+             `RefreshingTokenProvider` can fetch tokens however you like, Azure Identity included."
+        )
+    })
+}
+
 // --- Primary entry point -------------------------------------------------
 //
 // `QuestDb` is the connection/pool handle for a QuestDB instance. It spans

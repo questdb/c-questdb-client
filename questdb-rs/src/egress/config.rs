@@ -790,6 +790,11 @@ impl ReaderConfig {
         for (key, val) in params.iter() {
             let key = key.as_str();
             let val = val.as_str();
+            // Reserved for connect-string token providers, which this client
+            // does not implement.
+            if let Some(err) = crate::reserved_token_provider_key_error(key) {
+                return Err(err);
+            }
             match key {
                 "addr" => {} // already consumed
                 "path" => {

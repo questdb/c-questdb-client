@@ -1143,6 +1143,12 @@ impl SenderBuilder {
         ];
 
         for (key, val) in params.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
+            // Reserved for connect-string token providers, which this client
+            // does not implement: rejected on every schema, so a string that
+            // asked for a credential never connects without it.
+            if let Some(err) = crate::reserved_token_provider_key_error(key) {
+                return Err(err);
+            }
             builder = match key {
                 "username" => builder.username(val)?,
                 "password" => builder.password(val)?,
