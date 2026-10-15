@@ -406,11 +406,12 @@ pub struct TokenProviderStatus {
 /// one expires.
 ///
 /// ```no_run
+/// # #[cfg(all(feature = "sync-sender-http", feature = "sync-sender-qwp-ws"))] {
 /// # fn fetch_from_idp() -> questdb::Result<(String, std::time::Duration)> { unimplemented!() }
 /// use questdb::ingress::SenderBuilder;
 /// use questdb::token_provider::{ExpiringToken, RefreshingTokenProvider};
 ///
-/// # fn main() -> questdb::Result<()> {
+/// # fn run() -> questdb::Result<()> {
 /// let tokens = RefreshingTokenProvider::builder(|| -> questdb::Result<ExpiringToken> {
 ///     let (token, lifetime) = fetch_from_idp()?;
 ///     Ok(ExpiringToken::expires_in(token, lifetime))
@@ -420,6 +421,7 @@ pub struct TokenProviderStatus {
 ///     .bearer_token_provider(tokens.clone())?
 ///     .build()?;
 /// # Ok(())
+/// # }
 /// # }
 /// ```
 ///

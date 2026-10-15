@@ -435,7 +435,13 @@ fn the_reserved_token_provider_keys_are_rejected() {
         "azure_credential=managed_identity",
     ] {
         let key = setting.split('=').next().unwrap();
-        for schema in ["ws", "wss", "http", "https", "tcp"] {
+        // Every schema this build supports.
+        let mut schemas = vec!["ws", "wss"];
+        #[cfg(feature = "_sender-http")]
+        schemas.extend(["http", "https"]);
+        #[cfg(feature = "_sender-tcp")]
+        schemas.extend(["tcp", "tcps"]);
+        for schema in schemas {
             let conf = format!("{schema}::addr=localhost:9000;{setting};");
             let Err(err) = SenderBuilder::from_conf(&conf) else {
                 panic!("{conf} was accepted");
