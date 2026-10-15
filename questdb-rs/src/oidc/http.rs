@@ -166,16 +166,26 @@ impl DnsWorkerBudget {
             // No worker is needed when the caller has no deadline.
             return lookup().map_err(ureq::Error::Io);
         }
-        self.active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
-                (active < self.limit).then(|| active + 1)
-            })
-            .map_err(|_| {
-                ureq::Error::Io(std::io::Error::new(
+        // Use a CAS loop: `fetch_update` is deprecated on newer toolchains,
+        // but its replacement (`try_update`) is unavailable on our MSRV.
+        let mut active = self.active.load(Ordering::Relaxed);
+        loop {
+            if active >= self.limit {
+                return Err(ureq::Error::Io(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
                     "OIDC DNS resolver worker limit reached; retry after outstanding lookups finish",
-                ))
-            })?;
+                )));
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => active = actual,
+            }
+        }
         let permit = DnsWorkerPermit(self);
         let (tx, rx) = mpsc::sync_channel(1);
         // Builder::spawn turns thread exhaustion into a retryable I/O error
