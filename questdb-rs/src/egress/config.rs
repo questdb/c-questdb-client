@@ -1134,10 +1134,9 @@ impl ReaderConfig {
     /// thread. During a mid-query failover it runs on the provider's bounded,
     /// single-flight isolation worker so `next_batch` can stop waiting when the
     /// Execute-wide `failover_max_duration_ms` deadline expires.
-    pub fn token_provider<F, E>(self, provider: F) -> Result<Self>
+    pub fn token_provider<P>(self, provider: P) -> Result<Self>
     where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
+        P: crate::token_provider::BearerTokenProvider + 'static,
     {
         self.token_provider_object(crate::token_provider::TokenProvider::new(provider))
     }
@@ -1145,14 +1144,13 @@ impl ReaderConfig {
     /// Binding-only form that preserves one authentication object's QWP
     /// isolated-acquisition identity across independently configured clients.
     #[doc(hidden)]
-    pub fn token_provider_with_isolation<F, E>(
+    pub fn token_provider_with_isolation<P>(
         self,
-        provider: F,
+        provider: P,
         isolation: crate::TokenProviderIsolation,
     ) -> Result<Self>
     where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
+        P: crate::token_provider::BearerTokenProvider + 'static,
     {
         self.token_provider_object(crate::token_provider::TokenProvider::new_with_isolation(
             provider, isolation,

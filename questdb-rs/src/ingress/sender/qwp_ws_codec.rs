@@ -171,12 +171,22 @@ pub(super) fn classify_qwp_handshake_reject(
     reject: crate::ws::handshake::HttpReject,
 ) -> crate::Error {
     if reject.status == 401 || reject.status == 403 {
+        // A Bearer challenge's `error` decides whether the 401 is worth a
+        // token refresh (RFC 6750 §3.1).
+        let bearer_error = crate::token_provider::bearer_challenge::sanitized_bearer_error(
+            reject.headers.join_all_ci("www-authenticate").as_deref(),
+        );
+        let detail = bearer_error
+            .as_deref()
+            .map_or_else(String::new, |error| format!(" [error={error}]"));
         return error::fmt!(
             AuthError,
-            "WebSocket upgrade authentication failed: HTTP status {}",
-            reject.status
+            "WebSocket upgrade authentication failed: HTTP status {}{}",
+            reject.status,
+            detail
         )
-        .with_ws_http_status(reject.status);
+        .with_ws_http_status(reject.status)
+        .with_bearer_challenge_error(bearer_error);
     }
     if reject.status == 421
         && let Some(role) = reject

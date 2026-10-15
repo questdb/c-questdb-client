@@ -831,24 +831,22 @@ impl QuestDb {
     /// an eager pool. Otherwise initial sender/reader prewarming may invoke it
     /// from connection setup, and lazy/background senders may invoke it from a
     /// worker thread.
-    pub fn connect_with_token_provider<F, E>(conf: &str, provider: F) -> Result<Self>
+    pub fn connect_with_token_provider<P>(conf: &str, provider: P) -> Result<Self>
     where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
+        P: crate::token_provider::BearerTokenProvider + 'static,
     {
         Self::connect_with_handlers_and_token_provider(conf, ConnectHandlers::default(), provider)
     }
 
     /// [`Self::connect_with_handlers`] with one rotating Bearer-token provider
     /// shared by the sender and reader pools.
-    pub fn connect_with_handlers_and_token_provider<F, E>(
+    pub fn connect_with_handlers_and_token_provider<P>(
         conf: &str,
         handlers: ConnectHandlers,
-        provider: F,
+        provider: P,
     ) -> Result<Self>
     where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
+        P: crate::token_provider::BearerTokenProvider + 'static,
     {
         Self::connect_with_handlers_and_provider(
             conf,
@@ -860,15 +858,14 @@ impl QuestDb {
     /// Binding-only form that shares one authentication object's isolated QWP
     /// acquisition across every sender and reader attachment in this pool.
     #[doc(hidden)]
-    pub fn connect_with_handlers_and_token_provider_with_isolation<F, E>(
+    pub fn connect_with_handlers_and_token_provider_with_isolation<P>(
         conf: &str,
         handlers: ConnectHandlers,
-        provider: F,
+        provider: P,
         isolation: crate::TokenProviderIsolation,
     ) -> Result<Self>
     where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
+        P: crate::token_provider::BearerTokenProvider + 'static,
     {
         Self::connect_with_handlers_and_provider(
             conf,

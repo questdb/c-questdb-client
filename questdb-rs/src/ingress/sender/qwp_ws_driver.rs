@@ -2666,6 +2666,14 @@ pub(crate) fn reconnect_error_is_foreground_terminal(err: &Error) -> bool {
     if reconnect_error_is_terminal(err) {
         return true;
     }
+    // A provider failure is retried only when the provider classified it
+    // retryable (spec D6, D8), as the Java client's SYNC startup does: an
+    // unclassified failure, an OIDC one included, ends the connect.
+    if err.is_provider_failure()
+        && !crate::token_provider::provider_failure_is_retryable_at_startup(err)
+    {
+        return true;
+    }
     #[cfg(feature = "_oidc")]
     if err.oidc_error().is_some_and(|oidc| {
         oidc.kind() == crate::oidc::OidcErrorKind::InteractionRequired && !oidc.acquisition_busy()

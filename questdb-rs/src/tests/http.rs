@@ -875,6 +875,103 @@ fn test_retry_loop_401_provider_failure_is_marked_in_doubt() -> TestResult {
 }
 
 #[test]
+fn test_permanent_provider_failure_ends_the_flush_at_once() -> TestResult {
+    // A provider failure is re-resolved within the flush's retry budget only
+    // when it can clear: one the provider classified as permanent cannot.
+    let server = MockServer::new()?;
+    for (retryable, expect_retries) in [(false, false), (true, true)] {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sender = server
+            .lsb_http()
+            .protocol_version(ProtocolVersion::V2)?
+            .http_token_provider({
+                let calls = std::sync::Arc::clone(&calls);
+                move || -> crate::Result<String> {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(crate::Error::token_unavailable(
+                        retryable,
+                        None,
+                        "identity platform said no",
+                    ))
+                }
+            })?
+            .retry_timeout(Duration::from_millis(500))?
+            .build()?;
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("test")?
+            .symbol("t1", "v1")?
+            .column_f64("f1", 0.5)?
+            .at(TimestampNanos::new(10000000))?;
+        let err = sender.flush_and_keep(&buffer).unwrap_err();
+        assert!(err.msg().contains("identity platform said no"), "{err}");
+        let calls = calls.load(std::sync::atomic::Ordering::SeqCst);
+        if expect_retries {
+            assert!(
+                calls > 1,
+                "a retryable failure was not retried: {calls} call(s)"
+            );
+        } else {
+            assert_eq!(calls, 1, "a permanent failure was retried");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_401_naming_insufficient_scope_is_not_rotated() -> TestResult {
+    // C23 for ILP/HTTP: a 401 whose Bearer challenge names an error other than
+    // `invalid_token` is not worth a new token, so the flush does not resolve
+    // the provider again or replay the request.
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider({
+            let calls = std::sync::Arc::clone(&calls);
+            move || {
+                Ok::<_, crate::Error>(format!(
+                    "tok{}",
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                ))
+            }
+        })?
+        .retry_timeout(Duration::from_secs(5))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<usize> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_header("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+                .with_body_str("Unauthorized"),
+        )?;
+        let mut requests = 1usize;
+        if server.recv_http(1.0).is_ok() {
+            requests += 1;
+        }
+        Ok(requests)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+    let requests = server_thread.join().unwrap()?;
+    assert_eq!(requests, 1, "the request was replayed with a new token");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(res.unwrap_err().code(), ErrorCode::AuthError);
+    Ok(())
+}
+
+#[test]
 fn test_credential_rotation_budget_is_one_per_flush() -> TestResult {
     // Regression: the rotation budget is one per FLUSH. `http_send_with_retries`
     // spends it on the pre-loop 401, then hands off to `retry_http_send`, which

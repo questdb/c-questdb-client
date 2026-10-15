@@ -3029,9 +3029,12 @@ fn qwp_ws_provider_failure_keeps_sf_frames_recoverable() {
             let provider_calls = Arc::clone(&provider_calls);
             move || {
                 // Fail the first connect round's provider resolution, then recover.
+                // A connect the caller waits for retries only a failure the
+                // provider classifies retryable (spec D6, D8).
                 if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err(crate::Error::new(
-                        crate::ErrorCode::AuthError,
+                    Err(crate::Error::token_unavailable(
+                        true,
+                        None,
                         "token source temporarily unavailable",
                     ))
                 } else {
@@ -9512,3 +9515,5 @@ mod closed_provider_sf;
 
 #[cfg(feature = "_oidc")]
 mod oidc_foreground;
+
+mod token_provider;

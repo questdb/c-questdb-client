@@ -22,14 +22,80 @@
  *
  ******************************************************************************/
 
-//! A caller-supplied source of a fresh Bearer token, pulled on each (re)connect,
-//! for the QWP/WebSocket ingress sender and the egress reader (the ILP/HTTP
-//! sender has its own per-request provider in `ingress::sender::http`).
+//! Rotating Bearer credentials for QuestDB transports.
 //!
-//! Wire `OidcDeviceAuth::token` here so a
-//! long-lived client keeps working as the OIDC token silently rotates.
+//! A [`BearerTokenProvider`] supplies the current token to the QWP/WebSocket
+//! sender, the ILP/HTTP sender, the egress reader and the
+//! [`QuestDb`](crate::QuestDb) pools. It is pulled once per (re)connect round
+//! (per request for ILP/HTTP), and is told when a server rejects the token it
+//! presented. Pass a closure, a type of your own, or a
+//! [`RefreshingTokenProvider`]: a proactively refreshing cache in front of a
+//! [`TokenSource`] that fetches tokens however you like -- Azure Identity, an
+//! OAuth2 client-credentials or PKCE flow, a device flow, a secrets vault.
+//!
+//! Behaviour follows the cross-language dynamic-credential specification
+//! (design/qwp-token-provider-spec.md, v0.7, in the Java client). This client
+//! implements no connect-string providers (`token_provider=...`); attach a
+//! provider in code.
 
 use std::sync::Arc;
+
+pub(crate) mod bearer_challenge;
+pub(crate) mod redaction;
+mod refreshing;
+
+pub use refreshing::{
+    ExpiringToken, FetchFailure, RefreshingTokenProvider, RefreshingTokenProviderBuilder,
+    TokenProviderStatus, TokenSource,
+};
+
+/// The current Bearer token for QuestDB transports: the counterpart of the
+/// Java client's `HttpTokenProvider`.
+///
+/// Implemented for closures `Fn() -> Result<String, E>` where `E:
+/// Into<questdb::Error>`, for [`RefreshingTokenProvider`], and by applications
+/// for their own types.
+///
+/// - [`token`](Self::token) is called once per connect round (per request for
+///   ILP/HTTP), and the value is presented on every endpoint the round tries.
+///   It may block, but should be quick: a connect waits for it. Fetching a
+///   token over the network on every call is better left to a
+///   [`RefreshingTokenProvider`], which serves a cached token and refreshes it
+///   in the background.
+/// - A failure is reported with [`Error::token_unavailable`](crate::Error::token_unavailable),
+///   which says whether retrying can succeed. A connect the caller waits for
+///   (the synchronous initial connect, a pool borrow with retry) retries only
+///   a failure classified retryable; any other failure ends it at once.
+///   Background reconnects keep retrying either way.
+/// - The token is sent as `Authorization: Bearer <token>`, so it is given
+///   without the prefix. A blank token, or one with a character outside
+///   printable ASCII, is rejected without being sent.
+/// - Never put a token in an error message.
+pub trait BearerTokenProvider: Send + Sync {
+    /// The current token, without the `Bearer ` prefix.
+    fn token(&self) -> crate::Result<String>;
+
+    /// A server rejected `token` with `http_status`, currently always 401.
+    ///
+    /// The client calls this, then [`token`](Self::token) again, and retries
+    /// the same endpoint once if the token changed. A provider with a cache
+    /// should stop serving `token` if it has not rotated already. It may be
+    /// called more than once for the same rejection; rate-limit any refresh
+    /// it triggers. The default does nothing.
+    fn on_rejected(&self, token: &str, http_status: u16) {
+        let _ = (token, http_status);
+    }
+}
+
+impl<F, E> BearerTokenProvider for F
+where
+    F: Fn() -> std::result::Result<String, E> + Send + Sync,
+    E: Into<crate::Error>,
+{
+    fn token(&self) -> crate::Result<String> {
+        self().map_err(Into::into)
+    }
+}
 #[cfg(feature = "_sender-qwp-ws")]
 use std::sync::atomic::AtomicBool;
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
@@ -277,7 +343,11 @@ fn with_rejected_token<R>(token: Option<String>, pull: impl FnOnce() -> R) -> R 
 
 /// The token a server rejected, if the calling thread is pulling its
 /// replacement (see [`with_rejected_credential`]).
-#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
 fn rejected_token() -> Option<String> {
     REJECTED_TOKEN
         .try_with(|cell| cell.borrow().clone())
@@ -318,9 +388,9 @@ pub(crate) const PROVIDER_CONFLICTS_WITH_STATIC_AUTH: &str = "A rotating token p
      `ReaderConfig::token_provider`), or the `username` / `password` / `token` \
      settings.";
 
-/// The boxed provider closure. Returns a fresh token (the raw token, *not* the
+/// The shared provider. Returns a fresh token (the raw token, *not* the
 /// `Bearer` header) or an error that fails the connection attempt.
-pub(crate) type TokenProviderFn = Arc<dyn Fn() -> crate::Result<String> + Send + Sync>;
+pub(crate) type TokenProviderFn = Arc<dyn BearerTokenProvider>;
 
 /// Shared single-flight identity for isolated QWP token acquisition.
 ///
@@ -405,6 +475,10 @@ impl TokenProviderIsolation {
 #[derive(Clone)]
 pub(crate) struct TokenProvider {
     provide: TokenProviderFn,
+    /// Set when the provider is a [`RefreshingTokenProvider`]. Its pull is a
+    /// memory read when a token is held and a cancellable wait otherwise, so
+    /// it needs no isolated worker, and its forced refresh runs on a 401.
+    refreshing: Option<RefreshingTokenProvider>,
     /// Shared by every clone so one provider never holds more than one
     /// isolated worker. See [`IsolatedAcquisition`].
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
@@ -423,25 +497,25 @@ pub(crate) struct TokenProvider {
 }
 
 impl TokenProvider {
-    /// Wrap a caller closure, mapping its error into the crate error type.
-    pub(crate) fn new<F, E>(provider: F) -> Self
-    where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
-    {
+    /// Wrap a caller's provider: a closure, a [`RefreshingTokenProvider`] or a
+    /// type of the caller's own.
+    pub(crate) fn new<P: BearerTokenProvider + 'static>(provider: P) -> Self {
         Self::new_with_isolation(provider, TokenProviderIsolation::default())
     }
 
-    pub(crate) fn new_with_isolation<F, E>(provider: F, isolation: TokenProviderIsolation) -> Self
-    where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
-    {
+    pub(crate) fn new_with_isolation<P: BearerTokenProvider + 'static>(
+        provider: P,
+        isolation: TokenProviderIsolation,
+    ) -> Self {
         // Only the QWP/WebSocket and egress transports isolate acquisitions.
         #[cfg(not(any(feature = "_sender-qwp-ws", feature = "_egress")))]
         let _ = isolation;
+        let refreshing = (&provider as &dyn std::any::Any)
+            .downcast_ref::<RefreshingTokenProvider>()
+            .cloned();
         TokenProvider {
-            provide: Arc::new(move || provider().map_err(Into::into)),
+            provide: Arc::new(provider),
+            refreshing,
             #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
             isolated: isolation.isolated,
             #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
@@ -538,7 +612,40 @@ impl TokenProvider {
     /// reader connection factories; each transport applies its own validation
     /// and retry classification when it formats the Bearer header.
     pub(crate) fn provide(&self) -> crate::Result<String> {
-        (self.provide)()
+        self.provide.token()
+    }
+
+    /// Tell the provider which token a server just rejected with HTTP 401, when
+    /// the calling thread is pulling its replacement (see
+    /// [`with_rejected_credential`]). Isolated pulls carry the rejection to
+    /// their worker thread, so this runs wherever the provider runs.
+    fn notify_rejection(&self) {
+        if let Some(rejected) = rejected_token() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.provide.on_rejected(&rejected, 401)
+            }));
+        }
+    }
+
+    /// [`bearer_header`](Self::bearer_header) for a
+    /// [`RefreshingTokenProvider`]: a forced refresh after a 401, then a cached
+    /// token or a bounded wait for one. `cancel` ends both waits promptly.
+    fn refreshing_bearer_header(
+        refreshing: &RefreshingTokenProvider,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> crate::Result<String> {
+        if let Some(rejected) = rejected_token() {
+            refreshing.on_rejected_until(&rejected, 401, cancel);
+        }
+        match refreshing.token_until(cancel) {
+            // The provider validated the token when it arrived.
+            Ok(token) => Ok(format!("Bearer {token}")),
+            Err(refreshing::TokenWait::Cancelled) => Err(crate::Error::new(
+                crate::ErrorCode::SocketError,
+                PROVIDER_SHUTDOWN_MSG,
+            )),
+            Err(refreshing::TokenWait::Failed(err)) => Err(classify_provider_error(err)),
+        }
     }
 
     /// Pull a token and format it as a validated `Authorization: Bearer` value.
@@ -577,6 +684,10 @@ impl TokenProvider {
     /// the refresh token and device code into a URL-encoded body that ureq
     /// allocates internally.
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
+        if let Some(refreshing) = &self.refreshing {
+            return Self::refreshing_bearer_header(refreshing, None);
+        }
+        self.notify_rejection();
         // Only reachable in an UNWIND-enabled build. `questdb-rs-ffi` sets
         // `panic = "abort"` in both profiles, and a Cargo profile is chosen by
         // the top-level artifact, so in the shipped cdylib -- and therefore in
@@ -627,6 +738,11 @@ impl TokenProvider {
         &self,
         cancelled: impl Fn() -> bool,
     ) -> crate::Result<String> {
+        if let Some(refreshing) = &self.refreshing {
+            // A cached token, or a wait the transport's shutdown can end: no
+            // isolated worker, so none of the process-wide permits.
+            return Self::refreshing_bearer_header(refreshing, Some(&cancelled));
+        }
         let rejected = rejected_token();
         let mut restarted_after_rejection = false;
         loop {
@@ -819,7 +935,6 @@ impl TokenProvider {
     }
 }
 
-#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 const PROVIDER_SHUTDOWN_MSG: &str =
     "Token-provider acquisition was abandoned because the transport is shutting down";
 
@@ -864,7 +979,16 @@ pub(crate) fn is_provider_shutdown_error(err: &crate::Error) -> bool {
 /// retrying is visible rather than silent. Only a connect the caller waits for
 /// treats a non-busy `InteractionRequired` as final, through
 /// `reconnect_error_is_foreground_terminal`.
+///
+/// A closed [`RefreshingTokenProvider`] is terminal like a closed OIDC
+/// provider. Every result is marked as a provider failure, the spec's
+/// credential-unavailable class: a connect the caller waits for retries it
+/// only when the provider classified it retryable (spec D6, D8).
 fn classify_provider_error(e: crate::Error) -> crate::Error {
+    classify_provider_error_code(e).with_provider_failure()
+}
+
+fn classify_provider_error_code(e: crate::Error) -> crate::Error {
     if e.code() == crate::ErrorCode::InvalidApiCall {
         // Keep it terminal, but carry it as `ConfigError` rather than leaving
         // `InvalidApiCall` for `reconnect_error_is_terminal` to match on.
@@ -885,7 +1009,7 @@ fn classify_provider_error(e: crate::Error) -> crate::Error {
         let err = err.with_terminal_token_provider_failure();
         return err;
     }
-    if is_terminal_oidc_provider_error(&e) {
+    if is_terminal_oidc_provider_error(&e) || is_closed_token_provider_error(&e) {
         return e;
     }
     if e.code() == crate::ErrorCode::SocketError {
@@ -908,7 +1032,37 @@ const PROVIDER_FAILED_PREFIX: &str = "Token provider failed: ";
 /// HTTP 401 and endpoint context without changing the provider's failure.
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) fn is_terminal_provider_error(e: &crate::Error) -> bool {
-    is_terminal_oidc_provider_error(e) || e.is_terminal_token_provider_failure()
+    is_terminal_oidc_provider_error(e)
+        || e.is_terminal_token_provider_failure()
+        || is_closed_token_provider_error(e)
+}
+
+/// Whether `e` reports a closed [`RefreshingTokenProvider`]. A closed provider
+/// never supplies a token again, so it is terminal for every client using it,
+/// like a closed OIDC provider.
+fn is_closed_token_provider_error(e: &crate::Error) -> bool {
+    e.as_token_unavailable()
+        .is_some_and(crate::TokenUnavailable::provider_closed)
+}
+
+/// Whether a connect the caller waits for -- the synchronous initial connect,
+/// a pool borrow with retry -- may retry this provider failure (spec D6, D8):
+/// only when the provider classified it retryable, or when an OIDC provider
+/// was busy on another thread. Any other provider failure ends the connect.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) fn provider_failure_is_retryable_at_startup(e: &crate::Error) -> bool {
+    if e.as_token_unavailable()
+        .is_some_and(crate::TokenUnavailable::retryable)
+    {
+        return true;
+    }
+    #[cfg(feature = "_oidc")]
+    if e.oidc_error().is_some_and(|oidc| {
+        oidc.kind() == crate::oidc::OidcErrorKind::InteractionRequired && oidc.acquisition_busy()
+    }) {
+        return true;
+    }
+    false
 }
 
 /// Whether `e` is an OIDC provider failure that no later invocation can

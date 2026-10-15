@@ -669,11 +669,24 @@ fn map_http_reject(reject: HttpReject) -> Error {
         // is failover-eligible.
         ErrorCode::HandshakeError
     };
+    // A Bearer challenge's `error` decides whether a 401 is worth a token
+    // refresh (RFC 6750 §3.1).
+    let bearer_error = if code == ErrorCode::AuthError {
+        crate::token_provider::bearer_challenge::sanitized_bearer_error(
+            headers.join_all_ci("www-authenticate").as_deref(),
+        )
+    } else {
+        None
+    };
+    let detail = bearer_error
+        .as_deref()
+        .map_or_else(String::new, |error| format!(" [error={error}]"));
     Error::new(
         code,
-        format!("WebSocket handshake failed with HTTP {}", status),
+        format!("WebSocket handshake failed with HTTP {status}{detail}"),
     )
     .with_ws_http_status(status)
+    .with_bearer_challenge_error(bearer_error)
 }
 
 /// Extract `X-QuestDB-Role` (and the optional `X-QuestDB-Zone`) from a

@@ -3570,8 +3570,10 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
         // A credential can expire during DNS/TCP/TLS setup. Resolve once more
         // after a definite 401 and replay this endpoint only when the rotating
         // provider actually supplies a changed header. Static credentials, 403,
-        // unchanged values, and a second 401 remain terminal.
-        if matches!(&connected, Err(err) if err.ws_http_status() == Some(401))
+        // unchanged values, and a second 401 remain terminal, as does a 401
+        // whose Bearer challenge names an error other than `invalid_token`
+        // (spec §8.2): a new token cannot fix `insufficient_scope`.
+        if matches!(&connected, Err(err) if err.upgrade_401_allows_token_refresh())
             && !auth_rotation_retry_used
             && let Some(provider) = qwp_ws.token_provider.as_ref()
         {

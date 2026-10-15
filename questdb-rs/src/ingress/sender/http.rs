@@ -544,7 +544,9 @@ fn rotated_auth_after_401(
     retry_end: Option<std::time::Instant>,
     retry_max_backoff: Duration,
 ) -> crate::Result<Option<String>> {
-    if !state.auth.is_rotating() || !matches!(rep, Ok(rep) if rep.status() == 401) {
+    if !state.auth.is_rotating()
+        || !matches!(rep, Ok(rep) if rep.status() == 401 && http_401_allows_token_refresh(rep))
+    {
         return Ok(None);
     }
     let mark = |e: Error| {
@@ -578,6 +580,24 @@ fn rotated_auth_after_401(
         }
     };
     Ok((Some(value.as_str()) != used).then_some(value))
+}
+
+/// Whether a 401 is worth a token refresh: its `WWW-Authenticate` has no
+/// Bearer challenge with an `error` parameter, or that error is
+/// `invalid_token` (RFC 6750 §3.1). A new token cannot fix
+/// `insufficient_scope`.
+fn http_401_allows_token_refresh(rep: &Response<Body>) -> bool {
+    let challenges: Vec<&str> = rep
+        .headers()
+        .get_all(http::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    let joined = (!challenges.is_empty()).then(|| challenges.join(", "));
+    crate::token_provider::bearer_challenge::allows_token_refresh(
+        crate::token_provider::bearer_challenge::sanitized_bearer_error(joined.as_deref())
+            .as_deref(),
+    )
 }
 
 fn finish_http_send(
@@ -615,6 +635,13 @@ fn finish_http_send(
 ///   on failure.)
 fn provider_error_is_retryable(e: &Error) -> bool {
     if e.code() != crate::ErrorCode::SocketError {
+        return false;
+    }
+    // A provider that classified its failure as permanent cannot recover
+    // within this flush's retry budget.
+    if e.as_token_unavailable()
+        .is_some_and(|classification| !classification.retryable())
+    {
         return false;
     }
     #[cfg(feature = "_oidc")]

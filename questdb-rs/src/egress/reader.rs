@@ -3275,8 +3275,9 @@ fn walk_via_tracker(
         // 401, ask only a rotating provider for a fresh header and replay this
         // same endpoint once when the value changed. Endpoint failover still
         // reuses one cluster-wide credential and all other auth failures remain
-        // terminal.
-        if matches!(&connected, Err(err) if err.ws_http_status() == Some(401))
+        // terminal, including a 401 whose Bearer challenge names an error other
+        // than `invalid_token` (spec §8.2).
+        if matches!(&connected, Err(err) if err.upgrade_401_allows_token_refresh())
             && !auth_rotation_retry_used
             && cfg.token_provider.is_some()
         {

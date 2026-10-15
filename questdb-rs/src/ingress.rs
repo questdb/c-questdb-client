@@ -1561,7 +1561,11 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Supply a fresh HTTP Bearer token for every flush via a callback.
+    /// Supply a fresh HTTP Bearer token for every flush from a
+    /// [`BearerTokenProvider`](crate::token_provider::BearerTokenProvider): a
+    /// closure, a
+    /// [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider),
+    /// or a type of your own.
     ///
     /// Unlike [`token`](Self::token), which captures a fixed token once, the
     /// provider is called on each flush, so a long-lived sender keeps working as
@@ -1635,10 +1639,9 @@ impl SenderBuilder {
     /// [`retry_timeout`](Self::retry_timeout) bounds that wait, so size the OIDC
     /// timeout for the longest stall a flush may absorb.
     #[cfg(feature = "_sender-http")]
-    pub fn http_token_provider<F, E>(mut self, provider: F) -> Result<Self>
+    pub fn http_token_provider<P>(mut self, provider: P) -> Result<Self>
     where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
+        P: crate::token_provider::BearerTokenProvider + 'static,
     {
         if !self.protocol.is_httpx() {
             return Err(fmt!(
@@ -1658,8 +1661,11 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Supply a fresh Bearer token on every QWP/WebSocket (re)connect via a
-    /// callback (e.g. `OidcDeviceAuth::token`).
+    /// Supply a fresh Bearer token on every QWP/WebSocket (re)connect from a
+    /// [`BearerTokenProvider`](crate::token_provider::BearerTokenProvider): a
+    /// closure (e.g. `OidcDeviceAuth::token`), a
+    /// [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider),
+    /// or a type of your own.
     ///
     /// Unlike [`token`](Self::token), which captures a fixed token once, the
     /// provider is called once at each connect/reconnect endpoint walk. That
@@ -1675,11 +1681,15 @@ impl SenderBuilder {
     /// the reconnect loop because the callback may recover on its next invocation;
     /// already accepted store-and-forward frames remain queued. The exception is a
     /// connect the caller waits for -- the synchronous initial connect
-    /// (`initial_connect_retry=sync`) or a pool borrow with retry -- which fails
-    /// immediately on an OIDC `InteractionRequired` that is not
-    /// `acquisition_busy`: nobody has signed in, and the waiting caller is the
-    /// one that would have to. A server rejection of a successfully acquired token is a separate terminal authentication
-    /// error. In unwind-enabled builds, a callback panic is contained and treated
+    /// (`initial_connect_retry=sync`) or a pool borrow with retry -- which
+    /// retries only a failure the provider classified retryable with
+    /// [`Error::token_unavailable`](crate::Error::token_unavailable), or an OIDC
+    /// acquisition busy on another thread. Any other provider failure ends it at
+    /// once, OIDC's `InteractionRequired` included: nobody has signed in, and the
+    /// waiting caller is the one that would have to. Before retrying a 401, the
+    /// sender calls the provider's `on_rejected` with the rejected token. A
+    /// server rejection of a successfully acquired token is a separate terminal
+    /// authentication error. In unwind-enabled builds, a callback panic is contained and treated
     /// as a retryable provider failure; a process built with `panic = "abort"`
     /// cannot contain panics, so providers must not rely on this as their normal
     /// error path. Runner-owned acquisition is isolated so sender shutdown can
@@ -1696,10 +1706,9 @@ impl SenderBuilder {
     /// token is a bearer credential, sent in cleartext over plain
     /// [`Protocol::Ws`] to a non-loopback host.
     #[cfg(feature = "_sender-qwp-ws")]
-    pub fn qwp_ws_token_provider<F, E>(self, provider: F) -> Result<Self>
+    pub fn qwp_ws_token_provider<P>(self, provider: P) -> Result<Self>
     where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
+        P: crate::token_provider::BearerTokenProvider + 'static,
     {
         self.qwp_ws_token_provider_object(crate::token_provider::TokenProvider::new(provider))
     }
@@ -1738,12 +1747,20 @@ impl SenderBuilder {
     ///
     /// # Retry classification
     ///
-    /// Every provider failure is treated as **retryable** by default: the
-    /// closure is caller-controlled and may succeed on its next invocation, and
+    /// Background reconnects treat every provider failure as **retryable**: the
+    /// provider is caller-controlled and may succeed on its next invocation, and
     /// a QWP store-and-forward sender must not abandon accepted frames because
     /// one refresh attempt failed. `AuthError` and `ConfigError` returned from
-    /// the closure are reclassified to a retryable `SocketError` for that
+    /// the provider are reclassified to a retryable `SocketError` for that
     /// reason.
+    ///
+    /// A connect the caller waits for (the synchronous initial connect, or a
+    /// pool borrow with retry) retries only a failure the provider classified
+    /// retryable with
+    /// [`Error::token_unavailable`](crate::Error::token_unavailable), and ends
+    /// at once on any other (spec D6, D8). A
+    /// [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider)
+    /// classifies its failures itself.
     ///
     /// To signal a failure that retrying can never clear, return
     /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall): it is
@@ -1765,11 +1782,13 @@ impl SenderBuilder {
     /// connect, or a pool borrow with retry) instead fails immediately on an
     /// `InteractionRequired` that is not `acquisition_busy`, rather than
     /// spending its whole budget waiting for a sign-in it is blocking.
+    ///
+    /// A closed `RefreshingTokenProvider` is terminal, like a closed OIDC
+    /// provider.
     #[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
-    pub fn bearer_token_provider<F, E>(self, provider: F) -> Result<Self>
+    pub fn bearer_token_provider<P>(self, provider: P) -> Result<Self>
     where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
+        P: crate::token_provider::BearerTokenProvider + 'static,
     {
         self.bearer_token_provider_with_isolation(
             provider,
@@ -1781,14 +1800,13 @@ impl SenderBuilder {
     /// object share its isolated-acquisition single flight.
     #[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
     #[doc(hidden)]
-    pub fn bearer_token_provider_with_isolation<F, E>(
+    pub fn bearer_token_provider_with_isolation<P>(
         self,
-        provider: F,
+        provider: P,
         isolation: crate::TokenProviderIsolation,
     ) -> Result<Self>
     where
-        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
-        E: Into<crate::Error>,
+        P: crate::token_provider::BearerTokenProvider + 'static,
     {
         match self.protocol {
             // HTTP acquisition is synchronous and does not consume isolated

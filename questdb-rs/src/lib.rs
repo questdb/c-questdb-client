@@ -35,15 +35,25 @@ mod gai;
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 mod ws;
 
-// A caller-supplied rotating Bearer-token provider shared by the ILP/HTTP
-// sender, the QWP/WS ingress sender, and the egress reader. Lets an OIDC token
-// be refreshed at each (re)connect (or, for HTTP, resolved fresh each flush).
+// Display-safe rendering of untrusted text, shared by the OIDC prompt and
+// token-provider error redaction.
+#[cfg(any(
+    feature = "_oidc",
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+mod display_text;
+
+// Rotating Bearer-token providers shared by the ILP/HTTP sender, the QWP/WS
+// ingress sender, and the egress reader: the `BearerTokenProvider` interface,
+// and the proactively refreshing `RefreshingTokenProvider` cache.
 #[cfg(any(
     feature = "_sender-http",
     feature = "_sender-qwp-ws",
     feature = "_egress"
 ))]
-mod token_provider;
+pub mod token_provider;
 #[cfg(any(
     feature = "_sender-http",
     feature = "_sender-qwp-ws",
