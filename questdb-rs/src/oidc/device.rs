@@ -2175,7 +2175,9 @@ impl OidcDeviceAuth {
             expires_at,
             issued_at,
             token_type: "Bearer".to_string(),
-            scope: Some(self.config.scope.clone()),
+            // The frozen store format records configured identity scope, not
+            // the grant. Do not claim requested scopes were actually issued.
+            scope: None,
             sub,
         })
     }
@@ -2273,13 +2275,21 @@ impl OidcDeviceAuth {
         })?;
 
         let (current, current_is_persisted) = if let Some(persisted) = persisted {
-            let peer = self.tokenset_from_persisted(&persisted).ok_or_else(|| {
+            let mut peer = self.tokenset_from_persisted(&persisted).ok_or_else(|| {
                 self.discard_cached_refresh();
                 self.lock_store_state().set_last_persisted_refresh(None);
                 OidcError::network(
                     "The persisted OIDC token became invalid before refresh. Refusing to reuse a possibly rotated in-memory refresh token; retry or sign in again.",
                 )
             })?;
+            // Preserve known grant metadata only for the exact credential
+            // already in memory. A peer's replacement has an unknown grant.
+            if peer.access_token == existing.access_token
+                && peer.id_token == existing.id_token
+                && peer.refresh_token == existing.refresh_token
+            {
+                peer.scope = existing.scope.clone();
+            }
             // `is_usable` also refuses the token a server just rejected: until
             // a refresh replaces it, the persisted entry is that same token,
             // and its expiry alone would read as a peer's fresh refresh.
@@ -3163,7 +3173,7 @@ impl OidcDeviceAuth {
             // Carry the prior refresh token forward (a non-rotating IdP omits it
             // on refresh) and let the lifetime cap see it — see
             // `tokenset_from_response`.
-            return self.tokenset_from_response(&result.body, Some(refresh_token));
+            return self.tokenset_from_response(&result.body, Some(tokens));
         }
         let error = result.body.get("error").and_then(Value::as_str);
         // RFC 6749 defines `temporarily_unavailable` as a transient OAuth
@@ -3232,16 +3242,14 @@ impl OidcDeviceAuth {
         }
     }
 
-    /// Map an IdP token response into a [`TokenSet`]. `prior_refresh` is the
-    /// refresh token to carry forward when the response omits one (many IdPs
-    /// don't re-send it on a refresh); it is `None` on the initial device flow.
+    /// Map an IdP token response into a [`TokenSet`]. On refresh, carry forward
+    /// the prior refresh token and granted scope when the response omits them.
+    /// `None` denotes an initial device grant, whose omitted scope defaults to
+    /// the requested scope. Unknown persisted grants remain unknown on refresh.
     /// The lifetime cap keys off the *effective* refresh token — fresh or
     /// carried forward — so a non-rotating IdP's long TTL is still capped.
-    fn tokenset_from_response(
-        &self,
-        body: &Value,
-        prior_refresh: Option<&str>,
-    ) -> Result<TokenSet> {
+    fn tokenset_from_response(&self, body: &Value, prior: Option<&TokenSet>) -> Result<TokenSet> {
+        let prior_refresh = prior.and_then(|tokens| tokens.refresh_token.as_deref());
         // Every attached transport emits the Bearer authorization scheme. Do
         // not cache a token whose advertised type requires another scheme
         // (for example DPoP), or persistence would also erase that distinction
@@ -3347,7 +3355,10 @@ impl OidcDeviceAuth {
             expires_at,
             issued_at: now,
             token_type,
-            scope: str_field_val(body.get("scope")).or_else(|| Some(self.config.scope.clone())),
+            scope: str_field_val(body.get("scope")).or_else(|| match prior {
+                Some(tokens) => tokens.scope.clone(),
+                None => Some(self.config.scope.clone()),
+            }),
             sub,
         })
     }

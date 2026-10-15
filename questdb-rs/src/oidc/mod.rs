@@ -147,10 +147,12 @@
 //! where the durable directory-entry barrier required for token rotation is not
 //! available; reads remain available for migration to a custom store.
 //! A persisted file is treated as untrusted input on load (see [`FileTokenStore`]).
-//! A refresh is never attempted without owning the store's cross-process lock:
-//! contention returns a retryable network-class error, and an apparently stale
-//! lock is left in place for an operator to remove only after verifying that its
-//! holder is gone. This avoids reusing a rotating refresh token concurrently.
+//! A refresh is never attempted without owning the store's cross-process lock.
+//! Native holders renew their locks with heartbeats; eligible stale locks are
+//! recovered automatically using age-based capture-then-verify checks. Unresolved
+//! contention returns a retryable network-class error. Future-dated locks are not
+//! reclaimed while their timestamps remain ahead of the local clock; investigate
+//! the timestamp and verify that the holder is gone before removing one manually.
 //!
 //! # Using the token beyond ILP/HTTP
 //!

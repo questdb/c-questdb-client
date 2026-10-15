@@ -107,7 +107,8 @@ impl TokenSet {
         &self.token_type
     }
 
-    /// The space-separated scope the token was issued for.
+    /// The space-separated scope the token was issued for, or `None` when
+    /// unknown (the persisted-token format does not retain the granted scope).
     pub fn scope(&self) -> Option<&str> {
         self.scope.as_deref()
     }

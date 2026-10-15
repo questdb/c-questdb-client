@@ -436,6 +436,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_test(
         test_oidc
         cpp_test/test_oidc.cpp)
+    compile_test(
+        test_oidc_examples
+        cpp_test/test_oidc_examples.cpp)
 
     # Live-broker integration tests for the egress reader. Skips per-test
     # if no broker is reachable on QDB_LIVE_BROKER_HOST:QDB_LIVE_BROKER_HTTP_PORT

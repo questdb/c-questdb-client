@@ -543,7 +543,9 @@ void questdb_oidc_auth_detach_events(const questdb_oidc_auth* auth);
  * NULL-tolerant, and callable from any thread, including from inside a
  * renderer callback. This is the safe form for finalizers, garbage-collection
  * hooks, interpreter shutdown hooks, and other contexts that cannot wait for
- * arbitrary user callback code.
+ * arbitrary user callback code. It is not a managed-runtime finalization fence:
+ * before runtime teardown, the binding must independently quiesce callbacks
+ * already admitted, including callbacks waiting to acquire the runtime lock.
  *
  * Auths built from the same reusable builder are unaffected. Clones of this
  * auth ARE affected (see `questdb_oidc_auth_detach_events`).
@@ -577,13 +579,14 @@ void questdb_oidc_auth_detach_events_nowait(const questdb_oidc_auth* auth);
  * it runs wherever a collection happened to fire. A caller that cannot
  * establish this must use `questdb_oidc_auth_detach_diagnostics_nowait`.
  *
- * Most callers do not need either form: `questdb_oidc_auth_close` also ends
- * diagnostics, because a closed auth performs no further token-store writes.
- * These are for an owner that is going away without being able to wait for
- * that -- a binding whose callback enters a managed runtime being torn down (a
- * garbage-collected handle, or an interpreter beginning to shut down) while a
- * background token-provider or transport thread may still hold a clone of this
- * auth and reach a store write.
+ * Most callers do not need either form: `questdb_oidc_auth_close` also
+ * suppresses later diagnostics. Suppression is independent of token-store
+ * mutation: in-flight durable writes may complete after closure is published,
+ * and explicit clear remains available after close. These detach calls are for
+ * an owner going away without closing the auth, such as a managed handle being
+ * collected or an interpreter beginning to shut down, while a background
+ * token-provider or transport thread may still hold a clone of this auth and
+ * reach a store write.
  *
  * Auths built from the same builder are unaffected and keep delivering; this
  * call waits only for THIS auth's diagnostic callback, never for a sibling's.
@@ -607,6 +610,10 @@ void questdb_oidc_auth_detach_diagnostics(const questdb_oidc_auth* auth);
  * thread already holds, and the waiting form would deadlock against any of
  * them that the callback also needs. As with the waiting form, all clones of
  * this auth lose diagnostic delivery.
+ *
+ * This is not a managed-runtime finalization fence. Before runtime teardown,
+ * the binding must independently quiesce already-admitted callbacks, including
+ * callbacks waiting to acquire the runtime lock.
  */
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_detach_diagnostics_nowait(const questdb_oidc_auth* auth);

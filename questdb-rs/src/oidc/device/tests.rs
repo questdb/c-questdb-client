@@ -2068,6 +2068,12 @@ fn refresh_never_reuses_an_idle_idp_connection() {
 
 #[test]
 fn refresh_request_omits_scope_after_narrower_grant() {
+    for persisted in [false, true] {
+        check_refresh_scope_after_narrower_grant(persisted);
+    }
+}
+
+fn check_refresh_scope_after_narrower_grant(persisted: bool) {
     let refresh_body = Arc::new(Mutex::new(None));
     let mock = {
         let refresh_body = Arc::clone(&refresh_body);
@@ -2098,7 +2104,8 @@ fn refresh_request_omits_scope_after_narrower_grant() {
         }
         })
     };
-    let auth = OidcDeviceAuth::builder()
+    let directory = TempDir::new().unwrap();
+    let mut builder = OidcDeviceAuth::builder()
         .client_id("questdb")
         .device_authorization_endpoint(mock.url("/device"))
         .token_endpoint(mock.url("/token"))
@@ -2106,9 +2113,11 @@ fn refresh_request_omits_scope_after_narrower_grant() {
         .interactive(true)
         .open_browser(false)
         .timeout(Duration::from_secs(5))
-        .sleep_hook(no_sleep())
-        .build()
-        .expect("build auth");
+        .sleep_hook(no_sleep());
+    if persisted {
+        builder = builder.token_store(test_file_store(directory.path()));
+    }
+    let auth = builder.build().expect("build auth");
 
     assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
     assert_eq!(
@@ -2122,8 +2131,20 @@ fn refresh_request_omits_scope_after_narrower_grant() {
         Some("openid offline_access"),
         "the IdP's narrower granted scope must be recorded"
     );
-    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
-    assert_eq!(auth.token().unwrap(), "AT-refreshed");
+    // Rejection forces refresh of the persisted copy too, while its credential
+    // bytes still match the known in-memory grant.
+    assert_eq!(
+        crate::token_provider::with_rejected_credential(Some("Bearer AT-initial"), || {
+            auth.token()
+        })
+        .unwrap(),
+        "AT-refreshed"
+    );
+    assert_eq!(
+        auth.token_set().unwrap().scope(),
+        Some("openid offline_access"),
+        "scope-less refresh must preserve the narrower grant (persisted={persisted})"
+    );
 
     let body = refresh_body
         .lock()
@@ -2232,6 +2253,35 @@ fn groups_mode_preserves_scope_and_loads_java_store_entry() {
         "groups mode changed the Java-compatible persisted identity"
     );
     assert_eq!(auth.token().unwrap(), "ID-from-Java");
+    assert_eq!(auth.token_set().unwrap().scope(), None);
+}
+
+#[test]
+fn refreshed_scope_preserves_known_and_unknown_grants() {
+    let auth = offline_auth();
+    let mut prior = expired_tokens("RT-prior");
+    for granted in [Some("openid offline_access"), None] {
+        prior.scope = granted.map(String::from);
+        let response = serde_json::json!({"access_token": "AT", "expires_in": 300});
+        let refreshed = auth
+            .tokenset_from_response(&response, Some(&prior))
+            .unwrap();
+        assert_eq!(refreshed.scope(), granted);
+        let explicit = serde_json::json!({
+            "access_token": "AT", "expires_in": 300, "scope": "openid"
+        });
+        let refreshed = auth
+            .tokenset_from_response(&explicit, Some(&prior))
+            .unwrap();
+        assert_eq!(refreshed.scope(), Some("openid"));
+    }
+    let initial = auth
+        .tokenset_from_response(
+            &serde_json::json!({"access_token": "AT", "expires_in": 300}),
+            None,
+        )
+        .unwrap();
+    assert_eq!(initial.scope(), Some("openid"));
 }
 
 #[test]
@@ -3340,7 +3390,7 @@ fn lifetime_cap_bounds_refreshable_and_opaque_tokens() {
                 "access_token": "AT",
                 "expires_in": long,
             }),
-            Some("carried-RT"),
+            Some(&expired_tokens("carried-RT")),
         )
         .unwrap();
     assert_eq!(ts.refresh_token.as_deref(), Some("carried-RT"));
@@ -7526,7 +7576,7 @@ fn unsafe_refresh_token_is_rejected_at_ingestion() {
         serde_json::json!({"access_token": "AT", "refresh_token": "", "expires_in": 300}),
     ] {
         let ts = auth
-            .tokenset_from_response(&ok, Some("RT-prior"))
+            .tokenset_from_response(&ok, Some(&expired_tokens("RT-prior")))
             .expect("a missing refresh token is not a failure");
         assert_eq!(ts.refresh_token.as_deref(), Some("RT-prior"));
     }

@@ -2122,6 +2122,10 @@ pub unsafe extern "C" fn questdb_oidc_auth_detach_events(auth: *const questdb_oi
 /// callback is still running on return" guarantee is given up. Use this from a
 /// finalizer, garbage-collection hook, interpreter shutdown hook, or any other
 /// context that must not wait for arbitrary user callback code.
+///
+/// This is not a managed-runtime finalization fence. Before runtime teardown,
+/// bindings must independently quiesce already-admitted callbacks, including
+/// callbacks waiting to acquire the runtime lock.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_auth_detach_events_nowait(auth: *const questdb_oidc_auth) {
     if auth.is_null() || unsafe { (*auth).shared.inner.is_inherited() } {
@@ -2145,9 +2149,10 @@ pub unsafe extern "C" fn questdb_oidc_auth_detach_events_nowait(auth: *const que
 /// about to lose -- a garbage-collected handle being reclaimed, or an
 /// interpreter beginning to shut down -- while a background token-provider or
 /// transport thread may still hold a clone of this auth and reach a token-store
-/// write. Closing an auth also ends its diagnostics, because a closed auth
-/// performs no further store writes; this is the operation for the case where
-/// the owner is going away without being able to wait for that.
+/// write. Closing an auth also suppresses later diagnostics, independently of
+/// store mutation: in-flight durable writes can complete after closure is
+/// published, and explicit clear remains available after close. Detach is for
+/// an owner going away without closing the auth.
 ///
 /// Other auths built from the same builder keep delivering.
 #[unsafe(no_mangle)]
@@ -2169,6 +2174,10 @@ pub unsafe extern "C" fn questdb_oidc_auth_detach_diagnostics(auth: *const quest
 /// the calling thread holds no lock the diagnostic callback might acquire --
 /// the waiting form deadlocks against such a lock, and dropping the binding's
 /// global runtime lock does not prevent it.
+///
+/// This is not a managed-runtime finalization fence. Before runtime teardown,
+/// bindings must independently quiesce already-admitted callbacks, including
+/// callbacks waiting to acquire the runtime lock.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_auth_detach_diagnostics_nowait(
     auth: *const questdb_oidc_auth,
