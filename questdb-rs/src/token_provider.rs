@@ -1200,7 +1200,7 @@ mod tests {
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     mod isolated {
         use super::super::{
-            IsolatedProviderPermit, MAX_ISOLATED_PROVIDER_WORKERS, TokenProvider,
+            IsolatedProviderPermit, IsolatedResult, MAX_ISOLATED_PROVIDER_WORKERS, TokenProvider,
             TokenProviderIsolation,
         };
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1301,8 +1301,13 @@ mod tests {
                 .collect()
         }
 
-        fn wait_for_lead(provider: &TokenProvider) {
-            while provider.isolated.current.lock().unwrap().is_none() {
+        fn wait_for_lead(provider: &TokenProvider) -> Arc<IsolatedResult> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(slot) = provider.isolated.current.lock().unwrap().clone() {
+                    return slot;
+                }
+                assert!(Instant::now() < deadline, "lead did not publish its slot");
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
@@ -1380,20 +1385,67 @@ mod tests {
                     None,
                 ),
             );
+            let (lead_waiting_tx, lead_waiting_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (lead_result_tx, lead_result_rx) = std::sync::mpsc::channel();
             let lead = {
                 let provider = provider.clone();
-                std::thread::spawn(move || provider.bearer_header_isolated_until(|| false))
-            };
-            wait_for_lead(&provider);
-            let joiner = {
-                let provider = provider.clone();
-                let deadline = Instant::now() + Duration::from_secs(10);
                 std::thread::spawn(move || {
-                    provider.bearer_header_isolated_until(|| Instant::now() >= deadline)
+                    let checks = std::cell::Cell::new(0);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let result = provider.bearer_header_isolated_until(|| {
+                        checks.set(checks.get() + 1);
+                        if checks.get() == 2 {
+                            // The first check precedes publication. The second
+                            // is inside the permit wait: hold it until a joiner
+                            // has actually attached, even if 300 ms elapses.
+                            lead_waiting_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        }
+                        Instant::now() >= deadline
+                    });
+                    lead_result_tx.send(result).unwrap();
                 })
             };
-            let lead_result = lead.join().unwrap();
-            let joiner_result = joiner.join().unwrap();
+            lead_waiting_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let slot = wait_for_lead(&provider);
+            let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+            let (joiner_result_tx, joiner_result_rx) = std::sync::mpsc::channel();
+            let joiner = {
+                let provider = provider.clone();
+                std::thread::spawn(move || {
+                    let checks = std::cell::Cell::new(0);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let result = provider.bearer_header_isolated_until(|| {
+                        checks.set(checks.get() + 1);
+                        if checks.get() == 2 {
+                            // This check follows a wait on the selected slot.
+                            joined_tx.send(()).unwrap();
+                        }
+                        Instant::now() >= deadline
+                    });
+                    joiner_result_tx.send(result).unwrap();
+                })
+            };
+            joined_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(Arc::ptr_eq(
+                provider.isolated.current.lock().unwrap().as_ref().unwrap(),
+                &slot,
+            ));
+            // Exactly the current entry, lead, observer and admitted joiner
+            // own this slot. Matching error strings alone cannot prove that.
+            assert_eq!(Arc::strong_count(&slot), 4);
+            release_tx.send(()).unwrap();
+            let lead_result = lead_result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let joiner_result = joiner_result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            lead.join().unwrap();
+            joiner.join().unwrap();
             assert!(lead_result.unwrap_err().msg().contains("worker limit"));
             assert!(
                 joiner_result

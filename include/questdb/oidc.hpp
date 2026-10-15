@@ -666,9 +666,9 @@ public:
      * Authentication may first perform a coordinated load that creates
      * directories and coordination files or recovers records already marked
      * untrusted; this is not a no-write guarantee for authentication. C++
-     * callers should use memory-only authentication there; custom keychain-backed
-     * stores are currently available only through the Rust `TokenStore` API.
-     * Without this opt-in, credentials remain in memory only.
+     * callers should use memory-only authentication there; custom
+     * keychain-backed stores are currently available only through the Rust
+     * `TokenStore` API. Without this opt-in, credentials remain in memory only.
      *
      * `directory` is used verbatim: nothing expands `~`, so a value starting
      * with `~` throws rather than creating a directory literally named `~`

@@ -161,6 +161,33 @@ impl DnsWorkerBudget {
         timeout: NextTimeout,
         lookup: impl FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
     ) -> std::result::Result<Vec<SocketAddr>, ureq::Error> {
+        self.resolve_with_spawner(timeout, lookup, |permit, tx, lookup| {
+            // A failed spawn drops the closure and its permit too.
+            thread::Builder::new()
+                .name("questdb-oidc-dns".to_string())
+                .spawn(move || {
+                    let _permit = permit;
+                    let _ = tx.send(lookup());
+                })
+                .map(|_| ())
+        })
+    }
+
+    // Keep the real permit/error path injectable without allocating a boxed
+    // worker or exhausting OS threads to exercise a spawn failure in tests.
+    fn resolve_with_spawner<L>(
+        &'static self,
+        timeout: NextTimeout,
+        lookup: L,
+        spawn: impl FnOnce(
+            DnsWorkerPermit,
+            mpsc::SyncSender<std::io::Result<Vec<SocketAddr>>>,
+            L,
+        ) -> std::io::Result<()>,
+    ) -> std::result::Result<Vec<SocketAddr>, ureq::Error>
+    where
+        L: FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+    {
         refuse_elapsed_deadline(timeout)?;
         if timeout.after.is_not_happening() {
             // No worker is needed when the caller has no deadline.
@@ -192,13 +219,7 @@ impl DnsWorkerBudget {
         // rather than a panic (the shipped FFI uses panic=abort). The closure
         // owns the permit, including when its receiver times out or disappears;
         // a failed spawn drops the closure and releases the permit as well.
-        thread::Builder::new()
-            .name("questdb-oidc-dns".to_string())
-            .spawn(move || {
-                let _permit = permit;
-                let _ = tx.send(lookup());
-            })
-            .map_err(ureq::Error::Io)?;
+        spawn(permit, tx, lookup).map_err(ureq::Error::Io)?;
         match rx.recv_timeout(*timeout.after) {
             Ok(addresses) => addresses.map_err(ureq::Error::Io),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ureq::Error::Timeout(timeout.reason)),
@@ -1520,6 +1541,46 @@ mod tests {
         );
         assert!(matches!(result, Err(ureq::Error::Timeout(_))));
         assert_eq!(BUDGET.active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dns_worker_spawn_failure_releases_permit_without_running_lookup() {
+        static BUDGET: DnsWorkerBudget = DnsWorkerBudget::new(1);
+        let timeout = NextTimeout {
+            after: TimeoutAfter::Exact(Duration::from_secs(5)),
+            reason: ureq::Timeout::Global,
+        };
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&lookups);
+        let result = BUDGET.resolve_with_spawner(
+            timeout,
+            move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(Vec::new())
+            },
+            |permit, tx, lookup| {
+                assert_eq!(BUDGET.active.load(Ordering::Relaxed), 1);
+                // Model Builder::spawn consuming and dropping its closure on
+                // failure: the lookup must not run, but the permit must drop.
+                let worker = move || {
+                    let _permit = permit;
+                    let _ = tx.send(lookup());
+                };
+                drop(worker);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "injected DNS worker spawn failure",
+                ))
+            },
+        );
+        assert!(matches!(result, Err(ureq::Error::Io(error))
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                && error.to_string() == "injected DNS worker spawn failure"));
+        assert_eq!(lookups.load(Ordering::Relaxed), 0);
+        assert_eq!(BUDGET.active.load(Ordering::Relaxed), 0);
+        // The failed spawn did not consume the only slot permanently.
+        assert_eq!(BUDGET.resolve(timeout, || Ok(Vec::new())).unwrap(), []);
+        wait_for_dns_workers(&BUDGET, 0);
     }
 
     fn tls_certs_dir() -> PathBuf {

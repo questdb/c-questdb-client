@@ -5724,6 +5724,58 @@ fn a_persisted_jwt_with_a_refresh_token_still_honours_the_rotation_cap() {
 }
 
 #[test]
+fn unchanged_persisted_entry_cannot_renew_its_rotation_budget() {
+    for jwt in [false, true] {
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&refreshes);
+        let mock = MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","refresh_token":"RT-child","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        });
+        let dir = TempDir::new().unwrap();
+        let auth = auth_with_store(&mock, dir.path());
+        let key = auth.store_key.as_ref().unwrap();
+        let expiry = (now_epoch() + 86_400.0).floor();
+        let access = if jwt {
+            jwt_with_exp(expiry as i64)
+        } else {
+            "opaque-imported-access".to_string()
+        };
+        let original = PersistedToken::new(
+            Some(access.clone()),
+            None,
+            Some("RT-parent".to_string()),
+            expiry,
+            86_400.0,
+        );
+        let store = test_file_store(dir.path());
+        store.save(key, &original).unwrap();
+
+        assert_eq!(auth.token().unwrap(), access);
+        assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+        assert!(auth.token_set().unwrap().expires_at() <= now_epoch() + 3601.0);
+
+        // Reach the cached rotation deadline without changing the durable
+        // credential or waiting an hour. The locked read must not renew it.
+        auth.lock_tokens().as_mut().unwrap().expires_at = now_epoch() - 1.0;
+        assert_eq!(store.load(key).unwrap().unwrap(), original);
+        assert_eq!(auth.token().unwrap(), "AT-refreshed");
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load(key).unwrap().unwrap().refresh_token(),
+            Some("RT-child")
+        );
+    }
+}
+
+#[test]
 fn tampered_persisted_token_is_rejected_on_load() {
     // A persisted access_token carrying a CR/LF (a header-injection vector) must be
     // rejected on load exactly like a wire token, so it never reaches a header. The

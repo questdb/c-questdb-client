@@ -2289,6 +2289,11 @@ impl OidcDeviceAuth {
                 && peer.refresh_token == existing.refresh_token
             {
                 peer.scope = existing.scope.clone();
+                // Re-reading the same credential is not a peer refresh. Keep
+                // its original rotation deadline instead of renewing the
+                // now-relative cap for an imported long-lived store entry.
+                peer.expires_at = peer.expires_at.min(existing.expires_at);
+                peer.issued_at = existing.issued_at;
             }
             // `is_usable` also refuses the token a server just rejected: until
             // a refresh replaces it, the persisted entry is that same token,
