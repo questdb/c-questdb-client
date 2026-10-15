@@ -1,5 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #define QUESTDB_OIDC_CPP_TEST_HOOKS
+#if defined(_WIN32) && !defined(NOMINMAX)
+#    define NOMINMAX
+#endif
 #include "doctest.h"
 
 #include <cstdio>
@@ -7,6 +10,10 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+
+#ifdef _WIN32
+#    include <windows.h>
+#endif
 
 // Exercise the actual example handlers, not a copy of their output logic.
 #define main oidc_c_example_main
@@ -18,8 +25,28 @@
 
 static std::string c_prompt(const questdb_oidc_event& event)
 {
-    std::unique_ptr<FILE, decltype(&std::fclose)> output{
-        std::tmpfile(), &std::fclose};
+    FILE* file = nullptr;
+#ifdef _WIN32
+    // tmpfile_s uses the drive root and may require administrator rights.
+    // Create the capture in the user's temp directory; D deletes it on close.
+    wchar_t directory[MAX_PATH];
+    wchar_t path[MAX_PATH];
+    const auto length = GetTempPathW(MAX_PATH, directory);
+    REQUIRE(length > 0);
+    REQUIRE(length < MAX_PATH);
+    REQUIRE(GetTempFileNameW(directory, L"qdb", 0, path) != 0);
+    const auto error = _wfopen_s(&file, path, L"w+bD");
+    if (error != 0)
+        DeleteFileW(path);
+    REQUIRE(error == 0);
+#else
+    file = std::tmpfile();
+#endif
+    // A lambda avoids putting glibc's attributed fclose type in a template.
+    auto close_file = [](FILE* stream) {
+        std::fclose(stream);
+    };
+    std::unique_ptr<FILE, decltype(close_file)> output{file, close_file};
     REQUIRE(output != nullptr);
     oidc_event(output.get(), &event);
     std::fflush(output.get());
