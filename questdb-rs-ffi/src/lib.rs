@@ -5826,9 +5826,9 @@ mod tests {
         // These are hand-maintained in two places -- `#define`s in the C header
         // and `pub const`s here -- and a C listener switches on the header's
         // value. A drift silently relabels every lifecycle event: most
-        // damagingly a retryable `credential_unavailable` read as the terminal
-        // `auth_failed`, which the header itself says a listener may tear the
-        // pool down on. `c_header_line_sender_enum_matches_rust` guards the
+        // damagingly a provider's `credential_unavailable` read as a server's
+        // `auth_failed` rejection, sending an operator after the wrong
+        // credential. `c_header_line_sender_enum_matches_rust` guards the
         // error-code enum the same way; this covers the kinds, which had no
         // guard when `credential_unavailable` was appended.
         let header = include_str!(concat!(

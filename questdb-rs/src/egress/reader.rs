@@ -32,7 +32,9 @@
 //! on the Reader fail at the transport layer (open a fresh Reader to
 //! recover). Call `Cursor::cancel()` (or read until `next_batch()`
 //! returns `None`) before drop if you want to keep the existing
-//! connection alive.
+//! connection alive. A mid-query failover that gives up leaves the
+//! Reader disconnected too, but its next `execute()` reconnects
+//! (design/qwp-token-provider-spec.md §8.3, "Egress recovery").
 //!
 //! The `sync-reader-qwp-ws` feature gate is applied at the module
 //! declaration in `egress/mod.rs`; an inner `#![cfg(...)]` here would
@@ -117,13 +119,21 @@ pub struct Reader {
     /// Updated on mid-query failover so the cursor walks the list in the
     /// right order ("skip the failed one first") on the next failure.
     addr_idx: usize,
-    /// Live WS transport. `Option` only so that mid-query failover
-    /// can take the dead transport out via [`Option::take`] (releasing
-    /// its TCP FD) **before** sleeping on the backoff. Outside of the
-    /// brief reconnect window inside [`Reader::reconnect_with_failover`],
-    /// this is always `Some`. Use [`Reader::transport`] /
-    /// [`Reader::transport_mut`] to access — they assert this invariant.
+    /// Live WS transport. `None` once the connection was torn down: a
+    /// cursor abandoned mid-stream, a terminal stream error, or a mid-query
+    /// failover that gave up (see `reconnect_on_next_execute`). Briefly
+    /// `None` inside [`Reader::reconnect_with_failover`] too, which takes
+    /// the dead transport out via [`Option::take`] (releasing its TCP FD)
+    /// **before** sleeping on the backoff. Use [`Reader::transport_ref`] /
+    /// [`Reader::transport_mut`] to access it: they report a torn-down
+    /// connection as an error.
     transport: Option<WsTransport>,
+    /// Set while a mid-query failover that gave up has left the Reader
+    /// without a transport: the next `execute()` reconnects instead of
+    /// failing, so a failover that met, say, a token outage does not leave
+    /// the Reader unusable (design/qwp-token-provider-spec.md §8.3, "Egress
+    /// recovery"). A cursor abandoned mid-stream leaves it clear.
+    reconnect_on_next_execute: bool,
     dict: SymbolDict,
     /// Schema for the in-flight query. Populated from the first
     /// `RESULT_BATCH` (`batch_seq == 0`) and reused by continuation
@@ -287,6 +297,9 @@ impl Reader {
             cfg.zone.as_deref(),
             matches!(cfg.target, Target::Primary),
         );
+        if cfg.token_provider.is_some() && !cfg.tls {
+            crate::token_provider::warn_once_if_cleartext("ws");
+        }
         let walk = walk_via_tracker(
             &mut tracker,
             &cfg,
@@ -301,17 +314,14 @@ impl Reader {
             // every host floods server logs without recovery. Matches
             // the Java reference's `connect()` which rethrows on
             // `QwpAuthFailedException` immediately.
-            &[
-                ErrorCode::ConfigError,
-                ErrorCode::UnsupportedServer,
-                ErrorCode::AuthError,
-            ],
+            &WALK_TERMINAL_CODES,
             None,
         )?;
         Ok(Reader {
             cfg,
             addr_idx: walk.session.idx,
             transport: Some(walk.session.transport),
+            reconnect_on_next_execute: false,
             dict: SymbolDict::new(),
             query_schema: None,
             next_request_id: 1,
@@ -467,6 +477,10 @@ impl Reader {
         if let Some(dead) = self.transport.take() {
             drop(dead);
         }
+        // Until a walk below succeeds, the Reader has no connection. If this
+        // failover gives up, the next `execute()` reconnects rather than
+        // leaving the Reader unusable (spec §8.3, "Egress recovery").
+        self.reconnect_on_next_execute = true;
         // Cumulative dial count across every outer attempt's walk.
         // `FailoverResetEvent.attempts` carries this back to the user so
         // long-running diagnostics see real dial pressure, not just the
@@ -510,11 +524,7 @@ impl Reader {
                 // (cluster-wide credentials problem; retrying every
                 // host floods server logs without recovery). Initial
                 // connect accumulates instead — see `from_config`.
-                &[
-                    ErrorCode::ConfigError,
-                    ErrorCode::UnsupportedServer,
-                    ErrorCode::AuthError,
-                ],
+                &WALK_TERMINAL_CODES,
                 budget.deadline,
             );
             // Re-check a failed walk immediately. The admitted round may have
@@ -549,11 +559,7 @@ impl Reader {
                     // the counters callers query
                     // (`bytes_received`, `credit_granted_total`,
                     // `read_ns`, `decode_ns`, `next_request_id`).
-                    self.transport = Some(walk.session.transport);
-                    self.server_info = walk.session.server_info;
-                    self.dict = SymbolDict::new();
-                    self.query_schema = None;
-                    self.addr_idx = walk.session.idx;
+                    self.install_session(walk.session);
                     return Ok(total_dials);
                 }
                 Err(e) => match e.code() {
@@ -597,40 +603,65 @@ impl Reader {
         &self.cfg.addrs[self.addr_idx]
     }
 
+    /// Bind a freshly walked endpoint session to this Reader, resetting
+    /// the connection-scoped state: the new connection has its own empty
+    /// symbol dictionary, and no query is in flight on it.
+    fn install_session(&mut self, session: TransportSession) {
+        self.transport = Some(session.transport);
+        self.server_info = session.server_info;
+        self.dict = SymbolDict::new();
+        self.query_schema = None;
+        self.addr_idx = session.idx;
+        self.reconnect_on_next_execute = false;
+    }
+
+    /// Reconnect before a new query when a mid-query failover gave up and
+    /// left this Reader without a connection (design/qwp-token-provider-spec.md
+    /// §8.3, "Egress recovery"): an outage that outlasted one query's
+    /// failover budget, such as a rejected or unavailable token, must not
+    /// leave the Reader unusable. One endpoint walk, like the initial
+    /// connect; a failure fails this call, and the next one tries again.
+    fn reconnect_if_failover_gave_up(&mut self) -> Result<()> {
+        if self.transport.is_some() || !self.reconnect_on_next_execute {
+            return Ok(());
+        }
+        let cfg = Arc::clone(&self.cfg);
+        // The fall-through reset gives endpoints the failed failover
+        // classified another chance, as a failover reconnect does.
+        match walk_via_tracker(&mut self.tracker, &cfg, true, &WALK_TERMINAL_CODES, None) {
+            Ok(walk) => {
+                self.install_session(walk.session);
+                Ok(())
+            }
+            Err(err) => {
+                let code = err.code();
+                let msg = format!(
+                    "could not reconnect the Reader after its last failover gave up: {}",
+                    err.msg()
+                );
+                Err(err.reclassified(code, msg))
+            }
+        }
+    }
+
     /// Mutable access to the live transport. Returns `SocketError`
     /// when the transport is `None`, which happens after the connection
-    /// was torn down: either a cursor was dropped before being fully
-    /// read (drop closes the WebSocket — see [`Cursor`]'s docs), or a
-    /// mid-query failover exhausted its retry budget. Either way the
-    /// Reader is "poisoned"; the fix is to drain cursors (`next_batch()`
-    /// until `None`) or `Cursor::cancel()` before dropping them, or to
-    /// open a fresh Reader. Inside `reconnect_with_failover` the transport
-    /// is only briefly absent (between dropping the dead one and splicing
-    /// in a new one); that path uses `self.transport` directly and never
-    /// goes through this accessor.
+    /// was torn down: a cursor was dropped before being fully read (drop
+    /// closes the WebSocket — see [`Cursor`]'s docs), a stream error
+    /// ended it, or a mid-query failover gave up. After a failover gives
+    /// up, the next `execute()` reconnects; otherwise the fix is to drain
+    /// cursors (`next_batch()` until `None`) or `Cursor::cancel()` before
+    /// dropping them, or to open a fresh Reader. Inside
+    /// `reconnect_with_failover` the transport is only briefly absent
+    /// (between dropping the dead one and splicing in a new one); that path
+    /// uses `self.transport` directly and never goes through this accessor.
     fn transport_mut(&mut self) -> Result<&mut WsTransport> {
-        self.transport.as_mut().ok_or_else(|| {
-            fmt!(
-                SocketError,
-                "Reader connection is closed and cannot be reused: a cursor was dropped before being \
-                 fully read, or a mid-query failover exhausted its retry budget. To keep the \
-                 connection reusable, drain each cursor (call next_batch() until it returns None) or \
-                 call cursor.cancel() before dropping it; otherwise open a fresh Reader."
-            )
-        })
+        self.transport.as_mut().ok_or_else(connection_closed_error)
     }
 
     /// Read access to the live transport. See [`Reader::transport_mut`].
     fn transport_ref(&self) -> Result<&WsTransport> {
-        self.transport.as_ref().ok_or_else(|| {
-            fmt!(
-                SocketError,
-                "Reader connection is closed and cannot be reused: a cursor was dropped before being \
-                 fully read, or a mid-query failover exhausted its retry budget. To keep the \
-                 connection reusable, drain each cursor (call next_batch() until it returns None) or \
-                 call cursor.cancel() before dropping it; otherwise open a fresh Reader."
-            )
-        })
+        self.transport.as_ref().ok_or_else(connection_closed_error)
     }
 
     /// Allocate the next `request_id`, skipping `0` and negatives on
@@ -1150,6 +1181,11 @@ impl<'r> ReaderQuery<'r> {
     }
 
     /// Send the QUERY_REQUEST and return a streaming `Cursor`.
+    ///
+    /// If the Reader's last mid-query failover gave up and left it without a
+    /// connection, this reconnects first, walking the configured endpoints
+    /// once. A failed reconnect fails this call, with the reconnect's error
+    /// code, and the next call tries again.
     pub fn execute(self) -> Result<Cursor<'r>> {
         if self.reader.cursor_active {
             return Err(fmt!(
@@ -1157,6 +1193,9 @@ impl<'r> ReaderQuery<'r> {
                 "another cursor is already in flight on this connection (only one cursor at a time per Reader)"
             ));
         }
+        // Before anything reads the connection's SERVER_INFO: a reconnect
+        // may land on another endpoint, with other capabilities.
+        self.reader.reconnect_if_failover_gave_up()?;
         let request_id = self.reader.alloc_request_id();
         // The schema rides the first RESULT_BATCH (batch_seq == 0) of each
         // query; clear any schema left from the prior query so a stray
@@ -2545,6 +2584,9 @@ impl<'r> Cursor<'r> {
                         if let Some(dead) = self.reader.transport.take() {
                             drop(dead);
                         }
+                        // The failover found an endpoint but could not
+                        // replay on it: the next `execute()` reconnects.
+                        self.reader.reconnect_on_next_execute = true;
                         self.reader.cursor_active = false;
                         self.done = true;
                         return Err(e);
@@ -2991,6 +3033,12 @@ fn prefer_over_trigger(err: &Error) -> bool {
     if err.oidc_error().is_some() {
         return true;
     }
+    // The token provider could not supply a credential: the spec's
+    // credential-unavailable class, which the error for a failed failover
+    // must name (design/qwp-token-provider-spec.md §8.3).
+    if err.is_provider_failure() {
+        return true;
+    }
 
     matches!(
         err.code(),
@@ -3156,6 +3204,28 @@ fn authorization_header<'a>(headers: &'a [(&'static str, String)]) -> Option<&'a
     headers
         .iter()
         .find_map(|(name, value)| (*name == "Authorization").then_some(value.as_str()))
+}
+
+/// Error codes that end an endpoint walk at once rather than move on to the
+/// next endpoint: credentials are cluster-wide, and so are configuration and
+/// a server too old for this client (spec §6 / §11.9.3). See
+/// [`walk_via_tracker`].
+const WALK_TERMINAL_CODES: [ErrorCode; 3] = [
+    ErrorCode::ConfigError,
+    ErrorCode::UnsupportedServer,
+    ErrorCode::AuthError,
+];
+
+/// The error for an operation on a Reader whose connection was torn down.
+fn connection_closed_error() -> Error {
+    fmt!(
+        SocketError,
+        "Reader connection is closed: a cursor was dropped before being fully read, a stream \
+         error ended the connection, or a mid-query failover gave up. After a failover gives \
+         up, the next execute() reconnects. Otherwise, to keep the connection reusable, drain \
+         each cursor (call next_batch() until it returns None) or call cursor.cancel() before \
+         dropping it; or open a fresh Reader."
+    )
 }
 
 const WALK_DEADLINE_CUTOFF_MSG: &str =

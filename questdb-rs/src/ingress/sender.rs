@@ -55,6 +55,9 @@ mod qwp_udp;
 pub(crate) use qwp_udp::*;
 
 #[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_auth_rejection;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_codec;
 
 #[cfg(feature = "_sender-qwp-ws")]

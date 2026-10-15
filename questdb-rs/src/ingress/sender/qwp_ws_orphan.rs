@@ -51,6 +51,8 @@ use crate::ingress::tls::TlsSettings;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws::{QwpWsConnectKind, TrafficGate, try_dup_recovered};
 #[cfg(feature = "sync-sender-qwp-ws")]
+use super::qwp_ws_auth_rejection::{OrphanAuthRideOut, is_upgrade_auth_rejection};
+#[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseStepOutcome, DEFAULT_EVENT_CAPACITY, DriverError, PublicationLog,
     QwpWsPublicationStore, QwpWsSendCore, ReconnectPolicy,
@@ -158,6 +160,16 @@ impl OrphanDrainerConfig {
             qwp_ws: qwp_ws.clone(),
             auth_header,
         }
+    }
+
+    /// A fresh ride-out of credential rejections for `slot_dir`: a rotating
+    /// credential is one a token provider supplies.
+    fn auth_ride_out(&self, slot_dir: &Path) -> OrphanAuthRideOut {
+        OrphanAuthRideOut::new(
+            slot_dir.display().to_string(),
+            self.qwp_ws.token_provider.is_some(),
+            *self.qwp_ws.reconnect_max_duration,
+        )
     }
 
     fn queue_options(&self, slot_dir: PathBuf) -> Result<SfaQueueOptions, String> {
@@ -286,12 +298,14 @@ pub(crate) struct ManualOrphanDrainers {
 /// A slot awaiting (re)adoption. `not_before` gates the next connect attempt
 /// so an unreachable endpoint cannot turn the caller's park loop into a
 /// connect storm; `backoff` is the gate applied to the next failure, walking
-/// the same capped-doubling ladder as the background drainer.
+/// the same capped-doubling ladder as the background drainer. `ride_out`
+/// carries the credential rejections met so far into the drainer.
 #[cfg(feature = "sync-sender-qwp-ws")]
 struct PendingOrphanSlot {
     slot_dir: PathBuf,
     not_before: Option<Instant>,
     backoff: Duration,
+    ride_out: OrphanAuthRideOut,
 }
 
 /// An adopted slot. While `gated_until` is in the future the drainer is
@@ -319,6 +333,7 @@ impl ManualOrphanDrainers {
             pending: candidates
                 .into_iter()
                 .map(|slot_dir| PendingOrphanSlot {
+                    ride_out: config.auth_ride_out(&slot_dir),
                     slot_dir,
                     not_before: None,
                     backoff: initial_backoff,
@@ -365,11 +380,11 @@ impl ManualOrphanDrainers {
         false
     }
 
-    fn open_pending(&mut self, slot: PendingOrphanSlot) -> bool {
+    fn open_pending(&mut self, mut slot: PendingOrphanSlot) -> bool {
         if has_failed_sentinel(&slot.slot_dir) {
             return true;
         }
-        match OrphanDrainer::open(slot.slot_dir.clone(), &self.config) {
+        match OrphanDrainer::open(slot.slot_dir.clone(), &self.config, &mut slot.ride_out) {
             OrphanOpenOutcome::Drainer(drainer) => {
                 self.active.push(ActiveOrphanDrainer {
                     drainer: *drainer,
@@ -384,7 +399,7 @@ impl ManualOrphanDrainers {
             | OrphanOpenOutcome::Stopped => true,
             OrphanOpenOutcome::RetryLater(reason) => {
                 let _ = record_last_error(&slot.slot_dir, &reason);
-                self.requeue(slot.slot_dir, slot.backoff);
+                self.requeue(slot);
                 true
             }
             OrphanOpenOutcome::Terminal(reason) => {
@@ -399,11 +414,11 @@ impl ManualOrphanDrainers {
         }
     }
 
-    fn requeue(&mut self, slot_dir: PathBuf, backoff: Duration) {
+    fn requeue(&mut self, slot: PendingOrphanSlot) {
         self.pending.push_back(PendingOrphanSlot {
-            slot_dir,
-            not_before: Instant::now().checked_add(backoff),
-            backoff: next_orphan_retry_backoff(backoff, self.max_backoff()),
+            not_before: Instant::now().checked_add(slot.backoff),
+            backoff: next_orphan_retry_backoff(slot.backoff, self.max_backoff()),
+            ..slot
         });
     }
 
@@ -506,9 +521,11 @@ enum OrphanOpenOutcome {
     Locked,
     RetryLater(String),
     /// Opening can never succeed in this session -- the token provider is
-    /// closed or misconfigured -- but the slot itself is intact. Retire it for
-    /// this session and leave it on disk for the next one, exactly as a
-    /// drive-phase [`OrphanDriveOutcome::Terminal`] does.
+    /// closed or misconfigured, or the server rejected the credential (a
+    /// static one at once, a rotating one once its ride-out gave up) -- but the
+    /// slot itself is intact. Retire it for this session and leave it on disk
+    /// for the next one, exactly as a drive-phase
+    /// [`OrphanDriveOutcome::Terminal`] does.
     Terminal(String),
     Stopped,
     Unrecoverable(String),
@@ -537,8 +554,12 @@ enum OrphanDriveOutcome {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl OrphanDrainer {
-    fn open(slot_dir: PathBuf, config: &OrphanDrainerConfig) -> OrphanOpenOutcome {
-        Self::open_inner(slot_dir, config, None, None)
+    fn open(
+        slot_dir: PathBuf,
+        config: &OrphanDrainerConfig,
+        ride_out: &mut OrphanAuthRideOut,
+    ) -> OrphanOpenOutcome {
+        Self::open_inner(slot_dir, config, None, None, ride_out)
     }
 
     fn open_with_stop(
@@ -546,15 +567,20 @@ impl OrphanDrainer {
         config: &OrphanDrainerConfig,
         stop: &AtomicBool,
         traffic_gate: &Arc<TrafficGate>,
+        ride_out: &mut OrphanAuthRideOut,
     ) -> OrphanOpenOutcome {
-        Self::open_inner(slot_dir, config, Some(stop), Some(traffic_gate))
+        Self::open_inner(slot_dir, config, Some(stop), Some(traffic_gate), ride_out)
     }
 
+    /// Adopt `slot_dir`. A server's rejection of the credential counts toward
+    /// `ride_out`, which the drainer then takes over for its mid-drain
+    /// reconnects.
     fn open_inner(
         slot_dir: PathBuf,
         config: &OrphanDrainerConfig,
         stop: Option<&AtomicBool>,
         traffic_gate: Option<&Arc<TrafficGate>>,
+        ride_out: &mut OrphanAuthRideOut,
     ) -> OrphanOpenOutcome {
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
@@ -738,7 +764,21 @@ impl OrphanDrainer {
                     OrphanOpenOutcome::Terminal(err.to_string())
                 };
             }
-            Err(err) => return retry_open_later(err.to_string(), stop),
+            // A static credential is rejected the same way every time; a
+            // rotating one may be accepted once the provider has replaced it
+            // or the server's key set has caught up. Ride it out, then retire
+            // the slot (design/qwp-token-provider-spec.md §8.3).
+            Err(err) if is_upgrade_auth_rejection(&err) => {
+                return match ride_out.on_rejection(&err, Instant::now()) {
+                    None => retry_open_later(err.to_string(), stop),
+                    Some(_) if orphan_stop_requested(stop) => OrphanOpenOutcome::Stopped,
+                    Some(give_up) => OrphanOpenOutcome::Terminal(give_up.to_string()),
+                };
+            }
+            Err(err) => {
+                ride_out.on_other_failure();
+                return retry_open_later(err.to_string(), stop);
+            }
         };
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
@@ -764,6 +804,7 @@ impl OrphanDrainer {
         if let Some((recovered_dict_entries, recovered_dict_count)) = recovered_dict {
             send_core.enable_delta_dict_owned(recovered_dict_entries, recovered_dict_count);
         }
+        send_core.set_orphan_auth_ride_out(ride_out.clone());
         OrphanOpenOutcome::Drainer(Box::new(Self {
             slot_dir,
             store,
@@ -886,8 +927,15 @@ fn drain_orphan_to_completion(
     let initial_backoff = *config.qwp_ws.reconnect_initial_backoff;
     let max_backoff = *config.qwp_ws.reconnect_max_backoff;
     let mut retry_backoff = initial_backoff;
+    let mut ride_out = config.auth_ride_out(&slot_dir);
     let mut drainer = loop {
-        match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop, traffic_gate) {
+        match OrphanDrainer::open_with_stop(
+            slot_dir.clone(),
+            config,
+            stop,
+            traffic_gate,
+            &mut ride_out,
+        ) {
             OrphanOpenOutcome::Drainer(drainer) => break drainer,
             OrphanOpenOutcome::AlreadyDrained
             | OrphanOpenOutcome::FailedSentinel
@@ -1399,9 +1447,11 @@ mod tests {
         let sf_dir = temp.path().join("sf-root");
         let slot_dir = sf_dir.join("locked");
         let _held = SfaSlotQueue::open(slot_options(&sf_dir, "locked")).unwrap();
+        let config = test_config();
+        let mut ride_out = config.auth_ride_out(&slot_dir);
         assert!(
             matches!(
-                OrphanDrainer::open(slot_dir.clone(), &test_config()),
+                OrphanDrainer::open(slot_dir.clone(), &config, &mut ride_out),
                 OrphanOpenOutcome::Locked
             ),
             "held slot must surface as Locked before already-drained handling"
@@ -1667,6 +1717,206 @@ mod tests {
             !orphan_queue_drained(&queue),
             "queued frames must remain recoverable"
         );
+    }
+
+    /// Answers every WebSocket upgrade with `status`, counting each rejection
+    /// before it answers, until dropped.
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    struct RejectingServer {
+        port: u16,
+        rejections: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    impl RejectingServer {
+        fn spawn(status: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let rejections = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = thread::spawn({
+                let rejections = Arc::clone(&rejections);
+                let stop = Arc::clone(&stop);
+                move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let mut stream = match listener.accept() {
+                            Ok((stream, _)) => stream,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(1));
+                                continue;
+                            }
+                            Err(e) => panic!("rejecting server failed: {e}"),
+                        };
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => request.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        rejections.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all(
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: 0\r\n\
+                                 Connection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                }
+            });
+            Self {
+                port,
+                rejections,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn rejections(&self) -> usize {
+            self.rejections.load(Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    impl Drop for RejectingServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    fn rejected_credential_config(server: &RejectingServer, rotating: bool) -> OrphanDrainerConfig {
+        let mut config = test_config();
+        config.port = server.port.to_string();
+        config.qwp_ws.reconnect_initial_backoff =
+            ConfigSetting::new_default(Duration::from_millis(1));
+        config.qwp_ws.reconnect_max_backoff = ConfigSetting::new_default(Duration::from_millis(5));
+        config.qwp_ws.reconnect_max_duration =
+            ConfigSetting::new_default(Duration::from_millis(300));
+        if rotating {
+            config.qwp_ws.token_provider = Some(crate::token_provider::TokenProvider::new(|| {
+                Ok::<_, crate::Error>("rotating".to_string())
+            }));
+        } else {
+            config.auth_header = Some("Bearer static".to_string());
+        }
+        config
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    fn assert_retired_on_disk(slot_dir: &Path, sf_dir: &Path, reason: &str) {
+        let last_error = fs::read_to_string(slot_dir.join(LAST_ERROR_NAME)).unwrap();
+        assert!(last_error.contains(reason), "{last_error}");
+        assert!(
+            !has_failed_sentinel(slot_dir),
+            "a retired slot stays recoverable"
+        );
+        let queue = SfaSlotQueue::open(slot_options(sf_dir, "orphan")).unwrap();
+        assert!(
+            !orphan_queue_drained(&queue),
+            "queued frames must remain for the next session"
+        );
+    }
+
+    /// Spec §8.3: a static credential is rejected the same way every
+    /// time, so the first rejection retires the slot -- for this session
+    /// only, keeping it on disk. Adoption used to retry it forever.
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_retires_slot_when_the_server_rejects_a_static_credential() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let server = RejectingServer::spawn("403 Forbidden");
+        let config = rejected_credential_config(&server, false);
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !drainers.drive_once(),
+            "a slot whose static credential was rejected must not be retried"
+        );
+        assert_eq!(server.rejections(), 1);
+        assert_retired_on_disk(&slot_dir, &sf_dir, "static credential");
+        assert_retired_on_disk(&slot_dir, &sf_dir, "HTTP status 403");
+    }
+
+    /// Spec §8.3: a rotating credential is ridden out -- at least six
+    /// rejections that persist for min(reconnect_max_duration, 5 min) --
+    /// before the slot is retired.
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_rides_out_rejections_of_a_rotating_credential() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let server = RejectingServer::spawn("401 Unauthorized");
+        let config = rejected_credential_config(&server, true);
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        let started = Instant::now();
+        while !(drainers.pending.is_empty() && drainers.active.is_empty()) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the slot was never retired after {} rejections",
+                server.rejections()
+            );
+            if !drainers.drive_once() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(
+            server.rejections() >= OrphanAuthRideOut::MIN_REJECTIONS as usize,
+            "retired after only {} rejections",
+            server.rejections()
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "retired before the rejections persisted for the dwell"
+        );
+        assert_retired_on_disk(&slot_dir, &sf_dir, "rotating credential");
+        assert_retired_on_disk(&slot_dir, &sf_dir, "HTTP status 401");
+    }
+
+    /// The background pool applies the same rule as the manual drainers.
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn background_drainer_retires_slot_after_the_rejection_rule() {
+        for rotating in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let sf_dir = temp.path().join("sf-root");
+            let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+            let server = RejectingServer::spawn("401 Unauthorized");
+            let config = rejected_credential_config(&server, rotating);
+            let mut pool = OrphanDrainerPool::start(vec![slot_dir.clone()], 1, config).unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !pool.threads.iter().all(|(thread, _)| thread.is_finished()) {
+                assert!(Instant::now() < deadline, "the slot was never retired");
+                thread::sleep(Duration::from_millis(5));
+            }
+            pool.close();
+            if rotating {
+                assert!(server.rejections() >= OrphanAuthRideOut::MIN_REJECTIONS as usize);
+                assert_retired_on_disk(&slot_dir, &sf_dir, "rotating credential");
+            } else {
+                assert_eq!(server.rejections(), 1);
+                assert_retired_on_disk(&slot_dir, &sf_dir, "static credential");
+            }
+        }
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]

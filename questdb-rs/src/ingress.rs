@@ -1962,7 +1962,7 @@ impl SenderBuilder {
     /// [`ConnectionEvent`] per
     /// connection-state transition of this sender's QWP/WebSocket
     /// connection (initial connect, per-endpoint attempt failures,
-    /// disconnect, reconnect/failover, terminal auth rejection).
+    /// disconnect, reconnect/failover, credential rejections).
     /// Delivered on a dedicated dispatcher thread through a bounded inbox
     /// (`inbox_capacity`; `0` selects the default of 64, and the maximum is
     /// [`conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY`]) with a drop-oldest overflow
@@ -3023,6 +3023,12 @@ impl SenderBuilder {
         )?;
 
         let auth = self.build_auth()?;
+        // Spec §9: without TLS, an application-supplied provider's every
+        // token crosses the network in cleartext.
+        #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+        if self.has_token_provider_auth() && !self.protocol.tls_enabled() {
+            crate::token_provider::warn_once_if_cleartext(self.protocol.schema());
+        }
 
         let handler = match self.protocol {
             #[cfg(feature = "sync-sender-tcp")]
@@ -3330,6 +3336,9 @@ impl SenderBuilder {
         let auth = self.build_auth()?;
         reject_qwp_ws_token_provider_auth_conflict(qwp_ws, &auth)?;
         let auth_header = qwp_ws_auth_header(&auth)?;
+        if qwp_ws.token_provider.is_some() && !self.protocol.tls_enabled() {
+            crate::token_provider::warn_once_if_cleartext(self.protocol.schema());
+        }
         let qwp_ws = qwp_ws.clone();
         reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
         if *qwp_ws.progress == QwpWsProgress::Manual

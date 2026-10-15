@@ -1643,7 +1643,7 @@ pub(crate) fn connection_listener_from_c(
 /// `questdb_db_connect` with a connection lifecycle listener. Events fire
 /// for every ingress pool connect (initial connect, per-endpoint attempt
 /// failures, all-endpoints-unreachable sweeps, failover to a different
-/// endpoint, terminal auth rejection) and for transport deaths observed
+/// endpoint, credential rejections) and for transport deaths observed
 /// when a connection is returned.
 ///
 /// Delivery is via a bounded inbox (`inbox_capacity`; `0` = default 64,

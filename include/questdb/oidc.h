@@ -953,8 +953,8 @@ bool questdb_error_oidc_get_view(
  * Use `https::` or `wss::` (TLS). Over plain `http::` or `ws::` to a
  * non-loopback host the Bearer token -- an IdP-issued access or ID token -- is
  * sent in cleartext on every flush or connect and can be captured in transit.
- * Nothing rejects or warns about that configuration; reserve plaintext for a
- * loopback server.
+ * Nothing rejects that configuration; reserve plaintext for a loopback
+ * server.
  *
  * Identity-provider and QuestDB discovery requests connect directly. They do
  * not honor HTTPS_PROXY, ALL_PROXY, or their lowercase variants, and this API

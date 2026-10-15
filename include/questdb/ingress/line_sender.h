@@ -2320,9 +2320,16 @@ int64_t line_sender_now_micros(void);
 #define questdb_connection_event_failed_over 3u
 #define questdb_connection_event_endpoint_attempt_failed 4u
 #define questdb_connection_event_all_endpoints_unreachable 5u
-/** Terminal: the server rejected a credential the client presented.
- *  `host` / `port` are set. A 401 followed by a failed replacement-token
- *  acquisition is instead `credential_unavailable` with the endpoint set. */
+/** The server rejected the credential the client presented: HTTP 401 or 403
+ *  on the WebSocket upgrade. `host` / `port` are set and `cause_code` is
+ *  `line_sender_error_auth_error`; one event per connect round. Before a
+ *  sender's first connection, and for a connect the caller waits for (a pool
+ *  borrow), it is terminal. Once connected, a store-and-forward sender keeps
+ *  reconnecting with capped backoff and keeps its unacknowledged data,
+ *  reporting each failed round: an identity-provider outage makes a server
+ *  reject a valid credential for a while. Close the sender to give up instead.
+ *  A 401 followed by a failed replacement-token acquisition is instead
+ *  `credential_unavailable` with the endpoint set. */
 #define questdb_connection_event_auth_failed 6u
 /** The token provider failed while acquiring a credential. Before dialling,
  *  `host` / `port` are NULL. If this follows a server HTTP 401, they identify
@@ -2341,8 +2348,8 @@ int64_t line_sender_now_micros(void);
  *    process, but this process will not send them.
  *
  *  A listener that pages on a permanent stop must qualify on `cause_code`,
- *  not on the kind alone. `questdb_connection_event_auth_failed` remains
- *  the terminal server-rejection signal. */
+ *  not on the kind alone. `questdb_connection_event_auth_failed` is the
+ *  server-rejection signal. */
 #define questdb_connection_event_credential_unavailable 7u
 
 /** One connection-state transition. String fields are borrowed UTF-8

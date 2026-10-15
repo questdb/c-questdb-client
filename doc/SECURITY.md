@@ -51,8 +51,28 @@ caller waits for retries only retryable failures, while background reconnects
 retry both. No secret ever appears in errors or logs: at most a token's length
 and an 8-hex-digit SHA-256 fingerprint.
 
+A rejection can persist: during an identity-provider or signing-key outage a
+server answers 401 or 403 even to a fresh token. What happens then depends on
+the phase:
+
+- Before a sender's first connection, and for a connect the caller waits for
+  (a pool borrow), the connect fails.
+- Once connected, a QWP/WebSocket sender keeps reconnecting with capped
+  backoff, keeps its unacknowledged data, and reports each failed round as an
+  `auth_failed` connection event. Static credentials are treated the same way.
+  Close the sender to give up instead.
+- An orphan store-and-forward drainer rides out the rejections of a token
+  provider's tokens, then gives the slot up for the session: after at least 6
+  rejections that have persisted for `min(reconnect_max_duration_millis, 5
+  min)`, or after 256. With a static credential it gives the slot up at the
+  first rejection. The slot stays on disk, with the reason in its
+  `.last_error`, and the next session tries it again.
+- An ILP/HTTP flush and a query fail. If a mid-query failover gives up, the
+  reader's next query reconnects.
+
 This client selects no provider from a connection string: `token_provider` and
-the `azure_*` keys are rejected. Use a provider only over `https::` or `wss::`.
+the `azure_*` keys are rejected. Use a provider only over `https::` or `wss::`:
+the Rust crate logs a warning, once per process, when one is used without TLS.
 See [`token_provider.h`](../include/questdb/token_provider.h),
 [`token_provider.hpp`](../include/questdb/token_provider.hpp), the Rust
 `questdb::token_provider` module, and

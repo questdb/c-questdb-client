@@ -55,7 +55,8 @@ use super::qwp_ws_driver::{
     QwpWsCounters, QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore,
     QwpWsReconnectState, QwpWsReconnectStep, QwpWsSendCore, QwpWsTransportFailureAction,
     ReconnectPolicy, ReconnectReason, TransportFailure, TransportPoll, TransportResponse,
-    reconnect_error_is_foreground_terminal, reconnect_error_is_terminal, reconnect_sleep_duration,
+    reconnect_error_is_foreground_terminal, reconnect_error_is_terminal,
+    reconnect_error_is_terminal_when_established, reconnect_sleep_duration,
     retry_budget_exhausted_error,
 };
 use super::qwp_ws_orphan::{
@@ -1915,7 +1916,10 @@ where
                     sleep_for = retry_sleep;
                 }
                 Ok(QwpWsReconnectStep::Terminal(err)) => {
-                    if reconnect_error_is_terminal(&err) {
+                    return self.mark_store_terminal(shared, err);
+                }
+                Ok(QwpWsReconnectStep::BudgetExhausted(err)) => {
+                    if reconnect_error_is_terminal_when_established(&err) {
                         return self.mark_store_terminal(shared, err);
                     }
                     if let Some(step) = self.record_reconnect_failure(shared, &err) {
@@ -3496,7 +3500,9 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // accepted store-and-forward frames must remain drainable. An InvalidApiCall
     // from the callback is a caller-contract violation and arrives re-coded as a
     // terminal ConfigError (`classify_provider_error`). Server authentication
-    // rejections happen later in the handshake and remain terminal AuthErrors.
+    // rejections happen later in the handshake and end the round with an
+    // AuthError: terminal before the first connection, retried by a sender that
+    // has connected (`reconnect_error_is_terminal_when_established`).
     let mut provided_header = match qwp_ws.token_provider.as_ref() {
         Some(provider) => {
             let acquired = acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate);
@@ -3570,7 +3576,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
         // A credential can expire during DNS/TCP/TLS setup. Resolve once more
         // after a definite 401 and replay this endpoint only when the rotating
         // provider actually supplies a changed header. Static credentials, 403,
-        // unchanged values, and a second 401 remain terminal, as does a 401
+        // unchanged values, and a second 401 end the round, as does a 401
         // whose Bearer challenge names an error other than `invalid_token`
         // (spec §8.2): a new token cannot fix `insufficient_scope`.
         if matches!(&connected, Err(err) if err.upgrade_401_allows_token_refresh())

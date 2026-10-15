@@ -2791,7 +2791,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_current_addr_port(
 /// while a cursor is live.
 ///
 /// Returns `false` and sets `*err_out` on failure: the cursor handle is
-/// NULL, or the underlying connection is poisoned after a failed
+/// NULL, or the underlying connection was lost after a failed
 /// mid-query failover. On success returns `true` and writes the version
 /// to `*out_version`.
 #[unsafe(no_mangle)]

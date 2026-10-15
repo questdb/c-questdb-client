@@ -1920,12 +1920,11 @@ fn attempts_exhausted_surfaces_error() {
 fn reader_poisoned_after_failover_exhaustion_returns_err_not_panic() {
     // Regression: after `Cursor::failover_reconnect_and_replay`
     // exhausts its retry budget, `Reader::transport` is left as
-    // `None`. The doc on `Reader::from_config` promises that
-    // subsequent operations on the Reader fail at the transport
-    // layer; previously they panicked via `Option::expect` inside
-    // `transport_mut`. This test pins the documented behaviour:
-    // every public Reader method must return `SocketError`, not
-    // panic.
+    // `None`. Previously operations then panicked via `Option::expect`
+    // inside `transport_mut`. This test pins the documented behaviour:
+    // a Reader method that needs the connection returns `SocketError`,
+    // not a panic, and the next execute() tries to reconnect -- which
+    // fails here, because every endpoint now drops at connect.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
         drop_at_connect_script(),
@@ -1960,12 +1959,133 @@ fn reader_poisoned_after_failover_exhaustion_returns_err_not_panic() {
         .expect_err("server_version on a poisoned Reader must error");
     assert_eq!(err.code(), ErrorCode::SocketError);
 
-    // A fresh query.execute() must surface SocketError, not panic.
+    // A fresh query.execute() reconnects, and surfaces the reconnect's
+    // SocketError, not a panic.
     let err = match reader.prepare("select 2").execute() {
         Err(e) => e,
-        Ok(_) => panic!("execute on a poisoned Reader must error"),
+        Ok(_) => panic!("execute with every endpoint down must error"),
     };
     assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg().contains("could not reconnect the Reader"),
+        "{}",
+        err.msg()
+    );
+}
+
+/// Spec §8.3, "Egress recovery": a failover that gives up -- here on a
+/// rejected credential, as during a token outage -- must not leave a
+/// standalone Reader unusable. Its next execute() reconnects, and a failed
+/// reconnect fails only that call.
+#[test]
+fn reader_reconnects_on_next_execute_after_a_failover_gives_up() {
+    let srv = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        // The failover reconnect, then the first execute()'s reconnect.
+        vec![Action::Reject401],
+        vec![Action::Reject401],
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        srv.url()
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    {
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("the failover reconnect is rejected"),
+        };
+        assert_eq!(err.code(), ErrorCode::AuthError, "{}", err.msg());
+    }
+    assert!(reader.transport_torn_down());
+
+    let err = match reader.prepare("select 2").execute() {
+        Err(e) => e,
+        Ok(_) => panic!("the reconnect is rejected too"),
+    };
+    assert_eq!(err.code(), ErrorCode::AuthError, "{}", err.msg());
+    assert!(
+        err.msg().contains("could not reconnect the Reader"),
+        "{}",
+        err.msg()
+    );
+
+    let mut cursor = reader
+        .prepare("select 3")
+        .execute()
+        .expect("the next execute reconnects");
+    assert!(cursor.next_batch().expect("RESULT_END").is_none());
+    drop(cursor);
+    assert!(!reader.transport_torn_down());
+    assert_eq!(srv.accepts(), 4);
+}
+
+/// A failover that gives up because the token provider cannot supply a
+/// credential reports that, not the transport failure that started it, and
+/// the Reader recovers with the provider.
+#[test]
+fn a_failover_given_up_on_a_token_outage_names_it_and_recovers() {
+    let srv = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let outage = Arc::new(AtomicBool::new(false));
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        srv.url()
+    );
+    let cfg = ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let outage = Arc::clone(&outage);
+            move || {
+                if outage.load(Ordering::SeqCst) {
+                    Err(questdb::Error::token_unavailable(
+                        true,
+                        None,
+                        "identity provider unreachable",
+                    ))
+                } else {
+                    Ok("token".to_string())
+                }
+            }
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("connect");
+    {
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        outage.store(true, Ordering::SeqCst);
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("no credential for the failover"),
+        };
+        assert!(
+            err.msg().contains("identity provider unreachable"),
+            "the transport trigger hid the credential outage: {}",
+            err.msg()
+        );
+        assert!(
+            err.as_token_unavailable()
+                .is_some_and(|classification| classification.retryable()),
+            "{}",
+            err.msg()
+        );
+    }
+    assert_eq!(
+        srv.accepts(),
+        1,
+        "no endpoint was dialled without a credential"
+    );
+
+    outage.store(false, Ordering::SeqCst);
+    let mut cursor = reader
+        .prepare("select 2")
+        .execute()
+        .expect("the next execute reconnects");
+    assert!(cursor.next_batch().expect("RESULT_END").is_none());
+    assert_eq!(srv.accepts(), 2);
 }
 
 #[test]

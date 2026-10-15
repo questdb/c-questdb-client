@@ -53,6 +53,9 @@ use super::qwp_ws::{
     WsFrameReader, WsStream, connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints,
     write_binary_frame, write_ping_frame,
 };
+use super::qwp_ws_auth_rejection::{
+    AuthRejectionPolicy, OrphanAuthRideOut, is_upgrade_auth_rejection,
+};
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
 use super::qwp_ws_queue::{
@@ -208,6 +211,10 @@ pub(crate) struct QwpWsSendCore<T> {
     zero_progress_role_recycles: usize,
     completed_at_last_role_recycle: Option<u64>,
     sends_on_connection: u64,
+    /// What a server's 401 or 403 on a reconnect upgrade does: retried
+    /// indefinitely by a sender (D1), ridden out and then given up by an
+    /// orphan drainer (design/qwp-token-provider-spec.md §8.3).
+    auth_rejections: AuthRejectionPolicy,
 }
 
 #[derive(Debug)]
@@ -277,8 +284,17 @@ pub(crate) enum QwpWsTransportFailureAction {
 
 #[derive(Debug)]
 pub(crate) enum QwpWsReconnectStep {
-    Reconnected { reason: ReconnectReason },
-    RetryAfter { sleep_for: Duration },
+    Reconnected {
+        reason: ReconnectReason,
+    },
+    RetryAfter {
+        sleep_for: Duration,
+    },
+    /// The reconnect budget ran out before this attempt. The caller starts a
+    /// fresh budget unless the latest failure is terminal for an established
+    /// connection.
+    BudgetExhausted(Error),
+    /// The reconnect can never succeed: stop.
     Terminal(Error),
 }
 
@@ -892,7 +908,21 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             zero_progress_role_recycles: 0,
             completed_at_last_role_recycle: None,
             sends_on_connection: 0,
+            auth_rejections: AuthRejectionPolicy::default(),
         }
+    }
+
+    /// Make this an orphan drainer's send core: credential rejections on a
+    /// reconnect are ridden out by `ride_out`, which carries the rejections
+    /// the drainer met while adopting the slot, and then end the drain.
+    pub(crate) fn set_orphan_auth_ride_out(&mut self, ride_out: OrphanAuthRideOut) {
+        self.auth_rejections = AuthRejectionPolicy::Orphan(ride_out);
+    }
+
+    /// The server acknowledged data it had not acknowledged before.
+    fn note_ack_progress(&mut self) {
+        self.poison_tracker.clear();
+        self.auth_rejections.on_ack_progress();
     }
 
     fn apply_response<Q: PublicationLog>(
@@ -1266,7 +1296,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .map_err(DriverError::from)?;
         self.send_cursor.ack_through(fsn);
         if advanced {
-            self.poison_tracker.clear();
+            self.note_ack_progress();
             store.record_completed_through_event(fsn, wire_seq);
         }
         Ok(DriveOutcome::Acked { wire_seq })
@@ -1643,7 +1673,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .map_err(DriverError::from)?;
         self.send_cursor.ack_through(fsn);
         if advanced {
-            self.poison_tracker.clear();
+            self.note_ack_progress();
         }
         let event = advanced.then_some(DriverEvent::CompletedThrough {
             fsn,
@@ -1739,7 +1769,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .map_err(DriverError::from)?;
         self.send_cursor.ack_through(resolved.fsn);
         if advanced {
-            self.poison_tracker.clear();
+            self.note_ack_progress();
         }
         let event = advanced.then_some(DriverEvent::CompletedThrough {
             fsn: resolved.fsn,
@@ -1869,12 +1899,15 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         self.pending_reconnect.take()
     }
 
+    /// One reconnect attempt of a connection that was established: a send
+    /// core reconnects only after its first connection, so a server's 401 or
+    /// 403 is retried here (D1) unless an orphan drainer's ride-out gives up.
     pub(crate) fn reconnect_once(
         &mut self,
         reconnect: &mut QwpWsReconnectState,
     ) -> Result<QwpWsReconnectStep, DriverError> {
         if reconnect.deadline_expired() {
-            return Ok(QwpWsReconnectStep::Terminal(
+            return Ok(QwpWsReconnectStep::BudgetExhausted(
                 reconnect.retry_budget_exhausted_error(),
             ));
         }
@@ -1885,10 +1918,15 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 reason: reconnect.reason,
             }),
             Err(err) => match reconnect_attempt_error(err) {
-                Ok(err) if reconnect_error_is_terminal(&err) => {
+                Ok(err) if reconnect_error_is_terminal_when_established(&err) => {
                     Ok(QwpWsReconnectStep::Terminal(err))
                 }
                 Ok(err) => {
+                    if let Some(give_up) =
+                        self.auth_rejections.on_failed_attempt(&err, Instant::now())
+                    {
+                        return Ok(QwpWsReconnectStep::Terminal(give_up));
+                    }
                     let sleep_for = reconnect.record_retryable_error(err);
                     Ok(QwpWsReconnectStep::RetryAfter { sleep_for })
                 }
@@ -1973,7 +2011,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 })
             }
             QwpWsReconnectStep::Terminal(error) => {
-                if reconnect_error_is_terminal(&error) {
+                store.mark_terminal(Some(error));
+                Ok(DriveOutcome::Terminal)
+            }
+            QwpWsReconnectStep::BudgetExhausted(error) => {
+                if reconnect_error_is_terminal_when_established(&error) {
                     store.mark_terminal(Some(error));
                     Ok(DriveOutcome::Terminal)
                 } else {
@@ -2621,6 +2663,11 @@ pub(super) fn reconnect_attempt_error(err: DriverError) -> Result<Error, DriverE
     }
 }
 
+/// Terminal while a sender initializes: its first connect, in any
+/// `initial_connect_retry` mode. A server's 401 or 403 is terminal here, so a
+/// wrong credential reaches the caller (design/qwp-token-provider-spec.md
+/// §8.3). Once a connection has been established, reconnects use
+/// [`reconnect_error_is_terminal_when_established`] instead.
 pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     if is_qwp_ws_role_reject_error(err) {
         return false;
@@ -2649,6 +2696,19 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
             // same call and is already terminal; this belongs beside it.
             | ErrorCode::SymbolDictFull
     )
+}
+
+/// Terminal for a reconnect of a connection that was established: every
+/// [`reconnect_error_is_terminal`] error except a server's 401 or 403 on the
+/// upgrade, which is retried indefinitely (design/qwp-token-provider-spec.md
+/// §8.3, D1). An identity-provider or key-set outage makes a server
+/// reject a valid credential for a while, and store-and-forward must not drop a
+/// live producer over it. A closed or misconfigured token provider stays
+/// terminal: it never supplies a credential again in this process. An orphan
+/// drainer gives up on the rejections later, through its
+/// [`OrphanAuthRideOut`].
+pub(crate) fn reconnect_error_is_terminal_when_established(err: &Error) -> bool {
+    reconnect_error_is_terminal(err) && !is_upgrade_auth_rejection(err)
 }
 
 /// Terminal for a connect the caller waits for: the synchronous initial connect
@@ -4792,6 +4852,191 @@ mod tests {
             reconnect_error_is_terminal(&server_rejection),
             "a completed handshake authentication rejection remains terminal"
         );
+    }
+
+    #[test]
+    fn an_upgrade_rejection_is_terminal_only_during_initialization() {
+        for status in [401, 403] {
+            let rejection = upgrade_rejection(status);
+            assert!(reconnect_error_is_terminal(&rejection), "{status}");
+            assert!(
+                reconnect_error_is_foreground_terminal(&rejection),
+                "{status}"
+            );
+            assert!(
+                !reconnect_error_is_terminal_when_established(&rejection),
+                "D1: an established connection retries a {status}"
+            );
+        }
+        // A closed provider never supplies a token again: terminal in every
+        // phase, although it also reports AuthError.
+        let closed = Error::token_provider_closed("token provider p is closed");
+        assert!(reconnect_error_is_terminal(&closed));
+        assert!(reconnect_error_is_terminal_when_established(&closed));
+        // Every other terminal error stays terminal once established.
+        for code in [
+            ErrorCode::ConfigError,
+            ErrorCode::ProtocolVersionError,
+            ErrorCode::StoreResendRequired,
+            ErrorCode::SymbolDictFull,
+        ] {
+            let err = Error::new(code, "terminal");
+            assert!(
+                reconnect_error_is_terminal_when_established(&err),
+                "{code:?}"
+            );
+        }
+    }
+
+    fn upgrade_rejection(status: u16) -> Error {
+        Error::new(
+            ErrorCode::AuthError,
+            format!("WebSocket upgrade authentication failed: HTTP status {status}"),
+        )
+        .with_ws_http_status(status)
+    }
+
+    fn disconnect_then_restarts(
+        restarts: impl IntoIterator<Item = Result<(), DriverError>>,
+    ) -> QwpWsCoreTestHarness<SfaFrameQueue, TestTransport> {
+        let transport = TestTransport::scripted([
+            Ok(TransportSendResult::Failure(TransportFailure::Disconnect(
+                fake_transport_error("disconnect"),
+            ))),
+            Ok(TransportSendResult::Response(TransportResponse::Ack {
+                wire_seq: 0,
+            })),
+            Ok(TransportSendResult::Failure(TransportFailure::Disconnect(
+                fake_transport_error("disconnect again"),
+            ))),
+        ])
+        .with_restart_results(restarts);
+        QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024)),
+            transport,
+            ReconnectPolicy::no_backoff(Duration::from_secs(60)),
+            false,
+        )
+    }
+
+    fn rejected_restarts(count: usize, status: u16) -> Vec<Result<(), DriverError>> {
+        (0..count)
+            .map(|_| Err(DriverError::Transport(upgrade_rejection(status))))
+            .collect()
+    }
+
+    #[test]
+    fn an_established_connection_rides_out_upgrade_rejections() {
+        // D1: a 401 or 403 on the reconnect of an established connection is
+        // retried, and the queued frame replays once the server accepts the
+        // credential again.
+        let mut driver = disconnect_then_restarts([
+            Err(DriverError::Transport(upgrade_rejection(401))),
+            Err(DriverError::Transport(upgrade_rejection(403))),
+            Err(DriverError::Transport(upgrade_rejection(401))),
+            Ok(()),
+        ]);
+        let receipt = driver.try_submit(b"payload").unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::ReconnectDelay { .. }
+            ));
+            let failure = driver.store.reconnect_failure().expect("latched");
+            assert_eq!(failure.code(), ErrorCode::AuthError);
+        }
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect,
+            }
+        );
+        assert!(driver.store.reconnect_failure().is_none());
+        assert_eq!(driver.terminal_error(), None);
+        assert_eq!(driver.send_core.transport.restart_attempts, 4);
+        assert!(driver.receipt_status(receipt).is_pending());
+    }
+
+    #[test]
+    fn an_orphan_retires_a_rotating_credential_after_its_ride_out() {
+        let mut driver = disconnect_then_restarts(rejected_restarts(6, 401));
+        driver
+            .send_core
+            .set_orphan_auth_ride_out(OrphanAuthRideOut::new("slot", true, Duration::ZERO));
+        let receipt = driver.try_submit(b"payload").unwrap();
+        for _ in 0..5 {
+            assert!(matches!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::ReconnectDelay { .. }
+            ));
+        }
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        let err = driver.terminal_error().expect("terminal");
+        assert_eq!(err.code(), ErrorCode::AuthError);
+        assert!(err.msg().contains("rotating credential 6 times"), "{err}");
+        assert_eq!(driver.send_core.transport.restart_attempts, 6);
+        // The frame is not acknowledged; the slot keeps it.
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+    }
+
+    #[test]
+    fn an_orphan_retires_a_static_credential_at_the_first_rejection() {
+        let mut driver = disconnect_then_restarts(rejected_restarts(6, 403));
+        driver
+            .send_core
+            .set_orphan_auth_ride_out(OrphanAuthRideOut::new(
+                "slot",
+                false,
+                Duration::from_secs(60),
+            ));
+        driver.try_submit(b"payload").unwrap();
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        let err = driver.terminal_error().expect("terminal");
+        assert!(err.msg().contains("static credential"), "{err}");
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn acknowledged_data_ends_an_orphan_rejection_episode() {
+        // Five rejections, a reconnect that delivers the frame, then a new
+        // outage: the count starts over, so it takes six fresh rejections
+        // to retire the slot.
+        let mut restarts = rejected_restarts(5, 401);
+        restarts.push(Ok(()));
+        restarts.extend(rejected_restarts(6, 401));
+        let mut driver = disconnect_then_restarts(restarts);
+        driver
+            .send_core
+            .set_orphan_auth_ride_out(OrphanAuthRideOut::new("slot", true, Duration::ZERO));
+        let first = driver.try_submit(b"first").unwrap();
+        for _ in 0..5 {
+            assert!(matches!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::ReconnectDelay { .. }
+            ));
+        }
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected { .. }
+        ));
+        let mut drives = 0;
+        while driver.receipt_status(first).is_pending() {
+            driver.drive_once().unwrap();
+            drives += 1;
+            assert!(drives < 8, "the replayed frame was not acknowledged");
+        }
+        driver.try_submit(b"second").unwrap();
+        for _ in 0..5 {
+            assert!(matches!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::ReconnectDelay { .. }
+            ));
+        }
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(driver.send_core.transport.restart_attempts, 12);
     }
 
     #[test]

@@ -1085,7 +1085,9 @@ impl ReaderConfig {
     /// a non-printable-ASCII character (a header-injection vector) is rejected,
     /// and a provider error fails that walk before DNS or TCP work. Provider
     /// acquisition failures are retryable because the callback may recover on its
-    /// next invocation; a server rejection of an acquired token remains terminal.
+    /// next invocation; a server rejection of an acquired token fails the
+    /// operation. If a mid-query failover gives up on either, the reader's next
+    /// `execute()` reconnects.
     /// In unwind-enabled builds, a callback panic is contained and treated as a
     /// retryable provider failure; `panic = "abort"` builds cannot contain panics.
     /// `OidcDeviceAuth::token` may load or silently refresh a credential, but

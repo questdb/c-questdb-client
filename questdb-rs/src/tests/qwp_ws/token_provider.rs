@@ -474,3 +474,396 @@ fn the_reserved_token_provider_keys_are_rejected() {
         );
     }
 }
+
+// ---------- §8.3: rejections and outages once connected ----------
+
+const FORBIDDEN_403: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Reads an upgrade request and answers it with `rejection`, returning the
+/// request's `Authorization` header.
+fn reject_upgrade(stream: &mut TcpStream, rejection: &[u8]) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let request = read_request_until_blank(stream).unwrap();
+    let lines: Vec<String> = String::from_utf8_lossy(&request)
+        .split("\r\n")
+        .take_while(|line| !line.is_empty())
+        .map(String::from)
+        .collect();
+    stream.write_all(rejection).unwrap();
+    authorization(&lines)
+}
+
+/// Reads frames, acknowledging each, until the client goes away.
+fn ack_every_frame(stream: &mut TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut wire_seq = FIRST_WIRE_SEQUENCE;
+    while let Ok((_, opcode, _)) = read_frame(stream) {
+        if opcode == OPCODE_CLOSE || write_qwp_ok_response(stream, wire_seq).is_err() {
+            return;
+        }
+        wire_seq += 1;
+    }
+}
+
+/// Upgrades the first connection and drops it as soon as one frame arrives,
+/// unacknowledged. Answers the next connections with `rejections`, one each,
+/// then upgrades one more and acknowledges everything on it. Reports each
+/// connection's `Authorization` header.
+fn spawn_reject_after_disconnect_server(
+    rejections: Vec<&'static [u8]>,
+) -> (u16, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let lines = perform_server_upgrade(&mut first).unwrap();
+        let _ = tx.send(authorization(&lines));
+        read_frame(&mut first).unwrap();
+        drop(first);
+        for rejection in rejections {
+            let (mut rejected, _) = listener.accept().unwrap();
+            let _ = tx.send(reject_upgrade(&mut rejected, rejection));
+        }
+        let (mut accepted, _) = listener.accept().unwrap();
+        let lines = perform_server_upgrade(&mut accepted).unwrap();
+        let _ = tx.send(authorization(&lines));
+        ack_every_frame(&mut accepted);
+    });
+    (port, rx, server)
+}
+
+/// Collects connection events until a reconnect succeeds, returning the
+/// `AuthFailed` events seen before it.
+fn auth_failures_until_reconnected(
+    events: &mpsc::Receiver<crate::ingress::ConnectionEvent>,
+) -> Vec<crate::ingress::ConnectionEvent> {
+    let mut auth_failed = Vec::new();
+    loop {
+        let event = events
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the sender did not report a reconnect");
+        match event.kind {
+            crate::ingress::ConnectionEventKind::AuthFailed => auth_failed.push(event),
+            crate::ingress::ConnectionEventKind::Reconnected => return auth_failed,
+            _ => {}
+        }
+    }
+}
+
+/// C11, D1, C15: once connected, a sender rides out the server rejecting its
+/// credential -- 401 or 403, static credentials included -- with capped
+/// backoff and one `auth_failed` event per round, then delivers the queued
+/// row from memory or disk store-and-forward when the server accepts the
+/// credential again.
+#[test]
+fn an_established_sender_rides_out_upgrade_rejections() {
+    for (progress, disk) in [
+        (ProgressCase::Background, false),
+        (ProgressCase::Manual, false),
+        (ProgressCase::Background, true),
+    ] {
+        let sf_dir = tempfile::TempDir::new().unwrap();
+        let sf = if disk {
+            format!("sf_dir={};sender_id=d1;", sf_dir.path().display())
+        } else {
+            String::new()
+        };
+        let (port, authorizations, server) =
+            spawn_reject_after_disconnect_server(vec![PLAIN_401, FORBIDDEN_403, INVALID_TOKEN_401]);
+        let (tx, events) = mpsc::channel();
+        let builder = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{port};token=static-secret;{sf}\
+             reconnect_initial_backoff_millis=1;reconnect_max_backoff_millis=5;"
+        ))
+        .unwrap()
+        .connection_listener(
+            Arc::new(move |event| {
+                let _ = tx.send(event.clone());
+            }),
+            0,
+        )
+        .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+        let mut buf = one_row_buffer(&sender);
+        sender.flush(&mut buf).unwrap();
+
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{}: the row was not delivered after the rejections: {err}",
+                    progress.name()
+                )
+            });
+        let auth_failed = auth_failures_until_reconnected(&events);
+        assert_eq!(auth_failed.len(), 3, "{}: {auth_failed:?}", progress.name());
+        for event in &auth_failed {
+            assert_eq!(event.cause_code, Some(ErrorCode::AuthError));
+            assert_eq!(event.host.as_deref(), Some("127.0.0.1"));
+        }
+        let presented: Vec<String> = authorizations.try_iter().collect();
+        assert_eq!(
+            presented,
+            vec!["Bearer static-secret"; 5],
+            "{}",
+            progress.name()
+        );
+        drop(sender);
+        server.join().unwrap();
+    }
+}
+
+/// C13: once connected, a sender rides out a token provider that cannot
+/// supply a credential -- even one it classifies permanent -- and recovers
+/// when the provider does.
+#[test]
+fn an_established_sender_rides_out_a_token_outage() {
+    let (port, authorizations, server) = spawn_reject_after_disconnect_server(Vec::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (tx, events) = mpsc::channel();
+    let builder = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{port};\
+         reconnect_initial_backoff_millis=1;reconnect_max_backoff_millis=5;"
+    ))
+    .unwrap()
+    .qwp_ws_token_provider({
+        let calls = Arc::clone(&calls);
+        move || -> crate::Result<String> {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                1..=3 => Err(crate::Error::token_unavailable(
+                    false,
+                    None,
+                    "identity not assigned",
+                )),
+                n => Ok(format!("T{n}")),
+            }
+        }
+    })
+    .unwrap()
+    .connection_listener(
+        Arc::new(move |event| {
+            let _ = tx.send(event.clone());
+        }),
+        0,
+    )
+    .unwrap();
+    let mut sender = builder.build().unwrap();
+    let mut buf = one_row_buffer(&sender);
+    sender.flush(&mut buf).unwrap();
+
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+        .expect("the row is delivered once the provider recovers");
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    let mut unavailable = 0;
+    loop {
+        let event = events.recv_timeout(Duration::from_secs(10)).unwrap();
+        match event.kind {
+            crate::ingress::ConnectionEventKind::CredentialUnavailable => {
+                unavailable += 1;
+                assert!(
+                    event
+                        .cause_msg
+                        .as_deref()
+                        .is_some_and(|msg| msg.contains("identity not assigned")),
+                    "{event:?}"
+                );
+            }
+            crate::ingress::ConnectionEventKind::Reconnected => break,
+            _ => {}
+        }
+    }
+    assert_eq!(unavailable, 3);
+    let presented: Vec<String> = authorizations.try_iter().collect();
+    assert_eq!(presented, vec!["Bearer T0", "Bearer T4"]);
+    drop(sender);
+    server.join().unwrap();
+}
+
+/// A provider with a cache, as a refreshing one has: it rotates the token a
+/// server rejected.
+struct RotatingOnRejection {
+    current: Mutex<usize>,
+}
+
+impl BearerTokenProvider for RotatingOnRejection {
+    fn token(&self) -> crate::Result<String> {
+        Ok(format!("T{}", *self.current.lock().unwrap()))
+    }
+
+    fn on_rejected(&self, token: &str, _http_status: u16) {
+        let mut current = self.current.lock().unwrap();
+        if token == format!("T{}", *current) {
+            *current += 1;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OrphanConnection {
+    /// Upgrade, read the dictionary catch-up and the data frame, and drop the
+    /// connection without acknowledging them.
+    DropUnacked,
+    /// Answer the upgrade with this rejection.
+    Reject(&'static [u8]),
+    /// Upgrade, read both frames and acknowledge the data frame.
+    Drain,
+}
+
+/// Upgrades the primary sender's own connection, then serves the orphan
+/// drainer's connections by `script`. Reports each orphan connection's
+/// `Authorization` header, including any that arrive within half a second
+/// after the script.
+fn spawn_orphan_script_server(
+    script: Vec<OrphanConnection>,
+) -> (u16, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+        for step in script {
+            let (mut orphan, _) = listener.accept().unwrap();
+            orphan
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            match step {
+                OrphanConnection::Reject(rejection) => {
+                    let _ = tx.send(reject_upgrade(&mut orphan, rejection));
+                }
+                OrphanConnection::DropUnacked | OrphanConnection::Drain => {
+                    let lines = perform_server_upgrade(&mut orphan).unwrap();
+                    let _ = tx.send(authorization(&lines));
+                    let (_, _, _catch_up) = read_frame(&mut orphan).unwrap();
+                    let (_, _, _data) = read_frame(&mut orphan).unwrap();
+                    if matches!(step, OrphanConnection::Drain) {
+                        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut extra, _)) => {
+                    extra.set_nonblocking(false).unwrap();
+                    let _ = tx.send(reject_upgrade(&mut extra, PLAIN_401));
+                }
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    });
+    (port, rx, server)
+}
+
+fn orphan_drain_conf(port: u16, sf_dir: &std::path::Path, auth: &str) -> String {
+    format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;{auth}\
+         sf_dir={};sender_id=primary;drain_orphans=on;max_background_drainers=1;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;\
+         reconnect_initial_backoff_millis=1;reconnect_max_backoff_millis=5;\
+         reconnect_max_duration_millis=60000;",
+        sf_dir.display()
+    )
+}
+
+/// C16: an orphan drain that loses its connection mid-drain, and is then
+/// rejected for a whole round while the server catches up with a rotated
+/// token, rides the rejection out and drains the slot with the new token.
+#[test]
+fn an_orphan_drain_rides_out_a_token_rotation() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+    let orphan_slot = sf_dir.path().join("orphan");
+    let (port, authorizations, server) = spawn_orphan_script_server(vec![
+        OrphanConnection::DropUnacked,
+        // The drainer reconnects with T0, which the server rejects; told so,
+        // the provider rotates to T1 and the drainer retries at once. The
+        // server has not caught up yet and rejects T1 too.
+        OrphanConnection::Reject(PLAIN_401),
+        OrphanConnection::Reject(INVALID_TOKEN_401),
+        // A later round presents T1 again, and it is accepted.
+        OrphanConnection::Drain,
+    ]);
+    let mut sender = SenderBuilder::from_conf(orphan_drain_conf(port, sf_dir.path(), ""))
+        .unwrap()
+        .qwp_ws_token_provider(RotatingOnRejection {
+            current: Mutex::new(0),
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while slot_has_sfa_file(&orphan_slot) {
+        assert!(
+            Instant::now() < deadline,
+            "the orphan slot was not drained; .last_error: {:?}",
+            std::fs::read_to_string(orphan_slot.join(".last_error"))
+        );
+        if !sender.drive_once().unwrap() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    drop(sender);
+    server.join().unwrap();
+    let presented: Vec<String> = authorizations.try_iter().collect();
+    assert_eq!(
+        presented,
+        vec!["Bearer T0", "Bearer T0", "Bearer T1", "Bearer T1"]
+    );
+    assert!(!orphan_slot.join(".failed").exists());
+}
+
+/// C11, orphan drain with a static credential: the first rejection
+/// mid-drain retires the slot for the session, keeping it on disk.
+#[test]
+fn an_orphan_drain_gives_up_a_rejected_static_credential_at_once() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+    let orphan_slot = sf_dir.path().join("orphan");
+    let (port, authorizations, server) = spawn_orphan_script_server(vec![
+        OrphanConnection::DropUnacked,
+        OrphanConnection::Reject(FORBIDDEN_403),
+    ]);
+    let mut sender = SenderBuilder::from_conf(orphan_drain_conf(
+        port,
+        sf_dir.path(),
+        "token=static-secret;",
+    ))
+    .unwrap()
+    .build()
+    .unwrap();
+
+    let last_error = orphan_slot.join(".last_error");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&last_error).is_ok_and(|text| text.contains("static")) {
+        assert!(Instant::now() < deadline, "the orphan slot was not retired");
+        if !sender.drive_once().unwrap() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    // Keep driving: a retired slot is not dialled again.
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        let _ = sender.drive_once().unwrap();
+        thread::sleep(Duration::from_millis(5));
+    }
+    drop(sender);
+    server.join().unwrap();
+    let presented: Vec<String> = authorizations.try_iter().collect();
+    assert_eq!(presented, vec!["Bearer static-secret"; 2]);
+    let reason = std::fs::read_to_string(&last_error).unwrap();
+    assert!(reason.contains("HTTP status 403"), "{reason}");
+    assert!(!orphan_slot.join(".failed").exists());
+    assert!(slot_has_sfa_file(&orphan_slot), "the slot stays on disk");
+}

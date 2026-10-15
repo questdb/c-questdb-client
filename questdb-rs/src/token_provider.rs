@@ -388,6 +388,28 @@ pub(crate) const PROVIDER_CONFLICTS_WITH_STATIC_AUTH: &str = "A rotating token p
      `ReaderConfig::token_provider`), or the `username` / `password` / `token` \
      settings.";
 
+/// Log, once per process, that a token provider attached by the application
+/// is used over a schema without TLS, `scheme` (`ws` or `http`): every token
+/// then crosses the network in cleartext (design/qwp-token-provider-spec.md
+/// §9). A warning, not an error: a loopback server in development is a
+/// legitimate use.
+pub(crate) fn warn_once_if_cleartext(scheme: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(warning) = cleartext_warning(&WARNED, scheme) {
+        log::warn!("{warning}");
+    }
+}
+
+fn cleartext_warning(warned: &std::sync::atomic::AtomicBool, scheme: &str) -> Option<String> {
+    if warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    Some(format!(
+        "questdb: a token provider is used over {scheme}:: (no TLS): bearer tokens cross \
+         the network in cleartext; use {scheme}s:: in production"
+    ))
+}
+
 /// The shared provider. Returns a fresh token (the raw token, *not* the
 /// `Bearer` header) or an error that fails the connection attempt.
 pub(crate) type TokenProviderFn = Arc<dyn BearerTokenProvider>;
@@ -661,8 +683,9 @@ impl TokenProvider {
     /// stays terminal but is carried out as `ConfigError`, so the bare code --
     /// which the connection pool also uses for ordinary exhaustion -- is not
     /// dragged into the terminal set with it. Server authentication rejections
-    /// remain separate terminal `AuthError`s because they occur after this
-    /// method succeeds.
+    /// are separate `AuthError`s because they occur after this method succeeds:
+    /// terminal before a sender's first connection, retried once it has
+    /// connected (design/qwp-token-provider-spec.md §8.3).
     ///
     /// # Known residual: the credential is not scrubbed past this point
     ///
@@ -958,7 +981,8 @@ pub(crate) fn is_provider_shutdown_error(err: &crate::Error) -> bool {
 /// important for QWP store-and-forward: a provider failure must retain and keep
 /// draining already-accepted frames rather than terminalizing the publication
 /// store. An actual server rejection is produced later by the handshake path as
-/// a terminal [`AuthError`](crate::ErrorCode::AuthError).
+/// an [`AuthError`](crate::ErrorCode::AuthError), whose handling depends on the
+/// connection's phase (design/qwp-token-provider-spec.md §8.3).
 ///
 /// The exceptions are the failures for which "may recover on its next
 /// invocation" is false, which must stay terminal: a caller contract violation
@@ -1121,6 +1145,21 @@ mod tests {
     use super::*;
 
     fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+    /// Spec §9: one warning per process names the schema and its TLS
+    /// counterpart.
+    #[test]
+    fn the_cleartext_warning_is_given_once() {
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        let warning = cleartext_warning(&warned, "ws").expect("first use warns");
+        assert!(warning.contains("over ws:: (no TLS)"), "{warning}");
+        assert!(warning.contains("use wss:: in production"), "{warning}");
+        assert!(cleartext_warning(&warned, "http").is_none());
+
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        let warning = cleartext_warning(&warned, "http").unwrap();
+        assert!(warning.contains("use https:: in production"), "{warning}");
+    }
 
     #[test]
     fn provider_holders_stay_unwind_safe() {

@@ -792,6 +792,9 @@ void qwp_reader_query_free(qwp_reader_query* query);
  * violation: the call sets `*err_out` to
  * `questdb_error_invalid_api_call` and returns NULL.
  *
+ * If the reader's last mid-query failover gave up and left it without a
+ * connection, this reconnects first; a failed reconnect fails this call.
+ *
  * On success, ownership transfers to the returned cursor; on failure,
  * `*err_out` is set and NULL is returned.
  */
@@ -1140,12 +1143,19 @@ typedef struct qwp_reader_batch qwp_reader_batch;
  * `questdb_error_auth_error`, `questdb_error_role_mismatch`,
  * `questdb_error_config_error`, `questdb_error_unsupported_server`,
  * `questdb_error_handshake_error` or `questdb_error_tls_error`, or one
- * carrying an OIDC payload (`questdb_error_oidc_get_view`). This includes a
+ * carrying an OIDC payload (`questdb_error_oidc_get_view`) or a token
+ * provider's failure to supply a credential
+ * (`questdb_error_token_unavailable_get_view`). This includes a
  * give-up caused by `failover_max_duration_ms` running out while attempts
  * remain: if the last round was rejected on role, at the WebSocket upgrade
  * or at TLS, that code is returned (message prefixed with "failover
  * wall-clock budget exhausted"), not the `questdb_error_socket_error` or
  * `questdb_error_protocol_error` that started the failover.
+ *
+ * A failover that gives up leaves the reader without a connection, but not
+ * unusable: its next `qwp_reader_execute` or `qwp_reader_query_execute`
+ * reconnects first. A failed reconnect fails that call, and the next call
+ * tries again.
  */
 QUESTDB_CLIENT_API
 const qwp_reader_batch* qwp_reader_cursor_next_batch(
@@ -1398,7 +1408,7 @@ qwp_reader_cursor_current_addr_port(const qwp_reader_cursor*);
  * while a cursor is live).
  *
  * Returns `false` and sets `*err_out` on failure: the cursor handle is
- * NULL, or the underlying connection is poisoned after a failed mid-query
+ * NULL, or the underlying connection was lost after a failed mid-query
  * failover. On success returns `true` and writes `*out_version`.
  */
 QUESTDB_CLIENT_API bool qwp_reader_cursor_server_version(

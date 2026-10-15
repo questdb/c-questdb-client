@@ -3,7 +3,7 @@
 //! Mirrors the Java client's `SenderConnectionListener` contract: a
 //! user-supplied listener receives [`ConnectionEvent`]s describing
 //! connection-state transitions (initial connect, endpoint attempt
-//! failures, failover, terminal auth rejection). Events are delivered on
+//! failures, failover, credential rejections). Events are delivered on
 //! a dedicated dispatcher thread through a bounded inbox with a
 //! drop-oldest overflow policy, so a slow listener can never stall
 //! connect, publish, or reconnect paths. Success events fire once per
@@ -55,16 +55,31 @@ pub enum ConnectionEventKind {
     /// Every configured endpoint was attempted and none accepted the
     /// connection in this sweep.
     AllEndpointsUnreachable,
-    /// A terminal server rejection of a credential the client presented.
+    /// The server rejected the credential the client presented: HTTP 401 or
+    /// 403 on the WebSocket upgrade. `host` and `port` are set, and
+    /// `cause_code` is [`AuthError`](crate::ErrorCode::AuthError). One event
+    /// per connect round, for the round's final outcome: a 401 that the
+    /// client retried with a refreshed token, successfully, reports nothing.
     ///
-    /// `host` and `port` are set. A listener may page, tear down the pool,
-    /// or exit on this without further qualification. If the server first
-    /// returns HTTP 401 but acquiring a replacement credential then fails,
-    /// the provider error decides whether to retry: that is reported as
-    /// [`CredentialUnavailable`](Self::CredentialUnavailable) with the
-    /// rejected endpoint, not as an unconditional terminal `AuthFailed`.
-    /// Mirrors the Java client, whose `AUTH_FAILED` is likewise unconditional
-    /// and whose cause is always a `QwpAuthFailedException`, distinct from its
+    /// What happens next depends on the phase
+    /// (design/qwp-token-provider-spec.md §8.3):
+    ///
+    /// * **Before a sender's first connection**, and for a connect the caller
+    ///   waits for (a pool borrow or re-borrow), it is terminal: the sender
+    ///   fails to start, the borrow fails, and a sender that connects in the
+    ///   background stops.
+    /// * **Once connected**, a store-and-forward sender keeps reconnecting
+    ///   with capped backoff and keeps its unacknowledged data, reporting each
+    ///   failed round with one of these events. An identity-provider or
+    ///   key-set outage makes a server reject a valid credential for a while,
+    ///   and store-and-forward must not drop a live producer over it. To give
+    ///   up instead, close the sender.
+    ///
+    /// If the server returns HTTP 401 but acquiring a replacement credential
+    /// then fails, the provider error decides whether to retry: that is
+    /// reported as [`CredentialUnavailable`](Self::CredentialUnavailable) with
+    /// the rejected endpoint. Mirrors the Java client's `AUTH_FAILED`, whose
+    /// cause is always a `QwpAuthFailedException`, distinct from its
     /// `QwpCredentialUnavailableException`.
     AuthFailed,
 
@@ -95,15 +110,16 @@ pub enum ConnectionEventKind {
     ///
     /// A listener that pages on a permanent stop must therefore qualify on
     /// `cause_code`, not on the kind alone. [`AuthFailed`](Self::AuthFailed)
-    /// stays the *terminal* server-rejection signal.
+    /// is the server-rejection signal.
     ///
     /// This is the counterpart of the Java client's
     /// `QwpCredentialUnavailableException`: "a credential the client cannot
     /// ACQUIRE is instead handled by connection phase, exactly like a transport
-    /// outage". It exists as its own kind so `AuthFailed` can stay
-    /// unconditionally terminal; folding the two together forced every listener
-    /// to gate on `host.is_some()` and made an ordinary silent-refresh blip
-    /// indistinguishable from a rejected credential.
+    /// outage". It exists as its own kind so that a credential the client
+    /// could not obtain is never mistaken for one the server rejected: folding
+    /// the two together forced every listener to gate on `host.is_some()` and
+    /// made an ordinary silent-refresh blip indistinguishable from a rejected
+    /// credential.
     CredentialUnavailable,
 }
 
@@ -522,8 +538,8 @@ impl ConnectionEventSource {
     /// Report a provider failure before dial (`endpoint=None`) or after an
     /// endpoint returned HTTP 401 and reacquisition failed. In the latter case
     /// the rejected endpoint is retained for diagnostics, while `cause_code`
-    /// keeps the provider's retry/stop classification. A 401 alone cannot be
-    /// reported as terminal `AuthFailed`: a new token may still be obtainable.
+    /// keeps the provider's retry/stop classification: the provider failure,
+    /// not the 401, decides what happens next.
     pub(crate) fn token_provider_failed(
         &self,
         endpoint: Option<(&str, &str)>,
