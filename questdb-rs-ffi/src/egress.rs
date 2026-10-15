@@ -530,6 +530,34 @@ pub unsafe extern "C" fn qwp_reader_from_conf_with_oidc(
     })
 }
 
+/// Construct a reader from a QuestDB config string and use `provider` as its
+/// rotating Bearer-token provider. The reader keeps its own reference:
+/// `provider` may be freed afterwards. The config must not exceed
+/// [`crate::MAX_CONFIG_BYTES`] bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_reader_from_conf_with_token_provider(
+    config: line_sender_utf8,
+    provider: *const crate::token_provider::questdb_token_provider,
+    err_out: *mut *mut questdb_error,
+) -> *mut qwp_reader {
+    panic_guard(|| unsafe {
+        let conf = match validated_config_str(&config) {
+            Ok(s) => s,
+            Err(err) => {
+                write_err_box(err_out, err);
+                return ptr::null_mut();
+            }
+        };
+        let Some(provider) = crate::token_provider::provider_ref(provider, err_out) else {
+            return ptr::null_mut();
+        };
+        let config = reader_bubble!(err_out, ReaderConfig::from_conf(conf), ptr::null_mut());
+        let config = reader_bubble!(err_out, provider.attach_to_reader(config), ptr::null_mut());
+        let reader = reader_bubble!(err_out, Reader::from_config(&config), ptr::null_mut());
+        wrap_standalone_reader(reader)
+    })
+}
+
 /// Construct a reader from the configuration stored in the
 /// `QDB_CLIENT_CONF` environment variable.
 ///

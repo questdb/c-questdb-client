@@ -733,6 +733,22 @@ public:
     }
 
     /**
+     * Open a reader with a rotating Bearer-token provider (see
+     * `questdb::token_provider`). The reader keeps its own reference. Use
+     * `wss::` (TLS).
+     * @throws questdb::error on configuration or connection failure.
+     */
+    reader(
+        ::questdb::ingress::utf8_view config,
+        const ::questdb::token_provider& provider)
+        : _impl{::questdb::error::wrapped_call(
+              ::qwp_reader_from_conf_with_token_provider,
+              to_c_utf8(config),
+              provider.raw())}
+    {
+    }
+
+    /**
      * Open a reader using the config string stored in the
      * `QDB_CLIENT_CONF` environment variable. The variable's value
      * follows the same format as the constructor's `config` argument.

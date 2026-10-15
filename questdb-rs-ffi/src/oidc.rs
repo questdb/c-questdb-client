@@ -2357,7 +2357,10 @@ pub struct questdb_oidc_config_view {
 const QUESTDB_OIDC_CONFIG_VIEW_V1_SIZE: usize =
     std::mem::offset_of!(questdb_oidc_config_view, issuer_len) + std::mem::size_of::<size_t>();
 
-unsafe fn versioned_output_capacity<T>(out: *mut T, minimum_size: usize) -> Option<usize> {
+pub(crate) unsafe fn versioned_output_capacity<T>(
+    out: *mut T,
+    minimum_size: usize,
+) -> Option<usize> {
     if out.is_null() {
         return None;
     }
@@ -2371,7 +2374,7 @@ unsafe fn versioned_output_capacity<T>(out: *mut T, minimum_size: usize) -> Opti
     Some(capacity)
 }
 
-unsafe fn write_versioned_output<T>(out: *mut T, capacity: usize, value: &T) {
+pub(crate) unsafe fn write_versioned_output<T>(out: *mut T, capacity: usize, value: &T) {
     unsafe {
         std::ptr::copy_nonoverlapping(
             (value as *const T).cast::<u8>(),
@@ -6085,7 +6088,7 @@ mod tests {
 /// a Rust field is added, renamed or removed, and the literal list is then
 /// compared against the header's own field order.
 #[cfg(test)]
-mod header_abi {
+pub(crate) mod header_abi {
     use super::*;
 
     const OIDC_H: &str = include_str!(concat!(
@@ -6098,7 +6101,7 @@ mod header_abi {
     ));
 
     /// The field identifiers of a C `typedef struct NAME { ... }`, in order.
-    fn c_struct_fields(header: &str, name: &str) -> Vec<String> {
+    pub(crate) fn c_struct_fields(header: &str, name: &str) -> Vec<String> {
         let decl = format!("typedef struct {name}");
         let start = header
             .find(&decl)
@@ -6313,6 +6316,7 @@ mod header_abi {
                 rejection_callback: _,
                 rejection_user_data: _,
                 rejection_inbox_capacity: _,
+                token_provider: _,
             } = options;
         }
         assert_eq!(
@@ -6326,6 +6330,7 @@ mod header_abi {
                 "rejection_callback",
                 "rejection_user_data",
                 "rejection_inbox_capacity",
+                "token_provider",
             ]
         );
     }

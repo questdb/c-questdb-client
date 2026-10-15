@@ -25,6 +25,41 @@ environment variable and restrict tokens to the intended environment.
 Authentication does not encrypt traffic. Pair it with `tcps::`, `https::`, or
 `wss::` outside a trusted private network.
 
+## Rotating bearer tokens
+
+A fixed `token` is captured once, and stops working when it expires. For
+tokens that rotate -- Microsoft Entra ID managed identities and service
+principals, OAuth2 client credentials, an OIDC device flow -- attach a token
+provider in code instead. Every HTTP(S) and QWP/WebSocket sender, reader and
+pool accepts one, and pulls a token on each (re)connect, or per request for
+ILP/HTTP.
+
+- A **refreshing provider** wraps a token *source*, a callback that fetches a
+  token and its expiry however you like: Azure Identity, an OAuth2 flow, a
+  secrets vault. It caches the token, refreshes it on its own thread at about
+  half its lifetime, retries failures with backoff, and refreshes early when a
+  server rejects the token with HTTP 401.
+- An **application provider** returns the current token itself. Prefer a
+  refreshing provider unless you already cache tokens.
+
+When a server answers HTTP 401, the client tells the provider which token was
+rejected, pulls again, and retries the same endpoint once if the token changed
+-- unless the `WWW-Authenticate` challenge names an error other than
+`invalid_token`. A source classifies each failure as retryable (network,
+throttling, 5xx) or permanent (missing or wrong configuration); a connect the
+caller waits for retries only retryable failures, while background reconnects
+retry both. No secret ever appears in errors or logs: at most a token's length
+and an 8-hex-digit SHA-256 fingerprint.
+
+This client selects no provider from a connection string: `token_provider` and
+the `azure_*` keys are rejected. Use a provider only over `https::` or `wss::`.
+See [`token_provider.h`](../include/questdb/token_provider.h),
+[`token_provider.hpp`](../include/questdb/token_provider.hpp), the Rust
+`questdb::token_provider` module, and
+[`token_provider_c_example.c`](../examples/token_provider_c_example.c). The
+behaviour follows the cross-language dynamic-credential specification
+(`design/qwp-token-provider-spec.md` in the Java client).
+
 ## TLS
 
 The secure schemes are:

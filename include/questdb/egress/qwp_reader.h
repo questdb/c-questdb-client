@@ -211,6 +211,24 @@ qwp_reader* qwp_reader_from_conf_with_oidc(
     questdb_error** err_out);
 
 /**
+ * Construct a reader from a QuestDB config string and use `provider` (see
+ * `questdb/token_provider.h`) as its rotating Bearer-token provider. The
+ * reader keeps its own reference: `provider` may be freed afterwards. On a 401
+ * the reader calls the provider's `on_rejected`, pulls again, and replays the
+ * endpoint once if the token changed and the `WWW-Authenticate` challenge
+ * allows it.
+ *
+ * Mutually exclusive with static credentials in `config`. Use `wss::`.
+ *
+ * Returns NULL and sets `*err_out` on failure.
+ */
+QUESTDB_CLIENT_API
+qwp_reader* qwp_reader_from_conf_with_token_provider(
+    line_sender_utf8 config,
+    const questdb_token_provider* provider,
+    questdb_error** err_out);
+
+/**
  * Construct a reader from the configuration stored in the
  * `QDB_CLIENT_CONF` environment variable. The variable's value follows
  * the same format as `qwp_reader_from_conf`.

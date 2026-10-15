@@ -78,6 +78,9 @@ pub struct questdb_db_connect_options {
     pub rejection_callback: line_sender_qwpws_error_cb,
     pub rejection_user_data: *mut c_void,
     pub rejection_inbox_capacity: size_t,
+    /// A rotating Bearer-token provider shared by every pooled sender and
+    /// reader. Mutually exclusive with `oidc_auth`. Appended after v1.
+    pub token_provider: *const crate::token_provider::questdb_token_provider,
 }
 
 impl Default for questdb_db_connect_options {
@@ -91,6 +94,7 @@ impl Default for questdb_db_connect_options {
             rejection_callback: None,
             rejection_user_data: std::ptr::null_mut(),
             rejection_inbox_capacity: 0,
+            token_provider: std::ptr::null(),
         }
     }
 }
@@ -998,8 +1002,8 @@ pub unsafe extern "C" fn questdb_db_connect_ex(
         None => return std::ptr::null_mut(),
     };
 
-    let (handlers, auth) = if options.is_null() {
-        (questdb::ConnectHandlers::default(), None)
+    let (handlers, auth, token_provider) = if options.is_null() {
+        (questdb::ConnectHandlers::default(), None, None)
     } else {
         // Read only the size prefix before touching any later field. Forming a
         // reference to the current Rust struct here would itself require a
@@ -1076,6 +1080,35 @@ pub unsafe extern "C" fn questdb_db_connect_ex(
                 0,
             )
         };
+        let token_provider: *const crate::token_provider::questdb_token_provider = unsafe {
+            connect_options_field(
+                options,
+                struct_size,
+                std::mem::offset_of!(questdb_db_connect_options, token_provider),
+                std::ptr::null(),
+            )
+        };
+        if !oidc_auth.is_null() && !token_provider.is_null() {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::ConfigError,
+                        "questdb_db_connect_options: oidc_auth and token_provider are \
+                         mutually exclusive; attach one rotating token provider",
+                    ),
+                )
+            };
+            return std::ptr::null_mut();
+        }
+        let token_provider = if token_provider.is_null() {
+            None
+        } else {
+            match unsafe { crate::token_provider::provider_ref(token_provider, err_out) } {
+                Some(provider) => Some(provider),
+                None => return std::ptr::null_mut(),
+            }
+        };
 
         let Some(handlers) = connect_handlers_from_c(
             event_callback,
@@ -1096,24 +1129,27 @@ pub unsafe extern "C" fn questdb_db_connect_ex(
                 None => return std::ptr::null_mut(),
             }
         };
-        (handlers, auth)
+        (handlers, auth, token_provider)
     };
 
-    let result = match auth {
-        Some(auth) => {
-            // Pool sender/reader connectors may run in the background. The OIDC
-            // token path is non-interactive and returns InteractionRequired
-            // rather than starting a device flow on those threads. Preserve the
-            // auth's single-flight identity across every pool attachment.
-            let isolation = auth.token_provider_isolation();
-            QuestDb::connect_with_handlers_and_token_provider_with_isolation(
-                conf,
-                handlers,
-                move || auth.token(),
-                isolation,
-            )
-        }
-        None => QuestDb::connect_with_handlers(conf, handlers),
+    let result = match (auth, token_provider) {
+        (_, Some(provider)) => provider.connect_pool(conf, handlers),
+        (auth, None) => match auth {
+            Some(auth) => {
+                // Pool sender/reader connectors may run in the background. The OIDC
+                // token path is non-interactive and returns InteractionRequired
+                // rather than starting a device flow on those threads. Preserve the
+                // auth's single-flight identity across every pool attachment.
+                let isolation = auth.token_provider_isolation();
+                QuestDb::connect_with_handlers_and_token_provider_with_isolation(
+                    conf,
+                    handlers,
+                    move || auth.token(),
+                    isolation,
+                )
+            }
+            None => QuestDb::connect_with_handlers(conf, handlers),
+        },
     };
     match result {
         Ok(db) => Box::into_raw(Box::new(questdb_db(db))),

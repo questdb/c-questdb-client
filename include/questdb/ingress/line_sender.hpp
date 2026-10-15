@@ -27,6 +27,7 @@
 #include "line_sender_array.hpp"
 #include "line_sender_decimal.hpp"
 #include "../oidc.hpp"
+#include "../token_provider.hpp"
 
 namespace questdb::ingress
 {
@@ -1521,6 +1522,22 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_oidc_auth, _impl, auth.raw());
+        return *this;
+    }
+
+    /**
+     * Attach a rotating Bearer-token provider (see `questdb::token_provider`)
+     * to an HTTP(S) or QWP/WebSocket sender. The options keep their own
+     * reference. On a 401 the sender tells the provider which token was
+     * rejected, pulls again, and retries once if the token changed.
+     * Mutually exclusive with `username()`/`password()`, `token()` and
+     * `oidc_auth()`. Use `https::` or `wss::`.
+     * @throws line_sender_error if the configuration cannot use a provider.
+     */
+    opts& token_provider(const ::questdb::token_provider& provider)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_token_provider, _impl, provider.raw());
         return *this;
     }
 

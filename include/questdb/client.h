@@ -70,6 +70,11 @@ typedef struct questdb_db questdb_db;
 #    define QUESTDB_OIDC_AUTH_DEFINED
 typedef struct questdb_oidc_auth questdb_oidc_auth;
 #endif
+#ifndef QUESTDB_TOKEN_PROVIDER_DEFINED
+#    define QUESTDB_TOKEN_PROVIDER_DEFINED
+/** A rotating Bearer-token provider; see `questdb/token_provider.h`. */
+typedef struct questdb_token_provider questdb_token_provider;
+#endif
 
 /** Maximum accepted capacity for a pool callback inbox. A larger capacity
  *  passed to `questdb_db_connect_ex`, `questdb_db_connect_with_event_handler`
@@ -95,6 +100,11 @@ typedef struct questdb_db_connect_options
     line_sender_qwpws_error_cb rejection_callback;
     void* rejection_user_data;
     size_t rejection_inbox_capacity;
+    /** A rotating Bearer-token provider shared by every pooled sender and
+     *  reader (see `questdb/token_provider.h`). Mutually exclusive with
+     *  `oidc_auth` and with static credentials in `conf`. The pool keeps its
+     *  own reference. */
+    const questdb_token_provider* token_provider;
 } questdb_db_connect_options;
 
 /* -------------------------------------------------------------------------

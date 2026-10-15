@@ -299,6 +299,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         oidc_cpp_example
         examples/oidc_cpp_example.cpp)
     compile_example(
+        token_provider_c_example
+        examples/token_provider_c_example.c)
+    compile_example(
         line_sender_cpp_example_udp
         examples/line_sender_cpp_example_udp.cpp)
     compile_example(
@@ -439,6 +442,11 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_test(
         test_oidc_examples
         cpp_test/test_oidc_examples.cpp)
+
+    # Rotating Bearer-token providers: the C ABI through the C++ wrappers.
+    compile_test(
+        test_token_provider
+        cpp_test/test_token_provider.cpp)
 
     # Live-broker integration tests for the egress reader. Skips per-test
     # if no broker is reachable on QDB_LIVE_BROKER_HOST:QDB_LIVE_BROKER_HTTP_PORT

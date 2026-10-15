@@ -472,7 +472,11 @@ struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        self.shared.close();
+        // In a forked child the state mutex may be held by a parent thread
+        // that no longer exists: leave the provider alone rather than block.
+        if !self.shared.is_inherited() {
+            self.shared.close();
+        }
     }
 }
 
@@ -501,6 +505,10 @@ struct Shared {
     state: Mutex<State>,
     /// Signalled on every fetch completion, schedule change and close.
     changed: Condvar,
+    /// The process that built the provider. Its refresher thread does not
+    /// survive `fork()`, and a parent thread may hold the state mutex at the
+    /// fork, so a child never touches the state.
+    creator_pid: u32,
 }
 
 #[derive(Default)]
@@ -658,9 +666,11 @@ impl RefreshingTokenProvider {
         self.shared().close();
     }
 
-    /// Whether [`close`](Self::close) has been called.
+    /// Whether [`close`](Self::close) has been called. A provider inherited
+    /// across `fork()` counts as closed.
     pub fn is_closed(&self) -> bool {
-        self.shared().lock().closed
+        let shared = self.shared();
+        shared.is_inherited() || shared.lock().closed
     }
 
     /// The non-secret label this provider uses in log lines and errors.
@@ -671,7 +681,17 @@ impl RefreshingTokenProvider {
     /// A snapshot of the provider's state (spec §5.7). Never contains the
     /// token.
     pub fn status(&self) -> TokenProviderStatus {
-        let st = self.shared().lock();
+        let shared = self.shared();
+        if shared.is_inherited() {
+            return TokenProviderStatus {
+                token_expires_at: None,
+                last_success_at: None,
+                consecutive_failures: 0,
+                last_failure: None,
+                closed: true,
+            };
+        }
+        let st = shared.lock();
         TokenProviderStatus {
             token_expires_at: st.held.as_ref().map(|h| system_time(h.expires_at_ms)),
             last_success_at: st.last_success_ms.map(system_time),
@@ -695,6 +715,13 @@ impl BearerTokenProvider for RefreshingTokenProvider {
 impl fmt::Debug for RefreshingTokenProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let shared = self.shared();
+        if shared.is_inherited() {
+            return f
+                .debug_struct("RefreshingTokenProvider")
+                .field("name", &shared.name)
+                .field("inherited_across_fork", &true)
+                .finish();
+        }
         let st = shared.lock();
         let mut d = f.debug_struct("RefreshingTokenProvider");
         d.field("name", &shared.name);
@@ -788,11 +815,26 @@ impl Shared {
         self.changed.notify_all();
     }
 
+    fn is_inherited(&self) -> bool {
+        std::process::id() != self.creator_pid
+    }
+
+    fn inherited_error(&self) -> Error {
+        Error::token_provider_closed(format!(
+            "token provider {} was inherited across fork and cannot be used in this process; \
+             build a new provider in the child",
+            self.name
+        ))
+    }
+
     fn closed_error(&self) -> Error {
         Error::token_provider_closed(format!("token provider {} is closed", self.name))
     }
 
     fn token_until(&self, cancel: Option<&dyn Fn() -> bool>) -> Result<String, TokenWait> {
+        if self.is_inherited() {
+            return Err(TokenWait::Failed(self.inherited_error()));
+        }
         let mut st = self.lock();
         if st.closed {
             return Err(TokenWait::Failed(self.closed_error()));
@@ -885,6 +927,9 @@ impl Shared {
     }
 
     fn await_ready(&self, timeout: Duration) -> bool {
+        if self.is_inherited() {
+            return false;
+        }
         let mut st = self.lock();
         let start = self.clock.monotonic();
         let deadline = start.saturating_add(timeout.min(MAX_DELAY));
@@ -907,7 +952,7 @@ impl Shared {
     }
 
     fn on_rejected(&self, token: &str, http_status: u16, cancel: Option<&dyn Fn() -> bool>) {
-        if http_status != 401 {
+        if http_status != 401 || self.is_inherited() {
             return;
         }
         let mut st = self.lock();
@@ -940,6 +985,9 @@ impl Shared {
     }
 
     fn close(&self) {
+        if self.is_inherited() {
+            return;
+        }
         let mut st = self.lock();
         if st.closed {
             return;
@@ -1342,6 +1390,7 @@ impl RefreshingTokenProviderBuilder {
                 ..State::default()
             }),
             changed: Condvar::new(),
+            creator_pid: std::process::id(),
             clock,
         });
         if self.spawn_refresher {

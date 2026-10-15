@@ -123,6 +123,7 @@ use ndarr::StrideArrayView;
 
 mod egress;
 mod oidc;
+mod token_provider;
 
 pub mod column_sender;
 pub use column_sender::*;

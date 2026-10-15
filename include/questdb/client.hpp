@@ -44,6 +44,7 @@
 #include <questdb/client.h>
 #include <questdb/ingress/line_sender_core.hpp>
 #include <questdb/oidc.hpp>
+#include <questdb/token_provider.hpp>
 
 // Forward declarations so `pool` can hand out leases of either direction while
 // keeping both lease headers off its own include path. The corresponding
@@ -117,6 +118,22 @@ public:
         ::questdb_db_connect_options_init(&options, sizeof options);
         options.oidc_auth = auth.raw();
         _raw = ::questdb::oidc::detail::wrapped_call(
+            ::questdb_db_connect_ex, conf.data(), conf.size(), &options);
+    }
+
+    /**
+     * Open a pool whose sender and reader connections share one rotating
+     * Bearer-token provider (see `questdb::token_provider`). The pool keeps
+     * its own reference. Mutually exclusive with static credentials in
+     * `conf`. Use `wss::` (TLS).
+     * @throws questdb::error on configuration or connection failure.
+     */
+    pool(std::string_view conf, const ::questdb::token_provider& provider)
+    {
+        ::questdb_db_connect_options options;
+        ::questdb_db_connect_options_init(&options, sizeof options);
+        options.token_provider = provider.raw();
+        _raw = ::questdb::error::wrapped_call(
             ::questdb_db_connect_ex, conf.data(), conf.size(), &options);
     }
 
