@@ -376,11 +376,14 @@ bool questdb_oidc_builder_ca_bundle(
  * before permissions are tightened; deletion is synchronized before the
  * distrust marker is removed, preserving that boundary across crashes.
  * Use a directory dedicated to the token store. The bundled file store
- * currently rejects persistence on non-Unix platforms before changing disk
- * state because it cannot provide the durable directory-entry
- * replacement/deletion required for rotating refresh tokens there. C callers
- * should keep credentials in memory on those platforms; custom keychain-backed
- * stores are currently available only through the Rust `TokenStore` API.
+ * currently rejects mutation preflight, save, and explicit clear on non-Unix
+ * platforms before those operations change disk state: durable directory-entry
+ * replacement/deletion required for rotating refresh tokens is unavailable.
+ * This is not a no-write guarantee for authentication: a preceding coordinated
+ * load can create directories and coordination files, or recover records
+ * already marked untrusted. C callers should keep credentials in memory on
+ * those platforms; custom keychain-backed stores are currently available only
+ * through the Rust `TokenStore` API.
  * Without this call, credentials remain in memory only.
  *
  * `directory` is used verbatim. Nothing here expands `~` -- a shell does that,
@@ -407,8 +410,12 @@ bool questdb_oidc_builder_file_token_store(
  * directories with mode `0700`; an existing directory is tightened and, when
  * it was group- or other-writable, swept exactly as for
  * `questdb_oidc_builder_file_token_store`. The bundled file store currently
- * rejects persistence on non-Unix platforms before changing disk state because
- * the required durable metadata barrier is unavailable. C callers should use
+ * rejects mutation preflight, save, and explicit clear on non-Unix platforms
+ * before those operations change disk state because the required durable
+ * metadata barrier is unavailable. A preceding coordinated load during
+ * authentication may still create directories and coordination files or
+ * recover records already marked untrusted; see
+ * `questdb_oidc_builder_file_token_store`. C callers should use
  * memory-only authentication there; custom stores are currently Rust-only.
  * Without this call, credentials remain in memory only.
  */

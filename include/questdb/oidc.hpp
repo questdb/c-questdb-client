@@ -660,12 +660,15 @@ public:
      * `0700` store directory; an existing directory is tightened to `0700` and,
      * when it was group- or other-writable, swept of entries named like store
      * records (see `questdb_oidc_builder_file_token_store`), so dedicate the
-     * directory to the store. Non-Unix platforms currently reject persistence
-     * before changing disk state because the durable metadata barrier required
-     * for rotating refresh tokens is unavailable. C++ callers should use
-     * memory-only authentication there; custom keychain-backed stores are
-     * currently available only through the Rust `TokenStore` API. Without this
-     * opt-in, credentials remain in memory only.
+     * directory to the store. Non-Unix platforms currently reject mutation
+     * preflight, save, and explicit clear before those operations change disk
+     * state because the required durable metadata barrier is unavailable.
+     * Authentication may first perform a coordinated load that creates
+     * directories and coordination files or recovers records already marked
+     * untrusted; this is not a no-write guarantee for authentication. C++
+     * callers should use memory-only authentication there; custom keychain-backed
+     * stores are currently available only through the Rust `TokenStore` API.
+     * Without this opt-in, credentials remain in memory only.
      *
      * `directory` is used verbatim: nothing expands `~`, so a value starting
      * with `~` throws rather than creating a directory literally named `~`
@@ -746,9 +749,12 @@ public:
      * unencrypted JSON under the directory named by the
      * `QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR` environment variable, or
      * `${HOME}/.questdb/oidc-tokens/` when unset. Unix uses owner-only modes;
-     * non-Unix platforms currently reject persistence before changing disk
-     * state because the required durable metadata barrier is unavailable. C++
-     * callers should use memory-only authentication there; custom stores are
+     * non-Unix platforms reject mutation preflight, save, and explicit clear
+     * before those operations change disk state because the required durable
+     * metadata barrier is unavailable. A preceding coordinated load during
+     * authentication may create directories and coordination files or recover
+     * records already marked untrusted; see `file_token_store`. C++ callers
+     * should use memory-only authentication there; custom stores are
      * currently Rust-only.
      */
     builder& default_file_token_store()

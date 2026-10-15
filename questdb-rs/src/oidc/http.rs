@@ -34,6 +34,7 @@ use std::fmt::Debug;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -130,6 +131,74 @@ pub(crate) struct HttpClient {
     timeout: Duration,
 }
 
+// Bound OS resolver calls across all OIDC clients, not just the callers still
+// waiting for their results. A request timeout cannot cancel getaddrinfo/NSS.
+static DNS_WORKERS: DnsWorkerBudget = DnsWorkerBudget::new(16);
+
+struct DnsWorkerBudget {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+struct DnsWorkerPermit(&'static DnsWorkerBudget);
+
+impl Drop for DnsWorkerPermit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl DnsWorkerBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    fn resolve(
+        &'static self,
+        timeout: NextTimeout,
+        lookup: impl FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+    ) -> std::result::Result<Vec<SocketAddr>, ureq::Error> {
+        refuse_elapsed_deadline(timeout)?;
+        if timeout.after.is_not_happening() {
+            // No worker is needed when the caller has no deadline.
+            return lookup().map_err(ureq::Error::Io);
+        }
+        self.active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                (active < self.limit).then(|| active + 1)
+            })
+            .map_err(|_| {
+                ureq::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "OIDC DNS resolver worker limit reached; retry after outstanding lookups finish",
+                ))
+            })?;
+        let permit = DnsWorkerPermit(self);
+        let (tx, rx) = mpsc::sync_channel(1);
+        // Builder::spawn turns thread exhaustion into a retryable I/O error
+        // rather than a panic (the shipped FFI uses panic=abort). The closure
+        // owns the permit, including when its receiver times out or disappears;
+        // a failed spawn drops the closure and releases the permit as well.
+        thread::Builder::new()
+            .name("questdb-oidc-dns".to_string())
+            .spawn(move || {
+                let _permit = permit;
+                let _ = tx.send(lookup());
+            })
+            .map_err(ureq::Error::Io)?;
+        match rx.recv_timeout(*timeout.after) {
+            Ok(addresses) => addresses.map_err(ureq::Error::Io),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ureq::Error::Timeout(timeout.reason)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ureq::Error::Io(
+                std::io::Error::other("OIDC DNS resolver worker exited without a result"),
+            )),
+        }
+    }
+}
+
 /// The OIDC transport permits plaintext HTTP only for local development. Keep
 /// the convenient `localhost` spelling, but verify the exact addresses handed
 /// to the connector: trusting the name alone lets a poisoned hosts/NSS/DNS
@@ -149,37 +218,11 @@ impl Resolver for OidcResolver {
         let address =
             DefaultResolver::host_and_port(scheme, authority).ok_or(ureq::Error::HostNotFound)?;
 
-        // ureq's DefaultResolver uses `thread::spawn` for every timed lookup;
-        // that panics when the OS refuses a thread. The shipped FFI uses
-        // panic=abort, turning ordinary resource exhaustion into termination of
-        // the host process. The same bounded resolver with Builder::spawn makes
-        // creation failure an ordinary retryable I/O error instead.
-        let resolved: Vec<SocketAddr> = if timeout.after.is_not_happening() {
-            address.to_socket_addrs()?.collect()
-        } else {
-            let (tx, rx) = mpsc::sync_channel(1);
-            thread::Builder::new()
-                .name("questdb-oidc-dns".to_string())
-                .spawn(move || {
-                    let _ = tx.send(
-                        address
-                            .to_socket_addrs()
-                            .map(|addresses| addresses.collect::<Vec<_>>()),
-                    );
-                })
-                .map_err(ureq::Error::Io)?;
-            match rx.recv_timeout(*timeout.after) {
-                Ok(addresses) => addresses?,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(ureq::Error::Timeout(timeout.reason));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ureq::Error::Io(std::io::Error::other(
-                        "OIDC DNS resolver worker exited without a result",
-                    )));
-                }
-            }
-        };
+        let resolved = DNS_WORKERS.resolve(timeout, move || {
+            address
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect())
+        })?;
 
         let mut addresses = self.empty();
         // `ResolvedSocketAddrs` is ureq's fixed 16-address ArrayVec.
@@ -1332,6 +1375,142 @@ mod tests {
     use rustls::server::ServerConnection;
     use rustls::{ServerConfig, StreamOwned};
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    fn wait_for_dns_workers(budget: &DnsWorkerBudget, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while budget.active.load(Ordering::Relaxed) != expected {
+            assert!(
+                Instant::now() < deadline,
+                "DNS worker permits did not recover"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn timed_out_dns_workers_hold_permits_until_resolution_finishes() {
+        // A private budget avoids racing the real resolver tests, but exercises
+        // the exact worker path all production OidcResolver instances share.
+        static BUDGET: DnsWorkerBudget = DnsWorkerBudget::new(2);
+        let timeout = NextTimeout {
+            after: TimeoutAfter::Exact(Duration::from_millis(1)),
+            reason: ureq::Timeout::Global,
+        };
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = mpsc::channel();
+            releases.push(tx);
+            let result = BUDGET.resolve(timeout, move || {
+                // Dropping `releases` also unblocks workers on assertion failure.
+                let _ = rx.recv_timeout(Duration::from_secs(10));
+                Ok(vec!["127.0.0.1:443".parse().unwrap()])
+            });
+            assert!(matches!(result, Err(ureq::Error::Timeout(_))));
+        }
+        assert_eq!(BUDGET.active.load(Ordering::Relaxed), 2);
+        let lookups = Arc::new(AtomicUsize::new(0));
+        for _ in 0..50 {
+            let lookups = lookups.clone();
+            let result = BUDGET.resolve(timeout, move || {
+                lookups.fetch_add(1, Ordering::Relaxed);
+                Ok(Vec::new())
+            });
+            assert!(matches!(result, Err(ureq::Error::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock));
+        }
+        assert_eq!(lookups.load(Ordering::Relaxed), 0);
+        assert_eq!(BUDGET.active.load(Ordering::Relaxed), 2);
+        for tx in releases {
+            tx.send(()).unwrap();
+        }
+        wait_for_dns_workers(&BUDGET, 0);
+        let addresses = vec!["127.0.0.1:443".parse().unwrap()];
+        let expected = addresses.clone();
+        assert_eq!(
+            BUDGET
+                .resolve(
+                    NextTimeout {
+                        after: TimeoutAfter::Exact(Duration::from_secs(5)),
+                        reason: ureq::Timeout::Global,
+                    },
+                    move || Ok(addresses),
+                )
+                .unwrap(),
+            expected,
+        );
+        wait_for_dns_workers(&BUDGET, 0);
+    }
+
+    #[test]
+    fn dns_worker_budget_is_shared_by_concurrent_callers() {
+        static BUDGET: DnsWorkerBudget = DnsWorkerBudget::new(2);
+        let start = Arc::new(std::sync::Barrier::new(16));
+        let outcomes = thread::scope(|scope| {
+            let callers: Vec<_> = (0..16)
+                .map(|_| {
+                    let start = start.clone();
+                    scope.spawn(move || {
+                        let (tx, rx) = mpsc::channel();
+                        start.wait();
+                        let result = BUDGET.resolve(
+                            NextTimeout {
+                                after: TimeoutAfter::Exact(Duration::from_millis(10)),
+                                reason: ureq::Timeout::Global,
+                            },
+                            move || {
+                                let _ = rx.recv_timeout(Duration::from_secs(10));
+                                Ok(Vec::new())
+                            },
+                        );
+                        (tx, result)
+                    })
+                })
+                .collect();
+            callers
+                .into_iter()
+                .map(|caller| caller.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(BUDGET.active.load(Ordering::Relaxed), 2);
+        let mut timed_out = 0;
+        let mut limited = 0;
+        for (release, result) in outcomes {
+            let _ = release.send(());
+            match result {
+                Err(ureq::Error::Timeout(_)) => timed_out += 1,
+                Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    limited += 1
+                }
+                other => panic!("unexpected DNS outcome: {other:?}"),
+            }
+        }
+        wait_for_dns_workers(&BUDGET, 0);
+        assert_eq!(timed_out, 2);
+        assert_eq!(limited, 14);
+    }
+
+    #[test]
+    fn dns_worker_error_releases_permit_and_elapsed_timeout_starts_no_lookup() {
+        static BUDGET: DnsWorkerBudget = DnsWorkerBudget::new(1);
+        let result = BUDGET.resolve(
+            NextTimeout {
+                after: TimeoutAfter::Exact(Duration::from_secs(5)),
+                reason: ureq::Timeout::Global,
+            },
+            || Err(std::io::Error::other("test lookup failure")),
+        );
+        assert!(matches!(result, Err(ureq::Error::Io(_))));
+        wait_for_dns_workers(&BUDGET, 0);
+        let result = BUDGET.resolve(
+            NextTimeout {
+                after: TimeoutAfter::Exact(Duration::ZERO),
+                reason: ureq::Timeout::Global,
+            },
+            || panic!("elapsed deadline must not start a lookup"),
+        );
+        assert!(matches!(result, Err(ureq::Error::Timeout(_))));
+        assert_eq!(BUDGET.active.load(Ordering::Relaxed), 0);
+    }
 
     fn tls_certs_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tls_certs")

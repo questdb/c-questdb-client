@@ -1844,8 +1844,13 @@ pub unsafe extern "C" fn questdb_oidc_builder_ca_bundle(
 /// Explicitly enable plaintext token persistence in `directory`.
 ///
 /// Access, ID, and long-lived refresh tokens are stored as unencrypted JSON.
-/// Unix uses owner-only file/directory modes; other platforms depend on the
-/// directory's default ACL. Without this opt-in, credentials remain in memory.
+/// Unix uses owner-only file/directory modes. The bundled store currently
+/// rejects mutations on non-Unix platforms because the required durable
+/// metadata barrier is unavailable; use memory-only authentication there.
+/// Configuration is accepted and coordinated reads remain possible, but a
+/// sign-in needing persistence fails mutation preflight. Reads may create
+/// directories and coordination files. Without this opt-in, credentials remain
+/// in memory.
 ///
 /// `directory` is used verbatim: no runtime expands `~`, so a `~/...` value is
 /// rejected here rather than silently creating a directory literally named `~`

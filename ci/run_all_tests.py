@@ -91,6 +91,7 @@ def run_cpp_tests():
         'test_arrow_ingress',
         'test_column_sender',
         'test_oidc',
+        'test_oidc_examples',
     ]
     # Each C++ target may also have a `_cxx20` twin (QUESTDB_TEST_CXX20_VARIANTS);
     # run it too when present so the C++20 header paths are exercised.
