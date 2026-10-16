@@ -349,6 +349,8 @@ public:
      * reports `failover_retry`, yet that code alone does not make the input
      * safe to resend. When `true`, only replay the same input if table-level
      * dedup/upsert keys make duplicate rows harmless.
+     *
+     * For a low-level flush, this does not track earlier independent flushes.
      */
     bool in_doubt() const noexcept
     {
