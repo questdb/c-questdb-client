@@ -1722,6 +1722,168 @@ mod tests {
         (offsets, bytes)
     }
 
+    #[test]
+    fn slice_rows_singleton_matches_fresh_chunk_at_every_bit_offset() {
+        use crate::ingress::column_sender::NumpyDtype;
+
+        let values: Vec<i64> = (0..16).map(|i| i * 17 + 3).collect();
+        let arrays: Vec<f64> = (0..32).map(|i| i as f64 + 0.5).collect();
+        let codes: Vec<i32> = (0..16).map(|i| i % 2).collect();
+        let strings: Vec<String> = (0..16).map(|i| format!("value-{i}")).collect();
+        let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+        let (offsets, bytes) = build_varchar(&refs);
+        let bool_bits = [0b1010_1100, 0b0101_0011];
+        let numpy_bools: Vec<u8> = (0..16).map(|i| (bool_bits[i / 8] >> (i % 8)) & 1).collect();
+
+        for valid_bits in [[0, 0], [255, 255], [0b1100_1010, 0b0011_0101]] {
+            let validity = Validity::from_bitmap(&valid_bits, 16).unwrap();
+            let mut source = Chunk::new("trades");
+            source.column_i64("v", &values, Some(&validity)).unwrap();
+            source.column_bool("b", &bool_bits, 16, None).unwrap();
+            source
+                .column_bool("bn", &bool_bits, 16, Some(&validity))
+                .unwrap();
+            source
+                .column_str("s", &offsets, &bytes, Some(&validity))
+                .unwrap();
+            source
+                .symbol_i32("sym", &codes, &[0, 1, 2], b"ab", Some(&validity))
+                .unwrap();
+            source
+                .column_decimal64("d", &values, 2, Some(&validity))
+                .unwrap();
+            source
+                .column_f64_array("a", &arrays, 16, &[2], Some(&validity))
+                .unwrap();
+            unsafe {
+                source
+                    .push_numpy_deferred(
+                        "nb",
+                        NumpyDtype::Bool,
+                        numpy_bools.as_ptr(),
+                        16,
+                        Some(&validity),
+                    )
+                    .unwrap();
+            }
+            source.at_nanos(&values).unwrap();
+
+            for row in 0..16 {
+                let bit = [(valid_bits[row / 8] >> (row % 8)) & 1];
+                let one_validity = Validity::from_bitmap(&bit, 1).unwrap();
+                let one_bool = [numpy_bools[row]];
+                let (one_offsets, one_bytes) = build_varchar(&refs[row..row + 1]);
+                let mut fresh = Chunk::new("trades");
+                fresh
+                    .column_i64("v", &values[row..row + 1], Some(&one_validity))
+                    .unwrap();
+                fresh.column_bool("b", &one_bool, 1, None).unwrap();
+                fresh
+                    .column_bool("bn", &one_bool, 1, Some(&one_validity))
+                    .unwrap();
+                fresh
+                    .column_str("s", &one_offsets, &one_bytes, Some(&one_validity))
+                    .unwrap();
+                fresh
+                    .symbol_i32(
+                        "sym",
+                        &codes[row..row + 1],
+                        &[0, 1, 2],
+                        b"ab",
+                        Some(&one_validity),
+                    )
+                    .unwrap();
+                fresh
+                    .column_decimal64("d", &values[row..row + 1], 2, Some(&one_validity))
+                    .unwrap();
+                fresh
+                    .column_f64_array(
+                        "a",
+                        &arrays[row * 2..row * 2 + 2],
+                        1,
+                        &[2],
+                        Some(&one_validity),
+                    )
+                    .unwrap();
+                unsafe {
+                    fresh
+                        .push_numpy_deferred(
+                            "nb",
+                            NumpyDtype::Bool,
+                            one_bool.as_ptr(),
+                            1,
+                            Some(&one_validity),
+                        )
+                        .unwrap();
+                }
+                fresh.at_nanos(&values[row..row + 1]).unwrap();
+                let view = unsafe { source.slice_rows(row, 1) };
+                assert_eq!(
+                    encode_fresh(&view),
+                    encode_fresh(&fresh),
+                    "row {row}, validity {valid_bits:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn slice_rows_singleton_arrow_bool_matches_fresh_chunk() {
+        use super::super::arrow_batch;
+        use arrow::array::BooleanArray;
+        use std::sync::Arc;
+
+        let values = [
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+        ];
+        for scalar in [false, true] {
+            let mut source = Chunk::new("trades");
+            source
+                .push_arrow_deferred(
+                    "b",
+                    arrow_batch::ColumnKind::Bool,
+                    Arc::new(BooleanArray::from(values.to_vec())),
+                )
+                .unwrap();
+            if scalar {
+                source.at_scalar_nanos(42).unwrap();
+            } else {
+                source.at_now().unwrap();
+            }
+            for (row, value) in values.iter().enumerate() {
+                let mut fresh = Chunk::new("trades");
+                fresh
+                    .push_arrow_deferred(
+                        "b",
+                        arrow_batch::ColumnKind::Bool,
+                        Arc::new(BooleanArray::from(vec![*value])),
+                    )
+                    .unwrap();
+                if scalar {
+                    fresh.at_scalar_nanos(42).unwrap();
+                } else {
+                    fresh.at_now().unwrap();
+                }
+                let view = unsafe { source.slice_rows(row, 1) };
+                assert_eq!(
+                    encode_fresh(&view),
+                    encode_fresh(&fresh),
+                    "row {row}, scalar {scalar}"
+                );
+            }
+        }
+    }
+
     /// VARCHAR slicing keeps absolute offsets into the full byte buffer; the
     /// encoder must re-base them. A slice at offset 8 (offsets[8] != 0) must
     /// encode identically to a fresh chunk of the same strings (offsets from 0),

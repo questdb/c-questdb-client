@@ -44,6 +44,11 @@
 //!   [`crate::ingress::AckLevel`].
 //! - Drop the [`crate::BorrowedSender`] to return its connection to the pool.
 //!
+//! Oversized columnar batches are split down to individual rows as needed.
+//! If a single row still exceeds the frame cap, the flush fails. Earlier rows
+//! may already have been published or committed; check
+//! [`crate::Error::in_doubt`] before retrying the whole input.
+//!
 //! ```ignore
 //! let mut sender = db.borrow_sender()?;
 //! let mut chunk = Chunk::new("trades");
