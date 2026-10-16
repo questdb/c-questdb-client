@@ -3,7 +3,7 @@
 The C++17 client is a header-only RAII wrapper over the C ABI. Its primary
 entry point is `questdb::pool`, one thread-safe QWP/WebSocket pool for both
 ingestion and queries. QWP over WebSocket requires QuestDB 10.0 or newer; the
-native library is built with Rust 1.91.1.
+native library is built with Rust 1.91.0.
 
 See the repository [compatibility matrix](COMPATIBILITY.md), then follow the
 [build](BUILD.md) and [dependency](DEPENDENCY.md) instructions.
