@@ -3,7 +3,7 @@
 //! Mirrors the Java client's `SenderConnectionListener` contract: a
 //! user-supplied listener receives [`ConnectionEvent`]s describing
 //! connection-state transitions (initial connect, endpoint attempt
-//! failures, failover, terminal auth rejection). Events are delivered on
+//! failures, failover, credential rejections). Events are delivered on
 //! a dedicated dispatcher thread through a bounded inbox with a
 //! drop-oldest overflow policy, so a slow listener can never stall
 //! connect, publish, or reconnect paths. Success events fire once per
@@ -21,6 +21,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default bounded-inbox capacity, matching the Java dispatcher.
 pub const DEFAULT_CONNECTION_EVENT_INBOX_CAPACITY: usize = 64;
+
+/// Upper bound for a caller-selected connection-event inbox, mirroring the
+/// FFI's `MAX_DB_CALLBACK_INBOX_CAPACITY` and the conf string's
+/// `QWP_WS_MAX_ERROR_INBOX_CAPACITY`. The value reaches
+/// `VecDeque::with_capacity` and the allocator aborts on failure, so an absurd
+/// one must be refused rather than becoming a process abort with no traceback.
+/// Enforced here in the core so every caller is covered, not only the C entry
+/// point: `line_sender_opts_connection_event_handler` takes a `size_t`
+/// straight from C.
+pub const MAX_CONNECTION_EVENT_INBOX_CAPACITY: usize = 65_536;
 
 /// The set of connection-state transitions that fire as discrete events.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -45,9 +55,72 @@ pub enum ConnectionEventKind {
     /// Every configured endpoint was attempted and none accepted the
     /// connection in this sweep.
     AllEndpointsUnreachable,
-    /// Terminal: the server rejected credentials. The owning
-    /// sender/pool operation surfaces the error to the caller.
+    /// The server rejected the credential the client presented: HTTP 401 or
+    /// 403 on the WebSocket upgrade. `host` and `port` are set, and
+    /// `cause_code` is [`AuthError`](crate::ErrorCode::AuthError). One event
+    /// per connect round, for the round's final outcome: a 401 that the
+    /// client retried with a refreshed token, successfully, reports nothing.
+    ///
+    /// What happens next depends on the phase
+    /// (design/qwp-token-provider-spec.md §8.3):
+    ///
+    /// * **Before a sender's first connection**, and for a connect the caller
+    ///   waits for (a pool borrow or re-borrow), it is terminal: the sender
+    ///   fails to start, the borrow fails, and a sender that connects in the
+    ///   background stops.
+    /// * **Once connected**, a store-and-forward sender keeps reconnecting
+    ///   with capped backoff and keeps its unacknowledged data, reporting each
+    ///   failed round with one of these events. An identity-provider or
+    ///   key-set outage makes a server reject a valid credential for a while,
+    ///   and store-and-forward must not drop a live producer over it. To give
+    ///   up instead, close the sender.
+    ///
+    /// If the server returns HTTP 401 but acquiring a replacement credential
+    /// then fails, the provider error decides whether to retry: that is
+    /// reported as [`CredentialUnavailable`](Self::CredentialUnavailable) with
+    /// the rejected endpoint. Mirrors the Java client's `AUTH_FAILED`, whose
+    /// cause is always a `QwpAuthFailedException`, distinct from its
+    /// `QwpCredentialUnavailableException`.
     AuthFailed,
+
+    /// The token provider failed while acquiring a credential.
+    ///
+    /// Before the first dial, `host` and `port` are `None`. If an endpoint
+    /// rejected a previously offered token with HTTP 401 and acquisition of
+    /// its replacement failed, `host` and `port` identify that endpoint and
+    /// `cause_msg` includes the 401. `cause_code` still classifies the provider
+    /// failure (ordinarily `SocketError`), not the server's rejection.
+    ///
+    /// **Read `cause_code` to tell a retry from a stop.** This kind is emitted
+    /// for every provider failure, and `classify_provider_error` does not treat
+    /// them alike:
+    ///
+    /// * `SocketError` -- the ordinary case, and retryable by design. The
+    ///   store-and-forward drainer holds queued frames while the IdP recovers
+    ///   or a human signs in, and the sender goes on reconnecting. Only a
+    ///   foreground/initial connect fails fast, because a credential problem
+    ///   during initialization is the caller's to see.
+    /// * `AuthError` or `ConfigError` -- the provider cannot recover *in this
+    ///   process*, so the reconnect is **terminal** and the runner stops. Two
+    ///   causes reach here: a permanently closed provider (an OIDC provider's
+    ///   `close()` is monotonic) and a misconfiguration the scope cannot satisfy,
+    ///   such as groups mode against an IdP that returns no `id_token`. Queued
+    ///   frames are not deleted -- a disk-backed store-and-forward slot stays
+    ///   drainable by a later process -- but this process will not send them.
+    ///
+    /// A listener that pages on a permanent stop must therefore qualify on
+    /// `cause_code`, not on the kind alone. [`AuthFailed`](Self::AuthFailed)
+    /// is the server-rejection signal.
+    ///
+    /// This is the counterpart of the Java client's
+    /// `QwpCredentialUnavailableException`: "a credential the client cannot
+    /// ACQUIRE is instead handled by connection phase, exactly like a transport
+    /// outage". It exists as its own kind so that a credential the client
+    /// could not obtain is never mistaken for one the server rejected: folding
+    /// the two together forced every listener to gate on `host.is_some()` and
+    /// made an ordinary silent-refresh blip indistinguishable from a rejected
+    /// credential.
+    CredentialUnavailable,
 }
 
 /// One connection-state transition. All `Option` fields are `None` when
@@ -462,6 +535,27 @@ impl ConnectionEventSource {
         );
     }
 
+    /// Report a provider failure before dial (`endpoint=None`) or after an
+    /// endpoint returned HTTP 401 and reacquisition failed. In the latter case
+    /// the rejected endpoint is retained for diagnostics, while `cause_code`
+    /// keeps the provider's retry/stop classification: the provider failure,
+    /// not the 401, decides what happens next.
+    pub(crate) fn token_provider_failed(
+        &self,
+        endpoint: Option<(&str, &str)>,
+        err: &crate::Error,
+        attempt: u64,
+    ) {
+        self.failed_since_success.store(true, Ordering::Relaxed);
+        let event = ConnectionEvent::new(ConnectionEventKind::CredentialUnavailable)
+            .attempt(attempt)
+            .caused_by(err);
+        self.offer(match endpoint {
+            Some((host, port)) => event.at(host, port),
+            None => event,
+        });
+    }
+
     pub(crate) fn all_endpoints_unreachable(&self, err: &crate::Error) {
         self.failed_since_success.store(true, Ordering::Relaxed);
         self.offer(
@@ -563,6 +657,35 @@ mod tests {
             ]
         );
         assert_eq!(dispatcher.dropped(), 0);
+    }
+
+    #[test]
+    fn drop_immediately_after_new_never_hangs() {
+        // Regression: dropping a dispatcher right after construction — before
+        // its freshly spawned worker has parked on the condvar — must not lose
+        // the shutdown wakeup and hang the join in Drop. This is the create-
+        // then-close race that surfaced as a `questdb_db_close` hang when a
+        // pool was closed immediately after connect. Runs on a helper thread so
+        // a regression fails fast with a message instead of wedging the suite.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_in_thread = Arc::clone(&done);
+        let runner = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                let dispatcher =
+                    ConnectionEventDispatcher::new(Arc::new(|_: &ConnectionEvent| {}), 8);
+                drop(dispatcher);
+            }
+            done_in_thread.store(true, Ordering::Release);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !done.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "EventDispatcher::drop hung joining a not-yet-parked worker (lost wakeup)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        runner.join().unwrap();
     }
 
     #[test]

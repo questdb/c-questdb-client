@@ -48,11 +48,28 @@ def run_cargo_tests():
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
+    # `ffi-support` is not part of `almost-all-features`, but it gates the
+    # owned pool-borrow API the C ABI (and so the Python client) uses, plus
+    # its retry loop and tests. Only `questdb-rs-ffi` enables it, and that
+    # crate's `cargo test` does not compile questdb-rs's own unit tests, so
+    # enable it here or those tests never run.
     run_cmd('cargo', 'test', '--locked',
-            '--features=almost-all-features,arrow,polars',
+            '--features=almost-all-features,arrow,polars,ffi-support',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--locked', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',
+            '--', '--nocapture', cwd='questdb-rs')
+    # The shape the `oidc` feature's own documentation recommends: the OIDC
+    # opt-in plus a TLS root source and a crypto provider, and nothing else.
+    # `almost-all-features` also covers oidc, but with the QWP/WS sender and
+    # the egress reader switched on, so it never compiles this cfg cut --
+    # where, for instance, the isolated-worker path in `token_provider` and
+    # its statics disappear.
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,oidc',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=aws-lc-crypto,tls-native-certs,oidc',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--locked', cwd='questdb-rs-ffi')
     run_cmd('cargo', 'test', '--locked', '--features=arrow',
@@ -75,6 +92,9 @@ def run_cpp_tests():
         'test_arrow_egress',
         'test_arrow_ingress',
         'test_column_sender',
+        'test_oidc',
+        'test_oidc_examples',
+        'test_token_provider',
     ]
     # Each C++ target may also have a `_cxx20` twin (QUESTDB_TEST_CXX20_VARIANTS);
     # run it too when present so the C++20 header paths are exercised.
@@ -96,6 +116,11 @@ def run_integration_tests():
     before that server release exists, test the approved 10.0 RC checkout with
     `--repo`. After publication, the `--versions` alternative exercises the
     exact downloadable release artifact."""
+    # Run the pure-Python cleanup regressions on every host. Do not select
+    # the entire fixture module on Windows: its stand-in processes do not
+    # have the isolated consoles that JVM shutdown expects.
+    run_cmd('python3', '-m', 'unittest', '-v',
+            'test_fixture_unit.SqlCleanupTest', cwd='system_test')
     system_test_path = pathlib.Path('system_test') / 'test.py'
     run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
     # qdb_v = '<exact QuestDB 10.0 release tag>'

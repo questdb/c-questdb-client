@@ -299,6 +299,60 @@ pub enum ErrorCode {
     SymbolDictFull,
 }
 
+/// How a token source or token provider classified a failure to supply a
+/// token: the *token-unavailable* error of the dynamic-credential
+/// specification (design/qwp-token-provider-spec.md §4, §5.3).
+///
+/// Attach one with [`Error::token_unavailable`] and read it with
+/// [`Error::as_token_unavailable`]. A connect the caller waits for -- the
+/// synchronous initial connect and a pool borrow with retry -- retries a
+/// provider failure only when it is classified retryable; any other provider
+/// failure ends that connect at once. Background reconnects keep retrying
+/// whatever the classification.
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct TokenUnavailable {
+    retryable: bool,
+    retry_after: Option<std::time::Duration>,
+    provider_closed: bool,
+}
+
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+impl TokenUnavailable {
+    pub(crate) fn new(retryable: bool, retry_after: Option<std::time::Duration>) -> Self {
+        Self {
+            retryable,
+            retry_after,
+            provider_closed: false,
+        }
+    }
+
+    /// Whether retrying can succeed: network failures, timeouts, throttling
+    /// and 5xx responses are retryable; missing or wrong configuration is not.
+    pub fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    /// How long the source suggested waiting before retrying, if it said.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        self.retry_after
+    }
+
+    /// Whether the provider was closed. A closed provider never supplies a
+    /// token again, so every client using it stops reconnecting.
+    pub(crate) fn provider_closed(&self) -> bool {
+        self.provider_closed
+    }
+}
+
 /// An error that occurred when using the QuestDB client library.
 ///
 /// The payload lives behind a `Box` so `Result<T, Error>` stays pointer-sized
@@ -313,6 +367,14 @@ struct ErrorInner {
     code: ErrorCode,
     msg: String,
     in_doubt: bool,
+    /// A provider's InvalidApiCall stays terminal even when a transport adds
+    /// context to its message (notably after a WebSocket upgrade 401).
+    #[cfg(feature = "_sender-qwp-ws")]
+    terminal_token_provider_failure: bool,
+    /// Structured OIDC failure details retained across conversion into the
+    /// client-wide error type. OIDC-only.
+    #[cfg(feature = "_oidc")]
+    oidc_error: Option<Box<crate::oidc::OidcError>>,
     /// Structured QWP/WebSocket sender rejection diagnostic.
     /// Sender-only.
     #[cfg(feature = "_sender-qwp-ws")]
@@ -331,6 +393,31 @@ struct ErrorInner {
     /// mismatch. Query-only.
     #[cfg(feature = "_egress")]
     server_info: Option<crate::egress::server_event::ServerInfo>,
+    /// HTTP status from a WebSocket upgrade rejection. Kept structured so
+    /// rotating-auth callers can distinguish a replayable 401 from 403 and
+    /// other terminal errors without parsing diagnostic text.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    ws_http_status: Option<u16>,
+    /// The `error` parameter of a `WWW-Authenticate: Bearer` challenge on a
+    /// rejected WebSocket upgrade, sanitized. Decides whether a 401 is worth a
+    /// token refresh (RFC 6750 §3.1).
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    bearer_challenge_error: Option<String>,
+    /// How a token source or provider classified its failure.
+    #[cfg(any(
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws",
+        feature = "_egress"
+    ))]
+    token_unavailable: Option<TokenUnavailable>,
+    /// Set when a token provider failed while a transport was getting its
+    /// credential: the spec's *credential-unavailable* class (§8.1).
+    #[cfg(any(
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws",
+        feature = "_egress"
+    ))]
+    provider_failure: bool,
 }
 
 impl Error {
@@ -341,6 +428,10 @@ impl Error {
             msg: msg.into(),
             in_doubt: false,
             #[cfg(feature = "_sender-qwp-ws")]
+            terminal_token_provider_failure: false,
+            #[cfg(feature = "_oidc")]
+            oidc_error: None,
+            #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_rejection: None,
             #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_role_reject: None,
@@ -348,7 +439,112 @@ impl Error {
             upgrade_reject: None,
             #[cfg(feature = "_egress")]
             server_info: None,
+            #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+            ws_http_status: None,
+            #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+            bearer_challenge_error: None,
+            #[cfg(any(
+                feature = "_sender-http",
+                feature = "_sender-qwp-ws",
+                feature = "_egress"
+            ))]
+            token_unavailable: None,
+            #[cfg(any(
+                feature = "_sender-http",
+                feature = "_sender-qwp-ws",
+                feature = "_egress"
+            ))]
+            provider_failure: false,
         }))
+    }
+
+    /// A *token-unavailable* error, for token sources and providers to report
+    /// why they cannot supply a token (design/qwp-token-provider-spec.md §4).
+    ///
+    /// `retryable` says whether retrying can succeed: network failures,
+    /// timeouts, HTTP 429 and 5xx are retryable; configuration that is missing
+    /// or wrong is not. When unsure, report it as retryable. `retry_after` is
+    /// the platform's suggested wait, such as a `Retry-After` header.
+    ///
+    /// The message must not contain a token or a raw response body.
+    ///
+    /// The code is [`SocketError`](ErrorCode::SocketError) for a retryable
+    /// failure and [`AuthError`](ErrorCode::AuthError) for a permanent one.
+    #[cfg(any(
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws",
+        feature = "_egress"
+    ))]
+    pub fn token_unavailable<S: Into<String>>(
+        retryable: bool,
+        retry_after: Option<std::time::Duration>,
+        msg: S,
+    ) -> Error {
+        let code = if retryable {
+            ErrorCode::SocketError
+        } else {
+            ErrorCode::AuthError
+        };
+        Error::new(code, msg).with_token_unavailable(TokenUnavailable::new(retryable, retry_after))
+    }
+
+    /// The error a closed token provider reports: permanent, and terminal for
+    /// every client that uses the provider.
+    #[cfg(any(
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws",
+        feature = "_egress"
+    ))]
+    pub(crate) fn token_provider_closed<S: Into<String>>(msg: S) -> Error {
+        Error::new(ErrorCode::AuthError, msg).with_token_unavailable(TokenUnavailable {
+            retryable: false,
+            retry_after: None,
+            provider_closed: true,
+        })
+    }
+
+    #[cfg(any(
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws",
+        feature = "_egress"
+    ))]
+    pub(crate) fn with_token_unavailable(mut self, classification: TokenUnavailable) -> Self {
+        self.0.token_unavailable = Some(classification);
+        self
+    }
+
+    /// The token-unavailable classification of this error, when a token
+    /// source or token provider reported one with
+    /// [`token_unavailable`](Self::token_unavailable).
+    #[cfg(any(
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws",
+        feature = "_egress"
+    ))]
+    pub fn as_token_unavailable(&self) -> Option<&TokenUnavailable> {
+        self.0.token_unavailable.as_ref()
+    }
+
+    #[cfg(any(
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws",
+        feature = "_egress"
+    ))]
+    pub(crate) fn with_provider_failure(mut self) -> Self {
+        self.0.provider_failure = true;
+        self
+    }
+
+    /// Whether a token provider failed while a transport was getting its
+    /// credential. Survives [`reclassified`](Self::reclassified).
+    #[cfg(any(
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws",
+        feature = "_egress"
+    ))]
+    #[cfg_attr(not(feature = "_sender-qwp-ws"), allow(dead_code))]
+    pub(crate) fn is_provider_failure(&self) -> bool {
+        self.0.provider_failure
     }
 
     /// Mark this error as *delivery-unknown* ("in doubt"): the current input's
@@ -358,7 +554,7 @@ impl Error {
     /// [`Error::in_doubt`]. See `PooledSenderCore::flush` and the `FlushFailure`
     /// delivery classification.
     #[must_use]
-    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[cfg(any(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
     pub(crate) fn with_in_doubt(mut self, in_doubt: bool) -> Self {
         self.0.in_doubt = in_doubt;
         self
@@ -382,6 +578,60 @@ impl Error {
     #[must_use]
     pub fn in_doubt(&self) -> bool {
         self.0.in_doubt
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn with_terminal_token_provider_failure(mut self) -> Self {
+        self.0.terminal_token_provider_failure = true;
+        self
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn is_terminal_token_provider_failure(&self) -> bool {
+        self.0.terminal_token_provider_failure
+    }
+
+    /// Attach the structured OIDC failure that produced this client-wide
+    /// error. This preserves device-flow diagnostics for FFI and other generic
+    /// error consumers without adding OIDC-specific variants to [`ErrorCode`].
+    #[cfg(feature = "_oidc")]
+    pub(crate) fn with_oidc_error(mut self, oidc_error: crate::oidc::OidcError) -> Self {
+        self.0.oidc_error = Some(Box::new(oidc_error));
+        self
+    }
+
+    /// Replace the broad error classification and user-facing context while
+    /// retaining every structured diagnostic attached by the original source.
+    ///
+    /// Transport adapters use this when an error must become retryable or gain
+    /// endpoint context. Constructing a fresh [`Error`] there would silently
+    /// discard OIDC, QWP, and query-side diagnostic payloads.
+    #[cfg_attr(
+        not(any(
+            feature = "_sender-http",
+            feature = "_sender-qwp-ws",
+            feature = "_egress"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn reclassified<S: Into<String>>(mut self, code: ErrorCode, msg: S) -> Self {
+        self.0.code = code;
+        self.0.msg = msg.into();
+        self
+    }
+
+    /// The structured OIDC failure in this error's causal chain, if any.
+    ///
+    /// `Some` means an OIDC failure *caused* this error, not that this error
+    /// is one: `reclassified` deliberately preserves the
+    /// payload, so a token-provider failure re-coded to a retryable
+    /// [`SocketError`](crate::ErrorCode::SocketError), or a failover that then
+    /// exhausted its budget, both still answer `Some` while [`code`](Self::code)
+    /// and [`msg`](Self::msg) describe the outer failure. Read this for the auth
+    /// detail; keep using `code`/`msg` for what actually went wrong.
+    #[cfg(feature = "_oidc")]
+    pub fn oidc_error(&self) -> Option<&crate::oidc::OidcError> {
+        self.0.oidc_error.as_deref()
     }
 
     /// Attach a structured QWP/WebSocket rejection to this error.
@@ -445,6 +695,36 @@ impl Error {
         }
     }
 
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    pub(crate) fn with_ws_http_status(mut self, status: u16) -> Self {
+        self.0.ws_http_status = Some(status);
+        self
+    }
+
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    pub(crate) fn ws_http_status(&self) -> Option<u16> {
+        self.0.ws_http_status
+    }
+
+    /// Attach the `error` parameter of a rejected upgrade's
+    /// `WWW-Authenticate: Bearer` challenge, if it carried one.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    pub(crate) fn with_bearer_challenge_error(mut self, error: Option<String>) -> Self {
+        self.0.bearer_challenge_error = error;
+        self
+    }
+
+    /// Whether a 401 on a WebSocket upgrade is worth a token refresh: there is
+    /// no Bearer challenge with an `error` parameter, or its error is
+    /// `invalid_token` (design/qwp-token-provider-spec.md §8.2).
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    pub(crate) fn upgrade_401_allows_token_refresh(&self) -> bool {
+        self.ws_http_status() == Some(401)
+            && crate::token_provider::bearer_challenge::allows_token_refresh(
+                self.0.bearer_challenge_error.as_deref(),
+            )
+    }
+
     /// Get the error code (category) of this error.
     pub fn code(&self) -> ErrorCode {
         self.0.code
@@ -465,6 +745,14 @@ impl Error {
     #[cfg(feature = "_sender-qwp-ws")]
     pub(crate) fn qwp_ws_role_reject(&self) -> Option<&crate::ingress::QwpWsRoleReject> {
         self.0.qwp_ws_role_reject.as_ref()
+    }
+
+    /// Whether a QWP/WebSocket upgrade was rejected by a server advertising
+    /// its role. Unlike a plain protocol-version failure, this rejection can
+    /// be retried against another endpoint while the role changes.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn is_qwp_ws_role_reject(&self) -> bool {
+        self.0.qwp_ws_role_reject.is_some()
     }
 
     /// Server-advertised role + zone carried alongside a query-side error.
@@ -539,6 +827,21 @@ mod tests {
         let err = fmt!(ProtocolError, "bad code 0x{:02X}", 0xAB);
         assert_eq!(err.code(), ErrorCode::ProtocolError);
         assert_eq!(err.msg(), "bad code 0xAB");
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn reclassification_preserves_structured_oidc_error() {
+        let oidc = crate::oidc::OidcError::interaction_required("sign in");
+        let err = Error::from(oidc)
+            .reclassified(ErrorCode::SocketError, "Token provider failed: sign in");
+
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert_eq!(err.msg(), "Token provider failed: sign in");
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
     }
 
     #[cfg(feature = "_egress")]

@@ -118,8 +118,13 @@ pub struct WsTransport {
 }
 
 impl WsTransport {
-    /// Connect to a specific endpoint in `config.addrs` by index.
-    pub fn connect_to(config: &ReaderConfig, addr_idx: usize) -> Result<Self> {
+    /// Connect to a specific endpoint in `config.addrs` by index using headers
+    /// resolved once for the surrounding endpoint walk.
+    pub fn connect_to(
+        config: &ReaderConfig,
+        addr_idx: usize,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<Self> {
         if addr_idx >= config.addrs.len() {
             return Err(fmt!(
                 ConfigError,
@@ -234,8 +239,7 @@ impl WsTransport {
         // validation.
         let host_header = endpoint.to_string();
         let path = config.path.clone();
-        let extra_headers = config.upgrade_headers();
-        let handshake_result = handshake::upgrade(&mut stream, &host_header, &path, &extra_headers);
+        let handshake_result = handshake::upgrade(&mut stream, &host_header, &path, extra_headers);
 
         let handshake = match handshake_result {
             Ok(h) => h,
@@ -665,10 +669,24 @@ fn map_http_reject(reject: HttpReject) -> Error {
         // is failover-eligible.
         ErrorCode::HandshakeError
     };
+    // A Bearer challenge's `error` decides whether a 401 is worth a token
+    // refresh (RFC 6750 §3.1).
+    let bearer_error = if code == ErrorCode::AuthError {
+        crate::token_provider::bearer_challenge::sanitized_bearer_error(
+            headers.join_all_ci("www-authenticate").as_deref(),
+        )
+    } else {
+        None
+    };
+    let detail = bearer_error
+        .as_deref()
+        .map_or_else(String::new, |error| format!(" [error={error}]"));
     Error::new(
         code,
-        format!("WebSocket handshake failed with HTTP {}", status),
+        format!("WebSocket handshake failed with HTTP {status}{detail}"),
     )
+    .with_ws_http_status(status)
+    .with_bearer_challenge_error(bearer_error)
 }
 
 /// Extract `X-QuestDB-Role` (and the optional `X-QuestDB-Zone`) from a

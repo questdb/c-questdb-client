@@ -73,6 +73,7 @@ _WIN_CONSOLE_CTRL_HELPER = r'''
 import ctypes
 import ctypes.wintypes
 import sys
+import time
 
 CTRL_C_EVENT = 0
 CTRL_BREAK_EVENT = 1
@@ -89,18 +90,23 @@ def bail(code, what):
     sys.exit(code)
 
 
-# The posted event reaches every process on the console, this helper
-# included. A handler that claims each event keeps the default handler
+kernel32.FreeConsole()  # Failure is fine: it means we had no console.
+if not kernel32.AttachConsole(pid):
+    bail(3, 'AttachConsole')
+# AttachConsole resets the process's control-handler table, so install the
+# handler only after attaching. The posted event reaches every process on
+# the console, this helper included; claiming it keeps the default handler
 # (ExitProcess) from killing the helper before it can report success.
-# Merely ignoring would not do: SetConsoleCtrlHandler(NULL, TRUE)
-# covers Ctrl+C only, not Ctrl+Break.
 handler_t = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
 claim_all = handler_t(lambda _event: True)
 if not kernel32.SetConsoleCtrlHandler(claim_all, True):
     bail(2, 'SetConsoleCtrlHandler')
-kernel32.FreeConsole()  # Failure is fine: it means we had no console.
-if not kernel32.AttachConsole(pid):
-    bail(3, 'AttachConsole')
+# Suppress Ctrl+C deterministically in the helper. This flag is per-process,
+# so the JVM still receives Ctrl+C; claim_all remains necessary for
+# Ctrl+Break, which this flag does not cover.
+if event == CTRL_C_EVENT:
+    if not kernel32.SetConsoleCtrlHandler(None, True):
+        bail(5, 'SetConsoleCtrlHandler(ignore Ctrl+C)')
 # Process group 0 == everyone on this console, which is exactly the JVM
 # (and this helper): the JVM was launched with CREATE_NO_WINDOW, so its
 # console hosts nothing else. Group 0 rather than the JVM's pid because
@@ -109,6 +115,10 @@ if not kernel32.AttachConsole(pid):
 # without delivering anything.
 if not kernel32.GenerateConsoleCtrlEvent(event, 0):
     bail(4, 'GenerateConsoleCtrlEvent')
+# GenerateConsoleCtrlEvent queues delivery asynchronously. Stay attached
+# while the JVM's handler consumes the event; exiting immediately can detach
+# from the console first and drop the shutdown or thread-dump request.
+time.sleep(3)
 '''
 
 
@@ -318,7 +328,7 @@ class QuestDbFixtureBase:
         encoded = base64.b64encode(credentials).decode('ascii')
         return {'Authorization': f'Basic {encoded}'}
 
-    def http_sql_query(self, sql_query):
+    def http_sql_query(self, sql_query, *, timeout_sec=5):
         url = (
                 f'http://{self.host}:{self.http_server_port}/exec?' +
                 urllib.parse.urlencode({'query': sql_query}))
@@ -328,7 +338,7 @@ class QuestDbFixtureBase:
                 url,
                 headers=self.http_headers(),
                 method='GET')
-            resp = urllib.request.urlopen(req, timeout=5)
+            resp = urllib.request.urlopen(req, timeout=timeout_sec)
             buf = resp.read()
         except urllib.error.HTTPError as http_error:
             buf = http_error.read()
@@ -429,7 +439,10 @@ class QuestDbFixtureBase:
             raise qe
         
     def drop_table(self, table_name):
-        self.http_sql_query(f"drop table '{table_name}'")
+        # WAL writer cleanup can exceed the normal 5s query/poll timeout,
+        # particularly on Windows. Give this DDL a bounded cleanup budget;
+        # do not retry it, since a timed-out request may already have applied.
+        self.http_sql_query(f"drop table '{table_name}'", timeout_sec=30)
 
     def drop_all_tables(self):
         """Drop all tables in the database."""
