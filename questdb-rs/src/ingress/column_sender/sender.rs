@@ -1157,11 +1157,7 @@ impl DirectColumnBackend {
                 let row_count = chunk.row_count();
                 match split_mid(row_count) {
                     Some(mid) => {
-                        // Splitting publishes deferred prefix frames as it goes.
-                        // If a later sub-range hits the floor, those frames sit
-                        // on the wire uncommitted; tear the connection down so
-                        // the drop-time best-effort commit discards them instead
-                        // of committing a partial chunk under a later boundary.
+                        let fsn_before_split = self.conn.next_fsn();
                         let mut committed = false;
                         let mut result = self.publish_split(chunk, 0, mid, true, &mut committed);
                         if result.is_ok() {
@@ -1174,7 +1170,11 @@ impl DirectColumnBackend {
                             );
                         }
                         if let Err(e) = result {
-                            self.conn.mark_must_close();
+                            // Discard this split's partial prefix, but preserve
+                            // earlier chunks if this split published nothing.
+                            if self.conn.next_fsn() != fsn_before_split {
+                                self.conn.mark_must_close();
+                            }
                             // A mid-split sync may already have committed a
                             // prefix. The deferred remainder is discarded on
                             // drop, but a committed prefix is real, so downgrade
@@ -1399,6 +1399,7 @@ impl DirectColumnBackend {
                 let row_count = batch.num_rows();
                 match split_mid(row_count) {
                     Some(mid) => {
+                        let fsn_before_split = self.conn.next_fsn();
                         let mut committed = false;
                         let mut result =
                             self.publish_arrow_split(&spec, 0, mid, true, &mut committed);
@@ -1412,7 +1413,9 @@ impl DirectColumnBackend {
                             );
                         }
                         if let Err(e) = result {
-                            self.conn.mark_must_close();
+                            if self.conn.next_fsn() != fsn_before_split {
+                                self.conn.mark_must_close();
+                            }
                             // See `flush_inner`: a mid-split sync may have
                             // committed a prefix, so a blind retry would
                             // duplicate it.

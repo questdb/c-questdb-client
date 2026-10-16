@@ -3330,6 +3330,92 @@ fn small_arrow_batch_splits_below_eight_rows(
     assert_small_split_frames(&frames.try_iter().collect::<Vec<_>>(), counts, CAP);
 }
 
+fn assert_direct_rejection_preserves_deferred_tail(
+    explicit_commit: bool,
+    reject: impl FnOnce(&mut crate::BorrowedDirectColumnSender<'_>) -> crate::Result<()>,
+) {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "max_buf_size=2048;pool_reap=manual;",
+    ))
+    .unwrap();
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    for value in [100, 101, 102] {
+        let qty = [value];
+        let mut chunk = Chunk::new("trades");
+        chunk.column_i64("qty", &qty, None).unwrap();
+        chunk.at_now().unwrap();
+        if value == 100 {
+            sender.flush_and_wait(&mut chunk, AckLevel::Ok).unwrap();
+        } else {
+            sender.flush(&mut chunk).unwrap();
+        }
+        assert!(chunk.is_empty());
+        let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(frame_qty_values(&frame), vec![value]);
+        assert_eq!(frame[5] & 1 != 0, value != 100);
+    }
+    assert_eq!(sender.in_flight(), 2);
+
+    let err = reject(&mut sender).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(!err.in_doubt());
+    assert_eq!(sender.in_flight(), 2);
+
+    if explicit_commit {
+        sender.commit(AckLevel::Ok).unwrap();
+        assert_eq!(sender.in_flight(), 0);
+    }
+    drop(sender);
+
+    let commit = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(commit[5] & 1, 0);
+    assert_eq!(u16::from_le_bytes([commit[6], commit[7]]), 0);
+    assert!(frames.try_recv().is_err());
+    assert_eq!(server.accepted(), 1);
+}
+
+#[rstest::rstest]
+fn direct_chunk_local_size_rejection_preserves_deferred_tail(
+    #[values(1, 2, 8, 9)] rows: usize,
+    #[values(false, true)] explicit_commit: bool,
+) {
+    let bytes = vec![b'x'; 4096 + rows - 1];
+    let offsets: Vec<i32> = std::iter::once(0)
+        .chain((0..rows).map(|i| (4096 + i) as i32))
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_str("s", &offsets, &bytes, None).unwrap();
+    chunk.at_now().unwrap();
+
+    assert_direct_rejection_preserves_deferred_tail(explicit_commit, |sender| {
+        let result = sender.flush(&mut chunk);
+        assert_eq!(chunk.row_count(), rows);
+        result
+    });
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[rstest::rstest]
+fn direct_arrow_local_size_rejection_preserves_deferred_tail(
+    #[values(1, 2, 8, 9)] rows: usize,
+    #[values(false, true)] explicit_commit: bool,
+) {
+    use arrow::array::{ArrayRef, RecordBatch, StringArray};
+
+    let strings: ArrayRef = Arc::new(StringArray::from(
+        (0..rows)
+            .map(|i| "x".repeat(if i == 0 { 4096 } else { 1 }))
+            .collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_from_iter([("s", strings)]).unwrap();
+    assert_direct_rejection_preserves_deferred_tail(explicit_commit, |sender| {
+        sender.flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
+    });
+}
+
 #[rstest::rstest]
 fn small_chunk_oversized_row_preserves_delivery_classification(
     #[values(0, 2)] oversized_row: usize,
@@ -3361,7 +3447,7 @@ fn small_chunk_oversized_row_preserves_delivery_classification(
         let err = sender.flush(&mut chunk).unwrap_err();
         assert_eq!(err.code(), ErrorCode::BatchTooLarge);
         assert!(!err.in_doubt(), "no intermediate commit has occurred");
-        assert!(sender.must_close_for_test());
+        assert_eq!(sender.must_close_for_test(), oversized_row != 0);
     } else {
         let mut sender = db.borrow_sender().unwrap();
         let err = sender.flush(&mut chunk).unwrap_err();
@@ -3391,6 +3477,39 @@ fn small_chunk_oversized_row_preserves_delivery_classification(
             assert_split_closed_by_empty_committing_frame(&captured);
         }
     }
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn direct_arrow_split_failure_discards_partial_chunk() {
+    use arrow::array::{ArrayRef, RecordBatch, StringArray};
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "max_buf_size=2048;pool_reap=manual;",
+    ))
+    .unwrap();
+    let big = "x".repeat(4096);
+    let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", big.as_str()]));
+    let batch = RecordBatch::try_from_iter([("s", strings)]).unwrap();
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    let err = sender
+        .flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(!err.in_doubt());
+    assert_eq!(
+        sender.commit(AckLevel::Ok).unwrap_err().code(),
+        ErrorCode::FailoverRetry
+    );
+    drop(sender);
+
+    let prefix = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(frame_row_count(&prefix), 2);
+    assert_ne!(prefix[5] & 1, 0);
+    assert!(frames.try_recv().is_err());
 }
 
 #[test]
