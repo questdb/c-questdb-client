@@ -5774,51 +5774,32 @@ mod tests {
             .unwrap();
         let _server_streams = server.join().unwrap();
 
-        // A short read timeout plus a retry loop instead of one indefinitely
-        // blocking read: on Windows the gate's CancelIoEx only cancels a recv
-        // already in flight, and Winsock shutdown() does not wake one entered
-        // afterwards, so a single read can straddle the shutdown and miss
-        // both wake-ups. Retrying sidesteps the race: once the gate has shut
-        // the replacement socket down, the next read attempt fails
-        // immediately. A missing reconnect registration still fails the test,
-        // because the gate never touches this socket and every attempt times
-        // out until the deadline.
+        // The gate shuts the socket down before the read is issued, on this
+        // same thread, so no recv is in flight when it runs. This test checks
+        // only which socket the gate holds after a reconnect; the outcome
+        // does not depend on Windows CancelIoEx timing or on how Winsock
+        // treats a recv that overlaps shutdown(). A read issued after the
+        // shutdown returns EOF at once (std reports Winsock WSAESHUTDOWN as
+        // Ok(0)). A missing reconnect registration leaves the replacement
+        // socket open, and the read times out.
         transport
             .stream
-            .set_timeouts(Some(Duration::from_millis(100)), None)
+            .set_timeouts(Some(Duration::from_secs(5)), None)
             .unwrap();
-        let reader = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let mut byte = [0u8; 1];
-            loop {
-                match transport.stream.read(&mut byte) {
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) && std::time::Instant::now() < deadline => {}
-                    result => return result,
-                }
-            }
-        });
         traffic_gate.shutdown().unwrap();
 
-        match reader.join().unwrap() {
+        let mut byte = [0u8; 1];
+        match transport.stream.read(&mut byte) {
             Ok(0) => {}
             Err(err)
                 if matches!(
                     err.kind(),
-                    std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::ConnectionAborted
+                    std::io::ErrorKind::ConnectionAborted
                         | std::io::ErrorKind::ConnectionReset
                         | std::io::ErrorKind::NotConnected
                         | std::io::ErrorKind::BrokenPipe
                 ) => {}
-            // CancelIoEx interrupts an in-flight recv as WSAEINTR (10004) and
-            // a recv issued after Winsock shutdown() fails with WSAESHUTDOWN
-            // (10058); neither maps to a stable `ErrorKind`.
-            Err(err) if matches!(err.raw_os_error(), Some(10004) | Some(10058)) => {}
-            result => panic!("replacement socket read was not interrupted: {result:?}"),
+            result => panic!("traffic gate did not shut down the replacement socket: {result:?}"),
         }
     }
 
