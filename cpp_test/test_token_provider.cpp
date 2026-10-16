@@ -125,7 +125,8 @@ TEST_CASE("An application provider hears rejections and is released")
         CHECK(provider.token() == "fresh");
         CHECK(
             watch.lock()->rejected() ==
-            std::vector<std::pair<std::string, uint16_t>>{{"stale", 401}});
+            std::vector<std::pair<std::string, uint16_t>>{
+                {"stale", uint16_t{401}}});
         CHECK(provider.await_ready(0ms));
     }
     CHECK(watch.expired());
