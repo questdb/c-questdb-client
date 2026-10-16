@@ -327,7 +327,7 @@ fn run_mock_server_accept_loop(
                                 ack_each_frame_durable(&mut stream, &stop, capture)
                             }
                             MockMode::ReconnectAfterFirstFrame if accept_index == 0 => {
-                                read_then_close(&mut stream, &stop, 1)
+                                read_then_close(&mut stream, &stop, 1, capture)
                             }
                             MockMode::ReconnectAfterFirstFrame => {
                                 ack_each_frame(&mut stream, &stop, capture)
@@ -362,7 +362,9 @@ fn run_mock_server_accept_loop(
                                     (accept_index == 0).then_some(reject_at),
                                 )
                             }
-                            MockMode::ReadThenClose(n) => read_then_close(&mut stream, &stop, n),
+                            MockMode::ReadThenClose(n) => {
+                                read_then_close(&mut stream, &stop, n, capture)
+                            }
                         }
                     }
                 });
@@ -760,17 +762,25 @@ fn defer_aware_ack_rejecting(
 /// Read (consume) the first `n` binary frames the client sends — so its
 /// `write_all`s provably succeed — then close without ever acking. The client's
 /// subsequent ACK-wait read hits EOF.
-fn read_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize) {
+fn read_then_close(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+    n: usize,
+    capture: Option<mpsc::Sender<Vec<u8>>>,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut read = 0usize;
     while !stop.load(Ordering::SeqCst) && read < n {
         match read_frame(stream) {
-            Ok((_fin, opcode, _payload)) => {
+            Ok((_fin, opcode, payload)) => {
                 if opcode == 0x8 {
                     break;
                 }
                 if opcode != 0x2 {
                     continue;
+                }
+                if let Some(tx) = &capture {
+                    let _ = tx.send(payload);
                 }
                 read += 1;
             }
@@ -7761,7 +7771,7 @@ fn data_frame_count(frames: &mpsc::Receiver<Vec<u8>>) -> usize {
 // 12-byte header, delta-dict prefix, table, row/col counts, signature, then
 // the column body `flag(0) + row_count * i64_le`.
 #[cfg(feature = "arrow-ingress")]
-fn redriven_i64_rows(frames: &mpsc::Receiver<Vec<u8>>) -> Vec<i64> {
+fn redriven_i64_rows(frames: impl IntoIterator<Item = Vec<u8>>) -> Vec<i64> {
     fn varint(f: &[u8], pos: &mut usize) -> u64 {
         let (mut shift, mut value) = (0u32, 0u64);
         loop {
@@ -7779,7 +7789,7 @@ fn redriven_i64_rows(frames: &mpsc::Receiver<Vec<u8>>) -> Vec<i64> {
         *pos += len;
     }
     let mut rows = Vec::new();
-    for f in frames.try_iter() {
+    for f in frames {
         if f.len() < 12 || &f[..4] != b"QWP1" || u16::from_le_bytes([f[6], f[7]]) < 1 {
             continue;
         }
@@ -7848,7 +7858,7 @@ fn direct_flush_arrow_batch_splits_oversize_batch_into_capped_frames() {
         replay_tx.send(f).unwrap();
     }
     drop(replay_tx);
-    let mut got = redriven_i64_rows(&replay_rx);
+    let mut got = redriven_i64_rows(replay_rx.try_iter());
     got.sort_unstable();
     assert_eq!(
         got, vals,
@@ -7914,7 +7924,7 @@ fn store_and_forward_arrow_batch_reports_fsn_progress_and_split_boundary() {
         replay_tx.send(f).unwrap();
     }
     drop(replay_tx);
-    let mut got = redriven_i64_rows(&replay_rx);
+    let mut got = redriven_i64_rows(replay_rx.try_iter());
     got.sort_unstable();
     assert_eq!(
         got, vals,
@@ -8115,7 +8125,7 @@ fn store_and_forward_arrow_split_commits_early_rather_than_stalling_on_queue_cap
         replay_tx.send(frame).unwrap();
     }
     drop(replay_tx);
-    let mut got = redriven_i64_rows(&replay_rx);
+    let mut got = redriven_i64_rows(replay_rx.try_iter());
     got.sort_unstable();
     assert_eq!(
         got, vals,
@@ -8371,7 +8381,7 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
     // The whole df (the primary died before any checkpoint committed) is
     // re-driven onto the live endpoint: every row exactly once, none dropped
     // or duplicated, in order.
-    let mut got = redriven_i64_rows(&frames);
+    let mut got = redriven_i64_rows(frames.try_iter());
     got.sort_unstable();
     assert_eq!(
         got,
@@ -8424,7 +8434,7 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
     // 66 batches − 64 committed on the primary (one CHECKPOINT_BATCHES run) = 2
     // re-driven; the committed prefix (rows 1..=64) is not re-sent, so only the
     // uncommitted tail rows 65 and 66 reach the live endpoint, exactly once.
-    let mut got = redriven_i64_rows(&frames);
+    let mut got = redriven_i64_rows(frames.try_iter());
     got.sort_unstable();
     assert_eq!(
         got,
@@ -8480,6 +8490,203 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
         wait_until(Duration::from_secs(2), || recovery.accepted() >= 1),
         "the delayed recovery endpoint must eventually be used"
     );
+}
+
+#[cfg(feature = "polars-ingress")]
+#[test]
+fn flush_polars_dataframe_validation_error_covers_published_prefix() {
+    use crate::ingress::polars::PolarsIngestOptions;
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
+
+    // Reject UInt64 outside QuestDB LONG's range before publication, after
+    // one eager publication, and after a full 64-batch ACK checkpoint.
+    for prefix in [0, 1, 64] {
+        let (server, frames) = MockServer::spawn_acking_capturing(1);
+        let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+        let mut values = vec![1_u64; prefix];
+        values.push(u64::MAX);
+        let column = Series::new(PlSmallStr::from("i"), values.as_slice()).into_column();
+        let df = crate::polars_ffi::df_from_columns(vec![column]).unwrap();
+
+        let err = db
+            .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest, "{err}");
+        assert_eq!(err.in_doubt(), prefix != 0, "prefix={prefix}: {err}");
+        let fresh_error = db
+            .flush_polars_dataframe(
+                "trades",
+                &df.slice(prefix as i64, 1),
+                &PolarsIngestOptions::new(),
+            )
+            .unwrap_err();
+        assert!(!fresh_error.in_doubt(), "a new call starts with no history");
+        drop(db);
+        assert_eq!(data_frame_count(&frames), prefix, "prefix={prefix}");
+        assert_eq!(server.accepted(), 1);
+    }
+}
+
+#[test]
+fn direct_flush_error_does_not_aggregate_earlier_calls() {
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let server = MockServer::spawn_acking(1);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+    sender.flush(&mut first).unwrap();
+
+    let mut second = Chunk::new("trades");
+    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+    let err = sender.flush(&mut second).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SymbolDictFull);
+    assert!(!err.in_doubt(), "only the current chunk is classified");
+    assert_eq!(second.row_count(), 1);
+    sender.drop_on_return();
+}
+
+#[cfg(feature = "polars-ingress")]
+#[test]
+fn flush_polars_dataframe_first_batch_split_keeps_in_doubt_on_replacement_auth_error() {
+    use crate::ingress::polars::PolarsIngestOptions;
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
+
+    // Coupled to private column_sender::conn::MAX_IN_FLIGHT: 127 deferred
+    // frames fill the window, followed by an ACKing commit. This must happen
+    // inside the FIRST logical Polars batch, before `published` can be set by
+    // a successful batch. The primary consumes that prefix but never ACKs it.
+    const WINDOW_FRAMES: usize = 128;
+    const ROWS: usize = 32768;
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    let (tx, frames) = mpsc::channel();
+    let primary =
+        MockServer::spawn_with_mode_capture(1, MockMode::ReadThenClose(WINDOW_FRAMES), Some(tx));
+    let replacement = MockServer::spawn_auth_rejecting(1);
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), replacement.port()],
+        "sender_pool_min=1;sender_pool_max=2;pool_reap=manual;max_buf_size=2048;connect_timeout=500;",
+    ))
+    .unwrap();
+    let values: Vec<i64> = (0..ROWS as i64).collect();
+    let column = Series::new(PlSmallStr::from("i"), values.as_slice()).into_column();
+    let df = crate::polars_ffi::df_from_columns(vec![column]).unwrap();
+    let err = db
+        .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(ROWS))
+        .unwrap_err();
+
+    // EOF and then the replacement's 401 synchronize capture without sleeps.
+    let captured: Vec<_> = frames.try_iter().collect();
+    assert_eq!(primary.accepted(), 1);
+    assert_eq!(replacement.accepted(), 1);
+    assert_eq!(captured.len(), WINDOW_FRAMES);
+    for (index, frame) in captured.iter().enumerate() {
+        assert!(frame.len() >= 12);
+        assert_eq!(&frame[..4], b"QWP1");
+        let deferred = index < WINDOW_FRAMES - 1;
+        assert_eq!(frame[5] & FLAG_DEFER_COMMIT != 0, deferred);
+        assert_eq!(
+            u16::from_le_bytes([frame[6], frame[7]]),
+            u16::from(deferred)
+        );
+    }
+    let rows = redriven_i64_rows(captured);
+    assert!(!rows.is_empty() && rows.len() < ROWS);
+    assert_eq!(rows, values[..rows.len()], "exact first-batch prefix");
+    assert_eq!(err.code(), ErrorCode::AuthError, "{err}");
+    assert!(
+        err.in_doubt(),
+        "partial publication must survive replacement failure: {err}"
+    );
+}
+
+#[cfg(feature = "polars-ingress")]
+#[test]
+fn flush_polars_dataframe_failure_after_reconnect_keeps_call_status() {
+    use crate::ingress::polars::PolarsIngestOptions;
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
+
+    let primary = MockServer::spawn_ack_then_close(1, 64);
+    let live = MockServer::spawn_acking(1);
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), live.port()],
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
+    let mut values = vec![1_u64; 129];
+    values.push(u64::MAX);
+    let column = Series::new(PlSmallStr::from("i"), values.as_slice()).into_column();
+    let df = crate::polars_ffi::df_from_columns(vec![column]).unwrap();
+
+    let err = db
+        .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ArrowIngest, "{err}");
+    assert!(err.in_doubt());
+    assert_eq!(primary.accepted(), 1);
+    assert_eq!(
+        live.accepted(),
+        1,
+        "the call must have replaced its connection"
+    );
+}
+
+#[cfg(feature = "polars-ingress")]
+#[test]
+fn flush_polars_dataframe_failure_before_replay_keeps_call_status() {
+    use crate::ingress::polars::PolarsIngestOptions;
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
+
+    const CHECKPOINT_BATCHES: usize = 64;
+    const VALUE_BYTES: usize = 4096;
+    const REPLACEMENT_CAP: usize = 2048;
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+
+    // Commit a checkpoint on the primary, then reconnect successfully to a
+    // peer whose frame limit cannot fit even one row. No successful replay
+    // batch can restore `published` if reconnecting incorrectly cleared it.
+    let (tx, frames) = mpsc::channel();
+    let primary = MockServer::spawn_with_mode_capture(
+        1,
+        MockMode::DeferAwareAckKillingFirstConn(CHECKPOINT_BATCHES),
+        Some(tx),
+    );
+    let replacement = MockServer::spawn_with_max_batch_size(1, REPLACEMENT_CAP);
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), replacement.port()],
+        "sender_pool_min=1;sender_pool_max=2;pool_reap=manual;max_buf_size=8192;",
+    ))
+    .unwrap();
+    let values: Vec<String> = (0..130).map(|_| "x".repeat(VALUE_BYTES)).collect();
+    let column = Series::new(PlSmallStr::from("s"), values.as_slice()).into_column();
+    let df = crate::polars_ffi::df_from_columns(vec![column]).unwrap();
+
+    let err = db
+        .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
+        .unwrap_err();
+
+    assert_eq!(primary.accepted(), 1);
+    assert_eq!(replacement.accepted(), 1, "reconnect must succeed");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{err}");
+    assert!(
+        err.in_doubt(),
+        "earlier publication must survive a failure before replay: {err}"
+    );
+
+    // EOF precedes the completed reconnect, so capture needs no sleeps.
+    // The mock emits an empty marker when it drops the primary connection.
+    let captured: Vec<_> = frames
+        .try_iter()
+        .filter(|frame| !frame.is_empty())
+        .collect();
+    assert_eq!(captured.len(), CHECKPOINT_BATCHES);
+    for (index, frame) in captured.iter().enumerate() {
+        assert!(frame.len() >= 12);
+        assert_eq!(&frame[..4], b"QWP1");
+        assert_eq!(u16::from_le_bytes([frame[6], frame[7]]), 1);
+        let deferred = index != 0 && index != CHECKPOINT_BATCHES - 1;
+        assert_eq!(frame[5] & FLAG_DEFER_COMMIT != 0, deferred);
+    }
 }
 
 #[cfg(feature = "polars-ingress")]

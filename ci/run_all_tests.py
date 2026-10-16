@@ -27,11 +27,12 @@ def find_binary(build_dir, name, exe_suffix):
 def run_cargo_tests():
     """The questdb-rs / questdb-rs-ffi cargo test matrix. Pure Rust: needs no
     CMake build and no running QuestDB."""
+    run_cmd(sys.executable, 'ci/check_arrow_ffi_lock.py')
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test',
             '--no-default-features',
-            '--features=aws-lc-crypto,tls-native-certs,sync-sender',
+            '--features=aws-lc-crypto,tls-native-certs,sync-sender,sync-reader-qwp-ws',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=ring-crypto,tls-native-certs,sync-sender',
@@ -52,10 +53,10 @@ def run_cargo_tests():
     # its retry loop and tests. Only `questdb-rs-ffi` enables it, and that
     # crate's `cargo test` does not compile questdb-rs's own unit tests, so
     # enable it here or those tests never run.
-    run_cmd('cargo', 'test',
+    run_cmd('cargo', 'test', '--locked',
             '--features=almost-all-features,arrow,polars,ffi-support',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features',
+    run_cmd('cargo', 'test', '--locked', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',
             '--', '--nocapture', cwd='questdb-rs')
     # The shape the `oidc` feature's own documentation recommends: the OIDC
@@ -70,8 +71,9 @@ def run_cargo_tests():
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=aws-lc-crypto,tls-native-certs,oidc',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
-    run_cmd('cargo', 'test', '--features=arrow', cwd='questdb-rs-ffi')
+    run_cmd('cargo', 'test', '--locked', cwd='questdb-rs-ffi')
+    run_cmd('cargo', 'test', '--locked', '--features=arrow',
+            cwd='questdb-rs-ffi')
 
 
 def run_cpp_tests():
