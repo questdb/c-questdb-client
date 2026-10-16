@@ -46,7 +46,7 @@
 //!
 //! Oversized columnar batches are split down to individual rows as needed.
 //! If a single row still exceeds the frame cap, the flush fails. Earlier rows
-//! may already have been published or committed, even in a small batch; check
+//! may already have been published or committed; check
 //! [`crate::Error::in_doubt`] before retrying the whole input.
 //!
 //! ```ignore

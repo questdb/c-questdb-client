@@ -558,16 +558,12 @@ impl PooledSenderCore {
     /// `request_durable_ack=on`; otherwise the call is rejected up front
     /// (`InvalidApiCall`) before `chunk` is touched.
     ///
-    /// Failure contract: the ACK level is validated, then the frame is
-    /// published, then the wait runs. If publication fails the `chunk` is
-    /// retained, but a split may already have published a prefix, even for a
-    /// small chunk. Check [`crate::Error::in_doubt`] before retrying the input.
-    /// Once publication succeeds `chunk` is cleared even if the later ACK wait
-    /// fails — at which point delivery of the just
-    /// published frame is **unknown** (it may be committed, rejected, or in
-    /// flight) and the borrow should be dropped/reborrowed per the error class.
-    /// There is no internal failover retry; replay is the caller's
-    /// responsibility.
+    /// Publication failure retains `chunk`, but splitting may already have
+    /// published a prefix. Check [`crate::Error::in_doubt`] before retrying.
+    ///
+    /// Successful publication clears `chunk`, even if the ACK wait then fails.
+    /// On an ACK error, delivery may be unknown; drop and reborrow the sender
+    /// as required by the error class. There is no internal failover retry.
     pub fn flush_and_wait(&mut self, chunk: &mut Chunk<'_>, ack_level: AckLevel) -> Result<()> {
         self.backend
             .flush_chunk(chunk, WaitForAck::Yes(ack_level))

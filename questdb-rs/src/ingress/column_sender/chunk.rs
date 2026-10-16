@@ -215,8 +215,7 @@ impl ValidityDescriptor {
     }
 
     /// Slice to rows `[row_offset, row_offset + row_count)`. `row_offset` must
-    /// be a multiple of 8, unless `row_count` is 1. An unaligned singleton
-    /// points to a static byte containing its bit at position zero.
+    /// be a multiple of 8, unless `row_count` is 1.
     /// `non_null_count` is recomputed for the sub-range because the VARCHAR
     /// dense-offset path sizes its output from it.
     ///
@@ -425,10 +424,8 @@ impl SymbolOffsetsPtr {
 }
 
 impl ColumnKind {
-    /// Build a kind that views rows `[row_offset, row_offset + row_count)` of
-    /// `self`. Zero-copy: every variant advances its pointer(s) / Arrow array
-    /// rather than copying data. `row_offset` must be a multiple of 8 unless
-    /// `row_count` is 1; unaligned Boolean singletons use a static bitmap byte.
+    /// View rows `[row_offset, row_offset + row_count)` without copying column
+    /// data. `row_offset` must be a multiple of 8 unless `row_count` is 1.
     ///
     /// SAFETY: the source buffers must cover `row_offset + row_count` rows and
     /// still be alive.
@@ -702,7 +699,6 @@ impl<'a> Chunk<'a> {
     /// `self`, used to split an oversize chunk into cap-sized frames. Column
     /// data is re-pointed (zero-copy); the table name and column names are
     /// cloned. `row_offset` must be a multiple of 8 unless `row_count` is 1.
-    /// Unaligned singletons use static bytes for Boolean and validity bits.
     ///
     /// SAFETY: the caller's column buffers must still be alive (the same
     /// invariant `flush` relies on) and cover `row_offset + row_count` rows.
