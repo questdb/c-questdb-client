@@ -67,8 +67,12 @@ inline constexpr uint8_t ROLE_PRIMARY = 0x01;
 inline constexpr uint8_t ROLE_REPLICA = 0x02;
 inline constexpr uint8_t ROLE_PRIMARY_CATCHUP = 0x03;
 
-// SERVER_INFO capability bits.
+// SERVER_INFO capability bits (mirror
+// questdb-rs/src/egress/wire/capabilities.rs).
 inline constexpr uint32_t CAP_ZONE = 0x00000001u;
+inline constexpr uint32_t CAP_QUERY_FLAGS = 0x00000002u;
+inline constexpr uint32_t CAP_COMPRESSION = 0x00000004u;
+inline constexpr uint32_t CAP_QUERY_TIMEOUT = 0x00000008u;
 
 // ColumnKind wire codes (mirror questdb-rs/src/egress/column_kind.rs).
 inline constexpr uint8_t COL_BOOLEAN = 0x01;
@@ -102,6 +106,11 @@ inline constexpr uint8_t STATUS_INTERNAL_ERROR = 0x06;
 inline constexpr uint8_t STATUS_SECURITY_ERROR = 0x08;
 inline constexpr uint8_t STATUS_CANCELLED = 0x0A;
 inline constexpr uint8_t STATUS_LIMIT_EXCEEDED = 0x0B;
+inline constexpr uint8_t STATUS_QUERY_TIMEOUT = 0x0E;
+
+// QUERY_REQUEST `query_flags` bits (mirror query_request.rs).
+inline constexpr uint8_t QUERY_FLAG_RESET_DICT = 0x01;
+inline constexpr uint8_t QUERY_FLAG_TIMEOUT = 0x02;
 
 // CACHE_RESET masks.
 inline constexpr uint8_t CACHE_RESET_SYMBOLS = 0x01;
