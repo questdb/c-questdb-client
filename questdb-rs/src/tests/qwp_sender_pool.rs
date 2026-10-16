@@ -3217,6 +3217,182 @@ fn direct_flush_splits_oversize_chunk_into_capped_deferred_frames() {
     );
 }
 
+fn assert_small_split_frames(frames: &[Vec<u8>], counts: &[u64], cap: usize) {
+    assert_eq!(
+        frames
+            .iter()
+            .map(|f| frame_row_count(f))
+            .collect::<Vec<_>>(),
+        counts
+    );
+    for (i, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            frame[5] & 0x01 != 0,
+            i + 1 < frames.len(),
+            "only the last frame commits"
+        );
+    }
+    assert!(frames.iter().all(|f| f.len() <= cap));
+    let values: Vec<i64> = frames.iter().flat_map(|f| frame_qty_values(f)).collect();
+    assert_eq!(
+        values,
+        (0..counts.iter().sum::<u64>() as i64).collect::<Vec<_>>()
+    );
+}
+
+#[rstest::rstest]
+#[case(5, 420, &[4, 1])]
+#[case(8, 250, &[7, 1])]
+#[case(8, 1500, &[1; 8])]
+fn small_chunk_splits_below_eight_rows(
+    #[case] rows: usize,
+    #[case] width: usize,
+    #[case] counts: &[u64],
+    #[values(false, true)] direct: bool,
+) {
+    use crate::ingress::column_sender::Validity;
+
+    const CAP: usize = 2048;
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        &format!("max_buf_size={CAP};pool_reap=manual;"),
+    ))
+    .unwrap();
+    let bytes = vec![b'x'; rows * width];
+    let offsets: Vec<i32> = (0..=rows).map(|i| (i * width) as i32).collect();
+    let qty: Vec<i64> = (0..rows as i64).collect();
+    let valid_bits = [0b1010_1010];
+    let validity = Validity::from_bitmap(&valid_bits, rows).unwrap();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.column_str("s", &offsets, &bytes, None).unwrap();
+    chunk
+        .column_bool("b", &[0b1101_1011], rows, Some(&validity))
+        .unwrap();
+    chunk.at_now().unwrap();
+    if direct {
+        db.borrow_direct_column_sender()
+            .unwrap()
+            .flush_and_wait(&mut chunk, AckLevel::Ok)
+            .unwrap();
+    } else {
+        db.borrow_sender()
+            .unwrap()
+            .flush_and_wait(&mut chunk, AckLevel::Ok)
+            .unwrap();
+    }
+    assert!(chunk.is_empty());
+    assert_small_split_frames(&frames.try_iter().collect::<Vec<_>>(), counts, CAP);
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[rstest::rstest]
+#[case(5, 420, &[4, 1])]
+#[case(8, 250, &[7, 1])]
+#[case(8, 1500, &[1; 8])]
+fn small_arrow_batch_splits_below_eight_rows(
+    #[case] rows: usize,
+    #[case] width: usize,
+    #[case] counts: &[u64],
+    #[values(false, true)] direct: bool,
+) {
+    use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
+
+    const CAP: usize = 2048;
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        &format!("max_buf_size={CAP};pool_reap=manual;"),
+    ))
+    .unwrap();
+    let qty: ArrayRef = Arc::new(Int64Array::from_iter_values(0..rows as i64));
+    let strings: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(width); rows]));
+    let bools: ArrayRef = Arc::new(BooleanArray::from(
+        (0..rows)
+            .map(|i| if i % 3 == 0 { None } else { Some(i % 2 == 0) })
+            .collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_from_iter([("qty", qty), ("s", strings), ("b", bools)]).unwrap();
+    if direct {
+        db.borrow_direct_column_sender()
+            .unwrap()
+            .flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
+            .unwrap();
+    } else {
+        db.borrow_sender()
+            .unwrap()
+            .flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
+            .unwrap();
+    }
+    assert_small_split_frames(&frames.try_iter().collect::<Vec<_>>(), counts, CAP);
+}
+
+#[rstest::rstest]
+fn small_chunk_oversized_row_preserves_delivery_classification(
+    #[values(0, 2)] oversized_row: usize,
+    #[values(false, true)] direct: bool,
+) {
+    const CAP: usize = 2048;
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        &format!("max_buf_size={CAP};pool_reap=manual;"),
+    ))
+    .unwrap();
+    let mut bytes = Vec::new();
+    let mut offsets = vec![0];
+    for row in 0..5 {
+        bytes.extend(std::iter::repeat_n(
+            b'x',
+            if row == oversized_row { CAP * 2 } else { 1 },
+        ));
+        offsets.push(bytes.len() as i32);
+    }
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &[0, 1, 2, 3, 4], None).unwrap();
+    chunk.column_str("s", &offsets, &bytes, None).unwrap();
+    chunk.at_now().unwrap();
+    if direct {
+        let mut sender = db.borrow_direct_column_sender().unwrap();
+        let err = sender.flush(&mut chunk).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+        assert!(!err.in_doubt(), "no intermediate commit has occurred");
+        assert!(sender.must_close_for_test());
+    } else {
+        let mut sender = db.borrow_sender().unwrap();
+        let err = sender.flush(&mut chunk).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+        assert_eq!(err.in_doubt(), oversized_row != 0);
+        if oversized_row == 0 {
+            assert_eq!(sender.published_fsn().unwrap(), None);
+        } else {
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        }
+    }
+    assert_eq!(chunk.row_count(), 5, "failed input is retained");
+    // Direct publication does not wait for the peer to consume the prefix.
+    // Dropping the spent sender closes the stream without a committing frame.
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    if oversized_row == 0 {
+        assert!(captured.is_empty());
+    } else {
+        let values: Vec<i64> = captured.iter().flat_map(|f| frame_qty_values(f)).collect();
+        assert_eq!(values, vec![0, 1]);
+        if direct {
+            assert!(captured.iter().all(|f| f[5] & 0x01 != 0));
+        } else {
+            assert_split_closed_by_empty_committing_frame(&captured);
+        }
+    }
+}
+
 #[test]
 fn direct_flush_split_floor_marks_must_close_to_discard_uncommitted_prefix() {
     // A chunk whose small-row prefix fits but whose final row is irreducibly
@@ -3975,18 +4151,15 @@ fn store_and_forward_irreducible_frame_over_segment_cap_is_batch_too_large() {
 }
 
 /// Rows for a chunk that cannot be split down to a publishable frame, with the
-/// irreducible 8-row block placed to fail either half of the top-level split.
+/// individually oversized rows placed to fail either half of the top-level split.
 ///
 /// `Trailing` (16 rows, wide in 8..16): the leading half publishes, the trailing
-/// half is irreducible.
+/// half starts with an irreducible row.
 ///
 /// `Leading` (32 rows, wide in 8..16): the top-level split is at 16, so the
 /// LEADING half recurses, publishes rows 0..8 deferred, and only then hits the
 /// irreducible block. The error propagates past the trailing call entirely, so
-/// guarding only the trailing call leaves those frames stranded. 16 rows cannot
-/// express this -- the leading half would be exactly 8, which `split_mid`
-/// refuses to divide, so nothing is published and the flush is a clean
-/// rejection instead.
+/// guarding only the trailing call leaves those frames stranded.
 fn split_floor_rows(shape: SplitFloorShape) -> (Vec<i32>, Vec<u8>) {
     const WIDE: usize = 4000;
     let (rows, wide) = match shape {
@@ -4013,9 +4186,8 @@ enum SplitFloorShape {
     /// LEADING half recurses, publishes rows 0..8 deferred, and only then hits
     /// the irreducible block -- the error escapes before the trailing call runs.
     FailsInLeadingHalf,
-    /// 16 rows, irreducible block in 0..8. The leading half is exactly 8, which
-    /// `split_mid` refuses to divide, so the flush is rejected with NOTHING
-    /// enqueued.
+    /// 16 rows, irreducible rows in 0..8. Row zero itself cannot fit, so the
+    /// flush is rejected with nothing enqueued.
     RejectsBeforePublishing,
 }
 

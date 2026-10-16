@@ -88,16 +88,16 @@ struct ArrowFrameSpec<'a> {
     overrides: &'a [ArrowColumnOverride<'a>],
 }
 
-/// Split point for an oversize `row_count`: the largest multiple of 8 not
-/// exceeding `row_count / 2` (at least 8). `None` once the block is at the
-/// 8-row floor, which cannot be split further because bit-packed `Bool`
-/// columns and validity bitmaps are only byte-addressable.
+/// Keep multi-row slices byte-aligned for Boolean and validity bitmaps.
+/// Above eight rows, halve at an aligned boundary. At eight or fewer, peel off the
+/// last row: the prefix retains its aligned start and only singletons can
+/// start unaligned. A single oversized row cannot be split further.
 fn split_mid(row_count: usize) -> Option<usize> {
-    if row_count <= 8 {
-        return None;
+    match row_count {
+        0 | 1 => None,
+        2..=8 => Some(row_count - 1),
+        _ => Some(((row_count / 2) & !7).max(8)),
     }
-    let mid = (row_count / 2) & !7;
-    Some(if mid == 0 { 8 } else { mid })
 }
 
 /// Per-frame payload caps for the store-and-forward publish path, derived once
@@ -118,15 +118,10 @@ struct SfaFrameCaps {
 }
 
 impl SfaFrameCaps {
-    /// Cap for one publish attempt: the split target while the range can
-    /// still split; the hard cap at the 8-row floor, where splitting is no
-    /// longer an option and only the binding limit matters.
+    /// Use the packing target above eight rows. Smaller ranges split only
+    /// when the hard cap requires it, avoiding unnecessary singleton frames.
     fn for_range(self, row_count: usize) -> usize {
-        if split_mid(row_count).is_some() {
-            self.soft
-        } else {
-            self.hard
-        }
+        if row_count > 8 { self.soft } else { self.hard }
     }
 }
 
@@ -564,9 +559,11 @@ impl PooledSenderCore {
     /// (`InvalidApiCall`) before `chunk` is touched.
     ///
     /// Failure contract: the ACK level is validated, then the frame is
-    /// published, then the wait runs. If publication itself fails the `chunk`
-    /// is untouched and retryable. Once publication succeeds `chunk` is cleared
-    /// even if the later ACK wait fails — at which point delivery of the just
+    /// published, then the wait runs. If publication fails the `chunk` is
+    /// retained, but a split may already have published a prefix, even for a
+    /// small chunk. Check [`crate::Error::in_doubt`] before retrying the input.
+    /// Once publication succeeds `chunk` is cleared even if the later ACK wait
+    /// fails — at which point delivery of the just
     /// published frame is **unknown** (it may be committed, rejected, or in
     /// flight) and the borrow should be dropped/reborrowed per the error class.
     /// There is no internal failover retry; replay is the caller's
@@ -2324,10 +2321,33 @@ mod tests {
     }
 
     #[test]
-    fn split_mid_floors_at_eight_rows() {
+    fn split_mid_stops_at_one_row() {
         assert_eq!(split_mid(0), None);
         assert_eq!(split_mid(1), None);
-        assert_eq!(split_mid(8), None);
+        for count in 2..=8 {
+            assert_eq!(split_mid(count), Some(count - 1));
+        }
+    }
+
+    #[test]
+    fn split_ranges_preserve_alignment_and_order_down_to_single_rows() {
+        for rows in 1..=4096 {
+            let mut pending = vec![(0usize, rows)];
+            let mut next_row = 0;
+            while let Some((offset, count)) = pending.pop() {
+                assert!(offset.is_multiple_of(8) || count == 1);
+                if let Some(mid) = split_mid(count) {
+                    assert!(mid > 0 && mid < count);
+                    pending.push((offset + mid, count - mid));
+                    pending.push((offset, mid));
+                } else {
+                    assert_eq!(count, 1);
+                    assert_eq!(offset, next_row);
+                    next_row += 1;
+                }
+            }
+            assert_eq!(next_row, rows);
+        }
     }
 
     #[test]
@@ -2348,18 +2368,18 @@ mod tests {
     }
 
     #[test]
-    fn sfa_frame_caps_use_split_target_only_while_range_can_split() {
+    fn sfa_frame_caps_keep_small_ranges_at_the_hard_cap() {
         use super::SfaFrameCaps;
 
         let caps = SfaFrameCaps {
             hard: 1000,
             soft: 400,
         };
-        // At or below the 8-row split floor there is no split left to aim
-        // for: only the binding (hard) cap matters.
-        assert_eq!(caps.for_range(1), 1000);
-        assert_eq!(caps.for_range(8), 1000);
-        // Splittable ranges aim for the two-frames-per-segment target.
+        // Small ranges may split, but only to satisfy the hard cap.
+        for rows in 0..=8 {
+            assert_eq!(caps.for_range(rows), 1000);
+        }
+        // Larger ranges aim for the two-frames-per-segment target.
         assert_eq!(caps.for_range(9), 400);
         assert_eq!(caps.for_range(10_000), 400);
     }
