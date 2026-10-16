@@ -111,7 +111,8 @@ public:
     }
 };
 
-/** Parameters of a refreshing provider. Unset fields keep the defaults. */
+/** Parameters of a refreshing provider. Durations must not be negative.
+ *  Unset fields keep the defaults. */
 struct refreshing_token_provider_options
 {
     /** Non-secret label for log lines and errors. */
@@ -129,6 +130,14 @@ struct refreshing_token_provider_options
 
 namespace detail
 {
+inline uint64_t duration_ms(std::chrono::milliseconds value, const char* name)
+{
+    if (value.count() < 0)
+        throw std::invalid_argument{
+            std::string{name} + " must not be negative"};
+    return static_cast<uint64_t>(value.count());
+}
+
 inline int64_t epoch_ms(std::chrono::system_clock::time_point t) noexcept
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -266,19 +275,22 @@ public:
             c_options.name_len = options.name.size();
         }
         const auto set = [](uint64_t& field,
-                            const std::optional<std::chrono::milliseconds>& v) {
+                            const std::optional<std::chrono::milliseconds>& v,
+                            const char* name) {
             if (v)
-                field = static_cast<uint64_t>(v->count());
+                field = detail::duration_ms(*v, name);
         };
-        set(c_options.refresh_margin_ms, options.refresh_margin);
-        set(c_options.min_refresh_interval_ms, options.min_refresh_interval);
-        set(c_options.handout_floor_ms, options.handout_floor);
-        set(c_options.cold_wait_ms, options.cold_wait);
-        set(c_options.backoff_initial_ms, options.backoff_initial);
-        set(c_options.backoff_max_ms, options.backoff_max);
-        set(c_options.retry_after_max_ms, options.retry_after_max);
-        set(c_options.forced_min_interval_ms, options.forced_min_interval);
-        set(c_options.forced_wait_ms, options.forced_wait);
+        set(c_options.refresh_margin_ms, options.refresh_margin, "refresh_margin");
+        set(c_options.min_refresh_interval_ms, options.min_refresh_interval,
+            "min_refresh_interval");
+        set(c_options.handout_floor_ms, options.handout_floor, "handout_floor");
+        set(c_options.cold_wait_ms, options.cold_wait, "cold_wait");
+        set(c_options.backoff_initial_ms, options.backoff_initial, "backoff_initial");
+        set(c_options.backoff_max_ms, options.backoff_max, "backoff_max");
+        set(c_options.retry_after_max_ms, options.retry_after_max, "retry_after_max");
+        set(c_options.forced_min_interval_ms, options.forced_min_interval,
+            "forced_min_interval");
+        set(c_options.forced_wait_ms, options.forced_wait, "forced_wait");
         // The provider owns the copy from here on, failed calls included.
         auto* heap = new Source{std::move(source)};
         return token_provider{::questdb::error::wrapped_call(
@@ -363,11 +375,12 @@ public:
             _raw, token.data(), token.size(), http_status);
     }
 
-    /** Wait for a refreshing provider's first usable token. */
+    /** Wait for a refreshing provider's first usable token.
+     *  @throws std::invalid_argument if timeout is negative. */
     bool await_ready(std::chrono::milliseconds timeout) const
     {
         return ::questdb_token_provider_await_ready(
-            _raw, static_cast<uint64_t>(timeout.count()));
+            _raw, detail::duration_ms(timeout, "timeout"));
     }
 
     /** Close a refreshing provider, ending every client that uses it. */

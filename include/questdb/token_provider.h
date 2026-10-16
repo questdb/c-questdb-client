@@ -64,7 +64,10 @@
  *   provider.
  * - `release` runs once, on any thread, when the provider no longer needs
  *   `user_data`. It may run after the call that created the provider returns.
- * - A provider is not usable across `fork()`: create a new one in the child.
+ * - Providers and clients must not be used across `fork()`. Use spawn/exec
+ *   workers and create providers there, or fork before creating any providers
+ *   or clients. A fresh provider alone cannot repair a multithreaded parent's
+ *   inherited runtime state and isolated-worker accounting.
  * - Never put a token in an error message.
  */
 

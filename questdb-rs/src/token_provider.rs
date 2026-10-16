@@ -37,6 +37,11 @@
 //! (design/qwp-token-provider-spec.md, v0.7, in the Java client). This client
 //! implements no connect-string providers (`token_provider=...`); attach a
 //! provider in code.
+//!
+//! Providers and clients must not be used across `fork()`. Use spawn/exec
+//! workers and create providers there, or fork before creating any providers
+//! or clients. Merely creating a new provider in a multithreaded parent's child
+//! does not repair inherited locks, runtimes or isolated-worker accounting.
 
 use std::sync::Arc;
 

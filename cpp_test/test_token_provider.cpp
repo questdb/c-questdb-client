@@ -61,6 +61,41 @@ TEST_CASE("A refreshing provider serves its source's token")
     CHECK(fetches.load() == 1);
 }
 
+TEST_CASE("Negative provider durations are rejected before conversion")
+{
+    using options_type = questdb::refreshing_token_provider_options;
+    std::optional<std::chrono::milliseconds> options_type::* const fields[] = {
+        &options_type::refresh_margin,
+        &options_type::min_refresh_interval,
+        &options_type::handout_floor,
+        &options_type::cold_wait,
+        &options_type::backoff_initial,
+        &options_type::backoff_max,
+        &options_type::retry_after_max,
+        &options_type::forced_min_interval,
+        &options_type::forced_wait};
+    std::atomic<int> fetches{0};
+    const auto source = [&fetches] {
+        ++fetches;
+        return questdb::expiring_token{
+            "valid", std::chrono::system_clock::now() + 1h};
+    };
+    for (auto field : fields)
+    {
+        options_type options;
+        options.*field = -1ms;
+        CHECK_THROWS_AS(
+            questdb::token_provider::refreshing(source, options),
+            std::invalid_argument);
+    }
+    CHECK(fetches.load() == 0);
+
+    auto provider = questdb::token_provider::refreshing(source);
+    CHECK_THROWS_AS(provider.await_ready(-1ms), std::invalid_argument);
+    CHECK_NOTHROW(provider.await_ready(0ms));
+    CHECK(provider.await_ready(10s));
+}
+
 TEST_CASE("A source's exception becomes a classified failure")
 {
     questdb::refreshing_token_provider_options options;

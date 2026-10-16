@@ -6675,7 +6675,7 @@ mod tests {
             for null_every in [None, Some(4)] {
                 let arr = fsb_rows(width, rows, null_every);
                 let field = Field::new("c", DataType::FixedSizeBinary(width as i32), true);
-                let kind = classify(&field, &arr).unwrap();
+                let kind = classify(&field).unwrap();
                 assert!(matches!(kind, ColumnKind::FsbToBinary(w) if w == width));
                 let batch = single_col_batch(field, arr);
                 let encoded = encode(&batch).len();

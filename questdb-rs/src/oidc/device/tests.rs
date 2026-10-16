@@ -3337,6 +3337,104 @@ fn offline_auth() -> OidcDeviceAuth {
 }
 
 #[test]
+fn explicit_zero_lifetime_is_expired_including_refresh_responses() {
+    let auth = offline_auth();
+    let prior = expired_tokens("RT-prior");
+    for previous in [None, Some(&prior)] {
+        for lifetime in [serde_json::json!(0), serde_json::json!("0")] {
+            let tokens = auth
+                .tokenset_from_response(
+                    &serde_json::json!({"access_token": "opaque", "expires_in": lifetime}),
+                    previous,
+                )
+                .unwrap();
+            assert_eq!(tokens.expires_at, tokens.issued_at);
+            assert!(!auth.is_servable_now(&tokens));
+        }
+    }
+
+    let tokens = auth
+        .tokenset_from_response(&serde_json::json!({"access_token": "opaque"}), None)
+        .unwrap();
+    assert_eq!(
+        tokens.expires_at - tokens.issued_at,
+        DEFAULT_EXPIRES_IN as f64
+    );
+}
+
+#[test]
+fn invalid_explicit_token_lifetime_is_rejected() {
+    let auth = offline_auth();
+    for lifetime in [
+        serde_json::json!(-1),
+        serde_json::json!("-1"),
+        serde_json::json!("invalid"),
+        serde_json::json!(1.5),
+        serde_json::json!(null),
+        serde_json::json!(true),
+        serde_json::json!([]),
+    ] {
+        let err = auth
+            .tokenset_from_response(
+                &serde_json::json!({"access_token": "opaque", "expires_in": lifetime}),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Config);
+        assert!(err.message().contains("expires_in"), "{err}");
+    }
+}
+
+#[test]
+fn zero_lifetime_opaque_tokens_are_never_announced_or_persisted() {
+    struct SuccessCounter(Arc<AtomicUsize>);
+    impl Renderer for SuccessCounter {
+        fn on_success(&self, _: Option<&str>, _: f64) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    // Exercise both the initial device grant and its immediate refresh rescue.
+    for refreshable in [false, true] {
+        let mock = MockServer::start(move |method, path, _| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                let mut body = serde_json::json!({"access_token": "opaque", "expires_in": 0});
+                if refreshable {
+                    body["refresh_token"] = serde_json::json!("RT");
+                }
+                (200, body.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        });
+        let dir = TempDir::new().unwrap();
+        let successes = Arc::new(AtomicUsize::new(0));
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(test_file_store(dir.path()))
+            .renderer(SuccessCounter(Arc::clone(&successes)))
+            .build()
+            .unwrap();
+        let err = auth.sign_in().expect_err("zero lifetime must not succeed");
+        assert_eq!(successes.load(Ordering::SeqCst), 0);
+        assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+        assert!(err.message().contains("already expired"), "{err}");
+        assert!(auth.token().is_err());
+        assert!(
+            test_file_store(dir.path())
+                .load(&key_for(&mock))
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn lifetime_cap_bounds_refreshable_and_opaque_tokens() {
     // `expires_at` and `issued_at` are stamped from the same `now`, so their
     // difference is exactly the (capped or uncapped) lifetime — no clock race.

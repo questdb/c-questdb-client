@@ -688,8 +688,9 @@ fn await_ready_gates_on_the_first_fetch() {
         let provider = provider.clone();
         thread::spawn(move || provider.await_ready(Duration::from_secs(5)))
     };
-    thread::sleep(Duration::from_millis(20));
+    assert!(!waiter.is_finished());
     assert!(provider.run_due_fetch());
+    await_true("ready waiter", || waiter.is_finished());
     assert!(waiter.join().unwrap());
 
     let empty = Arc::new(Script::default());
@@ -698,8 +699,17 @@ fn await_ready_gates_on_the_first_fetch() {
         let cold = cold.clone();
         thread::spawn(move || cold.await_ready(Duration::from_secs(1)))
     };
-    thread::sleep(Duration::from_millis(20));
-    clock.advance_ms(2 * SEC);
+    // The waiter may not have established its deadline yet. Keep advancing
+    // until it completes instead of assuming a sleep scheduled that thread.
+    let watchdog = Instant::now() + Duration::from_secs(10);
+    while !waiter.is_finished() {
+        if Instant::now() >= watchdog {
+            cold.close();
+            panic!("cold await_ready did not reach its manual-clock deadline");
+        }
+        clock.advance_ms(2 * SEC);
+        thread::sleep(Duration::from_millis(5));
+    }
     assert!(!waiter.join().unwrap());
 }
 

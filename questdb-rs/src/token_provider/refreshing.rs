@@ -824,7 +824,7 @@ impl Shared {
     fn inherited_error(&self) -> Error {
         Error::token_provider_closed(format!(
             "token provider {} was inherited across fork and cannot be used in this process; \
-             build a new provider in the child",
+             use spawn/exec workers and build providers there, or fork before creating providers",
             self.name
         ))
     }

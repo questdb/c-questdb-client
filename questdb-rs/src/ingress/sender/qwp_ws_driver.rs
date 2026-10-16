@@ -2842,8 +2842,9 @@ pub(crate) fn reconnect_backoff_step(
 ///
 /// While the transport is down the stall is the reconnect's, not the
 /// server's. The message then names why the latest attempt failed, and the
-/// error carries that failure's OIDC detail, so a credential that needs a new
-/// sign-in reads as `INTERACTION_REQUIRED` (`questdb_error_oidc_get_view`) --
+/// error preserves that failure's structured detail, including generic token
+/// retryability and OIDC detail. A credential that needs a new sign-in reads
+/// as `INTERACTION_REQUIRED` (`questdb_error_oidc_get_view`) --
 /// as `line_sender_opts_oidc_auth` promises -- instead of as a live server
 /// that stopped acknowledging.
 pub(crate) fn ack_wait_timeout_error(
@@ -2869,20 +2870,16 @@ pub(crate) fn ack_wait_timeout_error(
             cause.msg()
         ),
     };
-    let err = Error::new(
-        ErrorCode::FailoverRetry,
-        format!(
-            "{operation} timed out after {timeout:?} with no ack progress (target FSN \
-             {boundary}, {progress}); {stall}, or close the pool to drain. Do not \
-             re-flush the same data, which is already accepted and would be delivered \
-             twice."
-        ),
+    let msg = format!(
+        "{operation} timed out after {timeout:?} with no ack progress (target FSN \
+         {boundary}, {progress}); {stall}, or close the pool to drain. Do not \
+         re-flush the same data, which is already accepted and would be delivered \
+         twice."
     );
-    #[cfg(feature = "_oidc")]
-    if let Some(oidc) = reconnect_failure.and_then(Error::oidc_error) {
-        return err.with_oidc_error(oidc.clone());
+    match reconnect_failure {
+        Some(cause) => cause.clone().reclassified(ErrorCode::FailoverRetry, msg),
+        None => Error::new(ErrorCode::FailoverRetry, msg),
     }
-    err
 }
 
 pub(super) fn retry_budget_exhausted_error(
@@ -4351,6 +4348,31 @@ mod tests {
             },
         ));
         (Arc::new(sink), callback_ran)
+    }
+
+    #[test]
+    fn ack_timeout_preserves_generic_provider_failure() {
+        let cause = Error::token_unavailable(
+            false,
+            Some(Duration::from_millis(2500)),
+            "identity not assigned",
+        )
+        .with_provider_failure()
+        .reclassified(ErrorCode::SocketError, "reconnect: identity not assigned");
+        let error =
+            ack_wait_timeout_error("wait", Duration::from_millis(50), 3, Some(1), Some(&cause));
+        assert_eq!(error.code(), ErrorCode::FailoverRetry);
+        assert!(error.msg().contains("identity not assigned"));
+        assert!(error.msg().contains("Do not re-flush"));
+        assert!(error.is_provider_failure());
+        let unavailable = error.as_token_unavailable().unwrap();
+        assert!(!unavailable.retryable());
+        assert_eq!(unavailable.retry_after(), Some(Duration::from_millis(2500)));
+        assert!(!unavailable.provider_closed());
+
+        let closed = Error::token_provider_closed("provider closed");
+        let error = ack_wait_timeout_error("wait", Duration::ZERO, 3, None, Some(&closed));
+        assert!(error.as_token_unavailable().unwrap().provider_closed());
     }
 
     #[test]

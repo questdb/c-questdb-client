@@ -438,7 +438,8 @@ fn inherited_error() -> Error {
     Error::new(
         ErrorCode::InvalidApiCall,
         "This token provider was inherited across fork and cannot be used in this \
-         process; create a new provider in the child.",
+         process; use spawn/exec workers and create providers there, or fork before \
+         creating providers.",
     )
 }
 
@@ -501,6 +502,10 @@ pub unsafe extern "C" fn questdb_refreshing_token_provider_new(
         ptr::null_mut()
     };
     let Some(fetch) = source else {
+        // Ownership transfers on entry, including this earliest rejection.
+        if let Some(release) = release {
+            unsafe { release(user_data) };
+        }
         return fail(
             err_out,
             "token source callback must not be NULL".to_string(),
@@ -1223,17 +1228,20 @@ mod tests {
 
     #[test]
     fn invalid_arguments_are_rejected() {
+        let mut probe = Probe::default();
         let mut err: *mut questdb_error = ptr::null_mut();
         let provider = unsafe {
             questdb_refreshing_token_provider_new(
                 None,
-                ptr::null_mut(),
-                None,
+                ptr::from_mut(&mut probe).cast(),
+                Some(release),
                 ptr::null(),
                 &mut err,
             )
         };
         assert!(provider.is_null() && !err.is_null());
+        assert_eq!(probe.released.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.fetches.load(Ordering::SeqCst), 0);
         unsafe { crate::questdb_error_free(err) };
         err = ptr::null_mut();
         let vtable = questdb_token_provider_vtable {
@@ -1248,6 +1256,29 @@ mod tests {
         assert!(unsafe { questdb_token_provider_clone(ptr::null()) }.is_null());
         unsafe { questdb_token_provider_free(ptr::null_mut()) };
         assert!(!unsafe { questdb_token_sink_set_token(ptr::null_mut(), ptr::null(), 0, 0, 0) });
+    }
+
+    #[test]
+    fn invalid_refreshing_options_release_the_source_once() {
+        let mut probe = Probe::default();
+        let options = questdb_refreshing_token_provider_options {
+            struct_size: 0,
+            ..Default::default()
+        };
+        let mut err = ptr::null_mut();
+        let provider = unsafe {
+            questdb_refreshing_token_provider_new(
+                Some(source),
+                ptr::from_mut(&mut probe).cast(),
+                Some(release),
+                &options,
+                &mut err,
+            )
+        };
+        assert!(provider.is_null() && !err.is_null());
+        assert_eq!(probe.released.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.fetches.load(Ordering::SeqCst), 0);
+        unsafe { crate::questdb_error_free(err) };
     }
 
     #[test]

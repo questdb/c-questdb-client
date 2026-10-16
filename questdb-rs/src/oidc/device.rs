@@ -54,9 +54,10 @@ static OIDC_INIT_PID: AtomicU32 = AtomicU32::new(0);
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const REFRESH_GRANT: &str = "refresh_token";
 
-// Clamp the token lifetime (access/id-token TTL). An absent or non-positive
-// `expires_in` is non-conformant; fall back to a short lifetime so a token with
-// no stated lifetime is refreshed promptly. A very long (or hostile) lifetime is
+// Clamp the token lifetime (access/id-token TTL). For an absent `expires_in`,
+// fall back to a short lifetime so a token with no stated lifetime is refreshed
+// promptly. Explicit zero means expired; malformed/negative values are rejected.
+// A very long (or hostile) lifetime is
 // capped to an hour so a cached token is silently rotated at least that often.
 // A no-refresh JWT can instead use its authoritative `exp`; a no-refresh opaque
 // token still needs this ceiling so a hostile `expires_in` cannot wedge the
@@ -3315,10 +3316,21 @@ impl OidcDeviceAuth {
         let refresh_token =
             safe_token(body.get("refresh_token")).or_else(|| prior_refresh.map(String::from));
 
-        let mut expires_in = int_field(body, "expires_in").unwrap_or(DEFAULT_EXPIRES_IN);
-        if expires_in <= 0 {
-            expires_in = DEFAULT_EXPIRES_IN;
-        }
+        let mut expires_in = match body.get("expires_in") {
+            None => DEFAULT_EXPIRES_IN,
+            Some(value) => {
+                let seconds = match value {
+                    Value::Number(n) => n.as_i64(),
+                    Value::String(s) => s.trim().parse::<i64>().ok(),
+                    _ => None,
+                };
+                seconds.filter(|seconds| *seconds >= 0).ok_or_else(|| {
+                    OidcError::config(
+                        "The identity provider's expires_in must be a non-negative integer.",
+                    )
+                })?
+            }
+        };
         // Cap the believed lifetime when a refresh token can silently rotate it —
         // including one carried forward above, so a non-rotating IdP's long (or
         // hostile) TTL stays bounded. A no-refresh JWT is bounded by its own `exp`
