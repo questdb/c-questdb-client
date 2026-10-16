@@ -1,0 +1,5 @@
+# False positives: JWT-shaped test tokens (`eyJhbGciOiJSUzI1NiJ9` is
+# `{"alg":"RS256"}`) in tests that check a token never reaches an error message
+# or a rendered description.
+55a0709dd2e349b16ac9be912ed33400bcd36996:questdb-rs/src/oidc/http.rs:generic-api-key:780
+08a2a93f697cf8bf8cae0a3f14b8f7b88436afab:questdb-rs/src/token_provider/redaction.rs:generic-api-key:191
