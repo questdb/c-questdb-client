@@ -166,6 +166,16 @@ impl ImportedArrowColumn {
     }
 }
 
+// Unaligned single-row slices normalize their bit into static storage. The
+// encoder can keep reading byte-aligned bitmaps without allocating a copy.
+static SINGLE_BITS: [u8; 2] = [0, 1];
+
+/// SAFETY: `bits` must cover bit `row` and still be alive.
+unsafe fn singleton_bitmap(bits: *const u8, row: usize) -> &'static u8 {
+    let bit = (unsafe { *bits.add(row / 8) } >> (row % 8)) & 1;
+    &SINGLE_BITS[bit as usize]
+}
+
 /// Validity bitmap descriptor (raw-ptr form, matching `Validity<'a>`).
 /// `non_null_count` is pre-computed at column-append time because several
 /// encoder paths (e.g. VARCHAR's dense offset table) size their output
@@ -213,15 +223,23 @@ impl ValidityDescriptor {
     }
 
     /// Slice to rows `[row_offset, row_offset + row_count)`. `row_offset` must
-    /// be a multiple of 8 so the bitmap pointer stays byte-addressable.
+    /// be a multiple of 8, unless `row_count` is 1.
     /// `non_null_count` is recomputed for the sub-range because the VARCHAR
     /// dense-offset path sizes its output from it.
     ///
     /// SAFETY: the source bitmap must cover `row_offset + row_count` bits and
     /// still be alive.
     unsafe fn slice_rows(&self, row_offset: usize, row_count: usize) -> Self {
-        debug_assert_eq!(row_offset % 8, 0);
+        debug_assert!(row_offset.is_multiple_of(8) || row_count == 1);
         debug_assert!(row_offset + row_count <= self.bit_len);
+        if !row_offset.is_multiple_of(8) {
+            let bits = unsafe { singleton_bitmap(self.bits, row_offset) };
+            return Self {
+                bits,
+                bit_len: 1,
+                non_null_count: *bits as usize,
+            };
+        }
         let bits = unsafe { self.bits.add(row_offset / 8) };
         let mut non_null_count = 0usize;
         for i in 0..row_count {
@@ -414,15 +432,13 @@ impl SymbolOffsetsPtr {
 }
 
 impl ColumnKind {
-    /// Build a kind that views rows `[row_offset, row_offset + row_count)` of
-    /// `self`. Zero-copy: every variant advances its pointer(s) / Arrow array
-    /// rather than copying data. `row_offset` must be a multiple of 8 (bit-
-    /// packed `Bool` and validity bitmaps are only byte-addressable).
+    /// View rows `[row_offset, row_offset + row_count)` without copying column
+    /// data. `row_offset` must be a multiple of 8 unless `row_count` is 1.
     ///
     /// SAFETY: the source buffers must cover `row_offset + row_count` rows and
     /// still be alive.
     unsafe fn slice_rows(&self, row_offset: usize, row_count: usize) -> Self {
-        debug_assert_eq!(row_offset % 8, 0);
+        debug_assert!(row_offset.is_multiple_of(8) || row_count == 1);
         unsafe {
             match self {
                 ColumnKind::Byte { data } => ColumnKind::Byte {
@@ -442,6 +458,9 @@ impl ColumnKind {
                 },
                 ColumnKind::Double { data } => ColumnKind::Double {
                     data: data.add(row_offset),
+                },
+                ColumnKind::Bool { bits } if !row_offset.is_multiple_of(8) => ColumnKind::Bool {
+                    bits: singleton_bitmap(*bits, row_offset),
                 },
                 ColumnKind::Bool { bits } => ColumnKind::Bool {
                     bits: bits.add(row_offset / 8),
@@ -687,7 +706,7 @@ impl<'a> Chunk<'a> {
     /// Build a chunk viewing rows `[row_offset, row_offset + row_count)` of
     /// `self`, used to split an oversize chunk into cap-sized frames. Column
     /// data is re-pointed (zero-copy); the table name and column names are
-    /// cloned. `row_offset` must be a multiple of 8.
+    /// cloned. `row_offset` must be a multiple of 8 unless `row_count` is 1.
     ///
     /// SAFETY: the caller's column buffers must still be alive (the same
     /// invariant `flush` relies on) and cover `row_offset + row_count` rows.
