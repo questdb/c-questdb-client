@@ -280,15 +280,23 @@ public:
             if (v)
                 field = detail::duration_ms(*v, name);
         };
-        set(c_options.refresh_margin_ms, options.refresh_margin, "refresh_margin");
-        set(c_options.min_refresh_interval_ms, options.min_refresh_interval,
+        set(c_options.refresh_margin_ms,
+            options.refresh_margin,
+            "refresh_margin");
+        set(c_options.min_refresh_interval_ms,
+            options.min_refresh_interval,
             "min_refresh_interval");
         set(c_options.handout_floor_ms, options.handout_floor, "handout_floor");
         set(c_options.cold_wait_ms, options.cold_wait, "cold_wait");
-        set(c_options.backoff_initial_ms, options.backoff_initial, "backoff_initial");
+        set(c_options.backoff_initial_ms,
+            options.backoff_initial,
+            "backoff_initial");
         set(c_options.backoff_max_ms, options.backoff_max, "backoff_max");
-        set(c_options.retry_after_max_ms, options.retry_after_max, "retry_after_max");
-        set(c_options.forced_min_interval_ms, options.forced_min_interval,
+        set(c_options.retry_after_max_ms,
+            options.retry_after_max,
+            "retry_after_max");
+        set(c_options.forced_min_interval_ms,
+            options.forced_min_interval,
             "forced_min_interval");
         set(c_options.forced_wait_ms, options.forced_wait, "forced_wait");
         // The provider owns the copy from here on, failed calls included.
