@@ -34,7 +34,7 @@ log = "0.4"
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.12.0"
-rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
+rustls = { version = "0.23.45", default-features = false, features = ["logging", "std", "tls12"] }
 rustls-native-certs = { version = "0.8.2", optional = true }
 webpki-roots = { version = "1.0.3", default-features = false, optional = true }
 chrono = { version = "0.4.40", optional = true }
