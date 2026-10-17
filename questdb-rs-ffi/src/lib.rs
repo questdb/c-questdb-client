@@ -3562,10 +3562,13 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
 
 /// Tell whether the sender is no longer usable and must be closed.
 /// Returns true after an unrecoverable failure. For ILP-over-TCP this is any
-/// socket error. For QWP/WebSocket this also covers a server rejection or
-/// protocol violation that latches the publication lifecycle to its terminal
-/// state. ILP-over-HTTP and QWP/UDP never transition into a
-/// permanently-unusable state and always return false.
+/// socket error. For QWP/WebSocket it is a server rejection or protocol
+/// violation that latches the publication lifecycle to its terminal state;
+/// recoverable failures (a back-pressure timeout, a periodic-sync durability
+/// latch, a storage fault during dictionary recycling) do not retire the
+/// sender, and the next flush drives it again. ILP-over-HTTP and QWP/UDP
+/// never transition into a permanently-unusable state and always return
+/// false.
 /// @param[in] sender Line sender object.
 /// @return true if an error occurred with a sender and it must be closed.
 #[unsafe(no_mangle)]

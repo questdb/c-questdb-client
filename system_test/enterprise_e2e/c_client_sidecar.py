@@ -111,12 +111,13 @@ def build_qwp_sidecar() -> Path:
     return _build_failover_bin("qwp_sidecar")
 
 
-def build_qwp_column_sidecar() -> Path:
+def build_qwp_column_sidecar(*, require_polars: bool = False) -> Path:
     """Build the column-major ``qwp_column_sidecar`` binary. With
     ``C_QUESTDB_CLIENT_COLUMN_POLARS`` set, enable the heavy ``polars`` feature
     so the ``SEND ... polars`` input shape is available; off by default to keep
-    the e2e build light."""
-    features = "polars" if os.environ.get("C_QUESTDB_CLIENT_COLUMN_POLARS") else None
+    the e2e build light. Tests that require Polars can request it explicitly
+    without changing that optional default for other callers."""
+    features = "polars" if require_polars or os.environ.get("C_QUESTDB_CLIENT_COLUMN_POLARS") else None
     return _build_failover_bin("qwp_column_sidecar", features=features)
 
 

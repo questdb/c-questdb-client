@@ -1149,7 +1149,38 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "qwp_ws_progress" => builder.qwp_ws_progress(parse_qwp_ws_progress_value(val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
+                "symbol_dict_reset" => {
+                    let enabled = if val.eq_ignore_ascii_case("on") {
+                        true
+                    } else if val.eq_ignore_ascii_case("off") {
+                        false
+                    } else {
+                        return Err(error::fmt!(
+                            ConfigError,
+                            "invalid symbol_dict_reset [value={val}, allowed-values=[on, off]]"
+                        ));
+                    };
+                    builder.symbol_dict_reset(enabled)?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "symbol_dict_reset_threshold" => {
+                    builder.symbol_dict_reset_threshold(parse_conf_value(key, val)?)?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "symbol_dict_reset_max_wait_millis" => builder.symbol_dict_reset_max_wait(
+                    Duration::from_millis(parse_conf_value(key, val)?),
+                )?,
+                #[cfg(feature = "_sender-qwp-ws")]
                 "sf_dir" => builder.store_and_forward_dir(PathBuf::from(val))?,
+                #[cfg(not(feature = "_sender-qwp-ws"))]
+                "symbol_dict_reset"
+                | "symbol_dict_reset_threshold"
+                | "symbol_dict_reset_max_wait_millis" => {
+                    return Err(error::fmt!(
+                        ConfigError,
+                        "The {key:?} setting is only supported for QWP/WebSocket."
+                    ));
+                }
                 #[cfg(feature = "_sender-qwp-ws")]
                 "sender_id" => builder.sender_id(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
@@ -1717,6 +1748,73 @@ impl SenderBuilder {
             ));
         };
         qwp_ws.progress.set_specified("qwp_ws_progress", progress)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Enable count-triggered QWP/WebSocket symbol dictionary recycling.
+    /// Enabled by default. Advisory reset requests are ignored when disabled.
+    pub fn symbol_dict_reset(mut self, enabled: bool) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"symbol_dict_reset\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        sender::qwp_ws_recycle::RecycleSettings {
+            enabled,
+            ..qwp_ws.recycle_settings()
+        }
+        .validate()?;
+        qwp_ws
+            .symbol_dict_reset
+            .set_specified("symbol_dict_reset", enabled)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Set the symbol count that arms QWP/WebSocket dictionary recycling.
+    /// Valid values are 1 through 1,000,000; the default is 100,000.
+    /// Recycling may raise this threshold after a swap to avoid repeated resets.
+    /// This threshold is not a hard memory bound.
+    pub fn symbol_dict_reset_threshold(mut self, threshold: usize) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"symbol_dict_reset_threshold\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        sender::qwp_ws_recycle::RecycleSettings {
+            threshold,
+            ..qwp_ws.recycle_settings()
+        }
+        .validate()?;
+        qwp_ws
+            .symbol_dict_reset_threshold
+            .set_specified("symbol_dict_reset_threshold", threshold)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Set both the minimum armed age for a blocking drainage wait and its
+    /// maximum extra wait. The default is 2,000 milliseconds; zero allows
+    /// opportunistic recycling only. An already-drained recycle has no age gate.
+    /// Accepts integral milliseconds from 0 through 9,223,372,036,854.
+    pub fn symbol_dict_reset_max_wait(mut self, wait: Duration) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"symbol_dict_reset_max_wait_millis\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        sender::qwp_ws_recycle::RecycleSettings {
+            max_wait: wait,
+            ..qwp_ws.recycle_settings()
+        }
+        .validate()?;
+        qwp_ws
+            .symbol_dict_reset_max_wait
+            .set_specified("symbol_dict_reset_max_wait_millis", wait)?;
         Ok(self)
     }
 

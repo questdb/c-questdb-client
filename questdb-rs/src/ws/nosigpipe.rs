@@ -115,7 +115,7 @@ pub(crate) fn apply_so_nosigpipe(_tcp: &TcpStream) -> io::Result<()> {
 }
 
 #[cfg(any(feature = "_egress", feature = "_sender-qwp-ws"))]
-pub(crate) struct NoSigpipeTcp(TcpStream);
+pub(crate) struct NoSigpipeTcp(TcpStream, Option<std::time::Instant>);
 
 #[cfg(any(feature = "_egress", feature = "_sender-qwp-ws"))]
 impl NoSigpipeTcp {
@@ -123,7 +123,30 @@ impl NoSigpipeTcp {
     /// [`apply_so_nosigpipe`] for the option semantics.
     pub(crate) fn new(tcp: TcpStream) -> io::Result<Self> {
         apply_so_nosigpipe(&tcp)?;
-        Ok(Self(tcp))
+        Ok(Self(tcp, None))
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn set_io_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.1 = deadline;
+    }
+
+    /// Bound the next read or write by the recycle drain deadline. A deadline
+    /// that has already passed still bounds the call (the OS rejects a zero
+    /// timeout, so the smallest positive one is used) rather than failing it:
+    /// failing a read or write that was never attempted would make the
+    /// caller's bounded wait look like a transport failure and force a
+    /// spurious reconnect.
+    fn apply_io_deadline(&self) -> io::Result<()> {
+        const MIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
+        if let Some(deadline) = self.1 {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(MIN_TIMEOUT);
+            self.0.set_read_timeout(Some(remaining))?;
+            self.0.set_write_timeout(Some(remaining))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn tcp(&self) -> &TcpStream {
@@ -137,13 +160,14 @@ impl NoSigpipeTcp {
 
     #[cfg(feature = "_egress")]
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self(self.0.try_clone()?))
+        Ok(Self(self.0.try_clone()?, None))
     }
 }
 
 #[cfg(any(feature = "_egress", feature = "_sender-qwp-ws"))]
 impl Read for NoSigpipeTcp {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.apply_io_deadline()?;
         self.0.read(buf)
     }
 }
@@ -152,6 +176,7 @@ impl Read for NoSigpipeTcp {
 impl Write for NoSigpipeTcp {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.apply_io_deadline()?;
         // SAFETY: fd is live for the duration of the call; `buf` is a
         // valid pointer for `buf.len()` bytes of read access.
         let ret = unsafe {
@@ -171,6 +196,7 @@ impl Write for NoSigpipeTcp {
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.apply_io_deadline()?;
         self.0.write(buf)
     }
 

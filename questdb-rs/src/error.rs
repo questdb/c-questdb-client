@@ -230,13 +230,18 @@ pub enum ErrorCode {
     /// (2,000,000, matching the server's ingress ceiling) or its cumulative
     /// UTF-8 heap cap (256 MiB). The dictionary accumulates every distinct
     /// symbol referenced across every column, chunk, and row-buffer flush on
-    /// one connection, and is only reset by discarding that connection.
+    /// one namespace. Store-and-forward senders can recycle that namespace at a
+    /// later safe flush boundary (see `symbol_dict_reset` settings), but cannot
+    /// remove either hard cap or guarantee a reset before a large publication
+    /// reaches it. The direct whole-source backend is excluded and retains the
+    /// spent/commit/reborrow behavior below. Retained SF bytes and side-files are
+    /// not an additional hard dictionary-memory budget.
     ///
     /// The failing frame is rejected before any byte reaches the wire and the
     /// buffer is rolled back, so *that flush* loses nothing and already-interned
-    /// symbols keep flushing — but retrying a *new* symbol on the same sender can
-    /// never succeed. A full dictionary therefore **retires the connection on
-    /// return**: a pooled sender is dropped rather than recycled (so the next
+    /// symbols keep flushing — but retrying a *new* symbol on the same sender
+    /// cannot succeed until the namespace is replaced. A full dictionary
+    /// **retires the connection on return**: a pooled sender is dropped rather than recycled (so the next
     /// borrow gets a fresh, empty-dictionary connection, not the same full one),
     /// and the frames flushed *earlier* on it are drained / committed best-effort
     /// on the way out. So the simplest recovery is to return or drop the sender as

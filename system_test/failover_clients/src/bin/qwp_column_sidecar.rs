@@ -153,6 +153,29 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             state.db = Some(db);
             reply_ok(out, "")
         }
+        "SYMBOLS" => {
+            let p: Vec<&str> = rest.split_whitespace().collect();
+            if !(4..=5).contains(&p.len()) {
+                return Err(
+                    "usage: SYMBOLS <table> <phase> <size> <chunk|arrow|polars_sf> [manual]".into(),
+                );
+            }
+            let phase: i64 = p[1].parse().map_err(|_| "invalid phase")?;
+            let size: usize = p[2].parse().map_err(|_| "invalid size")?;
+            if !(8..=4096).contains(&size) {
+                return Err("symbol corpus size out of bounds".into());
+            }
+            flush_symbol_corpus(
+                state.db.as_ref().ok_or("no sender")?,
+                p[0],
+                phase,
+                size,
+                p[3],
+                p.get(4) == Some(&"manual"),
+            )
+            .map_err(|e| e.to_string())?;
+            reply_ok(out, "")
+        }
         "SEND" => {
             if state.db.is_none() {
                 return Err("no sender".to_string());
@@ -318,4 +341,103 @@ fn reply_ok(out: &mut impl Write, payload: &str) -> Result<(), String> {
 fn sanitize(s: &str) -> String {
     // Newlines in an ERR message would break the line-based protocol.
     s.replace('\r', " ").replace('\n', "|")
+}
+
+/// Test-only corpus matching Python's symbol_batch; old SEND is unchanged.
+fn flush_symbol_corpus(
+    db: &QuestDb,
+    table: &str,
+    phase: i64,
+    size: usize,
+    source: &str,
+    manual: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use questdb::ingress::column_sender::{ArrowColumnOverride, Validity};
+    let mut values = vec![None, Some(String::new()), Some(format!("東京-{phase}"))];
+    values.extend((0..size - 6).map(|i| Some(format!("epoch-{phase}-{i}"))));
+    values.extend([
+        None,
+        Some(format!("東京-{phase}")),
+        Some(format!("東京-{phase}")),
+    ]);
+    let ids: Vec<i64> = (0..size).map(|i| phase * 10000 + i as i64).collect();
+    let ts: Vec<i64> = ids.iter().map(|id| 1_700_000_000_000_000 + id).collect();
+    let mut sender = db.borrow_sender()?;
+    if manual {
+        sender.reset_symbol_dictionary()?;
+    }
+    match source {
+        "chunk" => {
+            let mut bytes = Vec::new();
+            let mut offsets = vec![0_i32];
+            let mut codes = Vec::new();
+            let mut bits = vec![0_u8; size.div_ceil(8)];
+            for (i, value) in values.iter().enumerate() {
+                codes.push(i as i32);
+                if let Some(value) = value {
+                    bytes.extend_from_slice(value.as_bytes());
+                    bits[i / 8] |= 1 << (i % 8);
+                }
+                offsets.push(bytes.len() as i32);
+            }
+            let validity = Validity::from_bitmap(&bits, size)?;
+            let mut chunk = Chunk::new(table);
+            chunk.column_i64("row_id", &ids, None)?;
+            chunk.symbol_i32("sym", &codes, &offsets, &bytes, Some(&validity))?;
+            chunk.at_micros(&ts)?;
+            sender.flush(&mut chunk)?;
+        }
+        "arrow" => {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("row_id", DataType::Int64, false),
+                Field::new("sym", DataType::Utf8, true),
+                Field::new(
+                    "ts",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(arrow_array::StringArray::from_iter(
+                        values.iter().map(|s| s.as_deref()),
+                    )),
+                    Arc::new(TimestampMicrosecondArray::from(ts)),
+                ],
+            )?;
+            sender.flush_arrow_batch_at_column(
+                table,
+                &batch,
+                ColumnName::new("ts")?,
+                &[ArrowColumnOverride::Symbol { column: "sym" }],
+            )?;
+        }
+        #[cfg(feature = "polars")]
+        "polars_sf" => {
+            use polars::prelude::*;
+            let df = DataFrame::new(vec![
+                Series::new("row_id".into(), ids).into(),
+                Series::new("sym".into(), values).into(),
+                Series::new("ts".into(), ts)
+                    .cast(&polars::prelude::DataType::Datetime(
+                        polars::prelude::TimeUnit::Microseconds,
+                        None,
+                    ))?
+                    .into(),
+            ])?;
+            for batch in questdb::ingress::polars::dataframe_to_batches(&df, None) {
+                sender.flush_arrow_batch_at_column(
+                    table,
+                    &batch?,
+                    ColumnName::new("ts")?,
+                    &[ArrowColumnOverride::Symbol { column: "sym" }],
+                )?;
+            }
+        }
+        _ => return Err(format!("unsupported symbol corpus source: {source}").into()),
+    }
+    sender.wait(AckLevel::Durable, Duration::from_secs(120))?;
+    Ok(())
 }
