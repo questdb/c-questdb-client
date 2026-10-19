@@ -40,16 +40,17 @@ observable, so it must be integrated into the application's event loop.
 | ILP/HTTP(S) | The HTTP write request succeeded | HTTP status and response body report ingestion errors |
 | ILP/TCP(S) | Bytes were written to the connection | No per-batch acknowledgement; inspect server logs after disconnects |
 | QWP/UDP | Datagrams were handed to the local socket | No acknowledgement; datagrams may be lost, reordered, or partly delivered |
-| QWP/WebSocket | The frame was published to the local store-and-forward queue | FSN progress, `ok` ACK barriers, Enterprise `durable` ACK barriers, and structured rejection events |
+| QWP/WebSocket | The frame was published to the local store-and-forward queue | FSN progress, `ok`, local-durable, and replicated-durable ACK barriers, plus structured rejection events |
 
 For QWP/WebSocket, `flush` is a local publication boundary, not a server
 acknowledgement. Use `flush_and_wait` or `wait` when the caller needs a barrier:
 
 - `ok` waits until the server accepts every frame published through that
   sender up to the captured frame-sequence boundary;
-- `durable` requires QuestDB Enterprise, waits for the server's durable
-  watermark, and requires the sender or pool to be opened with
-  `request_durable_ack=on`; and
+- `local_durable` waits for a local-disk watermark and requires
+  `request_durable_ack=local`; it survives server power loss, not disk loss;
+- `durable` waits for the replicated/object-store watermark and requires
+  `request_durable_ack=on`, `replicated`, or `local,replicated`; and
 - neither ACK guarantees that a WAL table row is immediately query-visible.
   WAL application remains asynchronous, so read-after-write workflows should
   poll or otherwise wait for visibility.
@@ -75,10 +76,10 @@ In manual QWP progress mode, periodic checkpoints advance only when the
 application calls a progress-driving API such as `drive_once` or `wait`.
 
 A periodic checkpoint protects only the client's local replay log.
-`request_durable_ack=on` is orthogonal: it requests QuestDB Enterprise
-server-side durable ACKs. Use periodic local durability together with durable
-ACK waits when both sides of the delivery path must cross a durability
-barrier.
+`request_durable_ack` is orthogonal. It accepts `off` (default), legacy `on`
+(replicated), `local`, `replicated`, and `local,replicated`. The server must
+grant the complete requested set or the connection fails. Local-only trims on
+local ACK; any set containing replicated trims only on replicated ACK.
 
 Returning a borrowed QWP sender does not discard already-published frames. For
 in-memory store-and-forward, pool shutdown drains best-effort within

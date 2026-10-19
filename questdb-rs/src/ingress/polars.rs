@@ -407,13 +407,11 @@ impl<'a> PolarsIngestOptions<'a> {
 
     /// Block each checkpoint (and the trailing commit) until the frame reaches
     /// `level`. Defaults to the connect string's level — the same one the
-    /// store-and-forward senders use:
-    /// [`AckLevel::Durable`](crate::ingress::AckLevel::Durable) when the
-    /// Enterprise-only durable mode is enabled with
-    /// `request_durable_ack=on`, otherwise
-    /// [`AckLevel::Ok`](crate::ingress::AckLevel::Ok). Requesting `Durable`
-    /// requires QuestDB Enterprise and `request_durable_ack=on`; otherwise it
-    /// is rejected with
+    /// store-and-forward senders use: local-durable for
+    /// `request_durable_ack=local`, replicated-durable for `on`,
+    /// `replicated`, or `local,replicated`, otherwise
+    /// [`AckLevel::Ok`](crate::ingress::AckLevel::Ok). A requested durable
+    /// level must match the configured tier; otherwise it is rejected with
     /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall).
     #[must_use]
     pub fn ack_level(mut self, level: crate::ingress::AckLevel) -> Self {

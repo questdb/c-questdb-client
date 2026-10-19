@@ -129,9 +129,12 @@ ws::addr=localhost:9000;sf_dir=/var/lib/my-app/questdb-sf;sender_id=orders;sf_du
 The interval defaults to 5000 ms in periodic mode and is a target cadence:
 runner scheduling and storage-sync latency add to the actual recovery window.
 Publication can see ordinary backpressure at a segment boundary until the
-segment has been checkpointed. This local durability is independent of the
-QuestDB Enterprise server barrier selected by `request_durable_ack=on`; use
-both when end-to-end durability is required.
+segment has been checkpointed. This client-side durability is independent of
+`request_durable_ack`, whose values are `off` (default), legacy `on`
+(replicated), `local`, `replicated`, and `local,replicated`. Local ACKs survive
+server power loss but not disk loss; replicated ACKs cover the configured
+replication/object-store barrier. With both tiers, replicated ACKs control
+store-and-forward trimming.
 
 A standalone `Reader::from_conf("ws::addr=...")` gives the query side
 without a pool (`sync-reader-qwp-ws` feature), yielding results as native

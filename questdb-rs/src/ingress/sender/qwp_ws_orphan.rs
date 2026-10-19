@@ -721,7 +721,7 @@ impl OrphanDrainer {
             return OrphanOpenOutcome::Stopped;
         }
         let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
-        let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
+        let mut send_core = QwpWsSendCore::new_with_durable_ack_tiers_and_rejection_limit(
             transport,
             ReconnectPolicy::bounded(
                 *config.qwp_ws.reconnect_max_duration,
