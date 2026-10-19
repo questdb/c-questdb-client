@@ -97,3 +97,13 @@ The committed headers are the authoritative native API reference:
 For connection-string keys, QuestDB Enterprise multi-host failover,
 store-and-forward, and deployment guidance, use the public
 [C and C++ client guide](https://questdb.com/docs/ingestion/clients/c-and-cpp/).
+
+## Automatic symbol dictionary recycling
+
+QWP/WebSocket store-and-forward senders accept `symbol_dict_reset=on|off`
+(default `on`), `symbol_dict_reset_threshold=1..1000000` (default `100000`),
+and `symbol_dict_reset_max_wait_millis=0..9223372036854` (default `2000`)
+in the existing connect string. Recycling occurs at safe flush boundaries and
+keeps public FSNs continuous within a sender lifetime. No manual-reset C ABI
+is added. See [symbol dictionary recycling](CONSIDERATIONS.md#qwpwebsocket-symbol-dictionary-recycling)
+for hysteresis, waits, hard caps, and the direct whole-source backend exclusion.

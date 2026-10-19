@@ -231,5 +231,35 @@ class AlterThreadTransientErrorTest(unittest.TestCase):
         self.assertIn('ValueError', failures[0])
 
 
+class SymbolRecycleGeneratorTest(unittest.TestCase):
+    def test_churn_settings_and_policy_reach_multiple_resets(self):
+        from qwp_symbol_recycle import expected_reset_count, symbol_batch
+        for enabled in (True, False):
+            params = qwp_ws_fuzz.FuzzParams(
+                symbol_dict_reset=enabled, symbol_dict_reset_threshold=4,
+                symbol_churn=True, column_skip_factor=1)
+            self.assertEqual(params.symbol_dict_reset, enabled)
+            self.assertTrue(params.symbol_churn)
+            batches = [symbol_batch(i, 16 << i) for i in range(4)]
+            counts = [len({s for _, s in b if s is not None}) for b in batches]
+            self.assertEqual(expected_reset_count(counts, params.symbol_dict_reset_threshold,
+                                                 enabled=enabled), 3 if enabled else 0)
+            self.assertLess(sum(counts), 1_000_000)
+
+    def test_churn_symbol_survives_optional_column_skips(self):
+        # Isolate the generator from transport; assert its real expected-row
+        # output, which the live full-cell oracle later checks against SQL.
+        sender = mock.Mock()
+        params = qwp_ws_fuzz.FuzzParams(symbol_churn=True, column_skip_factor=1)
+        rng = qwp_ws_fuzz.Rng(0x1234567890)
+        table = qwp_ws_fuzz.TableData('weather0')
+        values = []
+        for timestamp in range(32):
+            line = qwp_ws_fuzz.generate_line('weather0', sender, params,
+                                             timestamp, rng, table)
+            values.append(line.get_value('recycle_symbol'))
+        self.assertEqual(values, [f'churn-東京-{i}' for i in range(32)])
+
+
 if __name__ == '__main__':
     unittest.main()

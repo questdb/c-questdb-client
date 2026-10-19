@@ -222,6 +222,47 @@ pub(crate) struct PersistedSymbolDict {
 }
 
 impl PersistedSymbolDict {
+    /// Strictly reset after durable old-frame exclusion, with exclusive slot
+    /// maintenance held and the old foreground handle released. Retry is safe
+    /// until new-namespace publication begins. Truncate the existing inode:
+    /// platforms without directory fsync must not recover an older dictionary
+    /// through a stale replacement directory entry.
+    pub(crate) fn reset_drained(slot_dir: &Path) -> io::Result<Self> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(slot_dir.join(FILE_NAME))?;
+        file.set_len(0)?;
+        #[cfg(test)]
+        super::qwp_ws_sfa_queue::recycle_barrier("dictionary truncated")?;
+        let mut header = [0u8; HEADER_SIZE as usize];
+        header[..4].copy_from_slice(&FILE_MAGIC.to_le_bytes());
+        header[4] = VERSION;
+        file.write_all(&header)?;
+        #[cfg(test)]
+        super::qwp_ws_sfa_queue::recycle_barrier("dictionary header written")?;
+        file.sync_all()?;
+        #[cfg(test)]
+        super::qwp_ws_sfa_queue::recycle_barrier("dictionary synced")?;
+        super::qwp_ws_sfa_manifest::sync_directory(slot_dir)?;
+        #[cfg(test)]
+        super::qwp_ws_sfa_queue::recycle_barrier("dictionary directory synced")?;
+        Ok(Self {
+            file,
+            append_offset: HEADER_SIZE,
+            size: 0,
+            loaded_entries: Vec::new(),
+            append_scratch: Vec::new(),
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_append_cleanup: false,
+            #[cfg(test)]
+            fail_next_append: false,
+        })
+    }
+
     /// Opens (creating if absent) the dictionary file in `slot_dir`. An existing,
     /// readable file is parsed and its complete entries are loaded into memory (see
     /// [`loaded_entries`]); a missing file, or a present file with a bad-magic
@@ -906,6 +947,26 @@ mod tests {
     /// truncate back to once chunk 1 is rejected (= the end of chunk 0).
     const TORN_BYTE_OFFSET: usize = 21;
     const TORN_TRUNCATED_LEN: u64 = 18;
+
+    #[test]
+    fn recycle_reset_dictionary_preserves_inode_and_clears_symbols() {
+        let dir = tmp_slot();
+        let mut dict = PersistedSymbolDict::open(dir.path()).unwrap();
+        dict.append_symbol(b"old").unwrap();
+        drop(dict);
+        let old_handle = File::open(dir.path().join(FILE_NAME)).unwrap();
+        let mut fresh = PersistedSymbolDict::reset_drained(dir.path()).unwrap();
+        assert_eq!(fresh.size(), 0);
+        assert_eq!(old_handle.metadata().unwrap().len(), HEADER_SIZE);
+        fresh.append_symbol(b"new").unwrap();
+        drop(fresh);
+        assert_eq!(
+            PersistedSymbolDict::open(dir.path())
+                .unwrap()
+                .read_loaded_symbols(),
+            [b"new"]
+        );
+    }
 
     fn tmp_slot() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()

@@ -82,6 +82,9 @@ mod qwp_ws_publisher;
 mod qwp_ws_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod qwp_ws_recycle;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_segment;
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -89,6 +92,23 @@ pub(crate) mod qwp_ws_sfa_manifest;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_queue;
+
+#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+pub(crate) fn fail_next_recycle_storage_for_test() {
+    qwp_ws_sfa_queue::RECYCLE_FAIL_AFTER.with(|fail| fail.set(Some(0)));
+}
+
+#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+pub(crate) fn terminal_after_recycle_park_for_test() {
+    qwp_ws::TERMINAL_AFTER_RECYCLE_PARK.with(|fault| fault.set(true));
+}
+
+/// Latch a periodic-sync failure the moment the next recycle claim has parked
+/// its worker, as a sync that was in flight during the park and failed would.
+#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+pub(crate) fn durability_failure_after_recycle_park_for_test() {
+    qwp_ws::DURABILITY_FAILURE_AFTER_RECYCLE_PARK.with(|fault| fault.set(true));
+}
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_slot;
@@ -303,6 +323,14 @@ impl Sender {
         )
     }
 
+    #[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+    pub(crate) fn recycle_allocation_probe(&self) -> Box<dyn Fn() -> Option<u64>> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => state.recycle_allocation_probe(),
+            _ => panic!("background sender expected"),
+        }
+    }
+
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn drain_qwp_ws_error_notifications(&mut self) -> Result<()> {
         loop {
@@ -357,17 +385,18 @@ impl Sender {
             )
         })?;
         qwp.check_can_flush()?;
-        if qwp.is_empty() {
-            return Ok(None);
-        }
-        if transactional {
+        if transactional && !qwp.is_empty() {
             return Err(error::fmt!(
                 InvalidApiCall,
                 "Transactional flushes are not supported for QWP/WebSocket."
             ));
         }
 
-        let result = match &mut self.handler {
+        // `must_close()` follows the publication lifecycle for QWP/WebSocket: a
+        // `SocketError` here may be recoverable (back-pressure timeout, a
+        // durability latch, a storage fault during dictionary recycling) and
+        // must not retire a sender that the next flush will drive again.
+        match &mut self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => {
                 let max =
                     effective_qwp_ws_max_buf_size(self.max_buf_size, &state.server_max_batch_size);
@@ -379,14 +408,7 @@ impl Sender {
                 flush_qwp_ws_manual(state, qwp, max)
             }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
-        };
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
-        {
-            self.connected = false;
         }
-        result
     }
 
     #[allow(unused_variables)]
@@ -631,6 +653,22 @@ impl Sender {
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
         self.flush_qwp_ws_buffer(buf, false)
+    }
+
+    /// Request symbol dictionary recycling at a later safe, nonempty flush.
+    ///
+    /// This advisory call does not flush, wait, reset storage, or connect. Repeated
+    /// requests coalesce, and success does not guarantee a reset. Disabled recycling
+    /// and non-QWP/WebSocket transports are no-ops. Closed or terminal QWP senders
+    /// return their existing error. Publication sequence numbers remain continuous.
+    pub fn reset_symbol_dictionary(&mut self) -> Result<()> {
+        match &mut self.handler {
+            #[cfg(feature = "sync-sender-qwp-ws")]
+            SyncProtocolHandler::SyncQwpWs(state) => state.reset_symbol_dictionary(),
+            #[cfg(feature = "sync-sender-qwp-ws")]
+            SyncProtocolHandler::ManualQwpWs(state) => state.reset_symbol_dictionary(),
+            _ => Ok(()),
+        }
     }
 
     /// Return the highest frame sequence number published locally by this
@@ -993,23 +1031,19 @@ impl Sender {
         } else {
             Ok(())
         };
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
-        {
-            self.connected = false;
-        }
         result.and(drain_result)
     }
 
     /// Tell whether the sender is no longer usable and must be dropped.
     ///
     /// Returns `true` after an unrecoverable failure. For ILP-over-TCP this
-    /// is any socket error. For QWP/WebSocket this also covers a server
-    /// rejection or protocol violation that latches the publication
-    /// lifecycle to its terminal state. ILP-over-HTTP and QWP/UDP never
-    /// transition into a permanently-unusable state and always return
-    /// `false`.
+    /// is any socket error. For QWP/WebSocket it is a server rejection or
+    /// protocol violation that latches the publication lifecycle to its
+    /// terminal state; recoverable failures (a back-pressure timeout, a
+    /// periodic-sync durability latch, a storage fault during dictionary
+    /// recycling) do not retire the sender, and the next flush drives it
+    /// again. ILP-over-HTTP and QWP/UDP never transition into a
+    /// permanently-unusable state and always return `false`.
     ///
     /// In QWP/WebSocket manual progress mode the answer only refreshes when
     /// the user drives the sender (`drive_once` / `flush`), since no

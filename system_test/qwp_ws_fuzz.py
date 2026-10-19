@@ -760,6 +760,9 @@ class FuzzParams:
         'extreme_numeric_factor',
         'extreme_timestamp_factor',
         'negative_zero_factor',
+        'symbol_dict_reset',
+        'symbol_dict_reset_threshold',
+        'symbol_churn',
     )
 
     def __init__(
@@ -780,7 +783,10 @@ class FuzzParams:
             extreme_string_factor=-1,
             extreme_numeric_factor=-1,
             extreme_timestamp_factor=-1,
-            negative_zero_factor=-1):
+            negative_zero_factor=-1,
+            symbol_dict_reset=True,
+            symbol_dict_reset_threshold=100000,
+            symbol_churn=False):
         self.duplicates_factor = duplicates_factor
         self.column_reordering_factor = column_reordering_factor
         self.column_skip_factor = column_skip_factor
@@ -805,6 +811,9 @@ class FuzzParams:
         self.extreme_numeric_factor = extreme_numeric_factor
         self.extreme_timestamp_factor = extreme_timestamp_factor
         self.negative_zero_factor = negative_zero_factor
+        self.symbol_dict_reset = symbol_dict_reset
+        self.symbol_dict_reset_threshold = symbol_dict_reset_threshold
+        self.symbol_churn = symbol_churn
 
 
 class LoadParams:
@@ -1186,6 +1195,12 @@ def generate_line(table_name: str, sender, params: FuzzParams,
                   table_data: 'TableData') -> LineData:
     line = LineData(timestamp_us)
     sender.table(table_name)
+    if params.symbol_churn:
+        # Always present, outside optional-column skipping: each row adds a
+        # deterministic symbol from the existing seeded timestamp sequence.
+        value = f'churn-東京-{timestamp_us}'
+        sender.symbol('recycle_symbol', value)
+        line.add_tag('recycle_symbol', value)
 
     if params.exercise_symbols:
         sym_indexes = skip_columns(
