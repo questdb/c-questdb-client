@@ -223,11 +223,11 @@ impl Drop for SenderSlotRelease<'_> {
 pub struct ConnectHandlers {
     /// Connection lifecycle listener; see [`QuestDb::connect_with_listener`].
     pub connection_listener: Option<crate::ingress::ConnectionListener>,
-    /// Listener inbox capacity; `0` selects the default (64).
+    /// Listener inbox capacity; `0` selects the default (64), maximum 65,536.
     pub connection_event_inbox_capacity: usize,
     /// Server-rejection handler; without one every rejection is logged.
     pub error_handler: Option<crate::ingress::QwpWsErrorHandler>,
-    /// Handler inbox capacity; `0` selects the default (64).
+    /// Handler inbox capacity; `0` selects the default (64), maximum 65,536.
     pub error_inbox_capacity: usize,
 }
 
@@ -797,6 +797,19 @@ impl QuestDb {
     /// producer-side abort logic belongs with the terminal error raised by
     /// the sender calls themselves.
     pub fn connect_with_handlers(conf: &str, handlers: ConnectHandlers) -> Result<Self> {
+        const MAX_CALLBACK_INBOX_CAPACITY: usize = 65_536;
+        if handlers.connection_event_inbox_capacity > MAX_CALLBACK_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "connection_event_inbox_capacity must be at most {MAX_CALLBACK_INBOX_CAPACITY}"
+            ));
+        }
+        if handlers.error_inbox_capacity > MAX_CALLBACK_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "error_inbox_capacity must be at most {MAX_CALLBACK_INBOX_CAPACITY}"
+            ));
+        }
         let conn_events = match handlers.connection_listener {
             Some(listener) => conn_events::ConnectionEventSource::new(
                 listener,
@@ -2799,10 +2812,14 @@ fn connect_sfa_pool_with_recovery_candidates(
             force_async_initial_connect,
         )
         .map_err(|err| {
-            crate::Error::new(
-                err.code(),
-                format!("Failed to open store-and-forward sender: {}", err.msg()),
-            )
+            // `reclassified` keeps the whole payload, including a role reject:
+            // `reconnect_pick` then retries an all-endpoints role rejection
+            // (every node a replica) until the caller's budget, as it already
+            // did for direct senders, instead of failing on the first round.
+            // A promotion can clear it; see `questdb_db_borrow_sender_with_retry`.
+            let code = err.code();
+            let msg = format!("Failed to open store-and-forward sender: {}", err.msg());
+            err.reclassified(code, msg)
         })?;
     PooledSenderCore::new_store_and_forward(
         state,
@@ -3326,15 +3343,48 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
     use tempfile::TempDir;
 
-    use super::{SlotReservations, managed_slot_recovery_scan_from};
+    use super::{ConnectHandlers, QuestDb, SlotReservations, managed_slot_recovery_scan_from};
 
     fn dirty_slot(root: &std::path::Path, name: &str) {
         let slot = root.join(name);
         fs::create_dir(&slot).unwrap();
         fs::write(slot.join("sf-0.sfa"), b"queued").unwrap();
+    }
+
+    #[test]
+    fn callback_inbox_capacities_are_rejected_before_allocation() {
+        let conf = "ws::addr=127.0.0.1:19009;lazy_connect=on;";
+        let listener_err = match QuestDb::connect_with_handlers(
+            conf,
+            ConnectHandlers {
+                connection_listener: Some(Arc::new(|_| {})),
+                connection_event_inbox_capacity: 65_537,
+                ..ConnectHandlers::default()
+            },
+        ) {
+            Ok(_) => panic!("oversized connection event inbox was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(listener_err.code(), crate::ErrorCode::ConfigError);
+        assert!(listener_err.msg().contains("at most 65536"));
+
+        let rejection_err = match QuestDb::connect_with_handlers(
+            conf,
+            ConnectHandlers {
+                error_handler: Some(crate::ingress::QwpWsErrorHandler::new(|_| {})),
+                error_inbox_capacity: 65_537,
+                ..ConnectHandlers::default()
+            },
+        ) {
+            Ok(_) => panic!("oversized rejection inbox was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(rejection_err.code(), crate::ErrorCode::ConfigError);
+        assert!(rejection_err.msg().contains("at most 65536"));
     }
 
     #[test]

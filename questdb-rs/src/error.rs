@@ -384,6 +384,22 @@ impl Error {
         self.0.in_doubt
     }
 
+    /// Replace the broad error classification and user-facing context while
+    /// retaining every structured diagnostic attached by the original source.
+    ///
+    /// Transport adapters use this when an error must become retryable or gain
+    /// endpoint context. Constructing a fresh [`Error`] there would silently
+    /// discard QWP and query-side diagnostic payloads.
+    #[cfg_attr(
+        not(any(feature = "_sender-qwp-ws", feature = "_egress")),
+        allow(dead_code)
+    )]
+    pub(crate) fn reclassified<S: Into<String>>(mut self, code: ErrorCode, msg: S) -> Self {
+        self.0.code = code;
+        self.0.msg = msg.into();
+        self
+    }
+
     /// Attach a structured QWP/WebSocket rejection to this error.
     #[cfg(feature = "_sender-qwp-ws")]
     pub fn with_qwp_ws_rejection(mut self, rejection: crate::ingress::QwpWsSenderError) -> Self {

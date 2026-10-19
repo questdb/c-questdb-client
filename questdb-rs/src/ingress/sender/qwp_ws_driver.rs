@@ -351,6 +351,11 @@ impl QwpWsReconnectState {
         Self::new(self.policy, self.context, self.reason, err)
     }
 
+    /// The latest attempt's failure, or what started the reconnect.
+    pub(crate) fn last_error(&self) -> &Error {
+        &self.last_error
+    }
+
     pub(crate) fn take_first_attempt_pace(&mut self) -> Option<Duration> {
         self.pace_first_attempt.take()
     }
@@ -464,6 +469,9 @@ pub(crate) struct QwpWsPublicationStore<Q = SfaFrameQueue> {
     sender_errors: SenderErrorLog,
     rejection_sink: Option<Arc<crate::ingress::rejection_events::RejectionEventSource>>,
     counters: QwpWsCounters,
+    /// Why the latest attempt to (re)connect failed, while the transport is
+    /// down; `None` once a connection is established.
+    reconnect_failure: Option<Error>,
 }
 
 impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
@@ -479,7 +487,24 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             sender_errors: SenderErrorLog::new(event_capacity),
             rejection_sink: None,
             counters: QwpWsCounters::default(),
+            reconnect_failure: None,
         }
+    }
+
+    /// Record why the latest attempt to (re)connect failed. An ACK wait that
+    /// times out while the transport is down reports it, rather than a server
+    /// that stopped acknowledging (see [`ack_wait_timeout_error`]).
+    pub(crate) fn record_reconnect_failure(&mut self, err: &Error) {
+        self.reconnect_failure = Some(err.clone());
+    }
+
+    /// A connection is established: no reconnect is failing any more.
+    pub(crate) fn clear_reconnect_failure(&mut self) {
+        self.reconnect_failure = None;
+    }
+
+    pub(crate) fn reconnect_failure(&self) -> Option<&Error> {
+        self.reconnect_failure.as_ref()
     }
 
     pub(crate) fn set_rejection_sink(
@@ -1891,6 +1916,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         // queued delta frames (which reference ids above 0) replay.
         self.catch_up_pending = self.dict_mirror.is_enabled() && !self.dict_mirror.is_empty();
         store.counters.total_reconnects_succeeded += 1;
+        store.clear_reconnect_failure();
         store.push_event(DriverEvent::Reconnected { reason });
         DriveOutcome::Reconnected { reason }
     }
@@ -1938,6 +1964,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 Ok(self.finish_reconnect_success(store, reason))
             }
             QwpWsReconnectStep::RetryAfter { sleep_for } => {
+                store.record_reconnect_failure(reconnect.last_error());
                 let deadline = reconnect.deadline();
                 self.pending_reconnect = Some(reconnect);
                 Ok(DriveOutcome::ReconnectDelay {
@@ -1950,6 +1977,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     store.mark_terminal(Some(error));
                     Ok(DriveOutcome::Terminal)
                 } else {
+                    store.record_reconnect_failure(&error);
                     let sleep_for = reconnect.policy.initial_backoff();
                     let next = QwpWsReconnectState::new(
                         reconnect.policy,
@@ -2599,6 +2627,11 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     }
     matches!(
         err.code(),
+        // NB: `InvalidApiCall` is deliberately NOT here. The connection pool
+        // raises it for ordinary exhaustion, which is transient contention,
+        // and `db.rs`'s borrow-retry loops key on this predicate -- listing it
+        // would make them give up on the first `acquire_timeout` expiry instead
+        // of retrying with backoff to the caller's budget.
         ErrorCode::AuthError
             | ErrorCode::ConfigError
             | ErrorCode::ProtocolVersionError
@@ -2708,6 +2741,50 @@ pub(crate) fn reconnect_backoff_step(
     (sleep_for, next_backoff)
 }
 
+/// The `failover_retry` an ACK wait returns when `timeout` passes with no ack
+/// progress toward `boundary`. The frames stay queued and the background runner
+/// keeps delivering them, so the caller retries the wait; re-flushing the data
+/// would deliver it twice.
+///
+/// While the transport is down the stall is the reconnect's, not the
+/// server's. The message then names why the latest attempt failed, and the
+/// error preserves that failure's structured detail, instead of describing a
+/// live server that stopped acknowledging.
+pub(crate) fn ack_wait_timeout_error(
+    operation: &str,
+    timeout: Duration,
+    boundary: u64,
+    completed: Option<u64>,
+    reconnect_failure: Option<&Error>,
+) -> Error {
+    let progress = match completed {
+        Some(fsn) => format!("reached FSN {fsn}"),
+        None => "reached no frame".to_string(),
+    };
+    let stall = match reconnect_failure {
+        None => "the connection is alive but the server is not advancing the watermark. \
+                 The published frames remain queued and the background runner keeps \
+                 delivering them: retry wait() to keep awaiting the ack"
+            .to_string(),
+        Some(cause) => format!(
+            "the connection is down and reconnecting keeps failing: {}. The published \
+             frames remain queued and the background runner keeps reconnecting: once \
+             that is resolved, retry wait() to keep awaiting the ack",
+            cause.msg()
+        ),
+    };
+    let msg = format!(
+        "{operation} timed out after {timeout:?} with no ack progress (target FSN \
+         {boundary}, {progress}); {stall}, or close the pool to drain. Do not \
+         re-flush the same data, which is already accepted and would be delivered \
+         twice."
+    );
+    match reconnect_failure {
+        Some(cause) => cause.clone().reclassified(ErrorCode::FailoverRetry, msg),
+        None => Error::new(ErrorCode::FailoverRetry, msg),
+    }
+}
+
 pub(super) fn retry_budget_exhausted_error(
     context: &str,
     attempts: usize,
@@ -2715,32 +2792,20 @@ pub(super) fn retry_budget_exhausted_error(
     last_error: Option<Error>,
 ) -> Error {
     let elapsed_ms = started.elapsed().as_millis();
-    let code = last_error
-        .as_ref()
-        .map_or(ErrorCode::SocketError, |err| err.code());
     let last_error_msg = last_error
         .as_ref()
         .map_or_else(|| "none".to_string(), |err| err.msg().to_string());
-    let qwp_ws_rejection = last_error
-        .as_ref()
-        .and_then(|err| err.qwp_ws_rejection().cloned());
-    let qwp_ws_role_reject = last_error
-        .as_ref()
-        .and_then(|err| err.qwp_ws_role_reject().cloned());
-
-    let mut err = Error::new(
-        code,
-        format!(
-            "{context} retry budget exhausted [attempts={attempts}, elapsed_ms={elapsed_ms}, last_error={last_error_msg}]"
-        ),
+    let msg = format!(
+        "{context} retry budget exhausted [attempts={attempts}, elapsed_ms={elapsed_ms}, last_error={last_error_msg}]"
     );
-    if let Some(rejection) = qwp_ws_rejection {
-        err = err.with_qwp_ws_rejection(rejection);
+
+    match last_error {
+        Some(err) => {
+            let code = err.code();
+            err.reclassified(code, msg)
+        }
+        None => Error::new(ErrorCode::SocketError, msg),
     }
-    if let Some(role_reject) = qwp_ws_role_reject {
-        err = err.with_qwp_ws_role_reject(role_reject);
-    }
-    err
 }
 
 pub(crate) trait PublicationLog {
@@ -4627,6 +4692,45 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_error_is_terminal_retries_bare_invalid_api_call() {
+        // Pool exhaustion is `InvalidApiCall` and is transient contention that
+        // resolves when a peer returns its handle. `db.rs`'s
+        // `borrow_sender_owned_with_retry` / `reborrow_with_retry` key on this
+        // predicate, so listing the bare code would make them give up on the
+        // first `acquire_timeout` expiry instead of retrying with backoff to the
+        // caller's budget.
+        let exhausted = Error::new(
+            ErrorCode::InvalidApiCall,
+            "Connection pool exhausted: 4 sender(s) in use at the sender_pool_max cap of 4",
+        );
+        assert!(!reconnect_error_is_terminal(&exhausted));
+    }
+
+    #[test]
+    fn ack_wait_timeout_names_a_failing_reconnect() {
+        // Connected: the server is not advancing the watermark.
+        let alive = ack_wait_timeout_error("wait", Duration::from_millis(50), 3, Some(1), None);
+        assert_eq!(alive.code(), ErrorCode::FailoverRetry);
+        assert!(alive.msg().contains("the connection is alive"), "{alive}");
+        assert!(alive.msg().contains("reached FSN 1"), "{alive}");
+        assert!(alive.msg().contains("Do not re-flush"), "{alive}");
+
+        // Disconnected: the stall is the reconnect's, and the error says why.
+        let cause = Error::new(ErrorCode::SocketError, "could not connect: refused");
+        let down = ack_wait_timeout_error("wait", Duration::from_millis(50), 3, None, Some(&cause));
+        assert_eq!(down.code(), ErrorCode::FailoverRetry);
+        assert!(
+            down.msg()
+                .contains("reconnecting keeps failing: could not connect: refused"),
+            "{down}"
+        );
+        assert!(down.msg().contains("reached no frame"), "{down}");
+        assert!(down.msg().contains("Do not re-flush"), "{down}");
+        assert!(!down.msg().contains("the connection is alive"), "{down}");
+        assert!(!down.in_doubt());
+    }
+
+    #[test]
     fn reconnect_catch_up_splits_across_frames_when_server_caps_batch() {
         // Five recovered symbols and a server batch cap too small for a one-frame
         // re-registration: the driver must split the catch-up across multiple
@@ -5774,36 +5878,19 @@ mod tests {
             .unwrap();
         let _server_streams = server.join().unwrap();
 
-        // A short read timeout plus a retry loop instead of one indefinitely
-        // blocking read: on Windows the gate's CancelIoEx only cancels a recv
-        // already in flight, and Winsock shutdown() does not wake one entered
-        // afterwards, so a single read can straddle the shutdown and miss
-        // both wake-ups. Retrying sidesteps the race: once the gate has shut
-        // the replacement socket down, the next read attempt fails
-        // immediately. A missing reconnect registration still fails the test,
-        // because the gate never touches this socket and every attempt times
-        // out until the deadline.
+        // Start the read after shutdown to cover the Windows cancellation race:
+        // CancelIoEx sees no pending recv in this ordering, so the original
+        // socket itself must have been shut down. A missing reconnect
+        // registration still fails because this read times out.
         transport
             .stream
             .set_timeouts(Some(Duration::from_millis(100)), None)
             .unwrap();
-        let reader = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let mut byte = [0u8; 1];
-            loop {
-                match transport.stream.read(&mut byte) {
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) && std::time::Instant::now() < deadline => {}
-                    result => return result,
-                }
-            }
-        });
         traffic_gate.shutdown().unwrap();
+        let mut byte = [0u8; 1];
+        let result = transport.stream.read(&mut byte);
 
-        match reader.join().unwrap() {
+        match result {
             Ok(0) => {}
             Err(err)
                 if matches!(

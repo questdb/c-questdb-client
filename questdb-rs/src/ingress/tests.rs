@@ -567,6 +567,54 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         SenderBuilder::from_conf("ws::addr=localhost:9000;error_inbox_capacity=15;"),
         "error_inbox_capacity must be >= 16: 15",
     );
+    // Upper bound. Only the floor was covered, so deleting the cap failed
+    // nothing -- and the cap is what stands between a caller-supplied capacity
+    // and a `VecDeque::with_capacity` the allocator aborts the host process on.
+    let max = crate::ingress::conf::QWP_WS_MAX_ERROR_INBOX_CAPACITY;
+    SenderBuilder::from_conf(format!(
+        "ws::addr=localhost:9000;error_inbox_capacity={max};"
+    ))
+    .unwrap();
+    assert_conf_err(
+        SenderBuilder::from_conf(format!(
+            "ws::addr=localhost:9000;error_inbox_capacity={};",
+            max + 1
+        )),
+        &format!("error_inbox_capacity must be <= {max}: {}", max + 1)[..],
+    );
+}
+
+/// The listener-side twin of the `error_inbox_capacity` cap above.
+///
+/// Every `connection_listener` callsite in the tree passes 0, so this guard had
+/// no coverage at all. It is reachable from Python as
+/// `Sender(..., connection_event_inbox_capacity=N)` and from C through
+/// `line_sender_opts_connection_event_handler`, which has no check of its own
+/// and depends entirely on this one.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn connection_listener_bounds_its_inbox_capacity() {
+    use crate::ingress::conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY as MAX;
+
+    let noop = || -> crate::ingress::ConnectionListener { std::sync::Arc::new(|_: &_| {}) };
+
+    // The exact cap is accepted: an off-by-one here turns a legal capacity into
+    // a spurious error for a caller who read the documented maximum.
+    SenderBuilder::from_conf("ws::addr=localhost:9000;")
+        .unwrap()
+        .connection_listener(noop(), MAX)
+        .unwrap();
+    let err = SenderBuilder::from_conf("ws::addr=localhost:9000;")
+        .unwrap()
+        .connection_listener(noop(), MAX + 1)
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(
+        err.msg()
+            .contains(&format!("inbox_capacity must be <= {MAX}")),
+        "{}",
+        err.msg()
+    );
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1416,6 +1464,15 @@ fn http_retry_timeout() {
     assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(10000));
     assert_specified_eq(&http_config.retry_timeout, Duration::from_millis(100));
     assert_defaulted_eq(&http_config.retry_max_backoff, Duration::from_millis(1000));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn http_retry_timeout_rejects_unrepresentable_deadline() {
+    assert_conf_err(
+        SenderBuilder::new(Protocol::Http, "localhost", 9000).retry_timeout(Duration::MAX),
+        "retry_timeout is too large for the platform monotonic clock.",
+    );
 }
 
 #[cfg(feature = "sync-sender-http")]

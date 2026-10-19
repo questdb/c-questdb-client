@@ -3063,11 +3063,13 @@ fn failover_duration_budget_spans_successful_resets() {
 
     let resets = Arc::new(AtomicUsize::new(0));
     let resets_cb = Arc::clone(&resets);
+    let (capture, gave_up) = gave_up_capture();
     let mut cursor = reader
         .prepare("select 1")
         .on_failover_reset(move |_| {
             resets_cb.fetch_add(1, Ordering::SeqCst);
         })
+        .on_failover_progress(capture)
         .execute()
         .expect("execute");
 
@@ -3075,17 +3077,15 @@ fn failover_duration_budget_spans_successful_resets() {
         Err(e) => e,
         Ok(_) => panic!("second failure must exhaust the original deadline"),
     };
-    assert!(
-        err.msg().contains("failover_max_duration_ms")
-            || err.msg().contains("wall-clock budget exhausted")
-            || matches!(
-                err.code(),
-                ErrorCode::SocketError | ErrorCode::ProtocolError
-            ),
-        "unexpected error: code={:?} msg={}",
+    // The spent deadline admits no reconnect, so the transport trigger is
+    // the surfaced error; the reconnect loop gave up on the deadline.
+    assert_eq!(
         err.code(),
+        ErrorCode::SocketError,
+        "unexpected error: {}",
         err.msg()
     );
+    assert_gave_up_on_deadline(&gave_up);
     assert_eq!(
         resets.load(Ordering::SeqCst),
         1,
@@ -4447,27 +4447,24 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+    let (capture, gave_up) = gave_up_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
     let err = match cursor.next_batch() {
         Err(e) => e,
         Ok(_) => panic!("must fail"),
     };
-    // The deadline branch surfaces a specific message including the
-    // configured `failover_max_duration_ms` value. The `prefer_over_trigger`
-    // logic may pick the trigger over the deadline-error if the
-    // trigger is more diagnostic — but in this test the trigger is a
-    // plain SocketError, so the deadline message should win.
-    assert!(
-        err.msg().contains("failover_max_duration_ms")
-            || err.msg().contains("wall-clock budget exhausted")
-            || matches!(
-                err.code(),
-                ErrorCode::SocketError | ErrorCode::ProtocolError
-            ),
-        "unexpected error: code={:?} msg={}",
-        err.code(),
-        err.msg()
-    );
+    // The deadline diagnostic names the configured duration knob. The
+    // last walk failed on a transport error, which is no more diagnostic
+    // than the trigger, so `next_batch` keeps surfacing the trigger.
+    assert_eq!(err.code(), ErrorCode::SocketError, "msg={}", err.msg());
+    assert!(!err.msg().contains("wall-clock budget exhausted"));
+    let (code, msg) = gave_up.lock().unwrap().clone().expect("GaveUp");
+    assert_eq!(code, ErrorCode::SocketError);
+    assert!(msg.contains("failover_max_duration_ms=50"), "msg={msg}");
 }
 
 /// Regression for `reconnect_with_failover`'s exhaustion-error counter:
@@ -4493,36 +4490,37 @@ fn deadline_exhaustion_reports_actual_attempt_count_not_configured_cap() {
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.prepare("select 1").execute().expect("execute");
-    let err = match cursor.next_batch() {
-        Err(e) => e,
-        Ok(_) => panic!("must fail"),
-    };
-    // The `prefer_over_trigger` logic may still surface the trigger
-    // error instead of the deadline wrapper. Only enforce the
-    // count-accuracy invariant when we actually got the deadline
-    // message — otherwise the test's premise doesn't hold.
-    if err.msg().contains("wall-clock budget exhausted") {
-        // Extract the "after N attempt(s)" number.
-        let msg = err.msg();
-        let needle = "after ";
-        let start = msg.find(needle).expect("missing 'after N attempt' phrase");
-        let rest = &msg[start + needle.len()..];
-        let end = rest.find(' ').expect("malformed attempt-count phrase");
-        let n: u32 = rest[..end].parse().expect("attempt count not a u32");
-        // Hard upper bound: anything ≥ CONFIGURED_CAP would mean the
-        // bug is back (or the message is once again hard-coding the
-        // configured cap). A handful of attempts is plausible if the
-        // first walk and one retry both fired before the 50 ms budget
-        // expired; CONFIGURED_CAP itself must never appear here.
-        assert!(
-            n < CONFIGURED_CAP,
-            "attempt count {n} ≥ configured cap {CONFIGURED_CAP} — \
-             message is reporting the configured cap instead of \
-             the actual count. msg={msg}",
-        );
-        assert!(n >= 1, "attempt count must be ≥ 1, got {n}. msg={msg}");
+    let (capture, gave_up) = gave_up_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
+    if cursor.next_batch().is_ok() {
+        panic!("must fail");
     }
+    // Extract the "after N attempt(s)" number from the deadline diagnostic
+    // the reconnect loop gave up with.
+    let (_, msg) = gave_up.lock().unwrap().clone().expect("GaveUp");
+    let msg = msg.as_str();
+    assert!(msg.contains("wall-clock budget exhausted"), "msg={msg}");
+    let needle = "after ";
+    let start = msg.find(needle).expect("missing 'after N attempt' phrase");
+    let rest = &msg[start + needle.len()..];
+    let end = rest.find(' ').expect("malformed attempt-count phrase");
+    let n: u32 = rest[..end].parse().expect("attempt count not a u32");
+    // Hard upper bound: anything ≥ CONFIGURED_CAP would mean the
+    // bug is back (or the message is once again hard-coding the
+    // configured cap). A handful of attempts is plausible if the
+    // first walk and one retry both fired before the 50 ms budget
+    // expired; CONFIGURED_CAP itself must never appear here.
+    assert!(
+        n < CONFIGURED_CAP,
+        "attempt count {n} ≥ configured cap {CONFIGURED_CAP} — \
+         message is reporting the configured cap instead of \
+         the actual count. msg={msg}",
+    );
+    assert!(n >= 1, "attempt count must be ≥ 1, got {n}. msg={msg}");
 }
 
 // ---------------------------------------------------------------------------
@@ -4776,6 +4774,33 @@ fn progress_capture() -> (
             .push(ProgressSnapshot::from_event(ev));
     };
     (closure, observed)
+}
+
+/// The `GaveUp` event's `final_error` code and message, once it fired.
+type GaveUpError = Arc<Mutex<Option<(ErrorCode, String)>>>;
+
+/// Capture the `GaveUp` event's `final_error` (code and message): the error
+/// the reconnect loop itself gave up with, which `next_batch` may replace
+/// with the original trigger when it is not more diagnostic.
+fn gave_up_capture() -> (impl FnMut(&FailoverProgressEvent), GaveUpError) {
+    let observed = Arc::new(Mutex::new(None));
+    let observed_clone = Arc::clone(&observed);
+    let closure = move |ev: &FailoverProgressEvent| {
+        if ev.phase == FailoverPhase::GaveUp {
+            let err = ev.final_error.as_ref().expect("GaveUp carries final_error");
+            *observed_clone.lock().unwrap() = Some((err.code(), err.msg().to_string()));
+        }
+    };
+    (closure, observed)
+}
+
+fn assert_gave_up_on_deadline(observed: &GaveUpError) {
+    let gave_up = observed.lock().unwrap().clone();
+    let (_, msg) = gave_up.expect("GaveUp must fire");
+    assert!(
+        msg.contains("wall-clock budget exhausted"),
+        "reconnect must give up on the deadline: {msg}"
+    );
 }
 
 #[test]
@@ -5396,4 +5421,231 @@ fn failover_replay_resets_symbol_cache_to_new_node_values() {
         cursor.next_arrow_batch().expect("terminal").is_none(),
         "B's RESULT_END must terminate the cursor"
     );
+}
+
+/// Answer every upgrade with 421 + `X-QuestDB-Role: REPLICA`, but only after
+/// `delay`, so a failover deadline can expire while a walk waits on it.
+fn slow_421_replica_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\n\
+                      Connection: close\r\nX-QuestDB-Role: REPLICA\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
+}
+
+/// Regression: when the final permitted reconnect round fails with a role
+/// mismatch on every endpoint AND the wall-clock deadline expires during that
+/// round, the caller must still see `RoleMismatch` -- the code it saw before
+/// the deadline was re-checked right after a failed walk. Re-coding it as a
+/// `SocketError` changed the error of existing static-auth readers.
+#[test]
+fn final_round_role_mismatch_past_deadline_surfaces_role_mismatch() {
+    for auth in ["", "username=u;password=p;"] {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Primary, "a-primary"),
+            vec![Action::Reject421 {
+                role: Some("REPLICA".into()),
+                zone: None,
+            }],
+        ]);
+        let b = slow_421_replica_server(Duration::from_millis(300));
+        let conf = format!(
+            "ws::addr={},{};target=primary;{auth}failover_max_attempts=2;\
+             failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+             failover_max_duration_ms=100",
+            a.url(),
+            b
+        );
+        let mut reader = Reader::from_conf(&conf).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::RoleMismatch,
+            "auth={auth:?}: msg={}",
+            err.msg()
+        );
+        assert!(
+            err.upgrade_reject().is_some(),
+            "the role reject must stay attached"
+        );
+    }
+}
+
+fn slow_503_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
+}
+
+fn slow_401_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
+}
+
+/// A late 401 must remain an AuthError even if the failover deadline expires
+/// while the endpoint is answering. Replacing it with a deadline error makes
+/// failover report the earlier, transient failure on the other endpoint.
+#[test]
+fn late_401_at_failover_deadline_surfaces_auth_error() {
+    let a = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        vec![Action::HardDrop],
+    ]);
+    let b = slow_401_server(Duration::from_millis(300));
+    let conf = format!(
+        "ws::addr={},{};failover_max_attempts=2;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+         failover_max_duration_ms=100",
+        a.url(),
+        b
+    );
+    let mut reader = Reader::from_conf(&conf).expect("initial connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("401 must reject the query"),
+    };
+    assert_eq!(err.code(), ErrorCode::AuthError, "{err}");
+}
+
+/// Regression: the `RoleMismatch` case above applies equally to the other
+/// diagnostic codes a final round can end on. When every endpoint rejects the
+/// WS upgrade on the last permitted round and the deadline expires during it,
+/// a static-auth reader must still see `HandshakeError`, as it did before the
+/// deadline was re-checked right after a failed walk.
+#[test]
+fn final_round_handshake_error_past_deadline_surfaces_handshake_error() {
+    for auth in ["", "username=u;password=p;"] {
+        let a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Standalone, "a"),
+            vec![Action::Reject421 {
+                role: None,
+                zone: None,
+            }],
+        ]);
+        let b = slow_503_server(Duration::from_millis(300));
+        let conf = format!(
+            "ws::addr={},{};{auth}failover_max_attempts=2;\
+             failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+             failover_max_duration_ms=100",
+            a.url(),
+            b
+        );
+        let mut reader = Reader::from_conf(&conf).expect("initial connect to A");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::HandshakeError,
+            "auth={auth:?}: msg={}",
+            err.msg()
+        );
+        assert!(
+            err.msg().contains("HTTP 503"),
+            "the last handshake failure must stay in the message: {}",
+            err.msg()
+        );
+    }
+}
+
+/// A static-auth reader whose query outlives `failover_max_duration_ms`
+/// before its first mid-stream failure has no reconnect budget left. The
+/// reconnect loop gives up on the deadline without dialling, so it learned
+/// nothing: `next_batch` must surface the original trigger -- its code and its
+/// message -- not an exhaustion error with no cause attached.
+#[test]
+fn deadline_spent_before_first_failure_surfaces_the_trigger() {
+    let bogus_frame = framed(1, 0, 0, &[0xEE, 0, 0, 0, 0, 0, 0, 0, 0]);
+    for (trigger, expected) in [
+        (Action::HardDrop, ErrorCode::SocketError),
+        (Action::SendRaw(bogus_frame), ErrorCode::ProtocolError),
+    ] {
+        let srv = MockServer::start(vec![
+            vec![
+                Action::SendServerInfo {
+                    role: ServerRole::Standalone,
+                    node_id: "a".into(),
+                },
+                Action::AwaitQueryRequest,
+                Action::Sleep(Duration::from_millis(200)),
+                trigger,
+                Action::Sleep(Duration::from_millis(200)),
+            ],
+            // Tripwire: the spent deadline must not admit a reconnect.
+            happy_script(ServerRole::Standalone, "a-recovered"),
+        ]);
+        let conf = format!(
+            "ws::addr={};failover_max_attempts=5;failover_backoff_initial_ms=0;\
+             failover_backoff_max_ms=0;failover_max_duration_ms=50",
+            srv.url()
+        );
+        let mut reader = Reader::from_conf(&conf).expect("connect");
+        let (capture, gave_up) = gave_up_capture();
+        let mut cursor = reader
+            .prepare("select 1")
+            .on_failover_progress(capture)
+            .execute()
+            .expect("execute");
+        let err = match cursor.next_batch() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert_eq!(err.code(), expected, "msg={}", err.msg());
+        assert!(
+            !err.msg().contains("wall-clock budget exhausted")
+                && !err.msg().contains("<no error captured>"),
+            "the trigger must stay the surfaced error: {}",
+            err.msg()
+        );
+        assert_gave_up_on_deadline(&gave_up);
+        assert_eq!(srv.accepts(), 1, "the spent deadline admits no reconnect");
+    }
 }

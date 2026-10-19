@@ -171,6 +171,10 @@ message.
 After the sender has signalled an error, it remains usable. You can handle the
 error as appropriate and continue using it.
 
+HTTP(S) proxies are not supported. The `HTTP_PROXY`, `HTTPS_PROXY` and
+`ALL_PROXY` environment variables (in either case) are ignored and the sender
+always connects directly to the configured address.
+
 # Health Check
 
 The QuestDB server has a "ping" endpoint you can access to see if it's alive,

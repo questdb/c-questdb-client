@@ -301,11 +301,7 @@ impl Reader {
             // every host floods server logs without recovery. Matches
             // the Java reference's `connect()` which rethrows on
             // `QwpAuthFailedException` immediately.
-            &[
-                ErrorCode::ConfigError,
-                ErrorCode::UnsupportedServer,
-                ErrorCode::AuthError,
-            ],
+            &WALK_TERMINAL_CODES,
         )?;
         Ok(Reader {
             cfg,
@@ -340,14 +336,9 @@ impl Reader {
             // message ("HTTP error: 401") with no way to tell which
             // endpoint refused.
             let endpoint = &cfg.addrs[idx];
-            let mut annotated = Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
-            if let Some(r) = e.upgrade_reject() {
-                annotated = annotated.with_upgrade_reject(r.clone());
-            }
-            if let Some(info) = e.server_info() {
-                annotated = annotated.with_server_info(info.clone());
-            }
-            annotated
+            let code = e.code();
+            let msg = format!("endpoint {}: {}", endpoint, e.msg());
+            e.reclassified(code, msg)
         })?;
         let server_info = if transport.server_version() >= 1 {
             Some(read_server_info_frame(
@@ -498,7 +489,7 @@ impl Reader {
             // number; the caller already knows the trigger and start
             // time.
             on_attempt(attempts_made);
-            match walk_via_tracker(
+            let walk_result = walk_via_tracker(
                 &mut self.tracker,
                 &cfg,
                 // Per failover.md §11.9.3, the WalkTracker fall-through
@@ -510,12 +501,28 @@ impl Reader {
                 // (cluster-wide credentials problem; retrying every
                 // host floods server logs without recovery). Initial
                 // connect accumulates instead — see `from_config`.
-                &[
-                    ErrorCode::ConfigError,
-                    ErrorCode::UnsupportedServer,
-                    ErrorCode::AuthError,
-                ],
-            ) {
+                &WALK_TERMINAL_CODES,
+            );
+            // Re-check a failed walk immediately. The admitted round may have
+            // consumed the final reconnect-attempt slot; waiting until the next
+            // loop would report AttemptsExhausted before consulting the expired
+            // wall-clock budget. A successful admitted walk remains accepted,
+            // preserving the per-Execute semantics: its next mid-stream failure
+            // observes the already-spent deadline and gives up immediately.
+            if walk_result.is_err()
+                && budget
+                    .deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                deadline_exhausted = true;
+                match walk_result {
+                    Err(error) if !is_failover_eligible(error.code()) => return Err(error),
+                    Err(error) => last_err = Some(error),
+                    Ok(_) => unreachable!("walk_result was checked as Err"),
+                }
+                break;
+            }
+            match walk_result {
                 Ok(walk) => {
                     total_dials = total_dials.saturating_add(walk.dials);
                     // Splice the new transport state into self, keeping
@@ -544,16 +551,10 @@ impl Reader {
             }
         }
         if deadline_exhausted {
-            let last_msg = last_err
-                .as_ref()
-                .map(|e| e.msg().to_string())
-                .unwrap_or_else(|| "<no error captured>".to_string());
-            return Err(fmt!(
-                SocketError,
-                "failover wall-clock budget exhausted (failover_max_duration_ms={}) after {} attempt(s); last error: {}",
+            return Err(failover_deadline_exhausted_error(
                 cfg.failover_max_duration_ms,
                 attempts_made,
-                last_msg
+                last_err,
             ));
         }
         Err(last_err.unwrap_or_else(|| {
@@ -2415,6 +2416,15 @@ impl<'r> Cursor<'r> {
                     // mismatched on every endpoint, config-level issue —
                     // tells the user *what to fix* and should win over
                     // the original cause-of-death.
+                    //
+                    // A wall-clock exhaustion is not diagnostic by itself:
+                    // it keeps a preferred code of the last walk, and then
+                    // wins through `prefer_over_trigger`. Otherwise the
+                    // trigger stays the surfaced error -- including when the
+                    // deadline expired before any reconnect ran, where the
+                    // exhaustion error would carry no cause at all. The
+                    // exhaustion error is still reported as the `GaveUp`
+                    // event's `final_error`.
                     return Err(if prefer_over_trigger(e.code()) {
                         e
                     } else {
@@ -2908,7 +2918,9 @@ fn is_failover_eligible(code: ErrorCode) -> bool {
             // RoleMismatch is "soft" for failover purposes: we just
             // skip this endpoint and try the next one (counting against
             // the budget). The eventual surfaced error is RoleMismatch
-            // if the budget exhausts entirely on mismatching nodes.
+            // if the budget -- attempts or wall-clock deadline -- exhausts
+            // entirely on mismatching nodes (see
+            // `failover_deadline_exhausted_error`).
             | ErrorCode::RoleMismatch
     )
 }
@@ -2968,6 +2980,58 @@ fn prefer_over_trigger(code: ErrorCode) -> bool {
             | ErrorCode::HandshakeError
             | ErrorCode::TlsError
     )
+}
+
+/// Whether `error` is the wall-clock exhaustion error built by
+/// [`failover_deadline_exhausted_error`].
+#[cfg(test)]
+fn is_failover_deadline_exhaustion(error: &Error) -> bool {
+    error
+        .msg()
+        .starts_with("failover wall-clock budget exhausted ")
+}
+
+/// Add wall-clock exhaustion context without replacing any structured
+/// diagnostics attached to the last reconnect error.
+fn failover_deadline_exhausted_error(
+    max_duration_ms: u64,
+    attempts: u32,
+    last_error: Option<Error>,
+) -> Error {
+    let last_msg = last_error
+        .as_ref()
+        .map_or("<no error captured>", |err| err.msg());
+    let msg = format!(
+        "failover wall-clock budget exhausted (failover_max_duration_ms={max_duration_ms}) after {attempts} attempt(s); last error: {last_msg}"
+    );
+
+    // A wall-clock exhaustion is a retryable `SocketError` -- except when the
+    // final walk ended on a diagnostic code that names what to fix. Before the
+    // deadline was checked immediately after a failed walk, a final round that
+    // both exhausted the attempts and overran the deadline surfaced its last
+    // error unchanged, so these codes are what existing callers branch on:
+    //
+    // * `RoleMismatch`: every endpoint rejected on role ("no primary
+    //   available"), which the failover contract promises when the budget runs
+    //   out on mismatching nodes.
+    // * `HandshakeError` / `TlsError`: every endpoint rejected the WS upgrade or
+    //   failed certificate validation (see `prefer_over_trigger`).
+    //
+    // Re-coding them as `SocketError` would silently change the error a
+    // reader receives. The message still carries the deadline context, so
+    // `is_failover_deadline_exhaustion` keeps recognising it.
+    match last_error {
+        Some(err) => {
+            let code = match err.code() {
+                code @ (ErrorCode::RoleMismatch
+                | ErrorCode::HandshakeError
+                | ErrorCode::TlsError) => code,
+                _ => ErrorCode::SocketError,
+            };
+            err.reclassified(code, msg)
+        }
+        None => Error::new(ErrorCode::SocketError, msg),
+    }
 }
 
 /// Splitmix64 PRNG state for failover backoff jitter. Lives on the
@@ -3064,6 +3128,16 @@ struct WalkOutcome {
     /// cycles).
     dials: u32,
 }
+
+/// Error codes that end an endpoint walk at once rather than move on to the
+/// next endpoint: credentials are cluster-wide, and so are configuration and
+/// a server too old for this client (spec §6 / §11.9.3). See
+/// [`walk_via_tracker`].
+const WALK_TERMINAL_CODES: [ErrorCode; 3] = [
+    ErrorCode::ConfigError,
+    ErrorCode::UnsupportedServer,
+    ErrorCode::AuthError,
+];
 
 /// Walk the tracker until either an endpoint accepts or the round is
 /// exhausted. Shared between [`Reader::from_config`] (initial connect)
@@ -3511,6 +3585,45 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn failover_deadline_context_keeps_role_mismatch_code() {
+        let original = Error::new(ErrorCode::RoleMismatch, "all endpoints are replicas");
+
+        let err = failover_deadline_exhausted_error(25, 2, Some(original));
+
+        assert_eq!(err.code(), ErrorCode::RoleMismatch);
+        assert!(is_failover_deadline_exhaustion(&err));
+        assert!(err.msg().contains("last error: all endpoints are replicas"));
+
+        let transport = Error::new(ErrorCode::ProtocolError, "peer closed");
+        let err = failover_deadline_exhausted_error(25, 2, Some(transport));
+        assert_eq!(err.code(), ErrorCode::SocketError);
+    }
+
+    #[test]
+    fn failover_deadline_context_keeps_handshake_and_tls_codes() {
+        for code in [ErrorCode::HandshakeError, ErrorCode::TlsError] {
+            let original = Error::new(code, "every endpoint rejected the upgrade");
+
+            let err = failover_deadline_exhausted_error(25, 2, Some(original));
+
+            assert_eq!(err.code(), code);
+            assert!(is_failover_deadline_exhaustion(&err));
+            assert!(
+                err.msg()
+                    .contains("last error: every endpoint rejected the upgrade")
+            );
+        }
+    }
+
+    #[test]
+    fn failover_deadline_context_without_a_last_error_is_a_socket_error() {
+        let err = failover_deadline_exhausted_error(25, 0, None);
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(is_failover_deadline_exhaustion(&err));
+        assert!(err.msg().contains("last error: <no error captured>"));
     }
 
     /// Pin the exponential base schedule without measuring wall-clock

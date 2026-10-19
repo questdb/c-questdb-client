@@ -512,6 +512,10 @@ typedef struct line_sender_utf8
     const char* buf;
 } line_sender_utf8;
 
+/** Maximum accepted byte length for any caller-supplied connection/config
+ * string passed to a `_from_conf` or `questdb_db_connect*` constructor. */
+#define QUESTDB_CONFIG_MAX_BYTES ((size_t)(1 << 20))
+
 /**
  * Check the provided buffer is a valid UTF-8 encoded string.
  *
@@ -1583,6 +1587,7 @@ typedef struct line_sender_opts line_sender_opts;
  *
  * For the full list of keys, search this header for `bool
  * line_sender_opts_`.
+ * The string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  */
 QUESTDB_CLIENT_API
 line_sender_opts* line_sender_opts_from_conf(
@@ -1965,6 +1970,7 @@ line_sender* line_sender_build(
  *
  * For the full list of keys, search this header for `bool
  * line_sender_opts_`.
+ * The string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  *
  * In the case of TCP, this synchronously establishes the TCP connection,
  * and returns once the connection is fully established. If the connection
@@ -2133,7 +2139,9 @@ typedef enum qwpws_ack_level
  * Returns `false` and sets `err_out` on the no-progress timeout
  * (`line_sender_error_failover_retry`), a server rejection, a transport
  * failure, or an invalid `ack_level`. With nothing published yet it succeeds
- * immediately.
+ * immediately. A timeout while the sender is disconnected and reconnecting
+ * keeps failing names that failure. The published frames stay queued either
+ * way.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_wait(
@@ -2357,9 +2365,14 @@ typedef void (*questdb_connection_event_cb)(
 
 /** Register a connection lifecycle listener on the sender being built.
  * Events are delivered on a dedicated dispatcher thread through a bounded
- * inbox (`inbox_capacity`; 0 = default 64) with a drop-oldest overflow
- * policy. The caller guarantees `user_data` is safe to use from that
- * thread. QWP/WebSocket only; at most one listener per builder. */
+ * inbox (`inbox_capacity`; 0 = default 64, maximum 65536) with a
+ * drop-oldest overflow policy. The caller guarantees `user_data` is safe to
+ * use from that thread. QWP/WebSocket only; at most one listener per builder.
+ *
+ * Returns `false` with a config error when a listener is already registered,
+ * or when `inbox_capacity` exceeds 65536: the capacity reaches an allocation
+ * whose failure aborts the process, so an absurd value is refused here
+ * instead. */
 QUESTDB_CLIENT_API
 bool line_sender_opts_connection_event_handler(
     line_sender_opts* opts,

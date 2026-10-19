@@ -3285,6 +3285,190 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
 }
 
 #[test]
+fn qwp_ws_manual_close_honors_deadline_while_reconnect_is_waiting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+        // Drop the only listener with the frame still unacknowledged: every
+        // reconnect is refused, leaving the driver in its retryable Waiting
+        // state.
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         close_flush_timeout_millis=120;reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=20;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+    assert!(sender.drive_once().unwrap());
+    frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    server.join().unwrap();
+
+    let started = Instant::now();
+    let err = sender
+        .close_drain()
+        .expect_err("unacknowledged close must stop at its configured deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "manual close ignored its deadline: {elapsed:?}"
+    );
+    assert!(err.msg().contains("close drain timed out"), "{err}");
+    assert!(
+        err.msg().contains("the latest reconnect failed"),
+        "the timeout must carry the reconnect failure: {err}"
+    );
+}
+
+/// Connect once, have the server go away, and wait for an ACK while every
+/// reconnect is refused.
+fn wait_after_the_server_disappears_mid_stream(progress: ProgressCase) -> crate::Error {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        // Dropping the stream and the listener refuses every reconnect.
+    });
+    let builder = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{port};reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=20;"
+    ))
+    .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+    server.join().unwrap();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("x", 1)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    sender.flush(&mut buffer).unwrap();
+
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(800))
+        .unwrap_err()
+}
+
+fn assert_wait_names_the_failing_reconnect(err: &crate::Error) {
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{err}");
+    assert!(!err.in_doubt(), "{err}");
+    assert!(err.msg().contains("no ack progress"), "{err}");
+    assert!(err.msg().contains("reconnecting keeps failing"), "{err}");
+    assert!(!err.msg().contains("the connection is alive"), "{err}");
+}
+
+#[test]
+fn qwp_ws_wait_names_a_failing_initial_connect() {
+    // `initial_connect_retry=async` builds the sender before any connection,
+    // and nothing listens where the runner's first connect is going.
+    let mut sender = SenderBuilder::from_conf(
+        "ws::addr=127.0.0.1:1;initial_connect_retry=async;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;",
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("x", 1)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    sender.flush(&mut buffer).unwrap();
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(500))
+        .unwrap_err();
+    assert_wait_names_the_failing_reconnect(&err);
+}
+
+#[test]
+fn qwp_ws_wait_names_a_failing_background_reconnect() {
+    let err = wait_after_the_server_disappears_mid_stream(ProgressCase::Background);
+    assert_wait_names_the_failing_reconnect(&err);
+}
+
+#[test]
+fn qwp_ws_wait_names_a_failing_manual_reconnect() {
+    let err = wait_after_the_server_disappears_mid_stream(ProgressCase::Manual);
+    assert_wait_names_the_failing_reconnect(&err);
+}
+
+#[test]
+fn qwp_ws_wait_forgets_a_reconnect_failure_once_reconnected() {
+    // One reconnect fails, the next succeeds, and then the server stays
+    // silent. The wait's timeout is the server's again: it must not report a
+    // reconnect failure that has since been overcome.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (reconnected_tx, reconnected_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut first).unwrap();
+        drop(first);
+        // Fail one reconnect: hang up before answering the upgrade.
+        let (mut refused, _) = listener.accept().unwrap();
+        let _ = read_request_until_blank(&mut refused);
+        drop(refused);
+        let (mut second, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut second).unwrap();
+        reconnected_tx.send(()).unwrap();
+        // Read whatever arrives and never acknowledge it.
+        let mut sink = [0u8; 4096];
+        while matches!(second.read(&mut sink), Ok(n) if n > 0) {}
+    });
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{port};reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=10;"
+    ))
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("x", 1)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    // Sending finds the dropped connection and starts the reconnect.
+    sender.flush(&mut buffer).unwrap();
+    reconnected_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the sender reconnected");
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(300))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{err}");
+    assert!(err.msg().contains("the connection is alive"), "{err}");
+    drop(sender);
+    server.join().unwrap();
+}
+
+#[test]
 fn qwp_ws_drop_interrupts_blocked_background_send() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -3297,8 +3481,10 @@ fn qwp_ws_drop_interrupts_blocked_background_send() {
             .set_recv_buffer_size(4096)
             .unwrap();
         upgrade_mock_stream(&mut stream);
+        // Generous: the client's first byte can lag by seconds on a loaded CI
+        // runner even though it is milliseconds locally.
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
 
         // Observe the first data byte without consuming it, then leave the
@@ -3325,8 +3511,11 @@ fn qwp_ws_drop_interrupts_blocked_background_send() {
         .unwrap();
     sender.flush(&mut buf).unwrap();
 
+    // Only synchronises setup: wait for the blocked 8 MiB send to reach the
+    // server. Keep it generous so a slow-but-correct send on a loaded CI runner is
+    // never mistaken for the drop failing to interrupt the write.
     send_started_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(30))
         .unwrap();
 
     let started = Instant::now();
