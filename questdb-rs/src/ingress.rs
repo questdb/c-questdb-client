@@ -623,6 +623,7 @@ impl QwpWsConnector {
             max_buf_size,
             request_timeout: *self.qwp_ws.request_timeout,
             durable_ack_tiers: *self.qwp_ws.request_durable_ack,
+            durable_ack_keepalive_interval: *self.qwp_ws.durable_ack_keepalive_interval,
         };
         if let Some(events) = events
             && let Some(endpoint) = self.endpoints.get(raw.endpoint_idx)
@@ -706,6 +707,7 @@ pub(crate) struct RawQwpWsRoundStream {
     pub(crate) max_buf_size: usize,
     pub(crate) request_timeout: Duration,
     pub(crate) durable_ack_tiers: conf::DurableAckTiers,
+    pub(crate) durable_ack_keepalive_interval: Duration,
 }
 
 /// Pre-scan a raw connect string for repeated `addr=...` params. Returns the
