@@ -2679,7 +2679,7 @@ checksum = "7aceffde1cbf8e67f34cdfd70d2436396176d6ff648fa719e0231fb9856ef3e9"
 
 [[package]]
 name = "questdb-rs"
-version = "7.0.0"
+version = "7.1.0"
 dependencies = [
  "aligned-vec",
  "arrow",
