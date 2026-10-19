@@ -1166,7 +1166,7 @@ mod tests {
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     #[test]
     fn detached_background_worker_retains_slot_until_exit() {
-        let temp = TempDir::new().unwrap();
+        let temp = Arc::new(TempDir::new().unwrap());
         let options = SfaSlotOptions {
             sf_dir: temp.path().to_path_buf(),
             sender_id: "orphan".to_owned(),
@@ -1174,26 +1174,22 @@ mod tests {
             max_bytes: 1024,
             periodic_sync_interval: None,
         };
+        // Slot creation does real filesystem I/O, not bounded worker startup.
+        // Open it before spawning so a slow fsync cannot fail a liveness gate
+        // and delete the directory underneath an unfinished open.
+        let queue = SfaSlotQueue::open(options.clone()).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (exited_tx, exited_rx) = std::sync::mpsc::channel();
-        let worker_stop = Arc::clone(&stop);
-        let worker_options = options.clone();
+        let worker_temp = Arc::clone(&temp);
         let worker = thread::spawn(move || {
-            let queue = SfaSlotQueue::open(worker_options).unwrap();
-            entered_tx.send(()).unwrap();
-            while !worker_stop.load(Ordering::Acquire) {
-                thread::yield_now();
-            }
-            release_rx.recv().unwrap();
+            // Retain the fixture even if the parent fails an assertion. Closing
+            // release_tx on unwind also releases the worker without a panic.
+            let _temp = worker_temp;
+            let _ = release_rx.recv();
             drop(queue);
-            exited_tx.send(()).unwrap();
+            let _ = exited_tx.send(());
         });
-        // Liveness gates only (slot open/teardown do real file I/O, which is
-        // slow on loaded CI runners); the bounded-close behavior under test is
-        // asserted via close_with_timeouts below.
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let mut pool = OrphanDrainerPool {
             stop,
             threads: vec![(worker, Arc::new(TrafficGate::default()))],
@@ -1201,12 +1197,16 @@ mod tests {
 
         pool.close_with_timeouts(Duration::from_millis(10), Duration::from_millis(10));
 
+        assert!(pool.stop.load(Ordering::Acquire));
+        assert!(pool.threads.is_empty());
         assert!(matches!(
             SfaSlotQueue::open(options.clone()),
             Err(SfaQueueError::SlotInUse { .. })
         ));
         release_tx.send(()).unwrap();
-        exited_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Teardown is filesystem I/O too; this test checks lock ownership, not
+        // storage latency. A worker panic disconnects the channel and fails.
+        exited_rx.recv().unwrap();
 
         let mut reopened = SfaSlotQueue::open(options).unwrap();
         reopened.close().unwrap();

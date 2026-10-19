@@ -82,6 +82,79 @@ while True:
 """
 
 
+class SqlCleanupTest(unittest.TestCase):
+
+    def setUp(self):
+        self.qdb = fixture.QuestDbFixtureBase()
+        self.qdb.host = 'localhost'
+        self.qdb.http_server_port = 9000
+        self.response = mock.Mock()
+        self.response.read.return_value = b'{"ddl": "OK"}'
+
+    def test_normal_queries_keep_the_five_second_timeout(self):
+        with mock.patch.object(
+                fixture.urllib.request, 'urlopen',
+                return_value=self.response) as urlopen:
+            self.qdb.http_sql_query('select 1')
+        self.assertEqual(urlopen.call_args.kwargs['timeout'], 5)
+
+    def test_drop_waits_for_cleanup_beyond_the_poll_timeout(self):
+        # Model the 5.3s DROP TABLE seen in the Windows CI server log,
+        # without imposing real sleeps on every integration job.
+        def slow_response(request, *, timeout):
+            if timeout < 5.3:
+                raise TimeoutError('DROP TABLE is still closing its writer')
+            return self.response
+
+        with mock.patch.object(
+                fixture.urllib.request, 'urlopen',
+                side_effect=slow_response) as urlopen:
+            self.qdb.drop_table('example')
+        urlopen.assert_called_once()
+        self.assertEqual(urlopen.call_args.kwargs['timeout'], 30)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            fixture.urllib.parse.parse_qs(
+                fixture.urllib.parse.urlsplit(request.full_url).query),
+            {'query': ["drop table 'example'"]})
+
+    def test_drop_timeout_still_fails_without_retrying(self):
+        with mock.patch.object(
+                fixture.urllib.request, 'urlopen',
+                side_effect=TimeoutError('cleanup budget exhausted')) as urlopen:
+            with self.assertRaisesRegex(TimeoutError, 'budget exhausted'):
+                self.qdb.drop_table('example')
+        urlopen.assert_called_once()
+        self.assertEqual(urlopen.call_args.kwargs['timeout'], 30)
+
+    def test_drop_sql_errors_are_not_suppressed(self):
+        self.response.read.return_value = b'{"error": "writer is busy"}'
+        with mock.patch.object(
+                fixture.urllib.request, 'urlopen',
+                return_value=self.response) as urlopen:
+            with self.assertRaisesRegex(fixture.QueryError, 'writer is busy'):
+                self.qdb.drop_table('example')
+        urlopen.assert_called_once()
+
+    def test_bulk_cleanup_only_extends_the_drop_timeout(self):
+        self.response.read.side_effect = (
+            b'{"dataset": [["first"], ["second"]]}',
+            b'{"ddl": "OK"}',
+            b'{"ddl": "OK"}')
+        with mock.patch.object(
+                fixture.urllib.request, 'urlopen',
+                return_value=self.response) as urlopen:
+            self.qdb.drop_all_tables()
+        self.assertEqual(
+            [call.kwargs['timeout'] for call in urlopen.call_args_list],
+            [5, 30, 30])
+        self.assertEqual(
+            [fixture.urllib.parse.parse_qs(
+                fixture.urllib.parse.urlsplit(call.args[0].full_url).query)
+                ['query'][0] for call in urlopen.call_args_list],
+            ['show tables', "drop table 'first'", "drop table 'second'"])
+
+
 class StopEscalationTest(unittest.TestCase):
 
     @unittest.skipUnless(

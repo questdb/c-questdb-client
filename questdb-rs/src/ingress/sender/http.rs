@@ -26,7 +26,6 @@ use crate::error::fmt;
 use crate::{Error, error};
 use rand::Rng;
 use rustls::{ClientConnection, StreamOwned};
-use rustls_pki_types::ServerName;
 use std::fmt;
 use std::fmt::{Debug, Write};
 use std::io::{Read, Write as IoWrite};
@@ -129,15 +128,15 @@ impl<In: Transport> Connector<In> for TlsConnector {
 
         match self.tls_config.as_ref() {
             Some(config) => {
-                let name_borrowed: ServerName<'_> = details
-                    .uri
-                    .authority()
-                    .expect("uri authority for tls")
-                    .host()
-                    .try_into()
-                    .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
+                let name = crate::ingress::tls::server_name_for_uri_host(
+                    details
+                        .uri
+                        .authority()
+                        .expect("uri authority for tls")
+                        .host(),
+                )
+                .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
 
-                let name = name_borrowed.to_owned();
                 let conn = ClientConnection::new(config.clone(), name)
                     .map_err(|_e| ureq::Error::Tls("tls client connection error"))?;
                 let stream = StreamOwned {
@@ -342,7 +341,12 @@ fn retry_http_send(
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
-    let retry_end = std::time::Instant::now() + retry_timeout;
+    let Some(retry_end) = std::time::Instant::now().checked_add(retry_timeout) else {
+        // This helper preserves the original ureq error type. Treat an
+        // unrepresentable retry window as no additional retry; public builder
+        // paths reject it as ConfigError before reaching here.
+        return last_rep;
+    };
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut retry_interval_ms = 10i32;
     let mut need_retry;
@@ -524,7 +528,12 @@ fn retry_http_get(
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
-    let retry_end = std::time::Instant::now() + retry_timeout;
+    let Some(retry_end) = std::time::Instant::now().checked_add(retry_timeout) else {
+        // This helper preserves the original ureq error type. Treat an
+        // unrepresentable retry window as no additional retry; public builder
+        // paths reject it as ConfigError before reaching here.
+        return last_rep;
+    };
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut retry_interval_ms = 10i32;
     let mut need_retry;

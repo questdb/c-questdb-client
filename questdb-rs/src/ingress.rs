@@ -1680,8 +1680,17 @@ impl SenderBuilder {
     /// connection (initial connect, per-endpoint attempt failures,
     /// disconnect, reconnect/failover, terminal auth rejection).
     /// Delivered on a dedicated dispatcher thread through a bounded inbox
-    /// (`inbox_capacity`; `0` selects the default of 64) with a
-    /// drop-oldest overflow policy. At most one listener per sender.
+    /// (`inbox_capacity`; `0` selects the default of 64, and the maximum is
+    /// [`conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY`]) with a drop-oldest overflow
+    /// policy. At most one listener per sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::ConfigError`](crate::ErrorCode::ConfigError) when a
+    /// listener is already registered, or when `inbox_capacity` exceeds
+    /// [`conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY`]. The capacity reaches
+    /// `VecDeque::with_capacity`, where the allocator aborts on failure, so an
+    /// absurd value is refused rather than becoming a process abort.
     pub fn connection_listener(
         mut self,
         listener: crate::ingress::ConnectionListener,
@@ -1697,6 +1706,13 @@ impl SenderBuilder {
             return Err(error::fmt!(
                 ConfigError,
                 "A connection listener is already registered on this builder."
+            ));
+        }
+        if inbox_capacity > conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "connection_listener inbox_capacity must be <= {}: {inbox_capacity}",
+                conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY
             ));
         }
         qwp_ws.conn_events = Some(std::sync::Arc::new(
@@ -2184,6 +2200,17 @@ impl SenderBuilder {
                 conf::QWP_WS_MIN_ERROR_INBOX_CAPACITY
             ));
         }
+        // Only the lower bound was checked. The value flows to
+        // `VecDeque::with_capacity`, and the allocator aborts on failure, so a
+        // large one from a configuration string was a process abort with no
+        // traceback rather than a config error.
+        if value > conf::QWP_WS_MAX_ERROR_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "error_inbox_capacity must be <= {}: {value}",
+                conf::QWP_WS_MAX_ERROR_INBOX_CAPACITY
+            ));
+        }
         qwp_ws
             .error_inbox_capacity
             .set_specified("error_inbox_capacity", value)?;
@@ -2372,6 +2399,12 @@ impl SenderBuilder {
     /// Set the cumulative duration spent in retries.
     /// The value is in milliseconds, and the default is 10 seconds.
     pub fn retry_timeout(mut self, value: Duration) -> Result<Self> {
+        if std::time::Instant::now().checked_add(value).is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "retry_timeout is too large for the platform monotonic clock."
+            ));
+        }
         if let Some(http) = &mut self.http {
             http.retry_timeout.set_specified("retry_timeout", value)?;
         } else {
@@ -2668,6 +2701,16 @@ impl SenderBuilder {
 
                 let agent_builder = ureq::Agent::config_builder()
                     .user_agent(user_agent)
+                    // `Config::default()` sets `proxy: Proxy::try_from_env()`
+                    // (ALL_PROXY / HTTPS_PROXY / HTTP_PROXY, either case), but
+                    // the connector chain below is TcpConnector -> TlsConnector
+                    // with no proxy connector. With a proxy in the environment
+                    // ureq then hands TcpConnector an empty address list and
+                    // every flush fails with a bare "Connection refused"
+                    // without dialling anything -- neither QuestDB nor the
+                    // proxy. Ignore proxies explicitly rather than half-honour
+                    // them.
+                    .proxy(None)
                     .no_delay(true);
 
                 let tls_config = match tls_settings {
