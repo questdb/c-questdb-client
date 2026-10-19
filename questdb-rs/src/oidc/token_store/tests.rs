@@ -1336,7 +1336,7 @@ fn untrusted_recovery_skips_cross_language_lock_capture() {
     std::fs::write(&write_temp, b"planted credential").unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
 
-    assert!(store.load(&key).unwrap().is_none());
+    assert!(store.load(&key).is_err());
     assert!(
         identity_capture.exists(),
         "recovery deleted an in-flight Java identity-lock capture"
@@ -1345,6 +1345,11 @@ fn untrusted_recovery_skips_cross_language_lock_capture() {
         directory_capture.exists(),
         "recovery deleted an in-flight Java directory-lock capture"
     );
+    // A live captured owner fences recovery too. Once it has returned,
+    // ordinary trust recovery can discard the planted credential.
+    std::fs::remove_file(&identity_capture).unwrap();
+    std::fs::remove_file(&directory_capture).unwrap();
+    assert!(store.load(&key).unwrap().is_none());
     assert!(!write_temp.exists(), "recovery retained a token write temp");
 }
 
@@ -1564,6 +1569,83 @@ fn release_lock_leaves_a_successor_lock() {
 }
 
 #[test]
+fn a_captured_live_owner_fences_the_third_process() {
+    let dir = TempDir::new().unwrap();
+    let store = test_file_store(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let lock = dir.path().join("refresh.lock");
+    // A acquired and passed its ownership check. B's obsolete stale snapshot
+    // then captures A, exposing the empty canonical name to C.
+    let owner = create_lock_file_handle(&lock, &holder_bytes().unwrap()).unwrap();
+    let captured = capture_path(&lock);
+    std::fs::rename(&lock, &captured).unwrap();
+    restore_captured_lock_with(&lock, &captured, |_, _| {
+        // C must not return an admitted lock while A's live inode is captured.
+        assert!(
+            store
+                .acquire_lock(
+                    &lock,
+                    DEFAULT_LOCK_STALE,
+                    EMPTY_LOCK_GRACE,
+                    &never_cancelled
+                )
+                .is_err()
+        );
+        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+    });
+    assert!(captured.exists(), "B discarded the live-owner fence");
+    // A returns: release updates its captured inode, not C's canonical file.
+    release_lock(&owner);
+    drop(owner);
+    let successor = store
+        .acquire_lock(
+            &lock,
+            DEFAULT_LOCK_STALE,
+            EMPTY_LOCK_GRACE,
+            &never_cancelled,
+        )
+        .unwrap();
+    assert!(!captured.exists());
+    drop(successor);
+}
+
+#[test]
+fn wall_clock_age_does_not_remove_a_captured_live_owner() {
+    let dir = TempDir::new().unwrap();
+    let lock = dir.path().join("refresh.lock");
+    let owner = create_lock_file_handle(&lock, &holder_bytes().unwrap()).unwrap();
+    let captured = capture_path(&lock);
+    std::fs::rename(&lock, &captured).unwrap();
+    owner.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+    assert!(has_live_lock_capture(&lock, Duration::ZERO, Duration::ZERO).unwrap());
+    assert!(captured.exists());
+    release_lock(&owner);
+    assert!(!has_live_lock_capture(&lock, Duration::ZERO, Duration::ZERO).unwrap());
+    assert!(!captured.exists());
+}
+
+#[test]
+fn a_displaced_action_cannot_clear_or_restore_over_its_successor() {
+    let dir = TempDir::new().unwrap();
+    let store = test_file_store(dir.path());
+    let key = test_key();
+    store.save(&key, &test_token()).unwrap();
+    let lock = store.lock_file(&key);
+    store
+        .in_lock(&key, &mut || {
+            let captured = capture_path(&lock);
+            std::fs::rename(&lock, &captured)?;
+            create_lock_file(&lock, "successor-owner")?;
+            assert!(store.load(&key).is_err());
+            assert!(store.clear(&key).is_err());
+            assert!(store.save(&key, &test_token()).is_err());
+            assert!(store.token_file(&key).exists());
+            assert_eq!(std::fs::read_to_string(&lock)?, "successor-owner");
+            Ok(())
+        })
+        .unwrap_err();
+}
+
+#[test]
 fn restore_without_hard_links_preserves_a_successor() {
     let dir = TempDir::new().unwrap();
     let lock = dir.path().join("restore.lock");
@@ -1583,7 +1665,7 @@ fn restore_without_hard_links_preserves_a_successor() {
         "successor-peer",
         "fallback restoration replaced the successor lock"
     );
-    assert!(!captured.exists());
+    assert_eq!(std::fs::read_to_string(&captured).unwrap(), "captured-peer");
 }
 
 #[test]
@@ -1633,9 +1715,12 @@ fn clear_removes_fresh_write_temp_but_preserves_lock_capture() {
     // clear must remove even a newly created plaintext write temp and detect the
     // change so the subsequent directory fsync is not skipped. A `.lock.` temp
     // is another client's in-flight stale-lock capture and must survive.
+    assert!(store.clear(&key).is_err());
+    assert!(orphan.exists());
+    assert!(capture.exists());
+    std::fs::remove_file(&capture).unwrap();
     store.clear(&key).unwrap();
     assert!(!orphan.exists());
-    assert!(capture.exists());
 }
 
 #[test]
@@ -1673,8 +1758,8 @@ fn java_lock_capture_temporaries_survive_concurrent_native_save_and_clear() {
     });
 
     captures_ready_rx.recv().unwrap();
-    store.save(&key, &test_token()).unwrap();
-    store.clear(&key).unwrap();
+    assert!(store.save(&key, &test_token()).is_err());
+    assert!(store.clear(&key).is_err());
     native_done_tx.send(()).unwrap();
     java_peer.join().unwrap();
 

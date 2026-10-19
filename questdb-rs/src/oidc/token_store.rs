@@ -65,8 +65,15 @@
 //! applies to IdP responses.
 //!
 //! The on-disk format (file name, JSON schema, atomic-write and lock-file
-//! protocols) is a **frozen cross-language contract** shared with the QuestDB
-//! Java and Python clients, so a file written by one can be read by another.
+//! protocols) is a **cross-language contract** shared with the QuestDB Java and
+//! Python clients, so a file written by one can be read by another. Stale-lock
+//! recovery must preserve a displaced live owner's capture if restoration loses
+//! to a successor, and new acquisitions must check those captures after creating
+//! the canonical lock. All clients sharing a rotating credential must implement
+//! this ownership fence; older peers that discard live captures are not safe
+//! concurrent writers. A captured owner whose death cannot be proven locally
+//! must return (retiring its inode) or be investigated before manual recovery;
+//! wall-clock age alone cannot prove it stopped refreshing.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -1178,7 +1185,26 @@ impl FileTokenStore {
             }
             match self.create_lock_handle(lock, &stamp) {
                 Ok(file) => {
-                    return Ok(HeldLock { stamp, file });
+                    let held = HeldLock {
+                        stamp: stamp.clone(),
+                        file,
+                    };
+                    // A stale snapshotter may have captured a newer LIVE
+                    // owner while this create won the empty canonical name.
+                    // Restoration preserves that capture as an ownership
+                    // fence. Check AFTER create, before admitting the action;
+                    // a pre-create scan alone has the same rename race.
+                    if !has_live_lock_capture(lock, stale_after, empty_grace)? {
+                        return Ok(held);
+                    }
+                    drop(held);
+                    if Instant::now() >= deadline {
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "an OIDC token-store lock owner is still captured",
+                        )));
+                    }
+                    std::thread::sleep(LOCK_POLL_SLICE);
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::AlreadyExists
@@ -1292,7 +1318,7 @@ impl FileTokenStore {
             EMPTY_LOCK_GRACE
         };
         let held = self.acquire_lock(&lock, stale_after, empty_grace, cancelled)?;
-        let scope = HeldLockScope::enter(lock.clone());
+        let scope = HeldLockScope::enter(lock.clone(), held.stamp.clone());
         let heartbeat = self.start_directory_lock_heartbeat(lock.clone(), held.stamp.clone())?;
         heartbeat.check_owned()?;
 
@@ -1353,9 +1379,17 @@ impl FileTokenStore {
             return Err(cancelled_error());
         }
         let lock = self.lock_file(key);
-        if current_thread_holds(&lock) {
+        if let Some(stamp) = current_thread_lock_stamp(&lock) {
             if cancelled() {
                 return Err(cancelled_error());
+            }
+            // A displaced action must not tombstone, restore or publish over
+            // its successor, nor submit a refresh after losing coordination.
+            if !lock_is_owned(&lock, &stamp) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "lost ownership of the OIDC token-store refresh lock",
+                )));
             }
             return action();
         }
@@ -1378,7 +1412,7 @@ impl FileTokenStore {
         // identity lock. Publish thread ownership only after the filesystem
         // lease was actually obtained; the previous order falsely marked an
         // unlocked fallback as coordinated.
-        let _scope = HeldLockScope::enter(lock.clone());
+        let _scope = HeldLockScope::enter(lock.clone(), held.stamp.clone());
         let result = if cancelled() {
             Err(cancelled_error())
         } else {
@@ -1395,6 +1429,19 @@ impl FileTokenStore {
             (Ok(_), Err(lost)) => Err(Box::new(lost)),
             (Err(e), _) => Err(e),
         }
+    }
+
+    fn check_identity_lock_if_held(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+        let lock = self.lock_file(key);
+        if let Some(stamp) = current_thread_lock_stamp(&lock)
+            && !lock_is_owned(&lock, &stamp)
+        {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "lost ownership of the OIDC token-store refresh lock",
+            )));
+        }
+        Ok(())
     }
 
     /// Remove only crash-orphaned temps old enough to be unambiguously stale.
@@ -1584,7 +1631,9 @@ impl TokenStore for FileTokenStore {
         key: &TokenStoreKey,
         cancelled: &dyn Fn() -> bool,
     ) -> TokenStoreResult<Option<PersistedToken>> {
+        self.check_identity_lock_if_held(key)?;
         self.with_directory_lock(cancelled, |trusted, _| {
+            self.check_identity_lock_if_held(key)?;
             if !trusted {
                 return Ok(None);
             }
@@ -1617,6 +1666,7 @@ impl TokenStore for FileTokenStore {
             return Err(cancelled_error());
         }
         self.ensure_durable_mutations_supported()?;
+        self.check_identity_lock_if_held(key)?;
         let content = self.serialize(key, token);
         if content.len() as u64 > MAX_FILE_BYTES {
             return Err(Box::new(std::io::Error::new(
@@ -1629,6 +1679,7 @@ impl TokenStore for FileTokenStore {
         }
         let published = std::cell::Cell::new(false);
         self.with_directory_lock(cancelled, |trusted, heartbeat| {
+            self.check_identity_lock_if_held(key)?;
             // `trusted` is the verdict on what the directory *contained* on
             // entry, which is what `load` must respect. For writing, the
             // question is whether the directory is safe *now*: by this point
@@ -1964,7 +2015,7 @@ fn lock_process_cancellable<'a>(
 /// held, and failed after the lock budget. The OS thread id stays valid for as
 /// long as the thread runs, and every entry is removed by its RAII scope
 /// before the thread can exit, so an id is never reused while registered.
-static HELD_LOCKS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
+static HELD_LOCKS: Mutex<Vec<(usize, PathBuf, String)>> = Mutex::new(Vec::new());
 
 /// An identifier for the calling OS thread that needs no thread-local storage.
 fn os_thread_id() -> usize {
@@ -1987,7 +2038,7 @@ fn os_thread_id() -> usize {
     }
 }
 
-fn held_locks() -> std::sync::MutexGuard<'static, Vec<(usize, PathBuf)>> {
+fn held_locks() -> std::sync::MutexGuard<'static, Vec<(usize, PathBuf, String)>> {
     HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1995,7 +2046,14 @@ fn current_thread_holds(lock: &Path) -> bool {
     let thread = os_thread_id();
     held_locks()
         .iter()
-        .any(|(holder, candidate)| *holder == thread && candidate == lock)
+        .any(|(holder, candidate, _)| *holder == thread && candidate == lock)
+}
+
+fn current_thread_lock_stamp(lock: &Path) -> Option<String> {
+    let thread = os_thread_id();
+    held_locks().iter().find_map(|(holder, candidate, stamp)| {
+        (*holder == thread && candidate == lock).then(|| stamp.clone())
+    })
 }
 
 /// Marks the dynamic scope in which this thread owns a filesystem lock.
@@ -2005,15 +2063,15 @@ struct HeldLockScope {
 }
 
 impl HeldLockScope {
-    fn enter(lock: PathBuf) -> Self {
+    fn enter(lock: PathBuf, stamp: String) -> Self {
         let thread = os_thread_id();
         let mut held = held_locks();
         debug_assert!(
             !held
                 .iter()
-                .any(|(holder, candidate)| *holder == thread && candidate == &lock)
+                .any(|(holder, candidate, _)| *holder == thread && candidate == &lock)
         );
-        held.push((thread, lock.clone()));
+        held.push((thread, lock.clone(), stamp));
         Self { thread, lock }
     }
 }
@@ -2028,7 +2086,7 @@ impl Drop for HeldLockScope {
         // ever broken, leaving no marker is already the desired state.
         if let Some(position) = held
             .iter()
-            .rposition(|(holder, candidate)| *holder == self.thread && candidate == &self.lock)
+            .rposition(|(holder, candidate, _)| *holder == self.thread && candidate == &self.lock)
         {
             held.remove(position);
         }
@@ -2120,7 +2178,7 @@ enum LockStamp {
     Unreadable,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LockSnapshot {
     stamp: LockStamp,
     modified_millis: u128,
@@ -2241,7 +2299,9 @@ fn restore_captured_lock_with(
 ) {
     match hard_link(captured, lock) {
         Ok(()) => delete_capture(captured),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => delete_capture(captured),
+        // Keep the displaced owner's inode as an acquisition fence. Deleting
+        // it lets a third process enter while that owner is still executing.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(_) => {
             let Ok(reservation) = holder_bytes() else {
                 // Keep the capture: losing evidence of the displaced owner is
@@ -2261,8 +2321,8 @@ fn restore_captured_lock_with(
                     // recovery can safely resolve the interrupted restoration.
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // A successor won the canonical name. Never replace it.
-                    delete_capture(captured);
+                    // A successor won the canonical name. Preserve the
+                    // displaced owner's capture as an acquisition fence.
                 }
                 Err(_) => {
                     // Preserve the capture when the destination could not be
@@ -2287,6 +2347,76 @@ fn displace_lock_squatter(lock: &Path) {
     }
 }
 
+/// A capture that could still belong to a live action fences new acquisitions.
+/// A departing holder retires its captured inode through its retained handle,
+/// so the ordinary released/dead/stale rules can subsequently reclaim it.
+fn has_live_lock_capture(
+    lock: &Path,
+    stale_after: Duration,
+    empty_grace: Duration,
+) -> std::io::Result<bool> {
+    let Some(parent) = lock.parent() else {
+        return Ok(false);
+    };
+    let Some(name) = lock.file_name() else {
+        return Ok(false);
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let captured = entry.path();
+        let Some(snapshot) = lock_snapshot(&captured)? else {
+            continue;
+        };
+        // A captured live owner cannot heartbeat its renamed pathname. Age
+        // alone is therefore NOT proof that it stopped executing. Reclaim
+        // only a released/empty inode or a provably dead local process. An
+        // unknown remote owner's crash needs manual recovery, not a second
+        // refresh-token consumer.
+        let reclaimable = match &snapshot.stamp {
+            LockStamp::Readable(None) => true,
+            LockStamp::Readable(Some(stamp)) => holder_is_dead_on_this_host(stamp),
+            LockStamp::Unreadable => false,
+        };
+        if reclaimable && lock_snapshot_is_stale(&snapshot, stale_after, empty_grace) {
+            // Captures have unique names and are never reacquired in place.
+            // Recheck because release can change the stamp/mtime concurrently.
+            if lock_snapshot(&captured)?.as_ref() != Some(&snapshot) {
+                return Ok(true);
+            }
+            delete_capture(&captured);
+        } else {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn lock_snapshot_is_stale(
+    snapshot: &LockSnapshot,
+    stale_after: Duration,
+    empty_grace: Duration,
+) -> bool {
+    let threshold = match &snapshot.stamp {
+        LockStamp::Readable(None) => empty_grace,
+        LockStamp::Readable(Some(stamp)) if holder_is_dead_on_this_host(stamp) => {
+            stale_after.min(DEAD_HOLDER_GRACE)
+        }
+        _ => stale_after,
+    };
+    let now_millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    snapshot.modified_millis <= now_millis
+        && now_millis - snapshot.modified_millis > threshold.as_millis()
+}
+
 /// Reclaim a stale Java, Python, or Rust lock with capture-then-verify. The stamp
 /// and mtime observed before the atomic capture must match afterwards; otherwise
 /// the captured peer replacement is restored rather than discarded.
@@ -2308,23 +2438,8 @@ fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> 
         Ok(Some(snapshot)) => snapshot,
         _ => return false,
     };
-    let threshold = match &before.stamp {
-        LockStamp::Readable(None) => empty_grace,
-        LockStamp::Readable(Some(stamp)) if holder_is_dead_on_this_host(stamp) => {
-            stale_after.min(DEAD_HOLDER_GRACE)
-        }
-        _ => stale_after,
-    };
-    let now_millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    // A future timestamp is not evidence of abandonment: it may be a live
-    // holder on a host whose clock is ahead. Fail closed rather than risk two
-    // refresh-token submissions.
-    let stale = before.modified_millis <= now_millis
-        && now_millis - before.modified_millis > threshold.as_millis();
-    if !stale {
+    // A future timestamp is not evidence of abandonment.
+    if !lock_snapshot_is_stale(&before, stale_after, empty_grace) {
         return false;
     }
 

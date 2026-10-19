@@ -1766,8 +1766,11 @@ impl OidcDeviceAuth {
                 return Err(store_wait_aborted_error());
             }
             match refresh_result {
-                // `is_usable`, not `has_required_token`: the served token must
-                // also still be valid. Bounding `expires_at` by the served
+                // A successful IdP response vouches for a byte-identical
+                // credential too (some IdPs cache it until expiry). Do not let
+                // our rejection digest make that response unusable forever.
+                // Still check validity, not just `has_required_token`: the
+                // served token must also still be valid. Bounding `expires_at` by the served
                 // token's own `exp` (see `tokenset_from_response`) means an IdP
                 // that re-returns the original `id_token` on a refresh -- the
                 // same IdP behaviour the arm below exists for -- yields a set
@@ -1777,7 +1780,10 @@ impl OidcDeviceAuth {
                 // coordinated refresh again: one IdP round-trip and one
                 // refresh-token rotation per flush, with the caller handed an
                 // expired token and a 401 instead of `InteractionRequired`.
-                Ok(refreshed) if self.is_usable(&refreshed) => {
+                Ok(refreshed)
+                    if refreshed.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS)
+                        && self.has_required_token(&refreshed) =>
+                {
                     self.ensure_open()?;
                     self.lock_store_state().reset_refresh_backoff();
                     *self.lock_tokens() = Some(refreshed.clone());

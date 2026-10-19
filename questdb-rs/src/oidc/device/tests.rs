@@ -8398,6 +8398,40 @@ fn a_token_the_server_rejected_is_refreshed_instead_of_served_again() {
 }
 
 #[test]
+fn a_successful_same_token_refresh_clears_the_rejection_digest() {
+    for groups in [false, true] {
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&refreshes);
+        let mock = MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                let n = if body.contains("grant_type=refresh_token") {
+                    count.fetch_add(1, Ordering::SeqCst) + 1
+                } else {
+                    0
+                };
+                (
+                    200,
+                    format!(
+                        r#"{{"access_token":"AT-same","id_token":"ID-same","refresh_token":"RT-{n}","expires_in":300}}"#
+                    ),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        });
+        let auth = explicit_auth(&mock, groups);
+        auth.sign_in().unwrap();
+        let token = if groups { "ID-same" } else { "AT-same" };
+        assert_eq!(token_after_401(&auth, token).unwrap(), token);
+        assert!(auth.lock_rejected().digest.is_none());
+        for _ in 0..3 {
+            assert_eq!(auth.token().unwrap(), token);
+        }
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
 fn a_401_does_not_drop_a_valid_token_without_a_refresh_token() {
     // QuestDB can answer 401 when its own userinfo lookup is temporarily down.
     // Entra, Okta and Auth0 commonly issue no refresh token for the default
