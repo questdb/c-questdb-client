@@ -3833,6 +3833,39 @@ mod tests {
     }
 
     #[test]
+    fn failover_deadline_abandons_a_blocked_token_provider() {
+        let cfg = ReaderConfig::from_conf("ws::addr=localhost:9000;")
+            .unwrap()
+            .token_provider(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok::<_, Error>("token".to_string())
+            })
+            .unwrap();
+        let start = std::time::Instant::now();
+        let error = upgrade_headers_for_walk(
+            &cfg,
+            Some(std::time::Instant::now() + Duration::from_millis(20)),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SocketError);
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "failover waited for the synchronous provider past its deadline"
+        );
+    }
+
+    #[test]
+    fn tracker_walk_rejects_work_after_the_execute_deadline() {
+        let expired = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = ensure_walk_deadline(Some(expired)).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SocketError);
+        assert!(error.msg().contains("failover deadline expired"));
+        assert!(ensure_walk_deadline(None).is_ok());
+    }
+
+    #[test]
     fn failover_deadline_context_keeps_role_mismatch_code() {
         let original = Error::new(ErrorCode::RoleMismatch, "all endpoints are replicas");
 
@@ -3864,36 +3897,11 @@ mod tests {
     }
 
     #[test]
-    fn failover_deadline_abandons_a_blocked_token_provider() {
-        let cfg = ReaderConfig::from_conf("ws::addr=localhost:9000;")
-            .unwrap()
-            .token_provider(|| {
-                std::thread::sleep(Duration::from_millis(250));
-                Ok::<_, Error>("token".to_string())
-            })
-            .unwrap();
-        let start = std::time::Instant::now();
-        let error = upgrade_headers_for_walk(
-            &cfg,
-            Some(std::time::Instant::now() + Duration::from_millis(20)),
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), ErrorCode::SocketError);
-        assert!(
-            start.elapsed() < Duration::from_millis(200),
-            "failover waited for the synchronous provider past its deadline"
-        );
-    }
-
-    #[test]
-    fn tracker_walk_rejects_work_after_the_execute_deadline() {
-        let expired = std::time::Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .unwrap();
-        let error = ensure_walk_deadline(Some(expired)).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::SocketError);
-        assert!(error.msg().contains("failover deadline expired"));
-        assert!(ensure_walk_deadline(None).is_ok());
+    fn failover_deadline_context_without_a_last_error_is_a_socket_error() {
+        let err = failover_deadline_exhausted_error(25, 0, None);
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(is_failover_deadline_exhaustion(&err));
+        assert!(err.msg().contains("last error: <no error captured>"));
     }
 
     /// Pin the exponential base schedule without measuring wall-clock

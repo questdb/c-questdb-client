@@ -1774,7 +1774,8 @@ fn connect_handlers_from_c(
 }
 
 /// Like `questdb_db_connect_with_event_handler`, additionally registering a
-/// server-rejection handler. Either callback may be NULL: a NULL
+/// server-rejection handler. `conf_len` must not exceed
+/// [`crate::MAX_CONFIG_BYTES`]. Either callback may be NULL: a NULL
 /// `event_callback` disables connection lifecycle events; a NULL
 /// `rejection_callback` selects the default behaviour of logging every
 /// rejection (warn for retriable policies — the frames are replayed, not
@@ -5838,6 +5839,23 @@ mod tests {
             questdb_db_connect_with_handlers(
                 conf.as_ptr() as *const c_char,
                 conf.len(),
+                Some(ignore_connection_event),
+                std::ptr::null_mut(),
+                oversized,
+                None,
+                std::ptr::null_mut(),
+                0,
+                &mut error,
+            )
+        };
+        assert!(db.is_null());
+        unsafe { assert_capacity_error(error, "event_inbox_capacity") };
+
+        error = std::ptr::null_mut();
+        let db = unsafe {
+            questdb_db_connect_with_handlers(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
                 None,
                 std::ptr::null_mut(),
                 0,
@@ -5849,6 +5867,25 @@ mod tests {
         };
         assert!(db.is_null());
         unsafe { assert_capacity_error(error, "rejection_inbox_capacity") };
+
+        // The cap itself is accepted.
+        error = std::ptr::null_mut();
+        let db = unsafe {
+            questdb_db_connect_with_handlers(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                Some(ignore_connection_event),
+                std::ptr::null_mut(),
+                MAX_DB_CALLBACK_INBOX_CAPACITY,
+                Some(ignore_rejection),
+                std::ptr::null_mut(),
+                MAX_DB_CALLBACK_INBOX_CAPACITY,
+                &mut error,
+            )
+        };
+        assert!(!db.is_null());
+        assert!(error.is_null());
+        unsafe { questdb_db_close(db) };
     }
 
     #[test]

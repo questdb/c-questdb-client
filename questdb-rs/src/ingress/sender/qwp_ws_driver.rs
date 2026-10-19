@@ -2677,8 +2677,8 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
         // NB: `InvalidApiCall` is deliberately NOT here. The connection pool
         // raises it for ordinary exhaustion, which is transient contention,
         // and `db.rs`'s borrow-retry loops key on this predicate -- listing it
-        // made them give up on the first `acquire_timeout` expiry instead of
-        // retrying with backoff to the caller's budget. A provider contract
+        // would make them give up on the first `acquire_timeout` expiry instead
+        // of retrying with backoff to the caller's budget. A provider contract
         // violation reaches this set as `ConfigError` instead; see
         // `classify_provider_error`.
         ErrorCode::AuthError
@@ -4847,14 +4847,38 @@ mod tests {
         // Pool exhaustion is `InvalidApiCall` and is transient contention that
         // resolves when a peer returns its handle. `db.rs`'s
         // `borrow_sender_owned_with_retry` / `reborrow_with_retry` key on this
-        // predicate, so listing the bare code made them give up on the first
-        // `acquire_timeout` expiry instead of retrying with backoff to the
+        // predicate, so listing the bare code would make them give up on the
+        // first `acquire_timeout` expiry instead of retrying with backoff to the
         // caller's budget.
         let exhausted = Error::new(
             ErrorCode::InvalidApiCall,
             "Connection pool exhausted: 4 sender(s) in use at the sender_pool_max cap of 4",
         );
         assert!(!reconnect_error_is_terminal(&exhausted));
+    }
+
+    #[test]
+    fn ack_wait_timeout_names_a_failing_reconnect() {
+        // Connected: the server is not advancing the watermark.
+        let alive = ack_wait_timeout_error("wait", Duration::from_millis(50), 3, Some(1), None);
+        assert_eq!(alive.code(), ErrorCode::FailoverRetry);
+        assert!(alive.msg().contains("the connection is alive"), "{alive}");
+        assert!(alive.msg().contains("reached FSN 1"), "{alive}");
+        assert!(alive.msg().contains("Do not re-flush"), "{alive}");
+
+        // Disconnected: the stall is the reconnect's, and the error says why.
+        let cause = Error::new(ErrorCode::SocketError, "could not connect: refused");
+        let down = ack_wait_timeout_error("wait", Duration::from_millis(50), 3, None, Some(&cause));
+        assert_eq!(down.code(), ErrorCode::FailoverRetry);
+        assert!(
+            down.msg()
+                .contains("reconnecting keeps failing: could not connect: refused"),
+            "{down}"
+        );
+        assert!(down.msg().contains("reached no frame"), "{down}");
+        assert!(down.msg().contains("Do not re-flush"), "{down}");
+        assert!(!down.msg().contains("the connection is alive"), "{down}");
+        assert!(!down.in_doubt());
     }
 
     #[test]

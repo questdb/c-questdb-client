@@ -587,8 +587,7 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
 /// The listener-side twin of the `error_inbox_capacity` cap above.
 ///
 /// Every `connection_listener` callsite in the tree passes 0, so this guard had
-/// no coverage at all -- not even the incidental dead-code lint its sibling gets
-/// from an unused constant. It is reachable from Python as
+/// no coverage at all. It is reachable from Python as
 /// `Sender(..., connection_event_inbox_capacity=N)` and from C through
 /// `line_sender_opts_connection_event_handler`, which has no check of its own
 /// and depends entirely on this one.

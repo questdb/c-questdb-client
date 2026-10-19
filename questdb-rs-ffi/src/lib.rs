@@ -6822,6 +6822,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn row_sender_config_apis_reject_null_with_nonzero_length() {
+        let config = line_sender_utf8 {
+            len: 8,
+            buf: ptr::null(),
+        };
+        let mut err = ptr::null_mut();
+        let opts = unsafe { line_sender_opts_from_conf(config, &mut err) };
+        assert!(opts.is_null());
+        assert_line_error_contains(
+            &mut err,
+            line_sender_error_code::line_sender_error_invalid_api_call,
+            "configuration pointer is NULL with non-zero length",
+        );
+    }
+
     fn new_udp_sender(err: &mut *mut line_sender_error) -> *mut line_sender {
         unsafe {
             let opts = line_sender_opts_new(

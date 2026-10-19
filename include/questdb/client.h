@@ -76,14 +76,6 @@ typedef struct questdb_oidc_auth questdb_oidc_auth;
 typedef struct questdb_token_provider questdb_token_provider;
 #endif
 
-/** Maximum accepted capacity for a pool callback inbox. A larger capacity
- *  passed to `questdb_db_connect_ex`, `questdb_db_connect_with_event_handler`
- *  or `questdb_db_connect_with_handlers` fails the call with
- *  `line_sender_error_invalid_api_call`. (The sender-level
- *  `line_sender_opts_connection_event_handler` and the `error_inbox_capacity`
- *  config key report the same cap as `line_sender_error_config_error`.) */
-#define QUESTDB_DB_MAX_CALLBACK_INBOX_CAPACITY ((size_t)65536)
-
 /** Extensible options for `questdb_db_connect_ex`. Initialize with
  *  `questdb_db_connect_options_init(&options, sizeof options)`, then override
  *  the needed fields. `struct_size` records the caller's allocation size; do
@@ -106,6 +98,14 @@ typedef struct questdb_db_connect_options
      *  own reference. */
     const questdb_token_provider* token_provider;
 } questdb_db_connect_options;
+
+/** Maximum accepted capacity for a pool callback inbox. A larger capacity
+ *  passed to `questdb_db_connect_ex`, `questdb_db_connect_with_event_handler`
+ *  or `questdb_db_connect_with_handlers` fails the call with
+ *  `line_sender_error_invalid_api_call`. (The sender-level
+ *  `line_sender_opts_connection_event_handler` and the `error_inbox_capacity`
+ *  config key report the same cap as `line_sender_error_config_error`.) */
+#define QUESTDB_DB_MAX_CALLBACK_INBOX_CAPACITY ((size_t)65536)
 
 /* -------------------------------------------------------------------------
  * Pool lifecycle
