@@ -197,9 +197,11 @@ impl questdb_token_sink {
 /// Report a token from a source or provider callback. The token is copied.
 ///
 /// `expires_at_ms` is the token's expiry in epoch milliseconds; a source must
-/// give it, a provider may pass 0. `refresh_at_ms` is the platform's suggested
-/// refresh time, or 0 for none. Returns false, setting nothing, when `sink` is
-/// NULL, a result was already reported, or the token is not UTF-8.
+/// give it, a provider may pass 0. For a token that does not expire, pass
+/// `INT64_MAX`: an instant after 9999-12-31T23:59:59.999Z is treated as that
+/// instant. `refresh_at_ms` is the platform's suggested refresh time, or 0 for
+/// none. Returns false, setting nothing, when `sink` is NULL, a result was
+/// already reported, or the token is not UTF-8.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_token_sink_set_token(
     sink: *mut questdb_token_sink,
@@ -339,8 +341,20 @@ impl BearerTokenProvider for CallbackProvider {
     }
 }
 
+/// The latest instant a callback can report, 9999-12-31T23:59:59.999Z; a later
+/// one is treated as this one. Every platform's `SystemTime` can hold it, so a
+/// token that never expires -- reported as `INT64_MAX`, or converted from C++'s
+/// `system_clock::time_point::max()` (922337203685477 ms with MSVC) -- is served
+/// alike everywhere. Windows' `SystemTime` ends in the year 30828: past it, the
+/// epoch fallback in [`system_time`] would turn such a token into one that
+/// expired in 1970, and the provider would reject every fetch.
+const MAX_EPOCH_MS: i64 = 253_402_300_799_999;
+
+/// Convert a callback's epoch-millisecond instant, clamping it to
+/// [`MAX_EPOCH_MS`]. The epoch fallback is then reachable only for an instant
+/// before the platform's range, which is in the past either way.
 fn system_time(epoch_ms: i64) -> SystemTime {
-    let offset = Duration::from_millis(epoch_ms.unsigned_abs());
+    let offset = Duration::from_millis(epoch_ms.min(MAX_EPOCH_MS).unsigned_abs());
     let t = if epoch_ms >= 0 {
         UNIX_EPOCH.checked_add(offset)
     } else {
@@ -1145,6 +1159,69 @@ mod tests {
         unsafe { questdb_token_provider_free(clone) };
         // The refresher drops the source, releasing user_data, once.
         await_count(&probe.released, 1);
+    }
+
+    /// INT64_MAX, and C++'s `system_clock::time_point::max()` with MSVC, lie
+    /// past the end of Windows' `SystemTime` range.
+    const NEVER_EXPIRES_MS: [i64; 2] = [i64::MAX, 922_337_203_685_477];
+
+    #[test]
+    fn far_future_instants_are_clamped_not_dropped() {
+        let max = UNIX_EPOCH + Duration::from_millis(MAX_EPOCH_MS as u64);
+        for far in NEVER_EXPIRES_MS.into_iter().chain([MAX_EPOCH_MS + 1]) {
+            assert_eq!(system_time(far), max, "{far}");
+        }
+        assert_eq!(system_time(MAX_EPOCH_MS), max);
+        assert_eq!(
+            system_time(1_500),
+            UNIX_EPOCH + Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            system_time(-1_500),
+            UNIX_EPOCH - Duration::from_millis(1_500)
+        );
+    }
+
+    unsafe extern "C" fn never_expiring_source(
+        user_data: *mut c_void,
+        sink: *mut questdb_token_sink,
+    ) {
+        let expires_at_ms = unsafe { *user_data.cast::<i64>() };
+        let token = "forever";
+        assert!(unsafe {
+            questdb_token_sink_set_token(sink, token.as_ptr().cast(), token.len(), expires_at_ms, 0)
+        });
+    }
+
+    #[test]
+    fn a_token_that_never_expires_is_served() {
+        for expires_at_ms in NEVER_EXPIRES_MS {
+            let user_data = ptr::from_mut(Box::leak(Box::new(expires_at_ms))).cast::<c_void>();
+            let mut err: *mut questdb_error = ptr::null_mut();
+            let provider = unsafe {
+                questdb_refreshing_token_provider_new(
+                    Some(never_expiring_source),
+                    user_data,
+                    None,
+                    ptr::null(),
+                    &mut err,
+                )
+            };
+            assert!(!provider.is_null() && err.is_null());
+            assert!(
+                unsafe { questdb_token_provider_await_ready(provider, 10_000) },
+                "{expires_at_ms}"
+            );
+            let token = unsafe { questdb_token_provider_token(provider, &mut err) };
+            assert_eq!(token_text(token), "forever");
+
+            let mut status = unsafe { std::mem::zeroed::<questdb_token_provider_status>() };
+            status.struct_size = size_of_val(&status);
+            assert!(unsafe { questdb_token_provider_get_status(provider, &mut status) });
+            assert!(!status.has_last_failure);
+            assert_eq!(status.token_expires_at_ms, MAX_EPOCH_MS);
+            unsafe { questdb_token_provider_free(provider) };
+        }
     }
 
     #[test]

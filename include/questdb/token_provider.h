@@ -100,6 +100,8 @@ typedef struct questdb_token questdb_token;
  * `expires_at_ms` is the token's expiry in epoch milliseconds: a source must
  * give it; `get_token` may pass 0. If the platform gave a relative lifetime
  * (OAuth's `expires_in`), compute the expiry from the local time of receipt.
+ * For a token that does not expire, pass `INT64_MAX`: on every platform, an
+ * instant after 9999-12-31T23:59:59.999Z is treated as that instant.
  * `refresh_at_ms` is the platform's suggested refresh time, or 0 for none.
  *
  * Returns false, recording nothing, when `sink` is NULL, a result was already

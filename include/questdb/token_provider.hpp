@@ -47,7 +47,8 @@ struct expiring_token
     /** The token, without the `Bearer ` prefix. */
     std::string token;
     /** When the token expires. For a relative lifetime (OAuth's `expires_in`),
-     *  add it to the local time of receipt. */
+     *  add it to the local time of receipt. For a token that does not expire,
+     *  use `std::chrono::system_clock::time_point::max()`. */
     std::chrono::system_clock::time_point expires_at;
     /** The platform's suggested refresh time, if it gave one. */
     std::optional<std::chrono::system_clock::time_point> refresh_at{};

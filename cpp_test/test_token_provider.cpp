@@ -62,6 +62,17 @@ TEST_CASE("A refreshing provider serves its source's token")
     CHECK(fetches.load() == 1);
 }
 
+TEST_CASE("A token that never expires is served")
+{
+    // With MSVC, time_point::max() lies past the end of Windows' SystemTime.
+    auto provider = questdb::token_provider::refreshing([] {
+        return questdb::expiring_token{
+            "forever", std::chrono::system_clock::time_point::max()};
+    });
+    CHECK(provider.await_ready(10s));
+    CHECK(provider.token() == "forever");
+}
+
 TEST_CASE("Negative provider durations are rejected before conversion")
 {
     using options_type = questdb::refreshing_token_provider_options;
