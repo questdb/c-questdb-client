@@ -798,19 +798,25 @@ def test_orphan_drainer_durable_ack_survives_kill_c_client_rust(
     p1.kill_9()
     wait_port_free(p1_ports.http)
     wait_port_free(p1_ports.pg)
+    # Stop the old drainer before P2 opens the same ports. It can reconnect
+    # autonomously, and the fresh CONNECT below could replay the slot again.
+    c_client_rust_sidecar.close()
     if p1.db_root.exists():
         shutil.rmtree(p1.db_root)
     obj_store.wipe()
 
     p2 = server_factory("p2", db_root_name="p2-fresh")
     p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+    # Replay is at least once across a lost ACK. Prepare the fresh target with
+    # the same dedup key used by the other SF recovery tests.
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" ('
+        "v LONG, timestamp TIMESTAMP"
+        ") TIMESTAMP(timestamp) PARTITION BY DAY WAL "
+        "DEDUP UPSERT KEYS(timestamp, v)"
+    ))
 
-    # When P1 died mid-drain the orphan worker returned RetryLater and stopped:
-    # the Rust drainer (drain_orphan_to_completion) does NOT autonomously
-    # reconnect to a successor within one attempt. The orphan slot is only
-    # re-attempted by a *fresh* orphan scan, which runs on the next CONNECT with
-    # drain_orphans=on. Reconnect the foreground sender so a new scan adopts the
-    # still-un-acked ghost slot and replays it to P2.
+    # A new scan adopts the still-un-acked ghost slot and replays it to P2.
     c_client_rust_sidecar.connect(fg_cs)
 
     wait_for_dense_sequence(port=p1_ports.pg, table=table,
