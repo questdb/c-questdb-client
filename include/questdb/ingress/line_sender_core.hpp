@@ -104,6 +104,7 @@ enum class error_code : int
     batch_too_large = ::line_sender_error_batch_too_large,
     store_resend_required = ::line_sender_error_store_resend_required,
     symbol_dict_full = ::line_sender_error_symbol_dict_full,
+    query_timeout = ::line_sender_error_query_timeout,
 };
 // clang-format on
 

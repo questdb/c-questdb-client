@@ -90,8 +90,8 @@ pub use config::{
 };
 #[cfg(feature = "sync-reader-qwp-ws")]
 pub use reader::{
-    BatchView, Cursor, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader,
-    ReaderQuery, ReaderStats, Terminal,
+    BatchView, Cursor, FailoverPhase, FailoverProgressEvent, FailoverResetEvent,
+    ROWS_AFFECTED_UNKNOWN, Reader, ReaderQuery, ReaderStats, Terminal,
 };
 pub use server_event::{ServerInfo, ServerRole, UpgradeReject};
 pub use symbol_dict::{SymbolDict, SymbolEntry};

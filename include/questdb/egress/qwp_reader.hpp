@@ -27,6 +27,8 @@
 #include "qwp_reader.h"
 
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -1193,6 +1195,56 @@ public:
         ensure_impl();
         ::qwp_reader_query_initial_credit(_impl, credit);
         return *this;
+    }
+
+    /**
+     * Run this query under its own timeout instead of the server-wide
+     * `query.timeout`. Overrides the connect string's `query_timeout_ms`;
+     * `0` clears it. Requires a server advertising `CAP_QUERY_TIMEOUT`
+     * (`0x08`) — against an older one `execute()` throws
+     * `error_code::unsupported_server`, before anything is written, rather
+     * than silently running under the server default; the connection is
+     * untouched. The server applies no ceiling, so a value above
+     * `query.timeout` is honoured.
+     *
+     * On expiry the cursor terminates with `error_code::query_timeout` and
+     * the connection stays usable. Do not retry a write on it: a statement
+     * that outlives its timeout is reported as `EXEC_DONE` instead, and a
+     * DDL / INSERT / UPDATE that timed out waiting for the table writer may
+     * still be applied afterwards.
+     */
+    query& timeout_ms(uint64_t timeout_ms)
+    {
+        ensure_impl();
+        ::qwp_reader_query_set_timeout_ms(_impl, timeout_ms);
+        return *this;
+    }
+
+    /** `timeout_ms` taking a `std::chrono` duration. A non-zero duration
+     *  below 1 ms rounds up to 1 ms, never down to "no timeout"; one too
+     *  large for the wire saturates at its maximum. Only zero clears the
+     *  timeout: a negative, NaN or infinite duration throws
+     *  `error_code::invalid_api_call`. */
+    template <typename Rep, typename Period>
+    query& timeout(std::chrono::duration<Rep, Period> d)
+    {
+        // Convert in double: `duration_cast` to an integral rep is UB for
+        // NaN and for values outside the target range.
+        const double ms = std::chrono::duration<double, std::milli>{d}.count();
+        if (std::isnan(ms) || std::isinf(ms))
+            throw ::questdb::error{
+                error_code::invalid_api_call,
+                "query::timeout(): duration must be finite"};
+        if (ms < 0.0)
+            throw ::questdb::error{
+                error_code::invalid_api_call,
+                "query::timeout(): duration must not be negative"};
+        if (ms == 0.0)
+            return timeout_ms(0);
+        if (ms >= 18446744073709551616.0) // 2^64
+            return timeout_ms(UINT64_MAX);
+        const auto as_u64 = static_cast<uint64_t>(ms);
+        return timeout_ms(as_u64 == 0 ? 1 : as_u64);
     }
 
     /**
