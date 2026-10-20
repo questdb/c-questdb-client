@@ -187,6 +187,48 @@ qwp_reader* qwp_reader_from_conf(
     line_sender_utf8 config, questdb_error** err_out);
 
 /**
+ * Construct a reader whose WebSocket handshake uses `auth` as a rotating
+ * Bearer-token provider. The reader retains shared ownership of the auth state,
+ * so the caller may free its auth handle after this call returns. Provider
+ * calls may load or silently refresh a token but never start an interactive
+ * device flow; call questdb_oidc_auth_sign_in before opening the reader. After
+ * a handshake 401 for a token that had not expired, the one re-resolution a
+ * connect makes refreshes it rather than presenting it again (at most once
+ * every 30 seconds per auth).
+ * Mutually exclusive with static credentials: `config` must not also set
+ * `username`/`password` or `token`. Setting both fails with
+ * `questdb_error_config_error`. An `auth` already closed with
+ * `questdb_oidc_auth_close` is rejected with QUESTDB_OIDC_ERROR_CANCELLED.
+ * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer token
+ * is sent in cleartext and can be captured in transit.
+ */
+QUESTDB_CLIENT_API
+qwp_reader* qwp_reader_from_conf_with_oidc(
+    line_sender_utf8 config,
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
+
+/**
+ * Construct a reader from a QuestDB config string and use `provider` (see
+ * `questdb/token_provider.h`) as its rotating Bearer-token provider. The
+ * reader keeps its own reference: `provider` may be freed afterwards. On a 401
+ * the reader calls the provider's `on_rejected`, pulls again, and replays the
+ * endpoint once if the token changed and the `WWW-Authenticate` challenge
+ * allows it.
+ *
+ * Mutually exclusive with static credentials in `config`. Use `wss::`. A
+ * refreshing provider already closed with `questdb_token_provider_close` is
+ * rejected with its permanent `questdb_error_auth_error`.
+ *
+ * Returns NULL and sets `*err_out` on failure.
+ */
+QUESTDB_CLIENT_API
+qwp_reader* qwp_reader_from_conf_with_token_provider(
+    line_sender_utf8 config,
+    const questdb_token_provider* provider,
+    questdb_error** err_out);
+
+/**
  * Construct a reader from the configuration stored in the
  * `QDB_CLIENT_CONF` environment variable. The variable's value follows
  * the same format as `qwp_reader_from_conf`.
@@ -742,6 +784,9 @@ void qwp_reader_query_free(qwp_reader_query* query);
  * violation: the call sets `*err_out` to
  * `questdb_error_invalid_api_call` and returns NULL.
  *
+ * If the reader's last mid-query failover gave up and left it without a
+ * connection, this reconnects first; a failed reconnect fails this call.
+ *
  * On success, ownership transfers to the returned cursor; on failure,
  * `*err_out` is set and NULL is returned.
  */
@@ -1112,6 +1157,21 @@ typedef struct qwp_reader_batch qwp_reader_batch;
  * @return NULL with `*err_out` left untouched when the stream has
  *         terminated normally — no batch is available.
  * @return NULL with `*err_out` set on error; the cursor must be freed.
+ *
+ * When a mid-query failover gives up, `*err_out` is the error that names
+ * what to fix if the reconnect rounds found one, else the error that
+ * started the failover. A reconnect error naming what to fix is one coded
+ * `questdb_error_auth_error`, `questdb_error_role_mismatch`,
+ * `questdb_error_config_error`, `questdb_error_unsupported_server`,
+ * `questdb_error_handshake_error` or `questdb_error_tls_error`, or one
+ * carrying an OIDC payload (`questdb_error_oidc_get_view`) or a token
+ * provider's failure to supply a credential
+ * (`questdb_error_token_unavailable_get_view`).
+ *
+ * A failover that gives up leaves the reader without a connection, but not
+ * unusable: its next `qwp_reader_execute` or `qwp_reader_query_execute`
+ * reconnects first. A failed reconnect fails that call, and the next call
+ * tries again.
  */
 QUESTDB_CLIENT_API
 const qwp_reader_batch* qwp_reader_cursor_next_batch(
@@ -1356,7 +1416,7 @@ qwp_reader_cursor_current_addr_port(const qwp_reader_cursor*);
  * while a cursor is live).
  *
  * Returns `false` and sets `*err_out` on failure: the cursor handle is
- * NULL, or the underlying connection is poisoned after a failed mid-query
+ * NULL, or the underlying connection was lost after a failed mid-query
  * failover. On success returns `true` and writes `*out_version`.
  */
 QUESTDB_CLIENT_API bool qwp_reader_cursor_server_version(

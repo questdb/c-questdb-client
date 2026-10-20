@@ -711,6 +711,48 @@ public:
     }
 
     /**
+     * Open a reader with a rotating OIDC Bearer-token provider. The reader
+     * retains the auth state internally. Provider calls may silently refresh
+     * but never prompt; call auth.sign_in() first.
+     * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer
+     * token is sent in cleartext and can be captured in transit.
+     * @throws questdb::oidc::error if `auth` is empty, moved from or already
+     *         closed (kind `cancelled`), or token acquisition returns a
+     *         structured OIDC failure.
+     * @throws questdb::error on configuration or connection failure.
+     * @note Unlike the ingest sender (which throws `line_sender_error` with the
+     *       OIDC detail on `oidc_diagnostic()`), the reader throws
+     *       `questdb::oidc::error` directly. Catch `const questdb::error&` to
+     *       handle both. See `questdb::oidc::error` for the cross-surface
+     *       model.
+     */
+    reader(
+        ::questdb::ingress::utf8_view config,
+        const ::questdb::oidc::device_auth& auth)
+        : _impl{::questdb::oidc::detail::wrapped_call(
+              ::qwp_reader_from_conf_with_oidc, to_c_utf8(config), auth.raw())}
+    {
+    }
+
+    /**
+     * Open a reader with a rotating Bearer-token provider (see
+     * `questdb::token_provider`). The reader keeps its own reference. Use
+     * `wss::` (TLS).
+     * @throws questdb::error if `provider` is empty, moved from, or a
+     *         refreshing provider that was already closed, and on
+     *         configuration or connection failure.
+     */
+    reader(
+        ::questdb::ingress::utf8_view config,
+        const ::questdb::token_provider& provider)
+        : _impl{::questdb::error::wrapped_call(
+              ::qwp_reader_from_conf_with_token_provider,
+              to_c_utf8(config),
+              provider.raw())}
+    {
+    }
+
+    /**
      * Open a reader using the config string stored in the
      * `QDB_CLIENT_CONF` environment variable. The variable's value
      * follows the same format as the constructor's `config` argument.
@@ -2656,7 +2698,7 @@ public:
         if (!p)
         {
             if (c_err)
-                throw ::questdb::error::from_c(c_err);
+                ::questdb::error::throw_from_c(c_err);
             return std::nullopt;
         }
         return egress::batch{p};
@@ -2766,7 +2808,7 @@ public:
             return std::nullopt;
         case ::qwp_reader_arrow_batch_error:
         default:
-            throw ::questdb::error::from_c(c_err);
+            ::questdb::error::throw_from_c(c_err);
         }
     }
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */
@@ -2952,7 +2994,7 @@ inline cursor query::execute()
     // is a NULL no-op without us having to clear `_impl` explicitly here.
     auto* c = ::qwp_reader_query_execute(&_impl, &c_err);
     if (!c)
-        throw ::questdb::error::from_c(c_err);
+        ::questdb::error::throw_from_c(c_err);
     cursor result{c};
     result._failover_callback = std::move(cb);
     result._failover_progress_callback = std::move(pcb);

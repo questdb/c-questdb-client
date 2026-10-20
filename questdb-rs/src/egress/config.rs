@@ -517,6 +517,11 @@ pub struct ReaderConfig {
     /// follow the master across zones. Failover.md §1.1 / §2.
     pub zone: Option<String>,
     pub auth: AuthMode,
+    /// A rotating Bearer-token source pulled once per initial/reconnect endpoint
+    /// walk (e.g. from `oidc::OidcDeviceAuth`). Mutually exclusive with
+    /// [`auth`](Self::auth); set via [`token_provider`](Self::token_provider) and
+    /// never from a conf string.
+    pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     pub tls_verify: TlsVerify,
     pub tls_ca: CertificateAuthority,
     pub tls_roots: Option<PathBuf>,
@@ -804,6 +809,11 @@ impl ReaderConfig {
         for (key, val) in params.iter() {
             let key = key.as_str();
             let val = val.as_str();
+            // Reserved for connect-string token providers, which this client
+            // does not implement.
+            if let Some(err) = crate::reserved_token_provider_key_error(key) {
+                return Err(err);
+            }
             match key {
                 "addr" => {} // already consumed
                 "path" => {
@@ -1069,6 +1079,7 @@ impl ReaderConfig {
             query_timeout_ms,
             zone,
             auth,
+            token_provider: None,
             tls_verify,
             tls_ca,
             tls_roots,
@@ -1076,6 +1087,133 @@ impl ReaderConfig {
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Supply a fresh Bearer token on every (re)connect via a callback (e.g.
+    /// `OidcDeviceAuth::token`).
+    ///
+    /// Mutually exclusive with the static `username`/`password`/`token` auth set in
+    /// the config string — combining them is a configuration error rather than a
+    /// silent override, mirroring
+    /// [`SenderBuilder::qwp_ws_token_provider`](crate::ingress::SenderBuilder::qwp_ws_token_provider).
+    /// So is attaching a second provider: one configuration takes one provider.
+    /// A [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider)
+    /// that was already closed is refused with the permanent error its
+    /// [`token`](crate::token_provider::RefreshingTokenProvider::token) returns.
+    ///
+    /// The provider is called once before each initial-connect or reconnect
+    /// endpoint walk, so a long-lived reader keeps working as the token silently
+    /// refreshes / rotates. The acquired token is reused for every endpoint tried
+    /// within that walk; after one handshake 401 it is resolved once more and
+    /// the same endpoint is replayed only if the value changed.
+    /// `OidcDeviceAuth::token` answers that re-resolution with a refreshed
+    /// token when the server rejected its cached one before it expired, at most
+    /// once every 30 seconds. A later reconnect round pulls a fresh one. The token is sent as the `Authorization: Bearer <token>` handshake header; a token with
+    /// a non-printable-ASCII character (a header-injection vector) is rejected,
+    /// and a provider error fails that walk before DNS or TCP work. Provider
+    /// acquisition failures are retryable because the callback may recover on its
+    /// next invocation; a server rejection of an acquired token fails the
+    /// operation. If a mid-query failover gives up on either, the reader's next
+    /// `execute()` reconnects.
+    /// In unwind-enabled builds, a callback panic is contained and treated as a
+    /// retryable provider failure; `panic = "abort"` builds cannot contain panics.
+    /// `OidcDeviceAuth::token` may load or silently refresh a credential, but
+    /// never launches an interactive device flow on the connect/reconnect thread;
+    /// it returns `InteractionRequired` when explicit sign-in is needed.
+    /// Use TLS (`wss://`) so the bearer credential isn't sent in cleartext.
+    ///
+    /// ```no_run
+    /// # #[cfg(all(feature = "oidc", feature = "sync-reader-qwp-ws"))] {
+    /// # use std::sync::Arc;
+    /// # use questdb::oidc::OidcDeviceAuth;
+    /// # use questdb::egress::{Reader, ReaderConfig};
+    /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let auth = Arc::new(OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?);
+    /// auth.sign_in()?;
+    /// let cfg = ReaderConfig::from_conf("wss::addr=questdb.example.com:9000;")?
+    ///     .token_provider({ let auth = Arc::clone(&auth); move || auth.token() })?;
+    /// let reader = Reader::from_config(&cfg)?;
+    /// # let _ = reader; Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// # Retry classification
+    ///
+    /// Every provider failure is treated as **retryable** by default: the
+    /// closure is caller-controlled and may succeed on its next invocation, and
+    /// a QWP store-and-forward sender must not abandon accepted frames because
+    /// one refresh attempt failed. `AuthError` and `ConfigError` returned from
+    /// the closure are reclassified to a retryable `SocketError` for that
+    /// reason.
+    ///
+    /// To signal a failure that retrying can never clear, return
+    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall): it is
+    /// carried out as a terminal `ConfigError`, so the reconnect loop stops and
+    /// reports it. Without it a permanently broken provider reconnects forever
+    /// -- `next_after_retryable_terminal` starts a fresh budget each round --
+    /// spawning a worker per attempt and never surfacing the cause.
+    ///
+    /// An error from an `oidc::OidcDeviceAuth` (for
+    /// example `move || auth.token()`) is classified by its OIDC kind instead
+    /// of its code. Two kinds are **terminal** and are not reclassified:
+    /// `OidcErrorKind::Cancelled` (the provider was
+    /// closed; stays `AuthError`) and
+    /// `OidcErrorKind::Config` (stays `ConfigError`).
+    /// Closing the provider therefore stops the reconnect loop and terminalizes
+    /// a reader's failover walk. Every other OIDC kind,
+    /// including `InteractionRequired`, stays retryable.
+    ///
+    /// On initial connect the provider is resolved synchronously on the caller
+    /// thread. During a mid-query failover it runs on the provider's bounded,
+    /// single-flight isolation worker so `next_batch` can stop waiting when the
+    /// Execute-wide `failover_max_duration_ms` deadline expires.
+    pub fn token_provider<P>(self, provider: P) -> Result<Self>
+    where
+        P: crate::token_provider::BearerTokenProvider + 'static,
+    {
+        self.token_provider_object(crate::token_provider::TokenProvider::new(provider))
+    }
+
+    /// Binding-only form that preserves one authentication object's QWP
+    /// isolated-acquisition identity across independently configured clients.
+    #[doc(hidden)]
+    pub fn token_provider_with_isolation<P>(
+        self,
+        provider: P,
+        isolation: crate::TokenProviderIsolation,
+    ) -> Result<Self>
+    where
+        P: crate::token_provider::BearerTokenProvider + 'static,
+    {
+        self.token_provider_object(crate::token_provider::TokenProvider::new_with_isolation(
+            provider, isolation,
+        ))
+    }
+
+    pub(crate) fn token_provider_object(
+        mut self,
+        provider: crate::token_provider::TokenProvider,
+    ) -> Result<Self> {
+        if !matches!(self.auth, AuthMode::None) {
+            return Err(fmt!(
+                ConfigError,
+                "{}",
+                crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
+            ));
+        }
+        if self.token_provider.is_some() {
+            return Err(fmt!(
+                ConfigError,
+                "{}",
+                crate::token_provider::PROVIDER_ALREADY_ATTACHED
+            ));
+        }
+        if let Some(err) = provider.attach_error() {
+            return Err(err);
+        }
+        self.token_provider = Some(provider);
+        Ok(self)
     }
 
     /// Re-run the cap and consistency checks that `from_conf` enforces.
@@ -1209,6 +1347,13 @@ impl ReaderConfig {
             reject_crlf("zone", z)?;
         }
         self.auth.validate()?;
+        if self.token_provider.is_some() && !matches!(&self.auth, AuthMode::None) {
+            return Err(fmt!(
+                ConfigError,
+                "{}",
+                crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
+            ));
+        }
         // tls_verify=unsafe_off needs the crate feature. Re-checked
         // here so a post-parse mutation of `cfg.tls_verify =
         // TlsVerify::UnsafeOff` is rejected too — the TLS builder
@@ -1254,7 +1399,48 @@ impl ReaderConfig {
     /// Build the negotiation headers as `(name, value)` pairs in the order
     /// the Java reference client emits them. Authorization is appended last
     /// when an auth mode is set.
-    pub fn upgrade_headers(&self) -> Vec<(&'static str, String)> {
+    ///
+    /// Most callers want [`Reader::from_config`](crate::egress::Reader::from_config)
+    /// instead; this is exposed for inspecting the handshake the reader will
+    /// send.
+    ///
+    /// # Secrets and side effects
+    ///
+    /// The `Authorization` value is the live credential: a Basic or Bearer
+    /// header for static credentials, or `Bearer <token>` resolved from the
+    /// configured [`token_provider`](Self::token_provider). Redact it before
+    /// logging the result. With a token provider this call also runs the
+    /// provider synchronously on the calling thread, so it can block, and an
+    /// OIDC provider may perform a silent refresh and update its token store.
+    /// The reader resolves its own token on every connect; the value returned
+    /// here is not the one it sends.
+    ///
+    /// # Compatibility
+    ///
+    /// This returned a bare `Vec` before rotating token providers existed.
+    /// Resolving a provider can fail, so it now returns [`Result`]; a config
+    /// with no token provider never returns `Err`. Add `?` (or `.unwrap()` on a
+    /// static-credential config) at the callsite.
+    pub fn upgrade_headers(&self) -> Result<Vec<(&'static str, String)>> {
+        self.upgrade_headers_with(|provider| provider.bearer_header())
+    }
+
+    /// Failover-only form: run a synchronous provider on the shared isolated
+    /// worker and abandon the wait once the Execute-wide deadline expires.
+    /// The provider itself may finish later, but single-flight isolation and
+    /// the process-wide worker cap prevent reconnect rounds from accumulating
+    /// one blocked thread apiece.
+    pub(crate) fn upgrade_headers_until(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<(&'static str, String)>> {
+        self.upgrade_headers_with(|provider| provider.bearer_header_isolated_until(cancelled))
+    }
+
+    fn upgrade_headers_with(
+        &self,
+        resolve_provider: impl FnOnce(&crate::token_provider::TokenProvider) -> Result<String>,
+    ) -> Result<Vec<(&'static str, String)>> {
         let mut headers = Vec::with_capacity(8);
         headers.push(("X-QWP-Max-Version", self.max_version.to_string()));
         if let Some(id) = &self.client_id {
@@ -1271,10 +1457,22 @@ impl ReaderConfig {
         if self.max_batch_rows > 0 {
             headers.push(("X-QWP-Max-Batch-Rows", self.max_batch_rows.to_string()));
         }
-        if let Some(v) = self.auth.header_value() {
+        // A rotating token provider (e.g. OIDC), pulled fresh here once per
+        // endpoint walk, overrides any static basic/token auth. `bearer_header`
+        // classifies provider acquisition/validation failures as retryable when
+        // the callback can recover on its next invocation. An InvalidApiCall
+        // from the callback denotes a contract violation and is re-coded to a
+        // terminal ConfigError (`classify_provider_error`), so the reconnect
+        // walk stops and reports it.
+        // Server authentication rejection remains a separate terminal AuthError
+        // produced by the handshake after header construction succeeds.
+        if let Some(provider) = &self.token_provider {
+            let header = resolve_provider(provider)?;
+            headers.push(("Authorization", header));
+        } else if let Some(v) = self.auth.header_value() {
             headers.push(("Authorization", v));
         }
-        headers
+        Ok(headers)
     }
 }
 
@@ -1487,7 +1685,7 @@ mod tests {
         let c =
             ReaderConfig::from_conf("ws::addr=h:1;compression=zstd;compression_level=9").unwrap();
         assert_eq!(c.compression_level, 9);
-        let headers = c.upgrade_headers();
+        let headers = c.upgrade_headers().unwrap();
         let accept = headers
             .iter()
             .find(|(n, _)| *n == "X-QWP-Accept-Encoding")
@@ -1500,7 +1698,7 @@ mod tests {
     fn compression_level_emitted_for_auto() {
         let c =
             ReaderConfig::from_conf("ws::addr=h:1;compression=auto;compression_level=7").unwrap();
-        let headers = c.upgrade_headers();
+        let headers = c.upgrade_headers().unwrap();
         let accept = headers
             .iter()
             .find(|(n, _)| *n == "X-QWP-Accept-Encoding")
@@ -1515,7 +1713,7 @@ mod tests {
         // (the spec says `level=N` only applies to zstd). The header value
         // collapses to the bare `raw` token.
         let c = ReaderConfig::from_conf("ws::addr=h:1;compression_level=15").unwrap();
-        let headers = c.upgrade_headers();
+        let headers = c.upgrade_headers().unwrap();
         let accept = headers
             .iter()
             .find(|(n, _)| *n == "X-QWP-Accept-Encoding")
@@ -1581,7 +1779,7 @@ mod tests {
     #[test]
     fn upgrade_headers_default() {
         let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
-        let h = c.upgrade_headers();
+        let h = c.upgrade_headers().unwrap();
         // Always emit max_version + accept-encoding; nothing else by default.
         assert_eq!(h.len(), 2);
         assert_eq!(h[0], ("X-QWP-Max-Version", "1".to_string()));
@@ -1594,7 +1792,7 @@ mod tests {
             "ws::addr=h:1;client_id=app1;max_batch_rows=1000;username=u;password=p",
         )
         .unwrap();
-        let h = c.upgrade_headers();
+        let h = c.upgrade_headers().unwrap();
         let names: Vec<_> = h.iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"X-QWP-Max-Version"));
         assert!(names.contains(&"X-QWP-Client-Id"));
@@ -1605,8 +1803,128 @@ mod tests {
 
         // max_batch_rows omitted when 0.
         let c = ReaderConfig::from_conf("ws::addr=h:1;max_batch_rows=0").unwrap();
-        let h = c.upgrade_headers();
+        let h = c.upgrade_headers().unwrap();
         assert!(h.iter().all(|(n, _)| *n != "X-QWP-Max-Batch-Rows"));
+    }
+
+    #[test]
+    fn token_provider_rejects_static_auth() {
+        // Combining a rotating provider with static auth from the config string is
+        // a configuration error (mirrors the sender), not a silent override.
+        let err = ReaderConfig::from_conf("wss::addr=h:1;username=u;password=p")
+            .unwrap()
+            .token_provider(|| Ok::<_, crate::Error>("tok".to_string()))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn validate_rejects_static_auth_added_after_token_provider() {
+        // `auth` is public, so the validate-before-use contract must catch static
+        // auth assigned after the provider setter has already accepted the config.
+        let mut c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| Ok::<_, crate::Error>("tok".to_string()))
+            .unwrap();
+        c.auth = AuthMode::Bearer {
+            token: "static".to_string(),
+        };
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("token_provider"));
+    }
+
+    #[test]
+    fn token_provider_pulled_fresh_each_header_resolution() {
+        // Without static auth the provider is accepted and pulled fresh for each
+        // endpoint walk's header resolution, so a rotated token reaches the next
+        // reconnect walk.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider({
+                let counter = std::sync::Arc::clone(&counter);
+                move || {
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, crate::Error>(format!("tok-{n}"))
+                }
+            })
+            .unwrap();
+        let h = c.upgrade_headers().unwrap();
+        let auth = h.iter().find(|(n, _)| *n == "Authorization").unwrap();
+        assert_eq!(auth.1, "Bearer tok-0");
+        // Re-invoked for the next endpoint walk.
+        let h = c.upgrade_headers().unwrap();
+        let auth = h.iter().find(|(n, _)| *n == "Authorization").unwrap();
+        assert_eq!(auth.1, "Bearer tok-1");
+    }
+
+    #[test]
+    fn token_provider_control_char_rejected() {
+        // A CR/LF token (a header-injection vector) fails the handshake build.
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| Ok::<_, crate::Error>("bad\r\ntoken".to_string()))
+            .unwrap();
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+    }
+
+    #[test]
+    fn token_provider_error_is_retryable() {
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| {
+                Err::<String, _>(crate::Error::new(crate::ErrorCode::AuthError, "no token"))
+            })
+            .unwrap();
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+    }
+
+    #[test]
+    fn token_provider_transient_error_stays_failover_eligible() {
+        // A transient provider error (SocketError, e.g. an OIDC silent-refresh
+        // network blip) must stay a SocketError — which the reader's failover
+        // treats as retry-eligible — instead of being force-mapped to a terminal
+        // AuthError that would kill a long-lived reader on a momentary blip.
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| {
+                Err::<String, _>(crate::Error::new(crate::ErrorCode::SocketError, "blip"))
+            })
+            .unwrap();
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+
+        // A non-socket provider error is still acquisition-local: the callback can
+        // recover on a later invocation, so failover must poll it again too.
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| {
+                Err::<String, _>(crate::Error::new(crate::ErrorCode::ConfigError, "bad"))
+            })
+            .unwrap();
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn upgrade_header_classification_preserves_oidc_detail() {
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| {
+                Err::<String, _>(crate::oidc::OidcError::interaction_required("sign in"))
+            })
+            .unwrap();
+
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
     }
 
     #[test]

@@ -99,6 +99,8 @@ mod ndarr;
 use ndarr::StrideArrayView;
 
 mod egress;
+mod oidc;
+mod token_provider;
 
 pub mod column_sender;
 pub use column_sender::*;
@@ -770,6 +772,18 @@ pub unsafe extern "C" fn questdb_error_in_doubt(error: *const questdb_error) -> 
     unsafe { (*error).error.in_doubt() }
 }
 
+/// Whether the error carries a QWP/WebSocket server-role rejection (including
+/// a 421 whose advertised role header cannot be parsed). Unlike a plain
+/// protocol-version error, the latter can be retried during role election.
+/// NULL-safe: passing `NULL` returns `false`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_error_is_qwp_ws_role_reject(error: *const questdb_error) -> bool {
+    if error.is_null() {
+        return false;
+    }
+    unsafe { (*error).error.is_qwp_ws_role_reject() }
+}
+
 /// Clean up the error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_error_free(error: *mut questdb_error) {
@@ -891,7 +905,7 @@ fn describe_buf(buf: &[u8]) -> String {
 }
 
 #[cold]
-unsafe fn set_err_out_from_error(err_out: *mut *mut line_sender_error, err: Error) {
+pub(crate) unsafe fn set_err_out_from_error(err_out: *mut *mut line_sender_error, err: Error) {
     let qwp_ws_error = err.qwp_ws_rejection().cloned();
     unsafe { set_err_out_from_error_with_qwpws(err_out, err, qwp_ws_error) };
 }
@@ -5775,6 +5789,19 @@ mod tests {
     #[test]
     fn line_sender_error_in_doubt_is_null_safe() {
         assert!(!unsafe { line_sender_error_in_doubt(ptr::null()) });
+    }
+
+    #[test]
+    fn role_reject_marker_is_null_safe_and_excludes_plain_protocol_errors() {
+        assert!(!unsafe { questdb_error_is_qwp_ws_role_reject(ptr::null()) });
+        let plain = Box::into_raw(Box::new(line_sender_error {
+            error: Error::new(ErrorCode::ProtocolVersionError, "unsupported version"),
+            qwp_ws_error: None,
+        }));
+        unsafe {
+            assert!(!questdb_error_is_qwp_ws_role_reject(plain));
+            line_sender_error_free(plain);
+        }
     }
 
     #[test]

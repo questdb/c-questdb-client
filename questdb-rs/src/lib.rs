@@ -35,6 +35,35 @@ mod gai;
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 mod ws;
 
+// Display-safe rendering of untrusted text, shared by the OIDC prompt and
+// token-provider error redaction.
+#[cfg(any(
+    feature = "_oidc",
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+mod display_text;
+
+// Rotating Bearer-token providers shared by the ILP/HTTP sender, the QWP/WS
+// ingress sender, and the egress reader: the `BearerTokenProvider` interface,
+// and the proactively refreshing `RefreshingTokenProvider` cache.
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+pub mod token_provider;
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+#[doc(hidden)]
+pub use token_provider::{
+    TokenProviderIsolation, token_pull_must_not_block, with_nonblocking_token_pull,
+};
+
 // JKS / PKCS#12 trust-store loader for `tls_roots_password`. Pulled
 // in only for the QWP transports — matches the Java reference's
 // `KeyStore.getInstance(...)` surface there. Other ILP transports
@@ -59,7 +88,54 @@ pub(crate) mod polars_ffi;
 #[cfg(feature = "_egress")]
 pub mod egress;
 
+#[cfg(feature = "_oidc")]
+pub mod oidc;
+
 pub use error::*;
+
+/// True if `s` is safe to send verbatim as a wire-bound Bearer credential:
+/// non-blank and printable-ASCII only. A control / non-ASCII byte (a decoded CR/LF
+/// is a header-injection vector) or a blank value must never reach an
+/// `Authorization: Bearer` header. Single gate shared by the OIDC token checks, the
+/// ILP/HTTP token-provider, and the QWP/WS + egress token-provider.
+#[cfg(any(
+    feature = "_oidc",
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+pub(crate) fn is_printable_ascii_token(s: &str) -> bool {
+    !s.trim().is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// Connect-string keys the dynamic-credential specification reserves for
+/// selecting a token provider (design/qwp-token-provider-spec.md §7.1).
+const RESERVED_TOKEN_PROVIDER_KEYS: &[&str] = &[
+    "token_provider",
+    "azure_resource",
+    "azure_client_id",
+    "azure_credential",
+];
+
+/// The error for a reserved token-provider key, or `None` for any other key.
+///
+/// This client selects no token provider from a connect string, so it rejects
+/// these keys on every schema with a pointer to the in-code API (§7.2): it must
+/// never connect without the credential the string asked for.
+pub(crate) fn reserved_token_provider_key_error(key: &str) -> Option<Error> {
+    RESERVED_TOKEN_PROVIDER_KEYS.contains(&key).then(|| {
+        error::fmt!(
+            ConfigError,
+            "\"{key}\" selects a connect-string token provider, which this client does not \
+             support (supported token_provider values: none). Attach a token provider in code \
+             instead: Python `bearer_token_provider=`; C/C++ `line_sender_opts_token_provider`, \
+             `questdb_db_connect_options.token_provider` or \
+             `qwp_reader_from_conf_with_token_provider`; Rust \
+             `SenderBuilder::bearer_token_provider` or `ReaderConfig::token_provider`. A \
+             `RefreshingTokenProvider` can fetch tokens however you like, Azure Identity included."
+        )
+    })
+}
 
 // --- Primary entry point -------------------------------------------------
 //

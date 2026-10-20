@@ -62,6 +62,38 @@ extern "C" {
  *  owning handle remains open. `questdb_db_close` is the final owner release:
  *  do not call it concurrently with other operations on the same `db`. */
 typedef struct questdb_db questdb_db;
+#ifndef QUESTDB_OIDC_AUTH_DEFINED
+#    define QUESTDB_OIDC_AUTH_DEFINED
+typedef struct questdb_oidc_auth questdb_oidc_auth;
+#endif
+#ifndef QUESTDB_TOKEN_PROVIDER_DEFINED
+#    define QUESTDB_TOKEN_PROVIDER_DEFINED
+/** A rotating Bearer-token provider; see `questdb/token_provider.h`. */
+typedef struct questdb_token_provider questdb_token_provider;
+#endif
+
+/** Extensible options for `questdb_db_connect_ex`. Initialize with
+ *  `questdb_db_connect_options_init(&options, sizeof options)`, then override
+ *  the needed fields. `struct_size` records the caller's allocation size; do
+ *  not modify it after initialization. For each non-NULL callback, an inbox
+ *  capacity of 0 selects the default (64). */
+typedef struct questdb_db_connect_options
+{
+    size_t struct_size;
+    const questdb_oidc_auth* oidc_auth;
+    questdb_connection_event_cb event_callback;
+    void* event_user_data;
+    size_t event_inbox_capacity;
+    line_sender_qwpws_error_cb rejection_callback;
+    void* rejection_user_data;
+    size_t rejection_inbox_capacity;
+    /** A rotating Bearer-token provider shared by every pooled sender and
+     *  reader (see `questdb/token_provider.h`). Mutually exclusive with
+     *  `oidc_auth` and with static credentials in `conf`. The pool keeps its
+     *  own reference. A refreshing provider already closed with
+     *  `questdb_token_provider_close` is rejected. NULL means none. */
+    const questdb_token_provider* token_provider;
+} questdb_db_connect_options;
 
 /* -------------------------------------------------------------------------
  * Pool lifecycle
@@ -122,6 +154,36 @@ typedef struct questdb_db questdb_db;
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
     const char* conf, size_t conf_len, questdb_error** err_out);
+
+QUESTDB_CLIENT_API
+void questdb_db_connect_options_init(
+    questdb_db_connect_options* options, size_t options_size);
+
+/**
+ * Open a pool with optional callbacks and a shared OIDC token provider.
+ * `options` may be NULL. When `oidc_auth` is set, the pool retains shared
+ * ownership and pulls a fresh token for every sender/reader connect or
+ * reconnect; the caller may free its auth handle after this call returns.
+ * Provider calls may load or silently refresh a token but never start an
+ * interactive device flow. Call questdb_oidc_auth_sign_in before opening the
+ * pool; otherwise token acquisition reports InteractionRequired. After a
+ * handshake 401 for a token that had not expired, the one re-resolution a
+ * connect makes refreshes it rather than presenting it again (at most once
+ * every 30 seconds per auth).
+ * `oidc_auth` is mutually exclusive with static credentials: `conf` must not
+ * also set `username`/`password` or `token`. Setting both fails with
+ * `questdb_error_config_error`.
+ * An `oidc_auth` already closed with `questdb_oidc_auth_close` is rejected
+ * with QUESTDB_OIDC_ERROR_CANCELLED rather than attached.
+ * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer token
+ * is sent in cleartext and can be captured in transit.
+ */
+QUESTDB_CLIENT_API
+questdb_db* questdb_db_connect_ex(
+    const char* conf,
+    size_t conf_len,
+    const questdb_db_connect_options* options,
+    questdb_error** err_out);
 
 /**
  * Close the pool. Accepts NULL and no-ops.

@@ -484,6 +484,12 @@ const char* questdb_error_msg(const questdb_error*, size_t* len_out);
 QUESTDB_CLIENT_API
 bool questdb_error_in_doubt(const questdb_error*);
 
+/** Whether the error carries a QWP/WebSocket server-role rejection (including
+ *  a 421 with an unrecognized role header). Unlike a plain protocol-version
+ *  error, this can be retried while server roles change. NULL-safe. */
+QUESTDB_CLIENT_API
+bool questdb_error_is_qwp_ws_role_reject(const questdb_error*);
+
 /** Clean up a client-wide error. Idempotent on NULL. */
 QUESTDB_CLIENT_API
 void questdb_error_free(questdb_error*);
@@ -2156,7 +2162,11 @@ typedef enum qwpws_ack_level
  * Returns `false` and sets `err_out` on the no-progress timeout
  * (`line_sender_error_failover_retry`), a server rejection, a transport
  * failure, or an invalid `ack_level`. With nothing published yet it succeeds
- * immediately.
+ * immediately. A timeout while the sender is disconnected and reconnecting
+ * keeps failing names that failure, and carries its OIDC detail when an
+ * attached OIDC auth could not supply a token (`questdb_error_oidc_get_view`
+ * reports `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` when a new sign-in is
+ * needed). The published frames stay queued either way.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_wait(
@@ -2342,7 +2352,37 @@ int64_t line_sender_now_micros(void);
 #define questdb_connection_event_failed_over 3u
 #define questdb_connection_event_endpoint_attempt_failed 4u
 #define questdb_connection_event_all_endpoints_unreachable 5u
+/** The server rejected the credential the client presented: HTTP 401 or 403
+ *  on the WebSocket upgrade. `host` / `port` are set and `cause_code` is
+ *  `line_sender_error_auth_error`; one event per connect round. Before a
+ *  sender's first connection, and for a connect the caller waits for (a pool
+ *  borrow), it is terminal. Once connected, a store-and-forward sender keeps
+ *  reconnecting with capped backoff and keeps its unacknowledged data,
+ *  reporting each failed round: an identity-provider outage makes a server
+ *  reject a valid credential for a while. Close the sender to give up instead.
+ *  A 401 followed by a failed replacement-token acquisition is instead
+ *  `credential_unavailable` with the endpoint set. */
 #define questdb_connection_event_auth_failed 6u
+/** The token provider failed while acquiring a credential. Before dialling,
+ *  `host` / `port` are NULL. If this follows a server HTTP 401, they identify
+ *  the endpoint that rejected the previous token and `cause_msg` includes the
+ *  401; `cause_code` still classifies the provider failure. Read `cause_code`
+ *  to tell a retry from a stop:
+ *
+ *  - `line_sender_error_socket_error` -- the ordinary case, retryable.
+ *    The sender keeps reconnecting and store-and-forward keeps its queued
+ *    frames; only a foreground/initial connect fails fast.
+ *  - `line_sender_error_auth_error` / `line_sender_error_config_error` --
+ *    the provider cannot recover in this process (a permanently closed
+ *    OIDC provider, or a scope that cannot yield the required token kind),
+ *    so the reconnect is TERMINAL and the runner stops. Queued frames are
+ *    not deleted and a disk-backed slot stays drainable by a later
+ *    process, but this process will not send them.
+ *
+ *  A listener that pages on a permanent stop must qualify on `cause_code`,
+ *  not on the kind alone. `questdb_connection_event_auth_failed` is the
+ *  server-rejection signal. */
+#define questdb_connection_event_credential_unavailable 7u
 
 /** One connection-state transition. String fields are borrowed UTF-8
  * slices valid only for the duration of the callback; absent strings are
