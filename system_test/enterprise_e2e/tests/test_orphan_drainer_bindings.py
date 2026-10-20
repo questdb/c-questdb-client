@@ -26,7 +26,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lib.pg_query import count_rows, wait_for_dense_sequence
+from lib.pg_query import count_rows, execute_ddl, wait_for_dense_sequence
 from lib.server import wait_port_free
 
 LOG = logging.getLogger(__name__)
@@ -79,21 +79,23 @@ def _survives_kill_body(sidecar, server_factory, obj_store, scenario_dir: Path,
     p1.kill_9()
     wait_port_free(p1_ports.http)
     wait_port_free(p1_ports.pg)
+    # Stop the old drainer before P2 opens the same ports; it can reconnect
+    # autonomously while the fresh CONNECT below is preparing another replay.
+    sidecar.close()
     if p1.db_root.exists():
         shutil.rmtree(p1.db_root)
     obj_store.wipe()
 
-    # Stop the original drainer *before* P2 accepts writes. Replacing it after
-    # P2 starts can race its first replay with the new orphan scan: if the old
-    # drainer's 50 rows land but it has not received DURABLE_ACK when CLOSE
-    # stops it, the new drainer sends those rows again (at-least-once replay).
-    # That tests a different, non-idempotent delivery scenario, not survival.
-    sidecar.close()
-
     p2 = server_factory("p2", db_root_name="p2-fresh")
     p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" ('
+        "v LONG, timestamp TIMESTAMP"
+        ") TIMESTAMP(timestamp) PARTITION BY DAY WAL "
+        "DEDUP UPSERT KEYS(timestamp, v)"
+    ))
 
-    # A fresh orphan scan adopts the still-un-acked ghost slot and replays it.
+    # A fresh scan re-adopts the still-un-acked ghost slot and replays it to P2.
     sidecar.connect(fg_cs)
     wait_for_dense_sequence(port=p1_ports.pg, table=table,
                             expected_count=row_count, timeout_s=60.0)
@@ -209,6 +211,8 @@ def test_survival_stops_old_drainer_before_successor_starts(
     monkeypatch.setattr(time, "sleep", lambda _: None)
     monkeypatch.setattr("tests.test_orphan_drainer_bindings.wait_port_free",
                         lambda _: None)
+    monkeypatch.setattr("tests.test_orphan_drainer_bindings.execute_ddl",
+                        lambda **_: events.append("ddl"))
     monkeypatch.setattr("tests.test_orphan_drainer_bindings.wait_for_dense_sequence",
                         lambda **_: events.append("verified"))
     obj_store = SimpleNamespace(wipe=lambda: events.append("wipe"))

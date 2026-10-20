@@ -3665,6 +3665,40 @@ fn cursor_short_circuits_after_query_error() {
 }
 
 #[test]
+#[ignore = "the pinned questdb submodule does not advertise CAP_QUERY_TIMEOUT yet"]
+fn query_timeout_ends_query_and_keeps_connection() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .prepare("sleep(10)")
+        .timeout(Duration::from_secs(1))
+        .execute()
+        .expect("execute");
+    let err = loop {
+        match cur.next_batch() {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("sleep(10) must not finish under a 1s timeout"),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(
+        err.code(),
+        questdb::ErrorCode::QueryTimeout,
+        "{}",
+        err.msg()
+    );
+    assert!(cur.connection_reusable());
+    drop(cur);
+
+    let mut cur = reader
+        .prepare("SELECT x FROM long_sequence(3)")
+        .execute()
+        .expect("execute after timeout");
+    let view = cur.next_batch().expect("next_batch").expect("Some batch");
+    assert_eq!(view.row_count(), 3);
+}
+
+#[test]
 fn null_handling_long_densifies() {
     let srv = server();
     let table = unique_table("nulls");

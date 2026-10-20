@@ -1136,6 +1136,7 @@ impl SenderBuilder {
             "pool_reap",
             "query_pool_max",
             "query_pool_min",
+            "query_timeout_ms",
             "sender_pool_max",
             "sender_pool_min",
             "target",

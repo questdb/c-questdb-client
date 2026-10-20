@@ -117,6 +117,43 @@ TEST(test_symbol_dict_full_is_a_distinct_appended_code)
         "neutral alias resolves to the same enumerator");
 }
 
+TEST(test_query_timeout_is_a_distinct_appended_code)
+{
+    /* A query that ran past its own timeout must be recognisable by code:
+     * callers branch on it to avoid retrying a write the server may have
+     * applied anyway. */
+    CHECK(
+        line_sender_error_query_timeout != line_sender_error_cancelled,
+        "query_timeout distinct from cancelled");
+    CHECK(
+        line_sender_error_query_timeout !=
+            line_sender_error_server_limit_exceeded,
+        "query_timeout distinct from server_limit_exceeded");
+    CHECK(
+        line_sender_error_query_timeout != line_sender_error_invalid_api_call,
+        "query_timeout distinct from invalid_api_call");
+    CHECK(
+        line_sender_error_query_timeout > line_sender_error_symbol_dict_full,
+        "query_timeout appended (not renumbered)");
+    CHECK(
+        line_sender_error_query_timeout == 38,
+        "query_timeout discriminant pinned at 38 for cached ABI consumers");
+    CHECK(
+        questdb_error_query_timeout == line_sender_error_query_timeout,
+        "neutral alias resolves to the same enumerator");
+}
+
+TEST(test_query_set_timeout_ms_null_query_is_tolerated)
+{
+    /* Proves the symbol links and argument-marshals under a plain C
+     * compiler (the Cython contract surface), and that the NULL-handle
+     * contract shared by every `qwp_reader_query_*` mutator holds: report
+     * and return, never crash. */
+    qwp_reader_query_set_timeout_ms(NULL, 1000);
+    qwp_reader_query_set_timeout_ms(NULL, 0);
+    CHECK(true, "NULL query handle did not crash");
+}
+
 TEST(test_egress_null_cursor_returns_error_tristate)
 {
     struct ArrowArray arr;
@@ -1609,6 +1646,8 @@ int main(void)
     RUN(test_appended_query_error_codes_have_distinct_values);
     RUN(test_appended_sender_error_codes_exist);
     RUN(test_symbol_dict_full_is_a_distinct_appended_code);
+    RUN(test_query_timeout_is_a_distinct_appended_code);
+    RUN(test_query_set_timeout_ms_null_query_is_tolerated);
     RUN(test_egress_null_cursor_returns_error_tristate);
     RUN(test_egress_null_out_array_returns_error_tristate);
     RUN(test_ingress_null_conn_returns_false);
