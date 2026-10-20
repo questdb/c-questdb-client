@@ -4367,23 +4367,53 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
     server.join().unwrap();
 }
 
-#[test]
-fn qwp_ws_manual_close_honors_deadline_while_reconnect_is_waiting() {
+/// Upgrade the first connection and hand it to `first`, then drop every later
+/// connection as soon as it is accepted, until `done` is set.
+///
+/// Every reconnect then fails fast at the WebSocket upgrade. A closed port
+/// would not: Windows retransmits the SYN against a refused port before
+/// failing the connect, which outlasts these tests' deadlines (see
+/// `spawn_accept_then_drop_server`).
+fn spawn_upgrade_once_then_drop_server(
+    done: Arc<AtomicBool>,
+    first: impl FnOnce(TcpStream) + Send + 'static,
+) -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (frame_tx, frame_rx) = mpsc::channel();
-    let server = thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         perform_server_upgrade(&mut stream).unwrap();
-        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
-        frame_tx.send(payload).unwrap();
-        // Drop the only listener with the frame still unacknowledged: every
-        // reconnect is refused, leaving the driver in its retryable Waiting
-        // state.
+        first(stream);
+        listener.set_nonblocking(true).unwrap();
+        while !done.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _)) => drop(stream),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("accept-then-drop listener failed: {err}"),
+            }
+        }
     });
+    (port, handle)
+}
+
+#[test]
+fn qwp_ws_manual_close_honors_deadline_while_reconnect_is_waiting() {
+    let done = Arc::new(AtomicBool::new(false));
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let (port, server) =
+        spawn_upgrade_once_then_drop_server(Arc::clone(&done), move |mut stream| {
+            let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+            // Drop the connection with the frame still unacknowledged: every
+            // reconnect then fails, leaving the driver in its retryable
+            // Waiting state.
+            drop(stream);
+            frame_tx.send(payload).unwrap();
+        });
 
     let conf = format!(
         "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
@@ -4401,13 +4431,15 @@ fn qwp_ws_manual_close_honors_deadline_while_reconnect_is_waiting() {
     sender.flush(&mut buf).unwrap();
     assert!(sender.drive_once().unwrap());
     frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    server.join().unwrap();
 
     let started = Instant::now();
     let err = sender
         .close_drain()
         .expect_err("unacknowledged close must stop at its configured deadline");
     let elapsed = started.elapsed();
+    drop(sender);
+    done.store(true, Ordering::Release);
+    server.join().unwrap();
     assert!(
         elapsed < Duration::from_secs(2),
         "manual close ignored its deadline: {elapsed:?}"
@@ -4487,14 +4519,13 @@ fn qwp_ws_manual_close_honors_deadline_while_token_refresh_fails() {
 }
 
 /// Connect once, have the server go away, and wait for an ACK while every
-/// reconnect is refused.
+/// reconnect fails.
 fn wait_after_the_server_disappears_mid_stream(progress: ProgressCase) -> crate::Error {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        perform_server_upgrade(&mut stream).unwrap();
-        // Dropping the stream and the listener refuses every reconnect.
+    let done = Arc::new(AtomicBool::new(false));
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    let (port, server) = spawn_upgrade_once_then_drop_server(Arc::clone(&done), move |stream| {
+        drop(stream);
+        dropped_tx.send(()).unwrap();
     });
     let builder = SenderBuilder::from_conf(format!(
         "ws::addr=127.0.0.1:{port};reconnect_initial_backoff_millis=10;\
@@ -4502,7 +4533,7 @@ fn wait_after_the_server_disappears_mid_stream(progress: ProgressCase) -> crate:
     ))
     .unwrap();
     let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
-    server.join().unwrap();
+    dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let mut buffer = sender.new_buffer();
     buffer
         .table("t")
@@ -4513,9 +4544,13 @@ fn wait_after_the_server_disappears_mid_stream(progress: ProgressCase) -> crate:
         .unwrap();
     sender.flush(&mut buffer).unwrap();
 
-    sender
+    let err = sender
         .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(800))
-        .unwrap_err()
+        .unwrap_err();
+    drop(sender);
+    done.store(true, Ordering::Release);
+    server.join().unwrap();
+    err
 }
 
 fn assert_wait_names_the_failing_reconnect(err: &crate::Error) {
@@ -4529,11 +4564,14 @@ fn assert_wait_names_the_failing_reconnect(err: &crate::Error) {
 #[test]
 fn qwp_ws_wait_names_a_failing_initial_connect() {
     // `initial_connect_retry=async` builds the sender before any connection,
-    // and nothing listens where the runner's first connect is going.
-    let mut sender = SenderBuilder::from_conf(
-        "ws::addr=127.0.0.1:1;initial_connect_retry=async;\
-         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;",
-    )
+    // and the endpoint drops every connection before the upgrade, so the
+    // runner's first connect fails.
+    let done = Arc::new(AtomicBool::new(false));
+    let (port, server) = spawn_accept_then_drop_server(Arc::clone(&done));
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{port};initial_connect_retry=async;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;"
+    ))
     .unwrap()
     .build()
     .unwrap();
@@ -4550,6 +4588,9 @@ fn qwp_ws_wait_names_a_failing_initial_connect() {
     let err = sender
         .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(500))
         .unwrap_err();
+    drop(sender);
+    done.store(true, Ordering::Release);
+    server.join().unwrap();
     assert_wait_names_the_failing_reconnect(&err);
 }
 
