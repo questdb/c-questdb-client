@@ -3956,6 +3956,46 @@ pub unsafe extern "C" fn line_sender_qwpws_errors_dropped(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_effective_frame_cap(
+    sender: *const line_sender,
+    cap_out: *mut usize,
+    server_cap_known_out: *mut bool,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        if cap_out.is_null() || server_cap_known_out.is_null() {
+            let output = if cap_out.is_null() {
+                "cap_out"
+            } else {
+                "server_cap_known_out"
+            };
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("line_sender_qwpws_effective_frame_cap requires non-NULL {output}"),
+            );
+            return false;
+        }
+        let Some(sender) =
+            qwpws_line_sender_ref(sender, err_out, "line_sender_qwpws_effective_frame_cap")
+        else {
+            return false;
+        };
+        match sender.effective_frame_cap() {
+            Ok((cap, server_cap_known)) => {
+                *cap_out = cap;
+                *server_cap_known_out = server_cap_known;
+                true
+            }
+            Err(err) => {
+                set_err_out_from_sender_error(err_out, sender, err);
+                false
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_qwpws_close_drain(
     sender: *mut line_sender,
     err_out: *mut *mut line_sender_error,

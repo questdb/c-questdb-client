@@ -2217,6 +2217,22 @@ bool line_sender_qwpws_errors_dropped(
     line_sender_error** err_out);
 
 /**
+ * Return the current hard per-frame cap of a QWP/WebSocket sender: the
+ * smallest of `max_buf_size`, the server's advertised `X-QWP-Max-Batch-Size`
+ * and the store-and-forward segment payload capacity. A flush whose encoded
+ * frame exceeds it fails with `line_sender_error_batch_too_large` and
+ * publishes nothing. `*server_cap_known_out` is true when the current
+ * connection advertised `X-QWP-Max-Batch-Size`, whether or not that value is
+ * the binding limit. The value can change after reconnect.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_qwpws_effective_frame_cap(
+    const line_sender* sender,
+    size_t* cap_out,
+    bool* server_cap_known_out,
+    line_sender_error** err_out);
+
+/**
  * Stop accepting new QWP/WebSocket publications and wait for already-published
  * frames to resolve. The timeout is configured with the QWP/WebSocket
  * `close_flush_timeout_millis` config key; the default is 5000 ms, and values

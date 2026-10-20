@@ -226,11 +226,14 @@ pub enum ErrorCode {
     /// bug; not user-recoverable. Only emitted on the `arrow` feature.
     ArrowExport,
 
-    /// An irreducible QWP/WebSocket unit (the table schema plus a single
-    /// row block) exceeds the negotiated per-batch cap
-    /// (`min(max_buf_size, server X-QWP-Max-Batch-Size)`). Chunk publication
-    /// splits oversize inputs into smaller frames automatically, so this only
-    /// surfaces when splitting cannot make a frame fit. Distinct from
+    /// A QWP/WebSocket frame exceeds the negotiated per-frame cap
+    /// (`min(max_buf_size, server X-QWP-Max-Batch-Size)`, further bounded by
+    /// the store-and-forward segment payload capacity). Chunk publication
+    /// splits oversize inputs into smaller frames automatically, so there this
+    /// only surfaces for an irreducible unit (the table schema plus a single
+    /// row block). A row [`Buffer`](crate::ingress::Buffer) is published as one
+    /// frame and is never split, so flushing one whose encoded frame exceeds
+    /// the cap fails with this code and publishes nothing. Distinct from
     /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
     /// without matching on the error message text.
     BatchTooLarge,
