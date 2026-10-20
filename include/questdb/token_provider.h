@@ -263,7 +263,9 @@ void questdb_token_provider_free(questdb_token_provider* provider);
 
 /**
  * Close a refreshing provider: stop its refresher and fail every later token
- * request as permanent, which ends every client that uses it. Idempotent.
+ * request as permanent, which ends every client that uses it. Attaching a
+ * closed provider to a new sender, pool or reader then fails at once with
+ * that same permanent error (`line_sender_error_auth_error`). Idempotent.
  * No-op for an application provider and for NULL.
  */
 QUESTDB_CLIENT_API
@@ -376,8 +378,13 @@ bool questdb_error_token_unavailable_get_view(
  * `invalid_token`).
  *
  * Mutually exclusive with `username`/`password`, `token` and
- * `line_sender_opts_oidc_auth`. Use `https::` or `wss::`: over plain `http::`
- * or `ws::` to a non-loopback host the token travels in cleartext.
+ * `line_sender_opts_oidc_auth`: one opts take one rotating provider, so a
+ * second token provider or an OIDC auth fails with
+ * `line_sender_error_config_error` instead of replacing the first. A
+ * refreshing provider already closed with `questdb_token_provider_close` is
+ * rejected with its permanent `line_sender_error_auth_error`. On failure the
+ * opts are left unchanged. Use `https::` or `wss::`: over plain `http::` or
+ * `ws::` to a non-loopback host the token travels in cleartext.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_token_provider(

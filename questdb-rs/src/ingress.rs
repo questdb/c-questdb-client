@@ -1621,6 +1621,14 @@ impl SenderBuilder {
     /// [`username`](Self::username) / [`password`](Self::password) /
     /// [`token`](Self::token); ILP/HTTP only.
     ///
+    /// One builder takes one provider: attaching a second one, through this
+    /// method or [`bearer_token_provider`](Self::bearer_token_provider), fails
+    /// with [`ConfigError`](crate::ErrorCode::ConfigError) instead of replacing
+    /// the first. A
+    /// [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider)
+    /// that was already closed is refused with the permanent error its
+    /// [`token`](crate::token_provider::RefreshingTokenProvider::token) returns.
+    ///
     /// **Use [`Protocol::Https`].** The token is a
     /// bearer credential for QuestDB; over
     /// [`Protocol::Http`] to a non-loopback host it
@@ -1664,7 +1672,18 @@ impl SenderBuilder {
                 crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
             ));
         }
-        self.http_token_provider = Some(crate::token_provider::TokenProvider::new(provider));
+        if self.http_token_provider.is_some() {
+            return Err(fmt!(
+                ConfigError,
+                "{}",
+                crate::token_provider::PROVIDER_ALREADY_ATTACHED
+            ));
+        }
+        let provider = crate::token_provider::TokenProvider::new(provider);
+        if let Some(err) = provider.attach_error() {
+            return Err(err);
+        }
+        self.http_token_provider = Some(provider);
         Ok(self)
     }
 
@@ -1694,9 +1713,18 @@ impl SenderBuilder {
     /// acquisition busy on another thread. Any other provider failure ends it at
     /// once, OIDC's `InteractionRequired` included: nobody has signed in, and the
     /// waiting caller is the one that would have to. Before retrying a 401, the
-    /// sender calls the provider's `on_rejected` with the rejected token. A
-    /// server rejection of a successfully acquired token is a separate terminal
-    /// authentication error. In unwind-enabled builds, a callback panic is contained and treated
+    /// sender calls the provider's `on_rejected` with the rejected token.
+    ///
+    /// A server's rejection of a successfully acquired token -- HTTP 401 or 403
+    /// on the WebSocket upgrade -- is terminal only before the sender's first
+    /// connection and for a connect the caller waits for: the sender fails to
+    /// start, or the pool borrow fails. Once the sender has connected, it keeps
+    /// reconnecting with capped backoff, keeps its unacknowledged data, and
+    /// reports each rejected round as a [`ConnectionEventKind::AuthFailed`]
+    /// event: an identity-provider or signing-key outage makes a server reject
+    /// a valid credential for a while. Close the sender to give up instead.
+    ///
+    /// In unwind-enabled builds, a callback panic is contained and treated
     /// as a retryable provider failure; a process built with `panic = "abort"`
     /// cannot contain panics, so providers must not rely on this as their normal
     /// error path. Runner-owned acquisition is isolated so sender shutdown can
@@ -1708,6 +1736,14 @@ impl SenderBuilder {
     /// `OidcDeviceAuth::token` never launches an interactive device flow from a
     /// connect or reconnect thread; it returns `InteractionRequired` if explicit
     /// sign-in is needed.
+    ///
+    /// One builder takes one provider: attaching a second one, through this
+    /// method or [`bearer_token_provider`](Self::bearer_token_provider), fails
+    /// with [`ConfigError`](crate::ErrorCode::ConfigError) instead of replacing
+    /// the first. A
+    /// [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider)
+    /// that was already closed is refused with the permanent error its
+    /// [`token`](crate::token_provider::RefreshingTokenProvider::token) returns.
     ///
     /// **Use [`Protocol::Wss`]** (TLS): the
     /// token is a bearer credential, sent in cleartext over plain
@@ -1738,6 +1774,20 @@ impl SenderBuilder {
                 "{}",
                 crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
             ));
+        }
+        if self
+            .qwp_ws
+            .as_ref()
+            .is_some_and(|qwp_ws| qwp_ws.token_provider.is_some())
+        {
+            return Err(fmt!(
+                ConfigError,
+                "{}",
+                crate::token_provider::PROVIDER_ALREADY_ATTACHED
+            ));
+        }
+        if let Some(err) = provider.attach_error() {
+            return Err(err);
         }
         self.qwp_ws.as_mut().unwrap().token_provider = Some(provider);
         Ok(self)
@@ -1791,7 +1841,11 @@ impl SenderBuilder {
     /// spending its whole budget waiting for a sign-in it is blocking.
     ///
     /// A closed `RefreshingTokenProvider` is terminal, like a closed OIDC
-    /// provider.
+    /// provider, and one that is already closed is refused here with that
+    /// same permanent error. One builder takes one provider: attaching a
+    /// second one, through any of the provider methods, fails with
+    /// [`ConfigError`](crate::ErrorCode::ConfigError) instead of replacing the
+    /// first.
     #[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
     pub fn bearer_token_provider<P>(self, provider: P) -> Result<Self>
     where

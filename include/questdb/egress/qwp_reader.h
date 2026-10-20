@@ -218,7 +218,9 @@ qwp_reader* qwp_reader_from_conf_with_oidc(
  * endpoint once if the token changed and the `WWW-Authenticate` challenge
  * allows it.
  *
- * Mutually exclusive with static credentials in `config`. Use `wss::`.
+ * Mutually exclusive with static credentials in `config`. Use `wss::`. A
+ * refreshing provider already closed with `questdb_token_provider_close` is
+ * rejected with its permanent `questdb_error_auth_error`.
  *
  * Returns NULL and sets `*err_out` on failure.
  */

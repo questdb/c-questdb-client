@@ -831,6 +831,10 @@ impl QuestDb {
     /// an eager pool. Otherwise initial sender/reader prewarming may invoke it
     /// from connection setup, and lazy/background senders may invoke it from a
     /// worker thread.
+    ///
+    /// A [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider)
+    /// that was already closed is refused here, with the permanent error its
+    /// [`token`](crate::token_provider::RefreshingTokenProvider::token) returns.
     pub fn connect_with_token_provider<P>(conf: &str, provider: P) -> Result<Self>
     where
         P: crate::token_provider::BearerTokenProvider + 'static,

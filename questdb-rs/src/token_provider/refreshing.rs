@@ -659,8 +659,9 @@ impl RefreshingTokenProvider {
     }
 
     /// Stop the refresher and wake every waiter. Afterwards
-    /// [`token`](Self::token) fails as permanent, and every client using the
-    /// provider stops reconnecting. Idempotent.
+    /// [`token`](Self::token) fails as permanent, every client using the
+    /// provider stops reconnecting, and attaching the provider to another
+    /// sender, reader or pool fails at once with that same error. Idempotent.
     ///
     /// Clients never close a provider: close it once every client using it is
     /// closed.
@@ -673,6 +674,22 @@ impl RefreshingTokenProvider {
     pub fn is_closed(&self) -> bool {
         let shared = self.shared();
         shared.is_inherited() || shared.lock().closed
+    }
+
+    /// The permanent error [`token`](Self::token) fails with once the provider
+    /// is closed or was inherited across `fork()`, or `None` while it is open.
+    ///
+    /// Clients check it when the provider is attached, so attaching a closed
+    /// provider fails there -- as attaching a closed OIDC auth does -- rather
+    /// than at the client's first token pull, after an async store-and-forward
+    /// sender could have accepted frames it would never send.
+    pub(crate) fn attach_error(&self) -> Option<Error> {
+        let shared = self.shared();
+        if shared.is_inherited() {
+            return Some(shared.inherited_error());
+        }
+        let closed = shared.lock().closed;
+        closed.then(|| shared.closed_error())
     }
 
     /// The non-secret label this provider uses in log lines and errors.

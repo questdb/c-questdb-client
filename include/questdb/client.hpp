@@ -126,13 +126,25 @@ public:
      * Bearer-token provider (see `questdb::token_provider`). The pool keeps
      * its own reference. Mutually exclusive with static credentials in
      * `conf`. Use `wss::` (TLS).
+     * @throws questdb::error with `invalid_api_call` if `provider` is empty or
+     *         moved from. (The C options treat a NULL provider as "none", so
+     *         passing it on would open a pool without any credential.)
+     * @throws questdb::error with `auth_error` if `provider` was already
+     *         closed.
      * @throws questdb::error on configuration or connection failure.
      */
     pool(std::string_view conf, const ::questdb::token_provider& provider)
     {
+        const ::questdb_token_provider* raw_provider = provider.raw();
+        if (!raw_provider)
+        {
+            throw ::questdb::error{
+                ::questdb::error_code::invalid_api_call,
+                "Cannot use an empty or moved-from questdb::token_provider."};
+        }
         ::questdb_db_connect_options options;
         ::questdb_db_connect_options_init(&options, sizeof options);
-        options.token_provider = provider.raw();
+        options.token_provider = raw_provider;
         _raw = ::questdb::error::wrapped_call(
             ::questdb_db_connect_ex, conf.data(), conf.size(), &options);
     }

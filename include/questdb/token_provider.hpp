@@ -391,7 +391,8 @@ public:
             _raw, detail::duration_ms(timeout, "timeout"));
     }
 
-    /** Close a refreshing provider, ending every client that uses it. */
+    /** Close a refreshing provider, ending every client that uses it.
+     *  Attaching it to a new sender, pool or reader then fails. */
     void close() const
     {
         ::questdb_token_provider_close(_raw);

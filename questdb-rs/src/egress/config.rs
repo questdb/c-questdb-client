@@ -1096,6 +1096,10 @@ impl ReaderConfig {
     /// the config string — combining them is a configuration error rather than a
     /// silent override, mirroring
     /// [`SenderBuilder::qwp_ws_token_provider`](crate::ingress::SenderBuilder::qwp_ws_token_provider).
+    /// So is attaching a second provider: one configuration takes one provider.
+    /// A [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider)
+    /// that was already closed is refused with the permanent error its
+    /// [`token`](crate::token_provider::RefreshingTokenProvider::token) returns.
     ///
     /// The provider is called once before each initial-connect or reconnect
     /// endpoint walk, so a long-lived reader keeps working as the token silently
@@ -1197,6 +1201,16 @@ impl ReaderConfig {
                 "{}",
                 crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
             ));
+        }
+        if self.token_provider.is_some() {
+            return Err(fmt!(
+                ConfigError,
+                "{}",
+                crate::token_provider::PROVIDER_ALREADY_ATTACHED
+            ));
+        }
+        if let Some(err) = provider.attach_error() {
+            return Err(err);
         }
         self.token_provider = Some(provider);
         Ok(self)

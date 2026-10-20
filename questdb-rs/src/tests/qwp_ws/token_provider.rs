@@ -358,12 +358,16 @@ fn sync_initial_connect_with_a_refreshing_provider() {
     assert!(err.msg().contains("idp unreachable"), "{err}");
     assert!(fetches.load(Ordering::SeqCst) > 1);
 
+    // Attached while open, then closed before the sender connects: the
+    // initial connect stops at once. (Attaching it after the close is refused
+    // outright; see `a_closed_refreshing_provider_is_refused_at_attach`.)
+    let builder = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .qwp_ws_token_provider(provider.clone())
+        .unwrap();
     provider.close();
     let started = Instant::now();
-    let err = SenderBuilder::from_conf(&conf)
-        .unwrap()
-        .qwp_ws_token_provider(provider)
-        .unwrap()
+    let err = builder
         .build()
         .map(drop)
         .expect_err("a closed provider supplies no token");
@@ -473,6 +477,103 @@ fn the_reserved_token_provider_keys_are_rejected() {
             "{err}"
         );
     }
+}
+
+/// One builder takes one rotating provider. A second attachment used to
+/// replace the first silently -- an OIDC identity included -- although the C
+/// headers call the two mutually exclusive and the pool refused the pairing.
+#[test]
+fn a_second_token_provider_is_refused() {
+    let first = || Ok::<_, crate::Error>("first".to_string());
+    let second = || Ok::<_, crate::Error>("second".to_string());
+
+    let Err(err) = SenderBuilder::from_conf("ws::addr=localhost:9000;")
+        .unwrap()
+        .qwp_ws_token_provider(first)
+        .unwrap()
+        .qwp_ws_token_provider(second)
+    else {
+        panic!("a second QWP/WebSocket provider was accepted");
+    };
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("already attached"), "{err}");
+
+    #[cfg(feature = "_sender-http")]
+    for conf in ["http::addr=localhost:9000;", "ws::addr=localhost:9000;"] {
+        let Err(err) = SenderBuilder::from_conf(conf)
+            .unwrap()
+            .bearer_token_provider(first)
+            .unwrap()
+            .bearer_token_provider(second)
+        else {
+            panic!("{conf}: a second provider was accepted");
+        };
+        assert_eq!(err.code(), ErrorCode::ConfigError, "{conf}");
+        assert!(err.msg().contains("already attached"), "{conf}: {err}");
+    }
+
+    #[cfg(feature = "sync-reader-qwp-ws")]
+    {
+        let err = crate::egress::ReaderConfig::from_conf("ws::addr=localhost:9000;")
+            .unwrap()
+            .token_provider(first)
+            .unwrap()
+            .token_provider(second)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("already attached"), "{err}");
+    }
+}
+
+/// A closed refreshing provider can never supply a token. Attaching one used
+/// to succeed and defer the failure to the first token pull; it is refused at
+/// attach with the provider's own permanent error, as a closed OIDC auth is.
+#[test]
+fn a_closed_refreshing_provider_is_refused_at_attach() {
+    let (provider, _) = counting_refreshing_provider();
+    provider.close();
+    let assert_closed = |err: crate::Error, context: &str| {
+        assert_eq!(err.code(), ErrorCode::AuthError, "{context}: {err}");
+        assert!(err.msg().contains("is closed"), "{context}: {err}");
+        let classification = err.as_token_unavailable().expect("classified");
+        assert!(!classification.retryable(), "{context}");
+    };
+
+    let Err(err) = SenderBuilder::from_conf("ws::addr=localhost:9000;")
+        .unwrap()
+        .qwp_ws_token_provider(provider.clone())
+    else {
+        panic!("a closed provider was attached to a QWP/WebSocket sender");
+    };
+    assert_closed(err, "ws");
+
+    #[cfg(feature = "_sender-http")]
+    {
+        let Err(err) = SenderBuilder::from_conf("http::addr=localhost:9000;")
+            .unwrap()
+            .http_token_provider(provider.clone())
+        else {
+            panic!("a closed provider was attached to an ILP/HTTP sender");
+        };
+        assert_closed(err, "http");
+    }
+
+    #[cfg(feature = "sync-reader-qwp-ws")]
+    assert_closed(
+        crate::egress::ReaderConfig::from_conf("ws::addr=localhost:9000;")
+            .unwrap()
+            .token_provider(provider.clone())
+            .unwrap_err(),
+        "reader",
+    );
+
+    let Err(err) = crate::QuestDb::connect_with_token_provider(
+        "ws::addr=127.0.0.1:1;lazy_connect=true;",
+        provider,
+    ) else {
+        panic!("a closed provider was attached to a pool");
+    };
+    assert_closed(err, "pool");
 }
 
 // ---------- §8.3: rejections and outages once connected ----------

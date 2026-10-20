@@ -1515,8 +1515,9 @@ public:
      * or connect and can be captured in transit.
      * @throws questdb::oidc::error if `auth` is empty or moved from.
      * @throws line_sender_error if the sender configuration cannot use OIDC,
-     *         including when static credentials are already set, or if `auth`
-     *         was already closed (OIDC kind `cancelled`).
+     *         including when static credentials or another rotating provider
+     *         (`token_provider()`) are already set, or if `auth` was already
+     *         closed (OIDC kind `cancelled`).
      * @note After attaching, a token-acquisition failure surfaces from
      *       `flush()` (and other sender calls) as a `line_sender_error`, with
      *       the structured OIDC detail on its `oidc_diagnostic()` member — not
@@ -1537,8 +1538,13 @@ public:
      * reference. On a 401 the sender tells the provider which token was
      * rejected, pulls again, and retries once if the token changed.
      * Mutually exclusive with `username()`/`password()`, `token()` and
-     * `oidc_auth()`. Use `https::` or `wss::`.
-     * @throws line_sender_error if the configuration cannot use a provider.
+     * `oidc_auth()`: one opts take one rotating provider. Use `https::` or
+     * `wss::`.
+     * @throws line_sender_error if the configuration cannot use a provider,
+     *         including when static credentials or another rotating provider
+     *         are already set (`config_error`), if `provider` is empty or
+     *         moved from (`invalid_api_call`), or if it is a refreshing
+     *         provider that was already closed (`auth_error`).
      */
     opts& token_provider(const ::questdb::token_provider& provider)
     {

@@ -393,6 +393,20 @@ pub(crate) const PROVIDER_CONFLICTS_WITH_STATIC_AUTH: &str = "A rotating token p
      `ReaderConfig::token_provider`), or the `username` / `password` / `token` \
      settings.";
 
+/// User-facing text for "a second rotating token provider was attached to the
+/// same sender options or reader configuration".
+///
+/// A client authenticates with exactly one credential source, and each
+/// builder holds one provider slot, so a second attachment used to replace the
+/// first without a word: an OIDC identity the caller had attached was dropped
+/// for a token provider, or the reverse. The pool's C options already rejected
+/// the same pairing; the sender options and the reader now agree with it.
+pub(crate) const PROVIDER_ALREADY_ATTACHED: &str = "A rotating token provider is already attached. \
+     Attach exactly one: an OIDC auth or a token provider (C/C++ \
+     `line_sender_opts_oidc_auth` or `line_sender_opts_token_provider`; Rust \
+     `SenderBuilder::bearer_token_provider`, `http_token_provider` or \
+     `qwp_ws_token_provider`, or `ReaderConfig::token_provider`).";
+
 /// Log, once per process, that a token provider attached by the application
 /// is used over a schema without TLS, `scheme` (`ws` or `http`): every token
 /// then crosses the network in cleartext (design/qwp-token-provider-spec.md
@@ -550,6 +564,16 @@ impl TokenProvider {
             #[cfg(feature = "_sender-qwp-ws")]
             callback_blocked: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The error to refuse attaching this provider with: the permanent error a
+    /// closed (or `fork()`-inherited) [`RefreshingTokenProvider`] returns for
+    /// every token request, or `None` for any provider that can still supply a
+    /// token. A closure cannot be inspected, so it always attaches.
+    pub(crate) fn attach_error(&self) -> Option<crate::Error> {
+        self.refreshing
+            .as_ref()
+            .and_then(RefreshingTokenProvider::attach_error)
     }
 
     /// A clone for one transport attachment (one sender): it shares the

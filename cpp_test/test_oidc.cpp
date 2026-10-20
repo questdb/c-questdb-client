@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -468,4 +469,55 @@ TEST_CASE("OIDC C++ diagnostic handler ownership is released exactly once")
         CHECK(releases <= 1);
     }
     CHECK(releases == 1);
+}
+
+TEST_CASE("OIDC C++ auth and a token provider are exclusive on one opts")
+{
+    // On sender options the later attachment used to replace the earlier one
+    // silently, in either order, although both headers call them exclusive.
+    auto builder = questdb::oidc::builder{};
+    builder.client_id("questdb-cpp")
+        .token_endpoint("https://idp.example/token")
+        .device_authorization_endpoint("https://idp.example/device");
+    auto auth = builder.build();
+    struct fixed_provider : questdb::bearer_token_provider
+    {
+        std::string token() override
+        {
+            return "app-token";
+        }
+    };
+    auto provider =
+        questdb::token_provider::from(std::make_shared<fixed_provider>());
+    const auto refused_code = [](auto&& attach) {
+        try
+        {
+            attach();
+        }
+        catch (const questdb::ingress::line_sender_error& e)
+        {
+            return e.code();
+        }
+        FAIL("the second rotating provider was accepted");
+        return questdb::error_code::invalid_api_call;
+    };
+    for (const bool oidc_first : {true, false})
+    {
+        auto opts =
+            questdb::ingress::opts::from_conf("https::addr=localhost:9000;");
+        if (oidc_first)
+        {
+            CHECK_NOTHROW(opts.oidc_auth(auth));
+            CHECK(refused_code([&] {
+                      opts.token_provider(provider);
+                  }) == questdb::error_code::config_error);
+        }
+        else
+        {
+            CHECK_NOTHROW(opts.token_provider(provider));
+            CHECK(refused_code([&] {
+                      opts.oidc_auth(auth);
+                  }) == questdb::error_code::config_error);
+        }
+    }
 }

@@ -945,7 +945,9 @@ bool questdb_error_oidc_get_view(
  * Mutually exclusive with static credentials: the opts must not also carry
  * `username`/`password` or `token` (whether set through the config string or
  * through `line_sender_opts_username` and friends). Setting both fails with
- * `questdb_error_config_error`.
+ * `questdb_error_config_error`. So does attaching it to opts that already
+ * carry a rotating provider -- another auth, or a token provider from
+ * `line_sender_opts_token_provider` -- instead of replacing that provider.
  *
  * An `auth` already closed with `questdb_oidc_auth_close` is rejected with
  * QUESTDB_OIDC_ERROR_CANCELLED; the opts are left unchanged.

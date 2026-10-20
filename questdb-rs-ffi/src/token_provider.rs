@@ -1313,4 +1313,146 @@ mod tests {
         }
         unsafe { questdb_token_provider_free(provider) };
     }
+
+    #[test]
+    fn a_second_provider_on_one_opts_is_rejected() {
+        // One opts take one rotating provider. A second attachment used to
+        // replace the first without a word.
+        let probe = Box::leak(Box::new(Probe::default()));
+        let vtable = questdb_token_provider_vtable {
+            struct_size: size_of::<questdb_token_provider_vtable>(),
+            get_token: Some(get_token),
+            on_rejected: None,
+            release: None,
+        };
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let first =
+            unsafe { questdb_token_provider_new(&vtable, ptr::from_mut(probe).cast(), &mut err) };
+        let second =
+            unsafe { questdb_token_provider_new(&vtable, ptr::from_mut(probe).cast(), &mut err) };
+        assert!(!first.is_null() && !second.is_null());
+        for conf in ["http::addr=localhost:9000;", "ws::addr=localhost:9000;"] {
+            let utf8 = unsafe { crate::line_sender_utf8_assert(conf.len(), conf.as_ptr().cast()) };
+            let opts = unsafe { crate::line_sender_opts_from_conf(utf8, &mut err) };
+            assert!(!opts.is_null(), "{conf}");
+            assert!(
+                unsafe { line_sender_opts_token_provider(opts, first, &mut err) },
+                "{conf}"
+            );
+            assert!(
+                !unsafe { line_sender_opts_token_provider(opts, second, &mut err) },
+                "{conf}"
+            );
+            assert!(!err.is_null(), "{conf}");
+            let error = unsafe { &(*err).error };
+            assert_eq!(error.code(), ErrorCode::ConfigError, "{conf}");
+            assert!(
+                error.msg().contains("already attached"),
+                "{conf}: {}",
+                error.msg()
+            );
+            unsafe { crate::questdb_error_free(err) };
+            err = ptr::null_mut();
+            unsafe { crate::line_sender_opts_free(opts) };
+        }
+        unsafe {
+            questdb_token_provider_free(first);
+            questdb_token_provider_free(second);
+        }
+    }
+
+    /// Asserts `err` is the permanent error of a closed provider, then frees it.
+    unsafe fn assert_closed_provider_error(err: &mut *mut questdb_error, context: &str) {
+        assert!(!err.is_null(), "{context}");
+        let error = unsafe { &(**err).error };
+        assert_eq!(
+            error.code(),
+            ErrorCode::AuthError,
+            "{context}: {}",
+            error.msg()
+        );
+        assert!(
+            error.msg().contains("is closed"),
+            "{context}: {}",
+            error.msg()
+        );
+        let mut view = unsafe { std::mem::zeroed::<questdb_token_unavailable_view>() };
+        view.struct_size = size_of_val(&view);
+        assert!(
+            unsafe { questdb_error_token_unavailable_get_view(*err, &mut view) },
+            "{context}"
+        );
+        assert!(!view.retryable, "{context}");
+        unsafe { crate::questdb_error_free(*err) };
+        *err = ptr::null_mut();
+    }
+
+    #[test]
+    fn a_closed_refreshing_provider_is_rejected_at_every_transport_attach() {
+        // Attaching a closed provider used to succeed and defer the failure to
+        // the first token pull, after an async store-and-forward sender could
+        // have accepted frames it would never send. The OIDC attach points
+        // already refused a closed auth; these refuse a closed provider alike.
+        let probe = Box::leak(Box::new(Probe::default()));
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let provider = unsafe {
+            questdb_refreshing_token_provider_new(
+                Some(source),
+                ptr::from_mut(probe).cast(),
+                Some(release),
+                ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!provider.is_null() && err.is_null());
+        assert!(unsafe { questdb_token_provider_await_ready(provider, 10_000) });
+        unsafe { questdb_token_provider_close(provider) };
+
+        for conf in [
+            "http::addr=localhost:9000;",
+            "ws::addr=localhost:9000;initial_connect_retry=async;",
+        ] {
+            let utf8 = unsafe { crate::line_sender_utf8_assert(conf.len(), conf.as_ptr().cast()) };
+            let opts = unsafe { crate::line_sender_opts_from_conf(utf8, &mut err) };
+            assert!(!opts.is_null(), "{conf}");
+            assert!(
+                !unsafe { line_sender_opts_token_provider(opts, provider, &mut err) },
+                "{conf}"
+            );
+            unsafe { assert_closed_provider_error(&mut err, conf) };
+            unsafe { crate::line_sender_opts_free(opts) };
+        }
+
+        let pool_conf = "ws::addr=127.0.0.1:1;lazy_connect=true;";
+        let mut options = crate::column_sender::questdb_db_connect_options::default();
+        let options_size = size_of_val(&options);
+        unsafe {
+            crate::column_sender::questdb_db_connect_options_init(&mut options, options_size)
+        };
+        options.token_provider = provider;
+        let db = unsafe {
+            crate::column_sender::questdb_db_connect_ex(
+                pool_conf.as_ptr().cast(),
+                pool_conf.len(),
+                &options,
+                &mut err,
+            )
+        };
+        assert!(db.is_null());
+        unsafe { assert_closed_provider_error(&mut err, "pool") };
+
+        let reader_conf = "ws::addr=127.0.0.1:1;";
+        let config = unsafe {
+            crate::line_sender_utf8_assert(reader_conf.len(), reader_conf.as_ptr().cast())
+        };
+        let reader = unsafe {
+            crate::egress::qwp_reader_from_conf_with_token_provider(config, provider, &mut err)
+        };
+        assert!(reader.is_null());
+        unsafe { assert_closed_provider_error(&mut err, "reader") };
+
+        unsafe { questdb_token_provider_free(provider) };
+        // The refused attachments kept no reference to the source.
+        await_count(&probe.released, 1);
+    }
 }

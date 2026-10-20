@@ -95,7 +95,8 @@ typedef struct questdb_db_connect_options
     /** A rotating Bearer-token provider shared by every pooled sender and
      *  reader (see `questdb/token_provider.h`). Mutually exclusive with
      *  `oidc_auth` and with static credentials in `conf`. The pool keeps its
-     *  own reference. */
+     *  own reference. A refreshing provider already closed with
+     *  `questdb_token_provider_close` is rejected. NULL means none. */
     const questdb_token_provider* token_provider;
 } questdb_db_connect_options;
 

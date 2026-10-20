@@ -738,7 +738,9 @@ public:
      * Open a reader with a rotating Bearer-token provider (see
      * `questdb::token_provider`). The reader keeps its own reference. Use
      * `wss::` (TLS).
-     * @throws questdb::error on configuration or connection failure.
+     * @throws questdb::error if `provider` is empty, moved from, or a
+     *         refreshing provider that was already closed, and on
+     *         configuration or connection failure.
      */
     reader(
         ::questdb::ingress::utf8_view config,

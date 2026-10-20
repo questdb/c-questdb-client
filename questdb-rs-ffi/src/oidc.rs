@@ -5882,6 +5882,92 @@ mod tests {
     }
 
     #[test]
+    fn an_oidc_auth_and_a_token_provider_are_exclusive_on_one_opts() {
+        // The headers call the two mutually exclusive, and the pool refused
+        // the pairing, but on sender options the later attachment used to
+        // replace the earlier one silently, in either order.
+        unsafe extern "C" fn fixed_token(
+            _user_data: *mut c_void,
+            sink: *mut crate::token_provider::questdb_token_sink,
+        ) {
+            let token = "app-token";
+            assert!(unsafe {
+                crate::token_provider::questdb_token_sink_set_token(
+                    sink,
+                    token.as_ptr().cast(),
+                    token.len(),
+                    0,
+                    0,
+                )
+            });
+        }
+
+        unsafe {
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+            let auth = questdb_oidc_builder_build(builder, &mut error);
+            assert!(!auth.is_null());
+            let vtable = crate::token_provider::questdb_token_provider_vtable {
+                struct_size: std::mem::size_of::<
+                    crate::token_provider::questdb_token_provider_vtable,
+                >(),
+                get_token: Some(fixed_token),
+                on_rejected: None,
+                release: None,
+            };
+            let provider = crate::token_provider::questdb_token_provider_new(
+                &vtable,
+                ptr::null_mut(),
+                &mut error,
+            );
+            assert!(!provider.is_null());
+
+            let host = crate::line_sender_utf8 {
+                len: "localhost".len(),
+                buf: c"localhost".as_ptr(),
+            };
+            for protocol in [
+                crate::line_sender_protocol::line_sender_protocol_https,
+                crate::line_sender_protocol::line_sender_protocol_wss,
+            ] {
+                for oidc_first in [true, false] {
+                    let opts = crate::line_sender_opts_new(protocol, host, 9000);
+                    assert!(!opts.is_null());
+                    let attach_oidc = |error: &mut *mut questdb_error| {
+                        line_sender_opts_oidc_auth(opts, auth, error)
+                    };
+                    let attach_provider = |error: &mut *mut questdb_error| {
+                        crate::token_provider::line_sender_opts_token_provider(
+                            opts, provider, error,
+                        )
+                    };
+                    let (first, second) = if oidc_first {
+                        (attach_oidc(&mut error), attach_provider(&mut error))
+                    } else {
+                        (attach_provider(&mut error), attach_oidc(&mut error))
+                    };
+                    assert!(first, "oidc_first={oidc_first}");
+                    assert!(!second, "oidc_first={oidc_first}");
+                    assert!(!error.is_null());
+                    assert_eq!((*error).error.code(), ErrorCode::ConfigError);
+                    assert!(
+                        (*error).error.msg().contains("already attached"),
+                        "{}",
+                        (*error).error.msg()
+                    );
+                    crate::questdb_error_free(error);
+                    error = ptr::null_mut();
+                    crate::line_sender_opts_free(opts);
+                }
+            }
+
+            crate::token_provider::questdb_token_provider_free(provider);
+            questdb_oidc_auth_free(auth);
+            questdb_oidc_builder_free(builder);
+        }
+    }
+
+    #[test]
     fn lazy_pool_retains_auth_without_running_device_flow() {
         unsafe {
             let builder = explicit_builder();

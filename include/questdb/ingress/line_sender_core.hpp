@@ -26,6 +26,7 @@
 
 #include "line_sender.h"
 #include "../oidc.h"
+#include "../token_provider.h"
 
 #include <cstddef>
 #include <chrono>
@@ -132,12 +133,28 @@ inline bool operator!=(::line_sender_error_code l, error_code r) noexcept
 }
 
 /**
+ * How a token source or token provider classified its failure to supply a
+ * token. Read it from `questdb::error::token_unavailable_diagnostic()`. The
+ * same classification is `questdb_error_token_unavailable_get_view` in C,
+ * `Error::as_token_unavailable` in Rust and `TokenUnavailableError` in
+ * Python. A source reports it by throwing `questdb::token_unavailable`.
+ */
+struct token_unavailable_info
+{
+    /** Whether retrying can succeed. */
+    bool retryable{false};
+
+    /** How long the source suggested waiting before retrying, if it said. */
+    std::optional<std::chrono::milliseconds> retry_after{};
+};
+
+/**
  * Base class for every QuestDB client error, ingest or query.
  *
  * `catch (const questdb::error&)` handles a failure from either direction.
  * The released `questdb::ingress::line_sender_error` subclass additionally
- * exposes `in_doubt()`, `qwp_ws_diagnostic()`, and `oidc_diagnostic()` for
- * sender operations.
+ * exposes `in_doubt()`, `qwp_ws_diagnostic()`, `oidc_diagnostic()`, and
+ * `is_qwp_ws_role_reject()` for sender operations.
  */
 class error : public std::runtime_error
 {
@@ -154,6 +171,21 @@ public:
         return _code;
     }
 
+    /**
+     * How a token source or token provider classified its failure, when that
+     * failure caused this error; `std::nullopt` for any other error.
+     *
+     * Read `retryable` here rather than inferring it from `code()`: a
+     * transport reports a provider failure the provider classified as
+     * permanent with `error_code::socket_error`, so that its own reconnect
+     * loop keeps the failure recoverable.
+     */
+    const std::optional<token_unavailable_info>& token_unavailable_diagnostic()
+        const noexcept
+    {
+        return _token_unavailable;
+    }
+
     /** Convert and take ownership of a C client error. */
     static error from_c(::questdb_error* c_err)
     {
@@ -163,7 +195,9 @@ public:
             static_cast<int>(::questdb_error_get_code(owned_err.get())));
         size_t len{0};
         const char* msg{::questdb_error_msg(owned_err.get(), &len)};
-        return error{code, std::string{msg, len}};
+        error err{code, std::string{msg, len}};
+        err._token_unavailable = token_unavailable_from_c(owned_err.get());
+        return err;
     }
 
     /** Whether a C error carries structured OIDC diagnostics. */
@@ -196,8 +230,31 @@ public:
         return result;
     }
 
+protected:
+    /** The token-unavailable classification `c_err` carries, if any. */
+    static std::optional<token_unavailable_info> token_unavailable_from_c(
+        const ::questdb_error* c_err) noexcept
+    {
+        ::questdb_token_unavailable_view view{};
+        view.struct_size = sizeof view;
+        if (!::questdb_error_token_unavailable_get_view(c_err, &view))
+            return std::nullopt;
+        token_unavailable_info info;
+        info.retryable = view.retryable;
+        if (view.retry_after_ms >= 0)
+            info.retry_after = std::chrono::milliseconds{view.retry_after_ms};
+        return info;
+    }
+
+    void set_token_unavailable(
+        std::optional<token_unavailable_info> info) noexcept
+    {
+        _token_unavailable = std::move(info);
+    }
+
 private:
     error_code _code;
+    std::optional<token_unavailable_info> _token_unavailable;
 };
 
 } // namespace questdb
@@ -364,15 +421,22 @@ inline bool error::has_oidc_detail(const ::questdb_error* c_err) noexcept
         return data ? std::string{data, size} : std::string{};
     };
 
+    auto token_unavailable = token_unavailable_from_c(owned_err.get());
+
     ::questdb_oidc_error_view view{};
     view.struct_size = sizeof view;
     if (!::questdb_error_oidc_get_view(owned_err.get(), &view))
     {
-        throw error{code, copy(message, message_len)};
+        error err{code, copy(message, message_len)};
+        err.set_token_unavailable(std::move(token_unavailable));
+        throw err;
     }
 
-    throw ::questdb::oidc::error_from_view(
+    auto err = ::questdb::oidc::error_from_view(
         code, copy(message, message_len), view);
+    static_cast<error&>(err).set_token_unavailable(
+        std::move(token_unavailable));
+    throw err;
 }
 
 } // namespace questdb
@@ -575,6 +639,17 @@ public:
         return _oidc_diagnostic;
     }
 
+    /**
+     * Whether a QWP/WebSocket server rejected the connection because of its
+     * role (`questdb_error_is_qwp_ws_role_reject`). Such a failure can carry
+     * `error_code::protocol_version_error`, but unlike a genuine version
+     * mismatch it can be retried while the cluster elects a primary.
+     */
+    bool is_qwp_ws_role_reject() const noexcept
+    {
+        return _qwp_ws_role_reject;
+    }
+
 private:
     inline static line_sender_error from_c(::line_sender_error* c_err)
     {
@@ -604,12 +679,16 @@ private:
                 ::questdb::oidc::error_from_view(code, msg, oidc_view);
         }
 
-        return line_sender_error{
+        line_sender_error err{
             code,
             msg,
             in_doubt,
             std::move(qwp_ws_diagnostic),
             std::move(oidc_diagnostic)};
+        err.set_token_unavailable(token_unavailable_from_c(owned_err.get()));
+        err._qwp_ws_role_reject =
+            ::questdb_error_is_qwp_ws_role_reject(owned_err.get());
+        return err;
     }
 
     [[noreturn]] inline static void throw_from_c(::line_sender_error* c_err)
@@ -645,6 +724,7 @@ private:
     bool _in_doubt;
     std::optional<qwp_ws_error> _qwp_ws_diagnostic;
     std::optional<::questdb::oidc::error> _oidc_diagnostic;
+    bool _qwp_ws_role_reject{false};
 };
 
 /**
