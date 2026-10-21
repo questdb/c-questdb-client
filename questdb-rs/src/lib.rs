@@ -117,6 +117,45 @@ const RESERVED_TOKEN_PROVIDER_KEYS: &[&str] = &[
     "azure_credential",
 ];
 
+/// The sender method that attaches a token provider in this build, named by the
+/// reserved-key error: the protocol-neutral one needs both Bearer transports.
+#[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+const SENDER_TOKEN_PROVIDER_API: Option<&str> = Some("SenderBuilder::bearer_token_provider");
+#[cfg(all(feature = "_sender-http", not(feature = "_sender-qwp-ws")))]
+const SENDER_TOKEN_PROVIDER_API: Option<&str> = Some("SenderBuilder::http_token_provider");
+#[cfg(all(feature = "_sender-qwp-ws", not(feature = "_sender-http")))]
+const SENDER_TOKEN_PROVIDER_API: Option<&str> = Some("SenderBuilder::qwp_ws_token_provider");
+#[cfg(not(any(feature = "_sender-http", feature = "_sender-qwp-ws")))]
+const SENDER_TOKEN_PROVIDER_API: Option<&str> = None;
+
+/// The reader method that attaches a token provider, when this build has one.
+#[cfg(feature = "_egress")]
+const READER_TOKEN_PROVIDER_API: Option<&str> = Some("ReaderConfig::token_provider");
+#[cfg(not(feature = "_egress"))]
+const READER_TOKEN_PROVIDER_API: Option<&str> = None;
+
+/// Where a Rust caller of this build attaches a token provider, for the
+/// reserved-key error. It names only methods the enabled features compile in:
+/// pointing an ILP/HTTP-only build at `bearer_token_provider` sent the caller
+/// looking for a method that does not exist there.
+fn rust_token_provider_hint() -> String {
+    let apis: Vec<String> = [SENDER_TOKEN_PROVIDER_API, READER_TOKEN_PROVIDER_API]
+        .into_iter()
+        .flatten()
+        .map(|api| format!("`{api}`"))
+        .collect();
+    if apis.is_empty() {
+        return "Rust: this build has no ILP/HTTP, QWP/WebSocket or reader feature, so \
+                nothing in it accepts a token provider."
+            .to_string();
+    }
+    format!(
+        "Rust {}. A `RefreshingTokenProvider` can fetch tokens however you like, Azure \
+         Identity included.",
+        apis.join(" or ")
+    )
+}
+
 /// The error for a reserved token-provider key, or `None` for any other key.
 ///
 /// This client selects no token provider from a connect string, so it rejects
@@ -130,11 +169,48 @@ pub(crate) fn reserved_token_provider_key_error(key: &str) -> Option<Error> {
              support (supported token_provider values: none). Attach a token provider in code \
              instead: Python `bearer_token_provider=`; C/C++ `line_sender_opts_token_provider`, \
              `questdb_db_connect_options.token_provider` or \
-             `qwp_reader_from_conf_with_token_provider`; Rust \
-             `SenderBuilder::bearer_token_provider` or `ReaderConfig::token_provider`. A \
-             `RefreshingTokenProvider` can fetch tokens however you like, Azure Identity included."
+             `qwp_reader_from_conf_with_token_provider`; {}",
+            rust_token_provider_hint()
         )
     })
+}
+
+#[cfg(test)]
+mod reserved_token_provider_key_tests {
+    use super::reserved_token_provider_key_error;
+
+    #[test]
+    fn the_error_names_only_apis_this_build_compiles_in() {
+        let err = reserved_token_provider_key_error("token_provider").unwrap();
+        let msg = err.msg();
+        for (api, compiled_in) in [
+            (
+                "SenderBuilder::bearer_token_provider",
+                cfg!(all(feature = "_sender-http", feature = "_sender-qwp-ws")),
+            ),
+            (
+                "SenderBuilder::http_token_provider",
+                cfg!(all(
+                    feature = "_sender-http",
+                    not(feature = "_sender-qwp-ws")
+                )),
+            ),
+            (
+                "SenderBuilder::qwp_ws_token_provider",
+                cfg!(all(
+                    feature = "_sender-qwp-ws",
+                    not(feature = "_sender-http")
+                )),
+            ),
+            ("ReaderConfig::token_provider", cfg!(feature = "_egress")),
+        ] {
+            assert_eq!(msg.contains(api), compiled_in, "{api}: {msg}");
+        }
+        assert!(
+            reserved_token_provider_key_error("token").is_none(),
+            "an ordinary key is not reserved"
+        );
+    }
 }
 
 // --- Primary entry point -------------------------------------------------

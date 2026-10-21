@@ -439,7 +439,9 @@ fn the_reserved_token_provider_keys_are_rejected() {
         "azure_credential=managed_identity",
     ] {
         let key = setting.split('=').next().unwrap();
-        // Every schema this build supports.
+        // Every schema this build supports. Only the ILP features extend the
+        // list, so a QWP/WebSocket-only build never mutates it.
+        #[allow(unused_mut)]
         let mut schemas = vec!["ws", "wss"];
         #[cfg(feature = "_sender-http")]
         schemas.extend(["http", "https"]);
@@ -456,7 +458,14 @@ fn the_reserved_token_provider_keys_are_rejected() {
                 err.msg().contains("supported token_provider values: none"),
                 "{err}"
             );
-            assert!(err.msg().contains("bearer_token_provider"), "{err}");
+            // The sender method this build compiles in: the protocol-neutral
+            // one needs ILP/HTTP as well as QWP/WebSocket.
+            let rust_api = if cfg!(feature = "_sender-http") {
+                "SenderBuilder::bearer_token_provider"
+            } else {
+                "SenderBuilder::qwp_ws_token_provider"
+            };
+            assert!(err.msg().contains(rust_api), "{err}");
         }
         #[cfg(feature = "sync-reader-qwp-ws")]
         {
