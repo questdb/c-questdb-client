@@ -749,8 +749,9 @@ where
                             if !self
                                 .wait_for_publication_capacity(backpressure_generation, deadline)
                             {
-                                return Err(driver_error_to_error_without_state(
-                                    DriverError::SubmitTimedOut { backpressure },
+                                return Err(submit_timeout_error(
+                                    backpressure,
+                                    self.reconnect_failure().as_ref(),
                                 ));
                             }
                             continue;
@@ -769,10 +770,9 @@ where
                 Ok(receipt) => return Ok(receipt.fsn),
                 Err(err) if driver_error_is_backpressure(&err) => {
                     if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
-                        return Err(driver_error_to_error_without_state(
-                            DriverError::SubmitTimedOut {
-                                backpressure: driver_error_backpressure_queue(&err),
-                            },
+                        return Err(submit_timeout_error(
+                            driver_error_backpressure_queue(&err),
+                            self.reconnect_failure().as_ref(),
                         ));
                     }
                 }
@@ -916,8 +916,9 @@ where
     /// Block until every published frame has resolved its receipt, then close
     /// the queue; give up with a `SocketError` once `deadline` passes (an
     /// already-elapsed deadline fails fast, which is what bounds a batched pool
-    /// close). `deadline == None` waits indefinitely. Assumes
-    /// [`Self::begin_close`] has already run.
+    /// close). While reconnecting keeps failing, that error names the latest
+    /// failure, as the manual close drain's does. `deadline == None` waits
+    /// indefinitely. Assumes [`Self::begin_close`] has already run.
     fn drain_to_deadline(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
         // No publication can pass the Closing lifecycle latch. Release the
         // detached producer's active-segment mapping before queue.close()
@@ -952,10 +953,7 @@ where
             }
 
             if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
-                return Err(error::fmt!(
-                    SocketError,
-                    "QWP/WebSocket close drain timed out before all published frames were acknowledged"
-                ));
+                return Err(close_drain_timeout_error(self.reconnect_failure().as_ref()));
             }
         }
     }
@@ -1979,6 +1977,9 @@ fn driver_error_to_error_from_store<Q: PublicationLog>(
             .terminal_error()
             .cloned()
             .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")),
+        DriverError::SubmitTimedOut { backpressure } => {
+            submit_timeout_error(backpressure, store.reconnect_failure())
+        }
         err => driver_error_to_error_without_state(err),
     }
 }
@@ -4531,14 +4532,15 @@ fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Re
 }
 
 fn qwp_ws_manual_close_timeout_error(state: &ManualQwpWsHandlerState) -> crate::Error {
-    manual_close_timeout_error(state.store.reconnect_failure())
+    close_drain_timeout_error(state.store.reconnect_failure())
 }
 
-/// The error of a manual close drain whose deadline passed before every
-/// published frame was acknowledged, naming the latest reconnect failure if
-/// there is one. As for an ACK-wait timeout, the failure's diagnostics are
-/// kept except a server-rejection diagnostic, which marks a terminal error.
-fn manual_close_timeout_error(reconnect_failure: Option<&crate::Error>) -> crate::Error {
+/// The error of a close drain, in either progress mode, whose deadline passed
+/// before every published frame was acknowledged, naming the latest reconnect
+/// failure if there is one. As for an ACK-wait timeout, the failure's
+/// diagnostics are kept except a server-rejection diagnostic, which marks a
+/// terminal error.
+fn close_drain_timeout_error(reconnect_failure: Option<&crate::Error>) -> crate::Error {
     let prefix =
         "QWP/WebSocket close drain timed out before all published frames were acknowledged";
     match reconnect_failure {
@@ -4562,7 +4564,7 @@ fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
             "QWP/WebSocket queue rejected publication: {:?}",
             err
         ),
-        DriverError::SubmitTimedOut { backpressure } => submit_timeout_error(backpressure),
+        DriverError::SubmitTimedOut { backpressure } => submit_timeout_error(backpressure, None),
         DriverError::Terminal => error::fmt!(SocketError, "QWP/WebSocket sender is terminal"),
         DriverError::Closing => error::fmt!(InvalidApiCall, "QWP/WebSocket sender is closing"),
         DriverError::UnknownReceipt { fsn } => error::fmt!(
@@ -4589,8 +4591,49 @@ fn driver_error_backpressure_queue(err: &DriverError) -> Option<super::qwp_ws_qu
     }
 }
 
-fn submit_timeout_error(backpressure: Option<super::qwp_ws_queue::QueueError>) -> crate::Error {
+/// The error of a publication that waited out its append deadline on
+/// store-and-forward back-pressure.
+///
+/// While the connection is down and reconnecting keeps failing, that failure is
+/// why no acknowledgement frees queue space, so the error names it instead of
+/// advising a larger `sf_max_total_bytes`, which would send the caller to fix
+/// the wrong thing. As for an ACK-wait timeout, the failure's diagnostics are
+/// kept except a server-rejection diagnostic, which marks a terminal error.
+fn submit_timeout_error(
+    backpressure: Option<super::qwp_ws_queue::QueueError>,
+    reconnect_failure: Option<&crate::Error>,
+) -> crate::Error {
     use super::qwp_ws_queue::QueueError;
+    if let Some(cause) = reconnect_failure {
+        let waited_for = match backpressure {
+            Some(QueueError::StorageSpareNotReady {
+                segment_size_bytes,
+                allocated_segment_bytes,
+                max_total_bytes,
+            }) => format!(
+                "a prepared segment spare [segment_size_bytes={segment_size_bytes}, allocated_segment_bytes={allocated_segment_bytes}, max_total_bytes={max_total_bytes}]"
+            ),
+            Some(QueueError::StorageSegmentCapFull {
+                segment_size_bytes,
+                allocated_segment_bytes,
+                max_total_bytes,
+            }) => format!(
+                "ACK-driven segment trim [segment_size_bytes={segment_size_bytes}, allocated_segment_bytes={allocated_segment_bytes}, max_total_bytes={max_total_bytes}]"
+            ),
+            _ => "local queue capacity".to_string(),
+        };
+        let msg = format!(
+            "QWP/WebSocket Store-and-Forward append timed out waiting for {waited_for}; the \
+             connection is down and reconnecting keeps failing: {}. The frames already \
+             published remain queued and the sender keeps reconnecting: retry the flush once \
+             that is resolved, or close the sender to give up.",
+            cause.msg()
+        );
+        return cause
+            .clone()
+            .without_qwp_ws_rejection()
+            .reclassified(crate::ErrorCode::SocketError, msg);
+    }
     match backpressure {
         Some(QueueError::StorageSpareNotReady {
             segment_size_bytes,
@@ -4673,22 +4716,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn manual_close_timeout_carries_no_server_rejection_diagnostic() {
-        // A close-drain timeout is not a terminal error, so it must not carry
-        // the structured rejection that marks one (`line_sender_error_qwpws_get_view`).
-        let cause = crate::Error::new(crate::ErrorCode::ServerRejection, "write failed")
-            .with_qwp_ws_rejection(crate::ingress::QwpWsSenderError {
+    fn retriable_server_rejection(msg: &str) -> crate::Error {
+        crate::Error::new(crate::ErrorCode::ServerRejection, msg).with_qwp_ws_rejection(
+            crate::ingress::QwpWsSenderError {
                 category: crate::ingress::QwpWsErrorCategory::WriteError,
                 applied_policy: crate::ingress::QwpWsErrorPolicy::Retriable,
                 status: Some(0x09),
-                message: Some("write failed".to_string()),
+                message: Some(msg.to_string()),
                 message_sequence: Some(0),
                 from_fsn: 0,
                 to_fsn: 0,
-            });
+            },
+        )
+    }
 
-        let err = manual_close_timeout_error(Some(&cause));
+    #[test]
+    fn close_drain_timeout_carries_no_server_rejection_diagnostic() {
+        // A close-drain timeout is not a terminal error, so it must not carry
+        // the structured rejection that marks one (`line_sender_error_qwpws_get_view`).
+        let cause = retriable_server_rejection("write failed");
+
+        let err = close_drain_timeout_error(Some(&cause));
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg()
@@ -4697,9 +4745,50 @@ mod tests {
         );
         assert!(err.qwp_ws_rejection().is_none());
 
-        let err = manual_close_timeout_error(None);
+        let err = close_drain_timeout_error(None);
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(err.qwp_ws_rejection().is_none());
+    }
+
+    #[test]
+    fn append_timeout_names_a_failing_reconnect_instead_of_the_buffer_size() {
+        use super::super::qwp_ws_queue::QueueError;
+        let cap_full = Some(QueueError::StorageSegmentCapFull {
+            segment_size_bytes: 512,
+            allocated_segment_bytes: 1024,
+            max_total_bytes: 1024,
+        });
+
+        // Connected: the queue really is too small for what the server acks.
+        let err = submit_timeout_error(cap_full, None);
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("increase sf_max_total_bytes"), "{err}");
+
+        // Disconnected: the failing reconnect is why nothing is acked.
+        let cause = crate::Error::new(
+            crate::ErrorCode::AuthError,
+            "WebSocket upgrade authentication failed: HTTP status 401",
+        )
+        .with_ws_http_status(401);
+        let err = submit_timeout_error(cap_full, Some(&cause));
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg()
+                .starts_with("QWP/WebSocket Store-and-Forward append timed out"),
+            "{err}"
+        );
+        assert!(
+            err.msg().contains(
+                "reconnecting keeps failing: WebSocket upgrade authentication failed: HTTP status 401"
+            ),
+            "{err}"
+        );
+        assert!(err.msg().contains("max_total_bytes=1024"), "{err}");
+        assert!(!err.msg().contains("increase sf_max_total_bytes"), "{err}");
+        assert!(!err.in_doubt());
+
+        let err = submit_timeout_error(cap_full, Some(&retriable_server_rejection("rejected")));
+        assert!(err.qwp_ws_rejection().is_none(), "{err}");
     }
 
     #[cfg(any(unix, windows))]

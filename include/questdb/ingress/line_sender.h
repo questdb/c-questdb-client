@@ -2250,7 +2250,9 @@ bool line_sender_qwpws_effective_frame_cap(
  * frames to resolve. The timeout is configured with the QWP/WebSocket
  * `close_flush_timeout_millis` config key; the default is 5000 ms, and values
  * less than or equal to 0 configure a zero-timeout fast close. Timeout and
- * terminal failure are reported through `err_out`.
+ * terminal failure are reported through `err_out`. A timeout while the sender
+ * is disconnected and reconnecting keeps failing names that failure, in either
+ * progress mode, as `line_sender_qwpws_wait` does.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_close_drain(
@@ -2282,7 +2284,10 @@ bool line_sender_qwpws_close_drain(
  * With QWP-over-WebSocket, the function publishes the buffer into the local
  * sender queue and returns before the server necessarily ACKs the frame. Later
  * terminal diagnostics fail subsequent sender calls and are also observable
- * through the QWP/WebSocket diagnostic polling API.
+ * through the QWP/WebSocket diagnostic polling API. A flush that waits out
+ * `sf_append_deadline_millis` on a full queue while the sender is disconnected
+ * and reconnecting keeps failing names that failure, as
+ * `line_sender_qwpws_wait` does.
  *
  * HTTP should be the first choice, but use TCP if you need to continuously
  * send data to the server at a high rate.

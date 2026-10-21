@@ -854,6 +854,150 @@ fn an_established_sender_rides_out_a_token_outage() {
     server.join().unwrap();
 }
 
+/// Upgrades the first connection and drops it as soon as one frame arrives,
+/// unacknowledged, then answers every later upgrade with `rejection` until
+/// `done` is set, reporting each rejection it sent.
+fn spawn_reject_after_disconnect_until_done(
+    rejection: &'static [u8],
+    done: Arc<AtomicBool>,
+) -> (u16, mpsc::Receiver<()>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut first).unwrap();
+        read_frame(&mut first).unwrap();
+        drop(first);
+        listener.set_nonblocking(true).unwrap();
+        while !done.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    // A closing client may hang up mid-request.
+                    if read_request_until_blank(&mut stream).is_ok()
+                        && stream.write_all(rejection).is_ok()
+                    {
+                        let _ = tx.send(());
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => panic!("rejecting listener failed: {err}"),
+            }
+        }
+    });
+    (port, rx, server)
+}
+
+/// Drives the sender (manual mode) until the server has rejected one of its
+/// reconnects, so the failure is latched before a timeout under test starts.
+fn wait_for_a_rejected_reconnect(
+    sender: &mut crate::ingress::Sender,
+    progress: ProgressCase,
+    rejections: &mpsc::Receiver<()>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rejections.try_recv().is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "{}: no reconnect was rejected",
+            progress.name()
+        );
+        if progress == ProgressCase::Manual {
+            let _ = sender.drive_once();
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// D1 keeps a sender that has connected reconnecting while the server rejects
+/// its credential. A close drain that times out meanwhile names the rejection
+/// in the default background mode, as in manual mode, rather than reporting a
+/// bare timeout.
+#[test]
+fn a_close_drain_timeout_names_a_rejected_credential() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let done = Arc::new(AtomicBool::new(false));
+        let (port, rejections, server) =
+            spawn_reject_after_disconnect_until_done(PLAIN_401, Arc::clone(&done));
+        let builder = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{port};token=static-secret;close_flush_timeout_millis=200;\
+             reconnect_initial_backoff_millis=1;reconnect_max_backoff_millis=5;"
+        ))
+        .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+        let mut buf = one_row_buffer(&sender);
+        sender.flush(&mut buf).unwrap();
+        wait_for_a_rejected_reconnect(&mut sender, progress, &rejections);
+
+        let err = sender
+            .close_drain()
+            .expect_err("the row cannot be acknowledged while the credential is rejected");
+        let mode = progress.name();
+        assert_eq!(err.code(), ErrorCode::SocketError, "{mode}: {err}");
+        assert!(err.msg().contains("close drain timed out"), "{mode}: {err}");
+        assert!(err.msg().contains("HTTP status 401"), "{mode}: {err}");
+        assert!(err.qwp_ws_rejection().is_none(), "{mode}: {err}");
+        drop(sender);
+        done.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+}
+
+/// A flush that waits out `sf_append_deadline_millis` on a full queue while
+/// the server rejects the credential names the rejection: no acknowledgement
+/// can free the queue until the credential is accepted again, so advice to
+/// grow `sf_max_total_bytes` would point the caller at the wrong fix.
+#[test]
+fn an_append_timeout_names_a_rejected_credential() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let done = Arc::new(AtomicBool::new(false));
+        let (port, rejections, server) =
+            spawn_reject_after_disconnect_until_done(PLAIN_401, Arc::clone(&done));
+        let builder = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{port};token=static-secret;\
+             sf_max_segment_bytes=512;sf_max_total_bytes=1024;sf_append_deadline_millis=100;\
+             reconnect_initial_backoff_millis=1;reconnect_max_backoff_millis=5;"
+        ))
+        .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+        let mut buf = one_row_buffer(&sender);
+        sender.flush(&mut buf).unwrap();
+        wait_for_a_rejected_reconnect(&mut sender, progress, &rejections);
+
+        let mut failure = None;
+        for _ in 0..10_000 {
+            let mut buf = one_row_buffer(&sender);
+            if let Err(err) = sender.flush(&mut buf) {
+                failure = Some(err);
+                break;
+            }
+        }
+        let mode = progress.name();
+        let err = failure.unwrap_or_else(|| panic!("{mode}: the queue never filled"));
+        assert_eq!(err.code(), ErrorCode::SocketError, "{mode}: {err}");
+        assert!(
+            err.msg()
+                .starts_with("QWP/WebSocket Store-and-Forward append timed out"),
+            "{mode}: {err}"
+        );
+        assert!(err.msg().contains("HTTP status 401"), "{mode}: {err}");
+        assert!(
+            !err.msg().contains("increase sf_max_total_bytes"),
+            "{mode}: {err}"
+        );
+        assert!(err.qwp_ws_rejection().is_none(), "{mode}: {err}");
+        drop(sender);
+        done.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+}
+
 /// A provider with a cache, as a refreshing one has: it rotates the token a
 /// server rejected.
 struct RotatingOnRejection {

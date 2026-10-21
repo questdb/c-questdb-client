@@ -662,7 +662,11 @@ impl Sender {
     /// mode, the caller must use `Sender::drive_once` or
     /// `Sender::wait` to advance WebSocket progress. Server or
     /// transport failures observed later are reported by subsequent sender
-    /// calls.
+    /// calls. If local capacity does not free up within
+    /// `sf_append_deadline_millis` while the sender is disconnected and
+    /// reconnecting keeps failing, the error names that failure and carries
+    /// its OIDC detail (`Error::oidc_error`), as a `Sender::wait` timeout
+    /// does.
     ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.
@@ -1107,7 +1111,10 @@ impl Sender {
     ///
     /// The wait is bounded by the QWP/WebSocket `close_flush_timeout_millis`
     /// setting. Its default is 5000 ms, matching the Java sender. Values less
-    /// than or equal to zero skip the wait.
+    /// than or equal to zero skip the wait. If the deadline passes while the
+    /// sender is disconnected and reconnecting keeps failing, in either
+    /// progress mode, the error names that failure and carries its OIDC detail
+    /// (`Error::oidc_error`).
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn close_drain(&mut self) -> Result<()> {
         let result = match &mut self.handler {
