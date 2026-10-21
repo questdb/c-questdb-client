@@ -24,7 +24,7 @@ also supported for ingestion.
 * [Repository compatibility matrix](../doc/COMPATIBILITY.md)
 * [InfluxDB Line Protocol reference](https://questdb.com/docs/reference/api/ilp/overview/)
 
-Version 7.1.0 requires Rust 1.91.0. QWP over WebSocket requires QuestDB 10.0
+Version 7.2.0 requires Rust 1.91.0. QWP over WebSocket requires QuestDB 10.0
 or newer.
 
 ## Transports
@@ -178,21 +178,21 @@ then see the
 
 ## Examples
 
-A selection of usage examples is available in the [examples directory](https://github.com/questdb/c-questdb-client/tree/7.1.0/questdb-rs/examples):
+A selection of usage examples is available in the [examples directory](https://github.com/questdb/c-questdb-client/tree/7.2.0/questdb-rs/examples):
 
 | Example | Description |
 |---------|-------------|
-| [`basic.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/basic.rs) | Minimal TCP ingestion example; shows basic row and array ingestion. |
-| [`auth.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/auth.rs) | Adds authentication (user/password, token) to basic ingestion. |
-| [`auth_tls.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/auth_tls.rs) | Like `auth.rs`, but uses TLS for encrypted TCP connections. |
-| [`from_conf.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/from_conf.rs) | Configures client via connection string instead of builder pattern. |
-| [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/from_env.rs) | Reads config from `QDB_CLIENT_CONF` environment variable. |
-| [`http.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/http.rs) | Uses HTTP transport and demonstrates array ingestion with `ndarray`. |
-| [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/protocol_version.rs) | Shows protocol version selection and feature differences (e.g. arrays). |
-| [`qwp_ws_chunk_and_query.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/qwp_ws_chunk_and_query.rs) | Shares one `QuestDb` pool between concurrent columnar ingestion and query workers. |
-| [`qwp_ws_l1_quotes.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/qwp_ws_l1_quotes.rs) | Columnar ingestion over QWP/WebSocket via the `QuestDb` connection pool. |
-| [`qwp_egress_read.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/qwp_egress_read.rs) | Runs a SQL query and streams the result set over QWP/WebSocket. |
-| [`polars.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/polars.rs) | Round trip: ingests a Polars `DataFrame` and queries it back as one. |
+| [`basic.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/basic.rs) | Minimal TCP ingestion example; shows basic row and array ingestion. |
+| [`auth.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/auth.rs) | Adds authentication (user/password, token) to basic ingestion. |
+| [`auth_tls.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/auth_tls.rs) | Like `auth.rs`, but uses TLS for encrypted TCP connections. |
+| [`from_conf.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/from_conf.rs) | Configures client via connection string instead of builder pattern. |
+| [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/from_env.rs) | Reads config from `QDB_CLIENT_CONF` environment variable. |
+| [`http.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/http.rs) | Uses HTTP transport and demonstrates array ingestion with `ndarray`. |
+| [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/protocol_version.rs) | Shows protocol version selection and feature differences (e.g. arrays). |
+| [`qwp_ws_chunk_and_query.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/qwp_ws_chunk_and_query.rs) | Shares one `QuestDb` pool between concurrent columnar ingestion and query workers. |
+| [`qwp_ws_l1_quotes.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/qwp_ws_l1_quotes.rs) | Columnar ingestion over QWP/WebSocket via the `QuestDb` connection pool. |
+| [`qwp_egress_read.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/qwp_egress_read.rs) | Runs a SQL query and streams the result set over QWP/WebSocket. |
+| [`polars.rs`](https://github.com/questdb/c-questdb-client/blob/7.2.0/questdb-rs/examples/polars.rs) | Round trip: ingests a Polars `DataFrame` and queries it back as one. |
 
 ## Crate features
 
