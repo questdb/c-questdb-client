@@ -34,6 +34,7 @@ use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 use crate::ingress::sender::ack_wait_timeout_error;
+use crate::ingress::sender::effective_hard_frame_cap;
 use crate::ingress::sender::qwp_ws::{
     SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
     qwp_ws_begin_close_background, qwp_ws_check_error_background,
@@ -2265,22 +2266,6 @@ impl SfaBackend {
             soft: hard.min(self.state.sfa_frame_split_target),
         }
     }
-}
-
-fn effective_hard_frame_cap(
-    max_buf_size: usize,
-    server_max_batch_size: usize,
-    sfa_frame_payload_cap: usize,
-) -> (usize, bool) {
-    let configured_cap = if server_max_batch_size == 0 {
-        max_buf_size
-    } else {
-        max_buf_size.min(server_max_batch_size)
-    };
-    (
-        configured_cap.min(sfa_frame_payload_cap),
-        server_max_batch_size != 0,
-    )
 }
 
 /// The store-and-forward `wait` poll loop made no progress toward `boundary`

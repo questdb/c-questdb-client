@@ -2177,14 +2177,14 @@ fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert_eq!(
             err.msg(),
             format!(
-                "Could not flush buffer: QWP/WebSocket encoded message size of {encoded_len} exceeds maximum configured allowed size of {max} bytes."
+                "Could not flush buffer: QWP/WebSocket encoded message size of {encoded_len} bytes exceeds the per-frame cap of {max} bytes. The cap is set by max_buf_size."
             ),
             "mode={}",
             progress.name()
@@ -6586,10 +6586,9 @@ fn qwp_ws_rewind_after_a_failed_publication_republishes_only_surviving_rows() {
     let bookmark = buf.bookmark().unwrap();
     write_doomed_rows(&mut buf);
     let err = sender.flush_and_keep(&buf).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{err}");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{err}");
     assert!(
-        err.msg()
-            .contains("exceeds maximum configured allowed size"),
+        err.msg().contains("exceeds the per-frame cap"),
         "the doomed flush must fail on the size cap, not another guard: {err}"
     );
 
@@ -9217,13 +9216,15 @@ fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert!(
-            err.msg()
-                .contains("exceeds maximum configured allowed size"),
+            err.msg().contains(
+                "exceeds the per-frame cap of 512 bytes. \
+                 The cap is set by the server's advertised X-QWP-Max-Batch-Size."
+            ),
             "mode={}: got: {}",
             progress.name(),
             err.msg()
@@ -9233,6 +9234,76 @@ fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes
             "mode={}: error should reference server cap {server_cap}, got: {}",
             progress.name(),
             err.msg()
+        );
+    }
+}
+
+#[test]
+fn segment_payload_capacity_clamps_flush_below_server_cap_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let server_cap: usize = 100 * 1024;
+        let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
+        let conf = format!(
+            "ws::addr=127.0.0.1:{port};qwp_ws_progress={};sf_max_segment_bytes=4096;",
+            progress.name()
+        );
+        let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+        let (cap, server_cap_known) = sender.effective_frame_cap().unwrap();
+        assert!(server_cap_known, "mode={}", progress.name());
+        assert!(
+            cap < 4096,
+            "mode={}: the segment payload capacity must bind, got {cap}",
+            progress.name()
+        );
+
+        let mut buf = build_buffer_with_payload_bytes(cap + 200);
+        let err = sender.flush(&mut buf).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::BatchTooLarge,
+            "mode={}",
+            progress.name()
+        );
+        assert!(
+            err.msg().contains(&format!(
+                "exceeds the per-frame cap of {cap} bytes. \
+                 The cap is set by the sf_max_segment_bytes segment payload capacity."
+            )),
+            "mode={}: got: {}",
+            progress.name(),
+            err.msg()
+        );
+        assert!(!buf.is_empty(), "mode={}", progress.name());
+    }
+}
+
+#[test]
+fn effective_frame_cap_reports_the_binding_limit_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let server_cap: usize = 512;
+        let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+            .max_buf_size(100 * 1024 * 1024)
+            .unwrap();
+        let sender = build_qwp_ws_sender_from_builder(progress, builder);
+        assert_eq!(
+            sender.effective_frame_cap().unwrap(),
+            (server_cap, true),
+            "mode={}",
+            progress.name()
+        );
+
+        let port = spawn_max_batch_size_upgrade_only_server(None);
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+            .max_buf_size(2048)
+            .unwrap();
+        let sender = build_qwp_ws_sender_from_builder(progress, builder);
+        assert_eq!(
+            sender.effective_frame_cap().unwrap(),
+            (2048, false),
+            "mode={}",
+            progress.name()
         );
     }
 }
@@ -9291,12 +9362,15 @@ fn absent_server_max_batch_size_falls_back_to_configured_max_in_all_progress_mod
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert!(
-            err.msg().contains(&configured_max.to_string()),
+            err.msg().contains(&format!(
+                "exceeds the per-frame cap of {configured_max} bytes. \
+                 The cap is set by max_buf_size."
+            )),
             "mode={}: error should reference configured max {configured_max}, got: {}",
             progress.name(),
             err.msg()
@@ -9331,12 +9405,15 @@ fn configured_max_wins_when_smaller_than_server_cap_in_all_progress_modes() {
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert!(
-            err.msg().contains(&configured_max.to_string()),
+            err.msg().contains(&format!(
+                "exceeds the per-frame cap of {configured_max} bytes. \
+                 The cap is set by max_buf_size."
+            )),
             "mode={}: error should reference configured max {configured_max}, got: {}",
             progress.name(),
             err.msg()
@@ -9378,8 +9455,8 @@ fn server_cap_prevents_message_too_big_by_rejecting_locally_in_all_progress_mode
         let err = sender.flush(&mut big_buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
-            "mode={}: must get local InvalidApiCall, not a server error",
+            crate::ErrorCode::BatchTooLarge,
+            "mode={}: must get local BatchTooLarge, not a server error",
             progress.name()
         );
     }
@@ -9441,12 +9518,15 @@ fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert!(
-            err.msg().contains(&server_cap.to_string()),
+            err.msg().contains(&format!(
+                "exceeds the per-frame cap of {server_cap} bytes. \
+                 The cap is set by the server's advertised X-QWP-Max-Batch-Size."
+            )),
             "mode={}: error should reference server cap {server_cap}, got: {}",
             progress.name(),
             err.msg()
