@@ -191,6 +191,7 @@ impl OidcError {
     /// Exposed for the C ABI shim, which owns the callback-activity tracking
     /// this condition is derived from and cannot reach `Error`'s crate-private
     /// constructors.
+    #[doc(hidden)]
     pub fn retryable_interaction_required(message: impl Into<String>) -> crate::Error {
         let message = message.into();
         crate::Error::from(Self::interaction_required_busy(message.clone()))
@@ -214,6 +215,11 @@ impl OidcError {
     /// the lock.
     /// A transport that would otherwise spend its retry budget re-resolving
     /// must fail this one immediately instead.
+    ///
+    /// Exposed for the C ABI shim, which owns the callback-activity tracking
+    /// this condition is derived from and cannot reach `Error`'s crate-private
+    /// constructors.
+    #[doc(hidden)]
     pub fn reentrant_interaction_required(message: impl Into<String>) -> crate::Error {
         let message = message.into();
         crate::Error::from(Self::interaction_required(message.clone()))
@@ -229,6 +235,7 @@ impl OidcError {
     ///
     /// Exposed for the C ABI shim, which cannot reach `Error`'s crate-private
     /// constructors.
+    #[doc(hidden)]
     pub fn config_error(message: impl Into<String>) -> crate::Error {
         crate::Error::from(Self::config(message))
     }
@@ -242,6 +249,7 @@ impl OidcError {
     ///
     /// Exposed for the C ABI shim, which cannot reach `Error`'s crate-private
     /// constructors.
+    #[doc(hidden)]
     pub fn closed_error() -> crate::Error {
         crate::Error::from(Self::cancelled(
             "The OIDC authentication provider is closed.",
