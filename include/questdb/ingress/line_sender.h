@@ -856,9 +856,12 @@ void line_sender_buffer_clear(line_sender_buffer* buffer);
 /**
  * The current encoded size of the buffered data.
  *
- * For ILP buffers this is the exact pending byte length. For QWP buffers this
- * is a buffered size hint, not the exact size of an eventual UDP datagram or
- * WebSocket replay frame.
+ * For ILP buffers this is the exact pending byte length. For QWP/UDP buffers
+ * this is a buffered size hint, not the exact size of an eventual datagram.
+ * For QWP/WebSocket buffers it is at least the size of the frame that
+ * flushing the buffer encodes, unless store-and-forward has fallen back to
+ * sending full symbol dictionaries because its symbol side-file could not be
+ * opened or rolled back.
  */
 QUESTDB_CLIENT_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);

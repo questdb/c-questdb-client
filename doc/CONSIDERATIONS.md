@@ -93,9 +93,12 @@ Flushing every row increases overhead, while unbounded buffers increase memory
 use and recovery time.
 
 For ILP, the buffer length is the exact pending encoded byte length. For
-QWP/UDP it is a size hint rather than an eventual datagram size. QWP/WebSocket
-column and row senders encode frames at publication time and apply their own
-store-and-forward limits.
+QWP/UDP it is a size hint rather than an eventual datagram size. For a
+QWP/WebSocket row buffer it is at least the size of the frame a flush encodes,
+unless store-and-forward has fallen back to full symbol dictionaries, so a
+buffer whose length is within the frame limit fits in one frame.
+QWP/WebSocket column and row senders encode frames at publication time and
+apply their own store-and-forward limits.
 
 Pool limits (`sender_pool_max`, `query_pool_max`) bound concurrent connections.
 At capacity, borrow operations wait up to `acquire_timeout_ms` or fail
