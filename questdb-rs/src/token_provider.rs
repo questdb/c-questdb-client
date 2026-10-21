@@ -133,6 +133,11 @@ const ISOLATED_PERMIT_WAIT: Duration = Duration::from_secs(30);
 struct IsolatedResult {
     done: std::sync::Mutex<IsolatedOutcome>,
     ready: std::sync::Condvar,
+    /// The rejected token the worker tells the provider about (see
+    /// [`with_rejected_credential`]): the lead's, as the worker pulls on the
+    /// lead's behalf. A re-resolution after a 401 compares it with its own to
+    /// learn whether the provider has heard of the rejection.
+    rejected: Option<String>,
 }
 
 /// What the callers that joined an isolated acquisition receive.
@@ -795,42 +800,59 @@ impl TokenProvider {
             return Self::refreshing_bearer_header(refreshing, Some(&cancelled));
         }
         let rejected = rejected_token();
-        let mut restarted_after_rejection = false;
+        let mut only_with_rejection = false;
         loop {
-            let Some(result) = self.bearer_header_isolated_attempt(&cancelled) else {
+            let Some((result, carried_rejection)) = self.bearer_header_isolated_attempt(
+                &cancelled,
+                rejected.as_deref(),
+                only_with_rejection,
+            ) else {
                 continue;
             };
             // Re-resolving after a 401, this caller may have joined an
-            // acquisition that started before the rejection and so hands back
-            // the rejected token. Lead one fresh acquisition, which carries the
-            // rejection to its worker; if the provider still answers with the
-            // same token, that is its answer.
-            if !restarted_after_rejection
+            // acquisition that never told the provider about the rejection --
+            // one that started before it, or another transport's ordinary
+            // pull -- and so hands back the rejected token. Settle only for an
+            // acquisition that carried the rejection to the provider: lead one,
+            // or join one led with the same rejection. If the provider still
+            // answers with the same token, that is its answer.
+            if !carried_rejection
                 && let (Some(rejected), Ok(header)) = (rejected.as_deref(), &result)
                 && header.strip_prefix("Bearer ") == Some(rejected)
             {
-                restarted_after_rejection = true;
+                only_with_rejection = true;
                 continue;
             }
             return result;
         }
     }
 
-    /// One pass of [`Self::bearer_header_isolated_until`]: `None` when the
-    /// joined acquisition was abandoned by its lead and must be started over.
+    /// One pass of [`Self::bearer_header_isolated_until`] for a caller whose
+    /// thread carries the rejected token `rejected` (see
+    /// [`with_rejected_credential`]).
+    ///
+    /// Returns the result, and whether the provider was told about
+    /// `rejected` when it produced it. `None` means start over: the joined
+    /// acquisition was abandoned by its lead or, with `only_with_rejection`,
+    /// it was another caller's that did not carry `rejected`. Such an
+    /// acquisition is waited out rather than raced by a second worker, so one
+    /// provider still holds at most one isolated worker.
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
     fn bearer_header_isolated_attempt(
         &self,
         cancelled: &impl Fn() -> bool,
-    ) -> Option<crate::Result<String>> {
+        rejected: Option<&str>,
+        only_with_rejection: bool,
+    ) -> Option<(crate::Result<String>, bool)> {
         if cancelled() {
-            return Some(Err(provider_shutdown_error()));
+            return Some((Err(provider_shutdown_error()), false));
         }
         // The provider's callback may be waiting for this caller. Go straight
         // to the closure instead of joining its in-flight worker: OIDC serves
-        // a valid cache or rejects a lock-taking token pull immediately.
+        // a valid cache or rejects a lock-taking token pull immediately. It
+        // runs on this thread, which carries this caller's rejection.
         if self.callback_is_active() {
-            return Some(self.resolve_during_callback());
+            return Some((self.resolve_during_callback(), true));
         }
         #[cfg(feature = "_sender-qwp-ws")]
         self.callback_blocked.store(false, Ordering::Release);
@@ -844,12 +866,17 @@ impl TokenProvider {
             match current.as_ref() {
                 Some(existing) => (Arc::clone(existing), false),
                 None => {
-                    let fresh = Arc::new(IsolatedResult::default());
+                    let fresh = Arc::new(IsolatedResult {
+                        rejected: rejected.map(str::to_owned),
+                        ..IsolatedResult::default()
+                    });
                     *current = Some(Arc::clone(&fresh));
                     (fresh, true)
                 }
             }
         };
+        // True for the lead, whose rejection the slot records.
+        let carries_rejection = slot.rejected.as_deref() == rejected;
         if lead {
             // Wait for a worker permit rather than failing at once while the
             // process-wide cap is full: see `ISOLATED_PERMIT_WAIT`. Every exit
@@ -864,7 +891,7 @@ impl TokenProvider {
             match permit {
                 Ok(Some(permit)) => {
                     if let Err(err) = self.spawn_isolated_worker(&slot, permit) {
-                        return Some(Err(err));
+                        return Some((Err(err), true));
                     }
                 }
                 Ok(None) if cancelled() => {
@@ -872,18 +899,18 @@ impl TokenProvider {
                     // reason for a joiner from another transport to fail, so
                     // hand the acquisition back rather than this error.
                     self.retire_isolated(&slot, IsolatedOutcome::Abandoned);
-                    return Some(Err(provider_shutdown_error()));
+                    return Some((Err(provider_shutdown_error()), true));
                 }
                 Ok(None) => {
                     // A callback became active while we waited: resolve on
                     // this thread as the callback-active path above does.
                     let result = self.resolve_during_callback();
                     self.publish_isolated(&slot, result.clone());
-                    return Some(result);
+                    return Some((result, true));
                 }
                 Err(err) => {
                     self.publish_isolated(&slot, Err(err.clone()));
-                    return Some(Err(err));
+                    return Some((Err(err), true));
                 }
             }
         }
@@ -894,13 +921,19 @@ impl TokenProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             match &*done {
-                IsolatedOutcome::Done(result) => return Some(result.clone()),
+                // Another caller's acquisition, which did not tell the
+                // provider about this caller's rejection. It has retired:
+                // start over, to lead or join one that does.
+                IsolatedOutcome::Done(_) if only_with_rejection && !carries_rejection => {
+                    return None;
+                }
+                IsolatedOutcome::Done(result) => return Some((result.clone(), carries_rejection)),
                 IsolatedOutcome::Abandoned => return None,
                 IsolatedOutcome::Pending => {}
             }
             if self.callback_is_active() {
                 drop(done);
-                return Some(self.resolve_during_callback());
+                return Some((self.resolve_during_callback(), true));
             }
             let (guard, wait) = slot
                 .ready
@@ -908,7 +941,7 @@ impl TokenProvider {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             done = guard;
             if matches!(*done, IsolatedOutcome::Pending) && wait.timed_out() && cancelled() {
-                return Some(Err(provider_shutdown_error()));
+                return Some((Err(provider_shutdown_error()), false));
             }
         }
     }
@@ -929,8 +962,10 @@ impl TokenProvider {
         let provider = self.clone();
         let published = Arc::clone(slot);
         // A pull that replaces a rejected credential must say so on the
-        // worker's thread too: that is where the provider runs.
-        let rejected = rejected_token();
+        // worker's thread too: that is where the provider runs. Take it from
+        // the slot, so what the worker tells the provider is exactly what
+        // callers joining the slot are told it carries.
+        let rejected = slot.rejected.clone();
         if let Err(err) = std::thread::Builder::new()
             .name("questdb-token-provider".to_string())
             .spawn(move || {
@@ -2154,6 +2189,159 @@ mod tests {
             assert_eq!(lead.join().unwrap().unwrap(), "Bearer stale");
             assert_eq!(re_resolution.join().unwrap().unwrap(), "Bearer fresh");
             assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn a_re_resolution_waits_out_acquisitions_that_did_not_carry_its_rejection() {
+            // Re-resolving after a 401, a caller joined an acquisition led by
+            // another transport's ordinary pull, got the rejected token, and
+            // restarted -- only to join a second such acquisition and take
+            // the rejected token again as the provider's answer, although the
+            // provider never heard of the rejection.
+            use super::super::{IsolatedAcquisition, rejected_token, with_rejected_credential};
+
+            static WORKERS: AtomicUsize = AtomicUsize::new(0);
+            let release_first = Arc::new(Gate::default());
+            let release_second = Arc::new(Gate::default());
+            let first_returning = Arc::new(AtomicBool::new(false));
+            let calls = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+            let provider = TokenProvider::new_with_isolation(
+                {
+                    let (release_first, release_second) =
+                        (Arc::clone(&release_first), Arc::clone(&release_second));
+                    let (first_returning, calls) =
+                        (Arc::clone(&first_returning), Arc::clone(&calls));
+                    move || {
+                        let rejected = rejected_token();
+                        let n = {
+                            let mut calls = calls.lock().unwrap();
+                            calls.push(rejected.clone());
+                            calls.len()
+                        };
+                        match n {
+                            1 => {
+                                release_first.wait();
+                                first_returning.store(true, Ordering::SeqCst);
+                            }
+                            2 => release_second.wait(),
+                            _ => {}
+                        }
+                        let token = if rejected.as_deref() == Some("stale") {
+                            "fresh"
+                        } else {
+                            "stale"
+                        };
+                        Ok::<_, crate::Error>(token.to_string())
+                    }
+                },
+                TokenProviderIsolation::with_worker_budget(&WORKERS),
+            );
+            let isolated = Arc::clone(&provider.isolated);
+            // How many hold the in-flight slot, if one is in flight. Slots are
+            // told apart by the provider calls made, never by address: a
+            // retired slot's allocation can be reused by its successor.
+            let holders = |isolated: &IsolatedAcquisition| {
+                isolated
+                    .current
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map(Arc::strong_count)
+            };
+            let calls_made = |calls: &Mutex<Vec<Option<String>>>| calls.lock().unwrap().len();
+
+            // An ordinary pull leads the first acquisition.
+            let first = {
+                let provider = provider.clone();
+                std::thread::spawn(move || provider.bearer_header_isolated_until(|| false))
+            };
+            while calls_made(&calls) < 1 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Its lead, the slot and its worker.
+            let in_flight = holders(&isolated).expect("first acquisition in flight");
+
+            // The re-resolution joins it. Its cancellation check, polled while
+            // it waits, holds it once the first acquisition is answering,
+            // until a second one is in flight: the schedule in which it meets
+            // two acquisitions that never heard of the rejection.
+            let held = Arc::new(AtomicBool::new(false));
+            let re_resolution = {
+                let provider = provider.clone();
+                let (first_returning, calls, held) = (
+                    Arc::clone(&first_returning),
+                    Arc::clone(&calls),
+                    Arc::clone(&held),
+                );
+                std::thread::spawn(move || {
+                    with_rejected_credential(Some("Bearer stale"), || {
+                        provider.bearer_header_isolated_until(|| {
+                            if first_returning.load(Ordering::SeqCst)
+                                && !held.swap(true, Ordering::SeqCst)
+                            {
+                                while calls_made(&calls) < 2 {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                            false
+                        })
+                    })
+                })
+            };
+            while holders(&isolated) != Some(in_flight + 1) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            release_first.signal();
+
+            // Once the first retires, another ordinary pull leads the second,
+            // and the restarted re-resolution finds it in flight.
+            while holders(&isolated).is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let second = {
+                let provider = provider.clone();
+                std::thread::spawn(move || provider.bearer_header_isolated_until(|| false))
+            };
+            while calls_made(&calls) < 2 || holders(&isolated) != Some(in_flight + 1) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            release_second.signal();
+
+            assert_eq!(first.join().unwrap().unwrap(), "Bearer stale");
+            assert_eq!(second.join().unwrap().unwrap(), "Bearer stale");
+            assert_eq!(re_resolution.join().unwrap().unwrap(), "Bearer fresh");
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![None, None, Some("stale".to_string())],
+                "the provider must hear of the rejection"
+            );
+        }
+
+        #[test]
+        fn a_re_resolution_that_led_its_acquisition_takes_the_providers_answer() {
+            // The worker told the provider about the rejection, so a provider
+            // that still answers with the same token has decided: it is not
+            // asked twice.
+            use super::super::{rejected_token, with_rejected_credential};
+
+            static WORKERS: AtomicUsize = AtomicUsize::new(0);
+            let calls = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+            let provider = TokenProvider::new_with_isolation(
+                {
+                    let calls = Arc::clone(&calls);
+                    move || {
+                        calls.lock().unwrap().push(rejected_token());
+                        Ok::<_, crate::Error>("stale".to_string())
+                    }
+                },
+                TokenProviderIsolation::with_worker_budget(&WORKERS),
+            );
+            let header = with_rejected_credential(Some("Bearer stale"), || {
+                provider.bearer_header_isolated_until(|| false)
+            })
+            .unwrap();
+            assert_eq!(header, "Bearer stale");
+            assert_eq!(*calls.lock().unwrap(), vec![Some("stale".to_string())]);
         }
 
         #[test]
