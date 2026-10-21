@@ -1,6 +1,6 @@
 # Compatibility
 
-This page records the supported versions and toolchains for the 7.1.0 client
+This page records the supported versions and toolchains for the 7.2.0 client
 release. It is the repository source of truth; language guides should link here
 instead of inventing their own compatibility claims.
 
