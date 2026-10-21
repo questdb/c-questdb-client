@@ -1120,6 +1120,69 @@ fn test_401_re_resolution_names_the_rejected_token() -> TestResult {
 }
 
 #[test]
+fn test_refreshing_provider_refreshes_a_rejected_token_however_attached() -> TestResult {
+    // Attached directly, a `RefreshingTokenProvider` hears the 401 through
+    // `on_rejected`. Wrapped in a closure it does not, and used to hand the
+    // rejected token straight back: the flush failed with the 401 until the
+    // provider's scheduled refresh, about half the token's lifetime away.
+    use crate::token_provider::{ExpiringToken, RefreshingTokenProvider};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for wrapped in [false, true] {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = RefreshingTokenProvider::builder({
+            let fetches = Arc::clone(&fetches);
+            move || -> crate::Result<ExpiringToken> {
+                let token = match fetches.fetch_add(1, Ordering::SeqCst) {
+                    0 => "T0",
+                    _ => "T1",
+                };
+                Ok(ExpiringToken::expires_in(token, Duration::from_secs(3600)))
+            }
+        })
+        .build()?;
+        assert!(provider.await_ready(Duration::from_secs(5)));
+        let mut server = MockServer::new()?;
+        let builder = server.lsb_http().protocol_version(ProtocolVersion::V2)?;
+        let builder = if wrapped {
+            let provider = provider.clone();
+            builder.http_token_provider(move || provider.token())?
+        } else {
+            builder.http_token_provider(provider.clone())?
+        };
+        let mut sender = builder.retry_timeout(Duration::from_secs(5))?.build()?;
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("test")?
+            .symbol("t1", "v1")?
+            .column_f64("f1", 0.5)?
+            .at(TimestampNanos::new(10000000))?;
+
+        let server_thread = std::thread::spawn(move || -> io::Result<()> {
+            server.accept()?;
+            let req = server.recv_http_q()?;
+            assert_eq!(req.header("authorization"), Some("Bearer T0"));
+            server.send_http_response_q(
+                HttpResponse::empty()
+                    .with_status(401, "Unauthorized")
+                    .with_body_str("Unauthorized"),
+            )?;
+            let req = server.recv_http_q()?;
+            assert_eq!(req.header("authorization"), Some("Bearer T1"));
+            server.send_http_response_q(HttpResponse::empty())?;
+            Ok(())
+        });
+
+        let res = sender.flush_and_keep(&buffer);
+        server_thread.join().unwrap()?;
+        res.map_err(|err| format!("wrapped={wrapped}: {err}"))?;
+        assert_eq!(fetches.load(Ordering::SeqCst), 2, "wrapped={wrapped}");
+        provider.close();
+    }
+    Ok(())
+}
+
+#[test]
 fn test_credential_rotation_keeps_retry_backoff() -> TestResult {
     // Regression: `retry_http_send`'s credential-rotation branch used to make
     // the rotated retry immediate by setting `retry_interval_ms = 0`. That

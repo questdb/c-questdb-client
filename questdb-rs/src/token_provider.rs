@@ -314,12 +314,14 @@ thread_local! {
 /// `rejected`, the `Authorization` value it had presented (`Bearer <token>`).
 ///
 /// A provider is a plain closure, so this is how the rejection reaches an
-/// [`OidcDeviceAuth`](crate::oidc::OidcDeviceAuth) the closure calls: its
-/// cache stops serving that token and it refreshes instead (see
-/// `OidcDeviceAuth::token`). Without it the re-resolution was answered from
-/// the same cache, every 401 for a token the client still considered valid
-/// stood, and the client kept presenting the rejected token until it neared
-/// expiry. Isolated acquisitions carry the mark to their worker thread.
+/// [`OidcDeviceAuth`](crate::oidc::OidcDeviceAuth) or a
+/// [`RefreshingTokenProvider`] the closure calls: its cache stops serving that
+/// token and it refreshes instead (see `OidcDeviceAuth::token` and
+/// [`RefreshingTokenProvider::token`]). Without it the re-resolution was
+/// answered from the same cache, every 401 for a token the client still
+/// considered valid stood, and the client kept presenting the rejected token
+/// until it neared expiry. Isolated acquisitions carry the mark to their worker
+/// thread.
 /// A provider that never consults it is unaffected.
 #[cfg(any(
     feature = "_sender-http",

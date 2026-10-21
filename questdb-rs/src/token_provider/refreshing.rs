@@ -604,7 +604,21 @@ impl RefreshingTokenProvider {
     /// usable token arrives in time, classified like the most recent failed
     /// fetch (retryable when none failed), or as permanent once the provider
     /// is closed.
+    ///
+    /// Called while a client replaces a token that a server rejected with HTTP
+    /// 401, it first refreshes early as [`on_rejected`](Self::on_rejected)
+    /// does, under the same rules. A client calls `on_rejected` itself only on
+    /// a provider attached directly; this covers one wrapped in a closure
+    /// (`move || provider.token()`) or in a type of the application's own.
     pub fn token(&self) -> crate::Result<String> {
+        // A wrapper's `on_rejected` is the trait's no-op, so the rejection
+        // arrives as the calling thread's mark instead, exactly as it reaches a
+        // wrapped `OidcDeviceAuth` (see `with_rejected_credential`). Without
+        // this the cached token -- the rejected one -- was handed straight back
+        // and the 401 stood until the scheduled refresh.
+        if let Some(rejected) = super::rejected_token() {
+            self.on_rejected(&rejected, 401);
+        }
         match self.shared().token_until(None) {
             Ok(token) => Ok(token),
             Err(TokenWait::Failed(err)) => Err(err),
@@ -770,6 +784,9 @@ impl fmt::Debug for RefreshingTokenProvider {
 }
 
 impl Shared {
+    /// The provider's state. Never log or call a token source while holding
+    /// it: `Debug` takes it too, under whatever locks its caller holds -- the
+    /// stderr lock, for `eprintln!("{provider:?}")`.
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -986,14 +1003,22 @@ impl Shared {
             return;
         }
         st.last_forced = Some(now);
+        let target = st.completed_fetches + 1;
+        self.request_fetch_now_locked(&mut st, now);
+        // Log with the state lock released, as `run_fetch` and `close` do. A
+        // `log` backend may hold its own output lock -- stderr's, say -- while
+        // it writes, and a thread formatting this provider with `{:?}` takes
+        // the state lock while holding that same lock (`eprintln!` formats
+        // under the stderr lock): logging under the state lock deadlocked the
+        // two threads, and with them every later user of the provider.
+        drop(st);
         log::info!(
             "questdb: token provider {}: the server rejected the current token with HTTP 401, \
              refreshing early",
             self.name
         );
-        let target = st.completed_fetches + 1;
-        self.request_fetch_now_locked(&mut st, now);
         let deadline = now.saturating_add(self.config.forced_wait.min(MAX_DELAY));
+        let mut st = self.lock();
         while !st.closed && st.completed_fetches < target {
             let now = self.clock.monotonic();
             if now >= deadline || cancel.is_some_and(|cancel| cancel()) {

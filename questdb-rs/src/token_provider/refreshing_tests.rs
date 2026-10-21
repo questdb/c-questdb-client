@@ -536,6 +536,38 @@ fn c8_forced_wait_is_bounded_and_cancellable() {
 }
 
 #[test]
+fn c8_a_wrapped_provider_refreshes_a_token_rejected_with_401() {
+    // Wrapped in a closure, the provider never hears `on_rejected`: the
+    // rejection reaches `token` as the token the calling thread is replacing.
+    let clock = ManualClock::new();
+    let script = Arc::new(Script::default());
+    script.push(Ok(token("T1", T0 + HOUR)));
+    script.push(Ok(token("T2", T0 + 2 * HOUR)));
+    let provider = manual(&clock, &script).build().unwrap();
+    assert!(provider.run_due_fetch());
+    let proactive = provider.scheduled_in();
+    let replacing = |rejected: &'static str| {
+        let provider = provider.clone();
+        move || crate::token_provider::with_rejected_credential(Some(rejected), || provider.token())
+    };
+
+    // No rejection, or one for a token that has already rotated: the cached
+    // token, and no fetch.
+    assert_eq!(provider.token().unwrap(), "T1");
+    assert_eq!(replacing("Bearer stale")().unwrap(), "T1");
+    assert_eq!(provider.scheduled_in(), proactive);
+
+    // Replacing the current token: a forced fetch, waited for.
+    let wrapped = thread::spawn(replacing("Bearer T1"));
+    await_true("the forced fetch to be scheduled", || {
+        provider.scheduled_in() == Some(Duration::ZERO)
+    });
+    assert!(provider.run_due_fetch());
+    assert_eq!(wrapped.join().unwrap().unwrap(), "T2");
+    assert_eq!(script.calls(), 2);
+}
+
+#[test]
 fn close_fails_token_permanently_and_wakes_every_cold_caller() {
     let clock = ManualClock::new();
     let script = Arc::new(Script::default());

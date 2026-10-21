@@ -40,7 +40,8 @@
  * - an **application provider** (`questdb_token_provider_new`): a function
  *   table whose `get_token` returns the current token. Prefer a refreshing
  *   provider unless you already cache tokens: `get_token` runs on every
- *   connect round.
+ *   connect round of a QWP/WebSocket sender, reader or pool, and on every
+ *   flush of an ILP/HTTP sender.
  *
  * Attach it with `line_sender_opts_token_provider`,
  * `questdb_db_connect_options.token_provider` or
@@ -58,7 +59,9 @@
  *   with itself. It may block, but should bound its own network calls (30 s
  *   per attempt is recommended).
  * - `get_token` and `on_rejected` run on a connect thread or an isolated
- *   worker, possibly concurrently.
+ *   worker for a QWP/WebSocket sender, reader or pool, and synchronously on
+ *   the flushing thread, inside the flush call, for an ILP/HTTP sender.
+ *   Calls may run concurrently.
  * - A callback must report through the sink it is given, which is valid only
  *   during the call, and must not call into a client that uses the same
  *   provider.
@@ -374,10 +377,11 @@ bool questdb_error_token_unavailable_get_view(
 
 /**
  * Attach `provider` to HTTP(S) or QWP/WebSocket sender options. The options
- * keep their own reference. On a 401 the sender calls the provider's
- * `on_rejected`, pulls again, and retries once if the token changed and the
- * `WWW-Authenticate` challenge allows it (no Bearer error, or
- * `invalid_token`).
+ * keep their own reference. A QWP/WebSocket sender pulls the token once per
+ * connect round; an ILP/HTTP sender pulls it on every flush, on the flushing
+ * thread. On a 401 the sender calls the provider's `on_rejected`, pulls
+ * again, and retries once if the token changed and the `WWW-Authenticate`
+ * challenge allows it (no Bearer error, or `invalid_token`).
  *
  * Mutually exclusive with `username`/`password`, `token` and
  * `line_sender_opts_oidc_auth`: one opts take one rotating provider, so a

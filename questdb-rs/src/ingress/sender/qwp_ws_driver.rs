@@ -5081,6 +5081,91 @@ mod tests {
     }
 
     #[test]
+    fn an_established_connection_rides_out_rejections_past_its_reconnect_budget() {
+        // D1 must outlast `reconnect_max_duration`, not just one budget: an
+        // identity-provider outage can last longer. When the budget runs out,
+        // its error keeps the rejection's HTTP status, which is what lets the
+        // expiry start a fresh budget instead of ending the sender with an
+        // AuthError.
+        for status in [401, 403] {
+            let budget_error = retry_budget_exhausted_error(
+                "QWP/WebSocket reconnect",
+                3,
+                Instant::now(),
+                Some(upgrade_rejection(status)),
+            );
+            assert_eq!(budget_error.code(), ErrorCode::AuthError);
+            assert_eq!(budget_error.ws_http_status(), Some(status));
+            assert!(
+                !reconnect_error_is_terminal_when_established(&budget_error),
+                "{status}: {budget_error}"
+            );
+
+            let transport = TestTransport::scripted([
+                Ok(TransportSendResult::Failure(TransportFailure::Disconnect(
+                    fake_transport_error("disconnect"),
+                ))),
+                Ok(TransportSendResult::Response(TransportResponse::Ack {
+                    wire_seq: 0,
+                })),
+            ])
+            .with_restart_results(rejected_restarts(1_000, status));
+            let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+                memory_queue(options(8, 1024)),
+                transport,
+                ReconnectPolicy::bounded(
+                    Duration::from_millis(10),
+                    Duration::from_millis(1),
+                    Duration::from_millis(1),
+                ),
+                false,
+            );
+            let receipt = driver.try_submit(b"payload").unwrap();
+
+            // Each budget reports its own deadline: ride out three expiries.
+            let started = Instant::now();
+            let mut budgets = 0;
+            let mut current = None;
+            while budgets < 4 {
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "{status}: stuck in reconnect budget {budgets}"
+                );
+                match driver.drive_once().unwrap() {
+                    DriveOutcome::ReconnectDelay { deadline, .. } => {
+                        if current != Some(deadline) {
+                            current = Some(deadline);
+                            budgets += 1;
+                        }
+                    }
+                    other => panic!(
+                        "{status}: {other:?} in reconnect budget {budgets}: {:?}",
+                        driver.terminal_error()
+                    ),
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(driver.terminal_error(), None, "{status}");
+            assert!(driver.receipt_status(receipt).is_pending(), "{status}");
+
+            // The server accepts the credential again: the frame replays.
+            driver.send_core.transport.restart_results.clear();
+            let mut drives = 0;
+            while driver.receipt_status(receipt).is_pending() {
+                assert!(drives < 16, "{status}: the frame was not replayed");
+                driver.drive_once().unwrap();
+                drives += 1;
+            }
+            assert_eq!(
+                driver.receipt_status(receipt),
+                QwpReceiptStatus::Completed { fsn: 0 },
+                "{status}"
+            );
+            assert_eq!(driver.terminal_error(), None, "{status}");
+        }
+    }
+
+    #[test]
     fn an_orphan_retires_a_rotating_credential_after_its_ride_out() {
         let mut driver = disconnect_then_restarts(rejected_restarts(6, 401));
         driver

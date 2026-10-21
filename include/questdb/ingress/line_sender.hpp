@@ -1538,7 +1538,9 @@ public:
     /**
      * Attach a rotating Bearer-token provider (see `questdb::token_provider`)
      * to an HTTP(S) or QWP/WebSocket sender. The options keep their own
-     * reference. On a 401 the sender tells the provider which token was
+     * reference. A QWP/WebSocket sender pulls the token once per connect
+     * round; an HTTP(S) sender pulls it on every flush, on the flushing
+     * thread. On a 401 the sender tells the provider which token was
      * rejected, pulls again, and retries once if the token changed.
      * Mutually exclusive with `username()`/`password()`, `token()` and
      * `oidc_auth()`: one opts take one rotating provider. Use `https::` or

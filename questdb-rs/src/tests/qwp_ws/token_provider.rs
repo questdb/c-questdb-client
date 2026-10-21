@@ -720,6 +720,73 @@ fn an_established_sender_rides_out_upgrade_rejections() {
     }
 }
 
+/// Upgrades the first connection and drops it as soon as one frame arrives,
+/// unacknowledged. Answers every connection made within `window` of that drop
+/// with `rejection`, then upgrades the next one and acknowledges everything on
+/// it. The server thread returns how many connections it rejected.
+fn spawn_reject_for_server(
+    rejection: &'static [u8],
+    window: Duration,
+) -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut first).unwrap();
+        read_frame(&mut first).unwrap();
+        drop(first);
+        let dropped_at = Instant::now();
+        let mut rejected = 0;
+        loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            if dropped_at.elapsed() < window {
+                reject_upgrade(&mut stream, rejection);
+                rejected += 1;
+            } else {
+                perform_server_upgrade(&mut stream).unwrap();
+                ack_every_frame(&mut stream);
+                return rejected;
+            }
+        }
+    });
+    (port, server)
+}
+
+/// D1 beyond one `reconnect_max_duration`: rejections that outlast the
+/// reconnect budget are ridden out like shorter ones, because an expired
+/// budget starts a fresh one instead of ending the sender.
+#[test]
+fn an_established_sender_rides_out_rejections_longer_than_its_reconnect_budget() {
+    for (rejection, status) in [(PLAIN_401, 401), (FORBIDDEN_403, 403)] {
+        for progress in [ProgressCase::Background, ProgressCase::Manual] {
+            // Ten 50 ms budgets' worth of rejections.
+            let (port, server) = spawn_reject_for_server(rejection, Duration::from_millis(500));
+            let builder = SenderBuilder::from_conf(format!(
+                "ws::addr=127.0.0.1:{port};token=static-secret;\
+                 reconnect_max_duration_millis=50;\
+                 reconnect_initial_backoff_millis=1;reconnect_max_backoff_millis=5;"
+            ))
+            .unwrap();
+            let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+            let mut buf = one_row_buffer(&sender);
+            sender.flush(&mut buf).unwrap();
+
+            sender
+                .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{status} {}: the row was not delivered after rejections that \
+                         outlasted the reconnect budget: {err}",
+                        progress.name()
+                    )
+                });
+            drop(sender);
+            let rejected = server.join().unwrap();
+            assert!(rejected > 1, "{status} {}: {rejected}", progress.name());
+        }
+    }
+}
+
 /// C13: once connected, a sender rides out a token provider that cannot
 /// supply a credential -- even one it classifies permanent -- and recovers
 /// when the provider does.

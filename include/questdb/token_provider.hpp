@@ -91,9 +91,11 @@ private:
 
 /**
  * A provider implemented by the application: the counterpart of the Java
- * client's `HttpTokenProvider`. `token()` runs on every connect round, on a
- * connect thread or an isolated worker, possibly concurrently; prefer a
- * refreshing provider unless you already cache tokens.
+ * client's `HttpTokenProvider`. `token()` runs on every connect round of a
+ * QWP/WebSocket sender, reader or pool, on a connect thread or an isolated
+ * worker, and on every flush of an ILP/HTTP sender, synchronously on the
+ * flushing thread. Calls may run concurrently. Prefer a refreshing provider
+ * unless you already cache tokens.
  */
 class bearer_token_provider
 {
