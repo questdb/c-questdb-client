@@ -1516,9 +1516,12 @@ pub unsafe extern "C" fn line_sender_buffer_clear(buffer: *mut line_sender_buffe
 
 /// The current encoded size of the buffered data.
 ///
-/// For ILP buffers this is the exact pending byte length. For QWP buffers this
-/// is a buffered size hint, not the exact size of an eventual UDP datagram or
-/// WebSocket replay frame.
+/// For ILP buffers this is the exact pending byte length. For QWP/UDP buffers
+/// this is a buffered size hint, not the exact size of an eventual datagram.
+/// For QWP/WebSocket buffers it is at least the size of the frame that
+/// flushing the buffer encodes, unless store-and-forward has fallen back to
+/// sending full symbol dictionaries because its symbol side-file could not be
+/// opened or rolled back.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_size(buffer: *const line_sender_buffer) -> size_t {
     unsafe {
@@ -3945,6 +3948,46 @@ pub unsafe extern "C" fn line_sender_qwpws_errors_dropped(
         match sender.qwp_ws_errors_dropped() {
             Ok(dropped) => {
                 *dropped_out = dropped;
+                true
+            }
+            Err(err) => {
+                set_err_out_from_sender_error(err_out, sender, err);
+                false
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_effective_frame_cap(
+    sender: *const line_sender,
+    cap_out: *mut usize,
+    server_cap_known_out: *mut bool,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        if cap_out.is_null() || server_cap_known_out.is_null() {
+            let output = if cap_out.is_null() {
+                "cap_out"
+            } else {
+                "server_cap_known_out"
+            };
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("line_sender_qwpws_effective_frame_cap requires non-NULL {output}"),
+            );
+            return false;
+        }
+        let Some(sender) =
+            qwpws_line_sender_ref(sender, err_out, "line_sender_qwpws_effective_frame_cap")
+        else {
+            return false;
+        };
+        match sender.effective_frame_cap() {
+            Ok((cap, server_cap_known)) => {
+                *cap_out = cap;
+                *server_cap_known_out = server_cap_known;
                 true
             }
             Err(err) => {

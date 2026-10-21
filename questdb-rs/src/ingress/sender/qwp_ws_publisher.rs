@@ -275,8 +275,8 @@ pub(crate) fn qwp_ws_encoded_message_size_error(
     max_buf_size: usize,
 ) -> crate::Error {
     error::fmt!(
-        InvalidApiCall,
-        "Could not flush buffer: QWP/WebSocket encoded message size of {} exceeds maximum configured allowed size of {} bytes.",
+        BatchTooLarge,
+        "Could not flush buffer: QWP/WebSocket encoded message size of {} bytes exceeds the per-frame cap of {} bytes.",
         encoded_len,
         max_buf_size
     )
@@ -405,7 +405,7 @@ mod tests {
         let err = encoder
             .encode_with_max_size(&buffer, local_hint)
             .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), ErrorCode::BatchTooLarge);
         assert!(err.msg().contains("QWP/WebSocket encoded message size"));
         assert_eq!(encoder.global_dict.len(), seeded_symbols);
 

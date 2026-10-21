@@ -2559,9 +2559,8 @@ impl QwpWsSizeHint {
         }
 
         QWP_MESSAGE_HEADER_SIZE
-            + 2
             + self.encoded_tables_len
-            + qwp_varint_size(0)
+            + QWP_WS_SYMBOL_ID_MAX_LEN
             + qwp_varint_size(self.symbol_dict_count as u64)
             + self.symbol_dict_bytes
     }
@@ -2831,7 +2830,7 @@ impl QwpWsColumnarBuffer {
 
     #[cfg(test)]
     fn recompute_len_slow(&self) -> usize {
-        let mut total = QWP_MESSAGE_HEADER_SIZE + 2;
+        let mut total = QWP_MESSAGE_HEADER_SIZE;
         let mut symbol_dict_count = 0usize;
         let mut symbol_dict_bytes = 0usize;
         for table in self.tables.iter().filter(|table| table.row_count > 0) {
@@ -2854,7 +2853,10 @@ impl QwpWsColumnarBuffer {
                 }
             }
         }
-        total + qwp_varint_size(0) + qwp_varint_size(symbol_dict_count as u64) + symbol_dict_bytes
+        total
+            + QWP_WS_SYMBOL_ID_MAX_LEN
+            + qwp_varint_size(symbol_dict_count as u64)
+            + symbol_dict_bytes
     }
 
     #[cfg(test)]
@@ -4127,7 +4129,7 @@ impl QwpWsColumnBuffer {
     fn rollback_rows_from(&mut self, from: u32) {
         if let QwpWsColumnValues::Symbol { cells, dict, .. } = &self.values {
             for cell in cells.iter().rev().take_while(|cell| cell.row_idx >= from) {
-                self.symbol_cells_encoded_len -= qwp_varint_size(cell.local_id as u64);
+                self.symbol_cells_encoded_len -= QWP_WS_SYMBOL_ID_MAX_LEN;
                 if cell.is_new {
                     let entry = &dict[cell.local_id as usize];
                     self.symbol_dict_encoded_len -= qwp_string_byte_len(entry.len as usize);
@@ -4317,7 +4319,7 @@ impl QwpWsColumnBuffer {
             is_new,
         });
         self.increment_non_null()?;
-        self.symbol_cells_encoded_len += qwp_varint_size(local_id as u64);
+        self.symbol_cells_encoded_len += QWP_WS_SYMBOL_ID_MAX_LEN;
         if is_new {
             self.symbol_dict_encoded_len += qwp_string_byte_len(bytes.len());
         }
@@ -4881,10 +4883,7 @@ impl QwpWsColumnValues {
                 cells.len().saturating_mul(8)
             }
             Self::String { cells, data } => (cells.len() + 1).saturating_mul(4) + data.len(),
-            Self::Symbol { cells, .. } => cells
-                .iter()
-                .map(|cell| qwp_varint_size(cell.local_id as u64))
-                .sum(),
+            Self::Symbol { cells, .. } => cells.len().saturating_mul(QWP_WS_SYMBOL_ID_MAX_LEN),
             Self::Decimal { cells, .. } => {
                 1 + cells
                     .iter()
@@ -5501,6 +5500,15 @@ impl Default for SymbolGlobalDict {
 /// reader has its own, independent ceiling; see `egress/symbol_dict.rs`.)
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 2_000_000;
+
+/// Bytes the QWP/WS size hint charges for each connection-wide symbol id a
+/// frame carries: every symbol cell, and the delta dictionary's start id.
+/// The buffer cannot see those ids until the flush interns its symbols, so
+/// it charges the widest varint an id can take. Ids stay below
+/// [`MAX_CONN_SYMBOL_DICT_SIZE`] and the start id reaches it at most, which
+/// keeps the hint at or above the encoded frame.
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_WS_SYMBOL_ID_MAX_LEN: usize = qwp_varint_size(MAX_CONN_SYMBOL_DICT_SIZE as u64);
 
 /// Per-connection cap on the cumulative UTF-8 heap (in bytes) the QWP/WS global
 /// symbol dictionary holds. Matches `MAX_CONN_DICT_HEAP_BYTES` in the egress
@@ -7421,7 +7429,7 @@ fn qwp_string_byte_len(byte_len: usize) -> usize {
     qwp_varint_size(byte_len as u64) + byte_len
 }
 
-fn qwp_varint_size(mut value: u64) -> usize {
+const fn qwp_varint_size(mut value: u64) -> usize {
     let mut size = 1usize;
     while value > 0x7F {
         value >>= 7;
@@ -10560,6 +10568,83 @@ mod tests {
         assert_eq!(cloned.len(), cloned.recompute_len_slow());
         buf.clear();
         assert_eq!(buf.len(), buf.recompute_len_slow());
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_size_hint_covers_encoded_frame_when_symbol_ids_widen() {
+        // A frame carries each symbol cell as its connection-wide id. The
+        // 500-value column comes first, so the other columns' ids start past
+        // its own, and the connection may have interned symbols before.
+        fn add_rows(buf: &mut QwpWsColumnarBuffer, rows: std::ops::Range<i64>) {
+            for i in rows {
+                let row = buf.table("trades").unwrap();
+                row.symbol("ticker", format!("T{:03}", (i * 7919) % 500).as_str())
+                    .unwrap();
+                row.symbol(
+                    "exchange",
+                    ["NYSE", "NASDAQ", "ARCA", "BATS"][(i % 4) as usize],
+                )
+                .unwrap();
+                row.symbol("side", ["buy", "sell"][((i / 3) % 2) as usize])
+                    .unwrap();
+                row.symbol("ccy", ["USD", "EUR", "GBP"][((i / 5) % 3) as usize])
+                    .unwrap();
+                if i % 3 != 0 {
+                    row.symbol("venue", format!("V{}", (i / 7) % 8).as_str())
+                        .unwrap();
+                }
+                row.column_f64("price", i as f64 * 0.5).unwrap();
+                row.at_now().unwrap();
+            }
+        }
+
+        fn assert_covers(
+            buf: &QwpWsColumnarBuffer,
+            global_dict: &mut SymbolGlobalDict,
+            warm: usize,
+            what: &str,
+        ) {
+            let mut scratch = QwpWsEncodeScratch::new();
+            let mut out = Vec::new();
+            buf.encode_ws_replay_message_with_defer(
+                &mut out,
+                &mut scratch,
+                global_dict,
+                QWP_VERSION_1,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(
+                out.len() <= buf.len(),
+                "{what} after {warm} interned symbols: encoded {} bytes, size hint {}",
+                out.len(),
+                buf.len()
+            );
+        }
+
+        for warm in [0usize, 127, 128, 16_383, 16_384] {
+            let mut global_dict = SymbolGlobalDict::new();
+            for i in 0..warm {
+                global_dict.intern(format!("w{i:05}").as_bytes()).unwrap();
+            }
+            let mut buf = QwpWsColumnarBuffer::new(127);
+
+            add_rows(&mut buf, 0..600);
+            assert_covers(&buf, &mut global_dict, warm, "new symbols");
+
+            buf.clear();
+            add_rows(&mut buf, 600..1200);
+            assert_covers(&buf, &mut global_dict, warm, "known symbols");
+
+            let before_marker = buf.len();
+            buf.set_marker().unwrap();
+            add_rows(&mut buf, 1200..1201);
+            buf.rewind_to_marker().unwrap();
+            assert_eq!(buf.len(), before_marker);
+            assert_covers(&buf, &mut global_dict, warm, "after a rewind");
+        }
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

@@ -513,6 +513,9 @@ pub(crate) struct ManualQwpWsHandlerState {
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
+    /// Hard cap on a single queued frame's payload, as on
+    /// [`SyncQwpWsHandlerState::sfa_frame_payload_cap`].
+    pub(crate) sfa_frame_payload_cap: usize,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
@@ -3700,6 +3703,7 @@ pub(crate) fn open_manual_qwp_ws(
         send_core: parts.send_core,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
+        sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,

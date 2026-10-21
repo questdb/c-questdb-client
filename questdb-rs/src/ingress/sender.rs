@@ -44,7 +44,7 @@ use crate::ingress::SenderBuilder;
 use crate::ingress::{Buffer, Protocol, ProtocolVersion};
 use std::fmt::{Debug, Formatter};
 #[cfg(feature = "sync-sender-qwp-ws")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::time::{Duration, Instant};
 
@@ -134,13 +134,44 @@ mod http;
 #[cfg(feature = "sync-sender-http")]
 pub(crate) use http::*;
 
+/// The binding per-frame cap of a store-and-forward QWP/WebSocket publication:
+/// the configured `max_buf_size`, clamped to the server's advertised
+/// `X-QWP-Max-Batch-Size` (0 = not advertised) and to the queue's segment
+/// payload capacity, which rejects any larger frame. Also reports whether the
+/// server advertised a cap, whether or not it is the binding one.
 #[cfg(feature = "sync-sender-qwp-ws")]
-fn effective_qwp_ws_max_buf_size(configured: usize, server_max: &AtomicUsize) -> usize {
-    let server = server_max.load(Ordering::Relaxed);
-    if server > 0 {
-        configured.min(server)
+pub(crate) fn effective_hard_frame_cap(
+    max_buf_size: usize,
+    server_max_batch_size: usize,
+    sfa_frame_payload_cap: usize,
+) -> (usize, bool) {
+    let configured_cap = if server_max_batch_size == 0 {
+        max_buf_size
     } else {
-        configured
+        max_buf_size.min(server_max_batch_size)
+    };
+    (
+        configured_cap.min(sfa_frame_payload_cap),
+        server_max_batch_size != 0,
+    )
+}
+
+/// Name the limit that [`effective_hard_frame_cap`] returns, so a size error
+/// points at the setting that actually binds.
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn effective_hard_frame_cap_source(
+    max_buf_size: usize,
+    server_max_batch_size: usize,
+    sfa_frame_payload_cap: usize,
+) -> &'static str {
+    let (cap, _) =
+        effective_hard_frame_cap(max_buf_size, server_max_batch_size, sfa_frame_payload_cap);
+    if server_max_batch_size != 0 && cap == server_max_batch_size {
+        "the server's advertised X-QWP-Max-Batch-Size"
+    } else if cap == max_buf_size {
+        "max_buf_size"
+    } else {
+        "the sf_max_segment_bytes segment payload capacity"
     }
 }
 
@@ -367,17 +398,14 @@ impl Sender {
             ));
         }
 
+        let (server_max, sfa_frame_payload_cap) = self
+            .qwp_ws_frame_cap_inputs()
+            .expect("QWP/WebSocket handler was checked above");
+        let (max, _) =
+            effective_hard_frame_cap(self.max_buf_size, server_max, sfa_frame_payload_cap);
         let result = match &mut self.handler {
-            SyncProtocolHandler::SyncQwpWs(state) => {
-                let max =
-                    effective_qwp_ws_max_buf_size(self.max_buf_size, &state.server_max_batch_size);
-                flush_qwp_ws(state, qwp, max)
-            }
-            SyncProtocolHandler::ManualQwpWs(state) => {
-                let max =
-                    effective_qwp_ws_max_buf_size(self.max_buf_size, &state.server_max_batch_size);
-                flush_qwp_ws_manual(state, qwp, max)
-            }
+            SyncProtocolHandler::SyncQwpWs(state) => flush_qwp_ws(state, qwp, max),
+            SyncProtocolHandler::ManualQwpWs(state) => flush_qwp_ws_manual(state, qwp, max),
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
         if result
@@ -386,7 +414,38 @@ impl Sender {
         {
             self.connected = false;
         }
-        result
+        result.map_err(|err| {
+            if err.code() == crate::ErrorCode::BatchTooLarge {
+                let source = effective_hard_frame_cap_source(
+                    self.max_buf_size,
+                    server_max,
+                    sfa_frame_payload_cap,
+                );
+                crate::Error::new(
+                    crate::ErrorCode::BatchTooLarge,
+                    format!("{} The cap is set by {}.", err.msg(), source),
+                )
+            } else {
+                err
+            }
+        })
+    }
+
+    /// The server's advertised cap (0 = not advertised) and the queue's segment
+    /// payload capacity, or `None` for a sender that is not QWP/WebSocket.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn qwp_ws_frame_cap_inputs(&self) -> Option<(usize, usize)> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => Some((
+                state.server_max_batch_size.load(Ordering::Acquire),
+                state.sfa_frame_payload_cap,
+            )),
+            SyncProtocolHandler::ManualQwpWs(state) => Some((
+                state.server_max_batch_size.load(Ordering::Acquire),
+                state.sfa_frame_payload_cap,
+            )),
+            _ => None,
+        }
     }
 
     #[allow(unused_variables)]
@@ -631,6 +690,31 @@ impl Sender {
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
         self.flush_qwp_ws_buffer(buf, false)
+    }
+
+    /// Return the binding per-frame cap of this QWP/WebSocket sender and whether
+    /// the current connection advertised `X-QWP-Max-Batch-Size`, whether or not
+    /// that value is the binding limit.
+    ///
+    /// The cap is the smallest of `max_buf_size`, the server's advertised cap
+    /// and the store-and-forward segment payload capacity. A flush whose
+    /// encoded frame exceeds it fails with
+    /// [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge) and
+    /// publishes nothing. The value can change after a reconnect.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn effective_frame_cap(&self) -> Result<(usize, bool)> {
+        let (server_max, sfa_frame_payload_cap) =
+            self.qwp_ws_frame_cap_inputs().ok_or_else(|| {
+                error::fmt!(
+                    InvalidApiCall,
+                    "effective_frame_cap is only supported for QWP/WebSocket senders."
+                )
+            })?;
+        Ok(effective_hard_frame_cap(
+            self.max_buf_size,
+            server_max,
+            sfa_frame_payload_cap,
+        ))
     }
 
     /// Return the highest frame sequence number published locally by this
