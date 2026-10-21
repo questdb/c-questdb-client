@@ -244,7 +244,9 @@ inline void provider_on_rejected(
 
 /**
  * A rotating Bearer-token provider for senders, readers and pools; see
- * `questdb/token_provider.h`. Copies share the provider.
+ * `questdb/token_provider.h`. Not copyable, like `oidc::device_auth`: take
+ * another handle to the same provider with `share()`, or pass
+ * `const token_provider&`.
  *
  * ```cpp
  * auto tokens = questdb::token_provider::refreshing([] {
@@ -327,25 +329,24 @@ public:
             ::questdb_token_provider_new, &vtable, static_cast<void*>(heap))};
     }
 
-    token_provider(const token_provider& other)
-        : _raw{::questdb_token_provider_clone(other._raw)}
-    {
-    }
+    /**
+     * Not copyable: copying would read as a value copy and alias instead.
+     *
+     * `questdb_token_provider_clone` does not duplicate the provider. It takes
+     * another handle on ONE shared provider, whose cached token and closed
+     * state are common to every handle and to every sender, reader and pool
+     * attached to any of them. So `close()` on a copy would permanently end
+     * the clients the original was attached to, as `close()` on a copy of an
+     * `oidc::device_auth` would. Use `share()` when an additional handle is
+     * what you want, or pass `const token_provider&`.
+     */
+    token_provider(const token_provider&) = delete;
+    token_provider& operator=(const token_provider&) = delete;
 
     token_provider(token_provider&& other) noexcept
         : _raw{other._raw}
     {
         other._raw = nullptr;
-    }
-
-    token_provider& operator=(const token_provider& other)
-    {
-        if (this != &other)
-        {
-            ::questdb_token_provider_free(_raw);
-            _raw = ::questdb_token_provider_clone(other._raw);
-        }
-        return *this;
     }
 
     token_provider& operator=(token_provider&& other) noexcept
@@ -363,6 +364,35 @@ public:
     ~token_provider()
     {
         ::questdb_token_provider_free(_raw);
+    }
+
+    /**
+     * Take an additional handle on the SAME provider.
+     *
+     * Not a copy: every handle `share()` produces, and every sender, reader
+     * and pool attached to any of them, uses one provider, so `close()` on one
+     * ends them all. Each handle must be destroyed independently; destroying
+     * one leaves the others usable.
+     * @throws questdb::error with `invalid_api_call` if this handle is empty
+     *         or moved from, or was inherited across `fork()`.
+     */
+    token_provider share() const
+    {
+        if (!_raw)
+        {
+            throw ::questdb::error{
+                ::questdb::error_code::invalid_api_call,
+                "Cannot share an empty or moved-from questdb::token_provider."};
+        }
+        ::questdb_token_provider* shared = ::questdb_token_provider_clone(_raw);
+        if (!shared)
+        {
+            throw ::questdb::error{
+                ::questdb::error_code::invalid_api_call,
+                "This token provider was inherited across fork() and cannot "
+                "be shared in this process."};
+        }
+        return token_provider{shared};
     }
 
     /**
@@ -394,8 +424,9 @@ public:
             _raw, detail::duration_ms(timeout, "timeout"));
     }
 
-    /** Close a refreshing provider, ending every client that uses it.
-     *  Attaching it to a new sender, pool or reader then fails. */
+    /** Close a refreshing provider, ending every client that uses it,
+     *  through this handle or any `share()` handle. Attaching it to a new
+     *  sender, pool or reader then fails. */
     void close() const
     {
         ::questdb_token_provider_close(_raw);

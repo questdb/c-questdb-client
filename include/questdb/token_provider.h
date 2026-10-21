@@ -253,7 +253,9 @@ questdb_token_provider* questdb_token_provider_new(
     void* user_data,
     questdb_error** err_out);
 
-/** Another handle to the same provider; NULL for NULL. */
+/** Another handle to the same provider, not an independent copy: closing
+ *  any handle closes the provider for every handle and client. NULL for NULL
+ *  and for a handle inherited across `fork()`. */
 QUESTDB_CLIENT_API
 questdb_token_provider* questdb_token_provider_clone(
     const questdb_token_provider* provider);

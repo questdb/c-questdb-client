@@ -624,7 +624,8 @@ pub unsafe extern "C" fn questdb_token_provider_new(
     new_handle(ProviderKind::Callbacks(CallbackProvider(Arc::new(target))))
 }
 
-/// Another handle to the same provider. NULL for NULL.
+/// Another handle to the same provider, not an independent copy. NULL for NULL
+/// and for a handle inherited across `fork()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_token_provider_clone(
     provider: *const questdb_token_provider,

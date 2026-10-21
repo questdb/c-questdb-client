@@ -36,10 +36,20 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 using namespace std::chrono_literals;
+
+// Another handle is taken explicitly, as for `oidc::device_auth`: a copy would
+// alias one shared provider, so `close()` on the "copy" would end every client
+// of the original.
+static_assert(!std::is_copy_constructible<questdb::token_provider>::value);
+static_assert(!std::is_copy_assignable<questdb::token_provider>::value);
+static_assert(
+    std::is_nothrow_move_constructible<questdb::token_provider>::value);
+static_assert(std::is_nothrow_move_assignable<questdb::token_provider>::value);
 
 TEST_CASE("A refreshing provider serves its source's token")
 {
@@ -54,12 +64,26 @@ TEST_CASE("A refreshing provider serves its source's token")
     CHECK(provider.await_ready(10s));
     CHECK(provider.token() == "T1");
 
-    // Copies share the provider; closing it ends every holder.
-    const questdb::token_provider copy{provider};
-    CHECK(copy.token() == "T1");
-    copy.close();
+    // A shared handle addresses the same provider; closing it ends every
+    // holder.
+    const questdb::token_provider shared = provider.share();
+    CHECK(shared.raw() != provider.raw());
+    CHECK(shared.token() == "T1");
+    shared.close();
     CHECK_THROWS_AS(provider.token(), questdb::error);
     CHECK(fetches.load() == 1);
+
+    // A moved-from handle has nothing to share.
+    auto moved = std::move(provider);
+    try
+    {
+        (void)provider.share();
+        FAIL("a moved-from provider was shared");
+    }
+    catch (const questdb::error& e)
+    {
+        CHECK(e.code() == questdb::error_code::invalid_api_call);
+    }
 }
 
 TEST_CASE("A token that never expires is served")
