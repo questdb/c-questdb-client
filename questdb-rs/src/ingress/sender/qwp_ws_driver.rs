@@ -350,6 +350,11 @@ impl QwpWsReconnectState {
         self.policy.initial_backoff
     }
 
+    /// How many reconnect attempts this budget has made.
+    pub(crate) fn attempts(&self) -> usize {
+        self.attempts
+    }
+
     fn deadline_expired(&self) -> bool {
         reconnect_deadline_expired(self.deadline)
     }
@@ -2019,7 +2024,15 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     store.mark_terminal(Some(error));
                     Ok(DriveOutcome::Terminal)
                 } else {
-                    store.record_reconnect_failure(&error);
+                    // A budget spent before its first attempt -- a manual
+                    // caller that did not drive progress for longer than
+                    // `reconnect_max_duration` -- has no reconnect failure to
+                    // report. Its error wraps what started the reconnect, a
+                    // server rejection among them, which an ACK wait would
+                    // otherwise name as the reason reconnecting keeps failing.
+                    if reconnect.attempts() > 0 {
+                        store.record_reconnect_failure(&error);
+                    }
                     let sleep_for = reconnect.policy.initial_backoff();
                     let next = QwpWsReconnectState::new(
                         reconnect.policy,
@@ -2846,7 +2859,9 @@ pub(crate) fn reconnect_backoff_step(
 /// retryability and OIDC detail. A credential that needs a new sign-in reads
 /// as `INTERACTION_REQUIRED` (`questdb_error_oidc_get_view`) --
 /// as `line_sender_opts_oidc_auth` promises -- instead of as a live server
-/// that stopped acknowledging.
+/// that stopped acknowledging. A server-rejection diagnostic is the exception:
+/// it marks the error that halted a sender (`line_sender_error_qwpws_get_view`),
+/// and this error is retryable, so it is not carried over.
 pub(crate) fn ack_wait_timeout_error(
     operation: &str,
     timeout: Duration,
@@ -2877,7 +2892,10 @@ pub(crate) fn ack_wait_timeout_error(
          twice."
     );
     match reconnect_failure {
-        Some(cause) => cause.clone().reclassified(ErrorCode::FailoverRetry, msg),
+        Some(cause) => cause
+            .clone()
+            .without_qwp_ws_rejection()
+            .reclassified(ErrorCode::FailoverRetry, msg),
         None => Error::new(ErrorCode::FailoverRetry, msg),
     }
 }
@@ -4864,6 +4882,80 @@ mod tests {
         assert!(down.msg().contains("Do not re-flush"), "{down}");
         assert!(!down.msg().contains("the connection is alive"), "{down}");
         assert!(!down.in_doubt());
+    }
+
+    #[test]
+    fn ack_wait_timeout_carries_no_server_rejection_diagnostic() {
+        // The structured rejection marks the error that halted a sender
+        // (`line_sender_error_qwpws_get_view`); an ACK-wait timeout is
+        // retryable, whatever its cause carried.
+        let cause = server_rejection_error(
+            Error::new(ErrorCode::ServerFlushError, "write failed"),
+            sender_error(0),
+        );
+        assert!(cause.qwp_ws_rejection().is_some());
+        let err = ack_wait_timeout_error("wait", Duration::from_millis(50), 0, None, Some(&cause));
+        assert_eq!(err.code(), ErrorCode::FailoverRetry);
+        assert!(err.msg().contains("write failed"), "{err}");
+        assert!(err.qwp_ws_rejection().is_none());
+    }
+
+    #[test]
+    fn a_reconnect_budget_spent_before_any_attempt_latches_no_failure() {
+        // A manual-progress caller that does not drive the sender for longer
+        // than the reconnect budget after a retriable rejection: the budget
+        // runs out before the first attempt. Nothing has failed to reconnect,
+        // so an ACK wait must not name the rejection that started the
+        // reconnect as the reason reconnecting keeps failing.
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+            TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed"),
+            },
+        ))])
+        .with_restart_results([Err(DriverError::Transport(fake_transport_error(
+            "connection refused",
+        )))]);
+        // Long enough that the fresh budget below cannot lapse between two
+        // back-to-back drives on a loaded machine.
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024)),
+            transport,
+            ReconnectPolicy::bounded(
+                Duration::from_millis(200),
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            ),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+        let deadline = match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { deadline, .. } => deadline.unwrap(),
+            other => panic!("expected the paced first attempt, got {other:?}"),
+        };
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+        );
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::ReconnectDelay { .. }
+        ));
+        assert_eq!(driver.send_core.transport.restart_attempts, 0);
+        assert!(
+            driver.store.reconnect_failure().is_none(),
+            "{:?}",
+            driver.store.reconnect_failure()
+        );
+
+        // The fresh budget's first attempt fails, and that is latched.
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::ReconnectDelay { .. }
+        ));
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+        let failure = driver.store.reconnect_failure().expect("latched");
+        assert!(failure.msg().contains("connection refused"), "{failure}");
+        assert!(failure.qwp_ws_rejection().is_none());
     }
 
     #[test]

@@ -668,6 +668,16 @@ impl Error {
         self
     }
 
+    /// Drop the structured QWP/WebSocket rejection, keeping every other
+    /// diagnostic. That rejection marks the error that halted a sender
+    /// (`line_sender_error_qwpws_get_view`), so a wrapper reporting a
+    /// retryable condition must not carry one over from its cause.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn without_qwp_ws_rejection(mut self) -> Self {
+        self.0.qwp_ws_rejection = None;
+        self
+    }
+
     #[cfg(feature = "_sender-qwp-ws")]
     pub(crate) fn with_qwp_ws_role_reject(
         mut self,

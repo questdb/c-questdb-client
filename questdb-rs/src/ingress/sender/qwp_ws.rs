@@ -1788,7 +1788,11 @@ where
                     if reconnect_error_is_terminal_when_established(&err) {
                         return self.mark_store_terminal(shared, err);
                     }
-                    if let Some(step) = self.record_reconnect_failure(shared, &err) {
+                    // As in the manual driver: a budget spent before its
+                    // first attempt has no reconnect failure to report.
+                    if reconnect.attempts() > 0
+                        && let Some(step) = self.record_reconnect_failure(shared, &err)
+                    {
                         return step;
                     }
                     sleep_for = reconnect.initial_backoff();
@@ -4527,10 +4531,18 @@ fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Re
 }
 
 fn qwp_ws_manual_close_timeout_error(state: &ManualQwpWsHandlerState) -> crate::Error {
+    manual_close_timeout_error(state.store.reconnect_failure())
+}
+
+/// The error of a manual close drain whose deadline passed before every
+/// published frame was acknowledged, naming the latest reconnect failure if
+/// there is one. As for an ACK-wait timeout, the failure's diagnostics are
+/// kept except a server-rejection diagnostic, which marks a terminal error.
+fn manual_close_timeout_error(reconnect_failure: Option<&crate::Error>) -> crate::Error {
     let prefix =
         "QWP/WebSocket close drain timed out before all published frames were acknowledged";
-    match state.store.reconnect_failure() {
-        Some(cause) => cause.clone().reclassified(
+    match reconnect_failure {
+        Some(cause) => cause.clone().without_qwp_ws_rejection().reclassified(
             crate::ErrorCode::SocketError,
             format!("{prefix}; the latest reconnect failed: {}", cause.msg()),
         ),
@@ -4659,6 +4671,35 @@ mod tests {
             err.oidc_error().map(crate::oidc::OidcError::kind),
             Some(crate::oidc::OidcErrorKind::InteractionRequired)
         );
+    }
+
+    #[test]
+    fn manual_close_timeout_carries_no_server_rejection_diagnostic() {
+        // A close-drain timeout is not a terminal error, so it must not carry
+        // the structured rejection that marks one (`line_sender_error_qwpws_get_view`).
+        let cause = crate::Error::new(crate::ErrorCode::ServerRejection, "write failed")
+            .with_qwp_ws_rejection(crate::ingress::QwpWsSenderError {
+                category: crate::ingress::QwpWsErrorCategory::WriteError,
+                applied_policy: crate::ingress::QwpWsErrorPolicy::Retriable,
+                status: Some(0x09),
+                message: Some("write failed".to_string()),
+                message_sequence: Some(0),
+                from_fsn: 0,
+                to_fsn: 0,
+            });
+
+        let err = manual_close_timeout_error(Some(&cause));
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg()
+                .contains("the latest reconnect failed: write failed"),
+            "{err}"
+        );
+        assert!(err.qwp_ws_rejection().is_none());
+
+        let err = manual_close_timeout_error(None);
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.qwp_ws_rejection().is_none());
     }
 
     #[cfg(any(unix, windows))]
