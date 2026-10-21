@@ -825,21 +825,11 @@ def _cmp_ipv4_sentinel(a, e, *, params):
     return int(a) == int(e)
 
 
-def _cmp_geohash_sentinel(a, e, *, params):
-    bits = params["bits"]
-    storage_w = 8 if bits <= 7 else 16 if bits <= 15 else 32 if bits <= 32 else 64
-    storage_sentinel = (1 << storage_w) - 1
-    def _is_null(v):
-        if v is None:
-            return True
-        try:
-            return int(v) == storage_sentinel
-        except (TypeError, ValueError):
-            return False
-    if _is_null(a) and _is_null(e):
-        return True
+def _cmp_geohash(a, e, *, params):
+    # Byte-aligned GEOHASH ingress uses an explicit validity bitmap, so the
+    # maximum value is distinct from the all-ones no-bitmap null sentinel.
     if a is None or e is None:
-        return False
+        return a is None and e is None
     return int(a) == int(e)
 
 def _is_null_or_nan(v):
@@ -1143,7 +1133,7 @@ def _make_geohash_spec(bits: int) -> KindSpec:
         value_generator=_vg_geohash,
         arrow_array_builder=_arr_geohash_int,
         ilp_setter=_set_geohash,
-        compare_fn=_cmp_geohash_sentinel,
+        compare_fn=_cmp_geohash,
         params={"bits": bits, "arrow_dtype": arrow_dtype},
     )
 

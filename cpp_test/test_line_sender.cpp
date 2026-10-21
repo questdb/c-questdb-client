@@ -73,6 +73,7 @@ constexpr uint8_t qwp_test_type_long = 0x05;
 constexpr uint8_t qwp_test_type_double = 0x07;
 constexpr uint8_t qwp_test_type_symbol = 0x09;
 constexpr uint8_t qwp_test_type_timestamp = 0x0A;
+constexpr uint8_t qwp_test_type_geohash = 0x0E;
 constexpr uint8_t qwp_test_type_varchar = 0x0F;
 constexpr uint8_t qwp_test_type_timestamp_nanos = 0x10;
 constexpr size_t qwp_test_message_header_size = 12;
@@ -261,6 +262,7 @@ enum class qwp_test_decoded_value_kind
     string,
     timestamp_micros,
     timestamp_nanos,
+    geohash,
 };
 
 struct qwp_test_decoded_value
@@ -270,6 +272,8 @@ struct qwp_test_decoded_value
     int64_t i64_value{0};
     double f64_value{0.0};
     std::string string_value;
+    uint64_t geohash_bits{0};
+    uint8_t geohash_precision{0};
 };
 
 struct qwp_test_decoded_scalar_column
@@ -483,7 +487,8 @@ size_t qwp_test_non_null_count(const std::vector<bool>& has_value)
 std::vector<qwp_test_decoded_value> qwp_test_read_column_values(
     qwp_test_decoder& decoder,
     uint8_t type_code,
-    const std::vector<bool>& has_value)
+    const std::vector<bool>& has_value,
+    bool has_null_bitmap)
 {
     const size_t row_count = has_value.size();
     const size_t non_null_count = qwp_test_non_null_count(has_value);
@@ -613,6 +618,35 @@ std::vector<qwp_test_decoded_value> qwp_test_read_column_values(
         }
         return values;
     }
+    case qwp_test_type_geohash: {
+        const auto precision = decoder.read_varint();
+        REQUIRE(precision >= 1);
+        REQUIRE(precision <= 60);
+        const size_t width = (precision + 7) / 8;
+        std::vector<qwp_test_decoded_value> values;
+        values.reserve(row_count);
+        for (bool present : has_value)
+        {
+            if (!present)
+            {
+                values.push_back(qwp_test_null_value());
+                continue;
+            }
+            qwp_test_decoded_value value{};
+            value.kind = qwp_test_decoded_value_kind::geohash;
+            value.geohash_precision = static_cast<uint8_t>(precision);
+            for (size_t byte = 0; byte < width; ++byte)
+                value.geohash_bits |= static_cast<uint64_t>(decoder.read_u8())
+                                      << (byte * 8);
+            const auto null_sentinel =
+                std::numeric_limits<uint64_t>::max() >> ((8 - width) * 8);
+            values.push_back(
+                !has_null_bitmap && value.geohash_bits == null_sentinel
+                    ? qwp_test_null_value()
+                    : value);
+        }
+        return values;
+    }
     case qwp_test_type_timestamp:
     case qwp_test_type_timestamp_nanos: {
         const auto kind = type_code == qwp_test_type_timestamp
@@ -679,8 +713,8 @@ qwp_test_decoded_scalar_datagram decode_single_scalar_qwp_datagram(
                     has_value[row] = false;
             }
         }
-        column_values.push_back(
-            qwp_test_read_column_values(decoder, column.type_code, has_value));
+        column_values.push_back(qwp_test_read_column_values(
+            decoder, column.type_code, has_value, column.nullable));
     }
 
     decoded.rows.assign(row_count, {});
@@ -4431,6 +4465,54 @@ TEST_CASE("line_sender c++ qwp geohash happy path")
     sender.flush(buffer);
     const auto datagram = receiver.recv_datagram();
     CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwp geohash maxima and omission round trip")
+{
+    udp_capture receiver;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::udp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())}};
+
+    auto buffer = sender.new_buffer();
+    for (int64_t row = 0; row < 3; ++row)
+    {
+        buffer.table("qwp_geohash_max_cpp")
+            .column_geohash("dense", uint64_t{0xFF}, uint8_t{8});
+        if (row != 1)
+            buffer.column_geohash("sparse", uint64_t{0xFFFF}, uint8_t{16});
+        buffer.at(questdb::ingress::timestamp_nanos{4000 + row * 1000});
+    }
+    sender.flush(buffer);
+
+    const auto decoded =
+        decode_single_scalar_qwp_datagram(receiver.recv_datagram());
+    CHECK(decoded.table_name == "qwp_geohash_max_cpp");
+    REQUIRE(decoded.row_count == 3);
+    qwp_check_column_count(decoded, 3);
+    // All wire bits are valid data at these precisions, even in a dense column.
+    qwp_check_column(decoded, "dense", qwp_test_type_geohash, true);
+    qwp_check_column(decoded, "sparse", qwp_test_type_geohash, true);
+    qwp_check_column(decoded, "", qwp_test_type_timestamp_nanos, false);
+    for (size_t row = 0; row < 3; ++row)
+    {
+        const auto dense = qwp_cell(decoded, row, "dense");
+        REQUIRE(dense.kind == qwp_test_decoded_value_kind::geohash);
+        CHECK(dense.geohash_precision == 8);
+        CHECK(dense.geohash_bits == 0xFF);
+        const auto sparse = qwp_cell(decoded, row, "sparse");
+        if (row == 1)
+            CHECK(sparse.kind == qwp_test_decoded_value_kind::null);
+        else
+        {
+            REQUIRE(sparse.kind == qwp_test_decoded_value_kind::geohash);
+            CHECK(sparse.geohash_precision == 16);
+            CHECK(sparse.geohash_bits == 0xFFFF);
+        }
+        qwp_expect_timestamp_nanos(
+            qwp_cell(decoded, row, ""), 4000 + row * 1000);
+    }
 }
 
 TEST_CASE("line_sender c++ qwp float happy path")

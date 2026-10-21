@@ -140,6 +140,12 @@ pub enum ErrorCode {
     HandshakeError,
 
     /// Server returned an unsupported QWP version, encoding, or capability.
+    ///
+    /// Also raised client-side, before anything is written, when a query
+    /// carries a per-query timeout and the server does not advertise
+    /// `CAP_QUERY_TIMEOUT` — see
+    /// [`ReaderQuery::timeout`](crate::egress::ReaderQuery::timeout). The
+    /// connection is untouched by that refusal.
     UnsupportedServer,
 
     /// Wire-format violation: bad magic, truncated frame, unknown discriminant,
@@ -174,6 +180,24 @@ pub enum ErrorCode {
     /// Query was cancelled (locally or via server `CANCELLED` status `0x0A`).
     Cancelled,
 
+    /// The query ran past the timeout it carried: server-reported QWP
+    /// `QUERY_TIMEOUT` (status `0x0E`), produced only for a request that
+    /// supplied `timeout_ms`. Per-query, so the connection stays usable and
+    /// a pooled client runs its next query on it.
+    ///
+    /// A timeout requested against a server that does not advertise
+    /// `CAP_QUERY_TIMEOUT` is refused with [`Self::UnsupportedServer`]
+    /// instead, so a caller that retries a timeout with a larger budget
+    /// does not loop against a server that ignores every budget — see
+    /// [`ReaderQuery::timeout`](crate::egress::ReaderQuery::timeout).
+    ///
+    /// **Do not retry a write on this error.** A DDL / `INSERT` / `UPDATE`
+    /// that timed out waiting for the table writer may still be applied
+    /// afterwards, and a statement that completes past its timeout is
+    /// reported as `EXEC_DONE` rather than a timeout precisely so a
+    /// retrying client cannot apply it twice.
+    QueryTimeout,
+
     /// Mid-query failover was eligible but at least one batch had already
     /// been delivered to the caller, and the cursor's `on_failover_reset`
     /// callback was not installed. Failover would replay the query from the
@@ -202,11 +226,14 @@ pub enum ErrorCode {
     /// bug; not user-recoverable. Only emitted on the `arrow` feature.
     ArrowExport,
 
-    /// An irreducible QWP/WebSocket unit (the table schema plus a single
-    /// row block) exceeds the negotiated per-batch cap
-    /// (`min(max_buf_size, server X-QWP-Max-Batch-Size)`). Chunk publication
-    /// splits oversize inputs into smaller frames automatically, so this only
-    /// surfaces when splitting cannot make a frame fit. Distinct from
+    /// A QWP/WebSocket frame exceeds the negotiated per-frame cap
+    /// (`min(max_buf_size, server X-QWP-Max-Batch-Size)`, further bounded by
+    /// the store-and-forward segment payload capacity). Chunk publication
+    /// splits oversize inputs into smaller frames automatically, so there this
+    /// only surfaces for an irreducible unit (the table schema plus a single
+    /// row block). A row [`Buffer`](crate::ingress::Buffer) is published as one
+    /// frame and is never split, so flushing one whose encoded frame exceeds
+    /// the cap fails with this code and publishes nothing. Distinct from
     /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
     /// without matching on the error message text.
     BatchTooLarge,
@@ -367,6 +394,10 @@ impl Error {
     /// `true` when the operation that produced this error is *delivery-unknown*
     /// ("in doubt"): the current input may already have reached the server, so
     /// blindly replaying it on a fresh connection can duplicate rows.
+    ///
+    /// For a high-level DataFrame ingestion call, the input is the entire
+    /// DataFrame, including any batches already committed by that call. For a
+    /// low-level flush, this does not track earlier independent flushes.
     ///
     /// This is independent of the [`code`](Error::code): a delivery-unknown
     /// failure typically reports [`ErrorCode::FailoverRetry`] (the connection
@@ -604,6 +635,7 @@ mod tests {
                 ErrorCode::LimitExceeded => {}
                 ErrorCode::ServerLimitExceeded => {}
                 ErrorCode::Cancelled => {}
+                ErrorCode::QueryTimeout => {}
                 ErrorCode::FailoverWouldDuplicate => {}
                 ErrorCode::SchemaDrift => {}
                 ErrorCode::NoSchema => {}

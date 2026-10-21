@@ -125,7 +125,8 @@ For 7.0.0, the approved compatibility decisions are:
   Open Source and Enterprise, while bearer-token and OIDC authentication,
   multi-host failover, and durable acknowledgement require QuestDB Enterprise;
 - Rust 1.91.0 is the MSRV for default and advertised docs.rs features;
-- Arrow `>=58, <60` and Polars `>=0.52, <0.55` are the supported ranges;
+- Arrow `>=58, <60` and Polars `>=0.52, <0.55` are the published crate's
+  supported ranges; the FFI artifact pins Arrow `=59.0.0`;
 - C/C++ remains source-only; and
 - release tags remain lightweight.
 
@@ -205,7 +206,7 @@ git fetch origin --tags --prune
 git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
-git switch -c release/7.0.0
+git switch -c release/7.1.0
 ```
 
 Do not prepare a release from a dirty feature-branch checkout.
@@ -215,7 +216,7 @@ Do not prepare a release from a dirty feature-branch checkout.
 For a future version change, preview before modifying files:
 
 ```bash
-NEW_VERSION=7.0.0
+NEW_VERSION=7.1.0
 bump-my-version replace --new-version "$NEW_VERSION" --dry-run
 bump-my-version replace --new-version "$NEW_VERSION"
 ```
@@ -325,7 +326,7 @@ git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-VERSION=7.0.0
+VERSION=7.1.0
 RELEASE_SHA="$(git rev-parse HEAD)"
 
 git show --no-patch --format=fuller "$RELEASE_SHA"
@@ -486,7 +487,7 @@ git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-VERSION=7.0.0
+VERSION=7.1.0
 RELEASE_SHA="$(git rev-parse HEAD)"
 
 git show --no-patch --format=fuller "$RELEASE_SHA"
@@ -571,7 +572,7 @@ can hide packaging mistakes:
 SMOKE_ROOT="$(mktemp -d)"
 cargo new "$SMOKE_ROOT/qdb-rs-release-smoke"
 cd "$SMOKE_ROOT/qdb-rs-release-smoke"
-cargo add questdb-rs@=7.0.0
+cargo add questdb-rs@=7.1.0
 cargo check
 ```
 
@@ -626,11 +627,11 @@ A crates.io version cannot be overwritten or deleted.
 To yank without deleting the already published package:
 
 ```bash
-cargo yank --version 7.0.0 questdb-rs
+cargo yank --version 7.1.0 questdb-rs
 ```
 
 Yanking does not break consumers whose lockfiles already select the version.
-Never reuse 7.0.0 after yanking it.
+Never reuse 7.1.0 after yanking it.
 
 ## Final release checklist
 

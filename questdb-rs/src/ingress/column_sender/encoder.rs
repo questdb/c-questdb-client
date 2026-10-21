@@ -33,7 +33,7 @@
 
 use std::slice;
 
-use crate::ingress::buffer::SymbolGlobalDict;
+use crate::ingress::buffer::{SymbolGlobalDict, geohash_precision_needs_bitmap};
 use crate::{Result, error};
 
 #[cfg(feature = "arrow-ingress")]
@@ -442,11 +442,24 @@ fn estimate_frame_size(
 
     let bitmap_bytes = row_count.div_ceil(8);
     for col in &chunk.columns {
-        let null_overhead = 1usize.saturating_add(if col.validity.is_some() {
-            bitmap_bytes
-        } else {
-            0
-        });
+        let forced_geohash_bitmap = match col.kind {
+            ColumnKind::NumpyDeferred { dtype, .. } => dtype
+                .geohash_precision_bits()
+                .is_some_and(geohash_precision_needs_bitmap),
+            #[cfg(feature = "arrow-ingress")]
+            ColumnKind::ArrowDeferred { arrow_kind, .. } => matches!(
+                arrow_kind,
+                arrow_batch::ColumnKind::Geohash(bits)
+                    if geohash_precision_needs_bitmap(bits)
+            ),
+            _ => false,
+        };
+        let null_overhead =
+            1usize.saturating_add(if col.validity.is_some() || forced_geohash_bitmap {
+                bitmap_bytes
+            } else {
+                0
+            });
         let payload_size = match col.kind {
             ColumnKind::Byte { .. } => row_count,
             ColumnKind::Short { .. } => row_count.saturating_mul(2),
@@ -1333,6 +1346,136 @@ mod tests {
         out
     }
 
+    // Comparing equal-width precisions isolates the forced bitmap from the
+    // estimator's other conservative slack: a mere estimated >= encoded
+    // assertion would pass even if the bitmap accounting were removed.
+    fn assert_geohash_bitmap_estimate(dense: &Chunk<'_>, bitmap: &Chunk<'_>, rows: usize) {
+        let estimate = |chunk| estimate_frame_size(chunk, rows, &[], 0, &[]);
+        assert_eq!(estimate(bitmap) - estimate(dense), rows.div_ceil(8));
+        let dense_frame = encode_fresh(dense);
+        let bitmap_frame = encode_fresh(bitmap);
+        assert_eq!(bitmap_frame.len() - dense_frame.len(), rows.div_ceil(8));
+        assert!(estimate(bitmap) >= bitmap_frame.len());
+    }
+
+    #[test]
+    fn numpy_geohash_estimator_accounts_for_forced_bitmap_boundaries() {
+        use super::super::NumpyDtype;
+        for rows in [7_usize, 8, 9, 16, 17, 129] {
+            let values = vec![1_i64; rows];
+            for bits in [8, 16, 24, 32, 40, 48, 56] {
+                let mut dense = Chunk::new("t");
+                let mut bitmap = Chunk::new("t");
+                for (chunk, precision) in [(&mut dense, bits - 1), (&mut bitmap, bits)] {
+                    // SAFETY: values is contiguous i64 storage and outlives
+                    // both chunks and their synchronous encodes.
+                    unsafe {
+                        chunk
+                            .push_numpy_deferred(
+                                "g",
+                                NumpyDtype::GeohashI64 { bits: precision },
+                                values.as_ptr().cast(),
+                                rows,
+                                None,
+                            )
+                            .unwrap();
+                    }
+                    chunk.at_now().unwrap();
+                }
+                assert_geohash_bitmap_estimate(&dense, &bitmap, rows);
+            }
+        }
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn arrow_geohash_estimator_accounts_for_forced_bitmap_boundaries() {
+        use arrow::array::Int64Array;
+        use std::sync::Arc;
+        for rows in [7_usize, 8, 9, 16, 17, 129] {
+            let values = Arc::new(Int64Array::from(vec![1_i64; rows]));
+            for bits in [8, 16, 24, 32, 40, 48, 56] {
+                let mut dense = Chunk::new("t");
+                let mut bitmap = Chunk::new("t");
+                for (chunk, precision) in [(&mut dense, bits - 1), (&mut bitmap, bits)] {
+                    chunk
+                        .push_arrow_deferred(
+                            "g",
+                            arrow_batch::ColumnKind::Geohash(precision),
+                            values.clone(),
+                        )
+                        .unwrap();
+                    chunk.at_now().unwrap();
+                }
+                assert_geohash_bitmap_estimate(&dense, &bitmap, rows);
+            }
+        }
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn geohash_deferred_dense_slice_of_sparse_parent_matches_fresh_dense() {
+        use super::super::NumpyDtype;
+        use arrow::array::Int64Array;
+        use arrow::buffer::{BooleanBuffer, NullBuffer};
+        use std::sync::Arc;
+
+        for bits in [8u8, 16, 24, 32, 40, 48, 56] {
+            let max = (1i64 << bits) - 1;
+            let mut values = [0; 24];
+            values[8..17].fill(max);
+            let validity_bits = [0, 0xff, 1];
+            let validity = Validity::from_bitmap(&validity_bits, values.len()).unwrap();
+            let mut numpy = Chunk::new("t");
+            let mut dense = Chunk::new("t");
+            // SAFETY: contiguous values and validity outlive chunks and encoding.
+            unsafe {
+                numpy
+                    .push_numpy_deferred(
+                        "g",
+                        NumpyDtype::GeohashI64 { bits },
+                        values.as_ptr().cast(),
+                        values.len(),
+                        Some(&validity),
+                    )
+                    .unwrap();
+                dense
+                    .push_numpy_deferred(
+                        "g",
+                        NumpyDtype::GeohashI64 { bits },
+                        values[8..].as_ptr().cast(),
+                        9,
+                        None,
+                    )
+                    .unwrap();
+            }
+            numpy.at_now().unwrap();
+            dense.at_now().unwrap();
+            let mut arrow = Chunk::new("t");
+            arrow
+                .push_arrow_deferred(
+                    "g",
+                    arrow_batch::ColumnKind::Geohash(bits),
+                    Arc::new(Int64Array::new(
+                        values.to_vec().into(),
+                        Some(NullBuffer::new(BooleanBuffer::from(
+                            (0..24).map(|i| (8..17).contains(&i)).collect::<Vec<_>>(),
+                        ))),
+                    )),
+                )
+                .unwrap();
+            arrow.at_now().unwrap();
+            let expected = encode_fresh(&dense);
+            for parent in [&numpy, &arrow] {
+                // SAFETY: byte-aligned offset and in-bounds range; parents and
+                // their borrowed storage remain alive through synchronous encode.
+                let sliced = unsafe { parent.slice_rows(8, 9) };
+                assert_eq!(encode_fresh(&sliced), expected, "bits={bits}");
+                assert!(estimate_frame_size(&sliced, 9, &[], 0, &[]) >= expected.len());
+            }
+        }
+    }
+
     #[test]
     fn native_decimal_wire_preserves_mantissas_scale_and_nulls() {
         let d64 = [i64::MIN, 0, i64::MAX, -12345];
@@ -1577,6 +1720,168 @@ mod tests {
             offsets.push(bytes.len() as i32);
         }
         (offsets, bytes)
+    }
+
+    #[test]
+    fn slice_rows_singleton_matches_fresh_chunk_at_every_bit_offset() {
+        use crate::ingress::column_sender::NumpyDtype;
+
+        let values: Vec<i64> = (0..16).map(|i| i * 17 + 3).collect();
+        let arrays: Vec<f64> = (0..32).map(|i| i as f64 + 0.5).collect();
+        let codes: Vec<i32> = (0..16).map(|i| i % 2).collect();
+        let strings: Vec<String> = (0..16).map(|i| format!("value-{i}")).collect();
+        let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+        let (offsets, bytes) = build_varchar(&refs);
+        let bool_bits = [0b1010_1100, 0b0101_0011];
+        let numpy_bools: Vec<u8> = (0..16).map(|i| (bool_bits[i / 8] >> (i % 8)) & 1).collect();
+
+        for valid_bits in [[0, 0], [255, 255], [0b1100_1010, 0b0011_0101]] {
+            let validity = Validity::from_bitmap(&valid_bits, 16).unwrap();
+            let mut source = Chunk::new("trades");
+            source.column_i64("v", &values, Some(&validity)).unwrap();
+            source.column_bool("b", &bool_bits, 16, None).unwrap();
+            source
+                .column_bool("bn", &bool_bits, 16, Some(&validity))
+                .unwrap();
+            source
+                .column_str("s", &offsets, &bytes, Some(&validity))
+                .unwrap();
+            source
+                .symbol_i32("sym", &codes, &[0, 1, 2], b"ab", Some(&validity))
+                .unwrap();
+            source
+                .column_decimal64("d", &values, 2, Some(&validity))
+                .unwrap();
+            source
+                .column_f64_array("a", &arrays, 16, &[2], Some(&validity))
+                .unwrap();
+            unsafe {
+                source
+                    .push_numpy_deferred(
+                        "nb",
+                        NumpyDtype::Bool,
+                        numpy_bools.as_ptr(),
+                        16,
+                        Some(&validity),
+                    )
+                    .unwrap();
+            }
+            source.at_nanos(&values).unwrap();
+
+            for row in 0..16 {
+                let bit = [(valid_bits[row / 8] >> (row % 8)) & 1];
+                let one_validity = Validity::from_bitmap(&bit, 1).unwrap();
+                let one_bool = [numpy_bools[row]];
+                let (one_offsets, one_bytes) = build_varchar(&refs[row..row + 1]);
+                let mut fresh = Chunk::new("trades");
+                fresh
+                    .column_i64("v", &values[row..row + 1], Some(&one_validity))
+                    .unwrap();
+                fresh.column_bool("b", &one_bool, 1, None).unwrap();
+                fresh
+                    .column_bool("bn", &one_bool, 1, Some(&one_validity))
+                    .unwrap();
+                fresh
+                    .column_str("s", &one_offsets, &one_bytes, Some(&one_validity))
+                    .unwrap();
+                fresh
+                    .symbol_i32(
+                        "sym",
+                        &codes[row..row + 1],
+                        &[0, 1, 2],
+                        b"ab",
+                        Some(&one_validity),
+                    )
+                    .unwrap();
+                fresh
+                    .column_decimal64("d", &values[row..row + 1], 2, Some(&one_validity))
+                    .unwrap();
+                fresh
+                    .column_f64_array(
+                        "a",
+                        &arrays[row * 2..row * 2 + 2],
+                        1,
+                        &[2],
+                        Some(&one_validity),
+                    )
+                    .unwrap();
+                unsafe {
+                    fresh
+                        .push_numpy_deferred(
+                            "nb",
+                            NumpyDtype::Bool,
+                            one_bool.as_ptr(),
+                            1,
+                            Some(&one_validity),
+                        )
+                        .unwrap();
+                }
+                fresh.at_nanos(&values[row..row + 1]).unwrap();
+                let view = unsafe { source.slice_rows(row, 1) };
+                assert_eq!(
+                    encode_fresh(&view),
+                    encode_fresh(&fresh),
+                    "row {row}, validity {valid_bits:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn slice_rows_singleton_arrow_bool_matches_fresh_chunk() {
+        use super::super::arrow_batch;
+        use arrow::array::BooleanArray;
+        use std::sync::Arc;
+
+        let values = [
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+        ];
+        for scalar in [false, true] {
+            let mut source = Chunk::new("trades");
+            source
+                .push_arrow_deferred(
+                    "b",
+                    arrow_batch::ColumnKind::Bool,
+                    Arc::new(BooleanArray::from(values.to_vec())),
+                )
+                .unwrap();
+            if scalar {
+                source.at_scalar_nanos(42).unwrap();
+            } else {
+                source.at_now().unwrap();
+            }
+            for (row, value) in values.iter().enumerate() {
+                let mut fresh = Chunk::new("trades");
+                fresh
+                    .push_arrow_deferred(
+                        "b",
+                        arrow_batch::ColumnKind::Bool,
+                        Arc::new(BooleanArray::from(vec![*value])),
+                    )
+                    .unwrap();
+                if scalar {
+                    fresh.at_scalar_nanos(42).unwrap();
+                } else {
+                    fresh.at_now().unwrap();
+                }
+                let view = unsafe { source.slice_rows(row, 1) };
+                assert_eq!(
+                    encode_fresh(&view),
+                    encode_fresh(&fresh),
+                    "row {row}, scalar {scalar}"
+                );
+            }
+        }
     }
 
     /// VARCHAR slicing keeps absolute offsets into the full byte buffer; the

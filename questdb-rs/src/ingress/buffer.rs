@@ -46,7 +46,7 @@ pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use self::qwp::{
     MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
-    SymbolGlobalDictMark, decode_qwp_varint,
+    SymbolGlobalDictMark, decode_qwp_varint, geohash_precision_needs_bitmap,
 };
 // Test-only: lets the sender-level suites drive the connection dictionary's
 // cap-rejection path through a real `Sender` (see `TestDictCapGuard`).
@@ -549,9 +549,12 @@ impl Buffer {
     ///
     /// For ILP buffers this is the exact serialized byte count. For QWP/UDP
     /// buffers this is the size hint used for flush planning. For QWP/WebSocket
-    /// buffers this is only a local size hint; symbol-ID remapping and replay
-    /// dictionary state can change the eventual frame size. The sender
-    /// enforces `max_buf_size` against the encoded replay message.
+    /// buffers this is a size hint that is at least the size of the frame a
+    /// flush encodes: it charges each symbol value the widest connection-wide
+    /// id. It falls short only once store-and-forward sends full symbol
+    /// dictionaries, which it does when its symbol side-file cannot be opened
+    /// or rolled back. The sender enforces `max_buf_size` against the encoded
+    /// replay message.
     pub fn len(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.len(),
@@ -1549,7 +1552,14 @@ impl Buffer {
     }
 
     /// Adds a GEOHASH column. `precision_bits` must be in `1..=60` and is
-    /// pinned per column (subsequent rows must match). QWP-only.
+    /// pinned per column (subsequent rows must match). `bits` is a raw pattern
+    /// and is not checked to be less than `2^precision_bits`. Supplying the
+    /// wrong precision or a pattern with bits set above it can succeed and
+    /// store a different GEOHASH or NULL. Only the low
+    /// `ceil(precision_bits / 8)` bytes are encoded; the exact result is
+    /// unspecified. This is a semantic data-integrity risk, not a memory-safety
+    /// risk for an otherwise valid call. The caller must validate `bits`.
+    /// QWP-only.
     pub fn column_geohash<'a, N>(
         &mut self,
         name: N,

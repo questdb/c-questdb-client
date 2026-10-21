@@ -602,8 +602,8 @@ impl QwpWsConnector {
         )?;
         // The per-frame cap is the negotiated one: the configured
         // max_buf_size clamped to the server's advertised
-        // X-QWP-Max-Batch-Size (0 = not advertised), matching the row
-        // sender's effective_qwp_ws_max_buf_size.
+        // X-QWP-Max-Batch-Size (0 = not advertised). A direct connection
+        // has no store-and-forward queue, so no segment cap applies.
         let max_buf_size = if connected.server_max_batch_size > 0 {
             self.max_buf_size.min(connected.server_max_batch_size)
         } else {
@@ -1128,6 +1128,7 @@ impl SenderBuilder {
             "pool_reap",
             "query_pool_max",
             "query_pool_min",
+            "query_timeout_ms",
             "sender_pool_max",
             "sender_pool_min",
             "target",

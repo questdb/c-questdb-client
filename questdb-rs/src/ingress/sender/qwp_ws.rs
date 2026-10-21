@@ -108,14 +108,12 @@ pub(crate) struct TrafficGate {
 #[derive(Default)]
 struct TrafficGateState {
     current: Option<TcpStream>,
-    /// Raw handle of the ORIGINAL socket, not the `current` dup. Winsock
-    /// `shutdown()` does not unblock a `recv()` already in progress on
-    /// another thread, so `shutdown()` first runs `CancelIoEx` — and that
-    /// must target the handle the blocked thread issued its I/O on; a
-    /// `try_clone` (WSADuplicateSocket) handle is not guaranteed to share
-    /// the file object. Only valid while `current` is `Some`: every close
-    /// of the original is mutex-ordered behind `clear()`/re-register, so
-    /// the handle cannot be recycled while the gate still holds it.
+    /// Raw handle of the ORIGINAL socket, not the `current` dup: a shutdown
+    /// through the `try_clone` (WSADuplicateSocket) dup can leave later
+    /// `recv()`s on the original blocking. Only valid while `current` is
+    /// `Some`: every close of the original is mutex-ordered behind
+    /// `clear()`/re-register, so the handle cannot be recycled while the
+    /// gate still holds it.
     #[cfg(windows)]
     original: Option<std::os::windows::io::RawSocket>,
     shut: bool,
@@ -222,15 +220,19 @@ impl TrafficGate {
         state.shut = true;
         #[cfg(windows)]
         if let Some(original) = state.original.take() {
-            // Winsock shutdown() does not unblock an in-progress recv() on
-            // another thread. Cancel outstanding I/O on the worker's own
-            // handle first, mirroring the Java client's windows/net.c
-            // shutdown(). A failure with ERROR_NOT_FOUND (nothing pending)
-            // is expected and deliberately ignored.
+            use std::os::windows::io::FromRawSocket;
             use windows_sys::Win32::Foundation::HANDLE;
+            // Shutdown does not wake an in-flight recv(), so CancelIoEx
+            // follows it; the reverse order lets a recv() slip in between.
+            // SAFETY: `original` is open while `current` is `Some`.
+            let original_stream =
+                std::mem::ManuallyDrop::new(unsafe { TcpStream::from_raw_socket(original) });
+            let shut = shutdown_socket(&original_stream);
             unsafe {
                 windows_sys::Win32::System::IO::CancelIoEx(original as HANDLE, std::ptr::null());
             }
+            state.current = None;
+            return shut;
         }
         if let Some(stream) = state.current.take() {
             shutdown_socket(&stream)?;
@@ -511,6 +513,9 @@ pub(crate) struct ManualQwpWsHandlerState {
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
+    /// Hard cap on a single queued frame's payload, as on
+    /// [`SyncQwpWsHandlerState::sfa_frame_payload_cap`].
+    pub(crate) sfa_frame_payload_cap: usize,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
@@ -3698,6 +3703,7 @@ pub(crate) fn open_manual_qwp_ws(
         send_core: parts.send_core,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
+        sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
