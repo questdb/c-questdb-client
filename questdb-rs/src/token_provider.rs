@@ -71,7 +71,12 @@ pub use refreshing::{
 ///   which says whether retrying can succeed. A connect the caller waits for
 ///   (the synchronous initial connect, a pool borrow with retry) retries only
 ///   a failure classified retryable; any other failure ends it at once.
-///   Background reconnects keep retrying either way.
+///   Background reconnects keep retrying either way. To stop them on a failure
+///   that retrying can never clear, return
+///   [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall): it is
+///   carried as a terminal `ConfigError`. C and C++ providers report the same
+///   with `questdb_token_sink_set_terminal_error` and by throwing
+///   `questdb::error` with `invalid_api_call`.
 /// - The token is sent as `Authorization: Bearer <token>`, so it is given
 ///   without the prefix. A blank token, or one with a character outside
 ///   printable ASCII, is rejected without being sent.
@@ -83,10 +88,14 @@ pub trait BearerTokenProvider: Send + Sync {
     /// A server rejected `token` with `http_status`, currently always 401.
     ///
     /// The client calls this, then [`token`](Self::token) again, and retries
-    /// the same endpoint once if the token changed. A provider with a cache
+    /// the same endpoint once if the token changed. Only a 401 that a new
+    /// token can fix is reported: one whose `WWW-Authenticate` Bearer
+    /// challenge names no error, or `invalid_token` (RFC 6750 §3.1). On any
+    /// other Bearer error, such as `insufficient_scope`, the rejection stands
+    /// without a new pull: a new token cannot fix it. A provider with a cache
     /// should stop serving `token` if it has not rotated already. It may be
-    /// called more than once for the same rejection; rate-limit any refresh
-    /// it triggers. The default does nothing.
+    /// called more than once for the same rejection; rate-limit any refresh it
+    /// triggers. The default does nothing.
     fn on_rejected(&self, token: &str, http_status: u16) {
         let _ = (token, http_status);
     }

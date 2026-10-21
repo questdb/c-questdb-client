@@ -169,7 +169,9 @@ void questdb_db_connect_options_init(
  * pool; otherwise token acquisition reports InteractionRequired. After a
  * handshake 401 for a token that had not expired, the one re-resolution a
  * connect makes refreshes it rather than presenting it again (at most once
- * every 30 seconds per auth).
+ * every 30 seconds per auth). A connect re-resolves only when the 401's
+ * `WWW-Authenticate` challenge allows it (no Bearer error, or
+ * `invalid_token`).
  * `oidc_auth` is mutually exclusive with static credentials: `conf` must not
  * also set `username`/`password` or `token`. Setting both fails with
  * `questdb_error_config_error`.

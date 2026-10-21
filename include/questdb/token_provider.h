@@ -65,6 +65,10 @@
  * - A callback must report through the sink it is given, which is valid only
  *   during the call, and must not call into a client that uses the same
  *   provider.
+ * - Clients keep retrying a failure to supply a token in the background. A
+ *   `get_token` callback that knows retrying can never succeed reports it with
+ *   `questdb_token_sink_set_terminal_error`, which stops them; a refreshing
+ *   provider is stopped with `questdb_token_provider_close`.
  * - `release` runs once, on any thread, when the provider no longer needs
  *   `user_data`. It may run after the call that created the provider returns.
  * - Providers and clients must not be used across `fork()`. Use spawn/exec
@@ -129,7 +133,8 @@ bool questdb_token_sink_set_token(
  *
  * A connect the caller waits for -- the synchronous initial connect, a pool
  * borrow with retry -- retries only a retryable failure. Background reconnects
- * retry either kind.
+ * retry either kind; to stop them, a `get_token` callback reports the failure
+ * with `questdb_token_sink_set_terminal_error` instead.
  *
  * Returns false when `sink` is NULL or a result was already reported.
  */
@@ -141,6 +146,29 @@ bool questdb_token_sink_set_error(
     const char* msg,
     size_t msg_len);
 
+/**
+ * Report, from a `get_token` callback, a failure that retrying can never
+ * clear: a provider misconfigured beyond repair, or one the application has
+ * retired. This is the counterpart of a Rust provider returning
+ * `InvalidApiCall`.
+ *
+ * Unlike `questdb_token_sink_set_error`, it also stops background
+ * reconnects: a QWP/WebSocket sender, reader or pool that pulls it reports
+ * `line_sender_error_config_error` and stops reconnecting, and an ILP/HTTP
+ * flush fails with it at once. Queued store-and-forward frames are not
+ * deleted, and a disk-backed slot stays drainable by a later process.
+ * `questdb_token_provider_token` reports it as
+ * `line_sender_error_invalid_api_call`, unclassified. The message (UTF-8,
+ * copied) must not contain a token or a raw response body.
+ *
+ * Returns false, recording nothing, when `sink` is NULL, a result was already
+ * reported, or `sink` belongs to a refreshing provider's token source: stop a
+ * refreshing provider with `questdb_token_provider_close` instead.
+ */
+QUESTDB_CLIENT_API
+bool questdb_token_sink_set_terminal_error(
+    questdb_token_sink* sink, const char* msg, size_t msg_len);
+
 /** Fetch a new token: report it with exactly one sink call. */
 typedef void (*questdb_token_source_fn)(
     void* user_data, questdb_token_sink* sink);
@@ -151,8 +179,10 @@ typedef void (*questdb_token_get_fn)(void* user_data, questdb_token_sink* sink);
 /**
  * A server rejected `token` (`token_len` bytes, not NUL-terminated) with
  * `http_status`, currently always 401. The client then calls `get_token`
- * again and retries once if the token changed. A provider with a cache should
- * stop serving `token`. May be called more than once for one rejection.
+ * again and retries once if the token changed. Only a 401 that a new token
+ * can fix is reported: one whose `WWW-Authenticate` Bearer challenge names no
+ * error, or `invalid_token`. A provider with a cache should stop serving
+ * `token`. May be called more than once for one rejection.
  */
 typedef void (*questdb_token_rejected_fn)(
     void* user_data, const char* token, size_t token_len, uint16_t http_status);

@@ -50,7 +50,8 @@ pub type questdb_token_source_fn =
     unsafe extern "C" fn(user_data: *mut c_void, sink: *mut questdb_token_sink);
 
 /// The current token of an application-implemented provider: call exactly one
-/// of `questdb_token_sink_set_token` or `questdb_token_sink_set_error`.
+/// of `questdb_token_sink_set_token`, `questdb_token_sink_set_error` or
+/// `questdb_token_sink_set_terminal_error`.
 pub type questdb_token_get_fn =
     unsafe extern "C" fn(user_data: *mut c_void, sink: *mut questdb_token_sink);
 
@@ -158,6 +159,10 @@ const QUESTDB_TOKEN_UNAVAILABLE_VIEW_V1_SIZE: usize =
 /// duration of the callback.
 pub struct questdb_token_sink {
     outcome: SinkOutcome,
+    /// Whether the callback may report a terminal failure. Only an application
+    /// provider's `get_token` can: a refreshing provider is ended by closing
+    /// it, and its source's failures only steer the refresher's backoff.
+    terminal_allowed: bool,
 }
 
 enum SinkOutcome {
@@ -171,9 +176,19 @@ enum SinkOutcome {
 }
 
 impl questdb_token_sink {
-    fn new() -> Self {
+    /// The sink of a refreshing provider's token source.
+    fn for_source() -> Self {
         Self {
             outcome: SinkOutcome::Empty,
+            terminal_allowed: false,
+        }
+    }
+
+    /// The sink of an application provider's `get_token`.
+    fn for_provider() -> Self {
+        Self {
+            outcome: SinkOutcome::Empty,
+            terminal_allowed: true,
         }
     }
 
@@ -251,15 +266,45 @@ pub unsafe extern "C" fn questdb_token_sink_set_error(
     if !matches!(sink.outcome, SinkOutcome::Empty) {
         return false;
     }
-    let message = if msg.is_null() || msg_len == 0 {
+    let message = unsafe { sink_message(msg, msg_len) };
+    let retry_after = (retry_after_ms >= 0).then(|| Duration::from_millis(retry_after_ms as u64));
+    sink.outcome = SinkOutcome::Error(Error::token_unavailable(retryable, retry_after, message));
+    true
+}
+
+/// Report, from an application provider's `get_token`, a failure that retrying
+/// can never clear. It is carried as `InvalidApiCall`, exactly as a Rust
+/// provider that returns `InvalidApiCall`: the transports re-code it to a
+/// terminal `ConfigError`, so background reconnects stop and report it.
+///
+/// Returns false, recording nothing, when `sink` is NULL, a result was already
+/// reported, or `sink` belongs to a refreshing provider's token source, which
+/// is ended with `questdb_token_provider_close` instead.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_token_sink_set_terminal_error(
+    sink: *mut questdb_token_sink,
+    msg: *const c_char,
+    msg_len: size_t,
+) -> bool {
+    let Some(sink) = (unsafe { sink.as_mut() }) else {
+        return false;
+    };
+    if !sink.terminal_allowed || !matches!(sink.outcome, SinkOutcome::Empty) {
+        return false;
+    }
+    let message = unsafe { sink_message(msg, msg_len) };
+    sink.outcome = SinkOutcome::Error(Error::new(ErrorCode::InvalidApiCall, message));
+    true
+}
+
+/// A failure message reported by a callback: UTF-8, lossily decoded.
+unsafe fn sink_message(msg: *const c_char, msg_len: size_t) -> String {
+    if msg.is_null() || msg_len == 0 {
         String::from("the token callback failed without a message")
     } else {
         String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(msg.cast::<u8>(), msg_len) })
             .into_owned()
-    };
-    let retry_after = (retry_after_ms >= 0).then(|| Duration::from_millis(retry_after_ms as u64));
-    sink.outcome = SinkOutcome::Error(Error::token_unavailable(retryable, retry_after, message));
-    true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +323,7 @@ unsafe impl Sync for CallbackSource {}
 
 impl TokenSource for CallbackSource {
     fn fetch_token(&self) -> questdb::Result<ExpiringToken> {
-        let mut sink = questdb_token_sink::new();
+        let mut sink = questdb_token_sink::for_source();
         unsafe { (self.fetch)(self.user_data, &mut sink) };
         let (token, expires_at_ms, refresh_at_ms) = sink.take("token source")?;
         let mut result = ExpiringToken::new(token.as_str(), system_time(expires_at_ms));
@@ -321,7 +366,7 @@ pub(crate) struct CallbackProvider(Arc<CallbackTarget>);
 
 impl BearerTokenProvider for CallbackProvider {
     fn token(&self) -> questdb::Result<String> {
-        let mut sink = questdb_token_sink::new();
+        let mut sink = questdb_token_sink::for_provider();
         unsafe { (self.0.get_token)(self.0.user_data, &mut sink) };
         let (token, _, _) = sink.take("token provider")?;
         Ok(token.as_str().to_string())
@@ -922,7 +967,7 @@ pub unsafe extern "C" fn line_sender_opts_token_provider(
 mod tests {
     use super::*;
     use crate::oidc::header_abi::c_struct_fields;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const TOKEN_PROVIDER_H: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1036,6 +1081,8 @@ mod tests {
         released: AtomicUsize,
         rejected: std::sync::Mutex<Vec<(String, u16)>>,
         fail: bool,
+        /// Whether a source's sink accepted a terminal failure.
+        terminal_accepted: AtomicBool,
     }
 
     unsafe extern "C" fn source(user_data: *mut c_void, sink: *mut questdb_token_sink) {
@@ -1302,6 +1349,204 @@ mod tests {
         assert!(unsafe { questdb_token_provider_await_ready(provider, 0) });
         unsafe { questdb_token_provider_free(provider) };
         assert_eq!(probe.released.load(Ordering::SeqCst), 1);
+    }
+
+    unsafe extern "C" fn retired_get_token(_user_data: *mut c_void, sink: *mut questdb_token_sink) {
+        let msg = "provider retired";
+        assert!(unsafe {
+            questdb_token_sink_set_terminal_error(sink, msg.as_ptr().cast(), msg.len())
+        });
+        // A second report is refused.
+        assert!(!unsafe {
+            questdb_token_sink_set_error(sink, true, -1, msg.as_ptr().cast(), msg.len())
+        });
+    }
+
+    unsafe extern "C" fn unassigned_get_token(
+        _user_data: *mut c_void,
+        sink: *mut questdb_token_sink,
+    ) {
+        let msg = "identity not assigned";
+        assert!(unsafe {
+            questdb_token_sink_set_error(sink, false, -1, msg.as_ptr().cast(), msg.len())
+        });
+    }
+
+    fn application_provider(get_token: questdb_token_get_fn) -> *mut questdb_token_provider {
+        let vtable = questdb_token_provider_vtable {
+            struct_size: size_of::<questdb_token_provider_vtable>(),
+            get_token: Some(get_token),
+            on_rejected: None,
+            release: None,
+        };
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let provider = unsafe { questdb_token_provider_new(&vtable, ptr::null_mut(), &mut err) };
+        assert!(!provider.is_null() && err.is_null());
+        provider
+    }
+
+    /// The error a transport's token pull yields, as its reconnect loops see
+    /// it: a reader's handshake headers, before any dial.
+    fn transport_failure(provider: *mut questdb_token_provider) -> Error {
+        let config = questdb::egress::ReaderConfig::from_conf("ws::addr=127.0.0.1:1;").unwrap();
+        let config = unsafe { &*provider }.attach_to_reader(config).unwrap();
+        config.upgrade_headers().unwrap_err()
+    }
+
+    #[test]
+    fn a_terminal_failure_is_classified_like_a_rust_providers_invalid_api_call() {
+        // What a Rust provider gets for returning `InvalidApiCall`.
+        let rust = questdb::egress::ReaderConfig::from_conf("ws::addr=127.0.0.1:1;")
+            .unwrap()
+            .token_provider(|| {
+                Err::<String, _>(Error::new(ErrorCode::InvalidApiCall, "provider retired"))
+            })
+            .unwrap()
+            .upgrade_headers()
+            .unwrap_err();
+        assert_eq!(rust.code(), ErrorCode::ConfigError);
+
+        let retired = application_provider(retired_get_token);
+        let err = transport_failure(retired);
+        assert_eq!(err.code(), rust.code(), "{err}");
+        assert_eq!(err.msg(), rust.msg());
+        // A direct pull reports what the callback reported, unclassified.
+        let mut c_err: *mut questdb_error = ptr::null_mut();
+        assert!(unsafe { questdb_token_provider_token(retired, &mut c_err) }.is_null());
+        assert!(!c_err.is_null());
+        assert_eq!(unsafe { &(*c_err).error }.code(), ErrorCode::InvalidApiCall);
+        let mut view = unsafe { std::mem::zeroed::<questdb_token_unavailable_view>() };
+        view.struct_size = size_of_val(&view);
+        assert!(!unsafe { questdb_error_token_unavailable_get_view(c_err, &mut view) });
+        unsafe { crate::questdb_error_free(c_err) };
+        unsafe { questdb_token_provider_free(retired) };
+
+        // A failure classified permanent stays retryable for reconnects.
+        let unassigned = application_provider(unassigned_get_token);
+        let err = transport_failure(unassigned);
+        assert_eq!(err.code(), ErrorCode::SocketError, "{err}");
+        assert!(!err.as_token_unavailable().unwrap().retryable());
+        unsafe { questdb_token_provider_free(unassigned) };
+    }
+
+    /// Publishes one row, returning the error a failed flush reported.
+    unsafe fn flush_one_row(sender: *mut crate::line_sender) -> Option<Error> {
+        let table = "t";
+        let column = "x";
+        let mut err: *mut questdb_error = ptr::null_mut();
+        unsafe {
+            let buffer = crate::line_sender_buffer_new_for_sender(sender);
+            assert!(!buffer.is_null());
+            let table = crate::line_sender_table_name_assert(table.len(), table.as_ptr().cast());
+            let column =
+                crate::line_sender_column_name_assert(column.len(), column.as_ptr().cast());
+            assert!(crate::line_sender_buffer_table(buffer, table, &mut err));
+            assert!(crate::line_sender_buffer_column_i64(
+                buffer, column, 1, &mut err
+            ));
+            assert!(crate::line_sender_buffer_at_now(buffer, &mut err));
+            let flushed = crate::line_sender_flush(sender, buffer, &mut err);
+            crate::line_sender_buffer_free(buffer);
+            if flushed {
+                return None;
+            }
+            assert!(!err.is_null());
+            let failure = (*err).error.clone();
+            crate::questdb_error_free(err);
+            Some(failure)
+        }
+    }
+
+    #[test]
+    fn only_a_terminal_failure_stops_a_background_connect() {
+        let conf = "ws::addr=127.0.0.1:1;initial_connect_retry=async;\
+                    reconnect_initial_backoff_millis=5;reconnect_max_backoff_millis=5;\
+                    close_flush_timeout_millis=0;";
+        for (get_token, terminal) in [
+            (retired_get_token as questdb_token_get_fn, true),
+            (unassigned_get_token, false),
+        ] {
+            let provider = application_provider(get_token);
+            let mut err: *mut questdb_error = ptr::null_mut();
+            let utf8 = unsafe { crate::line_sender_utf8_assert(conf.len(), conf.as_ptr().cast()) };
+            let opts = unsafe { crate::line_sender_opts_from_conf(utf8, &mut err) };
+            assert!(!opts.is_null());
+            assert!(unsafe { line_sender_opts_token_provider(opts, provider, &mut err) });
+            let sender = unsafe { crate::line_sender_build(opts, &mut err) };
+            unsafe { crate::line_sender_opts_free(opts) };
+            unsafe { questdb_token_provider_free(provider) };
+            assert!(!sender.is_null() && err.is_null());
+
+            // The background connect pulls the token every few milliseconds:
+            // a terminal failure must stop it well within the window, and a
+            // permanent one must leave the sender accepting rows throughout.
+            let window = Duration::from_millis(if terminal { 10_000 } else { 500 });
+            let started = std::time::Instant::now();
+            let mut failure = None;
+            while failure.is_none() && started.elapsed() < window {
+                failure = unsafe { flush_one_row(sender) };
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            unsafe { crate::line_sender_close(sender) };
+            if terminal {
+                let failure = failure.expect("the background connect never stopped");
+                assert_eq!(failure.code(), ErrorCode::ConfigError, "{failure}");
+                assert!(failure.msg().contains("provider retired"), "{failure}");
+            } else {
+                assert!(failure.is_none(), "the sender stopped: {failure:?}");
+            }
+        }
+    }
+
+    unsafe extern "C" fn source_reporting_terminal(
+        user_data: *mut c_void,
+        sink: *mut questdb_token_sink,
+    ) {
+        let probe = unsafe { &*user_data.cast::<Probe>() };
+        probe.fetches.fetch_add(1, Ordering::SeqCst);
+        let msg = "source retired";
+        let accepted =
+            unsafe { questdb_token_sink_set_terminal_error(sink, msg.as_ptr().cast(), msg.len()) };
+        probe.terminal_accepted.store(accepted, Ordering::SeqCst);
+        unsafe { questdb_token_sink_set_error(sink, false, -1, msg.as_ptr().cast(), msg.len()) };
+    }
+
+    #[test]
+    fn a_token_source_cannot_report_a_terminal_failure() {
+        // A refreshing provider is ended by closing it; its source's failures
+        // only steer the refresher.
+        let probe = Box::leak(Box::new(Probe::default()));
+        let mut options =
+            unsafe { std::mem::zeroed::<questdb_refreshing_token_provider_options>() };
+        unsafe {
+            questdb_refreshing_token_provider_options_init(&mut options, size_of_val(&options))
+        };
+        options.cold_wait_ms = 50;
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let provider = unsafe {
+            questdb_refreshing_token_provider_new(
+                Some(source_reporting_terminal),
+                ptr::from_mut(probe).cast(),
+                None,
+                &options,
+                &mut err,
+            )
+        };
+        assert!(!provider.is_null());
+        await_count(&probe.fetches, 1);
+        // The source's fallback report is what the provider kept. Waiting for
+        // it also orders the read of `terminal_accepted` after the callback.
+        let token = unsafe { questdb_token_provider_token(provider, &mut err) };
+        assert!(token.is_null() && !err.is_null());
+        let mut view = unsafe { std::mem::zeroed::<questdb_token_unavailable_view>() };
+        view.struct_size = size_of_val(&view);
+        assert!(unsafe { questdb_error_token_unavailable_get_view(err, &mut view) });
+        assert!(!view.retryable);
+        unsafe { crate::questdb_error_free(err) };
+        assert!(!probe.terminal_accepted.load(Ordering::SeqCst));
+        assert!(!unsafe { questdb_token_sink_set_terminal_error(ptr::null_mut(), ptr::null(), 0) });
+        unsafe { questdb_token_provider_close(provider) };
+        unsafe { questdb_token_provider_free(provider) };
     }
 
     #[test]

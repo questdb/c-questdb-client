@@ -194,7 +194,9 @@ qwp_reader* qwp_reader_from_conf(
  * device flow; call questdb_oidc_auth_sign_in before opening the reader. After
  * a handshake 401 for a token that had not expired, the one re-resolution a
  * connect makes refreshes it rather than presenting it again (at most once
- * every 30 seconds per auth).
+ * every 30 seconds per auth). A connect re-resolves only when the 401's
+ * `WWW-Authenticate` challenge allows it (no Bearer error, or
+ * `invalid_token`).
  * Mutually exclusive with static credentials: `config` must not also set
  * `username`/`password` or `token`. Setting both fails with
  * `questdb_error_config_error`. An `auth` already closed with

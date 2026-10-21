@@ -2945,8 +2945,12 @@ fn connect_sfa_pool_with_recovery_candidates(
 /// Re-acquire a live connection within `deadline`, retrying with the pool's
 /// reconnect backoff: a failed pick (every endpoint role-rejecting while the
 /// cluster elects a primary, or a transient transport error) backs off and
-/// retries; `AuthError` / `ProtocolVersionError` and deadline exhaustion are
-/// terminal.
+/// retries. Errors [`reconnect_error_is_foreground_terminal`] treats as
+/// terminal -- `AuthError`, a `ProtocolVersionError` that carries no role
+/// rejection, a provider failure that cannot clear -- and deadline exhaustion
+/// end it. A `ProtocolVersionError` from every endpoint rejecting by role (a
+/// durable-ack store-and-forward pool of replicas) is a role rejection, and is
+/// retried.
 #[cfg(feature = "ffi-support")]
 fn reconnect_pick<S>(
     inner: &Arc<DbInner>,

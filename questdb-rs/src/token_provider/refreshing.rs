@@ -454,7 +454,8 @@ pub struct TokenProviderStatus {
 /// - **Forced refresh.** [`on_rejected`](Self::on_rejected) with HTTP 401 for
 ///   the current token starts a fetch, at most once per `forced_min_interval`,
 ///   and waits up to `forced_wait` for it. Clients call it when a server
-///   rejects the token.
+///   rejects the token with a 401 that a new token can fix: one whose
+///   `WWW-Authenticate` Bearer challenge names no error, or `invalid_token`.
 /// - **Close.** [`close`](Self::close) stops the refresher and wakes every
 ///   waiter; [`token`](Self::token) then fails as permanent. Clients never
 ///   close a provider: close it once every client using it is closed. When

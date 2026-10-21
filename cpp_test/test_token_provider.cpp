@@ -34,8 +34,10 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -329,6 +331,91 @@ TEST_CASE("A closed provider is refused where it is attached")
     CHECK(attach_error_code([&] {
               questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", closed};
           }) == questdb::error_code::auth_error);
+}
+
+namespace
+{
+class retired_provider : public questdb::bearer_token_provider
+{
+public:
+    std::string token() override
+    {
+        throw questdb::error{
+            questdb::error_code::invalid_api_call, "provider retired"};
+    }
+};
+
+class failing_provider : public questdb::bearer_token_provider
+{
+public:
+    std::string token() override
+    {
+        throw std::runtime_error{"refresh failed"};
+    }
+};
+} // namespace
+
+TEST_CASE("A provider's invalid_api_call stops its clients")
+{
+    // The counterpart of a Rust provider returning `InvalidApiCall`: the
+    // transports report config_error, which no reconnect retries. A reader
+    // pulls the token before it dials, so no server is needed.
+    auto retired =
+        questdb::token_provider::from(std::make_shared<retired_provider>());
+    CHECK(attach_error_code([&] {
+              questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", retired};
+          }) == questdb::error_code::config_error);
+    // A direct pull reports what the provider reported, unclassified.
+    try
+    {
+        (void)retired.token();
+        FAIL("expected a failure");
+    }
+    catch (const questdb::error& e)
+    {
+        CHECK(e.code() == questdb::error_code::invalid_api_call);
+        CHECK_FALSE(e.token_unavailable_diagnostic().has_value());
+    }
+
+    // Any other exception stays retryable.
+    auto failing =
+        questdb::token_provider::from(std::make_shared<failing_provider>());
+    CHECK(attach_error_code([&] {
+              questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", failing};
+          }) == questdb::error_code::socket_error);
+}
+
+TEST_CASE("A source's invalid_api_call stays retryable")
+{
+    // A token source cannot stop its provider's clients: its sink refuses a
+    // terminal failure, and the exception is reported as retryable instead.
+    std::atomic<int> fetches{0};
+    questdb::refreshing_token_provider_options options;
+    options.cold_wait = 50ms;
+    auto provider = questdb::token_provider::refreshing(
+        [&fetches]() -> questdb::expiring_token {
+            ++fetches;
+            throw questdb::error{
+                questdb::error_code::invalid_api_call, "source retired"};
+        },
+        options);
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (fetches.load() == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(1ms);
+    REQUIRE(fetches.load() > 0);
+    try
+    {
+        (void)provider.token();
+        FAIL("expected a failure");
+    }
+    catch (const questdb::error& e)
+    {
+        CHECK(
+            std::string{e.what()}.find("source retired") != std::string::npos);
+        const auto& classification = e.token_unavailable_diagnostic();
+        REQUIRE(classification.has_value());
+        CHECK(classification->retryable);
+    }
 }
 
 TEST_CASE("One opts take one rotating provider")

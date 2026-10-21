@@ -1004,9 +1004,10 @@ impl OidcDeviceAuth {
     /// when a server rejects the cached token with HTTP 401 before it expires
     /// -- after a revocation or a signing-key rotation, say: the transport's
     /// one re-resolution then refreshes the token instead of being handed the
-    /// rejected one again. Such a forced refresh happens at most once every 30
-    /// seconds; within that window the cached token is served as usual and
-    /// the 401 stands.
+    /// rejected one again. A transport re-resolves only after a 401 whose
+    /// `WWW-Authenticate` Bearer challenge names no error, or `invalid_token`.
+    /// Such a forced refresh happens at most once every 30 seconds; within
+    /// that window the cached token is served as usual and the 401 stands.
     pub fn token(&self) -> Result<String> {
         self.ensure_open()?;
         self.drop_rejected_token();

@@ -925,10 +925,13 @@ bool questdb_error_oidc_get_view(
  * with `line_sender_error_failover_retry` carrying the OIDC detail.
  *
  * A server that answers HTTP 401 makes the transport resolve the token once
- * more and replay the request or handshake if it changed. If the server
- * rejected a token before it expired -- it was revoked, or the server rotated
- * its signing key -- that re-resolution refreshes it instead of presenting it
- * again, at most once every 30 seconds per auth, when a refresh token exists.
+ * more and replay the request or handshake if it changed, when the 401's
+ * `WWW-Authenticate` Bearer challenge names no error, or `invalid_token` (a
+ * new token cannot fix another error, such as `insufficient_scope`). If the
+ * server rejected a token before it expired -- it was revoked, or the server
+ * rotated its signing key -- that re-resolution refreshes it instead of
+ * presenting it again, at most once every 30 seconds per auth, when a refresh
+ * token exists.
  * Without one, the provider keeps the still-valid cached token until expiry: a
  * 401 can also mean that QuestDB's own userinfo lookup failed temporarily.
  *

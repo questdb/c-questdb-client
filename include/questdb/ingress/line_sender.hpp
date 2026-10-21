@@ -1541,7 +1541,9 @@ public:
      * reference. A QWP/WebSocket sender pulls the token once per connect
      * round; an HTTP(S) sender pulls it on every flush, on the flushing
      * thread. On a 401 the sender tells the provider which token was
-     * rejected, pulls again, and retries once if the token changed.
+     * rejected, pulls again, and retries once if the token changed and the
+     * `WWW-Authenticate` challenge allows it (no Bearer error, or
+     * `invalid_token`).
      * Mutually exclusive with `username()`/`password()`, `token()` and
      * `oidc_auth()`: one opts take one rotating provider. Use `https::` or
      * `wss::`.

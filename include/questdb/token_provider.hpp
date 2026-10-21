@@ -58,8 +58,10 @@ struct expiring_token
  * Throw from a token source or a `bearer_token_provider` to classify a
  * failure: whether retrying can succeed (network failures, timeouts, 429 and
  * 5xx are retryable; missing or wrong configuration is not), and a suggested
- * wait. Any other exception counts as retryable. Never put a token in the
- * message.
+ * wait. Any other exception counts as retryable, except a
+ * `questdb::error` with `error_code::invalid_api_call` thrown from
+ * `bearer_token_provider::token()`, which stops background reconnects (see
+ * there). Never put a token in the message.
  */
 class token_unavailable : public std::runtime_error
 {
@@ -102,11 +104,23 @@ class bearer_token_provider
 public:
     virtual ~bearer_token_provider() = default;
 
-    /** The current token, without the `Bearer ` prefix. */
+    /**
+     * The current token, without the `Bearer ` prefix.
+     *
+     * Clients keep retrying a failure in the background, whatever
+     * `token_unavailable` says. To stop them on a failure that retrying can
+     * never clear, throw `questdb::error` with `error_code::invalid_api_call`,
+     * as a Rust provider returns `InvalidApiCall`: a QWP/WebSocket sender,
+     * reader or pool then reports `config_error` and stops reconnecting, and
+     * an ILP/HTTP flush fails with it at once. A token source cannot do this;
+     * close a refreshing provider instead.
+     */
     virtual std::string token() = 0;
 
-    /** A server rejected `token` with `http_status` (401). Stop serving it if
-     *  it has not rotated already. May be called more than once. */
+    /** A server rejected `token` with `http_status` (401): one whose
+     *  `WWW-Authenticate` Bearer challenge names no error, or
+     *  `invalid_token`. Stop serving it if it has not rotated already. May be
+     *  called more than once. */
     virtual void on_rejected(std::string_view token, uint16_t http_status)
     {
         (void)token;
@@ -158,6 +172,13 @@ inline void set_sink_error(
         sink, retryable, retry_after_ms, msg, std::strlen(msg));
 }
 
+/** False when `sink` refuses a terminal failure, as a source's sink does. */
+inline bool set_sink_terminal_error(
+    ::questdb_token_sink* sink, const char* msg) noexcept
+{
+    return ::questdb_token_sink_set_terminal_error(sink, msg, std::strlen(msg));
+}
+
 /** Report the exception being handled through `sink`. */
 inline void report_current_exception(::questdb_token_sink* sink) noexcept
 {
@@ -172,6 +193,15 @@ inline void report_current_exception(::questdb_token_sink* sink) noexcept
             e.retryable(),
             e.retry_after() ? e.retry_after()->count() : -1,
             e.what());
+    }
+    catch (const ::questdb::error& e)
+    {
+        // `invalid_api_call` is a failure retrying can never clear, as for a
+        // Rust provider. A token source's sink refuses it, and it then counts
+        // as retryable like any other exception.
+        if (e.code() != ::questdb::error_code::invalid_api_call ||
+            !set_sink_terminal_error(sink, e.what()))
+            set_sink_error(sink, true, -1, e.what());
     }
     catch (const std::exception& e)
     {

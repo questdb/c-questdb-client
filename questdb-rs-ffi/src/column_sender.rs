@@ -1266,9 +1266,13 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_sender(
 
 /// Like `questdb_db_borrow_sender` but retries the connect within
 /// `budget_ms` using the pool's reconnect backoff (centered-jittered
-/// exponential with a role-reject reset; `AuthError` / protocol-version errors
-/// are terminal). `budget_ms == 0` makes a single attempt (no retry). Returns
-/// NULL on failure; sets `*err_out` if provided.
+/// exponential with a role-reject reset). `AuthError` and protocol-version
+/// errors are terminal, except a protocol-version error caused by every
+/// endpoint rejecting the connection by role (a durable-ack pool whose nodes
+/// are all replicas): that is retried until `budget_ms`, as a failover can
+/// promote a primary, and still ends with the protocol-version error.
+/// `budget_ms == 0` makes a single attempt (no retry). Returns NULL on
+/// failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_borrow_sender_with_retry(
     db: *mut questdb_db,

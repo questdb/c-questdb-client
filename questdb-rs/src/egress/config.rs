@@ -1105,7 +1105,9 @@ impl ReaderConfig {
     /// endpoint walk, so a long-lived reader keeps working as the token silently
     /// refreshes / rotates. The acquired token is reused for every endpoint tried
     /// within that walk; after one handshake 401 it is resolved once more and
-    /// the same endpoint is replayed only if the value changed.
+    /// the same endpoint is replayed only if the value changed, when the 401's
+    /// `WWW-Authenticate` Bearer challenge names no error, or `invalid_token`
+    /// -- a new token cannot fix any other, such as `insufficient_scope`.
     /// `OidcDeviceAuth::token` answers that re-resolution with a refreshed
     /// token when the server rejected its cached one before it expired, at most
     /// once every 30 seconds. A later reconnect round pulls a fresh one. The token is sent as the `Authorization: Bearer <token>` handshake header; a token with

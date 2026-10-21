@@ -1615,10 +1615,12 @@ impl SenderBuilder {
     /// panics). A server rejection of a successfully acquired token is a separate
     /// terminal authentication error, after one exception per flush: a request
     /// answered with HTTP 401 resolves the provider again and is replayed if
-    /// the token changed. `OidcDeviceAuth::token` answers that re-resolution
-    /// with a refreshed token when the server rejected its cached one before it
-    /// expired, at most once every 30 seconds. Mutually exclusive with
-    /// [`username`](Self::username) / [`password`](Self::password) /
+    /// the token changed, when the 401's `WWW-Authenticate` Bearer challenge
+    /// names no error, or `invalid_token` -- a new token cannot fix any other,
+    /// such as `insufficient_scope`. `OidcDeviceAuth::token` answers that
+    /// re-resolution with a refreshed token when the server rejected its cached
+    /// one before it expired, at most once every 30 seconds. Mutually exclusive
+    /// with [`username`](Self::username) / [`password`](Self::password) /
     /// [`token`](Self::token); ILP/HTTP only.
     ///
     /// One builder takes one provider: attaching a second one, through this
@@ -1696,10 +1698,12 @@ impl SenderBuilder {
     /// Unlike [`token`](Self::token), which captures a fixed token once, the
     /// provider is called once at each connect/reconnect endpoint walk. That
     /// value is reused across endpoint failover; after one handshake 401 it is
-    /// resolved once more and the same endpoint is replayed only if it changed.
-    /// `OidcDeviceAuth::token` answers that re-resolution with a refreshed
-    /// token when the server rejected its cached one before it expired, at most
-    /// once every 30 seconds.
+    /// resolved once more and the same endpoint is replayed only if it changed,
+    /// when the 401's `WWW-Authenticate` Bearer challenge names no error, or
+    /// `invalid_token` -- a new token cannot fix any other, such as
+    /// `insufficient_scope`. `OidcDeviceAuth::token` answers that
+    /// re-resolution with a refreshed token when the server rejected its cached
+    /// one before it expired, at most once every 30 seconds.
     /// Thus a long-lived sender keeps working as the token rotates. The returned token
     /// is sent as the `Authorization: Bearer <token>` handshake header; a token
     /// with a non-printable-ASCII character (a header-injection vector) is
@@ -1712,8 +1716,9 @@ impl SenderBuilder {
     /// [`Error::token_unavailable`](crate::Error::token_unavailable), or an OIDC
     /// acquisition busy on another thread. Any other provider failure ends it at
     /// once, OIDC's `InteractionRequired` included: nobody has signed in, and the
-    /// waiting caller is the one that would have to. Before retrying a 401, the
-    /// sender calls the provider's `on_rejected` with the rejected token.
+    /// waiting caller is the one that would have to. Before that one
+    /// re-resolution after a 401, the sender calls the provider's
+    /// `on_rejected` with the rejected token.
     ///
     /// A server's rejection of a successfully acquired token -- HTTP 401 or 403
     /// on the WebSocket upgrade -- is terminal only before the sender's first

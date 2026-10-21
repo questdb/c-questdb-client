@@ -91,10 +91,12 @@ pub enum ConnectionEventKind {
     ///   foreground/initial connect fails fast, because a credential problem
     ///   during initialization is the caller's to see.
     /// * `AuthError` or `ConfigError` -- the provider cannot recover *in this
-    ///   process*, so the reconnect is **terminal** and the runner stops. Two
-    ///   causes reach here: a permanently closed provider (an OIDC provider's
-    ///   `close()` is monotonic) and a misconfiguration the scope cannot satisfy,
-    ///   such as groups mode against an IdP that returns no `id_token`. Queued
+    ///   process*, so the reconnect is **terminal** and the runner stops. The
+    ///   causes: a permanently closed provider (an OIDC provider's `close()` is
+    ///   monotonic), a misconfiguration the scope cannot satisfy, such as
+    ///   groups mode against an IdP that returns no `id_token`, and a provider
+    ///   that reported a failure retrying can never clear (`InvalidApiCall` in
+    ///   Rust, `questdb_token_sink_set_terminal_error` in C). Queued
     ///   frames are not deleted -- a disk-backed store-and-forward slot stays
     ///   drainable by a later process -- but this process will not send them.
     ///

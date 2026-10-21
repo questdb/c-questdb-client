@@ -2398,8 +2398,9 @@ int64_t line_sender_now_micros(void);
  *    frames; only a foreground/initial connect fails fast.
  *  - `line_sender_error_auth_error` / `line_sender_error_config_error` --
  *    the provider cannot recover in this process (a permanently closed
- *    OIDC provider, or a scope that cannot yield the required token kind),
- *    so the reconnect is TERMINAL and the runner stops. Queued frames are
+ *    provider, a scope that cannot yield the required token kind, or a
+ *    provider that reported `questdb_token_sink_set_terminal_error`), so
+ *    the reconnect is TERMINAL and the runner stops. Queued frames are
  *    not deleted and a disk-backed slot stays drainable by a later
  *    process, but this process will not send them.
  *
