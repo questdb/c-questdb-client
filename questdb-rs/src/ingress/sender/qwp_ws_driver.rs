@@ -5774,14 +5774,10 @@ mod tests {
             .unwrap();
         let _server_streams = server.join().unwrap();
 
-        // The gate shuts the socket down before the read is issued, on this
-        // same thread, so no recv is in flight when it runs. This test checks
-        // only which socket the gate holds after a reconnect; the outcome
-        // does not depend on Windows CancelIoEx timing or on how Winsock
-        // treats a recv that overlaps shutdown(). A read issued after the
-        // shutdown returns EOF at once (std reports Winsock WSAESHUTDOWN as
-        // Ok(0)). A missing reconnect registration leaves the replacement
-        // socket open, and the read times out.
+        // The gate shuts the socket down before the read, on this same thread,
+        // so the read returns EOF at once (std maps Winsock WSAESHUTDOWN to
+        // Ok(0)). Without the reconnect's registration the socket stays open
+        // and the read times out.
         transport
             .stream
             .set_timeouts(Some(Duration::from_secs(5)), None)
