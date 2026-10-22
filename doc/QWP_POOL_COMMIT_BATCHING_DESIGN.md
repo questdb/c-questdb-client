@@ -6,268 +6,300 @@
 (`borrow_sender()`), in Rust, C and C++. Neither the protocol nor the server
 changes.
 
-## 1. Goal
+## 1. The problem
 
-| Mode | Calls | Who decides when rows commit |
+A common way to use the pool is one lease per message:
+
+```rust
+for msg in queue {
+    let mut s = db.borrow_sender()?;
+    buf.table("trades")?.symbol("sym", &msg.sym)?.column_f64("px", msg.px)?.at(msg.ts)?;
+    s.flush_buffer(&mut buf)?;
+}
+```
+
+Today every flush becomes one frame on the wire, and the server commits
+every frame on its own. A million messages mean a million frames and a
+million commits, and that, not the data, is what limits throughput.
+
+Users work in one of two modes:
+
+| Mode | Calls | When rows commit |
 |---|---|---|
-| Streaming | borrow, add, flush, return | The client, within `commit_interval_ms` |
-| Transaction control | borrow, add, flush, **commit**, add, flush, **commit**, return | The user: `commit()` sends now |
+| Streaming | borrow, add, flush, return | Soon. The client decides when |
+| Transaction control | borrow, add, flush, **commit**, add, flush, **commit**, return | When the user calls `commit()` |
 
 Requirements:
 
-1. **Durable on flush.** When a flush returns `Ok`, its frame is in the
-   store-and-forward (SF) queue, exactly as today. Nothing stays in a
+1. **A flush is durable.** When a flush returns `Ok`, its frame is in the
+   store-and-forward (SF) queue, exactly as today. Nothing is left in any
    client buffer after a lease is returned.
-2. **Fewer frames and fewer commits.** One lease per message must not mean
-   one frame and one commit per message.
-3. **Protocol unchanged.** A table appears at most once in a message. The
-   only flag used is the existing `FLAG_DEFER_COMMIT`.
+2. **Fewer frames and fewer commits.** Small flushes are sent together.
+3. **Nothing changes on the server.** Messages use the protocol as it is.
 
-## 2. Design
+## 2. The idea
 
-The publish path does not change: each flush encodes one frame into SF. All
-batching happens in each slot's I/O thread. When unsent frames are due, the
-I/O thread decodes them and merges each table's rows into one block. It
-then encodes the result as one message: one frame on the wire and one
-commit on the server.
+Flush stays exactly as it is: each flush writes one frame into SF, and SF
+holds the only copy of the data.
+
+What changes is sending. Each slot already has an I/O thread that reads
+frames from SF and sends them. Now it waits a little, collects the small
+frames that have queued up, and turns them into **one** message. It decodes
+them, puts each table's rows together, and encodes the result once. The
+server receives one frame and commits once.
 
 ```text
-flush ──► SF queue (frame per flush, durable) ──► I/O thread ──► server
-          unchanged                                decode, merge    1 message,
-                                                   per table,       1 commit
-                                                   encode
+flush ──► SF queue ─────────────────────► I/O thread ──────────────► server
+          one frame per flush,            decode the queued frames,   1 message,
+          durable, unchanged              one block per table,        1 commit
+                                          encode once
 ```
 
-SF is the only source of truth. A merged message is derived from SF frames
-and replaces them on the wire. Recovery, replay and the SF format are
-unchanged.
+With `commit_interval_ms=100`, one slot sees this:
 
-Each SF sender already has its own I/O thread (`ingress/sender/qwp_ws.rs:644`,
-`:698`). Merging therefore scales with `sender_pool_max`, and per slot it
-runs in parallel with the caller's encoding.
+```text
+time     event                          SF queue (unsent)       wire
+0 ms     lease A flushes 1 row          frame 1
+1 ms     lease B flushes 1 row          frames 1-2
+...
+99 ms    lease X flushes 1 row          frames 1-500
+100 ms   frame 1 is 100 ms old          (sent)                  1 message, 500 rows, 1 commit
+```
 
-### 2.1 Configuration
+## 3. Why it is safe
+
+Four rules hold at all times. Each one is what keeps an existing guarantee
+intact.
+
+1. **Every row that is sent is already in SF.** Batching never holds data
+   anywhere else. So a crash or restart loses nothing, and recovery stays
+   exactly as it is.
+2. **A merged message is just another way to put SF frames on the wire.**
+   Each frame (identified by its FSN, its position in SF) is sent once, inside
+   exactly one message. So acks still tell SF exactly which frames it can
+   drop.
+3. **Frames go out in FSN order.** So rows reach the server in the order
+   they were flushed.
+4. **Each table appears at most once in a message, and a frame is never
+   split.** So the server sees an ordinary message, and the rows of one
+   flush always commit together.
+
+## 4. How it works
+
+### 4.1 Configuration
 
 | Key | Default | Meaning |
 |---|---|---|
-| `commit_interval_ms` | unset (off) | Turns batching on. Frames are sent at the latest this long after the oldest unsent one was flushed |
-| `commit_rows` | off | Also send when the unsent frames hold this many rows |
+| `commit_interval_ms` | unset (off) | Turns batching on. Rows are sent at the latest this long after they were flushed |
+| `commit_rows` | off | Also send once this many rows are waiting |
 
 - Setting `commit_rows` alone turns batching on with
   `commit_interval_ms=100`.
-- The pool parses both keys and strips them before opening each slot's
+- The pool reads both keys and removes them before opening each slot's
   sender. A standalone `Sender` rejects them.
 - With batching off, every frame is sent as soon as it is queued, as today.
 
-### 2.2 When the I/O thread sends
+### 4.2 When frames are sent
 
-All unsent frames are due as soon as any of these holds:
+All unsent frames become due as soon as any of these is true:
 
-1. The oldest unsent frame has waited `commit_interval_ms`.
-2. The unsent frames hold `commit_rows` rows.
-3. The unsent frames reach the frame cap: the smallest of `max_buf_size`,
-   the server's advertised max batch size, and the SF segment payload cap.
-4. `commit()` or a wait asked for it (§2.5).
-5. The sender is closing or draining.
+1. the oldest one has waited `commit_interval_ms`;
+2. together they hold `commit_rows` rows;
+3. together they reach the frame cap (the smallest of `max_buf_size`, the
+   server's advertised max batch size, and the SF segment payload cap);
+4. someone called `commit()` or a wait (§4.5);
+5. the sender is closing or draining.
 
-- The I/O thread sleeps until the oldest unsent frame is due, using the
-  existing `wait_timeout` (`qwp_ws.rs:1010`).
-- Each frame's enqueue time and row count are kept in memory only. Frames
-  replayed after a reconnect or restart are due at once.
+- **Waiting.** The I/O thread sleeps until the oldest unsent frame is due,
+  using the `wait_timeout` it already has (`ingress/sender/qwp_ws.rs:1010`).
+- **Bookkeeping.** Each frame's enqueue time and row count are kept in
+  memory only.
+- **After a restart or reconnect.** Replayed frames are due at once.
 
-### 2.3 From due frames to messages
+### 4.3 From due frames to messages
 
-Due frames are taken in FSN order and grouped. Each group becomes one
-message.
+Due frames are taken in FSN order. Each frame goes one of three ways.
 
-**Merge path (normal).** Frames are merged with the merger in §2.4. The
-message's header flags are the frames' flags. Its `FLAG_DEFER_COMMIT` is
-the last frame's, so a chunk split that is still open stays deferred.
+**Merged (the normal case).** Consecutive small frames are merged into one
+message (§4.4). The message keeps the frames' header flags. Its
+`FLAG_DEFER_COMMIT` is the last frame's, so a chunk split that is still
+open stays open.
 
-A group ends before the next frame when that frame:
+A message ends, and a new one starts, before a frame that:
 
 - would push the message over the frame cap;
-- has different header flags, ignoring `FLAG_DEFER_COMMIT` (version,
-  Gorilla, delta-dictionary mode);
-- has a column whose type, or type parameter (decimal scale, geohash
-  precision, array element type), differs from the same column already in
-  the group;
-- has a different designated-timestamp shape for the same table: the
-  timestamp column versus server-assigned (`at_now`);
-- does not continue the group's symbol dictionary range. This includes a
+- has different header flags (version, Gorilla, delta dictionary), ignoring
+  `FLAG_DEFER_COMMIT`;
+- writes a column with a different type, or a different type parameter
+  (decimal scale, geohash precision, array element type), than the same
+  column already in the message;
+- writes a table with a different timestamp shape: an explicit designated
+  timestamp versus server-assigned (`at_now`);
+- does not continue the message's symbol dictionary range, for example a
   dictionary that restarts at 0.
 
-**As-is path.** These frames are sent unchanged, each as its own message:
+**As is.** These frames are sent unchanged, each as its own message:
 
-- frames of at least 64 KiB, because merging no longer saves anything. Big
-  row buffers, chunks and Arrow batches usually land here;
-- frames without the delta-dictionary flag (the degraded full-dictionary
-  mode).
+- frames of 64 KiB or more. They are big enough already, so merging gains
+  nothing. Big buffers, chunks and Arrow batches usually land here.
+- frames without a delta dictionary (the degraded full-dictionary mode).
 
-**Backlog path.** If more than two frame caps of unsent bytes are queued
-when a group is due, the I/O thread is falling behind. It then stops
-merging and sends that group's frames unchanged. On the wire, each frame
-carries its stored `FLAG_DEFER_COMMIT`. Every frame but the last also gets
-the flag, so the server commits the group once. These extra flags are never
-written to SF. Merging resumes once the backlog drains.
+**Backlog.** If more than two frame caps of unsent data have queued up, the
+I/O thread is falling behind. It stops merging and sends the frames
+unchanged, which is cheap. To keep the commit count low, it sets
+`FLAG_DEFER_COMMIT` on the wire on every frame of the group but the last,
+so the server commits the group once. Flags already stored on a frame are
+kept. The added flags are never written to SF. Merging resumes once the
+backlog has cleared.
 
-### 2.4 The merger
+### 4.4 The merger
 
-The merger lives in a new module, `ingress/sender/qwp_ws_merge.rs`.
+The merger lives in a new module, `ingress/sender/qwp_ws_merge.rs`. It does
+not invent a new way to merge rows: it reuses the one the row API already
+uses.
 
-1. **Decode.** Read each frame's table blocks into a reused
-   `QwpWsColumnarBuffer`, the same buffer type that the row API fills. The
-   buffer already keeps one table buffer per table name, sparse cells for
-   missing columns, and per-column symbol dictionaries. Decoding covers
-   every QWP wire type: fixed width, booleans, varchar and binary,
-   symbols, Gorilla-encoded timestamps, decimals, geohash, UUID, long256
-   and arrays.
-2. **Symbols.** Each symbol ID is resolved to its string through the I/O
-   thread's copy of the connection dictionary. That copy is a
-   `SymbolGlobalDict`, updated from every frame's delta section in FSN
-   order.
-3. **Encode.** Use the existing encoder
-   (`encode_ws_replay_message_with_defer`, `buffer/qwp.rs:3802`). Interning
-   returns the same IDs, because every symbol is already in the
-   dictionary. The encoder gains an explicit dictionary start: the delta
-   section must carry exactly the entries the group's frames introduced,
-   starting at the first frame's `delta_start`.
-4. **Bulk append.** `QwpWsColumnarBuffer` gains a bulk append for decoded
-   columns, so decoding does not go through the per-row API.
+1. **Decode into a `Buffer`.** Each frame's table blocks are decoded into a
+   reused `QwpWsColumnarBuffer`, the buffer the row API fills. That buffer
+   already keeps one table per name, represents missing columns as nulls,
+   and keeps a dictionary per symbol column. The decoder covers every QWP
+   wire type: fixed width, booleans, varchar and binary, symbols,
+   Gorilla-encoded timestamps, decimals, geohash, UUID, long256 and arrays.
+   A new bulk append adds the decoded columns without going row by row.
+2. **Resolve symbols.** Symbol IDs in a frame are connection-wide. The I/O
+   thread keeps a copy of the connection dictionary (`SymbolGlobalDict`),
+   fed from every frame's dictionary section in FSN order, and resolves
+   each ID to its string.
+3. **Encode once.** The existing encoder writes the message
+   (`encode_ws_replay_message_with_defer`, `buffer/qwp.rs:3802`).
+   - **IDs stay the same.** Every symbol is already in the dictionary, so
+     encoding gives back the IDs the server knows.
+   - **New: an explicit dictionary start.** The message must carry exactly
+     the entries its frames introduced, from the first frame's
+     `delta_start` onwards. Today the encoder always starts at the
+     dictionary's current end.
 
-### 2.5 API
+### 4.5 The API
 
 | Call | With batching on |
 |---|---|
 | `flush_buffer`, `flush_buffer_and_keep`, `flush_chunk`, `flush_arrow_batch_*`, `*_and_get_fsn` | Unchanged. `Ok` means the frame is in SF, and the FSN is known |
-| **`commit()`** (new) | Makes every unsent frame up to this lease's last flushed frame due now. Returns without waiting |
-| `wait`, `*_and_wait` | `commit()`, then wait as today |
-| Return or drop of a lease | Unchanged. No I/O |
+| **`commit()`** (new) | Every unsent frame up to this lease's last flush becomes due now. Returns at once, without waiting for the server |
+| `wait`, `*_and_wait` | Do what `commit()` does, then wait as today |
+| Return or drop of a lease | Unchanged. No I/O; the rows are already in SF |
 
 - **Rust:** `BorrowedSender::commit(&mut self) -> Result<()>`
 - **C:** `qwp_sender_commit(qwp_sender*, line_sender_error**)`
 - **C++:** `borrowed_sender::commit()`
 
-`commit()` sets a per-connection "due through FSN" mark. With batching off,
-it does nothing.
+With batching off, `commit()` does nothing, since every frame is already
+sent at once.
 
-A transaction is one `Buffer`: add rows, `flush_buffer`, `commit()`. One
-buffer is one frame, and a frame is never split across messages, so its
-rows commit together, per table, up to the frame cap.
+**A transaction is one `Buffer`.** Add the rows, `flush_buffer`, then
+`commit()`. One buffer is one frame, and a frame is never split, so its rows
+commit together (per table, up to the frame cap).
 
-### 2.6 Acks and rejections
+### 4.6 Acks and rejections
 
-`InFlightRun` (`ingress/sender/qwp_ws_driver.rs:2828`) maps FSNs to wire
-sequences with fixed arithmetic, assuming one frame per message. It becomes
-a queue of `(wire_seq, first_fsn, last_fsn)`, one entry per message.
+Today `InFlightRun` (`ingress/sender/qwp_ws_driver.rs:2828`) assumes one
+frame per message and maps FSNs to wire sequence numbers with arithmetic.
+It becomes a small queue with one entry per message:
+`(wire_seq, first_fsn, last_fsn)`.
 
-- **Ack.** An ack (OK or durable) of a message acks through its
-  `last_fsn`. The SF queue trims as today. Deferred frames on the backlog
-  path are covered by the ack of the group's last frame.
-- **Rejection.** A rejected message applies the existing rejection policy to
-  its whole FSN range. The error handler receives the range.
-- **Symbol dictionary.** `dict_mirror.accumulate` and `guard_dict_not_torn`
-  run on every message sent.
+- **Ack.** An ack (OK or durable) of a message covers all its frames. SF
+  trims through `last_fsn`, as today. On the backlog path, the last frame's
+  ack covers the deferred frames before it.
+- **Rejection.** The existing rejection policy applies to the message's
+  whole FSN range, and the error handler receives the range.
+- **Dictionary checks.** `dict_mirror.accumulate` and
+  `guard_dict_not_torn` run on every message sent.
 
-### 2.7 Unchanged
+### 4.7 What does not change
 
 - The publish path, the SF format, recovery, replay and the reconnect
-  catch-up. Replayed frames go through the same merging.
+  catch-up. Replayed frames are merged like any others.
 - Return, drop, reaping, close and drain.
 - `SymbolDictFull` handling and the `Buffer` contract.
 
-## 3. Invariants
-
-1. Every row sent is already in SF. Nothing is held outside SF.
-2. Each FSN is sent at most once per connection, inside exactly one
-   message.
-3. Wire order is FSN order.
-4. A table appears at most once in a message.
-5. A frame is never split across messages.
-
-## 4. Limits
+## 5. Costs and limits
 
 - **Visibility.** In streaming mode, rows become visible up to
-  `commit_interval_ms` after the flush. Call `commit()` to send sooner.
-- **Rejections.** A rejection covers the whole message, so every flush
+  `commit_interval_ms` after the flush. Call `commit()` to see them sooner.
+- **Rejections.** One bad frame fails the whole message, so every flush
   merged into it fails together.
-- **Partial commits.** These are possible exactly as today with multi-table
-  frames. The server commits a table as soon as it reaches
-  `maxUncommittedRows`, so if a later table's block in the same message
-  fails, the earlier tables may already be committed.
-- **I/O thread CPU.** The I/O thread decodes and re-encodes small frames.
-  Frames of 64 KiB or more skip the merge, and a backlog switches to the
-  backlog path.
+- **Partial commits.** These can happen exactly as they do today with
+  multi-table frames. The server commits a table early once it reaches
+  `maxUncommittedRows`. If a later table in the same message then fails,
+  the tables before it may already be committed.
+- **I/O thread CPU.** The I/O thread now decodes and re-encodes small
+  frames. Each slot has its own I/O thread, so the work spreads across
+  `sender_pool_max` threads and runs alongside the callers' encoding. Big
+  frames skip the merge, and a backlog switches to the cheap path.
 
-## 5. Code
+## 6. Code
 
 - **`ingress/sender/qwp_ws_merge.rs` (new):** the frame decoder, grouping
-  and the rules that end a group.
-- **`ingress/buffer/qwp.rs`:**
-  - bulk append of decoded columns into `QwpWsColumnarBuffer`;
-  - an explicit dictionary start for the replay encoder.
+  frames, and the rules that end a message.
+- **`ingress/buffer/qwp.rs`:** bulk append of decoded columns; an explicit
+  dictionary start for the encoder.
 - **`ingress/sender/qwp_ws_driver.rs`:**
-  - the due rules and the "due through FSN" mark;
-  - merging, the as-is path and the backlog path;
-  - the in-flight message queue;
+  - when frames are due, including the `commit()` mark;
+  - the three paths;
+  - the per-message in-flight queue;
   - the I/O-side `SymbolGlobalDict`.
-- **`ingress/sender/qwp_ws.rs`:** per-frame enqueue time and row count, and
-  the timed wake.
-- **`ingress/column_sender/sender.rs` (`PooledSenderCore`):**
-  - `commit()`;
-  - `wait` and `*_and_wait` set the mark.
-
-  The C FFI calls this directly, so this also covers C and C++.
+- **`ingress/sender/qwp_ws.rs`:** per-frame enqueue time and row count; the
+  timed wake.
+- **`ingress/column_sender/sender.rs` (`PooledSenderCore`):** `commit()`;
+  `wait` and `*_and_wait` set the mark. The C FFI calls this type directly,
+  so C and C++ get it too.
 - **`db.rs`:** `BorrowedSender::commit`.
 - **`db/conf.rs`:** the two keys.
 - **`include/questdb/ingress/qwp_sender.h` / `.hpp`, `client.h`:**
-  `qwp_sender_commit`, `borrowed_sender::commit()`, and the conf-key table.
+  `qwp_sender_commit`, `borrowed_sender::commit()`, the conf-key table.
 
-## 6. Tests
+## 7. Tests
 
 **Decoder and merger**
 
-- Round trip: encode a `Buffer`, decode it, encode it again. The two encodings
-  must be byte for byte equal. Cover every column kind, sparse columns,
-  nulls, symbols, the designated timestamp and `at_now`, and Gorilla.
-- Merge: frames from several buffers, once merged, encode exactly like the
-  same rows written into one buffer.
-- Each rule that ends a group: cap, flag mismatch, type or type-parameter
-  clash, timestamp shape, dictionary gap or restart.
-- `FLAG_DEFER_COMMIT` on a merged message follows the last frame. On the
-  backlog path, a stored flag is kept.
+- Round trip: encode a `Buffer`, decode it, encode it again. The bytes must
+  be identical. Cover every column kind, sparse columns, nulls, symbols,
+  `at_now` and Gorilla.
+- Merging the frames of several buffers gives the same bytes as writing all
+  their rows into one buffer.
+- Each rule that ends a message: cap, flags, type or type parameter,
+  timestamp shape, dictionary gap or restart.
+- `FLAG_DEFER_COMMIT` on a merged message follows its last frame.
 
 **Driver** (`QwpWsCoreTestHarness`, fake server)
 
-- A group goes out as one message with one block per table, and its ack
+- Due frames go out as one message with one block per table, and its ack
   trims the whole range.
-- A frame of 64 KiB or more goes out as-is, in order.
-- The backlog path sends the group deferred except the last frame, so the
-  server sees one commit.
-- Reconnect replays and merges again. A rejection covers the whole range.
+- A frame of 64 KiB or more goes out unchanged, in order.
+- The backlog path makes the server commit once per group. Stored flags are
+  kept.
+- After a reconnect, frames are replayed and merged again.
+- A rejection covers the whole range.
 - The interval, `commit_rows`, `commit()` and close each make frames due.
 
 **Pool** (`tests/qwp_sender_pool.rs`)
 
 - One lease per message: about one message per interval.
 - `commit()` sends now.
-- Returning a lease leaves nothing behind.
-- With `sf_dir`, frames flushed before a kill are delivered after a
-  restart.
+- A returned lease leaves nothing behind.
+- With `sf_dir`, frames flushed before a kill arrive after a restart.
 
 **Config**
 
 - Defaults.
-- `commit_rows` alone enables batching.
+- `commit_rows` alone turns batching on.
 - A standalone `Sender` rejects the keys.
 
-**C/C++:** `commit` exists, and the keys are accepted.
+**C/C++:** `commit` exists and the keys are accepted.
 
-## 7. Plan
+## 8. Plan
 
-1. Decoder and bulk append, with round-trip tests.
-2. Merger, with merge tests and the explicit dictionary start.
-3. Driver: due rules, the three paths, the in-flight message queue, the
+1. Decoder and bulk append, with the round-trip tests.
+2. Merger and the explicit dictionary start, with the merge tests.
+3. Driver: when frames are due, the three paths, the in-flight queue and the
    I/O-side dictionary.
 4. `commit()` in Rust, C and C++; the config keys.
 5. Pool, C and C++ tests.
