@@ -738,6 +738,71 @@ fn qwp_udp_rejects_duplicate_entry_names_within_row() -> TestResult {
 }
 
 #[test]
+fn qwp_udp_rejects_case_variant_duplicate_within_row() -> TestResult {
+    // QuestDB column names are case insensitive, so `Side` and `side` are one
+    // column. QWP/UDP compared them byte for byte and emitted both (issue #204).
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer.table("trades")?.symbol("Side", "buy")?;
+    assert_err_contains(
+        buffer.symbol("side", "sell"),
+        ErrorCode::InvalidApiCall,
+        "column 'side' already set for current row",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_rejects_case_variant_type_change_within_row() -> TestResult {
+    // The same clash with two different types, which is the worse shape: the row
+    // would otherwise carry one server column as both a LONG and a SYMBOL.
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer.table("trades")?.column_i64("Qty", 1)?;
+    assert_err_contains(
+        buffer.symbol("qty", "x"),
+        ErrorCode::InvalidApiCall,
+        "column 'qty' already set for current row",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_treats_case_variants_as_one_column_across_rows() -> TestResult {
+    // Cross-row identity is resolved by RowGroupPlanner::find_column, which was also
+    // byte exact, so two rows spelling one column differently planned two columns and
+    // the datagram carried the same server column twice.
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer.table("trades")?.symbol("Side", "buy")?.at_now()?;
+    buffer.table("trades")?.symbol("side", "sell")?.at_now()?;
+    // A genuinely different name must still plan as its own column.
+    buffer.table("trades")?.symbol("venue", "XNAS")?.at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Side", "venue"]
+    );
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_rejects_ilp_buffer_with_qwp_sender() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;
