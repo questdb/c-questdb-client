@@ -5774,44 +5774,28 @@ mod tests {
             .unwrap();
         let _server_streams = server.join().unwrap();
 
-        // Retry short reads so a missed wake-up fails at the deadline
-        // instead of hanging the test.
+        // The gate shuts the socket down before the read, on this same thread,
+        // so the read returns EOF at once (std maps Winsock WSAESHUTDOWN to
+        // Ok(0)). Without the reconnect's registration the socket stays open
+        // and the read times out.
         transport
             .stream
-            .set_timeouts(Some(Duration::from_millis(100)), None)
+            .set_timeouts(Some(Duration::from_secs(5)), None)
             .unwrap();
-        let reader = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let mut byte = [0u8; 1];
-            loop {
-                match transport.stream.read(&mut byte) {
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) && std::time::Instant::now() < deadline => {}
-                    result => return result,
-                }
-            }
-        });
         traffic_gate.shutdown().unwrap();
 
-        match reader.join().unwrap() {
+        let mut byte = [0u8; 1];
+        match transport.stream.read(&mut byte) {
             Ok(0) => {}
             Err(err)
                 if matches!(
                     err.kind(),
-                    std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::ConnectionAborted
+                    std::io::ErrorKind::ConnectionAborted
                         | std::io::ErrorKind::ConnectionReset
                         | std::io::ErrorKind::NotConnected
                         | std::io::ErrorKind::BrokenPipe
                 ) => {}
-            // CancelIoEx interrupts an in-flight recv as WSAEINTR (10004) and
-            // a recv issued after Winsock shutdown() fails with WSAESHUTDOWN
-            // (10058); neither maps to a stable `ErrorKind`.
-            Err(err) if matches!(err.raw_os_error(), Some(10004) | Some(10058)) => {}
-            result => panic!("replacement socket read was not interrupted: {result:?}"),
+            result => panic!("traffic gate did not shut down the replacement socket: {result:?}"),
         }
     }
 
