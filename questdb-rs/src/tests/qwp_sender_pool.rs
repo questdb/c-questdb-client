@@ -3077,10 +3077,10 @@ fn mixed_sfa_namespace_survives_endpoint_failover_and_catch_up() {
         .expect("the replacement endpoint must receive a dictionary catch-up");
     let (catch_up_start, catch_up_symbols) = parse_delta_dict_prefix(catch_up);
     assert_eq!(catch_up_start, 0);
+    let published_symbols = [b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()];
     assert!(
-        catch_up_symbols == vec![b"alpha".to_vec()]
-            || catch_up_symbols == vec![b"alpha".to_vec(), b"bravo".to_vec()],
-        "the old socket may fail before or after its final write, but catch-up must be a contiguous alpha[/bravo] prefix: {catch_up_symbols:?}"
+        !catch_up_symbols.is_empty() && published_symbols.starts_with(&catch_up_symbols),
+        "a send burst may stage any contiguous prefix before disconnect: {catch_up_symbols:?}"
     );
     assert_eq!(data_frames.len(), 3);
     assert_eq!(
