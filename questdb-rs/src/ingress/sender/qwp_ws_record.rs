@@ -351,8 +351,8 @@ impl<'a> ColumnView<'a> {
                 let count = values.checked_add(1).ok_or_else(invalid_record)?;
                 result.offsets = reader.take(count.checked_mul(4).ok_or_else(invalid_record)?)?;
                 let mut previous = 0usize;
-                for (index, bytes) in result.offsets.chunks_exact(4).enumerate() {
-                    let offset = u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
+                for (index, bytes) in result.offsets.as_chunks::<4>().0.iter().enumerate() {
+                    let offset = u32::from_le_bytes(*bytes) as usize;
                     if (index == 0 && offset != 0)
                         || offset < previous
                         || offset > reader.bytes.len()
@@ -815,9 +815,8 @@ impl Column {
                     self.offsets.push(0);
                 }
                 let base = self.data.len() as u32;
-                for offset in view.offsets.chunks_exact(4).skip(1) {
-                    self.offsets
-                        .push(base + u32::from_le_bytes(offset.try_into().unwrap()));
+                for offset in view.offsets.as_chunks::<4>().0.iter().skip(1) {
+                    self.offsets.push(base + u32::from_le_bytes(*offset));
                 }
                 self.data.extend_from_slice(view.data);
             }
@@ -1133,7 +1132,7 @@ mod tests {
                 .unwrap();
         }
         let decoded = decode_datagram(&frame(&batch)).unwrap();
-        for rows in decoded.table.rows.chunks_exact(3) {
+        for rows in decoded.table.rows.as_chunks::<3>().0 {
             assert_eq!(
                 rows,
                 &[
