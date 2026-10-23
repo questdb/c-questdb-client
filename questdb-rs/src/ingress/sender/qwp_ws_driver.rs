@@ -1355,6 +1355,10 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         ready |= drain_ready
             || interval.is_none()
             || self
+                .record_last_fsn
+                .zip(force_through)
+                .is_some_and(|(last, boundary)| last >= boundary)
+            || self
                 .record_started
                 .zip(interval)
                 .is_some_and(|(start, interval)| start.elapsed() >= interval)
@@ -5539,6 +5543,76 @@ mod tests {
             .encode_sfa_record(&mut record, false)
             .unwrap();
         record
+    }
+
+    #[test]
+    fn wait_request_flushes_already_staged_records_without_new_publications() {
+        struct StagingTransport;
+
+        impl QwpWsCoreTransport for StagingTransport {
+            fn record_batch_limits(&self) -> (Option<Duration>, usize, usize) {
+                (Some(Duration::from_secs(60)), 0, 4096)
+            }
+
+            fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+                Ok(TransportPoll::Idle)
+            }
+
+            fn send_frame(
+                &mut self,
+                _frame: OutboundFrameView<'_>,
+            ) -> Result<TransportSendResult, TransportFailure> {
+                Ok(TransportSendResult::NoResponse)
+            }
+        }
+
+        for legacy_prefix in [false, true] {
+            let mut core =
+                QwpWsSendCore::new(StagingTransport, ReconnectPolicy::no_backoff(Duration::MAX));
+            let mut queue = memory_queue(SfaMemoryQueueOptions {
+                segment_size_bytes: 4096,
+                max_bytes: 64 * 1024,
+            });
+            let progress = queue.progress_view();
+            if legacy_prefix {
+                queue
+                    .try_submit(&replay_payload(&qwp_buffer("legacy", 1, 1)))
+                    .unwrap();
+                let outbound = core
+                    .next_outbound_sfa_frame_through(&progress, Some(0), false)
+                    .unwrap()
+                    .unwrap();
+                let (sent, result) = core.send_frame(outbound);
+                core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+            }
+            queue.try_submit(&record_payload(43)).unwrap();
+            let fsn = u64::from(legacy_prefix);
+            let stale_boundary = fsn.checked_sub(1);
+            assert!(
+                core.next_outbound_sfa_frame_through(&progress, stale_boundary, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                core.next_outbound_sfa_frame_through(&progress, Some(fsn + 1), false)
+                    .unwrap()
+                    .is_none(),
+                "a future boundary must wait for its publication"
+            );
+            assert!(
+                core.next_outbound_sfa_frame_through(&progress, stale_boundary, false)
+                    .unwrap()
+                    .is_none(),
+                "an earlier wait must not close the next batch"
+            );
+            let outbound = core
+                .next_outbound_sfa_frame_through(&progress, Some(fsn), false)
+                .unwrap()
+                .expect("a wait must flush records staged before the request arrived");
+            let sent = outbound.sent_frame();
+            assert_eq!((sent.first_fsn, sent.fsn), (fsn, fsn));
+            assert_eq!(core.ready_record_through, Some(fsn));
+        }
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
