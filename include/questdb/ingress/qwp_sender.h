@@ -369,7 +369,9 @@ bool qwp_sender_flush_buffer(
     line_sender_buffer* buffer,
     line_sender_error** err_out);
 
-/** Publish and clear a Buffer, then wait for `ack_level`. */
+/** Publish and clear a Buffer, then wait for `ack_level`. If automatic commit
+ * batching is enabled, close the pending batch through this publication
+ * without waiting for the batching timer or row threshold. */
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_buffer_and_wait(
     qwp_sender* sender,
@@ -1664,6 +1666,10 @@ bool qwp_sender_error_events_dropped(
  * check: only a terminal connection failure fails it. Server rejections are
  * delivered to the pool's rejection handler (default: logged) rather than
  * raised here; retriable ones are replayed by the queue.
+ *
+ * With automatic commit batching, a pending boundary requests immediate batch
+ * closure before waiting. Call on the publishing borrow before returning it;
+ * a fresh borrow's wait is not a drain of earlier borrows or the whole pool.
  *
  * `ack_level` carries a `qwpws_ack_level_*` constant. The
  * parameter is `uint32_t` rather than `enum qwpws_ack_level` so

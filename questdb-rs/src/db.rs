@@ -439,7 +439,8 @@ impl<S> PoolState<S> {
 struct PoolEntry<S> {
     sender: S,
     slot_index: Option<usize>,
-    last_idle_at: Instant,
+    // Fixed-size SF pools never reap idle entries.
+    last_idle_at: Option<Instant>,
 }
 
 struct PooledSender<S> {
@@ -641,7 +642,8 @@ fn preopen_recovery_sender(
                 state.free.push(PoolEntry {
                     sender,
                     slot_index,
-                    last_idle_at: Instant::now(),
+                    last_idle_at: (inner.sender_pool_min < inner.sender_pool_max)
+                        .then(Instant::now),
                 });
             }
             slot.commit();
@@ -673,8 +675,16 @@ impl QuestDb {
     /// | `idle_timeout_ms`    | 60000   | Above-minimum idle connections are closed after this long. |
     /// | `pool_reap`          | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
     /// | `lazy_connect`       | `false` | Tolerate a down server at startup: connect opens nothing, senders buffer and connect in the background, readers connect on first borrow. |
+    /// | `commit_interval_ms` | unset   | Opt in to background commit batching for ingestion senders; close a window after this many milliseconds. Positive integer. |
+    /// | `commit_rows`        | unset   | Also close a commit window after this many rows. Positive integer; alone enables a 100 ms interval. |
     ///
-    /// Key names and defaults match the Java client's `QuestDBBuilder`; the
+    /// Commit windows span leases on the same ingestion slot. `flush` still
+    /// publishes to SF before returning; `wait` forces its pending boundary
+    /// to commit. Returning a lease does not close the window. Network batching
+    /// of ready frames is automatic and adds no timer to wait for more frames.
+    /// Standalone senders reject the two `commit_*` keys.
+    ///
+    /// Lifecycle key names and defaults match the Java client's `QuestDBBuilder`; the
     /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,
     /// `query_close_timeout_ms`) have no counterpart here — the reaper tick
     /// and `close_flush_timeout` own those responsibilities.
@@ -825,14 +835,15 @@ impl QuestDb {
         let sf_disk = parsed.sf_disk;
         let pool_cfg = parsed.pool;
 
-        let mut builder = SenderBuilder::from_conf(conf)?;
+        let mut builder = SenderBuilder::from_conf(&parsed.sender_conf)?;
         if pool_cfg.lazy_connect {
             // Java's lazy_connect injects an async initial connect into the
             // ingest config once; every pooled sender then inherits it.
             builder.force_async_initial_connect();
         }
         let buffer_max_name_len = builder.configured_max_name_len();
-        let connector = builder.build_qwp_ws_connector()?;
+        let mut connector = builder.build_qwp_ws_connector()?;
+        connector.configure_pool_commit_batching(pool_cfg.commit_interval, pool_cfg.commit_rows);
         let health = QwpWsHostHealthTracker::new(connector.endpoint_count());
         let slot_base_id = connector.sender_id().to_owned();
         let managed_slot_exclusion = if sf_disk {
@@ -869,7 +880,7 @@ impl QuestDb {
 
         let inner = Arc::new(DbInner {
             #[cfg(feature = "_egress")]
-            conf: conf.to_owned(),
+            conf: parsed.sender_conf,
             connector,
             buffer_max_name_len,
             health: Mutex::new(health),
@@ -1735,7 +1746,9 @@ impl<'a> BorrowedSender<'a> {
     }
 
     /// Publish and clear a QWP/WebSocket [`Buffer`], then wait for the requested
-    /// ACK boundary using the pool's configured request timeout.
+    /// ACK boundary using the pool's configured request timeout. Automatic
+    /// commit batching closes through this publication without waiting for
+    /// its row threshold or timer.
     pub fn flush_buffer_and_wait(
         &mut self,
         buffer: &mut Buffer,
@@ -1826,6 +1839,10 @@ impl<'a> BorrowedSender<'a> {
     /// [`QuestDb::connect_with_handlers`]) rather than raised here;
     /// retriable ones are replayed by the queue. `AckLevel::Durable` requires
     /// QuestDB Enterprise and a pool opened with `request_durable_ack=on`.
+    ///
+    /// With automatic commit batching, a pending boundary requests immediate
+    /// batch closure before waiting. Call on the publishing lease before
+    /// returning it; this is not a drain across earlier leases or all slots.
     ///
     /// `timeout` is a no-progress deadline (it fires only if the ack watermark
     /// fails to advance for that long); `Duration::ZERO` waits indefinitely.
@@ -3011,7 +3028,7 @@ fn return_sfa_to_pool(
             state.free.push(PoolEntry {
                 sender,
                 slot_index,
-                last_idle_at: Instant::now(),
+                last_idle_at: (inner.sender_pool_min < inner.sender_pool_max).then(Instant::now),
             });
             inner.cv.notify_all();
             return;
@@ -3045,7 +3062,7 @@ fn return_direct_to_pool(inner: &Arc<DbInner>, sender: DirectSenderCore) {
             state.free.push(PoolEntry {
                 sender,
                 slot_index: None,
-                last_idle_at: Instant::now(),
+                last_idle_at: Some(Instant::now()),
             });
         }
     }
@@ -3064,7 +3081,7 @@ fn finish_replaced_sender(inner: &Arc<DbInner>, sender: DirectSenderCore) {
             state.free.push(PoolEntry {
                 sender,
                 slot_index: None,
-                last_idle_at: Instant::now(),
+                last_idle_at: Some(Instant::now()),
             });
         }
     }
@@ -3208,13 +3225,15 @@ fn take_reapable_column_sender(
         if state.total() <= inner.sender_pool_min {
             return None;
         }
-        let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
+        let expired = state.free[i]
+            .last_idle_at
+            .is_some_and(|idle_at| now.saturating_duration_since(idle_at) > inner.idle_timeout);
         // Never evict a connection whose store-and-forward queue still holds
         // undelivered frames: its background runner is still delivering, and
         // dropping it now would lose that data. It becomes reapable once the
         // runner drains it (or the transport goes terminal). `sfa_fully_delivered`
         // is a lock-free progress read in the healthy case.
-        if idle_for > inner.idle_timeout && state.free[i].sender.sfa_fully_delivered(durable) {
+        if expired && state.free[i].sender.sfa_fully_delivered(durable) {
             let entry = state.free.remove(i);
             if entry.slot_index.is_some() {
                 state.closing += 1;
@@ -3236,8 +3255,10 @@ fn reap_idle_direct_senders(inner: &DbInner) -> usize {
         let now = Instant::now();
         let mut i = 0;
         while i < state.free.len() {
-            let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
-            if idle_for > inner.idle_timeout {
+            let expired = state.free[i]
+                .last_idle_at
+                .is_some_and(|idle_at| now.saturating_duration_since(idle_at) > inner.idle_timeout);
+            if expired {
                 let entry = state.free.remove(i);
                 to_drop.push(entry.sender);
             } else {

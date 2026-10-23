@@ -1,0 +1,1907 @@
+{
+  "scope": "Historical optimization experiments on macOS arm64 against the existing localhost:9000 server. Record-first results use a fixed-schema prototype, removed from the shipping library. Timings are milliseconds through final OK ACK, not power-loss durability or SQL visibility. Raw logs and temporary outputs were removed after verification.",
+  "campaigns": {
+    "pool_batching_memory_20261022_01": {
+      "metadata": {
+        "utc": "20261023_031603",
+        "conf": "ws::addr=127.0.0.1:9000;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
+        "binary_sha256": "424ca4da36d0ab6dbcadd2cc6729edc481925bfaacbdd45d2d1aada03a578ed0",
+        "platform": "macOS-15.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "rows": 1000000,
+        "warmup": 10000,
+        "rounds": 5,
+        "symbols": 1000,
+        "schema": "sym SYMBOL, qty LONG, px DOUBLE, ts TIMESTAMP_NS; WAL; PARTITION BY DAY",
+        "ack_barrier": "wait(AckLevel::Ok) on the last publishing lease, one pool slot",
+        "server_build": {
+          "query": "select build()",
+          "columns": [
+            {
+              "name": "build()",
+              "type": "STRING"
+            }
+          ],
+          "timestamp": -1,
+          "dataset": [
+            ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+          ],
+          "count": 1
+        },
+        "cases": ["per_flush:1"],
+        "client_revision": "8278a7feec1d43eecbfb8d2769886d21665ea77a",
+        "cpu_scope": "client process, including its background threads; timed region only",
+        "variants": ["baseline", "control", "network", "commit", "both"],
+        "group_frames": 1000,
+        "transport_counters_scope": "whole connection, including warmup; write_all calls, not TCP packets",
+        "source_sha256": {
+          "questdb-rs/Cargo.toml": "031d017701416c7deba8d3c5c58b31f008813c8fa0342faada29f74fb6d68fcf",
+          "questdb-rs/examples/qwp_pool_bench.rs": "a25d9c2f84c0a8e73f3a8535fbf58f4b476fadbc6d26fdec21b6d6f2af528534",
+          "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "f49e8a5f09b7e97af69f15cc17d074dc1bb007387ebc46051e1b6dd69de2b49d",
+          "questdb-rs/src/ingress/sender/qwp_ws_batching_bench.rs": "d403b372b4787118881d0712b21e81cd6615c5d8cb0004fa5866532f5fad127d",
+          "doc/net_bench/run_pool_baseline.py": "7d7dc799608327ae78e3a96b81475851755fd842d07576a1f10d3eb05c850022"
+        }
+      },
+      "measurements": {
+        "commit/per_flush:1/": {
+          "total_ms": [2747.909, 2851.847, 2990.623, 2845.237, 3337.456],
+          "publish_ms": [328.037, 345.149, 310.183, 354.8, 331.45],
+          "client_cpu_ms": [3017.26, 3143.679, 3255.337, 3153.161, 3519.952],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [1010000, 1010000, 1010000, 1010000, 1010000]
+        },
+        "control/per_flush:1/": {
+          "total_ms": [3077.549, 3527.482, 3214.356, 3316.392, 4227.977],
+          "publish_ms": [337.17, 326.318, 304.967, 295.951, 540.352],
+          "client_cpu_ms": [3351.992, 3425.042, 3482.44, 3567.692, 4432.848],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [1010000, 1010000, 1010000, 1010000, 1010000]
+        },
+        "network/per_flush:1/": {
+          "total_ms": [1950.153, 1781.691, 1999.681, 1723.258, 1945.023],
+          "publish_ms": [541.383, 444.556, 504.231, 423.905, 544.072],
+          "client_cpu_ms": [2304.755, 2117.468, 2015.57, 2070.796, 2231.338],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [2020, 2020, 2020, 2020, 2020]
+        },
+        "both/per_flush:1/": {
+          "total_ms": [1290.967, 1203.572, 1201.87, 1182.6, 1240.117],
+          "publish_ms": [537.061, 441.55, 448.59, 441.299, 458.029],
+          "client_cpu_ms": [1698.071, 1569.157, 1577.788, 1557.594, 1604.797],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [2020, 2020, 2020, 2020, 2020]
+        },
+        "baseline/per_flush:1/": {
+          "total_ms": [3437.157, 3563.133, 3576.9, 3792.54, 4211.867],
+          "publish_ms": [374.314, 408.44, 377.88, 402.361, 468.33],
+          "client_cpu_ms": [3761.124, 3878.62, 3910.075, 4113.043, 4466.849],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [1010000, 1010000, 1010000, 1010000, 1010000]
+        }
+      },
+      "validation": {
+        "runs": 25,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 0
+      }
+    },
+    "pool_batching_disk_20261022_01": {
+      "metadata": {
+        "utc": "20261023_031749",
+        "conf": "ws::addr=127.0.0.1:9000;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;sf_dir=/tmp/qwp_pool_batching_disk_20261022_01;sender_id=pool_batching_perf;",
+        "binary_sha256": "424ca4da36d0ab6dbcadd2cc6729edc481925bfaacbdd45d2d1aada03a578ed0",
+        "platform": "macOS-15.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "rows": 1000000,
+        "warmup": 10000,
+        "rounds": 5,
+        "symbols": 1000,
+        "schema": "sym SYMBOL, qty LONG, px DOUBLE, ts TIMESTAMP_NS; WAL; PARTITION BY DAY",
+        "ack_barrier": "wait(AckLevel::Ok) on the last publishing lease, one pool slot",
+        "server_build": {
+          "query": "select build()",
+          "columns": [
+            {
+              "name": "build()",
+              "type": "STRING"
+            }
+          ],
+          "timestamp": -1,
+          "dataset": [
+            ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+          ],
+          "count": 1
+        },
+        "cases": ["per_flush:1"],
+        "client_revision": "8278a7feec1d43eecbfb8d2769886d21665ea77a",
+        "cpu_scope": "client process, including its background threads; timed region only",
+        "variants": ["baseline", "control", "network", "commit", "both"],
+        "group_frames": 1000,
+        "transport_counters_scope": "whole connection, including warmup; write_all calls, not TCP packets",
+        "source_sha256": {
+          "questdb-rs/Cargo.toml": "031d017701416c7deba8d3c5c58b31f008813c8fa0342faada29f74fb6d68fcf",
+          "questdb-rs/examples/qwp_pool_bench.rs": "a25d9c2f84c0a8e73f3a8535fbf58f4b476fadbc6d26fdec21b6d6f2af528534",
+          "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "f49e8a5f09b7e97af69f15cc17d074dc1bb007387ebc46051e1b6dd69de2b49d",
+          "questdb-rs/src/ingress/sender/qwp_ws_batching_bench.rs": "d403b372b4787118881d0712b21e81cd6615c5d8cb0004fa5866532f5fad127d",
+          "doc/net_bench/run_pool_baseline.py": "7d7dc799608327ae78e3a96b81475851755fd842d07576a1f10d3eb05c850022"
+        }
+      },
+      "measurements": {
+        "commit/per_flush:1/": {
+          "total_ms": [3856.22, 4028.75, 3748.51, 3363.708, 3555.593],
+          "publish_ms": [919.728, 1087.976, 856.381, 861.101, 933.128],
+          "client_cpu_ms": [3465.027, 3494.194, 3353.573, 3219.835, 3403.371],
+          "wal_commits": [1035, 1036, 1033, 1031, 1031],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [1010000, 1010000, 1010000, 1010000, 1010000]
+        },
+        "control/per_flush:1/": {
+          "total_ms": [4116.508, 4323.104, 4818.975, 3839.648, 3857.256],
+          "publish_ms": [897.495, 1058.008, 1252.865, 890.196, 906.919],
+          "client_cpu_ms": [3681.969, 3921.364, 4361.692, 3610.623, 3452.718],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [1010000, 1010000, 1010000, 1010000, 1010000]
+        },
+        "network/per_flush:1/": {
+          "total_ms": [2697.228, 3086.969, 2747.519, 2620.385, 2702.791],
+          "publish_ms": [1477.308, 1708.303, 1522.737, 1442.155, 1522.316],
+          "client_cpu_ms": [2640.091, 2518.565, 2675.983, 2589.193, 2676.851],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [2033, 2032, 2036, 2031, 2033]
+        },
+        "both/per_flush:1/": {
+          "total_ms": [1769.488, 1833.082, 2074.684, 1807.373, 1887.281],
+          "publish_ms": [1041.988, 1139.723, 1180.32, 1130.837, 1167.278],
+          "client_cpu_ms": [1638.073, 1674.155, 1447.48, 1691.836, 1661.697],
+          "wal_commits": [1023, 1024, 1030, 1026, 1026],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [2027, 2026, 2033, 2027, 2026]
+        },
+        "baseline/per_flush:1/": {
+          "total_ms": [5028.251, 4923.096, 4757.354, 4321.599, 4814.352],
+          "publish_ms": [1259.407, 1319.33, 1209.591, 1097.842, 1105.622],
+          "client_cpu_ms": [4781.968, 4615.391, 4517.512, 4266.989, 4479.634],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [1010000, 1010000, 1010000, 1010000, 1010000]
+        }
+      },
+      "validation": {
+        "runs": 25,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 0
+      }
+    },
+    "pool_production_memory_20261022_01": {
+      "metadata": {
+        "utc": "20261023_035250",
+        "conf": "ws::addr=127.0.0.1:9000;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
+        "binary_sha256": "1da7b8c7c8dc8bf76d5f95977416a4c5236a566f2e57d19d8449accb338e7dc4",
+        "platform": "macOS-15.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "rows": 1000000,
+        "warmup": 10000,
+        "rounds": 5,
+        "symbols": 1000,
+        "schema": "sym SYMBOL, qty LONG, px DOUBLE, ts TIMESTAMP_NS; WAL; PARTITION BY DAY",
+        "ack_barrier": "wait(AckLevel::Ok) on the last publishing lease, one pool slot",
+        "server_build": {
+          "query": "select build()",
+          "columns": [
+            {
+              "name": "build()",
+              "type": "STRING"
+            }
+          ],
+          "timestamp": -1,
+          "dataset": [
+            ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+          ],
+          "count": 1
+        },
+        "cases": ["per_flush:1", "hold:1000"],
+        "client_revision": "8278a7feec1d43eecbfb8d2769886d21665ea77a",
+        "cpu_scope": "client process, including its background threads; timed region only",
+        "variants": ["production-network", "production-both"],
+        "group_frames": 1000,
+        "transport_counters_scope": "whole connection, including warmup; write_all calls, not TCP packets",
+        "source_sha256": {
+          "questdb-rs/Cargo.toml": "031d017701416c7deba8d3c5c58b31f008813c8fa0342faada29f74fb6d68fcf",
+          "questdb-rs/examples/qwp_pool_bench.rs": "679748c631dad700a23f87603b024217629b3446a4dd95ec8b1f5684e9e4c9a1",
+          "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "456cd5e861e746aa912335dfef30b477bebeef7899811d91989f2afe0853fb20",
+          "questdb-rs/src/ingress/sender/qwp_ws_batching_bench.rs": "d403b372b4787118881d0712b21e81cd6615c5d8cb0004fa5866532f5fad127d",
+          "questdb-rs/src/ingress/sender/qwp_ws_batch.rs": "fbbb955ea78521e1312f9eeeb772a26b9c937dced4ecaf15b6828a843bf4fd4f",
+          "questdb-rs/src/ingress/sender/qwp_ws.rs": "23c5bb4f267621d7b177310faab342eb9ec2ad049a62880fb6422c7e6b3006e1",
+          "questdb-rs/src/db/conf.rs": "22aaa6d0d56ef622e32fa839d49a277129a093092927990cbcb6e4ea83fc3c4b",
+          "doc/net_bench/run_pool_baseline.py": "095ac50af2411df1ca17495170a4f9971892ed3a3c22b76f06b7ccadeaed3bc5"
+        }
+      },
+      "measurements": {
+        "production-network/hold:1000/": {
+          "total_ms": [66.297, 66.856, 64.827, 65.437, 68.566],
+          "publish_ms": [54.07, 56.821, 54.489, 55.389, 57.89],
+          "client_cpu_ms": [69.22, 70.7, 71.418, 71.463, 74.137],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "production-both/per_flush:1/": {
+          "total_ms": [513.393, 455.056, 451.937, 470.088, 491.804],
+          "publish_ms": [279.766, 296.285, 289.632, 298.57, 279.128],
+          "client_cpu_ms": [430.325, 466.772, 461.219, 473.253, 452.276],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000]
+        },
+        "production-both/hold:1000/": {
+          "total_ms": [68.151, 64.756, 62.035, 71.284, 69.041],
+          "publish_ms": [55.869, 53.175, 51.794, 59.884, 56.528],
+          "client_cpu_ms": [71.106, 67.923, 66.451, 78.4, 73.105],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "production-network/per_flush:1/": {
+          "total_ms": [1685.253, 1742.203, 1599.203, 1702.001, 1662.185],
+          "publish_ms": [269.793, 285.608, 258.876, 323.094, 290.09],
+          "client_cpu_ms": [536.03, 564.387, 553.008, 628.769, 576.636],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000]
+        }
+      },
+      "validation": {
+        "runs": 20,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 0
+      }
+    },
+    "pool_production_disk_20261022_01": {
+      "metadata": {
+        "utc": "20261023_035513",
+        "conf": "ws::addr=127.0.0.1:9000;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;sf_dir=/tmp/qwp_production_disk_20261022_01;sender_id=pool_production_perf;",
+        "binary_sha256": "1da7b8c7c8dc8bf76d5f95977416a4c5236a566f2e57d19d8449accb338e7dc4",
+        "platform": "macOS-15.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "rows": 1000000,
+        "warmup": 10000,
+        "rounds": 5,
+        "symbols": 1000,
+        "schema": "sym SYMBOL, qty LONG, px DOUBLE, ts TIMESTAMP_NS; WAL; PARTITION BY DAY",
+        "ack_barrier": "wait(AckLevel::Ok) on the last publishing lease, one pool slot",
+        "server_build": {
+          "query": "select build()",
+          "columns": [
+            {
+              "name": "build()",
+              "type": "STRING"
+            }
+          ],
+          "timestamp": -1,
+          "dataset": [
+            ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+          ],
+          "count": 1
+        },
+        "cases": ["per_flush:1", "per_flush:1000"],
+        "client_revision": "8278a7feec1d43eecbfb8d2769886d21665ea77a",
+        "cpu_scope": "client process, including its background threads; timed region only",
+        "variants": ["production-network", "production-both"],
+        "group_frames": 1000,
+        "transport_counters_scope": "whole connection, including warmup; write_all calls, not TCP packets",
+        "source_sha256": {
+          "questdb-rs/Cargo.toml": "031d017701416c7deba8d3c5c58b31f008813c8fa0342faada29f74fb6d68fcf",
+          "questdb-rs/examples/qwp_pool_bench.rs": "679748c631dad700a23f87603b024217629b3446a4dd95ec8b1f5684e9e4c9a1",
+          "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "456cd5e861e746aa912335dfef30b477bebeef7899811d91989f2afe0853fb20",
+          "questdb-rs/src/ingress/sender/qwp_ws_batching_bench.rs": "d403b372b4787118881d0712b21e81cd6615c5d8cb0004fa5866532f5fad127d",
+          "questdb-rs/src/ingress/sender/qwp_ws_batch.rs": "fbbb955ea78521e1312f9eeeb772a26b9c937dced4ecaf15b6828a843bf4fd4f",
+          "questdb-rs/src/ingress/sender/qwp_ws.rs": "23c5bb4f267621d7b177310faab342eb9ec2ad049a62880fb6422c7e6b3006e1",
+          "questdb-rs/src/db/conf.rs": "22aaa6d0d56ef622e32fa839d49a277129a093092927990cbcb6e4ea83fc3c4b",
+          "doc/net_bench/run_pool_baseline.py": "095ac50af2411df1ca17495170a4f9971892ed3a3c22b76f06b7ccadeaed3bc5"
+        }
+      },
+      "measurements": {
+        "production-network/per_flush:1000/": {
+          "total_ms": [313.439, 842.092, 299.205, 326.759, 327.352],
+          "publish_ms": [289.731, 817.239, 288.598, 314.425, 303.391],
+          "client_cpu_ms": [89.78, 128.628, 95.679, 95.956, 89.067],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "production-both/per_flush:1/": {
+          "total_ms": [1229.961, 1172.176, 1185.173, 1275.885, 1237.177],
+          "publish_ms": [1219.164, 1160.206, 1164.405, 1215.767, 1212.793],
+          "client_cpu_ms": [718.436, 623.147, 644.73, 624.735, 606.787],
+          "wal_commits": [1015, 1014, 1015, 1015, 1016],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000]
+        },
+        "production-both/per_flush:1000/": {
+          "total_ms": [301.004, 905.083, 315.789, 324.173, 305.274],
+          "publish_ms": [288.7, 872.255, 278.957, 301.312, 293.111],
+          "client_cpu_ms": [92.033, 113.011, 98.595, 93.202, 89.073],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "production-network/per_flush:1/": {
+          "total_ms": [2990.68, 2506.304, 2645.695, 2485.571, 2411.419],
+          "publish_ms": [1047.545, 1161.64, 1220.538, 1079.527, 996.538],
+          "client_cpu_ms": [971.17, 986.453, 1030.115, 945.29, 925.636],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000]
+        }
+      },
+      "validation": {
+        "runs": 20,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 0
+      }
+    },
+    "pool_production_reference_memory_20261022_01": {
+      "metadata": {
+        "utc": "20261023_035406",
+        "conf": "ws::addr=127.0.0.1:9000;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
+        "binary_sha256": "1da7b8c7c8dc8bf76d5f95977416a4c5236a566f2e57d19d8449accb338e7dc4",
+        "platform": "macOS-15.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "rows": 1000000,
+        "warmup": 10000,
+        "rounds": 5,
+        "symbols": 1000,
+        "schema": "sym SYMBOL, qty LONG, px DOUBLE, ts TIMESTAMP_NS; WAL; PARTITION BY DAY",
+        "ack_barrier": "wait(AckLevel::Ok) on the last publishing lease, one pool slot",
+        "server_build": {
+          "query": "select build()",
+          "columns": [
+            {
+              "name": "build()",
+              "type": "STRING"
+            }
+          ],
+          "timestamp": -1,
+          "dataset": [
+            ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+          ],
+          "count": 1
+        },
+        "cases": ["per_flush:1", "per_flush:1000", "standalone:1000"],
+        "client_revision": "8278a7feec1d43eecbfb8d2769886d21665ea77a",
+        "cpu_scope": "client process, including its background threads; timed region only",
+        "variants": ["baseline", "production-network"],
+        "group_frames": 1000,
+        "transport_counters_scope": "whole connection, including warmup; write_all calls, not TCP packets",
+        "source_sha256": {
+          "questdb-rs/Cargo.toml": "031d017701416c7deba8d3c5c58b31f008813c8fa0342faada29f74fb6d68fcf",
+          "questdb-rs/examples/qwp_pool_bench.rs": "679748c631dad700a23f87603b024217629b3446a4dd95ec8b1f5684e9e4c9a1",
+          "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "456cd5e861e746aa912335dfef30b477bebeef7899811d91989f2afe0853fb20",
+          "questdb-rs/src/ingress/sender/qwp_ws_batching_bench.rs": "d403b372b4787118881d0712b21e81cd6615c5d8cb0004fa5866532f5fad127d",
+          "questdb-rs/src/ingress/sender/qwp_ws_batch.rs": "fbbb955ea78521e1312f9eeeb772a26b9c937dced4ecaf15b6828a843bf4fd4f",
+          "questdb-rs/src/ingress/sender/qwp_ws.rs": "23c5bb4f267621d7b177310faab342eb9ec2ad049a62880fb6422c7e6b3006e1",
+          "questdb-rs/src/db/conf.rs": "22aaa6d0d56ef622e32fa839d49a277129a093092927990cbcb6e4ea83fc3c4b",
+          "doc/net_bench/run_pool_baseline.py": "095ac50af2411df1ca17495170a4f9971892ed3a3c22b76f06b7ccadeaed3bc5"
+        }
+      },
+      "measurements": {
+        "production-network/per_flush:1000/": {
+          "total_ms": [65.816, 64.95, 95.014, 64.721, 63.221],
+          "publish_ms": [53.762, 53.285, 61.996, 53.993, 51.725],
+          "client_cpu_ms": [64.576, 66.934, 79.254, 67.228, 65.666],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "production-network/per_flush:1/": {
+          "total_ms": [1895.276, 1927.722, 2212.823, 1937.355, 1846.568],
+          "publish_ms": [253.309, 248.31, 254.143, 261.149, 275.545],
+          "client_cpu_ms": [528.169, 534.777, 526.566, 537.499, 546.907],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000]
+        },
+        "baseline/per_flush:1000/": {
+          "total_ms": [78.465, 63.841, 62.912, 65.035, 72.618],
+          "publish_ms": [54.973, 52.606, 52.405, 53.867, 61.512],
+          "client_cpu_ms": [68.591, 67.887, 66.433, 66.559, 77.439],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000],
+          "application_write_calls": [1010, 1010, 1010, 1010, 1010]
+        },
+        "baseline/standalone:1000/": {
+          "total_ms": [59.021, 65.283, 72.987, 59.73, 57.036],
+          "publish_ms": [50.931, 56.383, 55.91, 53.982, 55.253],
+          "client_cpu_ms": [65.208, 72.56, 70.08, 68.833, 69.663],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000],
+          "application_write_calls": [1010, 1010, 1010, 1010, 1010]
+        },
+        "baseline/per_flush:1/": {
+          "total_ms": [3625.966, 3603.329, 3774.32, 3457.814, 3357.281],
+          "publish_ms": [342.603, 447.688, 459.787, 380.523, 381.49],
+          "client_cpu_ms": [3898.752, 3937.532, 3994.884, 3781.416, 3690.165],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [1010000, 1010000, 1010000, 1010000, 1010000]
+        },
+        "production-network/standalone:1000/": {
+          "total_ms": [62.791, 68.723, 81.213, 57.449, 55.362],
+          "publish_ms": [54.237, 55.527, 51.951, 52.976, 53.547],
+          "client_cpu_ms": [69.41, 74.285, 67.244, 66.161, 66.751],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        }
+      },
+      "validation": {
+        "runs": 30,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 0
+      }
+    },
+    "pool_production_reference_disk_20261022_01": {
+      "metadata": {
+        "utc": "20261023_035900",
+        "conf": "ws::addr=127.0.0.1:9000;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;sf_dir=/tmp/qwp_production_reference_disk_20261022_01;sender_id=pool_production_reference;",
+        "binary_sha256": "1da7b8c7c8dc8bf76d5f95977416a4c5236a566f2e57d19d8449accb338e7dc4",
+        "platform": "macOS-15.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "rows": 1000000,
+        "warmup": 10000,
+        "rounds": 5,
+        "symbols": 1000,
+        "schema": "sym SYMBOL, qty LONG, px DOUBLE, ts TIMESTAMP_NS; WAL; PARTITION BY DAY",
+        "ack_barrier": "wait(AckLevel::Ok) on the last publishing lease, one pool slot",
+        "server_build": {
+          "query": "select build()",
+          "columns": [
+            {
+              "name": "build()",
+              "type": "STRING"
+            }
+          ],
+          "timestamp": -1,
+          "dataset": [
+            ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+          ],
+          "count": 1
+        },
+        "cases": ["per_flush:1", "standalone:1000"],
+        "client_revision": "8278a7feec1d43eecbfb8d2769886d21665ea77a",
+        "cpu_scope": "client process, including its background threads; timed region only",
+        "variants": ["baseline", "production-network"],
+        "group_frames": 1000,
+        "transport_counters_scope": "whole connection, including warmup; write_all calls, not TCP packets",
+        "source_sha256": {
+          "questdb-rs/Cargo.toml": "031d017701416c7deba8d3c5c58b31f008813c8fa0342faada29f74fb6d68fcf",
+          "questdb-rs/examples/qwp_pool_bench.rs": "679748c631dad700a23f87603b024217629b3446a4dd95ec8b1f5684e9e4c9a1",
+          "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "456cd5e861e746aa912335dfef30b477bebeef7899811d91989f2afe0853fb20",
+          "questdb-rs/src/ingress/sender/qwp_ws_batching_bench.rs": "d403b372b4787118881d0712b21e81cd6615c5d8cb0004fa5866532f5fad127d",
+          "questdb-rs/src/ingress/sender/qwp_ws_batch.rs": "fbbb955ea78521e1312f9eeeb772a26b9c937dced4ecaf15b6828a843bf4fd4f",
+          "questdb-rs/src/ingress/sender/qwp_ws.rs": "23c5bb4f267621d7b177310faab342eb9ec2ad049a62880fb6422c7e6b3006e1",
+          "questdb-rs/src/db/conf.rs": "fab85302c828ecfed1c2bbb9be405b96aa829c06a9b72091894309b9d81db113",
+          "doc/net_bench/run_pool_baseline.py": "095ac50af2411df1ca17495170a4f9971892ed3a3c22b76f06b7ccadeaed3bc5"
+        }
+      },
+      "measurements": {
+        "baseline/standalone:1000/": {
+          "total_ms": [279.961, 278.393, 315.9, 292.014, 317.331],
+          "publish_ms": [271.153, 267.676, 304.595, 284.455, 311.774],
+          "client_cpu_ms": [92.786, 95.226, 129.43, 115.248, 110.686],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000],
+          "application_write_calls": [1010, 1010, 1010, 1010, 1010]
+        },
+        "production-network/per_flush:1/": {
+          "total_ms": [2557.197, 2321.102, 2492.754, 2553.398, 2537.556],
+          "publish_ms": [1013.351, 956.409, 1122.053, 1082.562, 1052.782],
+          "client_cpu_ms": [971.108, 925.342, 1080.556, 1025.744, 995.602],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000]
+        },
+        "production-network/standalone:1000/": {
+          "total_ms": [277.839, 275.366, 293.382, 301.617, 301.67],
+          "publish_ms": [267.593, 264.533, 278.349, 289.509, 299.092],
+          "client_cpu_ms": [102.159, 92.615, 103.061, 107.237, 104.617],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "baseline/per_flush:1/": {
+          "total_ms": [4502.682, 4383.024, 4687.438, 4803.29, 4559.128],
+          "publish_ms": [1074.651, 1044.242, 1123.003, 1099.028, 1153.368],
+          "client_cpu_ms": [4344.991, 4258.183, 4647.19, 4747.23, 4492.739],
+          "wal_commits": [1010000, 1010000, 1010000, 1010000, 1010000],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "application_write_calls": [1010000, 1010000, 1010000, 1010000, 1010000]
+        }
+      },
+      "validation": {
+        "runs": 20,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 0
+      }
+    },
+    "pool_hotpath_comparison_20261022_01": {
+      "binaries": {
+        "before": {
+          "utc": "2026-10-23T05:44:12.553099+00:00",
+          "binary_sha256": "b3a52d54dce63f4e4bae96470959cddc8453d17cfdebb4a8a646b98325250cf7",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "e7da0ab1264b285fc2077553d686e1c346c5306d8bd2dc35f46cb27bdb551c72",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "02ef1bf6cbc42601a038ac5deec53b9c256f0f53b1a760bf55e6b17b651234ce",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "1eb37f6fb51579ec52a92e750c0fe32a87d2fe6cf616b051cd987c3f4c97cebb",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "73bbffd55f4ada2312b673ec55bd2f38c57ff9beeb36c13955b270a4c2f1f469",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "6a5bb0ebac7e96d73fc5d79a047240c855587ede54f923492a0319650ba04393",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b",
+            "questdb-rs/Cargo.toml": "031d017701416c7deba8d3c5c58b31f008813c8fa0342faada29f74fb6d68fcf"
+          }
+        },
+        "lease_append": {
+          "binary_sha256": "ca3c84aee7f34bd38a7a9a6eaf99d819c0ddc75be46b854905a106830fb728b0",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "6bb4379673327b716ae06b47b468b6e1fe05f42b455e02df63592ea873e6d553",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "405fd61efd7d0d2ba05a93fda179b1e55ac6c8f018e79ab2789e5458a8070192",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "38c75c21ce2357954087515c117bb53fb4c1dcdf89770b99527186170e2efd06",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "6a5bb0ebac7e96d73fc5d79a047240c855587ede54f923492a0319650ba04393",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b",
+            "questdb-rs/Cargo.toml": "031d017701416c7deba8d3c5c58b31f008813c8fa0342faada29f74fb6d68fcf"
+          }
+        },
+        "plus_buffer": {
+          "binary_sha256": "57be5ab2260344faec28b589554d5c7714a87f5d3b7078a7886abf383f2d46a7",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "6bb4379673327b716ae06b47b468b6e1fe05f42b455e02df63592ea873e6d553",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "405fd61efd7d0d2ba05a93fda179b1e55ac6c8f018e79ab2789e5458a8070192",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "38c75c21ce2357954087515c117bb53fb4c1dcdf89770b99527186170e2efd06",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "8269f540a31af385b39e1a7af955271be1172619ac94a33993b4a2a28350ba23",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b",
+            "questdb-rs/Cargo.toml": "031d017701416c7deba8d3c5c58b31f008813c8fa0342faada29f74fb6d68fcf"
+          }
+        }
+      },
+      "validation": {
+        "runs": 50,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 40
+      },
+      "measurements": {
+        "disk_4m/plus_buffer": {
+          "total_ms": [775.993, 678.093, 665.999, 714.715, 656.872],
+          "publish_ms": [741.436, 653.446, 641.228, 690.663, 632.999],
+          "client_cpu_ms": [255.051, 273.088, 252.149, 274.871, 261.641],
+          "wal_commits": [1014, 1011, 1011, 1011, 1011],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1014, 1011, 1011, 1011, 1011]
+        },
+        "memory_standalone/plus_buffer": {
+          "total_ms": [64.053, 64.473, 60.563, 63.527, 58.606],
+          "publish_ms": [54.128, 55.425, 55.583, 55.588, 57.147],
+          "client_cpu_ms": [67.292, 69.012, 69.945, 67.894, 72.106],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "memory_fixed/plus_buffer": {
+          "total_ms": [154.516, 177.294, 171.898, 163.699, 142.267],
+          "publish_ms": [142.647, 164.779, 149.15, 153.269, 131.365],
+          "client_cpu_ms": [284.478, 334.4, 308.774, 306.613, 262.842],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "disk_16m/plus_buffer": {
+          "total_ms": [455.215, 495.892, 433.16, 446.852, 409.811],
+          "publish_ms": [442.697, 483.498, 420.807, 434.603, 397.612],
+          "client_cpu_ms": [428.647, 416.217, 403.11, 402.942, 377.455],
+          "wal_commits": [1011, 1011, 1011, 1010, 1011],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1011, 1011, 1011, 1010, 1011]
+        },
+        "memory_growable/plus_buffer": {
+          "total_ms": [188.998, 213.481, 211.581, 218.504, 188.64],
+          "publish_ms": [178.94, 201.669, 201.253, 207.737, 178.189],
+          "client_cpu_ms": [354.741, 404.369, 402.484, 416.439, 356.21],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "disk_4m/before": {
+          "total_ms": [913.84, 901.156, 900.419, 1025.904, 895.724],
+          "publish_ms": [902.33, 889.397, 889.255, 1013.565, 883.329],
+          "client_cpu_ms": [580.889, 566.654, 571.63, 540.648, 580.897],
+          "wal_commits": [1011, 1012, 1012, 1016, 1012],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1011, 1012, 1012, 1016, 1012]
+        },
+        "disk_standalone/plus_buffer": {
+          "total_ms": [255.869, 248.137, 272.452, 260.513, 240.99],
+          "publish_ms": [234.787, 230.885, 248.198, 236.412, 223.4],
+          "client_cpu_ms": [85.768, 80.892, 89.418, 82.199, 85.604],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "memory_growable/before": {
+          "total_ms": [359.149, 300.648, 321.361, 327.786, 314.462],
+          "publish_ms": [348.929, 288.485, 311.323, 315.334, 302.529],
+          "client_cpu_ms": [627.511, 566.514, 608.79, 619.985, 596.127],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_fixed/before": {
+          "total_ms": [318.575, 320.797, 285.632, 324.243, 290.388],
+          "publish_ms": [306.138, 309.273, 275.598, 312.422, 279.448],
+          "client_cpu_ms": [603.076, 608.391, 544.812, 617.263, 544.641],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_fixed/lease_append": {
+          "total_ms": [191.995, 236.843, 186.505, 201.288, 190.653],
+          "publish_ms": [180.898, 226.271, 174.855, 188.781, 180.451],
+          "client_cpu_ms": [360.933, 451.804, 349.139, 376.985, 360.482],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        }
+      }
+    },
+    "pool_single_symbol_comparison_20261023_01": {
+      "binaries": {
+        "before": {
+          "binary_sha256": "57be5ab2260344faec28b589554d5c7714a87f5d3b7078a7886abf383f2d46a7",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "6bb4379673327b716ae06b47b468b6e1fe05f42b455e02df63592ea873e6d553",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "8269f540a31af385b39e1a7af955271be1172619ac94a33993b4a2a28350ba23",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "38c75c21ce2357954087515c117bb53fb4c1dcdf89770b99527186170e2efd06",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs": "2ef07bdd954a23e5450619148714a4e89e0aa54cff0e84a1aaa6b2593f18f334",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "405fd61efd7d0d2ba05a93fda179b1e55ac6c8f018e79ab2789e5458a8070192",
+            "questdb-rs/src/ingress/sender/qwp_ws_rowlog_bench.rs": "34712a4a4a6834293d3ad9bbd0c12333e49b4bfb80e595732bed9e9543925fb8",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b"
+          }
+        },
+        "final": {
+          "binary_sha256": "c6a01621568b155381676d0e693ff636ce346d66798dc40a7c4f066c60291cee",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "f25c471c5d26eb7c231f7d1d502e6df37f4b788d9fc2123206e5f8a4fda2db71",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "79083bb452700341abcb44d811fe0af1156a5723166b0c6e4452d710d44cf566",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "38c75c21ce2357954087515c117bb53fb4c1dcdf89770b99527186170e2efd06",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs": "2ef07bdd954a23e5450619148714a4e89e0aa54cff0e84a1aaa6b2593f18f334",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "405fd61efd7d0d2ba05a93fda179b1e55ac6c8f018e79ab2789e5458a8070192",
+            "questdb-rs/src/ingress/sender/qwp_ws_rowlog_bench.rs": "34712a4a4a6834293d3ad9bbd0c12333e49b4bfb80e595732bed9e9543925fb8",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b"
+          }
+        }
+      },
+      "validation": {
+        "runs": 60,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 40
+      },
+      "measurements": {
+        "memory_hold/final": {
+          "total_ms": [113.88, 113.836, 116.26, 130.282, 110.688],
+          "publish_ms": [101.021, 101.094, 90.796, 105.357, 100.203],
+          "client_cpu_ms": [206.49, 208.041, 188.169, 221.529, 205.327],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "disk_4m/before": {
+          "total_ms": [744.108, 745.241, 659.926, 690.619, 746.19],
+          "publish_ms": [701.14, 703.301, 634.95, 661.828, 702.634],
+          "client_cpu_ms": [258.74, 258.135, 251.989, 245.702, 242.744],
+          "wal_commits": [1011, 1011, 1011, 1012, 1011],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1011, 1011, 1011, 1012, 1011]
+        },
+        "memory_hold/before": {
+          "total_ms": [122.238, 123.924, 133.893, 121.571, 138.682],
+          "publish_ms": [107.543, 109.228, 119.408, 109.487, 111.519],
+          "client_cpu_ms": [218.372, 222.348, 233.844, 222.486, 244.39],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_standalone/final": {
+          "total_ms": [54.412, 53.642, 53.937, 54.148, 66.318],
+          "publish_ms": [52.746, 51.889, 51.998, 52.713, 52.11],
+          "client_cpu_ms": [65.457, 64.972, 64.512, 65.068, 65.3],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "memory_growable/final": {
+          "total_ms": [166.541, 198.096, 177.201, 206.879, 192.759],
+          "publish_ms": [155.712, 187.657, 165.875, 191.977, 182.505],
+          "client_cpu_ms": [312.024, 374.79, 331.786, 383.938, 365.015],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "disk_standalone/before": {
+          "total_ms": [247.084, 243.79, 254.346, 244.043, 286.628],
+          "publish_ms": [226.92, 221.651, 232.763, 222.9, 260.345],
+          "client_cpu_ms": [81.412, 79.689, 89.71, 84.208, 84.529],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "disk_standalone/final": {
+          "total_ms": [244.047, 247.977, 252.821, 255.626, 245.231],
+          "publish_ms": [223.781, 225.832, 237.006, 233.669, 221.863],
+          "client_cpu_ms": [78.212, 81.024, 76.575, 79.276, 81.951],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "memory_standalone/before": {
+          "total_ms": [56.52, 62.054, 56.394, 56.163, 57.184],
+          "publish_ms": [55.16, 52.561, 55.025, 54.419, 55.283],
+          "client_cpu_ms": [67.791, 65.388, 67.4, 67.358, 67.673],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "memory_growable/before": {
+          "total_ms": [174.284, 204.064, 198.282, 170.184, 217.579],
+          "publish_ms": [164.068, 191.916, 188.229, 159.647, 202.596],
+          "client_cpu_ms": [332.749, 382.836, 375.84, 319.057, 406.037],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_fixed/before": {
+          "total_ms": [162.032, 146.07, 168.048, 163.343, 194.299],
+          "publish_ms": [151.744, 135.253, 155.159, 149.68, 183.589],
+          "client_cpu_ms": [304.378, 270.876, 311.089, 300.465, 375.47],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_fixed/final": {
+          "total_ms": [147.994, 186.782, 161.67, 152.524, 143.473],
+          "publish_ms": [137.193, 164.356, 150.875, 142.302, 130.915],
+          "client_cpu_ms": [274.962, 335.841, 301.897, 288.939, 261.635],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "disk_4m/final": {
+          "total_ms": [672.417, 664.868, 634.375, 714.535, 700.237],
+          "publish_ms": [642.693, 621.378, 605.391, 670.724, 646.871],
+          "client_cpu_ms": [241.326, 235.936, 238.008, 230.667, 243.184],
+          "wal_commits": [1012, 1011, 1011, 1011, 1011],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1012, 1011, 1011, 1011, 1011]
+        }
+      }
+    },
+    "pool_lease_discard_comparison_20261023_01": {
+      "binaries": {
+        "before": {
+          "binary_sha256": "57be5ab2260344faec28b589554d5c7714a87f5d3b7078a7886abf383f2d46a7",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "6bb4379673327b716ae06b47b468b6e1fe05f42b455e02df63592ea873e6d553",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "8269f540a31af385b39e1a7af955271be1172619ac94a33993b4a2a28350ba23",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "38c75c21ce2357954087515c117bb53fb4c1dcdf89770b99527186170e2efd06",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs": "2ef07bdd954a23e5450619148714a4e89e0aa54cff0e84a1aaa6b2593f18f334",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "405fd61efd7d0d2ba05a93fda179b1e55ac6c8f018e79ab2789e5458a8070192",
+            "questdb-rs/src/ingress/sender/qwp_ws_rowlog_bench.rs": "34712a4a4a6834293d3ad9bbd0c12333e49b4bfb80e595732bed9e9543925fb8",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b"
+          }
+        },
+        "lease": {
+          "binary_sha256": "ffe59a20dce41aa965b4af23ca294dbf7e8561d8d8cb42158d3c3f559c1515fd",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "6bb4379673327b716ae06b47b468b6e1fe05f42b455e02df63592ea873e6d553",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "8269f540a31af385b39e1a7af955271be1172619ac94a33993b4a2a28350ba23",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "7ba4d7278c1c8bb4a6e1f4b990ef7ce862f66673bf0a87c23a8ded4270f62d58",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "2c62a407014f86635d5e7da2c5cb0b3f9f8ff66998d209937ae94c7967c36faa",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs": "2ef07bdd954a23e5450619148714a4e89e0aa54cff0e84a1aaa6b2593f18f334",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "1d72ba18dfa325685468cdaedc4a42d13ffb93d98fba474ad113dbff6bd3f254",
+            "questdb-rs/src/ingress/sender/qwp_ws_rowlog_bench.rs": "34712a4a4a6834293d3ad9bbd0c12333e49b4bfb80e595732bed9e9543925fb8",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b"
+          }
+        }
+      },
+      "measurements": {
+        "memory_fixed/lease": {
+          "total_ms": [238.754, 143.415, 145.664, 157.249, 153.773],
+          "publish_ms": [228.617, 132.21, 135.31, 145.944, 142.432],
+          "client_cpu_ms": [378.279, 264.161, 270.827, 292.81, 283.794],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_fixed/before": {
+          "total_ms": [145.096, 144.137, 145.38, 147.151, 158.328],
+          "publish_ms": [134.423, 131.655, 133.206, 134.745, 146.449],
+          "client_cpu_ms": [267.976, 260.96, 266.507, 270.047, 291.382],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        }
+      },
+      "validation": {
+        "runs": 10,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 10
+      }
+    },
+    "pool_crc_comparison_20261023_01": {
+      "binaries": {
+        "before": {
+          "binary_sha256": "57be5ab2260344faec28b589554d5c7714a87f5d3b7078a7886abf383f2d46a7",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "6bb4379673327b716ae06b47b468b6e1fe05f42b455e02df63592ea873e6d553",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "8269f540a31af385b39e1a7af955271be1172619ac94a33993b4a2a28350ba23",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "38c75c21ce2357954087515c117bb53fb4c1dcdf89770b99527186170e2efd06",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs": "2ef07bdd954a23e5450619148714a4e89e0aa54cff0e84a1aaa6b2593f18f334",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "405fd61efd7d0d2ba05a93fda179b1e55ac6c8f018e79ab2789e5458a8070192",
+            "questdb-rs/src/ingress/sender/qwp_ws_rowlog_bench.rs": "34712a4a4a6834293d3ad9bbd0c12333e49b4bfb80e595732bed9e9543925fb8",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b"
+          }
+        },
+        "lease": {
+          "binary_sha256": "ffe59a20dce41aa965b4af23ca294dbf7e8561d8d8cb42158d3c3f559c1515fd",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "6bb4379673327b716ae06b47b468b6e1fe05f42b455e02df63592ea873e6d553",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "8269f540a31af385b39e1a7af955271be1172619ac94a33993b4a2a28350ba23",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "7ba4d7278c1c8bb4a6e1f4b990ef7ce862f66673bf0a87c23a8ded4270f62d58",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "2c62a407014f86635d5e7da2c5cb0b3f9f8ff66998d209937ae94c7967c36faa",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs": "2ef07bdd954a23e5450619148714a4e89e0aa54cff0e84a1aaa6b2593f18f334",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "1d72ba18dfa325685468cdaedc4a42d13ffb93d98fba474ad113dbff6bd3f254",
+            "questdb-rs/src/ingress/sender/qwp_ws_rowlog_bench.rs": "34712a4a4a6834293d3ad9bbd0c12333e49b4bfb80e595732bed9e9543925fb8",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b"
+          }
+        },
+        "final": {
+          "binary_sha256": "f54046d4f9a052e2690ad24c5db86fb493fe1cfa187063f7c5e544b7a2a700c6",
+          "source_sha256": {
+            "questdb-rs/src/db.rs": "6bb4379673327b716ae06b47b468b6e1fe05f42b455e02df63592ea873e6d553",
+            "questdb-rs/src/ingress/buffer/qwp.rs": "8269f540a31af385b39e1a7af955271be1172619ac94a33993b4a2a28350ba23",
+            "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+            "questdb-rs/src/ingress/sender/qwp_ws.rs": "38c75c21ce2357954087515c117bb53fb4c1dcdf89770b99527186170e2efd06",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+            "questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs": "0a83d6a9d4530615068e09acd8e5c1498eccc70c430ecffa766c83368baa9877",
+            "questdb-rs/src/ingress/sender/qwp_ws_driver.rs": "405fd61efd7d0d2ba05a93fda179b1e55ac6c8f018e79ab2789e5458a8070192",
+            "questdb-rs/src/ingress/sender/qwp_ws_rowlog_bench.rs": "34712a4a4a6834293d3ad9bbd0c12333e49b4bfb80e595732bed9e9543925fb8",
+            "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b"
+          }
+        }
+      },
+      "measurements": {
+        "disk_standalone/before": {
+          "total_ms": [253.677, 248.74, 282.177, 255.361, 265.834],
+          "publish_ms": [233.19, 229.265, 260.573, 239.845, 244.193],
+          "client_cpu_ms": [77.833, 89.504, 83.783, 83.475, 85.599],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "disk_4m/before": {
+          "total_ms": [708.479, 747.157, 744.589, 654.9, 699.962],
+          "publish_ms": [686.068, 698.142, 695.312, 617.8, 652.964],
+          "client_cpu_ms": [261.684, 250.529, 248.526, 249.927, 246.315],
+          "wal_commits": [1011, 1011, 1011, 1011, 1011],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1011, 1011, 1011, 1011, 1011]
+        },
+        "memory_fixed/final": {
+          "total_ms": [167.812, 160.485, 176.662, 190.144, 152.898],
+          "publish_ms": [156.596, 149.851, 165.658, 168.14, 142.355],
+          "client_cpu_ms": [314.866, 300.832, 334.033, 348.049, 284.745],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_standalone/final": {
+          "total_ms": [56.516, 62.113, 65.584, 62.561, 56.364],
+          "publish_ms": [55.073, 61.471, 54.813, 54.568, 54.965],
+          "client_cpu_ms": [69.059, 76.38, 68.019, 68.668, 68.762],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "disk_standalone/final": {
+          "total_ms": [264.74, 256.296, 248.233, 254.941, 248.499],
+          "publish_ms": [246.494, 233.112, 227.001, 237.374, 227.545],
+          "client_cpu_ms": [94.204, 96.923, 94.575, 85.05, 80.275],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "memory_growable/before": {
+          "total_ms": [194.793, 220.808, 194.693, 213.407, 178.342],
+          "publish_ms": [184.046, 208.714, 184.071, 203.318, 168.273],
+          "client_cpu_ms": [367.813, 417.794, 368.046, 406.479, 336.603],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "disk_4m/final": {
+          "total_ms": [680.995, 669.499, 676.874, 644.749, 693.677],
+          "publish_ms": [656.43, 645.269, 652.256, 620.158, 668.917],
+          "client_cpu_ms": [265.335, 250.097, 254.533, 250.448, 259.32],
+          "wal_commits": [1011, 1011, 1011, 1011, 1011],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1011, 1011, 1011, 1011, 1011]
+        },
+        "memory_hold/final": {
+          "total_ms": [127.638, 152.018, 131.751, 126.826, 127.684],
+          "publish_ms": [105.334, 119.401, 120.419, 115.519, 106.373],
+          "client_cpu_ms": [220.358, 268.564, 234.755, 233.887, 220.702],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_hold/before": {
+          "total_ms": [128.096, 122.371, 144.185, 131.21, 136.431],
+          "publish_ms": [106.756, 111.006, 119.364, 107.665, 113.236],
+          "client_cpu_ms": [232.853, 227.805, 254.612, 223.831, 237.401],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_standalone/before": {
+          "total_ms": [56.73, 58.717, 61.154, 63.358, 55.972],
+          "publish_ms": [54.889, 54.717, 55.295, 53.7, 54.339],
+          "client_cpu_ms": [68.642, 68.931, 68.723, 67.004, 68.738],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000, 1000, 1000, 1000, 1000]
+        },
+        "memory_fixed/before": {
+          "total_ms": [154.093, 176.811, 185.183, 173.184, 171.814],
+          "publish_ms": [143.887, 166.121, 162.415, 161.05, 159.555],
+          "client_cpu_ms": [290.502, 334.545, 334.51, 324.013, 319.016],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_fixed/lease": {
+          "total_ms": [181.246, 162.852, 160.374, 161.242, 163.371],
+          "publish_ms": [169.945, 152.51, 149.688, 150.048, 151.218],
+          "client_cpu_ms": [349.477, 306.846, 299.706, 301.263, 303.492],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        },
+        "memory_growable/final": {
+          "total_ms": [190.249, 209.153, 206.933, 215.503, 225.529],
+          "publish_ms": [177.831, 197.491, 194.696, 205.435, 213.235],
+          "client_cpu_ms": [352.18, 395.972, 389.634, 411.327, 426.799],
+          "wal_commits": [1010, 1010, 1010, 1010, 1010],
+          "publications": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "physical_qwp_frames": [1010, 1010, 1010, 1010, 1010]
+        }
+      },
+      "validation": {
+        "runs": 65,
+        "all_have_sql_verification": true,
+        "all_wal_unsuspended": true,
+        "all_column_verified_runs": 45
+      }
+    },
+    "pool_hotpath_profile_20261023_01": {
+      "metadata": {
+        "utc": "20261023_074539",
+        "binary_sha256": "57be5ab2260344faec28b589554d5c7714a87f5d3b7078a7886abf383f2d46a7",
+        "source_sha256": {
+          "questdb-rs/src/db.rs": "6bb4379673327b716ae06b47b468b6e1fe05f42b455e02df63592ea873e6d553",
+          "questdb-rs/src/ingress/buffer/qwp.rs": "8269f540a31af385b39e1a7af955271be1172619ac94a33993b4a2a28350ba23",
+          "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+          "questdb-rs/src/ingress/sender/qwp_ws.rs": "38c75c21ce2357954087515c117bb53fb4c1dcdf89770b99527186170e2efd06",
+          "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+          "questdb-rs/src/ingress/sender/qwp_ws_rowlog_bench.rs": "34712a4a4a6834293d3ad9bbd0c12333e49b4bfb80e595732bed9e9543925fb8",
+          "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b"
+        },
+        "sampling": "macOS sample, 3 seconds, 1 ms, -mayDie; wall stacks including waits, not exclusive CPU shares",
+        "scope": "Longer diagnostic runs, not substitutes for unprofiled 1M-row timing comparisons",
+        "server_build": {
+          "query": "select build()",
+          "columns": [
+            {
+              "name": "build()",
+              "type": "STRING"
+            }
+          ],
+          "timestamp": -1,
+          "dataset": [
+            ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+          ],
+          "count": 1
+        }
+      },
+      "sample_summary": {
+        "method": "Exclusive stack weights by recognizable call path; inline/unwound work remains unclassified. Inclusive hotspots overlap. Shares include waits and are not exclusive CPU percentages.",
+        "profiles": {
+          "standalone": [
+            {
+              "thread": "Thread_42318100   DispatchQueue_1: com.apple.main-thread  (serial)",
+              "total_samples": 2686,
+              "stages": {
+                "other_or_unwound": {
+                  "samples": 1398,
+                  "percent": 52.05
+                },
+                "fill_buffer": {
+                  "samples": 1288,
+                  "percent": 47.95
+                }
+              },
+              "overlapping_inclusive_hotspots": {
+                "symbol_append": {
+                  "samples": 820,
+                  "percent": 30.53
+                },
+                "sf_append": {
+                  "samples": 148,
+                  "percent": 5.51
+                },
+                "crc": {
+                  "samples": 49,
+                  "percent": 1.82
+                },
+                "buffer_clear": {
+                  "samples": 33,
+                  "percent": 1.23
+                }
+              }
+            },
+            {
+              "thread": "Thread_42318101",
+              "total_samples": 2686,
+              "stages": {
+                "other_or_unwound": {
+                  "samples": 2686,
+                  "percent": 100.0
+                }
+              },
+              "overlapping_inclusive_hotspots": {
+                "socket_send": {
+                  "samples": 1821,
+                  "percent": 67.8
+                },
+                "sleep": {
+                  "samples": 664,
+                  "percent": 24.72
+                },
+                "clock_read": {
+                  "samples": 3,
+                  "percent": 0.11
+                }
+              }
+            }
+          ],
+          "per_flush": [
+            {
+              "thread": "Thread_42316117   DispatchQueue_1: com.apple.main-thread  (serial)",
+              "total_samples": 2598,
+              "stages": {
+                "borrow": {
+                  "samples": 877,
+                  "percent": 33.76
+                },
+                "flush": {
+                  "samples": 810,
+                  "percent": 31.18
+                },
+                "fill_buffer": {
+                  "samples": 489,
+                  "percent": 18.82
+                },
+                "other_or_unwound": {
+                  "samples": 234,
+                  "percent": 9.01
+                },
+                "return": {
+                  "samples": 188,
+                  "percent": 7.24
+                }
+              },
+              "overlapping_inclusive_hotspots": {
+                "lease_rebase": {
+                  "samples": 462,
+                  "percent": 17.78
+                },
+                "sf_append": {
+                  "samples": 309,
+                  "percent": 11.89
+                },
+                "error_ring_poll": {
+                  "samples": 293,
+                  "percent": 11.28
+                },
+                "symbol_append": {
+                  "samples": 229,
+                  "percent": 8.81
+                },
+                "record_encode": {
+                  "samples": 193,
+                  "percent": 7.43
+                },
+                "crc": {
+                  "samples": 191,
+                  "percent": 7.35
+                },
+                "buffer_clear": {
+                  "samples": 122,
+                  "percent": 4.7
+                }
+              }
+            },
+            {
+              "thread": "Thread_42316118",
+              "total_samples": 2598,
+              "stages": {
+                "other_or_unwound": {
+                  "samples": 2598,
+                  "percent": 100.0
+                }
+              },
+              "overlapping_inclusive_hotspots": {
+                "background_record_append": {
+                  "samples": 568,
+                  "percent": 21.86
+                },
+                "qwp_encode": {
+                  "samples": 205,
+                  "percent": 7.89
+                },
+                "utf8_validation": {
+                  "samples": 139,
+                  "percent": 5.35
+                },
+                "socket_send": {
+                  "samples": 71,
+                  "percent": 2.73
+                },
+                "clock_read": {
+                  "samples": 6,
+                  "percent": 0.23
+                },
+                "sleep": {
+                  "samples": 1,
+                  "percent": 0.04
+                }
+              }
+            }
+          ],
+          "hold": [
+            {
+              "thread": "Thread_42317432   DispatchQueue_1: com.apple.main-thread  (serial)",
+              "total_samples": 2656,
+              "stages": {
+                "flush": {
+                  "samples": 1173,
+                  "percent": 44.16
+                },
+                "fill_buffer": {
+                  "samples": 1084,
+                  "percent": 40.81
+                },
+                "other_or_unwound": {
+                  "samples": 399,
+                  "percent": 15.02
+                }
+              },
+              "overlapping_inclusive_hotspots": {
+                "symbol_append": {
+                  "samples": 821,
+                  "percent": 30.91
+                },
+                "sf_append": {
+                  "samples": 401,
+                  "percent": 15.1
+                },
+                "record_encode": {
+                  "samples": 274,
+                  "percent": 10.32
+                },
+                "crc": {
+                  "samples": 228,
+                  "percent": 8.58
+                },
+                "buffer_clear": {
+                  "samples": 212,
+                  "percent": 7.98
+                }
+              }
+            },
+            {
+              "thread": "Thread_42317436",
+              "total_samples": 2656,
+              "stages": {
+                "other_or_unwound": {
+                  "samples": 2656,
+                  "percent": 100.0
+                }
+              },
+              "overlapping_inclusive_hotspots": {
+                "background_record_append": {
+                  "samples": 657,
+                  "percent": 24.74
+                },
+                "qwp_encode": {
+                  "samples": 292,
+                  "percent": 10.99
+                },
+                "utf8_validation": {
+                  "samples": 134,
+                  "percent": 5.05
+                },
+                "socket_send": {
+                  "samples": 102,
+                  "percent": 3.84
+                },
+                "clock_read": {
+                  "samples": 3,
+                  "percent": 0.11
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "pool_single_symbol_profile_20261023_01": {
+      "metadata": {
+        "utc": "20261023_080223",
+        "binary_sha256": "c6a01621568b155381676d0e693ff636ce346d66798dc40a7c4f066c60291cee",
+        "source_sha256": {
+          "questdb-rs/src/db.rs": "f25c471c5d26eb7c231f7d1d502e6df37f4b788d9fc2123206e5f8a4fda2db71",
+          "questdb-rs/src/ingress/buffer/qwp.rs": "79083bb452700341abcb44d811fe0af1156a5723166b0c6e4452d710d44cf566",
+          "questdb-rs/src/ingress/column_sender/sender.rs": "76ec34766b10b274ea8505329521e5422aa69674b901712c76059cae96d07958",
+          "questdb-rs/src/ingress/sender/qwp_ws.rs": "38c75c21ce2357954087515c117bb53fb4c1dcdf89770b99527186170e2efd06",
+          "questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25",
+          "questdb-rs/src/ingress/sender/qwp_ws_rowlog_bench.rs": "34712a4a4a6834293d3ad9bbd0c12333e49b4bfb80e595732bed9e9543925fb8",
+          "questdb-rs/examples/qwp_pool_bench.rs": "0a443b0ba1825e018613ad53a994425284fde8f1bfa40f817e5f22ef7ffb951b"
+        },
+        "sampling": "macOS sample, 3 seconds, 1 ms, -mayDie; wall stacks including waits, not exclusive CPU shares",
+        "scope": "Longer diagnostic runs, not substitutes for unprofiled 1M-row timing comparisons",
+        "server_build": {
+          "query": "select build()",
+          "columns": [
+            {
+              "name": "build()",
+              "type": "STRING"
+            }
+          ],
+          "timestamp": -1,
+          "dataset": [
+            ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+          ],
+          "count": 1
+        }
+      },
+      "sample_summary": {
+        "method": "Exclusive stack weights by recognizable call path; inline/unwound work remains unclassified. Inclusive hotspots overlap. Shares include waits and are not exclusive CPU percentages.",
+        "profiles": {
+          "per_flush": [
+            {
+              "thread": "Thread_42397867   DispatchQueue_1: com.apple.main-thread  (serial)",
+              "total_samples": 2567,
+              "stages": {
+                "borrow": {
+                  "samples": 831,
+                  "percent": 32.37
+                },
+                "flush": {
+                  "samples": 750,
+                  "percent": 29.22
+                },
+                "fill_buffer": {
+                  "samples": 463,
+                  "percent": 18.04
+                },
+                "other_or_unwound": {
+                  "samples": 378,
+                  "percent": 14.73
+                },
+                "return": {
+                  "samples": 145,
+                  "percent": 5.65
+                }
+              },
+              "overlapping_inclusive_hotspots": {
+                "lease_rebase": {
+                  "samples": 393,
+                  "percent": 15.31
+                },
+                "sf_append": {
+                  "samples": 308,
+                  "percent": 12.0
+                },
+                "error_ring_poll": {
+                  "samples": 217,
+                  "percent": 8.45
+                },
+                "symbol_append": {
+                  "samples": 205,
+                  "percent": 7.99
+                },
+                "crc": {
+                  "samples": 183,
+                  "percent": 7.13
+                },
+                "record_encode": {
+                  "samples": 162,
+                  "percent": 6.31
+                },
+                "buffer_clear": {
+                  "samples": 113,
+                  "percent": 4.4
+                }
+              }
+            },
+            {
+              "thread": "Thread_42397869",
+              "total_samples": 2567,
+              "stages": {
+                "other_or_unwound": {
+                  "samples": 2567,
+                  "percent": 100.0
+                }
+              },
+              "overlapping_inclusive_hotspots": {
+                "background_record_append": {
+                  "samples": 583,
+                  "percent": 22.71
+                },
+                "qwp_encode": {
+                  "samples": 191,
+                  "percent": 7.44
+                },
+                "utf8_validation": {
+                  "samples": 132,
+                  "percent": 5.14
+                },
+                "socket_send": {
+                  "samples": 65,
+                  "percent": 2.53
+                },
+                "clock_read": {
+                  "samples": 6,
+                  "percent": 0.23
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "pool_single_symbol_recovery_20261023_01": {
+      "result": {
+        "table": "qpbench_20261023_080453_000",
+        "rows": 10003,
+        "sf_dir": "/var/folders/k1/j7t_d0dn4rg8y5y3_zw_m6840000gn/T/qwp_rowlog_recovery_4c321406",
+        "seed_exit": -9,
+        "binary_sha256": "c6a01621568b155381676d0e693ff636ce346d66798dc40a7c4f066c60291cee",
+        "sf_mode": "disk, OS page cache; not a power-loss test",
+        "wal": [11, 11, false],
+        "verified_symbol_groups": 1000,
+        "server_build": {
+          "query": "select build()",
+          "columns": [
+            {
+              "name": "build()",
+              "type": "STRING"
+            }
+          ],
+          "timestamp": -1,
+          "dataset": [
+            ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+          ],
+          "count": 1
+        },
+        "table_removed": true,
+        "temporary_sf_directory_removed": true
+      }
+    }
+  },
+  "final_implementation": {
+    "memory": {
+      "metadata": {
+        "utc": "2026-10-23T08:21:45.656375+00:00",
+        "binary_sha256": "00b5e61476d8db1bcadfb1f4b371625369be25c94c43053668f9ccdb91385567",
+        "source_sha256": {
+          "Cargo.toml": "85b686e3bbb4044078247b90b9e0ba8a89836d507259cc9fc3e91cbf405f5555",
+          "examples/qwp_pool_bench.rs": "d291d7dfaad5500f8422cee006cf5e75fc88e03e5d3c0598c1fda7191d966af1",
+          "src/db.rs": "f25c471c5d26eb7c231f7d1d502e6df37f4b788d9fc2123206e5f8a4fda2db71",
+          "src/db/conf.rs": "fab85302c828ecfed1c2bbb9be405b96aa829c06a9b72091894309b9d81db113",
+          "src/ingress/buffer/qwp.rs": "262b99960a40ac57cfd343e4eaeb29d090062ac71a64abec7f902e779c1898e0",
+          "src/ingress/column_sender/sender.rs": "84248aec67cb133966fbbf6457b77d9b3ecfb3b12527f41a7dd3716f0cba00dd",
+          "src/ingress/sender/qwp_ws.rs": "0df8f3ef305d28129598c26b8642357d5311303ab133fcafc06ddce8a31bf46b",
+          "src/ingress/sender/qwp_ws_batch.rs": "7787e42e787c8976caa1116caddbcdb486eec5d50abbdb724e08342c28760125",
+          "src/ingress/sender/qwp_ws_driver.rs": "8730cfd1854590c3b878912e99206f843eb9fd4ff421c64bd144009a2d07c08b",
+          "src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25"
+        },
+        "platform": "macOS-15.2-arm64-arm-64bit-Mach-O",
+        "server_build": [
+          ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+        ],
+        "rows": 1000000,
+        "warmup": 10000,
+        "rounds": 5,
+        "sf_mode": "memory",
+        "disk_durability": "OS page cache, default 4 MiB segments",
+        "commit_rows": 1000,
+        "commit_interval_ms": 10,
+        "completion": "OK ACK on last publishing lease; all-column SQL verification outside timing",
+        "cases": [
+          ["per_flush:1", "network"],
+          ["per_flush:1", "commit"],
+          ["per_flush:1000", "network"],
+          ["per_flush:1000", "commit"],
+          ["standalone:1000", "network"]
+        ]
+      },
+      "summary": {
+        "network/per_flush:1": {
+          "publish_ms": {
+            "median": 163.503,
+            "min": 156.262,
+            "max": 198.97
+          },
+          "drain_ms": {
+            "median": 1795.432,
+            "min": 1748.015,
+            "max": 1827.164
+          },
+          "total_ms": {
+            "median": 1958.935,
+            "min": 1941.954,
+            "max": 1995.149
+          },
+          "total_cpu_ms": {
+            "median": 450.043,
+            "min": 445.147,
+            "max": 503.238
+          }
+        },
+        "commit/per_flush:1": {
+          "publish_ms": {
+            "median": 171.621,
+            "min": 158.17,
+            "max": 194.194
+          },
+          "drain_ms": {
+            "median": 358.696,
+            "min": 336.308,
+            "max": 401.514
+          },
+          "total_ms": {
+            "median": 519.421,
+            "min": 514.193,
+            "max": 595.708
+          },
+          "total_cpu_ms": {
+            "median": 344.776,
+            "min": 327.164,
+            "max": 388.185
+          }
+        },
+        "network/per_flush:1000": {
+          "publish_ms": {
+            "median": 52.164,
+            "min": 51.525,
+            "max": 52.414
+          },
+          "drain_ms": {
+            "median": 11.485,
+            "min": 10.015,
+            "max": 14.417
+          },
+          "total_ms": {
+            "median": 63.31,
+            "min": 62.32,
+            "max": 65.942
+          },
+          "total_cpu_ms": {
+            "median": 64.204,
+            "min": 63.86,
+            "max": 65.779
+          }
+        },
+        "commit/per_flush:1000": {
+          "publish_ms": {
+            "median": 52.233,
+            "min": 50.675,
+            "max": 52.353
+          },
+          "drain_ms": {
+            "median": 10.775,
+            "min": 10.433,
+            "max": 23.811
+          },
+          "total_ms": {
+            "median": 62.665,
+            "min": 61.723,
+            "max": 76.164
+          },
+          "total_cpu_ms": {
+            "median": 64.784,
+            "min": 62.202,
+            "max": 66.563
+          }
+        },
+        "network/standalone:1000": {
+          "publish_ms": {
+            "median": 52.706,
+            "min": 51.227,
+            "max": 55.954
+          },
+          "drain_ms": {
+            "median": 1.926,
+            "min": 1.619,
+            "max": 3.865
+          },
+          "total_ms": {
+            "median": 54.979,
+            "min": 52.874,
+            "max": 59.156
+          },
+          "total_cpu_ms": {
+            "median": 65.038,
+            "min": 61.586,
+            "max": 67.459
+          }
+        }
+      },
+      "measurements": {
+        "network/per_flush:1": {
+          "total_ms": [1941.954, 1958.935, 1981.745, 1946.985, 1995.149],
+          "publish_ms": [161.097, 163.503, 156.262, 198.97, 167.985],
+          "total_cpu_ms": [448.483, 462.007, 445.147, 503.238, 450.043],
+          "frames": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "wal": [
+            [1010000, 1010000, false],
+            [1010000, 1010000, false],
+            [1010000, 1010000, false],
+            [1010000, 1010000, false],
+            [1010000, 1010000, false]
+          ]
+        },
+        "commit/per_flush:1": {
+          "total_ms": [595.708, 519.421, 519.983, 514.193, 518.687],
+          "publish_ms": [194.194, 158.17, 161.287, 177.885, 171.621],
+          "total_cpu_ms": [388.185, 327.164, 334.543, 357.733, 344.776],
+          "frames": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "wal": [
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false]
+          ]
+        },
+        "network/per_flush:1000": {
+          "total_ms": [62.77, 63.31, 65.942, 62.32, 63.954],
+          "publish_ms": [52.414, 51.825, 51.525, 52.304, 52.164],
+          "total_cpu_ms": [65.779, 63.958, 65.756, 63.86, 64.204],
+          "frames": [1000, 1000, 1000, 1000, 1000],
+          "wal": [
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false]
+          ]
+        },
+        "commit/per_flush:1000": {
+          "total_ms": [61.723, 62.665, 62.828, 76.164, 62.521],
+          "publish_ms": [50.675, 52.233, 52.235, 52.353, 51.746],
+          "total_cpu_ms": [62.202, 64.594, 65.994, 66.563, 64.784],
+          "frames": [1000, 1000, 1000, 1000, 1000],
+          "wal": [
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false]
+          ]
+        },
+        "network/standalone:1000": {
+          "total_ms": [55.092, 54.979, 54.631, 59.156, 52.874],
+          "publish_ms": [51.227, 53.359, 52.706, 55.954, 51.255],
+          "total_cpu_ms": [63.857, 65.038, 65.107, 67.459, 61.586],
+          "frames": [1000, 1000, 1000, 1000, 1000],
+          "wal": [
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false]
+          ]
+        }
+      },
+      "validation": {
+        "runs": 25,
+        "all_columns_verified_by_symbol": true,
+        "all_artifacts_removed": true,
+        "grouped_data_sha256": ["4b8f4c41a0a13e36db0b2a045196e838df70819966a9a89a51f32aa14d28817b"]
+      }
+    },
+    "disk": {
+      "metadata": {
+        "utc": "2026-10-23T08:22:57.390635+00:00",
+        "binary_sha256": "00b5e61476d8db1bcadfb1f4b371625369be25c94c43053668f9ccdb91385567",
+        "source_sha256": {
+          "Cargo.toml": "85b686e3bbb4044078247b90b9e0ba8a89836d507259cc9fc3e91cbf405f5555",
+          "examples/qwp_pool_bench.rs": "d291d7dfaad5500f8422cee006cf5e75fc88e03e5d3c0598c1fda7191d966af1",
+          "src/db.rs": "f25c471c5d26eb7c231f7d1d502e6df37f4b788d9fc2123206e5f8a4fda2db71",
+          "src/db/conf.rs": "fab85302c828ecfed1c2bbb9be405b96aa829c06a9b72091894309b9d81db113",
+          "src/ingress/buffer/qwp.rs": "262b99960a40ac57cfd343e4eaeb29d090062ac71a64abec7f902e779c1898e0",
+          "src/ingress/column_sender/sender.rs": "84248aec67cb133966fbbf6457b77d9b3ecfb3b12527f41a7dd3716f0cba00dd",
+          "src/ingress/sender/qwp_ws.rs": "0df8f3ef305d28129598c26b8642357d5311303ab133fcafc06ddce8a31bf46b",
+          "src/ingress/sender/qwp_ws_batch.rs": "7787e42e787c8976caa1116caddbcdb486eec5d50abbdb724e08342c28760125",
+          "src/ingress/sender/qwp_ws_driver.rs": "8730cfd1854590c3b878912e99206f843eb9fd4ff421c64bd144009a2d07c08b",
+          "src/ingress/sender/qwp_ws_sfa_queue.rs": "593756703b53a5b44bda62065bd4b0dec15ad873cf1f5d7334e7f9db1e9f3d25"
+        },
+        "platform": "macOS-15.2-arm64-arm-64bit-Mach-O",
+        "server_build": [
+          ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+        ],
+        "rows": 1000000,
+        "warmup": 10000,
+        "rounds": 5,
+        "sf_mode": "disk",
+        "disk_durability": "OS page cache, default 4 MiB segments",
+        "commit_rows": 1000,
+        "commit_interval_ms": 10,
+        "completion": "OK ACK on last publishing lease; all-column SQL verification outside timing",
+        "cases": [
+          ["per_flush:1", "network"],
+          ["per_flush:1", "commit"],
+          ["per_flush:1000", "network"],
+          ["per_flush:1000", "commit"],
+          ["standalone:1000", "network"]
+        ]
+      },
+      "summary": {
+        "network/per_flush:1": {
+          "publish_ms": {
+            "median": 873.162,
+            "min": 764.611,
+            "max": 909.857
+          },
+          "drain_ms": {
+            "median": 1742.652,
+            "min": 1682.514,
+            "max": 1870.268
+          },
+          "total_ms": {
+            "median": 2592.371,
+            "min": 2494.271,
+            "max": 2765.754
+          },
+          "total_cpu_ms": {
+            "median": 842.806,
+            "min": 809.072,
+            "max": 907.575
+          }
+        },
+        "commit/per_flush:1": {
+          "publish_ms": {
+            "median": 1089.968,
+            "min": 976.559,
+            "max": 1226.984
+          },
+          "drain_ms": {
+            "median": 50.328,
+            "min": 40.553,
+            "max": 53.366
+          },
+          "total_ms": {
+            "median": 1143.334,
+            "min": 1017.111,
+            "max": 1277.311
+          },
+          "total_cpu_ms": {
+            "median": 343.372,
+            "min": 336.611,
+            "max": 400.812
+          }
+        },
+        "network/per_flush:1000": {
+          "publish_ms": {
+            "median": 242.649,
+            "min": 221.872,
+            "max": 287.452
+          },
+          "drain_ms": {
+            "median": 29.208,
+            "min": 28.161,
+            "max": 50.05
+          },
+          "total_ms": {
+            "median": 270.809,
+            "min": 250.863,
+            "max": 337.502
+          },
+          "total_cpu_ms": {
+            "median": 78.5,
+            "min": 74.898,
+            "max": 97.877
+          }
+        },
+        "commit/per_flush:1000": {
+          "publish_ms": {
+            "median": 238.781,
+            "min": 210.96,
+            "max": 292.643
+          },
+          "drain_ms": {
+            "median": 27.083,
+            "min": 25.479,
+            "max": 38.093
+          },
+          "total_ms": {
+            "median": 267.968,
+            "min": 237.684,
+            "max": 330.736
+          },
+          "total_cpu_ms": {
+            "median": 85.831,
+            "min": 74.321,
+            "max": 116.519
+          }
+        },
+        "network/standalone:1000": {
+          "publish_ms": {
+            "median": 238.149,
+            "min": 228.751,
+            "max": 277.048
+          },
+          "drain_ms": {
+            "median": 25.192,
+            "min": 17.612,
+            "max": 47.109
+          },
+          "total_ms": {
+            "median": 263.341,
+            "min": 248.323,
+            "max": 318.052
+          },
+          "total_cpu_ms": {
+            "median": 97.494,
+            "min": 75.977,
+            "max": 99.841
+          }
+        }
+      },
+      "measurements": {
+        "network/per_flush:1": {
+          "total_ms": [2494.271, 2507.263, 2765.754, 2592.371, 2674.962],
+          "publish_ms": [788.9, 764.611, 895.486, 909.857, 873.162],
+          "total_cpu_ms": [809.072, 813.778, 907.575, 876.24, 842.806],
+          "frames": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "wal": [
+            [1010000, 1010000, false],
+            [1010000, 1010000, false],
+            [1010000, 1010000, false],
+            [1010000, 1010000, false],
+            [1010000, 1010000, false]
+          ]
+        },
+        "commit/per_flush:1": {
+          "total_ms": [1017.111, 1143.334, 1131.35, 1277.311, 1247.14],
+          "publish_ms": [976.559, 1089.968, 1088.93, 1226.984, 1193.774],
+          "total_cpu_ms": [336.611, 337.162, 343.372, 400.812, 380.363],
+          "frames": [1000000, 1000000, 1000000, 1000000, 1000000],
+          "wal": [
+            [1014, 1014, false],
+            [1015, 1015, false],
+            [1015, 1015, false],
+            [1017, 1017, false],
+            [1016, 1016, false]
+          ]
+        },
+        "network/per_flush:1000": {
+          "total_ms": [250.863, 262.93, 273.882, 270.809, 337.502],
+          "publish_ms": [221.872, 233.723, 244.466, 242.649, 287.452],
+          "total_cpu_ms": [74.898, 78.052, 78.5, 94.391, 97.877],
+          "frames": [1000, 1000, 1000, 1000, 1000],
+          "wal": [
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false]
+          ]
+        },
+        "commit/per_flush:1000": {
+          "total_ms": [237.684, 250.124, 267.968, 283.2, 330.736],
+          "publish_ms": [210.96, 224.645, 238.781, 256.117, 292.643],
+          "total_cpu_ms": [74.321, 85.831, 76.554, 90.497, 116.519],
+          "frames": [1000, 1000, 1000, 1000, 1000],
+          "wal": [
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false]
+          ]
+        },
+        "network/standalone:1000": {
+          "total_ms": [248.323, 252.719, 318.052, 263.341, 312.38],
+          "publish_ms": [228.751, 235.107, 270.943, 238.149, 277.048],
+          "total_cpu_ms": [75.977, 77.837, 99.841, 97.494, 98.932],
+          "frames": [1000, 1000, 1000, 1000, 1000],
+          "wal": [
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false],
+            [1010, 1010, false]
+          ]
+        }
+      },
+      "validation": {
+        "runs": 25,
+        "all_columns_verified_by_symbol": true,
+        "all_artifacts_removed": true,
+        "grouped_data_sha256": ["4b8f4c41a0a13e36db0b2a045196e838df70819966a9a89a51f32aa14d28817b"]
+      }
+    },
+    "recovery": {
+      "table": "qpbench_ed5b6cb223414602b5d5d0f3c6813beb",
+      "rows": 10003,
+      "seed_exit": -9,
+      "binary_sha256": "00b5e61476d8db1bcadfb1f4b371625369be25c94c43053668f9ccdb91385567",
+      "sf_mode": "disk, OS page cache; not a power-loss test",
+      "server_build": [
+        ["Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown"]
+      ],
+      "wal": [11, 11, false],
+      "verified_symbol_groups": 1000,
+      "grouped_data_sha256": "330d684980d7c0af1e75c3f82504019ab87f0fa91e398d5c81c05ec606cf95e9",
+      "table_and_sf_directory_removed": true
+    },
+    "checks": {
+      "rust": "cargo test --locked --features almost-all-features --lib: 2264 passed, 24 ignored",
+      "clippy_core": "all targets, almost-all-features, -D warnings: passed",
+      "clippy_ffi": "all targets, arrow,insecure-skip-verify,confstr-ffi, -D warnings: passed",
+      "cpp": "test_column_sender and test_column_sender_cxx20 passed",
+      "format": "cargo fmt and clang-format 21.1.8 passed"
+    }
+  },
+  "cleanup": {
+    "recorded_historical_tables_checked": 398,
+    "historical_tables_remaining": [],
+    "final_trial_tables_and_sf_directories_removed": 51,
+    "raw_result_files_removed": 1812,
+    "temporary_directories_removed": [
+      "qwp_explicit_disk_20261022_01",
+      "qwp_pool_batching_disk_20261022_01",
+      "qwp_pool_bench_disk_20261022_01",
+      "qwp_production_disk_20261022_01",
+      "qwp_production_reference_disk_20261022_01",
+      "qwp_rowlog_disk_20261022_01",
+      "qwp_rowlog_recovery_2tz1sowo",
+      "qwp_hotpath_before_5xdeo651",
+      "qwp_hotpath_stage1_h_gn2huk",
+      "qwp_next_before_d2gb10kf",
+      "qwp_next_symbol_xm_ipo3q",
+      "qwp_next_lease_vq6t1cqd",
+      "qwp_landing_7g68jdc_",
+      "qwp_landing_results_ouam7vm3",
+      "qwp_next_crc_ezeke63w"
+    ],
+    "benchmark_build_artifacts_removed": 8
+  }
+}

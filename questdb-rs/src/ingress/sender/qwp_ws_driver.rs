@@ -34,7 +34,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -780,6 +780,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.sender_errors.poll()
     }
 
+    pub(crate) fn sender_errors_pending(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.sender_errors.pending)
+    }
+
     pub(crate) fn poll_sender_error_notification(&mut self) -> Option<QwpWsSenderError> {
         self.sender_errors.poll_notification()
     }
@@ -1264,6 +1268,21 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         progress: &SfaProgressView,
     ) -> Result<Option<OutboundFrame>, DriverError> {
         progress.next_outbound_frame(&mut self.send_cursor)
+    }
+
+    pub(crate) fn begin_send_batch(&mut self) -> usize {
+        self.transport.begin_send_batch()
+    }
+
+    pub(crate) fn send_batch_interrupted(&self) -> bool {
+        self.has_pending_reconnect() || self.catch_up_pending || self.sends_on_connection == 0
+    }
+
+    pub(crate) fn finish_send_batch(
+        &mut self,
+        force_through: Option<u64>,
+    ) -> Result<(), TransportFailure> {
+        self.transport.finish_send_batch(force_through)
     }
 
     pub(crate) fn send_frame(
@@ -3025,6 +3044,16 @@ impl SendCursor {
 }
 
 pub(crate) trait QwpWsCoreTransport {
+    /// Byte budget for one bounded background send burst. Manual drivers keep
+    /// their immediate-write behavior; test transports default to one frame.
+    fn begin_send_batch(&mut self) -> usize {
+        1
+    }
+
+    fn finish_send_batch(&mut self, _force_through: Option<u64>) -> Result<(), TransportFailure> {
+        Ok(())
+    }
+
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure>;
 
     fn send_durable_ack_keepalive_if_due(
@@ -3122,6 +3151,8 @@ pub(crate) struct BlockingQwpWsTransport {
     stream: WsStream,
     reader: WsFrameReader,
     send_buf: Vec<u8>,
+    batch: super::qwp_ws_batch::QwpWsBatch,
+    batching: bool,
     pending_wire_sequences: PendingWireSequenceRun,
     last_durable_keepalive_ping: Option<Instant>,
 }
@@ -3186,6 +3217,11 @@ impl BlockingQwpWsTransport {
         connected: QwpWsConnectRoundSuccess,
     ) -> Self {
         server_max_batch_size.store(connected.server_max_batch_size, Ordering::Release);
+        let batch = super::qwp_ws_batch::QwpWsBatch::new(
+            qwp_ws.pool_commit_interval,
+            qwp_ws.pool_commit_rows,
+            commit_byte_limit(&qwp_ws, connected.server_max_batch_size),
+        );
         let transport = Self {
             endpoints,
             previous_idx: Some(connected.endpoint_idx),
@@ -3201,6 +3237,8 @@ impl BlockingQwpWsTransport {
             stream: connected.stream,
             reader: WsFrameReader::with_initial_input(connected.leftover),
             send_buf: Vec::with_capacity(16 * 1024),
+            batch,
+            batching: false,
             pending_wire_sequences: PendingWireSequenceRun::default(),
             last_durable_keepalive_ping: None,
         };
@@ -3213,6 +3251,8 @@ impl BlockingQwpWsTransport {
     }
 
     fn reconnect(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
+        self.batch.reset_connection();
+        self.batching = false;
         if let Some(gate) = self.traffic_gate.as_deref() {
             gate.clear();
         }
@@ -3245,6 +3285,10 @@ impl BlockingQwpWsTransport {
         self.negotiated_version = connected.negotiated_version;
         self.server_max_batch_size
             .store(connected.server_max_batch_size, Ordering::Release);
+        self.batch.set_byte_limit(commit_byte_limit(
+            &self.qwp_ws,
+            connected.server_max_batch_size,
+        ));
         self.reader = WsFrameReader::with_initial_input(connected.leftover);
         self.send_buf.clear();
         self.pending_wire_sequences.clear();
@@ -3266,6 +3310,20 @@ impl BlockingQwpWsTransport {
     fn complete_pending_through(&mut self, sequence: u64) {
         self.pending_wire_sequences.complete_through(sequence);
     }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn commit_byte_limit(config: &QwpWsConfig, server_max: usize) -> usize {
+    config
+        .pool_commit_max_bytes
+        .min(super::qwp_ws_sfa_queue::segment_payload_capacity(
+            *config.sf_max_segment_bytes,
+        ))
+        .min(if server_max == 0 {
+            usize::MAX
+        } else {
+            server_max
+        })
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -3330,6 +3388,25 @@ fn decode_durable_transport_response(
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl QwpWsCoreTransport for BlockingQwpWsTransport {
+    fn begin_send_batch(&mut self) -> usize {
+        self.batching = true;
+        super::qwp_ws_batch::NETWORK_BYTES
+    }
+
+    fn finish_send_batch(&mut self, force_through: Option<u64>) -> Result<(), TransportFailure> {
+        self.batching = false;
+        if self.batch.should_flush(force_through) {
+            self.batch.flush(&mut self.stream).map_err(|io| {
+                TransportFailure::Disconnect(error::fmt!(
+                    SocketError,
+                    "Could not flush WebSocket batch: {}",
+                    io
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
         if self.pending_wire_sequences.is_empty() && !*self.qwp_ws.request_durable_ack {
             return Ok(TransportPoll::Idle);
@@ -3433,6 +3510,29 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
         &mut self,
         frame: OutboundFrameView<'_>,
     ) -> Result<TransportSendResult, TransportFailure> {
+        if self.batching {
+            let result = (|| {
+                if self.batch.full_before(frame.payload.len()) {
+                    self.batch.flush(&mut self.stream)?;
+                }
+                if self
+                    .batch
+                    .append(frame.fsn, frame.payload, rand::random())?
+                {
+                    self.batch.flush(&mut self.stream)?;
+                }
+                std::io::Result::Ok(())
+            })();
+            result.map_err(|io| {
+                TransportFailure::Disconnect(error::fmt!(
+                    SocketError,
+                    "Could not send WebSocket batch: {}",
+                    io
+                ))
+            })?;
+            self.pending_wire_sequences.push(frame.wire_seq);
+            return Ok(TransportSendResult::NoResponse);
+        }
         write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload).map_err(|io| {
             TransportFailure::Disconnect(error::fmt!(
                 SocketError,
@@ -3761,6 +3861,7 @@ struct DriverEventRing {
 #[derive(Debug)]
 struct SenderErrorLog {
     errors: VecDeque<QwpWsSenderError>,
+    pending: Arc<AtomicBool>,
     capacity: usize,
     dropped_total: u64,
     first_seq: u64,
@@ -3903,6 +4004,7 @@ impl SenderErrorLog {
     fn new(capacity: usize) -> Self {
         Self {
             errors: VecDeque::with_capacity(capacity),
+            pending: Arc::new(AtomicBool::new(false)),
             capacity,
             dropped_total: 0,
             first_seq: 0,
@@ -3932,6 +4034,7 @@ impl SenderErrorLog {
         }
         debug_assert_eq!(self.first_seq + self.errors.len() as u64, seq);
         self.errors.push_back(error);
+        self.pending.store(true, Ordering::Release);
     }
 
     fn poll(&mut self) -> Option<QwpWsSenderError> {
@@ -3966,6 +4069,9 @@ impl SenderErrorLog {
             self.errors.pop_front();
             self.first_seq = self.first_seq.saturating_add(1);
         }
+        // Both cursors must consume a record before empty polls can skip the lock.
+        self.pending
+            .store(!self.errors.is_empty(), Ordering::Release);
     }
 
     fn capacity(&self) -> usize {
@@ -9434,11 +9540,16 @@ mod tests {
     fn sender_error_log_cursors_are_independent() {
         let mut log = SenderErrorLog::new(2);
         let error = sender_error(0);
+        let pending = Arc::clone(&log.pending);
+        assert!(!pending.load(Ordering::Acquire));
 
         log.push(error.clone());
+        assert!(pending.load(Ordering::Acquire));
 
         assert_eq!(log.poll_notification(), Some(error.clone()));
+        assert!(pending.load(Ordering::Acquire));
         assert_eq!(log.poll(), Some(error));
+        assert!(!pending.load(Ordering::Acquire));
         assert_eq!(log.poll_notification(), None);
         assert_eq!(log.poll(), None);
         assert_eq!(log.dropped_total(), 0);
@@ -9457,7 +9568,21 @@ mod tests {
 
         assert_eq!(log.dropped_total(), 1);
         assert_eq!(log.poll_notification(), Some(second.clone()));
+        assert!(log.pending.load(Ordering::Acquire));
         assert_eq!(log.poll(), Some(second));
+        assert!(!log.pending.load(Ordering::Acquire));
+        log.push(sender_error(2));
+        assert!(log.pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn disabled_sender_error_log_never_reports_pending_entries() {
+        let mut log = SenderErrorLog::new(0);
+        log.push(sender_error(0));
+        assert!(!log.pending.load(Ordering::Acquire));
+        assert_eq!(log.poll(), None);
+        assert_eq!(log.poll_notification(), None);
+        assert_eq!(log.dropped_total(), 1);
     }
 
     #[test]

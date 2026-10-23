@@ -1,305 +1,388 @@
 # Pool commit batching
 
-**Status:** proposal
+**Decision:** batch ready network writes by default and provide an opt-in,
+automatic commit window for QWP/WebSocket ingestion through `QuestDb`.
+Reuse `wait` and `flush_and_wait` for explicit completion. Keep the current
+SF format and one successful SF publication per flush.
 
-**Scope:** QWP/WebSocket ingestion through the `QuestDb` pool
-(`borrow_sender()`), in Rust, C and C++. Neither the protocol nor the server
-changes.
+This document describes the implementation, its compatibility constraints,
+and the performance evidence used to choose it. The fixed-schema
+record-first experiment is evidence for a separate format design (§7.3);
+it is not part of the library implementation.
 
-## 1. The problem
+## 1. Problem and scope
 
-A common way to use the pool is one lease per message:
-
-```rust
-for msg in queue {
-    let mut s = db.borrow_sender()?;
-    buf.table("trades")?.symbol("sym", &msg.sym)?.column_f64("px", msg.px)?.at(msg.ts)?;
-    s.flush_buffer(&mut buf)?;
-}
-```
-
-Today every flush becomes one frame on the wire, and the server commits
-every frame on its own. A million messages mean a million frames and a
-million commits, and that, not the data, is what limits throughput.
-
-Users work in one of two modes:
-
-| Mode | Calls | When rows commit |
-|---|---|---|
-| Streaming | borrow, add, flush, return | Soon. The client decides when |
-| Transaction control | borrow, add, flush, **commit**, add, flush, **commit**, return | When the user calls `commit()` |
-
-Requirements:
-
-1. **A flush is durable.** When a flush returns `Ok`, its frame is in the
-   store-and-forward (SF) queue, exactly as today. Nothing is left in any
-   client buffer after a lease is returned.
-2. **Fewer frames and fewer commits.** Small flushes are sent together.
-3. **Nothing changes on the server.** Messages use the protocol as it is.
-
-## 2. The idea
-
-Flush stays exactly as it is: each flush writes one frame into SF, and SF
-holds the only copy of the data.
-
-What changes is sending. Each slot already has an I/O thread that reads
-frames from SF and sends them. Now it waits a little, collects the small
-frames that have queued up, and turns them into **one** message. It decodes
-them, puts each table's rows together, and encodes the result once. The
-server receives one frame and commits once.
+A Stream consumer often borrows a sender, flushes one message and returns
+it. Repeating this pattern used to require one socket write and one server
+commit per small QWP frame. Batching already-published frames across leases
+on the same pool slot shares these costs without changing the caller.
 
 ```text
-flush ──► SF queue ─────────────────────► I/O thread ──────────────► server
-          one frame per flush,            decode the queued frames,   1 message,
-          durable, unchanged              one block per table,        1 commit
-                                          encode once
+application flush → SF publication → background transport → server
+                       original       bounded writes and     commit at
+                       QWP frames     commit windows         window end
 ```
 
-With `commit_interval_ms=100`, one slot sees this:
+A successful flush means the client owns replayable data in SF. Disk SF
+supports process-restart replay; power-loss durability depends on
+`sf_durability`. Memory SF does not survive process death. Unflushed Buffer
+rows remain the application's responsibility. Returning a lease is not an
+implicit flush.
 
-```text
-time     event                          SF queue (unsent)       wire
-0 ms     lease A flushes 1 row          frame 1
-1 ms     lease B flushes 1 row          frames 1-2
-...
-99 ms    lease X flushes 1 row          frames 1-500
-100 ms   frame 1 is 100 ms old          (sent)                  1 message, 500 rows, 1 commit
-```
+Network batching applies to the background QWP transport, including the
+standalone sender. Commit windows apply only to pooled SF ingestion.
+Direct, non-SF column transactions and manual recovery drainers retain
+their existing send behavior. Rust, C and C++ share the implementation.
 
-## 3. Why it is safe
+## 2. Decisions and reasons
 
-Four rules hold at all times. Each one is what keeps an existing guarantee
-intact.
-
-1. **Every row that is sent is already in SF.** Batching never holds data
-   anywhere else. So a crash or restart loses nothing, and recovery stays
-   exactly as it is.
-2. **A merged message is just another way to put SF frames on the wire.**
-   Each frame (identified by its FSN, its position in SF) is sent once, inside
-   exactly one message. So acks still tell SF exactly which frames it can
-   drop.
-3. **Frames go out in FSN order.** So rows reach the server in the order
-   they were flushed.
-4. **Each table appears at most once in a message, and a frame is never
-   split.** So the server sees an ordinary message, and the rows of one
-   flush always commit together.
-
-## 4. How it works
-
-### 4.1 Configuration
-
-| Key | Default | Meaning |
-|---|---|---|
-| `commit_interval_ms` | unset (off) | Turns batching on. Rows are sent at the latest this long after they were flushed |
-| `commit_rows` | off | Also send once this many rows are waiting |
-
-- Setting `commit_rows` alone turns batching on with
-  `commit_interval_ms=100`.
-- The pool reads both keys and removes them before opening each slot's
-  sender. A standalone `Sender` rejects them.
-- With batching off, every frame is sent as soon as it is queued, as today.
-
-### 4.2 When frames are sent
-
-All unsent frames become due as soon as any of these is true:
-
-1. the oldest one has waited `commit_interval_ms`;
-2. together they hold `commit_rows` rows;
-3. together they reach the frame cap (the smallest of `max_buf_size`, the
-   server's advertised max batch size, and the SF segment payload cap);
-4. someone called `commit()` or a wait (§4.5);
-5. the sender is closing or draining.
-
-- **Waiting.** The I/O thread sleeps until the oldest unsent frame is due,
-  using the `wait_timeout` it already has (`ingress/sender/qwp_ws.rs:1010`).
-- **Bookkeeping.** Each frame's enqueue time and row count are kept in
-  memory only.
-- **After a restart or reconnect.** Replayed frames are due at once.
-
-### 4.3 From due frames to messages
-
-Due frames are taken in FSN order. Each frame goes one of three ways.
-
-**Merged (the normal case).** Consecutive small frames are merged into one
-message (§4.4). The message keeps the frames' header flags. Its
-`FLAG_DEFER_COMMIT` is the last frame's, so a chunk split that is still
-open stays open.
-
-A message ends, and a new one starts, before a frame that:
-
-- would push the message over the frame cap;
-- has different header flags (version, Gorilla, delta dictionary), ignoring
-  `FLAG_DEFER_COMMIT`;
-- writes a column with a different type, or a different type parameter
-  (decimal scale, geohash precision, array element type), than the same
-  column already in the message;
-- writes a table with a different timestamp shape: an explicit designated
-  timestamp versus server-assigned (`at_now`);
-- does not continue the message's symbol dictionary range, for example a
-  dictionary that restarts at 0.
-
-**As is.** These frames are sent unchanged, each as its own message:
-
-- frames of 64 KiB or more. They are big enough already, so merging gains
-  nothing. Big buffers, chunks and Arrow batches usually land here.
-- frames without a delta dictionary (the degraded full-dictionary mode).
-
-**Backlog.** If more than two frame caps of unsent data have queued up, the
-I/O thread is falling behind. It stops merging and sends the frames
-unchanged, which is cheap. To keep the commit count low, it sets
-`FLAG_DEFER_COMMIT` on the wire on every frame of the group but the last,
-so the server commits the group once. Flags already stored on a frame are
-kept. The added flags are never written to SF. Merging resumes once the
-backlog has cleared.
-
-### 4.4 The merger
-
-The merger lives in a new module, `ingress/sender/qwp_ws_merge.rs`. It does
-not invent a new way to merge rows: it reuses the one the row API already
-uses.
-
-1. **Decode into a `Buffer`.** Each frame's table blocks are decoded into a
-   reused `QwpWsColumnarBuffer`, the buffer the row API fills. That buffer
-   already keeps one table per name, represents missing columns as nulls,
-   and keeps a dictionary per symbol column. The decoder covers every QWP
-   wire type: fixed width, booleans, varchar and binary, symbols,
-   Gorilla-encoded timestamps, decimals, geohash, UUID, long256 and arrays.
-   A new bulk append adds the decoded columns without going row by row.
-2. **Resolve symbols.** Symbol IDs in a frame are connection-wide. The I/O
-   thread keeps a copy of the connection dictionary (`SymbolGlobalDict`),
-   fed from every frame's dictionary section in FSN order, and resolves
-   each ID to its string.
-3. **Encode once.** The existing encoder writes the message
-   (`encode_ws_replay_message_with_defer`, `buffer/qwp.rs:3802`).
-   - **IDs stay the same.** Every symbol is already in the dictionary, so
-     encoding gives back the IDs the server knows.
-   - **New: an explicit dictionary start.** The message must carry exactly
-     the entries its frames introduced, from the first frame's
-     `delta_start` onwards. Today the encoder always starts at the
-     dictionary's current end.
-
-### 4.5 The API
-
-| Call | With batching on |
+| Decision | Reason |
 |---|---|
-| `flush_buffer`, `flush_buffer_and_keep`, `flush_chunk`, `flush_arrow_batch_*`, `*_and_get_fsn` | Unchanged. `Ok` means the frame is in SF, and the FSN is known |
-| **`commit()`** (new) | Every unsent frame up to this lease's last flush becomes due now. Returns at once, without waiting for the server |
-| `wait`, `*_and_wait` | Do what `commit()` does, then wait as today |
-| Return or drop of a lease | Unchanged. No I/O; the rows are already in SF |
+| Batch complete ready WebSocket messages into writes of up to 64 KiB | Independent experiments show fewer writes help; no extra waiting timer is needed |
+| Allow automatic commit windows across leases on one slot | Commit batching adds benefit beyond network batching and supports unchanged callers |
+| Leave commit windows off unless configured | Delayed server visibility is a behavior change; throughput results do not establish a suitable default latency |
+| Use the existing `commit_interval_ms` and optional `commit_rows` settings | One time setting is enough to opt in; a row limit remains useful for high-rate workloads without adding another alias |
+| Reuse `wait` / `*_and_wait` | These already express “finish my published work now and wait for its ACK”; another `commit()` would duplicate the operation |
+| Modify defer flags only in the wire copy | Restart can replay the original SF frames without reconstructing a lost commit window |
+| Keep one SF record and one wire sequence per frame | Preserves recovery format, dictionary handling, rejection attribution and cumulative ACK mapping |
+| Retain measured, general hot-path improvements | Reduces per-call overhead without changing acceptance, durability or wire format |
+| Exclude the fixed-schema record-first prototype | It needs a general format, compatibility policy and complete ACK/rejection mapping before it can ship |
 
-- **Rust:** `BorrowedSender::commit(&mut self) -> Result<()>`
-- **C:** `qwp_sender_commit(qwp_sender*, line_sender_error**)`
-- **C++:** `borrowed_sender::commit()`
+This is automatic mode. The server may commit earlier windows before an
+explicit wait. There is no manual mode that prevents commits until a caller
+command, and a window is not a transaction across tables or pool slots.
 
-With batching off, `commit()` does nothing, since every frame is already
-sent at once.
+## 3. Configuration and API
 
-**A transaction is one `Buffer`.** Add the rows, `flush_buffer`, then
-`commit()`. One buffer is one frame, and a frame is never split, so its rows
-commit together (per table, up to the frame cap).
+| Pool key | Default | Meaning |
+|---|---|---|
+| `commit_interval_ms` | unset | Positive milliseconds from the first staged frame until the window is eligible to close |
+| `commit_rows` | unset | Positive row threshold that also closes a window; alone selects a 100 ms interval |
 
-### 4.6 Acks and rejections
+For example, `ws::addr=localhost:9000;commit_interval_ms=10;` enables
+automatic windows without requiring a row-count choice. A high-rate caller
+can additionally use `commit_rows=1000`. Neither key changes foreground
+Buffer flushing. Omit both to keep the existing per-frame commit boundaries.
+Standalone senders reject these pool-only keys. The pool removes them before
+passing the remaining, correctly escaped configuration to ingress and egress.
 
-Today `InFlightRun` (`ingress/sender/qwp_ws_driver.rs:2828`) assumes one
-frame per message and maps FSNs to wire sequence numbers with arithmetic.
-It becomes a small queue with one entry per message:
-`(wire_seq, first_fsn, last_fsn)`.
+An interval is a staging policy, not an end-to-end deadline. It starts when
+the I/O thread collects the first frame. Scheduling, backlog, network transfer,
+server processing and WAL apply add time. Byte and row limits can close a
+window earlier.
 
-- **Ack.** An ack (OK or durable) of a message covers all its frames. SF
-  trims through `last_fsn`, as today. On the backlog path, the last frame's
-  ack covers the deferred frames before it.
-- **Rejection.** The existing rejection policy applies to the message's
-  whole FSN range, and the error handler receives the range.
-- **Dictionary checks.** `dict_mirror.accumulate` and
-  `guard_dict_not_torn` run on every message sent.
+| Operation | Guarantee with automatic batching |
+|---|---|
+| `flush_buffer`, `flush_chunk`, `flush_arrow_batch_*`, keep/get-FSN variants | Successful publication to SF, as before |
+| `wait(level, timeout)` | Request closure through this lease's pending publication boundary, then wait for the chosen ACK |
+| Rust `flush_buffer_and_wait` / C++ `flush_and_wait` / C `qwp_sender_flush_buffer_and_wait` | Publish the Buffer, request closure, then wait |
+| Return/drop a lease | Neither publish unflushed rows nor close the background window |
+| Close with a drain budget | Request closure through published data, bounded by the existing close timeout |
 
-### 4.7 What does not change
+Use the **publishing lease before returning it**. A fresh empty lease's wait
+is a no-op for earlier borrowers; it is not a pool-wide drain. Earlier frames
+on the same slot may be covered by the cumulative ACK, but different slots
+are independent. OK ACK is not SQL visibility. Durable ACK still requires
+`request_durable_ack=on` and a supporting server. Wait retains its existing
+no-progress timeout; timeout does not withdraw accepted data.
 
-- The publish path, the SF format, recovery, replay and the reconnect
-  catch-up. Replayed frames are merged like any others.
-- Return, drop, reaping, close and drain.
-- `SymbolDictFull` handling and the `Buffer` contract.
+For example, after A+B commit automatically and C enters the next window,
+`wait` on C's publishing lease closes that tail and confirms progress. It
+does not undo the earlier commit or turn A+B+C into one transaction.
 
-## 5. Costs and limits
+### Relationship to auto-flush
 
-- **Visibility.** In streaming mode, rows become visible up to
-  `commit_interval_ms` after the flush. Call `commit()` to see them sooner.
-- **Rejections.** One bad frame fails the whole message, so every flush
-  merged into it fails together.
-- **Partial commits.** These can happen exactly as they do today with
-  multi-table frames. The server commits a table early once it reaches
-  `maxUncommittedRows`. If a later table in the same message then fails,
-  the tables before it may already be committed.
-- **I/O thread CPU.** The I/O thread now decodes and re-encodes small
-  frames. Each slot has its own I/O thread, so the work spreads across
-  `sender_pool_max` threads and runs alongside the callers' encoding. Big
-  frames skip the merge, and a backlog switches to the cheap path.
+Foreground batching accumulates application rows **before** SF acceptance.
+It can reduce encoding calls, SF records and QWP frames. Network and commit
+batching share work **after** SF acceptance and retain every publication.
+This client currently accepts only `auto_flush=off`; the other `auto_flush*`
+settings remain rejected. No foreground auto-flush parameters are added or
+repurposed by this change.
 
-## 6. Code
+## 4. Transport implementation
 
-- **`ingress/sender/qwp_ws_merge.rs` (new):** the frame decoder, grouping
-  frames, and the rules that end a message.
-- **`ingress/buffer/qwp.rs`:** bulk append of decoded columns; an explicit
-  dictionary start for the encoder.
-- **`ingress/sender/qwp_ws_driver.rs`:**
-  - when frames are due, including the `commit()` mark;
-  - the three paths;
-  - the per-message in-flight queue;
-  - the I/O-side `SymbolGlobalDict`.
-- **`ingress/sender/qwp_ws.rs`:** per-frame enqueue time and row count; the
-  timed wake.
-- **`ingress/column_sender/sender.rs` (`PooledSenderCore`):** `commit()`;
-  `wait` and `*_and_wait` set the mark. The C FFI calls this type directly,
-  so C and C++ get it too.
-- **`db.rs`:** `BorrowedSender::commit`.
-- **`db/conf.rs`:** the two keys.
-- **`include/questdb/ingress/qwp_sender.h` / `.hpp`, `client.h`:**
-  `qwp_sender_commit`, `borrowed_sender::commit()`, the conf-key table.
+### Network batching
 
-## 7. Tests
+Each background drive step reads a bounded burst of ready SF frames. The
+transport masks each as its own complete WebSocket message, then writes
+whole messages together in chunks of at most 64 KiB. A larger individual
+message is written whole. Once the ready queue is empty or the burst reaches
+its budget, the thread checks the window, polls responses and performs SF
+maintenance.
 
-**Decoder and merger**
+With commit windows disabled, the burst is written immediately; no timer
+waits for additional data. The first message still waits for assembly of the
+bounded burst, so this does not claim zero latency impact under every load.
+No columns are decoded or re-encoded. FSNs, wire sequences and cumulative
+ACK mapping remain one-to-one for data frames.
 
-- Round trip: encode a `Buffer`, decode it, encode it again. The bytes must
-  be identical. Cover every column kind, sparse columns, nulls, symbols,
-  `at_now` and Gorilla.
-- Merging the frames of several buffers gives the same bytes as writing all
-  their rows into one buffer.
-- Each rule that ends a message: cap, flags, type or type parameter,
-  timestamp shape, dictionary gap or restart.
-- `FLAG_DEFER_COMMIT` on a merged message follows its last frame.
+### Commit windows
 
-**Driver** (`QwpWsCoreTestHarness`, fake server)
+The transport retains a bounded window of masked messages. Appending a new
+frame adds `FLAG_DEFER_COMMIT` to the preceding frame's **wire copy**. The
+newest frame keeps its original flags. Closing the window writes its complete
+messages; an ordinary final frame commits the pending server rows.
 
-- Due frames go out as one message with one block per table, and its ack
-  trims the whole range.
-- A frame of 64 KiB or more goes out unchanged, in order.
-- The backlog path makes the server commit once per group. Stored flags are
-  kept.
-- After a reconnect, frames are replayed and merged again.
-- A rejection covers the whole range.
-- The interval, `commit_rows`, `commit()` and close each make frames due.
+An existing deferred tail is never converted to a committing frame. The
+memory-mode split path may already store deferred frames; its final split
+frame is still required to finish that group. Disk SF continues to store
+ordinary, replayable frame flags.
 
-**Pool** (`tests/qwp_sender_pool.rs`)
+A window closes when:
 
-- One lease per message: about one message per interval.
-- `commit()` sends now.
-- A returned lease leaves nothing behind.
-- With `sf_dir`, frames flushed before a kill arrive after a restart.
+1. The first staged frame's interval expires.
+2. The configured row threshold is reached.
+3. The next message would exceed the staging byte cap.
+4. A wait's pending publication boundary has been collected.
+5. Close requests draining through the final publication.
 
-**Config**
+The byte cap is the minimum of `max_buf_size`, the advertised server batch
+cap and the SF segment payload capacity. Whole messages are never split by
+this layer; a whole message larger than the staging target is sent alone.
+Existing per-frame limits and rejection handling still apply. Network chunks
+and commit windows are separate limits. Storage is
+reused, with additional per-message metadata proportional to the bounded
+window.
 
-- Defaults.
-- `commit_rows` alone turns batching on.
-- A standalone `Sender` rejects the keys.
+Row thresholds read only the dictionary-length fields and row count of a
+single-table delta frame. Other layouts close conservatively rather than
+walking column data or treating one frame as one row. Deadline checks run
+on idle drive steps too, so a short tail needs no later flush.
 
-**C/C++:** `commit` exists and the keys are accepted.
+### Wait, close and recovery
 
-## 8. Plan
+A wait atomically publishes the highest requested FSN boundary before ACK
+polling. The I/O thread closes once that boundary is included. Once sent
+with a committing tail, the request does not force later windows to close.
+Reconnect clears staged copies and the satisfied-boundary state, then replays
+from the ACK watermark in FSN order. Original SF bytes remain authoritative.
 
-1. Decoder and bulk append, with the round-trip tests.
-2. Merger and the explicit dictionary start, with the merge tests.
-3. Driver: when frames are due, the three paths, the in-flight queue and the
-   I/O-side dictionary.
-4. `commit()` in Rust, C and C++; the config keys.
-5. Pool, C and C++ tests.
+| Event | Required behavior |
+|---|---|
+| Partial/failed socket write | Retain SF data; discard staging on reconnect and replay unacked frames |
+| Retriable rejection or disconnect | Existing policy reconnects; the whole uncommitted suffix can replay |
+| Terminal rejection | Existing terminal handling applies; no new skip-and-continue policy |
+| Disk restart | Replay original flags, including when commit windows are disabled after restart |
+| Server commits early at its uncommitted-row limit | Existing cumulative/deferred ACK handling remains valid |
+| Close with zero/expired drain budget | Stop within the existing policy; disk data remains available for recovery |
+
+An ambiguous disconnect after a server commit can cause replay. Delivery
+remains at least once, not exactly once. SF data is retired only by the
+existing requested ACK policy, never by staging or a successful write alone.
+
+## 5. General hot-path changes
+
+These optimizations apply to ordinary QWP buffers and pooled SF senders:
+
+- An atomic empty-error hint avoids the publication-store mutex when both
+  diagnostic cursors are drained. New errors publish the hint; nonempty and
+  poisoned stores keep the locked path.
+- An active-segment append performs the existing validation, CRC, copy and
+  publication before creating a timeout deadline. Rotation and backpressure
+  retain the slow path and its deadline; durability checks are unchanged.
+- Fixed-size SF pools omit idle timestamps because they cannot reap below
+  their fixed warm floor. Growable pools and direct senders retain reaping.
+- Cleared single-table Buffers reuse their validated table name while
+  resetting row state. Changed names still take the normal validation path.
+- A one-symbol dictionary uses a direct comparison and creates its hash index
+  only on the second distinct symbol. Dictionary IDs, collision handling,
+  rollback, clone and clear behavior are preserved.
+
+Bulk-discarding lease diagnostics and changing CRC calculation were also
+measured. Their timing differences were inconsistent or regressed other
+paths, so neither experiment is retained. No durability barrier was relaxed.
+
+## 6. Validation
+
+The regression suite covers network message preservation, row and byte caps,
+idle expiry, stored defer flags, one-shot wait boundaries, partial writes
+and reconnect reset. Pool tests cover windows spanning leases, explicit
+short-tail closure, idle/close progress, disconnect/rejection replay, and
+disk restart with original flags. Memory and disk tests also wait for a
+cumulative durable ACK through an entire window.
+
+Configuration tests cover defaults, invalid/overflowing values, rows-only
+fallback, escaped values and standalone rejection. Buffer tests cover name
+validation after clear and singleton-symbol promotion, rollback and clone.
+Existing backpressure, lease-boundary, dictionary recovery and reaping tests
+remain applicable. C++17/C++20 tests exercise configuration and wait through
+the C ABI. No exported function or ABI layout changes.
+
+Final validation results and the real-server restart check are recorded in
+§7.4. Power-loss, WAN/TLS performance and low-rate p99 latency are not claimed
+by the local throughput measurements.
+
+## 7. Performance evidence
+
+Measurements were taken on the same arm64 Mac as the existing
+`127.0.0.1:9000` server, with proxies bypassed. Unless stated otherwise, each
+case has five shuffled repetitions, 1M timed rows after 10k warmup, one pool
+slot, 1,000 symbols, and SYMBOL/LONG/DOUBLE/TIMESTAMP_NS columns in a WAL table.
+The final OK ACK on the last publishing lease is inside timing; SQL checks
+are outside it. Disk SF uses 4 MiB segments and OS page cache durability,
+not fsync per row. Client CPU includes background threads, not server CPU.
+
+[Curated evidence](net_bench/pool_batching_evidence.json) retains measurements,
+source/binary hashes, server build responses and validation summaries.
+Raw logs, sample dumps, temporary SF directories and benchmark tables are
+cleanup artifacts. Results from different campaigns must not be combined
+into precise speedup claims.
+
+### 7.1 Why both kinds of batching
+
+The original controlled experiment held staging constant at up to 1,000
+frames, with a 10 ms tail timer, and changed network/commit toggles separately:
+
+| Controlled arm | Memory SF median ms | Disk SF median ms |
+|---|---:|---:|
+| Neither toggle | 3,316.392 | 4,116.508 |
+| Network only | 1,945.023 | 2,702.791 |
+| Commit only | 2,851.847 | 3,748.510 |
+| Both | 1,203.572 | 1,833.082 |
+
+Network batching saved 41.4% / 34.3%; commit batching alone saved
+14.0% / 8.9%. Adding commits to network batching saved another 38.1% / 32.2%.
+Every memory run still sent 1,010,000 frames including warmup. Network
+batching reduced application writes to 2,020; commit batching reduced WAL
+commits to 1,010. Writes are not TCP packet or syscall counts.
+
+This experiment retained per-frame receive polling. The final implementation
+also amortizes background-loop work across bounded bursts, so these numbers
+isolate the toggles rather than describe the final implementation.
+
+### 7.2 Compatible frame-path measurements
+
+An earlier implementation campaign, before the hot-path follow-up, measured:
+
+| Path | Memory SF median ms (range) | Disk SF median ms (range) |
+|---|---:|---:|
+| Network only | 1,685.253 (1,599–1,742) | 2,506.304 (2,411–2,991) |
+| Network + commit window | 470.088 (452–513) | 1,229.961 (1,172–1,276) |
+| Pool, explicit 1,000-row flush | 64.950 (63–95) | 326.759 (299–842) |
+| Standalone, explicit 1,000-row flush | 62.791 (55–81) | 293.382 (275–302) |
+
+The network/window rows are paired; the standalone references came from a
+separate campaign. A separate paired default comparison found network
+batching reduced one-row elapsed time by 46.5% / 44.3% versus the original
+send loop. Explicit 1,000-row flushes showed no reliable large gain from
+network batching alone. The final source is remeasured in §7.4.
+
+### 7.3 Record-first exploration: a separate format decision
+
+The experiment published an owned compact record for each one-row flush,
+then assembled up to 1,000 records into one QWP frame in the background.
+It retained real SF append, CRC, rotation, backpressure and per-row borrowing.
+Memory runs had 1,010,000 SF publications but only 1,010 physical frames.
+
+Its record supported only `sym/qty/px/designated-ns`. It was not compatible
+with Java replay and did not generalize durable ACK or rejection ranges.
+The prototype and experimental environment switches are removed from the
+library; its results must not be reported as the compatible path's speed.
+
+After the first four hot-path changes, fixed-pool memory improved from
+318.575 to 163.699 ms in a paired campaign. The subsequent singleton-symbol
+experiment remeasured both controls:
+
+| Prototype/control path | Before median ms (range) | After median ms (range) |
+|---|---:|---:|
+| Fixed memory pool, one-row flush | 163.343 (146–194) | 152.524 (143–187) |
+| Held memory lease, one-row flush | 123.924 (122–139) | 113.880 (111–130) |
+| Growable memory pool, one-row flush | 198.282 (170–218) | 192.759 (167–207) |
+| Disk pool, one-row flush | 744.108 (660–746) | 672.417 (634–715) |
+| Standalone, explicit 1,000-row flush, memory | 56.520 (56–62) | 54.148 (54–66) |
+| Standalone, explicit 1,000-row flush, disk | 247.084 (244–287) | 247.977 (244–256) |
+
+The final small change saved 6.6% elapsed / 5.1% client CPU in fixed memory
+and 9.6% / 5.5% on disk, with overlapping elapsed ranges. Even this restricted
+prototype remained **2.82× / 2.71×** slower than its fresh standalone controls.
+It recovered 10,003 records after SIGKILL with all-column SQL verification;
+that checks process restart, not power loss.
+
+Fresh main-thread wall-stack samples after optimization attributed 32.4%
+to borrowing, 29.2% to flush, 18.0% to recognizable Buffer filling and 5.6%
+to return; 14.7% was other/unwound work. Nested samples included lease
+rebasing (15.3%) and SF append (12.0%). These overlapping stack observations
+are not isolated CPU costs or promised speedups. The held-lease comparison
+also changes scheduling, so it is not a per-borrow microbenchmark.
+
+A future general record-first design needs owned schema/type/symbol data,
+versioned replay compatibility, publication-range ACK/rejection semantics,
+splitting, durable ACK and restart coverage. The evidence supports exploring
+that direction; silently changing the SF format is not justified here.
+
+### 7.4 Final compatible implementation
+
+The final release binary was measured in five shuffled rounds per mode,
+with `commit_rows=1000;commit_interval_ms=10` for window cases. The ordinary
+library build contains no experimental environment switches. All 50 trials
+verified every column per symbol and WAL progress; their unique tables and
+SF directories were removed.
+
+| Final path | Memory SF median ms (range) | Disk SF median ms (range) |
+|---|---:|---:|
+| Network only, one-row flush | 1,958.935 (1,942–1,995) | 2,592.371 (2,494–2,766) |
+| **Network + commit, one-row flush** | **519.421 (514–596)** | **1,143.334 (1,017–1,277)** |
+| Pool, explicit 1,000-row flush, network only | 63.310 (62–66) | 270.809 (251–338) |
+| Pool, explicit 1,000-row flush, network + commit | 62.665 (62–76) | 267.968 (238–331) |
+| Standalone, explicit 1,000-row flush | 54.979 (53–59) | 263.341 (248–318) |
+
+In these paired runs, adding the commit window saves **73.5% memory /
+55.9% disk elapsed time**, and **23.4% / 59.3% client CPU**, relative to
+network batching alone. Including warmup, one-row paths still publish and
+send 1,010,000 frames; WAL commits fall from 1,010,000 to 1,010 in memory and
+1,014–1,017 on disk.
+
+**One-row streaming has not reached standalone explicit-batch performance:**
+it takes about **9.45× / 4.34×** as long in this compatible implementation.
+Explicit 1,000-row pool flushes are close to the standalone reference,
+particularly on disk; the memory pool's existing 10 ms wait polling matters
+at this scale. These are workload-specific observations, not equivalence
+claims. The 152.524 ms prototype result in §7.3 uses a different SF payload
+and is not the result of this implementation.
+
+The memory window path's median publication phase is 171.621 ms; median
+end-to-ACK time is 519.421 ms. Foreground/background work overlaps, so these
+figures do not isolate server or transport cost, but the remaining tail is
+consistent with continuing to process one million individual frames. A
+record-first format would address that work and requires the separate design
+listed in §7.3.
+
+Validation on the final source: **2,264 Rust tests passed, 24 ignored**;
+core and FFI Clippy checks passed with warnings denied; C++17/C++20
+column-sender suites and format checks passed. A separate process published
+10,003 rows into disk SF while offline, was killed with SIGKILL, and recovered
+all rows after restart against the existing server. All 1,000 symbol groups
+matched every column; WAL reached 11 committed transactions. This replay
+still used individual QWP frames, not the record-first prototype.
+
+The measured binary SHA-256 is
+`00b5e61476d8db1bcadfb1f4b371625369be25c94c43053668f9ccdb91385567`;
+source hashes and validation details are under `final_implementation` in the
+[evidence file](net_bench/pool_batching_evidence.json).
+
+## 8. Reproduction and ownership
+
+```sh
+cargo build --manifest-path questdb-rs/Cargo.toml --release --locked \
+  --example qwp_pool_bench --no-default-features \
+  --features sync-sender-qwp-ws,ring-crypto,tls-webpki-certs
+python3 doc/net_bench/run_pool_baseline.py \
+  --binary questdb-rs/target/release/examples/qwp_pool_bench \
+  --output /tmp/pool-memory-results --sf-mode memory
+python3 doc/net_bench/run_pool_baseline.py \
+  --binary questdb-rs/target/release/examples/qwp_pool_bench \
+  --output /tmp/pool-disk-results --sf-mode disk
+python3 doc/net_bench/run_pool_recovery.py \
+  --binary questdb-rs/target/release/examples/qwp_pool_bench \
+  --output /tmp/pool-recovery-results
+```
+
+Use fresh output paths. The runners create unique tables, validate all
+columns per symbol and WAL progress, then remove their tables and temporary
+SF directories. They leave the existing server and its configuration running.
+The restart probe kills only its own offline publisher process.
+
+Implementation ownership: `qwp_ws_batch.rs` owns wire staging and limits;
+`qwp_ws_driver.rs` owns transport writes/reconnect reset; `qwp_ws.rs` owns
+bounded background progress and wait/close requests. `db/conf.rs` parses
+pool policy, and `column_sender/sender.rs` requests closure before waiting.

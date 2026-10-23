@@ -285,6 +285,33 @@ TEST_CASE("pool construction throws on invalid connect string")
     CHECK_THROWS_AS(questdb::pool{"http::not-a-qwp-string;"}, questdb::error);
 }
 
+TEST_CASE("commit window config and wait cross the C API")
+{
+    auto mock = spawn_acking_mock(1);
+    questdb::pool db{
+        conf_for(mock->addr(), "commit_interval_ms=60000;commit_rows=1000;")};
+    auto sender = db.borrow_sender();
+    auto buf = sender.new_buffer();
+    buf.table("trades")
+        .column("qty", int64_t{42})
+        .at(qdb::timestamp_nanos::now());
+    sender.flush(buf);
+    // One row cannot fill the window; wait must bypass its 60-second timer.
+    sender.wait(qdb::qwpws_ack_level::ok, std::chrono::milliseconds{2000});
+    REQUIRE(sender.acked_fsn().has_value());
+    CHECK(sender.acked_fsn() == sender.published_fsn());
+}
+
+TEST_CASE("invalid commit window config crosses the C API as ConfigError")
+{
+    check_db_config_error(
+        conf_for("127.0.0.1:1", "commit_interval_ms=0;"),
+        "commit_interval_ms must be greater than 0");
+    check_db_config_error(
+        conf_for("127.0.0.1:1", "commit_rows=0;"),
+        "commit_rows must be a positive integer");
+}
+
 TEST_CASE("periodic durability config errors cross the C API as ConfigError")
 {
     check_db_config_error(

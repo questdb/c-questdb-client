@@ -2199,6 +2199,8 @@ impl SfaBackend {
             return Ok(());
         }
 
+        crate::ingress::sender::qwp_ws_request_commit_background(&self.state, boundary);
+
         // No-progress deadline: reset every time the ack/durable watermark
         // advances, so this only fires when the peer stays alive yet silent
         // (never advancing toward `boundary`) for `sync_timeout`. This mirrors

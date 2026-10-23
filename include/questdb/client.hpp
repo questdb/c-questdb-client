@@ -65,7 +65,8 @@ namespace questdb
  *
  * `conf` is a `ws::` / `wss::` connect string; see `questdb/client.h` for
  * pool-specific keys (`sender_pool_min`, `sender_pool_max`, `query_pool_min`,
- * `query_pool_max`, `acquire_timeout_ms`, `idle_timeout_ms`, `pool_reap`).
+ * `query_pool_max`, `acquire_timeout_ms`, `idle_timeout_ms`, `pool_reap`,
+ * `lazy_connect`, `commit_interval_ms`, `commit_rows`).
  * With `sf_dir`, `sender_id` is the
  * slot base; pooled senders mint `<sender_id>-ingest-<index>` disk slots.
  * Those `<sender_id>-ingest-*` directories under `sf_dir` belong to the pool

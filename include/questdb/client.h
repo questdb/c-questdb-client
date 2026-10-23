@@ -80,8 +80,8 @@ typedef struct questdb_db questdb_db;
  * replay run in the background. `sender_pool_min` (default 1) is the warm
  * minimum the reaper keeps.
  *
- * `conf` is a `ws::` / `wss::` connect string. Pool-specific keys (aligned
- * with the Java client's `QuestDBBuilder`):
+ * `conf` is a `ws::` / `wss::` connect string. Pool lifecycle keys are aligned
+ * with the Java client's `QuestDBBuilder`:
  *   `sender_pool_min`      (default 1)    warm/min sender connections,
  *                                         pre-opened at connect unless
  *                                         `lazy_connect=true`;
@@ -105,7 +105,19 @@ typedef struct questdb_db questdb_db;
  *                                         connect opens nothing, senders
  *                                         buffer and connect in the
  *                                         background, readers connect on
- *                                         first borrow.
+ *                                         first borrow;
+ *   `commit_interval_ms`  (default unset)
+ *                                         opt in to ingestion commit windows;
+ *                                         positive milliseconds per window;
+ *   `commit_rows`         (default unset)
+ *                                         positive row threshold per window;
+ *                                         alone enables a 100 ms interval.
+ *
+ * Commit windows span leases on one ingestion slot. Flush still publishes to
+ * SF before returning; wait forces its pending boundary to commit. Returning
+ * a lease does not close the window. Ready frames are automatically batched
+ * into network writes with no timer to wait for more frames. Standalone
+ * senders reject the two `commit_*` keys.
  *
  * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
  * for the public ingestion pool. `sender_id` names the slot *base* (default
