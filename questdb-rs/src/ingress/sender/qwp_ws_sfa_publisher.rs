@@ -172,6 +172,24 @@ impl SfaForegroundPublisher {
         self.symbols.global.seed(entries, count)
     }
 
+    pub(crate) fn encode_record_publish(
+        &mut self,
+        max_buf_size: usize,
+        encode: impl FnOnce(&mut Vec<u8>) -> Result<usize>,
+        publish: impl FnOnce(&[u8]) -> Result<u64>,
+    ) -> Result<SfaPublishOutcome> {
+        self.payload.clear();
+        let wire_len = encode(&mut self.payload)?;
+        let encoded_len = self.payload.len().max(wire_len);
+        if encoded_len > max_buf_size {
+            return Ok(SfaPublishOutcome::TooLarge {
+                encoded_len,
+                max_buf_size,
+            });
+        }
+        publish(&self.payload).map(SfaPublishOutcome::Published)
+    }
+
     /// Encode, size-check, write-ahead, and append one frame as a single
     /// transaction. On any failure, the in-memory dictionary and persisted
     /// side-file return to their pre-encode marks. `encode` writes directly into
@@ -230,6 +248,82 @@ mod tests {
     use crate::ErrorCode;
     use crate::ingress::column_sender::{Chunk, encoder};
     use crate::ingress::sender::qwp_ws_sfa_catchup::SentDictMirror;
+
+    #[test]
+    fn record_admission_checks_wire_size_before_publishing() {
+        use crate::ingress::Buffer;
+        use crate::ingress::sender::qwp_ws_record::RecordBatch;
+
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        buffer
+            .table("trades")
+            .unwrap()
+            .column_str("name", "x".repeat(29))
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let buffer = buffer.as_qwp_ws().unwrap();
+        let mut record = Vec::new();
+        let wire_len = buffer.encode_sfa_record(&mut record, false).unwrap();
+        assert_eq!(record.len(), 64);
+        assert_eq!(wire_len, 65);
+        let mut batch = RecordBatch::new();
+        batch.try_append(&record, usize::MAX, 0).unwrap();
+        let mut frame = Vec::new();
+        batch.encode_frame(&mut frame).unwrap();
+        assert_eq!(frame.len(), wire_len);
+
+        let mut foreground = SfaForegroundPublisher::new(true, None);
+        let outcome = foreground
+            .encode_record_publish(
+                64,
+                |payload| buffer.encode_sfa_record(payload, false),
+                |_| panic!("oversized wire frame must not reach SF"),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SfaPublishOutcome::TooLarge {
+                encoded_len: 65,
+                max_buf_size: 64
+            }
+        ));
+        let outcome = foreground
+            .encode_record_publish(
+                65,
+                |payload| buffer.encode_sfa_record(payload, false),
+                |payload| {
+                    assert_eq!(payload, record);
+                    Ok(4)
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcome, SfaPublishOutcome::Published(4)));
+    }
+
+    #[test]
+    fn record_admission_also_checks_storage_size() {
+        let mut chunk = Chunk::new("trades");
+        chunk.column_i64("a", &[1], None).unwrap();
+        chunk.column_i64("b", &[2], None).unwrap();
+        chunk.at_now().unwrap();
+        let mut scratch = encoder::EncodeScratch::new();
+        let mut record = Vec::new();
+        let wire_len =
+            encoder::encode_chunk_record_into(&mut record, &chunk, &mut scratch, false).unwrap();
+        assert_eq!(record.len(), wire_len + 3);
+        let mut foreground = SfaForegroundPublisher::new(true, None);
+        let outcome = foreground
+            .encode_record_publish(
+                wire_len,
+                |payload| encoder::encode_chunk_record_into(payload, &chunk, &mut scratch, false),
+                |_| panic!("oversized SF record must not reach storage"),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, SfaPublishOutcome::TooLarge { encoded_len, max_buf_size } if encoded_len == record.len() && max_buf_size == wire_len)
+        );
+    }
 
     fn one_symbol_chunk<'a>(
         codes: &'a [i32],

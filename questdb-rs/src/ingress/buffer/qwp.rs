@@ -3804,6 +3804,64 @@ impl QwpWsColumnarBuffer {
         result
     }
 
+    pub(crate) fn encode_sfa_record(
+        &self,
+        out: &mut Vec<u8>,
+        defer_commit: bool,
+    ) -> crate::Result<usize> {
+        self.check_can_flush()?;
+        out.clear();
+        let table_count = checked_qwp_u16(
+            self.tables
+                .iter()
+                .filter(|table| table.row_count > 0)
+                .count(),
+            "SF record table count",
+        )?;
+        out.extend_from_slice(b"QSR1");
+        out.push(u8::from(defer_commit));
+        out.extend_from_slice(&table_count.to_le_bytes());
+        let mut column_count = 0;
+        for table in self.tables.iter().filter(|table| table.row_count > 0) {
+            column_count += table.columns.len();
+            write_qwp_bytes(out, &table.table_name);
+            write_qwp_varint(out, table.row_count as u64);
+            write_qwp_varint(out, table.columns.len() as u64);
+            for column in &table.columns {
+                write_qwp_bytes(out, &column.name);
+                out.push(wire_type_byte(column.kind, false));
+            }
+            for column in &table.columns {
+                let length_at = out.len();
+                out.extend_from_slice(&[0; 4]);
+                if let QwpWsColumnValues::Symbol {
+                    cells, dict, data, ..
+                } = &column.values
+                {
+                    let has_bitmap = column.uses_null_bitmap(table.row_count as usize);
+                    out.push(u8::from(has_bitmap));
+                    if has_bitmap {
+                        column
+                            .values
+                            .encode_null_bitmap(table.row_count as usize, out)?;
+                    }
+                    write_qwp_varint(out, dict.len() as u64);
+                    for entry in dict {
+                        write_qwp_bytes(out, &data[entry.offset as usize..][..entry.len as usize]);
+                    }
+                    for cell in cells {
+                        write_qwp_varint(out, cell.local_id as u64);
+                    }
+                } else {
+                    column.encode(table.row_count as usize, &[], out)?;
+                }
+                let length = checked_qwp_u32(out.len() - length_at - 4, "SF column length")?;
+                out[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
+            }
+        }
+        Ok(out.len() - 4 * column_count + 5)
+    }
+
     pub(crate) fn encode_ws_replay_message_with_defer(
         &self,
         out: &mut Vec<u8>,

@@ -683,6 +683,10 @@ impl QuestDb {
     /// to commit. Returning a lease does not close the window. Network batching
     /// of ready frames is automatic and adds no timer to wait for more frames.
     /// Standalone senders reject the two `commit_*` keys.
+    /// Enabling a commit window stores small flushes as versioned SF records
+    /// for background frame assembly. This client also replays legacy QWP
+    /// frames; older clients cannot replay the new records. Drain the slot
+    /// before handing it to an older client or a Java client.
     ///
     /// Lifecycle key names and defaults match the Java client's `QuestDBBuilder`; the
     /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,

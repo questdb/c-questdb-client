@@ -85,6 +85,9 @@ mod qwp_ws_publisher;
 mod qwp_ws_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod qwp_ws_record;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_segment;
 
 #[cfg(feature = "_sender-qwp-ws")]

@@ -118,6 +118,10 @@ typedef struct questdb_db questdb_db;
  * a lease does not close the window. Ready frames are automatically batched
  * into network writes with no timer to wait for more frames. Standalone
  * senders reject the two `commit_*` keys.
+ * Enabling a commit window stores small flushes as versioned SF records for
+ * background frame assembly. This client also replays legacy QWP frames;
+ * older clients cannot replay the new records. Drain the slot before handing
+ * it to an older client or a Java client.
  *
  * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
  * for the public ingestion pool. `sender_id` names the slot *base* (default

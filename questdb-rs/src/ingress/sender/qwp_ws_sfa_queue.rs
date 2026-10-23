@@ -1380,9 +1380,10 @@ impl SfaProgressView {
             return Ok(None);
         };
         Ok(Some(OutboundFrame {
+            first_fsn: fsn,
             fsn,
             wire_seq,
-            payload,
+            payload: payload.into(),
         }))
     }
 
@@ -1407,7 +1408,7 @@ impl SfaProgressView {
         Ok(after > before)
     }
 
-    fn next_cursor_payload_for_fsn(
+    pub(crate) fn next_cursor_payload_for_fsn(
         &self,
         send_cursor: &mut Option<SfaSendCursor>,
         fsn: u64,

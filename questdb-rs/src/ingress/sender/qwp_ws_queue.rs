@@ -53,6 +53,7 @@ impl QwpReceiptStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SentFrame {
+    pub(crate) first_fsn: u64,
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
     pub(crate) payload_len: usize,
@@ -60,13 +61,49 @@ pub(crate) struct SentFrame {
 
 #[derive(Debug)]
 pub(crate) struct OutboundFrame {
+    pub(crate) first_fsn: u64,
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
-    pub(crate) payload: SfaMappedPayload,
+    pub(crate) payload: OutboundPayload,
+}
+
+#[derive(Debug)]
+pub(crate) enum OutboundPayload {
+    Mapped(SfaMappedPayload),
+    Owned(Vec<u8>),
+}
+
+impl OutboundPayload {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Mapped(payload) => payload.len(),
+            Self::Owned(payload) => payload.len(),
+        }
+    }
+
+    pub(crate) fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        match self {
+            Self::Mapped(payload) => payload.with_bytes(f),
+            Self::Owned(payload) => f(payload),
+        }
+    }
+}
+
+impl From<SfaMappedPayload> for OutboundPayload {
+    fn from(payload: SfaMappedPayload) -> Self {
+        Self::Mapped(payload)
+    }
+}
+
+impl From<Vec<u8>> for OutboundPayload {
+    fn from(payload: Vec<u8>) -> Self {
+        Self::Owned(payload)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OutboundFrameView<'a> {
+    pub(crate) first_fsn: u64,
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
     pub(crate) payload: &'a [u8],
@@ -75,6 +112,7 @@ pub(crate) struct OutboundFrameView<'a> {
 impl OutboundFrame {
     pub(crate) fn sent_frame(&self) -> SentFrame {
         SentFrame {
+            first_fsn: self.first_fsn,
             fsn: self.fsn,
             wire_seq: self.wire_seq,
             payload_len: self.payload.len(),
@@ -84,6 +122,7 @@ impl OutboundFrame {
     pub(crate) fn with_view<R>(&self, f: impl FnOnce(OutboundFrameView<'_>) -> R) -> R {
         self.payload.with_bytes(|payload| {
             f(OutboundFrameView {
+                first_fsn: self.first_fsn,
                 fsn: self.fsn,
                 wire_seq: self.wire_seq,
                 payload,
@@ -95,6 +134,7 @@ impl OutboundFrame {
 impl OutboundFrameView<'_> {
     pub(crate) fn sent_frame(&self) -> SentFrame {
         SentFrame {
+            first_fsn: self.first_fsn,
             fsn: self.fsn,
             wire_seq: self.wire_seq,
             payload_len: self.payload.len(),

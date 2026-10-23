@@ -1611,13 +1611,22 @@ impl SfaBackend {
         // A Buffer is one indivisible publication (no row-range slicing), so
         // only the hard cap applies — there is no split to soft-target.
         let frame_cap = self.effective_frame_caps().hard;
-        let result = {
+        let result = (|| {
             let Self {
                 foreground,
                 state,
                 buffer_scratch,
                 ..
             } = self;
+            if state.use_record_for_rows(buffer.row_count())
+                && let SfaPublishOutcome::Published(fsn) = foreground.encode_record_publish(
+                    frame_cap,
+                    |payload| buffer.encode_sfa_record(payload, false),
+                    |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+                )?
+            {
+                return Ok(SfaPublishOutcome::Published(fsn));
+            }
             foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
@@ -1632,7 +1641,7 @@ impl SfaBackend {
                 },
                 |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
-        };
+        })();
         if let Err(err) = &result {
             self.latch_if_connection_is_spent(err);
         }
@@ -1858,13 +1867,24 @@ impl SfaBackend {
                 &view
             }
         };
-        let result = {
+        let result = (|| {
             let Self {
                 state,
                 foreground,
                 scratch,
                 ..
             } = self;
+            if state.use_record_for_rows(target.row_count())
+                && let SfaPublishOutcome::Published(fsn) = foreground.encode_record_publish(
+                    frame_cap,
+                    |payload| {
+                        encoder::encode_chunk_record_into(payload, target, scratch, defer_commit)
+                    },
+                    |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+                )?
+            {
+                return Ok(SfaPublishOutcome::Published(fsn));
+            }
             foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
@@ -1888,7 +1908,7 @@ impl SfaBackend {
                 },
                 |encoded| publish_qwp_ws_payload_background(state, encoded, frame_cap),
             )
-        };
+        })();
         if let Err(err) = &result {
             self.latch_if_connection_is_spent(err);
         }
@@ -2072,10 +2092,28 @@ impl SfaBackend {
                 &sliced
             }
         };
-        let result = {
+        let result = (|| {
             let Self {
                 state, foreground, ..
             } = self;
+            if state.use_record_for_rows(batch.num_rows())
+                && let SfaPublishOutcome::Published(fsn) = foreground.encode_record_publish(
+                    frame_cap,
+                    |payload| {
+                        arrow_batch::encode_arrow_record_into(
+                            payload,
+                            spec.table,
+                            batch,
+                            spec.ts,
+                            spec.overrides,
+                            defer_commit,
+                        )
+                    },
+                    |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+                )?
+            {
+                return Ok(SfaPublishOutcome::Published(fsn));
+            }
             foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
@@ -2103,7 +2141,7 @@ impl SfaBackend {
                 },
                 |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
-        };
+        })();
         if let Err(err) = &result {
             self.latch_if_connection_is_spent(err);
         }

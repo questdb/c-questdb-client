@@ -450,6 +450,8 @@ struct QwpWsConnectedParts {
 pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     runner: SyncQwpWsRunner,
+    record_first: bool,
+    record_first_row_limit: usize,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
     /// Hard cap on a single store-and-forward frame's payload: `sf_max_segment_bytes`
@@ -496,6 +498,9 @@ pub(crate) struct SyncQwpWsHandlerState {
 }
 
 impl SyncQwpWsHandlerState {
+    pub(crate) fn use_record_for_rows(&self, rows: usize) -> bool {
+        self.record_first && rows < self.record_first_row_limit
+    }
     /// Releases the recovered dictionary seeded into the standalone replay
     /// encoder at connect. The pooled core uses its own dictionary and never
     /// touches this encoder, so that seed is dead weight once the pooled core
@@ -1308,6 +1313,13 @@ where
             }
         }
 
+        let force_through = if self.lifecycle.load() == PublicationState::Closing {
+            self.progress.published_fsn()
+        } else {
+            self.commit_requested_upper
+                .load(Ordering::Acquire)
+                .checked_sub(1)
+        };
         let budget = self.send_core.begin_send_batch();
         let mut bytes = 0usize;
         let mut send_step = RunnerStep::Idle;
@@ -1315,9 +1327,18 @@ where
             if stop.load(Ordering::Acquire) {
                 return RunnerStep::Stop;
             }
-            let outbound = match self.send_core.next_outbound_sfa_frame(&self.progress) {
+            let outbound = match self.send_core.next_outbound_sfa_frame_through(
+                &self.progress,
+                force_through,
+                false,
+            ) {
                 Ok(Some(outbound)) => outbound,
-                Ok(None) => break,
+                Ok(None) => {
+                    if self.send_core.has_more_record_input(&self.progress) {
+                        send_step = RunnerStep::Continue;
+                    }
+                    break;
+                }
                 Err(err) => return self.store_shared_driver_error(shared, err),
             };
             // Keep dictionary validation per frame even within a send burst.
@@ -1337,13 +1358,6 @@ where
                 return send_step;
             }
         }
-        let force_through = if self.lifecycle.load() == PublicationState::Closing {
-            self.progress.published_fsn()
-        } else {
-            self.commit_requested_upper
-                .load(Ordering::Acquire)
-                .checked_sub(1)
-        };
         if let Err(failure) = self.send_core.finish_send_batch(force_through) {
             return self.apply_transport_failure(shared, stop, failure);
         }
@@ -3658,6 +3672,12 @@ pub(crate) fn connect_qwp_ws_background_state(
     );
 
     Ok(SyncQwpWsHandlerState {
+        record_first: qwp_ws.pool_commit_interval.is_some(),
+        record_first_row_limit: if qwp_ws.pool_commit_rows == 0 {
+            1_000
+        } else {
+            qwp_ws.pool_commit_rows.min(1_000)
+        },
         encoder,
         runner,
         server_max_batch_size,
