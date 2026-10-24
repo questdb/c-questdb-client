@@ -273,6 +273,31 @@ impl TerminalRenderer {
     }
 }
 
+/// Show a URL that [`safe_target`] refused as inert text: every scheme
+/// separator is broken (`https://` becomes `https[:]//`), so a terminal
+/// emulator auto-links no part of it.
+///
+/// Every `://` is broken, not only a leading one. `safe_target` strips and
+/// trims before it vets, but the display text keeps a leading space, an NBSP
+/// (folded to a space) or words, which would otherwise leave the refused URL's
+/// scheme intact. A leading `http(s)://` is also written in lowercase.
+fn defang_terminal_url(uri: &str) -> String {
+    let (scheme, rest) = if uri
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        ("https[:]//", &uri[8..])
+    } else if uri
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        ("http[:]//", &uri[7..])
+    } else {
+        ("", uri)
+    };
+    format!("{scheme}{}", rest.replace("://", "[:]//"))
+}
+
 /// Build the terminal sign-in prompt for `challenge`.
 ///
 /// The pre-filled "open directly" shortcut is offered only when it is the
@@ -285,22 +310,6 @@ impl TerminalRenderer {
 /// `complete` only when it is safe and shares the origin of `verification_uri`,
 /// otherwise it falls back to the plain URI already shown above, which is then
 /// suppressed here as redundant.
-fn defang_terminal_url(uri: &str) -> String {
-    if uri
-        .get(..8)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
-    {
-        format!("https[:]//{}", &uri[8..])
-    } else if uri
-        .get(..7)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-    {
-        format!("http[:]//{}", &uri[7..])
-    } else {
-        uri.to_string()
-    }
-}
-
 fn format_prompt(challenge: &DeviceCodeChallenge) -> String {
     let browser_target = challenge.browser_target();
     // When the plain URI is vetted, show the vetted URL itself, never the
@@ -931,7 +940,36 @@ mod tests {
             assert!(!prompt.contains("or open directly"));
         }
         // UTF-8 prefixes must not make byte-indexing panic.
-        assert_eq!(defang_terminal_url("éééé://example"), "éééé://example");
+        assert_eq!(defang_terminal_url("éééé://example"), "éééé[:]//example");
+    }
+
+    #[test]
+    fn terminal_prompt_defangs_a_refused_url_behind_leading_text() {
+        // `safe_target` vets the stripped, trimmed URL, but the prompt shows the
+        // display text, which keeps leading spaces and words: the scheme must be
+        // defanged wherever it sits.
+        for uri in [
+            " https://trusted.example@evil.example/device",
+            "\u{a0}https://trusted.example@evil.example/device",
+            "\u{200b} https://trusted.example@evil.example/device",
+            "Open https://trusted.example@evil.example/device",
+            " https://xn--80ak6aa92e.com/device",
+            " HTTP://evil.example/device",
+            "https://ok.example/ https://trusted.example@evil.example/device",
+        ] {
+            let challenge = DeviceCodeChallenge {
+                user_code: "WXYZ".into(),
+                verification_uri: uri.into(),
+                verification_uri_complete: None,
+                expires_in_seconds: 600,
+                interval_seconds: 5,
+                idp_is_loopback: false,
+            };
+            assert!(challenge.browser_target().is_none(), "{uri:?}");
+            let prompt = format_prompt(&challenge);
+            assert!(!prompt.contains("://"), "{uri:?}: {prompt}");
+            assert!(prompt.contains("[:]//"), "{uri:?}: {prompt}");
+        }
     }
 
     #[test]
