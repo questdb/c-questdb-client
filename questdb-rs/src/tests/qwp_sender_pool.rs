@@ -184,11 +184,11 @@ fn stream_commit_batching_handles_large_publications_and_a_record_tail() {
 fn stream_memory_record_and_legacy_inputs_share_one_symbol_namespace() {
     use crate::ingress::column_sender::ArrowColumnOverride;
 
-    for lazy in [false, true] {
+    for initial_connect in ["off", "async"] {
         let (server, frames) = MockServer::spawn_acking_capturing(1);
         let db = QuestDb::connect(&format!(
-            "ws::addr=127.0.0.1:{};lazy_connect={lazy};auth_timeout=2000;\
-             sender_pool_min=1;sender_pool_max=1;pool_reap=manual;\
+            "ws::addr=127.0.0.1:{};lazy_connect=false;initial_connect_retry={initial_connect};auth_timeout=2000;\
+             sender_pool_min=1;sender_pool_max=1;query_pool_min=0;pool_reap=manual;\
              commit_rows=2;commit_interval_ms=60000;",
             server.port(),
         ))
