@@ -2431,6 +2431,7 @@ struct QwpWsTableBuffer {
     in_progress_column_count: usize,
     column_access_cursor: usize,
     columns: Vec<QwpWsColumnBuffer>,
+    encoded_column_schema: Vec<u8>,
     column_lookup: std::collections::HashMap<Box<[u8]>, usize>,
     row_mark: Option<QwpWsRowRollbackMark>,
 }
@@ -2891,6 +2892,7 @@ impl QwpWsColumnarBuffer {
         for table in &self.tables {
             cap += table.table_name.capacity();
             cap += table.columns.capacity() * std::mem::size_of::<QwpWsColumnBuffer>();
+            cap += table.encoded_column_schema.capacity();
             for column in &table.columns {
                 cap += column.name.capacity() + column.lower_name.capacity() + column.capacity();
             }
@@ -3827,10 +3829,7 @@ impl QwpWsColumnarBuffer {
             write_qwp_bytes(out, &table.table_name);
             write_qwp_varint(out, table.row_count as u64);
             write_qwp_varint(out, table.columns.len() as u64);
-            for column in &table.columns {
-                write_qwp_bytes(out, &column.name);
-                out.push(wire_type_byte(column.kind, false));
-            }
+            out.extend_from_slice(&table.encoded_column_schema);
             for column in &table.columns {
                 let length_at = out.len();
                 out.extend_from_slice(&[0; 4]);
@@ -3996,6 +3995,7 @@ impl QwpWsTableBuffer {
             in_progress_column_count: 0,
             column_access_cursor: 0,
             columns: Vec::new(),
+            encoded_column_schema: Vec::new(),
             column_lookup: std::collections::HashMap::new(),
             row_mark: None,
         }
@@ -4038,7 +4038,7 @@ impl QwpWsTableBuffer {
         }
         if self.columns.len() > mark.columns_len {
             self.columns.truncate(mark.columns_len);
-            self.rebuild_column_lookup();
+            self.rebuild_column_metadata();
         }
         self.row_count = mark.row_count;
         self.in_progress = mark.in_progress;
@@ -4088,15 +4088,21 @@ impl QwpWsTableBuffer {
         let idx = self.columns.len();
         self.columns.push(QwpWsColumnBuffer::new(name, kind));
         self.column_lookup.insert(lookup_key, idx);
+        write_qwp_bytes(&mut self.encoded_column_schema, name);
+        self.encoded_column_schema.push(wire_type_byte(kind, false));
         Ok(idx)
     }
 
-    fn rebuild_column_lookup(&mut self) {
+    fn rebuild_column_metadata(&mut self) {
         self.column_lookup.clear();
+        self.encoded_column_schema.clear();
         for (idx, column) in self.columns.iter().enumerate() {
             if let Ok(key) = column_lookup_key(&column.name) {
                 self.column_lookup.insert(key, idx);
             }
+            write_qwp_bytes(&mut self.encoded_column_schema, &column.name);
+            self.encoded_column_schema
+                .push(wire_type_byte(column.kind, false));
         }
     }
 }
@@ -10819,7 +10825,41 @@ mod tests {
                 .at_now()
                 .unwrap();
             assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut expected));
+            assert_eq!(sfa_record_bytes(&buf), sfa_record_bytes(&expected));
         }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_sfa_record_schema_replaces_rolled_back_column_type() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let mut expected = buf.clone();
+
+        buf.table("trades")
+            .unwrap()
+            .column_str("discarded", "value")
+            .unwrap();
+        assert!(buf.column_bool("qty", true).is_err());
+        assert_eq!(sfa_record_bytes(&buf), sfa_record_bytes(&expected));
+
+        for buffer in [&mut buf, &mut expected] {
+            buffer
+                .table("trades")
+                .unwrap()
+                .column_bool("discarded", false)
+                .unwrap()
+                .column_i64("qty", 2)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        assert_eq!(sfa_record_bytes(&buf), sfa_record_bytes(&expected));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -10913,6 +10953,13 @@ mod tests {
         buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
             .unwrap();
         scratch.message.clone()
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn sfa_record_bytes(buf: &QwpWsColumnarBuffer) -> Vec<u8> {
+        let mut record = Vec::new();
+        buf.encode_sfa_record(&mut record, false).unwrap();
+        record
     }
 
     /// A rewind must unwind every row appended after the mark, not only the
@@ -11152,6 +11199,11 @@ mod tests {
                             expected,
                             "{case}: a rewound buffer must encode exactly the surviving rows"
                         );
+                        assert_eq!(
+                            sfa_record_bytes(&buf),
+                            sfa_record_bytes(&reference),
+                            "{case}: SF record schema must discard rewound columns and tables"
+                        );
 
                         // Fixed-width kinds encode by walking row indexes, so a
                         // leftover cell past the row count is invisible above. It
@@ -11178,6 +11230,11 @@ mod tests {
                             ws_replay_bytes(&mut reference),
                             "{case}: rows appended after a rewind must land on \
                          clean row indexes in every column"
+                        );
+                        assert_eq!(
+                            sfa_record_bytes(&buf),
+                            sfa_record_bytes(&reference),
+                            "{case}: SF record schema must grow after a rewind"
                         );
                     }
                 }
@@ -11750,6 +11807,8 @@ mod tests {
             .unwrap()
             .column_i64("qty", 3)
             .unwrap()
+            .column_bool("discarded", true)
+            .unwrap()
             .at_now()
             .unwrap();
 
@@ -11762,6 +11821,7 @@ mod tests {
 
         cloned.rewind_to_marker().unwrap();
         assert_eq!(cloned.row_count(), 1);
+        assert_eq!(sfa_record_bytes(&cloned), sfa_record_bytes(&original));
 
         original
             .table("trades")
@@ -11787,6 +11847,7 @@ mod tests {
             .unwrap();
         cloned.rewind_to_bookmark(clone_bookmark).unwrap();
         assert_eq!(cloned.row_count(), 1);
+        assert_eq!(sfa_record_bytes(&cloned), sfa_record_bytes(&original));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
