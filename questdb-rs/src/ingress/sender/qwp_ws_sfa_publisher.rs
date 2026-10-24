@@ -436,6 +436,69 @@ mod tests {
     }
 
     #[test]
+    fn shared_memory_transaction_keeps_rollback_exclusive_through_publication() {
+        let global = Arc::new(Mutex::new(SymbolGlobalDict::new()));
+        global.lock().unwrap().intern(b"prior").unwrap();
+        let mut foreground = SfaForegroundPublisher::new_shared_memory(Arc::clone(&global));
+        let mut scratch = encoder::EncodeScratch::new();
+        let chunk = one_symbol_chunk(&[0], &[0, 4], &[1], b"next");
+        let err = publish_chunk(&mut foreground, &mut scratch, &chunk, 4096, |_| {
+            assert!(matches!(
+                global.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            Err(error::fmt!(SocketError, "injected publication failure"))
+        })
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert_eq!(global.lock().unwrap().next_id(), 1);
+        assert!(matches!(
+            publish_chunk(&mut foreground, &mut scratch, &chunk, 1, |_| {
+                panic!("oversized frame must not publish")
+            })
+            .unwrap(),
+            SfaPublishOutcome::TooLarge { .. }
+        ));
+        assert_eq!(global.lock().unwrap().next_id(), 1);
+        assert!(matches!(
+            publish_chunk(&mut foreground, &mut scratch, &chunk, 4096, |payload| {
+                assert_eq!(delta_prefix(payload), (1, vec![b"next".to_vec()]));
+                Ok(7)
+            })
+            .unwrap(),
+            SfaPublishOutcome::Published(7)
+        ));
+        let global = global.lock().unwrap();
+        assert_eq!(global.next_id(), 2);
+        assert_eq!(global.entry(0), Some(b"prior".as_slice()));
+        assert_eq!(global.entry(1), Some(b"next".as_slice()));
+    }
+
+    #[test]
+    fn shared_memory_record_publication_does_not_lock_or_intern() {
+        let global = Arc::new(Mutex::new(SymbolGlobalDict::new()));
+        let mut foreground = SfaForegroundPublisher::new_shared_memory(Arc::clone(&global));
+        let mut scratch = encoder::EncodeScratch::new();
+        let chunk = one_symbol_chunk(&[0], &[0, 4], &[1], b"next");
+        let outcome = foreground
+            .encode_record_publish(
+                4096,
+                |payload| {
+                    assert!(global.try_lock().is_ok());
+                    encoder::encode_chunk_record_into(payload, &chunk, &mut scratch, false)
+                },
+                |payload| {
+                    assert!(global.try_lock().is_ok());
+                    assert!(payload.starts_with(b"QSR1"));
+                    Ok(9)
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcome, SfaPublishOutcome::Published(9)));
+        assert_eq!(global.lock().unwrap().next_id(), 0);
+    }
+
+    #[test]
     fn injected_transaction_failures_roll_back_memory_disk_and_driver_mirror() {
         let dir = tempfile::tempdir().unwrap();
         let persisted = PersistedSymbolDict::open(dir.path()).unwrap();

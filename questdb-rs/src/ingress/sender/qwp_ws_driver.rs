@@ -4541,6 +4541,7 @@ pub(crate) enum FakeSendResult {
 #[cfg(test)]
 mod tests {
     use super::super::qwp_ws_publisher::QwpWsReplayEncoder;
+    use super::super::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
     use super::*;
     use crate::ingress::buffer::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
     use crate::ingress::rejection_events::RejectionEventSource;
@@ -5587,6 +5588,171 @@ mod tests {
             .encode_sfa_record(&mut record, false)
             .unwrap();
         record
+    }
+
+    fn symbol_record(symbol: &str, qty: i64) -> Vec<u8> {
+        let mut payload = Vec::new();
+        qwp_buffer(symbol, qty, qty)
+            .as_qwp_ws()
+            .unwrap()
+            .encode_sfa_record(&mut payload, false)
+            .unwrap();
+        payload
+    }
+
+    fn shared_legacy_payload(global: &SharedSymbolGlobalDict, symbol: &str) -> Vec<u8> {
+        let mut foreground = SfaForegroundPublisher::new_shared_memory(Arc::clone(global));
+        let mut scratch = QwpWsEncodeScratch::new();
+        let buffer = qwp_buffer(symbol, 10, 10);
+        let mut published = Vec::new();
+        assert!(matches!(
+            foreground
+                .encode_persist_publish(
+                    4096,
+                    |payload, global, delta| buffer
+                        .as_qwp_ws()
+                        .unwrap()
+                        .encode_ws_replay_message_with_defer(
+                            payload,
+                            &mut scratch,
+                            global,
+                            1,
+                            false,
+                            delta
+                        ),
+                    |payload| {
+                        published.extend_from_slice(payload);
+                        Ok(0)
+                    },
+                )
+                .unwrap(),
+            SfaPublishOutcome::Published(0)
+        ));
+        published
+    }
+
+    #[test]
+    fn shared_record_delta_covers_later_legacy_allocations() {
+        let global = Arc::new(std::sync::Mutex::new(SymbolGlobalDict::new()));
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.send_core.enable_delta_dict(&[], 0);
+        driver
+            .send_core
+            .set_record_global_dict(Some(Arc::clone(&global)));
+        driver.try_submit(&symbol_record("record", 1)).unwrap();
+        let legacy = shared_legacy_payload(&global, "legacy");
+        driver.try_submit(&legacy).unwrap();
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        let first = &driver.send_core.transport.sent_payloads()[0];
+        let (start, pos) = read_frame_varint(first, 12);
+        let (count, _) = read_frame_varint(first, pos);
+        assert_eq!((start, count), (0, 2));
+        assert_eq!(driver.send_core.dict_mirror.count(), 2);
+        {
+            let global = global.lock().unwrap();
+            assert_eq!(global.entry(0), Some(b"legacy".as_slice()));
+            assert_eq!(global.entry(1), Some(b"record".as_slice()));
+        }
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.send_core.transport.sent_payloads()[1], legacy);
+    }
+
+    #[test]
+    fn shared_record_delta_falls_back_on_contention_and_dictionary_cap() {
+        use crate::tests::qwp_decode::{DecodedValue, decode_datagram};
+
+        let global = Arc::new(std::sync::Mutex::new(SymbolGlobalDict::with_cap(1)));
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.send_core.enable_delta_dict(&[], 0);
+        driver
+            .send_core
+            .set_record_global_dict(Some(Arc::clone(&global)));
+        driver
+            .try_submit(&shared_legacy_payload(&global, "alpha"))
+            .unwrap();
+        driver.drive_send_once().unwrap();
+        for (symbol, contend) in [("bravo", true), ("charlie", false)] {
+            let receipt = driver.try_submit(&symbol_record(symbol, 2)).unwrap();
+            let guard = contend.then(|| global.lock().unwrap());
+            let outcome = driver.drive_send_once().unwrap();
+            drop(guard);
+            assert!(matches!(outcome, DriveOutcome::Sent(frame) if frame.fsn == receipt.fsn));
+            let payload = driver.send_core.transport.sent_payloads().last().unwrap();
+            assert_eq!(payload[5] & 8, 0);
+            assert_eq!(
+                decode_datagram(payload).unwrap().table.rows[0][0],
+                DecodedValue::Symbol(symbol.into())
+            );
+            assert_eq!(global.lock().unwrap().next_id(), 1);
+            assert_eq!(driver.send_core.dict_mirror.count(), 1);
+        }
+        driver.try_submit(&symbol_record("alpha", 3)).unwrap();
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_ne!(
+            driver.send_core.transport.sent_payloads().last().unwrap()[5] & 8,
+            0
+        );
+    }
+
+    #[test]
+    fn shared_record_delta_failed_send_catches_up_before_local_replay_and_sparse_legacy() {
+        let global = Arc::new(std::sync::Mutex::new(SymbolGlobalDict::new()));
+        let transport = TestTransport::scripted([Err(TransportFailure::Disconnect(
+            fake_transport_error("failed before wire"),
+        ))]);
+        let mut driver =
+            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 4096)), transport);
+        driver.send_core.enable_delta_dict(&[], 0);
+        driver
+            .send_core
+            .set_record_global_dict(Some(Arc::clone(&global)));
+        driver.try_submit(&symbol_record("alpha", 1)).unwrap();
+        let progress = driver.store.progress_view();
+        let outbound = driver
+            .send_core
+            .next_outbound_sfa_frame(&progress)
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.send_core.dict_mirror.count(), 1);
+        let (_, sent) = driver.send_core.send_frame(outbound);
+        assert!(sent.is_err());
+        let legacy = shared_legacy_payload(&global, "alpha");
+        let (start, pos) = read_frame_varint(&legacy, 12);
+        assert_eq!((start, read_frame_varint(&legacy, pos).0), (1, 0));
+        driver.try_submit(&legacy).unwrap();
+        driver
+            .send_core
+            .finish_reconnect_success(&mut driver.store, ReconnectReason::Disconnect);
+        let guard = global.lock().unwrap();
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        drop(guard);
+        assert_catch_up_frame(&driver.send_core.transport.sent_payloads[1], &[b"alpha"]);
+        assert_eq!(driver.send_core.transport.sent_payloads[2][5] & 8, 0);
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.send_core.transport.sent_payloads[3], legacy);
+        assert_eq!(
+            driver
+                .send_core
+                .send_cursor
+                .ack_fsn_for_wire_seq(2)
+                .unwrap(),
+            Some((1, 2))
+        );
     }
 
     #[test]

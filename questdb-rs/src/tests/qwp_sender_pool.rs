@@ -153,7 +153,7 @@ fn stream_record_size_checks_preserve_flush_acceptance() {
 }
 
 #[test]
-fn stream_commit_batching_keeps_large_publications_on_direct_encoding_path() {
+fn stream_commit_batching_handles_large_publications_and_a_record_tail() {
     for rows_config in ["", "commit_rows=5000;"] {
         let (tx, frames) = mpsc::channel();
         let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
@@ -175,8 +175,116 @@ fn stream_commit_batching_keeps_large_publications_on_direct_encoding_path() {
             .flush_and_wait(&mut one_i64_row("trades", &[43], &[43]), AckLevel::Ok)
             .unwrap();
         let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(frame[5] & 8, 0);
         assert_eq!(frame_qty_values(&frame), [43]);
+    }
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn stream_memory_record_and_legacy_inputs_share_one_symbol_namespace() {
+    use crate::ingress::column_sender::ArrowColumnOverride;
+
+    for lazy in [false, true] {
+        let (server, frames) = MockServer::spawn_acking_capturing(1);
+        let db = QuestDb::connect(&format!(
+            "ws::addr=127.0.0.1:{};lazy_connect={lazy};auth_timeout=2000;\
+             sender_pool_min=1;sender_pool_max=1;pool_reap=manual;\
+             commit_rows=2;commit_interval_ms=60000;",
+            server.port(),
+        ))
+        .unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush_buffer_and_wait(&mut one_symbol_buffer(&db, "alpha"), AckLevel::Ok)
+            .unwrap();
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .symbol_i32("sym", &[0, 1], &[0, 5, 10], b"alphabravo", None)
+            .unwrap();
+        chunk.at_now().unwrap();
+        sender.flush_and_wait(&mut chunk, AckLevel::Ok).unwrap();
+        let overrides = [ArrowColumnOverride::Symbol { column: "sym" }];
+        sender
+            .flush_arrow_batch_at_now("trades", &symbol_arrow_batch(vec!["charlie"]), &overrides)
+            .unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let mut buffer = one_symbol_buffer(&db, "alpha");
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "delta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .symbol_i32("sym", &[0], &[0, 5], b"bravo", None)
+            .unwrap();
+        chunk.at_now().unwrap();
+        sender.flush_and_wait(&mut chunk, AckLevel::Ok).unwrap();
+        sender
+            .flush_arrow_batch_at_now(
+                "trades",
+                &symbol_arrow_batch(vec!["charlie", "echo"]),
+                &overrides,
+            )
+            .unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        sender
+            .flush_buffer_and_wait(&mut one_symbol_buffer(&db, "alpha"), AckLevel::Ok)
+            .unwrap();
+        assert_eq!(sender.published_fsn().unwrap(), Some(6));
+        assert_eq!(sender.acked_fsn().unwrap(), Some(6));
+
+        let captured: Vec<_> = frames
+            .try_iter()
+            .filter(|frame| frame.len() >= 12 && u16::from_le_bytes([frame[6], frame[7]]) != 0)
+            .collect();
+        let expected = [
+            vec!["alpha"],
+            vec!["alpha", "bravo"],
+            vec!["charlie"],
+            vec!["alpha", "delta"],
+            vec!["bravo"],
+            vec!["charlie", "echo"],
+            vec!["alpha"],
+        ];
+        assert_eq!(captured.len(), expected.len());
+        let mut dictionary: Vec<Vec<u8>> = Vec::new();
+        for (frame, expected) in captured.iter().zip(expected) {
+            assert_ne!(frame[5] & 8, 0);
+            let mut pos = 12;
+            let start = read_test_varint(frame, &mut pos) as usize;
+            let count = read_test_varint(frame, &mut pos) as usize;
+            assert!(start <= dictionary.len());
+            for id in start..start + count {
+                let value = read_test_bytes(frame, &mut pos);
+                if id == dictionary.len() {
+                    dictionary.push(value.to_vec());
+                } else {
+                    assert_eq!(dictionary[id], value);
+                }
+            }
+            assert_eq!(read_test_bytes(frame, &mut pos), b"trades");
+            let rows = read_test_varint(frame, &mut pos) as usize;
+            assert_eq!(rows, expected.len());
+            assert_eq!(read_test_varint(frame, &mut pos), 1);
+            assert_eq!(read_test_bytes(frame, &mut pos), b"sym");
+            assert_eq!(frame[pos..pos + 2], [9, 0]);
+            pos += 2;
+            for symbol in expected {
+                let id = read_test_varint(frame, &mut pos) as usize;
+                assert_eq!(dictionary[id], symbol.as_bytes());
+            }
+            assert_eq!(pos, frame.len());
+        }
+        assert_eq!(
+            dictionary,
+            ["alpha", "bravo", "charlie", "delta", "echo"].map(|s| s.as_bytes().to_vec())
+        );
     }
 }
 
