@@ -215,7 +215,9 @@ typedef struct questdb_refreshing_token_provider_options
      *  60000. */
     uint64_t handout_floor_ms;
     /** The longest a client waits when no usable token is held. Default
-     *  30000. */
+     *  30000. A QWP/WebSocket sender in manual progress mode does not wait
+     *  when it reconnects: it fails that attempt at once and pulls again on
+     *  a later one. */
     uint64_t cold_wait_ms;
     /** First retry delay after a failed fetch; must be positive. Default
      *  500. */
@@ -414,6 +416,15 @@ bool questdb_error_token_unavailable_get_view(
  * thread. On a 401 the sender calls the provider's `on_rejected`, pulls
  * again, and retries once if the token changed and the `WWW-Authenticate`
  * challenge allows it (no Bearer error, or `invalid_token`).
+ *
+ * With `qwp_ws_progress=manual` a reconnect pulls the token on the thread
+ * that drives progress, inside `line_sender_qwpws_drive_once`,
+ * `line_sender_qwpws_wait`, `line_sender_qwpws_close_drain` or a flush that
+ * waits for queue space, and those calls check their deadlines only between
+ * attempts: an application provider's `get_token` that blocks delays them
+ * past their deadlines. A refreshing provider does not wait there for a
+ * token it does not hold: the attempt fails at once while the provider keeps
+ * fetching, and a later attempt pulls again.
  *
  * Mutually exclusive with `username`/`password`, `token` and
  * `line_sender_opts_oidc_auth`: one opts take one rotating provider, so a

@@ -641,6 +641,15 @@ impl RefreshingTokenProvider {
         self.shared().token_until(cancel)
     }
 
+    /// [`token`](Self::token) without the cold wait: the usable token if one
+    /// is held, otherwise at once the error a cold wait that ran out would
+    /// end with. The fetch that wait would have waited for is still started,
+    /// so the refresher can hold a token when the caller asks again.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn token_now(&self) -> Result<String, TokenWait> {
+        self.shared().token_within(Duration::ZERO, None)
+    }
+
     /// Forced refresh (spec §5.5). When a server answered HTTP 401 to `token`
     /// and that token is still the current one, start a fetch now -- joining
     /// one already running, and respecting failure backoff -- and wait up to
@@ -662,6 +671,14 @@ impl RefreshingTokenProvider {
         cancel: Option<&dyn Fn() -> bool>,
     ) {
         self.shared().on_rejected(token, http_status, cancel);
+    }
+
+    /// [`on_rejected`](Self::on_rejected), starting the forced fetch without
+    /// waiting for it.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn on_rejected_now(&self, token: &str, http_status: u16) {
+        self.shared()
+            .on_rejected(token, http_status, Some(&|| true));
     }
 
     /// Wait until the provider holds a usable token, starting a fetch if none
@@ -869,6 +886,16 @@ impl Shared {
     }
 
     fn token_until(&self, cancel: Option<&dyn Fn() -> bool>) -> Result<String, TokenWait> {
+        self.token_within(self.config.cold_wait, cancel)
+    }
+
+    /// [`Self::token_until`], waiting at most `max_wait`, itself capped at
+    /// `cold_wait`, when no usable token is held.
+    fn token_within(
+        &self,
+        max_wait: Duration,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> Result<String, TokenWait> {
         if self.is_inherited() {
             return Err(TokenWait::Failed(self.inherited_error()));
         }
@@ -898,7 +925,7 @@ impl Shared {
         // that keeps returning a token inside the hand-out floor would
         // otherwise be fetched in a tight loop for the whole wait.
         let start = self.clock.monotonic();
-        let deadline = start.saturating_add(self.config.cold_wait.min(MAX_DELAY));
+        let deadline = start.saturating_add(max_wait.min(self.config.cold_wait).min(MAX_DELAY));
         self.request_fetch_now_locked(&mut st, start);
         loop {
             if st.closed {
@@ -1321,6 +1348,10 @@ impl RefreshingTokenProviderBuilder {
 
     /// The longest [`token`](RefreshingTokenProvider::token) waits when no
     /// usable token is held. Default 30 s.
+    ///
+    /// A QWP/WebSocket sender in manual progress mode does not wait when it
+    /// reconnects: it fails that attempt at once and pulls again on a later
+    /// one (see `SenderBuilder::qwp_ws_token_provider`).
     pub fn cold_wait(mut self, value: Duration) -> Self {
         self.cold_wait = value;
         self

@@ -3329,6 +3329,13 @@ fn acquire_qwp_ws_provider_header(
         Some(gate) if connect_kind.bounded_dial() => {
             provider.bearer_header_isolated_until(|| gate.is_shutdown())
         }
+        // A manual-progress reconnect, or a manual orphan drainer's connect,
+        // runs inside the caller's `drive_once`, `wait`, `close_drain` or a
+        // `flush` waiting for queue space. Their deadlines are checked only
+        // between attempts, so a refreshing provider's cold wait (30 s by
+        // default) would overrun them. Fail the attempt at once instead: the
+        // provider's refresher keeps fetching, and a later attempt pulls again.
+        None if connect_kind.bounded_dial() => provider.bearer_header_on_caller_without_waiting(),
         _ => provider.bearer_header_on_caller(),
     }
 }
@@ -5103,6 +5110,76 @@ mod tests {
             QwpWsConnectKind::BackgroundDrainer.for_reconnect(),
             QwpWsConnectKind::BackgroundDrainer
         );
+    }
+
+    /// A refreshing provider whose every fetch stalls until `release` fires.
+    fn stalled_refreshing_provider(
+        cold_wait: Duration,
+    ) -> (
+        crate::token_provider::RefreshingTokenProvider,
+        mpsc::Sender<()>,
+    ) {
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let provider = crate::token_provider::RefreshingTokenProvider::builder(
+            move || -> crate::Result<crate::token_provider::ExpiringToken> {
+                let _ = released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30));
+                Err(crate::Error::token_unavailable(
+                    true,
+                    None,
+                    "stalled source",
+                ))
+            },
+        )
+        .name("stalled")
+        .cold_wait(cold_wait)
+        .build()
+        .unwrap();
+        (provider, release)
+    }
+
+    #[test]
+    fn a_manual_reconnect_does_not_wait_for_a_refreshing_provider() {
+        // A manual-progress reconnect, and a manual orphan drainer's connect,
+        // run inside a caller's close_drain, wait or flush: waiting out the
+        // cold wait there overran the caller's deadline.
+        let (refreshing, release) = stalled_refreshing_provider(Duration::from_secs(20));
+        let provider = crate::token_provider::TokenProvider::new(refreshing.clone());
+        for kind in [
+            QwpWsConnectKind::ForegroundBounded,
+            QwpWsConnectKind::BackgroundDrainer,
+        ] {
+            let started = Instant::now();
+            let err = acquire_qwp_ws_provider_header(&provider, kind, None)
+                .expect_err("no token is held");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{kind:?} waited {:?} for the provider",
+                started.elapsed()
+            );
+            assert_eq!(err.code(), crate::ErrorCode::SocketError, "{err}");
+            assert!(err.is_provider_failure(), "{err}");
+            assert!(err.msg().contains("no usable token"), "{err}");
+        }
+        let _ = release.send(());
+        refreshing.close();
+
+        // A connect the caller waits for still waits for the provider's fetch.
+        let (refreshing, release) = stalled_refreshing_provider(Duration::from_millis(300));
+        let provider = crate::token_provider::TokenProvider::new(refreshing.clone());
+        let started = Instant::now();
+        acquire_qwp_ws_provider_header(&provider, QwpWsConnectKind::Foreground, None)
+            .expect_err("no token is held");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "a waited-for connect gave up after {:?}",
+            started.elapsed()
+        );
+        let _ = release.send(());
+        refreshing.close();
     }
 
     #[test]

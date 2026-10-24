@@ -1753,6 +1753,16 @@ impl SenderBuilder {
     /// connect or reconnect thread; it returns `InteractionRequired` if explicit
     /// sign-in is needed.
     ///
+    /// With manual progress ([`QwpWsProgress::Manual`]) a reconnect pulls the
+    /// token on the thread that drives progress, inside `drive_once`, `wait`,
+    /// `close_drain` or a `flush` that waits for queue space, and those calls
+    /// check their deadlines only between attempts: a provider that blocks
+    /// delays them past their deadlines. A
+    /// [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider)
+    /// does not wait there for a token it does not hold: the attempt fails at
+    /// once while the provider's refresher keeps fetching, and a later attempt
+    /// pulls again.
+    ///
     /// One builder takes one provider: attaching a second one, through this
     /// method or [`bearer_token_provider`](Self::bearer_token_provider), fails
     /// with [`ConfigError`](crate::ErrorCode::ConfigError) instead of replacing

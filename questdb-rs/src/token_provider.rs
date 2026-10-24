@@ -553,6 +553,20 @@ pub(crate) struct TokenProvider {
     callback_blocked: Arc<AtomicBool>,
 }
 
+/// How long a pull may wait for a [`RefreshingTokenProvider`] that holds no
+/// usable token. Other providers are called as they are.
+#[derive(Clone, Copy)]
+enum RefreshingWait<'a> {
+    /// Up to its `forced_wait` after a 401, then up to its `cold_wait`.
+    /// `cancel` ends either wait promptly.
+    Bounded(Option<&'a dyn Fn() -> bool>),
+    /// Not at all: the usable token, or at once the error a cold wait that
+    /// ran out would end with. The fetches a wait would have waited for -- the
+    /// forced refresh after a 401, the cold fetch -- are still started.
+    #[cfg(feature = "_sender-qwp-ws")]
+    NoWait,
+}
+
 impl TokenProvider {
     /// Wrap a caller's provider: a closure, a [`RefreshingTokenProvider`] or a
     /// type of the caller's own.
@@ -650,11 +664,27 @@ impl TokenProvider {
     /// timeout (forever with none) while the callback it runs in waits on it.
     #[cfg(feature = "_sender-qwp-ws")]
     pub(crate) fn bearer_header_on_caller(&self) -> crate::Result<String> {
+        self.bearer_header_on_caller_with(RefreshingWait::Bounded(None))
+    }
+
+    /// [`Self::bearer_header_on_caller`] that does not wait for a
+    /// [`RefreshingTokenProvider`] holding no usable token: it fails at once,
+    /// leaving the fetch it starts to the provider's refresher. For a pull
+    /// made inside a call whose deadline no provider wait observes, such as a
+    /// manual-progress `close_drain`, `wait` or `flush`. Any other provider is
+    /// called as it is.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn bearer_header_on_caller_without_waiting(&self) -> crate::Result<String> {
+        self.bearer_header_on_caller_with(RefreshingWait::NoWait)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn bearer_header_on_caller_with(&self, wait: RefreshingWait<'_>) -> crate::Result<String> {
         if self.callback_is_active() {
             return self.resolve_during_callback();
         }
         self.callback_blocked.store(false, Ordering::Release);
-        self.bearer_header()
+        self.bearer_header_with(wait)
     }
 
     #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
@@ -696,15 +726,27 @@ impl TokenProvider {
 
     /// [`bearer_header`](Self::bearer_header) for a
     /// [`RefreshingTokenProvider`]: a forced refresh after a 401, then a cached
-    /// token or a bounded wait for one. `cancel` ends both waits promptly.
+    /// token or, as `wait` allows, a wait for one.
     fn refreshing_bearer_header(
         refreshing: &RefreshingTokenProvider,
-        cancel: Option<&dyn Fn() -> bool>,
+        wait: RefreshingWait<'_>,
     ) -> crate::Result<String> {
-        if let Some(rejected) = rejected_token() {
-            refreshing.on_rejected_until(&rejected, 401, cancel);
-        }
-        match refreshing.token_until(cancel) {
+        let token = match wait {
+            RefreshingWait::Bounded(cancel) => {
+                if let Some(rejected) = rejected_token() {
+                    refreshing.on_rejected_until(&rejected, 401, cancel);
+                }
+                refreshing.token_until(cancel)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            RefreshingWait::NoWait => {
+                if let Some(rejected) = rejected_token() {
+                    refreshing.on_rejected_now(&rejected, 401);
+                }
+                refreshing.token_now()
+            }
+        };
+        match token {
             // The provider validated the token when it arrived.
             Ok(token) => Ok(format!("Bearer {token}")),
             Err(refreshing::TokenWait::Cancelled) => Err(crate::Error::new(
@@ -757,8 +799,14 @@ impl TokenProvider {
     /// the refresh token and device code into a URL-encoded body that ureq
     /// allocates internally.
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
+        self.bearer_header_with(RefreshingWait::Bounded(None))
+    }
+
+    /// [`Self::bearer_header`], waiting for a [`RefreshingTokenProvider`] as
+    /// `wait` allows.
+    fn bearer_header_with(&self, wait: RefreshingWait<'_>) -> crate::Result<String> {
         if let Some(refreshing) = &self.refreshing {
-            return Self::refreshing_bearer_header(refreshing, None);
+            return Self::refreshing_bearer_header(refreshing, wait);
         }
         self.notify_rejection();
         // Only reachable in an UNWIND-enabled build. `questdb-rs-ffi` sets
@@ -815,7 +863,10 @@ impl TokenProvider {
         if let Some(refreshing) = &self.refreshing {
             // A cached token, or a wait the transport's shutdown can end: no
             // isolated worker, so none of the process-wide permits.
-            return Self::refreshing_bearer_header(refreshing, Some(&cancelled));
+            return Self::refreshing_bearer_header(
+                refreshing,
+                RefreshingWait::Bounded(Some(&cancelled)),
+            );
         }
         let rejected = rejected_token();
         let mut only_with_rejection = false;

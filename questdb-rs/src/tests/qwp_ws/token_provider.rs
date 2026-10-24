@@ -1035,6 +1035,100 @@ fn an_append_timeout_names_a_rejected_credential() {
     }
 }
 
+/// With manual progress the reconnect runs inside `wait` and `close_drain`,
+/// whose deadlines are checked only between attempts. A refreshing provider
+/// that holds no usable token while its refresh stalls must not hold them for
+/// its cold wait.
+#[test]
+fn manual_wait_and_close_drain_do_not_wait_out_a_refreshing_providers_cold_wait() {
+    // The first token is usable for 1.5 s (2.5 s lifetime, 1 s hand-out
+    // floor); every later fetch stalls well past the 8 s cold wait.
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let provider = RefreshingTokenProvider::builder({
+        let fetches = Arc::clone(&fetches);
+        move || -> crate::Result<ExpiringToken> {
+            if fetches.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ExpiringToken::expires_in(
+                    "first",
+                    Duration::from_millis(2_500),
+                ));
+            }
+            let _ = released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(60));
+            Err(crate::Error::token_unavailable(
+                true,
+                None,
+                "the identity provider stalled",
+            ))
+        }
+    })
+    .handout_floor(Duration::from_secs(1))
+    .cold_wait(Duration::from_secs(8))
+    .build()
+    .unwrap();
+    assert!(provider.await_ready(Duration::from_secs(5)));
+    let first_token_at = Instant::now();
+
+    // Upgrade once, read the row, then go away without acknowledging it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        read_frame(&mut stream).unwrap();
+    });
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;initial_connect_retry=off;\
+         close_flush_timeout_millis=300;reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=20;"
+    ))
+    .unwrap()
+    .qwp_ws_token_provider(provider.clone())
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buf = one_row_buffer(&sender);
+    sender.flush(&mut buf).unwrap();
+    assert!(sender.drive_once().unwrap());
+    server.join().unwrap();
+    // Let the first token leave its hand-out window.
+    thread::sleep(
+        (first_token_at + Duration::from_millis(1_600)).saturating_duration_since(Instant::now()),
+    );
+
+    let started = Instant::now();
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(300))
+        .expect_err("nothing can be acknowledged");
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(4), "wait took {elapsed:?}");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{err}");
+    assert!(err.msg().contains("no usable token"), "{err}");
+
+    let started = Instant::now();
+    let err = sender
+        .close_drain()
+        .expect_err("nothing can be acknowledged");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "close_drain took {elapsed:?}"
+    );
+    assert!(err.msg().contains("close drain timed out"), "{err}");
+    assert!(err.msg().contains("no usable token"), "{err}");
+
+    drop(sender);
+    let _ = release.send(());
+    provider.close();
+}
+
 /// A provider with a cache, as a refreshing one has: it rotates the token a
 /// server rejected.
 struct RotatingOnRejection {
