@@ -4978,6 +4978,25 @@ mod tests {
     }
 
     #[test]
+    fn an_invalid_provider_token_ends_only_a_connect_the_caller_waits_for() {
+        for token in ["", "   ", "tok\n", "t\u{e9}"] {
+            let error = crate::token_provider::TokenProvider::new(move || {
+                Ok::<_, Error>(token.to_string())
+            })
+            .bearer_header()
+            .unwrap_err();
+            // Unclassified, like a provider error: a waited-for connect ends (D8).
+            assert!(reconnect_error_is_foreground_terminal(&error), "{token:?}");
+            // Background reconnects keep retrying: queued SFA frames stay replayable.
+            assert!(!reconnect_error_is_terminal(&error), "{token:?}");
+            assert!(
+                !reconnect_error_is_terminal_when_established(&error),
+                "{token:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_upgrade_rejection_is_terminal_only_during_initialization() {
         for status in [401, 403] {
             let rejection = upgrade_rejection(status);

@@ -1707,8 +1707,9 @@ impl SenderBuilder {
     /// Thus a long-lived sender keeps working as the token rotates. The returned token
     /// is sent as the `Authorization: Bearer <token>` handshake header; a token
     /// with a non-printable-ASCII character (a header-injection vector) is
-    /// rejected. A provider error fails that connection attempt and is retried by
-    /// the reconnect loop because the callback may recover on its next invocation;
+    /// rejected, which counts as a provider error. A provider error fails that
+    /// connection attempt and is retried by the reconnect loop because the
+    /// callback may recover on its next invocation;
     /// already accepted store-and-forward frames remain queued. The exception is a
     /// connect the caller waits for -- the synchronous initial connect
     /// (`initial_connect_retry=sync`) or a pool borrow with retry -- which

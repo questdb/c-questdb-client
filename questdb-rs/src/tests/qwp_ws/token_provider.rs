@@ -257,6 +257,13 @@ fn the_www_authenticate_challenge_decides_whether_a_401_is_retried() {
 fn sync_initial_connect_with(
     error: impl Fn() -> crate::Error + Send + Sync + 'static,
 ) -> (crate::Result<()>, usize, Duration) {
+    sync_initial_connect_answering(move || Err(error()))
+}
+
+/// [`sync_initial_connect_with`] against a provider that answers with `answer`.
+fn sync_initial_connect_answering(
+    answer: impl Fn() -> crate::Result<String> + Send + Sync + 'static,
+) -> (crate::Result<()>, usize, Duration) {
     // Bound but never accepted: the provider runs before any dial.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -272,7 +279,7 @@ fn sync_initial_connect_with(
             let calls = Arc::clone(&calls);
             move || -> crate::Result<String> {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Err(error())
+                answer()
             }
         })
         .unwrap();
@@ -292,6 +299,27 @@ fn sync_initial_connect_fails_fast_on_an_unclassified_provider_failure() {
     assert!(err.msg().contains("idp down"), "{err}");
     assert_eq!(calls, 1, "an unclassified failure was retried");
     assert!(elapsed < Duration::from_millis(1_000), "{elapsed:?}");
+}
+
+/// C12, D8: a token the client refuses to send (blank, or with a byte outside
+/// printable ASCII, such as a token file's trailing newline) is an unclassified
+/// provider failure too, and ends the connect at once.
+#[test]
+fn sync_initial_connect_fails_fast_on_an_invalid_token() {
+    for token in ["", "   ", "tok\n", "t\u{e9}"] {
+        let (result, calls, elapsed) =
+            sync_initial_connect_answering(move || Ok(token.to_string()));
+        let err = result.expect_err("an invalid token is never sent");
+        assert!(
+            err.msg().contains("non-printable-ASCII"),
+            "{token:?}: {err}"
+        );
+        assert_eq!(calls, 1, "{token:?}: an invalid token was retried");
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "{token:?}: {elapsed:?}"
+        );
+    }
 }
 
 /// C12, D8: a permanent token-unavailable failure ends the connect at once.

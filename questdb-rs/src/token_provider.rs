@@ -724,7 +724,12 @@ impl TokenProvider {
     /// Provider acquisition and validation failures are normally retryable: the
     /// callback can return a different token on its next invocation, and a QWP
     /// store-and-forward sender must not abandon accepted frames because one
-    /// refresh attempt failed. A caller contract violation (`InvalidApiCall`)
+    /// refresh attempt failed. A rejected token is marked as the provider's
+    /// failure exactly as the provider's own error is (`Error::is_provider_failure`),
+    /// so a connect the caller waits for ends at once on it rather than pulling
+    /// the provider until its retry budget runs out
+    /// (`reconnect_error_is_foreground_terminal`); background reconnects still
+    /// retry it. A caller contract violation (`InvalidApiCall`)
     /// stays terminal but is carried out as `ConfigError`, so the bare code --
     /// which the connection pool also uses for ordinary exhaustion -- is not
     /// dragged into the terminal set with it. Server authentication rejections
@@ -772,6 +777,7 @@ impl TokenProvider {
                      (Unwind-enabled builds only: under `panic = \"abort\"` the \
                      panic terminates the process instead.)"
                 )
+                .with_provider_failure()
             })?;
         let token = provided.map_err(classify_provider_error)?;
         if !crate::is_printable_ascii_token(&token) {
@@ -780,7 +786,8 @@ impl TokenProvider {
                 "The token provider returned an empty token or one containing a \
                  non-printable-ASCII character; refusing to send it as a Bearer header. \
                  The provider will be polled again on the next connection attempt."
-            ));
+            )
+            .with_provider_failure());
         }
         Ok(format!("Bearer {token}"))
     }
@@ -1288,12 +1295,13 @@ mod tests {
         );
 
         // Validation is also provider-local and is retried: the next invocation
-        // may return a rotated, valid token.
+        // may return a rotated, valid token. Like the provider's own errors it is
+        // the provider's failure, which a connect the caller waits for does not
+        // retry.
         let blank = TokenProvider::new(|| Ok::<_, crate::Error>("   ".to_string()));
-        assert_eq!(
-            blank.bearer_header().unwrap_err().code(),
-            ErrorCode::SocketError
-        );
+        let err = blank.bearer_header().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(err.is_provider_failure());
     }
 
     #[test]
@@ -1455,6 +1463,7 @@ mod tests {
         let err = provider.bearer_header().unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(err.msg().contains("token provider panicked"));
+        assert!(err.is_provider_failure());
         assert_eq!(provider.bearer_header().unwrap(), "Bearer recovered-token");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
