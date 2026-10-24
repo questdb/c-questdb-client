@@ -314,9 +314,12 @@ struct DbInner {
     /// `2 * sender_pool_max + query_pool_max`.
     #[cfg(feature = "_egress")]
     reader_state: Mutex<ReaderPoolState>,
-    /// Wakes the reaper thread on `shutdown` and lets a disk-SF borrow wait
-    /// briefly for an in-flight slot close to release its flock.
+    /// Wakes at-cap store-and-forward borrows when a sender is returned or
+    /// an in-flight disk slot close releases its flock. Paired with `state`.
     cv: Condvar,
+    /// Wakes the reaper on shutdown, without triggering a sweep on every
+    /// store-and-forward sender return. Also paired with `state`.
+    reaper_cv: Condvar,
     /// Wakes at-cap direct-pool borrows when a direct sender is returned
     /// or a reservation is rolled back. Paired with `direct_state`.
     direct_cv: Condvar,
@@ -899,6 +902,7 @@ impl QuestDb {
             #[cfg(feature = "_egress")]
             reader_state: Mutex::new(ReaderPoolState::default()),
             cv: Condvar::new(),
+            reaper_cv: Condvar::new(),
             direct_cv: Condvar::new(),
             #[cfg(feature = "_egress")]
             reader_cv: Condvar::new(),
@@ -1448,6 +1452,7 @@ impl Drop for QuestDb {
         {
             let _g = lock_state(&self.inner.state);
             self.inner.cv.notify_all();
+            self.inner.reaper_cv.notify_all();
         }
         {
             let _g = lock_state(&self.inner.direct_state);
@@ -3114,7 +3119,7 @@ fn reaper_loop(inner: Arc<DbInner>, tick: Duration) {
             break;
         }
         let (state, _) = inner
-            .cv
+            .reaper_cv
             .wait_timeout(state, tick)
             .unwrap_or_else(|e| e.into_inner());
         if inner.shutdown.load(Ordering::SeqCst) {
