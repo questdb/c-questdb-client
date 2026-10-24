@@ -1,0 +1,6 @@
+# These goldens are byte-exact contracts, not ordinary text: the tests compare
+# the native writer's output against the file verbatim. Left to git's own
+# heuristics they are checked out with CRLF on Windows, which appends a stray
+# \r that the trailing-newline strip does not remove -- failing the comparison
+# only there. Pin them so every platform sees the committed bytes.
+*.json -text

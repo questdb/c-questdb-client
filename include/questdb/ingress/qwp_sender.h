@@ -170,9 +170,14 @@ qwp_sender* questdb_db_borrow_sender(
 /**
  * Like `questdb_db_borrow_sender` but retries the connect within `budget_ms`
  * using the pool's reconnect backoff (centered-jittered exponential with
- * a role-reject reset; authentication and protocol-version errors are
- * terminal). On a transient `line_sender_error_failover_retry`, drop the dead
- * sender with `questdb_db_drop_sender` then call this to fail over with the
+ * a role-reject reset). Authentication and protocol-version errors are
+ * terminal, except a protocol-version error caused by every endpoint rejecting
+ * the connection by role (for example a durable-ack store-and-forward pool
+ * whose nodes are all replicas): that is retried until `budget_ms`, because a
+ * failover can promote a primary. The final error then still carries
+ * `line_sender_error_protocol_version_error`. On a transient
+ * `line_sender_error_failover_retry`, drop the dead sender with
+ * `questdb_db_drop_sender` then call this to fail over with the
  * same budget and backoff. `budget_ms == 0` makes a single attempt. Returns
  * NULL on failure and sets `*err_out` if provided.
  */
@@ -1671,7 +1676,12 @@ bool qwp_sender_error_events_dropped(
  * instead of being undefined behaviour at the language boundary.
  *
  * `timeout_millis` is the no-progress deadline (it fires only if the ack
- * watermark fails to advance for that long); `0` waits indefinitely.
+ * watermark fails to advance for that long); `0` waits indefinitely. It fails
+ * the call with `line_sender_error_failover_retry` and leaves the frames
+ * queued. If the borrow is disconnected and reconnecting keeps failing, the
+ * error names that failure and carries its OIDC detail when an attached OIDC
+ * auth could not supply a token (`questdb_error_oidc_get_view` reports
+ * `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` when a new sign-in is needed).
  */
 QUESTDB_CLIENT_API
 bool qwp_sender_wait(

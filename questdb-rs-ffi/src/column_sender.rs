@@ -66,6 +66,61 @@ use crate::{
 /// and must not race with other operations on the same `db`.
 pub struct questdb_db(pub(crate) QuestDb);
 
+/// Extensible options for [`questdb_db_connect_ex`]. Initialize with
+/// [`questdb_db_connect_options_init`] so future fields default safely.
+#[repr(C)]
+pub struct questdb_db_connect_options {
+    pub struct_size: size_t,
+    pub oidc_auth: *const crate::oidc::questdb_oidc_auth,
+    pub event_callback: Option<questdb_connection_event_cb>,
+    pub event_user_data: *mut c_void,
+    pub event_inbox_capacity: size_t,
+    pub rejection_callback: line_sender_qwpws_error_cb,
+    pub rejection_user_data: *mut c_void,
+    pub rejection_inbox_capacity: size_t,
+    /// A rotating Bearer-token provider shared by every pooled sender and
+    /// reader. Mutually exclusive with `oidc_auth`. Appended after v1.
+    pub token_provider: *const crate::token_provider::questdb_token_provider,
+}
+
+impl Default for questdb_db_connect_options {
+    fn default() -> Self {
+        Self {
+            struct_size: std::mem::size_of::<Self>(),
+            oidc_auth: std::ptr::null(),
+            event_callback: None,
+            event_user_data: std::ptr::null_mut(),
+            event_inbox_capacity: 0,
+            rejection_callback: None,
+            rejection_user_data: std::ptr::null_mut(),
+            rejection_inbox_capacity: 0,
+            token_provider: std::ptr::null(),
+        }
+    }
+}
+
+// The first published layout ends at `rejection_inbox_capacity`. Keep this
+// minimum pinned when fields are appended: a newer library must continue to
+// accept an older caller's complete v1 prefix and default every absent tail.
+const QUESTDB_DB_CONNECT_OPTIONS_V1_SIZE: usize =
+    std::mem::offset_of!(questdb_db_connect_options, rejection_inbox_capacity)
+        + std::mem::size_of::<size_t>();
+
+unsafe fn connect_options_field<T: Copy>(
+    options: *const questdb_db_connect_options,
+    struct_size: usize,
+    offset: usize,
+    default: T,
+) -> T {
+    let Some(end) = offset.checked_add(std::mem::size_of::<T>()) else {
+        return default;
+    };
+    if end > struct_size {
+        return default;
+    }
+    unsafe { options.cast::<u8>().add(offset).cast::<T>().read() }
+}
+
 /// Borrowed store-and-forward QWP/WS sender. Owns a pool slot until
 /// `questdb_db_return_sender` or `questdb_db_drop_sender`
 /// is called. Bundles the per-connection schema registry and symbol-dict state
@@ -886,6 +941,203 @@ pub unsafe extern "C" fn questdb_db_connect(
     }
 }
 
+/// Initialize a versioned pool-connect options structure. `options_size` must
+/// be the caller's `sizeof(*options)`. Accepts NULL and no-ops. Only the prefix
+/// known to this library is initialized, so older callers remain safe with a
+/// newer library and newer callers remain safe with an older library.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_connect_options_init(
+    options: *mut questdb_db_connect_options,
+    options_size: size_t,
+) {
+    if options.is_null() || options_size < std::mem::size_of::<size_t>() {
+        return;
+    }
+    // Zero the complete known layout (including padding) before copying a
+    // bounded prefix. Unknown fields belonging to a newer caller are left
+    // untouched; that older library will never inspect them.
+    let mut defaults = unsafe { std::mem::zeroed::<questdb_db_connect_options>() };
+    defaults.struct_size = options_size;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&defaults as *const questdb_db_connect_options).cast::<u8>(),
+            options.cast::<u8>(),
+            options_size.min(std::mem::size_of::<questdb_db_connect_options>()),
+        )
+    };
+}
+
+/// Open a connection pool with optional callbacks and a shared OIDC Bearer
+/// token provider. A NULL `options` pointer is equivalent to
+/// [`questdb_db_connect`]. The pool retains shared ownership of `oidc_auth`, so
+/// its caller-owned handle may be released as soon as this function returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_connect_ex(
+    conf: *const c_char,
+    conf_len: size_t,
+    options: *const questdb_db_connect_options,
+    err_out: *mut *mut questdb_error,
+) -> *mut questdb_db {
+    let conf = match unsafe { name_str(conf, conf_len, err_out) } {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+
+    let (handlers, auth, token_provider) = if options.is_null() {
+        (questdb::ConnectHandlers::default(), None, None)
+    } else {
+        // Read only the size prefix before touching any later field. Forming a
+        // reference to the current Rust struct here would itself require a
+        // current-sized allocation and defeat versioned-prefix compatibility.
+        let struct_size = unsafe { options.cast::<size_t>().read() };
+        if struct_size < QUESTDB_DB_CONNECT_OPTIONS_V1_SIZE {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "questdb_db_connect_options.struct_size is {}, expected at least {}",
+                            struct_size, QUESTDB_DB_CONNECT_OPTIONS_V1_SIZE
+                        ),
+                    ),
+                )
+            };
+            return std::ptr::null_mut();
+        }
+        let oidc_auth: *const crate::oidc::questdb_oidc_auth = unsafe {
+            connect_options_field(
+                options,
+                struct_size,
+                std::mem::offset_of!(questdb_db_connect_options, oidc_auth),
+                std::ptr::null(),
+            )
+        };
+        let event_callback: Option<questdb_connection_event_cb> = unsafe {
+            connect_options_field(
+                options,
+                struct_size,
+                std::mem::offset_of!(questdb_db_connect_options, event_callback),
+                None,
+            )
+        };
+        let event_user_data: *mut c_void = unsafe {
+            connect_options_field(
+                options,
+                struct_size,
+                std::mem::offset_of!(questdb_db_connect_options, event_user_data),
+                std::ptr::null_mut(),
+            )
+        };
+        let event_inbox_capacity: size_t = unsafe {
+            connect_options_field(
+                options,
+                struct_size,
+                std::mem::offset_of!(questdb_db_connect_options, event_inbox_capacity),
+                0,
+            )
+        };
+        let rejection_callback: line_sender_qwpws_error_cb = unsafe {
+            connect_options_field(
+                options,
+                struct_size,
+                std::mem::offset_of!(questdb_db_connect_options, rejection_callback),
+                None,
+            )
+        };
+        let rejection_user_data: *mut c_void = unsafe {
+            connect_options_field(
+                options,
+                struct_size,
+                std::mem::offset_of!(questdb_db_connect_options, rejection_user_data),
+                std::ptr::null_mut(),
+            )
+        };
+        let rejection_inbox_capacity: size_t = unsafe {
+            connect_options_field(
+                options,
+                struct_size,
+                std::mem::offset_of!(questdb_db_connect_options, rejection_inbox_capacity),
+                0,
+            )
+        };
+        let token_provider: *const crate::token_provider::questdb_token_provider = unsafe {
+            connect_options_field(
+                options,
+                struct_size,
+                std::mem::offset_of!(questdb_db_connect_options, token_provider),
+                std::ptr::null(),
+            )
+        };
+        if !oidc_auth.is_null() && !token_provider.is_null() {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::ConfigError,
+                        "questdb_db_connect_options: oidc_auth and token_provider are \
+                         mutually exclusive; attach one rotating token provider",
+                    ),
+                )
+            };
+            return std::ptr::null_mut();
+        }
+        let token_provider = if token_provider.is_null() {
+            None
+        } else {
+            match unsafe { crate::token_provider::provider_ref(token_provider, err_out) } {
+                Some(provider) => Some(provider),
+                None => return std::ptr::null_mut(),
+            }
+        };
+
+        let handlers = connect_handlers_from_c(
+            event_callback,
+            event_user_data,
+            event_inbox_capacity,
+            rejection_callback,
+            rejection_user_data,
+            rejection_inbox_capacity,
+        );
+        let auth = if oidc_auth.is_null() {
+            None
+        } else {
+            match unsafe { crate::oidc::clone_open_auth(oidc_auth, err_out) } {
+                Some(auth) => Some(auth),
+                None => return std::ptr::null_mut(),
+            }
+        };
+        (handlers, auth, token_provider)
+    };
+
+    let result = match (auth, token_provider) {
+        (_, Some(provider)) => provider.connect_pool(conf, handlers),
+        (auth, None) => match auth {
+            Some(auth) => {
+                // Pool sender/reader connectors may run in the background. The OIDC
+                // token path is non-interactive and returns InteractionRequired
+                // rather than starting a device flow on those threads. Preserve the
+                // auth's single-flight identity across every pool attachment.
+                let isolation = auth.token_provider_isolation();
+                QuestDb::connect_with_handlers_and_token_provider_with_isolation(
+                    conf,
+                    handlers,
+                    move || auth.token(),
+                    isolation,
+                )
+            }
+            None => QuestDb::connect_with_handlers(conf, handlers),
+        },
+    };
+    match result {
+        Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Close the pool. Accepts NULL and no-ops.
 ///
 /// Final owner release: callers must ensure no other thread is concurrently
@@ -1014,9 +1266,13 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_sender(
 
 /// Like `questdb_db_borrow_sender` but retries the connect within
 /// `budget_ms` using the pool's reconnect backoff (centered-jittered
-/// exponential with a role-reject reset; `AuthError` / protocol-version errors
-/// are terminal). `budget_ms == 0` makes a single attempt (no retry). Returns
-/// NULL on failure; sets `*err_out` if provided.
+/// exponential with a role-reject reset). `AuthError` and protocol-version
+/// errors are terminal, except a protocol-version error caused by every
+/// endpoint rejecting the connection by role (a durable-ack pool whose nodes
+/// are all replicas): that is retried until `budget_ms`, as a failover can
+/// promote a primary, and still ends with the protocol-version error.
+/// `budget_ms == 0` makes a single attempt (no retry). Returns NULL on
+/// failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_borrow_sender_with_retry(
     db: *mut questdb_db,
@@ -1239,6 +1495,7 @@ pub const questdb_connection_event_failed_over: u32 = 3;
 pub const questdb_connection_event_endpoint_attempt_failed: u32 = 4;
 pub const questdb_connection_event_all_endpoints_unreachable: u32 = 5;
 pub const questdb_connection_event_auth_failed: u32 = 6;
+pub const questdb_connection_event_credential_unavailable: u32 = 7;
 
 /// One connection-state transition, delivered to a
 /// `questdb_connection_event_cb`. String fields are borrowed UTF-8
@@ -1332,6 +1589,9 @@ pub(crate) fn connection_listener_from_c(
             questdb::ingress::ConnectionEventKind::AuthFailed => {
                 questdb_connection_event_auth_failed
             }
+            questdb::ingress::ConnectionEventKind::CredentialUnavailable => {
+                questdb_connection_event_credential_unavailable
+            }
             _ => return,
         };
         let (host, host_len) = str_or_null(event.host.as_deref());
@@ -1364,7 +1624,7 @@ pub(crate) fn connection_listener_from_c(
 /// `questdb_db_connect` with a connection lifecycle listener. Events fire
 /// for every ingress pool connect (initial connect, per-endpoint attempt
 /// failures, all-endpoints-unreachable sweeps, failover to a different
-/// endpoint, terminal auth rejection) and for transport deaths observed
+/// endpoint, credential rejections) and for transport deaths observed
 /// when a connection is returned.
 ///
 /// Delivery is via a bounded inbox (`inbox_capacity`; `0` = default 64)
@@ -1426,6 +1686,32 @@ pub unsafe extern "C" fn questdb_db_connection_events_delivered(db: *const quest
     db_ref.0.connection_events_delivered()
 }
 
+fn connect_handlers_from_c(
+    event_callback: Option<questdb_connection_event_cb>,
+    event_user_data: *mut c_void,
+    event_inbox_capacity: size_t,
+    rejection_callback: line_sender_qwpws_error_cb,
+    rejection_user_data: *mut c_void,
+    rejection_inbox_capacity: size_t,
+) -> questdb::ConnectHandlers {
+    let mut handlers = questdb::ConnectHandlers::default();
+    if let Some(cb) = event_callback {
+        handlers.connection_listener = Some(connection_listener_from_c(cb, event_user_data));
+        handlers.connection_event_inbox_capacity = event_inbox_capacity;
+    }
+    if let Some(cb) = rejection_callback {
+        let user_data = rejection_user_data as usize;
+        handlers.error_handler = Some(questdb::ingress::QwpWsErrorHandler::new(
+            move |error: &questdb::ingress::QwpWsSenderError| {
+                let view = qwp_ws_sender_error_view(error);
+                unsafe { cb(user_data as *mut c_void, &view) };
+            },
+        ));
+        handlers.error_inbox_capacity = rejection_inbox_capacity;
+    }
+    handlers
+}
+
 /// Like `questdb_db_connect_with_event_handler`, additionally registering a
 /// server-rejection handler. Either callback may be NULL: a NULL
 /// `event_callback` disables connection lifecycle events; a NULL
@@ -1459,21 +1745,14 @@ pub unsafe extern "C" fn questdb_db_connect_with_handlers(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    let mut handlers = questdb::ConnectHandlers::default();
-    if let Some(cb) = event_callback {
-        handlers.connection_listener = Some(connection_listener_from_c(cb, event_user_data));
-        handlers.connection_event_inbox_capacity = event_inbox_capacity;
-    }
-    if let Some(cb) = rejection_callback {
-        let user_data = rejection_user_data as usize;
-        handlers.error_handler = Some(questdb::ingress::QwpWsErrorHandler::new(
-            move |error: &questdb::ingress::QwpWsSenderError| {
-                let view = qwp_ws_sender_error_view(error);
-                unsafe { cb(user_data as *mut c_void, &view) };
-            },
-        ));
-        handlers.error_inbox_capacity = rejection_inbox_capacity;
-    }
+    let handlers = connect_handlers_from_c(
+        event_callback,
+        event_user_data,
+        event_inbox_capacity,
+        rejection_callback,
+        rejection_user_data,
+        rejection_inbox_capacity,
+    );
     match QuestDb::connect_with_handlers(conf, handlers) {
         Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
         Err(err) => {
@@ -5165,6 +5444,32 @@ mod tests {
     #[cfg(feature = "arrow")]
     use std::ffi::c_void;
 
+    // Frozen copy of the first published options prefix. This test type must
+    // not gain future fields when `questdb_db_connect_options` does.
+    #[repr(C)]
+    struct ConnectOptionsV1 {
+        struct_size: size_t,
+        oidc_auth: *const crate::oidc::questdb_oidc_auth,
+        event_callback: Option<questdb_connection_event_cb>,
+        event_user_data: *mut c_void,
+        event_inbox_capacity: size_t,
+        rejection_callback: line_sender_qwpws_error_cb,
+        rejection_user_data: *mut c_void,
+        rejection_inbox_capacity: size_t,
+    }
+
+    #[repr(C)]
+    struct GuardedConnectOptionsV1 {
+        options: ConnectOptionsV1,
+        canary: [u8; 16],
+    }
+
+    #[repr(C)]
+    struct FutureConnectOptions {
+        options: questdb_db_connect_options,
+        future_tail: [u64; 2],
+    }
+
     // Most behaviour is already covered by the questdb-rs lib tests; this
     // module's tests focus on the FFI surface — pointer handling, NULL
     // guards, lifetime of error objects, etc.
@@ -5228,6 +5533,88 @@ mod tests {
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let db =
             unsafe { questdb_db_connect(conf.as_ptr() as *const c_char, conf.len(), &mut err) };
+        assert!(db.is_null());
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn connect_options_init_respects_caller_size_and_future_tail() {
+        assert_eq!(
+            std::mem::size_of::<ConnectOptionsV1>(),
+            QUESTDB_DB_CONNECT_OPTIONS_V1_SIZE
+        );
+
+        let mut guarded = unsafe { std::mem::zeroed::<GuardedConnectOptionsV1>() };
+        guarded.canary = [0xA5; 16];
+        unsafe {
+            questdb_db_connect_options_init(
+                (&mut guarded.options as *mut ConnectOptionsV1)
+                    .cast::<questdb_db_connect_options>(),
+                std::mem::size_of::<ConnectOptionsV1>(),
+            )
+        };
+        assert_eq!(
+            guarded.options.struct_size,
+            std::mem::size_of::<ConnectOptionsV1>()
+        );
+        assert!(guarded.options.oidc_auth.is_null());
+        assert!(guarded.options.event_callback.is_none());
+        assert_eq!(guarded.canary, [0xA5; 16]);
+
+        let mut future = unsafe { std::mem::zeroed::<FutureConnectOptions>() };
+        future.future_tail = [0xDEAD_BEEF, 0xCAFE_BABE];
+        unsafe {
+            questdb_db_connect_options_init(
+                &mut future.options,
+                std::mem::size_of::<FutureConnectOptions>(),
+            )
+        };
+        assert_eq!(
+            future.options.struct_size,
+            std::mem::size_of::<FutureConnectOptions>()
+        );
+        assert_eq!(future.future_tail, [0xDEAD_BEEF, 0xCAFE_BABE]);
+    }
+
+    #[test]
+    fn connect_ex_accepts_larger_struct_and_rejects_undersized_prefix() {
+        let conf = b"ws::addr=127.0.0.1:1;lazy_connect=true;";
+        let mut future = unsafe { std::mem::zeroed::<FutureConnectOptions>() };
+        unsafe {
+            questdb_db_connect_options_init(
+                &mut future.options,
+                std::mem::size_of::<FutureConnectOptions>(),
+            )
+        };
+        let mut err = std::ptr::null_mut();
+        let db = unsafe {
+            questdb_db_connect_ex(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                &future.options,
+                &mut err,
+            )
+        };
+        assert!(!db.is_null());
+        assert!(err.is_null());
+        unsafe { questdb_db_close(db) };
+
+        #[repr(C)]
+        struct SizeOnly {
+            struct_size: size_t,
+        }
+        let undersized = SizeOnly {
+            struct_size: std::mem::size_of::<SizeOnly>(),
+        };
+        let db = unsafe {
+            questdb_db_connect_ex(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                (&undersized as *const SizeOnly).cast::<questdb_db_connect_options>(),
+                &mut err,
+            )
+        };
         assert!(db.is_null());
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
