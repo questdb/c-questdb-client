@@ -46,7 +46,11 @@ def run_cargo_tests():
     run_cmd('cargo', 'test', '--lib', '--examples', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-reader',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--features=almost-all-features',
+    # The C ABI builds questdb-rs with `ffi-support`, and the pool's owned
+    # handles and borrow-with-retry paths, with their tests, compile only
+    # under it. `almost-all-features` leaves it out, so add it here; the
+    # arrow/polars run below still covers the cut without it.
+    run_cmd('cargo', 'test', '--features=almost-all-features,ffi-support',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--locked',
             '--features=almost-all-features,arrow,polars',
