@@ -1497,10 +1497,19 @@ fn refuses_non_qwp_ws_schema() {
 
 #[test]
 fn at_cap_borrow_waits_for_a_return_within_acquire_timeout() {
+    check_at_cap_borrow_waits_for_a_return_within_acquire_timeout("manual");
+}
+
+#[test]
+fn at_cap_borrow_waits_for_a_return_with_auto_reaper() {
+    check_at_cap_borrow_waits_for_a_return_within_acquire_timeout("auto");
+}
+
+fn check_at_cap_borrow_waits_for_a_return_within_acquire_timeout(reap: &str) {
     let server = MockServer::spawn(2);
     let conf = conf_for_endpoints(
         &[server.port()],
-        "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
+        &format!("sender_pool_min=1;sender_pool_max=1;pool_reap={reap};"),
     );
     let db = std::sync::Arc::new(QuestDb::connect(&conf).unwrap());
     let held = db.borrow_sender().expect("first borrow fills the cap");
@@ -8149,8 +8158,9 @@ fn close_joins_reaper_cleanly() {
         server.port(),
         // close_flush_timeout_millis bounds the per-Sender close drain, which
         // otherwise can wait up to 5s for the mock server's (absent) WS close
-        // handshake. We only care here that the reaper thread joins.
-        "sender_pool_min=1;sender_pool_max=2;idle_timeout_ms=500;pool_reap=auto;close_flush_timeout_millis=200;",
+        // handshake. A 15s reaper tick exceeds the 10s assertion below, so
+        // shutdown must wake the reaper rather than wait for its next tick.
+        "sender_pool_min=1;sender_pool_max=2;idle_timeout_ms=180000;pool_reap=auto;close_flush_timeout_millis=200;",
     ))
     .unwrap();
     // Borrow + return so we have something to reap eventually.
