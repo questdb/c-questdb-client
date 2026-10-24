@@ -55,6 +55,15 @@ pub enum OidcErrorKind {
     /// refresh responses retain the parent token for a later backed-off retry.
     /// A genuinely ambiguous post-dispatch refresh failure instead discards the
     /// parent and is reported as [`InteractionRequired`](Self::InteractionRequired).
+    ///
+    /// Retryable means a later call can succeed. A transport that pulls the
+    /// token in the background -- a QWP/WebSocket reconnect -- keeps retrying
+    /// it, and an ILP/HTTP flush resolves the token again until its
+    /// `retry_timeout` expires. A QWP/WebSocket connect the caller waits for --
+    /// the synchronous initial connect, or a pool borrow with retry -- ends at
+    /// once on it instead: of an `OidcDeviceAuth`'s failures it retries only a
+    /// busy acquisition, because the provider classifies none of them retryable
+    /// with `Error::token_unavailable`.
     Network,
 
     /// The OAuth 2.0 device authorization grant failed; the IdP

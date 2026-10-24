@@ -48,8 +48,13 @@ rejected, pulls again, and retries the same endpoint once if the token changed
 `invalid_token`. A source classifies each failure as retryable (network,
 throttling, 5xx) or permanent (missing or wrong configuration); a connect the
 caller waits for retries only retryable failures, while background reconnects
-retry both. No secret ever appears in errors or logs: at most a token's length
-and an 8-hex-digit SHA-256 fingerprint.
+retry both. The OIDC device-flow auth classifies none of its failures that
+way, so a connect the caller waits for -- a synchronous initial connect, or a
+pool borrow with retry -- ends at once even on a transient identity-provider
+failure, and retries only an acquisition busy on another thread; an ILP/HTTP
+flush retries a transient failure within its `retry_timeout`. No secret ever
+appears in errors or logs: at most a token's length and an 8-hex-digit SHA-256
+fingerprint.
 
 A rejection can persist: during an identity-provider or signing-key outage a
 server answers 401 or 403 even to a fresh token. What happens then depends on

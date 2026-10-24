@@ -1270,7 +1270,10 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_sender(
 /// errors are terminal, except a protocol-version error caused by every
 /// endpoint rejecting the connection by role (a durable-ack pool whose nodes
 /// are all replicas): that is retried until `budget_ms`, as a failover can
-/// promote a primary, and still ends with the protocol-version error.
+/// promote a primary, and still ends with the protocol-version error. A
+/// token-provider failure the provider did not classify retryable is terminal
+/// too. That is every OIDC failure except a busy acquisition, so a transient
+/// identity-provider failure ends the borrow at once.
 /// `budget_ms == 0` makes a single attempt (no retry). Returns NULL on
 /// failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
@@ -1296,7 +1299,9 @@ pub unsafe extern "C" fn questdb_db_borrow_sender_with_retry(
 }
 
 /// Like `questdb_db_borrow_direct_sender` but retries the connect
-/// within `budget_ms` using the same reconnect backoff. `budget_ms == 0`
+/// within `budget_ms` using the same reconnect backoff. A token-provider
+/// failure the provider did not classify retryable is terminal, as for
+/// `questdb_db_borrow_sender_with_retry`. `budget_ms == 0`
 /// makes a single attempt. Returns NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_borrow_direct_sender_with_retry(

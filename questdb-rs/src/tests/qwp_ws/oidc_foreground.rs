@@ -22,11 +22,13 @@
  *
  ******************************************************************************/
 
-//! The synchronous initial connect is a connect its caller waits for, so an
-//! OIDC provider that needs an explicit sign-in fails it immediately instead
-//! of spending the whole reconnect budget (`reconnect_error_is_foreground_terminal`).
-//! A provider that is only busy -- another thread is acquiring -- keeps
-//! retrying.
+//! The synchronous initial connect is a connect its caller waits for, so it
+//! retries only a provider failure classified retryable with
+//! `Error::token_unavailable` (`reconnect_error_is_foreground_terminal`). An
+//! OIDC provider classifies none: one that needs an explicit sign-in, or whose
+//! silent refresh failed transiently, fails it immediately instead of spending
+//! the whole reconnect budget. A provider that is only busy -- another thread
+//! is acquiring -- keeps retrying.
 
 use super::*;
 
@@ -72,6 +74,29 @@ fn sync_initial_connect_fails_fast_when_sign_in_is_required() {
     assert_eq!(
         calls, 1,
         "the waiting connect retried a sign-in it cannot get"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "the waiting connect spent its reconnect budget: {elapsed:?}"
+    );
+}
+
+#[test]
+fn sync_initial_connect_fails_fast_on_a_transient_refresh_failure() {
+    // Spec D8, as in the Java client: the failure carries no retryable
+    // token-unavailable classification, so the waiting connect ends.
+    let (result, calls, elapsed) =
+        sync_initial_connect_with(|| OidcError::network("identity provider answered 503"));
+    let err = result.expect_err("a provider that cannot refresh cannot connect");
+    assert_eq!(err.code(), ErrorCode::SocketError, "{err}");
+    assert_eq!(
+        err.oidc_error().map(OidcError::kind),
+        Some(OidcErrorKind::Network),
+        "{err}"
+    );
+    assert_eq!(
+        calls, 1,
+        "the waiting connect retried an unclassified provider failure"
     );
     assert!(
         elapsed < Duration::from_millis(1000),

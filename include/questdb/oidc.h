@@ -938,7 +938,16 @@ bool questdb_error_oidc_get_view(
  * A refresh response with HTTP 408, 429 or 5xx, or the OAuth
  * `temporarily_unavailable` error, retains the refresh token in memory and in
  * the configured store and is retried by later calls under backoff (including
- * Retry-After when supplied). A status-less transport
+ * Retry-After when supplied). Such a failure reports
+ * QUESTDB_OIDC_ERROR_NETWORK, as does a call that needs a refresh while that
+ * backoff lasts. An HTTP flush resolves the token again until its
+ * `retry_timeout` expires, and a QWP/WS background reconnect keeps retrying,
+ * but a QWP/WS connect the caller waits for -- an initial connect with
+ * `initial_connect_retry=sync`, or `questdb_db_borrow_sender_with_retry` --
+ * fails at once: this auth classifies none of its failures retryable, so such
+ * a connect retries only an acquisition busy on another thread
+ * (`acquisition_busy`), as in the Java client. Retry the start or the borrow
+ * to ride out an identity-provider outage. A status-less transport
  * failure after request dispatch is genuinely ambiguous: the identity
  * provider may have rotated the parent but lost the response. In that case the
  * parent is discarded and QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED explicitly

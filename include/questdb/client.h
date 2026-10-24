@@ -166,7 +166,11 @@ void questdb_db_connect_options_init(
  * reconnect; the caller may free its auth handle after this call returns.
  * Provider calls may load or silently refresh a token but never start an
  * interactive device flow. Call questdb_oidc_auth_sign_in before opening the
- * pool; otherwise token acquisition reports InteractionRequired. After a
+ * pool; otherwise token acquisition reports InteractionRequired.
+ * `questdb_db_borrow_sender_with_retry` ends at once, whatever its budget, on
+ * any OIDC failure except a busy acquisition -- a transient refresh failure
+ * (QUESTDB_OIDC_ERROR_NETWORK) as well -- while a sender's background
+ * reconnects keep retrying; see `line_sender_opts_oidc_auth`. After a
  * handshake 401 for a token that had not expired, the one re-resolution a
  * connect makes refreshes it rather than presenting it again (at most once
  * every 30 seconds per auth). A connect re-resolves only when the 401's

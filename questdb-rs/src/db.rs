@@ -1707,9 +1707,12 @@ impl<'a> DirectSenderHandle<'a> {
 
     /// Retry [`reborrow_from_pool`] within `deadline` using the row API's
     /// reconnect backoff (centered-jittered, role-reject reset; `AuthError` /
-    /// `ProtocolVersionError` terminal). On terminal failure or budget
-    /// exhaustion the handle stays populated (per [`reborrow_from_pool`]), so a
-    /// later call reports a typed error rather than panicking.
+    /// `ProtocolVersionError` terminal, and so is a token-provider failure the
+    /// provider did not classify retryable: see
+    /// [`reconnect_error_is_foreground_terminal`]). On terminal failure or
+    /// budget exhaustion the handle stays populated (per
+    /// [`reborrow_from_pool`]), so a later call reports a typed error rather
+    /// than panicking.
     #[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
     pub(crate) fn reborrow_with_retry(&mut self, deadline: Option<Instant>) -> Result<()> {
         let policy = self.reconnect_policy();
@@ -2947,10 +2950,11 @@ fn connect_sfa_pool_with_recovery_candidates(
 /// cluster elects a primary, or a transient transport error) backs off and
 /// retries. Errors [`reconnect_error_is_foreground_terminal`] treats as
 /// terminal -- `AuthError`, a `ProtocolVersionError` that carries no role
-/// rejection, a provider failure that cannot clear -- and deadline exhaustion
-/// end it. A `ProtocolVersionError` from every endpoint rejecting by role (a
-/// durable-ack store-and-forward pool of replicas) is a role rejection, and is
-/// retried.
+/// rejection, a token-provider failure the provider did not classify
+/// retryable (every OIDC failure but a busy acquisition, a transient refresh
+/// failure included) -- and deadline exhaustion end it. A
+/// `ProtocolVersionError` from every endpoint rejecting by role (a durable-ack
+/// store-and-forward pool of replicas) is a role rejection, and is retried.
 #[cfg(feature = "ffi-support")]
 fn reconnect_pick<S>(
     inner: &Arc<DbInner>,

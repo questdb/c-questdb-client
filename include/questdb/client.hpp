@@ -104,6 +104,9 @@ public:
      * Open a pool whose sender and reader connections share one rotating OIDC
      * token provider. The pool retains the auth state internally. Provider
      * calls may silently refresh but never prompt; call auth.sign_in() first.
+     * `borrow_sender_with_retry()` throws at once, whatever its budget, on any
+     * OIDC failure except a busy acquisition, a transient refresh failure
+     * included; see `questdb_db_borrow_sender_with_retry`.
      * Mutually exclusive with static credentials: `conf` must not also set
      * `username`/`password` or `token`.
      * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer
@@ -197,7 +200,9 @@ public:
      * `budget_ms` using the pool's reconnect backoff. On a transient
      * `failover_retry`, drop the dead sender then call this with
      * `reconnect_max_duration_ms()` (or your tracked remaining budget). Throws
-     * on a terminal error or budget exhaustion.
+     * on a terminal error or budget exhaustion; see
+     * `questdb_db_borrow_sender_with_retry` for which errors are terminal,
+     * token-provider failures included.
      *
      * DEFINED in `questdb/ingress/qwp_sender.hpp`, alongside the
      * `borrowed_sender` type it returns. Include that header to call this.

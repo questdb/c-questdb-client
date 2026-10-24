@@ -1603,8 +1603,14 @@ impl SenderBuilder {
     /// that flush as a retryable [`SocketError`](crate::ErrorCode::SocketError) —
     /// the same classification the QWP/WebSocket sender and reader apply — because
     /// the callback may recover on the next flush; the buffer is left intact for a
-    /// retry. The exceptions are the failures that can never recover inside this
-    /// process, which keep their terminal code: an
+    /// retry. Before it fails, the flush resolves the provider again with backoff
+    /// until its [`retry_timeout`](Self::retry_timeout) expires -- after a
+    /// transient `OidcDeviceAuth` refresh failure (`OidcErrorKind::Network`), for
+    /// example -- but not after a failure the provider classified permanent with
+    /// [`Error::token_unavailable`](crate::Error::token_unavailable), an OIDC
+    /// `InteractionRequired` that is not `acquisition_busy`, or one of the
+    /// terminal failures that follow. The exceptions are the failures that can
+    /// never recover inside this process, which keep their terminal code: an
     /// [`InvalidApiCall`](crate::ErrorCode::InvalidApiCall) from the closure
     /// (carried as `ConfigError`) and, from an
     /// `oidc::OidcDeviceAuth` provider, a closed provider
@@ -1716,10 +1722,14 @@ impl SenderBuilder {
     /// retries only a failure the provider classified retryable with
     /// [`Error::token_unavailable`](crate::Error::token_unavailable), or an OIDC
     /// acquisition busy on another thread. Any other provider failure ends it at
-    /// once, OIDC's `InteractionRequired` included: nobody has signed in, and the
-    /// waiting caller is the one that would have to. Before that one
-    /// re-resolution after a 401, the sender calls the provider's
-    /// `on_rejected` with the rejected token.
+    /// once. An `OidcDeviceAuth` classifies none of its failures that way, so
+    /// every other OIDC failure ends it: an `InteractionRequired` -- nobody has
+    /// signed in, and the waiting caller is the one that would have to -- and a
+    /// transient refresh failure (`OidcErrorKind::Network`, such as an
+    /// identity-provider 5xx) alike, as in the Java client. To ride out an
+    /// identity-provider outage at startup, retry the build or the borrow.
+    /// Before that one re-resolution after a 401, the sender calls the
+    /// provider's `on_rejected` with the rejected token.
     ///
     /// A server's rejection of a successfully acquired token -- HTTP 401 or 403
     /// on the WebSocket upgrade -- is terminal only before the sender's first
@@ -1841,10 +1851,16 @@ impl SenderBuilder {
     /// Closing the provider therefore stops the reconnect loop and terminalizes
     /// a store-and-forward sender's publication store. Every other OIDC kind,
     /// including `InteractionRequired`, stays retryable for the background
-    /// reconnect loop. A connect the caller waits for (the synchronous initial
-    /// connect, or a pool borrow with retry) instead fails immediately on an
-    /// `InteractionRequired` that is not `acquisition_busy`, rather than
-    /// spending its whole budget waiting for a sign-in it is blocking.
+    /// reconnect loop, and an ILP/HTTP flush resolves the token again after a
+    /// `Network` failure or a busy acquisition until its
+    /// [`retry_timeout`](Self::retry_timeout) expires. A connect the caller
+    /// waits for (the synchronous initial connect, or a pool borrow with retry)
+    /// instead fails immediately on every OIDC failure except an
+    /// `InteractionRequired` that is `acquisition_busy`: an `OidcDeviceAuth`
+    /// classifies none of its failures with
+    /// [`Error::token_unavailable`](crate::Error::token_unavailable), so a
+    /// transient refresh failure (`OidcErrorKind::Network`) ends that connect
+    /// just as a missing sign-in does, as in the Java client.
     ///
     /// A closed `RefreshingTokenProvider` is terminal, like a closed OIDC
     /// provider, and one that is already closed is refused here with that

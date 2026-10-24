@@ -1510,6 +1510,11 @@ public:
      * shared ownership, so `auth` does not need to outlive these options.
      * Provider calls may silently refresh but never prompt from flush/connect;
      * call auth.sign_in() explicitly before starting the sender.
+     * A QWP/WebSocket initial connect with `initial_connect_retry=sync`
+     * retries only a busy acquisition: any other OIDC failure, a transient
+     * refresh failure included, fails it at once. An HTTP flush retries a
+     * transient failure within its `retry_timeout`. See
+     * `line_sender_opts_oidc_auth`.
      * Mutually exclusive with static credentials: these opts must not also
      * carry `username`/`password` or `token`, from the config string or from
      * `username()` and friends.

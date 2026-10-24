@@ -2726,15 +2726,20 @@ pub(crate) fn reconnect_error_is_terminal_when_established(err: &Error) -> bool 
 
 /// Terminal for a connect the caller waits for: the synchronous initial connect
 /// and pool borrows with retry. Besides every [`reconnect_error_is_terminal`]
-/// error, this fails fast on any OIDC `InteractionRequired` that is not
-/// `acquisition_busy` -- both the caller's own callback re-entry and "nobody
-/// has signed in". Neither can resolve while this caller waits: a re-entrant
-/// caller cannot return from its callback until the connect returns, and a
-/// sign-in is a separate, explicit call the waiting thread would have to make.
-/// A busy acquisition on another thread stays retryable. The background
-/// reconnect loop keeps using [`reconnect_error_is_terminal`]. Do not classify
-/// either case as a terminal *driver* error: store-and-forward frames must
-/// remain replayable.
+/// error, this fails fast on a token-provider failure that the provider did
+/// not classify retryable with
+/// [`Error::token_unavailable`](crate::Error::token_unavailable) (spec D6, D8).
+/// An `OidcDeviceAuth` classifies none of its failures, so every OIDC failure
+/// ends such a connect -- a transient refresh failure (`Network`) as well as
+/// an `InteractionRequired` -- except a busy acquisition on another thread,
+/// which stays retryable. A non-busy `InteractionRequired` fails fast here
+/// even when it is not marked a provider failure: both the caller's own
+/// callback re-entry and "nobody has signed in" cannot resolve while this
+/// caller waits, since a re-entrant caller cannot return from its callback
+/// until the connect returns, and a sign-in is a separate, explicit call the
+/// waiting thread would have to make. The background reconnect loop keeps
+/// using [`reconnect_error_is_terminal`]. Do not classify any of these as a
+/// terminal *driver* error: store-and-forward frames must remain replayable.
 pub(crate) fn reconnect_error_is_foreground_terminal(err: &Error) -> bool {
     if reconnect_error_is_terminal(err) {
         return true;

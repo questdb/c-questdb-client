@@ -2395,7 +2395,13 @@ int64_t line_sender_now_micros(void);
  *
  *  - `line_sender_error_socket_error` -- the ordinary case, retryable.
  *    The sender keeps reconnecting and store-and-forward keeps its queued
- *    frames; only a foreground/initial connect fails fast.
+ *    frames. Only a connect the caller waits for fails fast: an initial
+ *    connect other than `initial_connect_retry=async`, or a pool borrow.
+ *    With `initial_connect_retry=sync`, or a pool borrow with retry, that
+ *    connect still retries within its budget a failure the provider
+ *    classified retryable (`questdb_error_token_unavailable_get_view`). An
+ *    OIDC auth classifies none, so there only its busy acquisition is
+ *    retried: a transient refresh failure ends the connect.
  *  - `line_sender_error_auth_error` / `line_sender_error_config_error` --
  *    the provider cannot recover in this process (a permanently closed
  *    provider, a scope that cannot yield the required token kind, or a

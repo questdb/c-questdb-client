@@ -88,8 +88,15 @@ pub enum ConnectionEventKind {
     /// * `SocketError` -- the ordinary case, and retryable by design. The
     ///   store-and-forward drainer holds queued frames while the IdP recovers
     ///   or a human signs in, and the sender goes on reconnecting. Only a
-    ///   foreground/initial connect fails fast, because a credential problem
-    ///   during initialization is the caller's to see.
+    ///   connect the caller waits for fails fast -- an initial connect other
+    ///   than `initial_connect_retry=async`, or a pool borrow -- because a
+    ///   credential problem during initialization is the caller's to see. With
+    ///   `initial_connect_retry=sync`, or a pool borrow with retry, that
+    ///   connect still retries within its budget a failure the provider
+    ///   classified retryable with
+    ///   [`Error::token_unavailable`](crate::Error::token_unavailable). An
+    ///   `OidcDeviceAuth` classifies none, so there only its busy acquisition
+    ///   is retried: a transient refresh failure ends the connect.
     /// * `AuthError` or `ConfigError` -- the provider cannot recover *in this
     ///   process*, so the reconnect is **terminal** and the runner stops. The
     ///   causes: a permanently closed provider (an OIDC provider's `close()` is
