@@ -38,7 +38,7 @@ use rand::RngCore;
 
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
-use crate::ingress::buffer::QwpWsColumnarBuffer;
+use crate::ingress::buffer::{QwpWsColumnarBuffer, SymbolGlobalDict};
 use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability};
 use crate::ingress::tls::{TlsSettings, configure_tls};
 use crate::ws::frame::{
@@ -64,6 +64,7 @@ use super::qwp_ws_orphan::{
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
 use super::qwp_ws_queue::{OutboundFrame, SentFrame};
+use super::qwp_ws_sfa_publisher::SharedSymbolGlobalDict;
 use super::qwp_ws_sfa_queue::{
     SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError, segment_payload_capacity,
     two_frame_segment_payload_capacity,
@@ -450,6 +451,9 @@ struct QwpWsConnectedParts {
 pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     runner: SyncQwpWsRunner,
+    record_first: bool,
+    record_first_row_limit: usize,
+    pub(crate) record_global_dict: Option<SharedSymbolGlobalDict>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
     /// Hard cap on a single store-and-forward frame's payload: `sf_max_segment_bytes`
@@ -496,6 +500,9 @@ pub(crate) struct SyncQwpWsHandlerState {
 }
 
 impl SyncQwpWsHandlerState {
+    pub(crate) fn use_record_for_rows(&self, rows: usize) -> bool {
+        self.record_first && rows < self.record_first_row_limit
+    }
     /// Releases the recovered dictionary seeded into the standalone replay
     /// encoder at connect. The pooled core uses its own dictionary and never
     /// touches this encoder, so that seed is dead weight once the pooled core
@@ -523,10 +530,12 @@ pub(crate) struct ManualQwpWsHandlerState {
 
 pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
+    sender_errors_pending: Arc<AtomicBool>,
     producer: Option<SfaProducer>,
     lifecycle: PublicationLifecycle,
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
+    commit_requested_upper: Arc<AtomicU64>,
     append_deadline: Duration,
     stop: Arc<AtomicBool>,
     traffic_gate: Arc<TrafficGate>,
@@ -540,6 +549,7 @@ struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     cold_effects: VecDeque<RunnerColdEffect>,
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
+    commit_requested_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -549,6 +559,7 @@ struct SyncQwpWsPendingRunnerCore {
     progress: SfaProgressView,
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
+    commit_requested_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -571,6 +582,7 @@ struct QwpWsPendingConnect {
     /// Empty in memory mode / on a fresh slot.
     recovered_dict_entries: Vec<u8>,
     recovered_dict_count: u32,
+    record_global_dict: Option<SharedSymbolGlobalDict>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -632,13 +644,16 @@ where
         let lifecycle = store.lifecycle();
         let progress = store.progress_view();
         let producer = store.take_producer();
+        let sender_errors_pending = store.sender_errors_pending();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
+        let commit_requested_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
         let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
+        let thread_commit_requested_upper = Arc::clone(&commit_requested_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -648,6 +663,7 @@ where
                 cold_effects: VecDeque::new(),
                 backpressure: thread_backpressure,
                 ok_completed_upper: thread_ok_completed_upper,
+                commit_requested_upper: thread_commit_requested_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -661,10 +677,12 @@ where
 
         Self {
             shared,
+            sender_errors_pending,
             producer,
             lifecycle,
             backpressure,
             ok_completed_upper,
+            commit_requested_upper,
             append_deadline,
             stop,
             traffic_gate,
@@ -685,14 +703,17 @@ where
         let lifecycle = store.lifecycle();
         let progress = store.progress_view();
         let producer = store.take_producer();
+        let sender_errors_pending = store.sender_errors_pending();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
+        let commit_requested_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let traffic_gate = Arc::clone(&pending_connect.traffic_gate);
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
         let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
+        let thread_commit_requested_upper = Arc::clone(&commit_requested_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -702,6 +723,7 @@ where
                 progress,
                 backpressure: thread_backpressure,
                 ok_completed_upper: thread_ok_completed_upper,
+                commit_requested_upper: thread_commit_requested_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -715,10 +737,12 @@ where
 
         Self {
             shared,
+            sender_errors_pending,
             producer,
             lifecycle,
             backpressure,
             ok_completed_upper,
+            commit_requested_upper,
             append_deadline,
             stop,
             traffic_gate,
@@ -728,6 +752,17 @@ where
     }
 
     fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<u64> {
+        self.check_publication_open()?;
+        if let Some(producer) = self.producer.as_mut()
+            && let Some(receipt) = producer
+                .try_submit_active(payload)
+                .map_err(DriverError::from)
+                .map_err(driver_error_to_error_without_state)?
+        {
+            return Ok(receipt.fsn);
+        }
+        // Start the wait budget before rotation or backpressure, not on every
+        // successful append to an already allocated segment.
         let deadline = Instant::now().checked_add(self.append_deadline);
         loop {
             let backpressure_generation = self.backpressure.generation();
@@ -851,11 +886,17 @@ where
     }
 
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
+        if !self.sender_errors_pending.load(Ordering::Acquire) && !self.shared.is_poisoned() {
+            return Ok(None);
+        }
         let mut store = self.lock_shared()?;
         Ok(store.poll_sender_error())
     }
 
     fn poll_sender_error_notification(&self) -> crate::Result<Option<QwpWsSenderError>> {
+        if !self.sender_errors_pending.load(Ordering::Acquire) && !self.shared.is_poisoned() {
+            return Ok(None);
+        }
         let mut store = self.lock_shared()?;
         Ok(store.poll_sender_error_notification())
     }
@@ -1070,6 +1111,7 @@ impl QwpWsPendingConnect {
             delta_dict_enabled,
             recovered_dict_entries,
             recovered_dict_count,
+            record_global_dict: None,
         }
     }
 
@@ -1192,12 +1234,14 @@ impl SyncQwpWsPendingRunnerCore {
                         self.pending_connect.recovered_dict_count,
                     );
                 }
+                send_core.set_record_global_dict(self.pending_connect.record_global_dict.clone());
                 self.connected = Some(SyncQwpWsRunnerCore {
                     send_core,
                     progress: self.progress.clone(),
                     cold_effects: VecDeque::new(),
                     backpressure: Arc::clone(&self.backpressure),
                     ok_completed_upper: Arc::clone(&self.ok_completed_upper),
+                    commit_requested_upper: Arc::clone(&self.commit_requested_upper),
                     lifecycle: self.lifecycle.clone(),
                 });
                 RunnerStep::Continue
@@ -1274,26 +1318,53 @@ where
             }
         }
 
-        let outbound = match self.send_core.next_outbound_sfa_frame(&self.progress) {
-            Ok(outbound) => outbound,
-            Err(err) => return self.store_shared_driver_error(shared, err),
+        let force_through = if self.lifecycle.load() == PublicationState::Closing {
+            self.progress.published_fsn()
+        } else {
+            self.commit_requested_upper
+                .load(Ordering::Acquire)
+                .checked_sub(1)
         };
-        // Torn-dictionary guard (file mode): a replayed delta frame whose base
-        // exceeds the re-registered dictionary is unrecoverable -- fail loudly
-        // rather than send the server a frame it cannot decode.
-        if let Some(frame) = outbound.as_ref()
-            && let Err(err) =
-                frame.with_view(|view| self.send_core.guard_dict_not_torn(view.payload))
-        {
-            return self.store_shared_driver_error(shared, DriverError::Storage(err));
+        let budget = self.send_core.begin_send_batch();
+        let mut bytes = 0usize;
+        let mut send_step = RunnerStep::Idle;
+        while bytes < budget {
+            if stop.load(Ordering::Acquire) {
+                return RunnerStep::Stop;
+            }
+            let outbound = match self.send_core.next_outbound_sfa_frame_through(
+                &self.progress,
+                force_through,
+                false,
+            ) {
+                Ok(Some(outbound)) => outbound,
+                Ok(None) => {
+                    if self.send_core.has_more_record_input(&self.progress) {
+                        send_step = RunnerStep::Continue;
+                    }
+                    break;
+                }
+                Err(err) => return self.store_shared_driver_error(shared, err),
+            };
+            // Keep dictionary validation per frame even within a send burst.
+            if let Err(err) =
+                outbound.with_view(|view| self.send_core.guard_dict_not_torn(view.payload))
+            {
+                return self.store_shared_driver_error(shared, DriverError::Storage(err));
+            }
+            bytes = bytes
+                .saturating_add(outbound.sent_frame().payload_len)
+                .saturating_add(14);
+            send_step = self.finish_send(shared, stop, outbound);
+            if send_step == RunnerStep::Stop {
+                return RunnerStep::Stop;
+            }
+            if self.send_core.send_batch_interrupted() {
+                return send_step;
+            }
         }
-
-        let send_step = match outbound {
-            Some(outbound) => self.finish_send(shared, stop, outbound),
-            None => self.finish_receive(shared, stop),
-        };
-        if send_step == RunnerStep::Stop {
-            return RunnerStep::Stop;
+        if let Err(failure) = self.send_core.finish_send_batch(force_through) {
+            return self.apply_transport_failure(shared, stop, failure);
         }
 
         let receive_step = self.drain_receive_ready(shared, stop);
@@ -3470,6 +3541,10 @@ pub(crate) fn connect_qwp_ws_background_state(
     );
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
     let traffic_gate = Arc::new(TrafficGate::default());
+    // QSR1 does not persist background-assigned global IDs. Sharing is safe in
+    // memory slots, whose allocator and replay mirror survive every reconnect.
+    let record_global_dict = (qwp_ws.sf_dir.is_none() && qwp_ws.pool_commit_interval.is_some())
+        .then(|| Arc::new(Mutex::new(SymbolGlobalDict::new())));
     let (
         runner,
         encoder,
@@ -3523,7 +3598,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         if delta_dict_enabled {
             encoder.seed_global_dict(&recovered_dict_entries, recovered_dict_count)?;
         }
-        let pending_connect = QwpWsPendingConnect::new(
+        let mut pending_connect = QwpWsPendingConnect::new(
             host,
             port,
             use_tls,
@@ -3537,6 +3612,7 @@ pub(crate) fn connect_qwp_ws_background_state(
             try_dup_recovered(&recovered_dict_entries)?,
             recovered_dict_count,
         );
+        pending_connect.record_global_dict = record_global_dict.clone();
         let runner = SyncQwpWsRunner::start_pending_connect(
             queue,
             pending_connect,
@@ -3583,6 +3659,9 @@ pub(crate) fn connect_qwp_ws_background_state(
                 .send_core
                 .enable_delta_dict(&parts.recovered_dict_entries, parts.recovered_dict_count);
         }
+        parts
+            .send_core
+            .set_record_global_dict(record_global_dict.clone());
         let runner = SyncQwpWsRunner::start_with_append_deadline(
             parts.store,
             parts.send_core,
@@ -3606,6 +3685,13 @@ pub(crate) fn connect_qwp_ws_background_state(
     );
 
     Ok(SyncQwpWsHandlerState {
+        record_first: qwp_ws.pool_commit_interval.is_some(),
+        record_first_row_limit: if qwp_ws.pool_commit_rows == 0 {
+            1_000
+        } else {
+            qwp_ws.pool_commit_rows.min(1_000)
+        },
+        record_global_dict,
         encoder,
         runner,
         server_max_batch_size,
@@ -4031,6 +4117,14 @@ pub(crate) fn qwp_ws_ok_fsn_background(
     state: &SyncQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
     state.runner.ok_fsn()
+}
+
+pub(crate) fn qwp_ws_request_commit_background(state: &SyncQwpWsHandlerState, boundary: u64) {
+    update_atomic_max(
+        &state.runner.commit_requested_upper,
+        boundary.saturating_add(1),
+    );
+    state.runner.backpressure.notify_all();
 }
 
 pub(crate) fn qwp_ws_published_fsn_manual(
@@ -5571,6 +5665,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure: Arc::new(BackpressureNotifier::new()),
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
 
@@ -5720,6 +5815,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_sender_error_polls_do_not_wait_for_storage_maintenance() {
+        let driver =
+            QwpWsCoreTestHarness::from_queue(memory_queue(8192), FakeOrderedServer::no_response());
+        let runner =
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
+        let shared = Arc::clone(&runner.shared);
+        let guard = shared.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let runner = &runner;
+            let polling = scope.spawn(move || {
+                tx.send((
+                    runner.poll_sender_error(),
+                    runner.poll_sender_error_notification(),
+                ))
+                .unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            drop(guard);
+            polling.join().unwrap();
+            let (error, notification) = result.expect("empty polls must not wait on the store");
+            assert_eq!(error.unwrap(), None);
+            assert_eq!(notification.unwrap(), None);
+        });
+    }
+
+    #[test]
     fn threaded_sfa_publication_does_not_take_shared_store_mutex() {
         let dir = TempDir::new().unwrap();
         let queue = SfaFrameQueue::open(SfaQueueOptions {
@@ -5790,6 +5912,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure,
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -5842,6 +5965,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure,
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -5904,6 +6028,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure,
             ok_completed_upper: Arc::clone(&ok_completed_upper),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);

@@ -66,6 +66,8 @@ pub(crate) struct EncodeScratch {
     /// them instead of allocating one `Vec<u64>` per row-symbol column per flush.
     /// Mirrors the row replay encoder's `per_segment_symbol_globals` pooling.
     symbol_gid_pool: Vec<Vec<u64>>,
+    record_symbol_dict: Option<SymbolGlobalDict>,
+    record_dictionary_ends: Vec<usize>,
 }
 
 impl EncodeScratch {
@@ -96,6 +98,7 @@ impl EncodeScratch {
             }
         }
         self.referenced.clear();
+        self.record_dictionary_ends.clear();
     }
 }
 
@@ -150,33 +153,7 @@ fn encode_chunk_into_mode(
         emit_header_only_frame(out, defer_commit);
         return Ok(());
     }
-    let row_count = chunk.row_count();
-    if row_count == 0 {
-        return Err(error::fmt!(
-            InvalidApiCall,
-            "Chunk row_count is 0; flush at least one row or hand back an empty chunk."
-        ));
-    }
-    if row_count > super::MAX_CHUNK_ROWS {
-        return Err(error::fmt!(
-            InvalidApiCall,
-            "Chunk row_count {} exceeds MAX_CHUNK_ROWS ({}); split into smaller chunks",
-            row_count,
-            super::MAX_CHUNK_ROWS
-        ));
-    }
-    // Server-stamping (no per-row designated timestamp) must be an
-    // explicit opt-in via `Chunk::at_now`, mirroring the arrow-batch
-    // `flush_arrow_batch_at_now` entry point.
-    if chunk.designated_ts.is_none() && !chunk.server_now {
-        return Err(error::fmt!(
-            InvalidApiCall,
-            "Chunk has no designated timestamp; \
-             call at_micros or at_nanos before flush, or at_now to \
-             explicitly let the server stamp each row on arrival."
-        ));
-    }
-    validate_table_name(&chunk.table)?;
+    let row_count = validate_chunk(chunk)?;
     let table_bytes = chunk.table.as_bytes();
 
     let designated = chunk.designated_ts.as_ref();
@@ -193,6 +170,7 @@ fn encode_chunk_into_mode(
         &mut scratch.per_column,
         &mut scratch.referenced,
         &mut scratch.symbol_gid_pool,
+        None,
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -252,6 +230,132 @@ fn encode_chunk_into_mode(
             symbol_dict.rollback(dict_mark);
             Err(e)
         }
+    }
+}
+
+fn validate_chunk(chunk: &Chunk<'_>) -> Result<usize> {
+    let row_count = chunk.row_count();
+    if row_count == 0 {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "Chunk row_count is 0; flush at least one row or hand back an empty chunk."
+        ));
+    }
+    if row_count > super::MAX_CHUNK_ROWS {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "Chunk row_count {} exceeds MAX_CHUNK_ROWS ({}); split into smaller chunks",
+            row_count,
+            super::MAX_CHUNK_ROWS
+        ));
+    }
+    // Server-stamping (no per-row designated timestamp) must be an
+    // explicit opt-in via `Chunk::at_now`, mirroring the arrow-batch
+    // `flush_arrow_batch_at_now` entry point.
+    if chunk.designated_ts.is_none() && !chunk.server_now {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "Chunk has no designated timestamp; \
+             call at_micros or at_nanos before flush, or at_now to \
+             explicitly let the server stamp each row on arrival."
+        ));
+    }
+    validate_table_name(&chunk.table)?;
+    Ok(row_count)
+}
+
+pub(crate) fn encode_chunk_record_into(
+    out: &mut Vec<u8>,
+    chunk: &Chunk<'_>,
+    scratch: &mut EncodeScratch,
+    defer_commit: bool,
+) -> Result<usize> {
+    scratch.reset();
+    if chunk.is_empty() {
+        write_record_header(out, 0, defer_commit);
+        return Ok(QWP_HEADER_LEN);
+    }
+    let row_count = validate_chunk(chunk)?;
+    let mut dict = scratch.record_symbol_dict.take().unwrap_or_default();
+    let mark = dict.mark();
+    let resolution = resolve_symbols(
+        chunk,
+        &mut dict,
+        &mut scratch.new_symbols,
+        &mut scratch.per_column,
+        &mut scratch.referenced,
+        &mut scratch.symbol_gid_pool,
+        Some(&mut scratch.record_dictionary_ends),
+    );
+    dict.rollback(mark);
+    scratch.record_symbol_dict = Some(dict);
+    resolution?;
+
+    let start = out.len();
+    let result = (|| {
+        write_record_header(out, 1, defer_commit);
+        write_qwp_bytes(out, chunk.table.as_bytes());
+        write_qwp_varint(out, row_count as u64);
+        let column_count = chunk.columns.len() + usize::from(chunk.designated_ts.is_some());
+        write_qwp_varint(out, column_count as u64);
+        for col in &chunk.columns {
+            write_qwp_bytes(out, col.name.as_bytes());
+            out.push(col.wire_type);
+        }
+        if let Some(ts) = &chunk.designated_ts {
+            write_qwp_bytes(out, &[]);
+            out.push(ts.unit.wire_type());
+        }
+        let mut dictionary_start = 0;
+        for (col_idx, col) in chunk.columns.iter().enumerate() {
+            let dictionary_end = scratch.record_dictionary_ends[col_idx];
+            let dictionary = &scratch.new_symbols[dictionary_start..dictionary_end];
+            write_record_column(out, |out| unsafe {
+                encode_column(
+                    out,
+                    col,
+                    row_count,
+                    col_idx,
+                    &scratch.per_column,
+                    Some(dictionary),
+                )
+            })?;
+            dictionary_start = dictionary_end;
+        }
+        if let Some(ts) = &chunk.designated_ts {
+            write_record_column(out, |out| encode_designated_ts(out, ts, row_count))?;
+        }
+        Ok(out.len() - start - 4 * column_count + 5)
+    })();
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
+pub(super) fn write_record_header(out: &mut Vec<u8>, tables: u16, defer_commit: bool) {
+    out.extend_from_slice(b"QSR1");
+    out.push(u8::from(defer_commit));
+    out.extend_from_slice(&tables.to_le_bytes());
+}
+
+pub(super) fn write_record_column(
+    out: &mut Vec<u8>,
+    encode: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    let length_offset = out.len();
+    out.extend_from_slice(&[0; 4]);
+    encode(out)?;
+    let len = u32::try_from(out.len() - length_offset - 4)
+        .map_err(|_| error::fmt!(InvalidApiCall, "SF record column exceeds u32::MAX bytes"))?;
+    out[length_offset..length_offset + 4].copy_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
+pub(super) fn write_local_symbol_dictionary(out: &mut Vec<u8>, entries: &[Vec<u8>]) {
+    write_qwp_varint(out, entries.len() as u64);
+    for entry in entries {
+        write_qwp_bytes(out, entry);
     }
 }
 
@@ -392,7 +496,7 @@ fn encode_frame_after_signature(
 
     for (col_idx, col) in chunk.columns.iter().enumerate() {
         unsafe {
-            encode_column(out, col, row_count, col_idx, &scratch.per_column)?;
+            encode_column(out, col, row_count, col_idx, &scratch.per_column, None)?;
         }
     }
 
@@ -629,12 +733,14 @@ fn resolve_symbols(
     per_column: &mut Vec<Option<ResolvedColumn>>,
     referenced_scratch: &mut Vec<u8>,
     symbol_gid_pool: &mut Vec<Vec<u64>>,
+    mut local_dictionary_ends: Option<&mut Vec<usize>>,
 ) -> Result<u64> {
     let delta_start = symbol_dict.next_id();
     per_column.reserve(chunk.columns.len());
     let row_count = chunk.row_count();
 
     for col in &chunk.columns {
+        let mark = symbol_dict.mark();
         match col.kind {
             ColumnKind::Symbol {
                 codes,
@@ -692,6 +798,10 @@ fn resolve_symbols(
             }
             _ => per_column.push(None),
         }
+        if let Some(ends) = local_dictionary_ends.as_mut() {
+            ends.push(new_symbols.len());
+            symbol_dict.rollback(mark);
+        }
     }
     Ok(delta_start)
 }
@@ -708,6 +818,7 @@ unsafe fn encode_column(
     row_count: usize,
     col_idx: usize,
     per_column: &[Option<ResolvedColumn>],
+    local_symbols: Option<&[Vec<u8>]>,
 ) -> Result<()> {
     let validity = col.validity.as_ref();
     match col.kind {
@@ -806,7 +917,7 @@ unsafe fn encode_column(
                 }
             };
             unsafe {
-                encode_symbol(out, codes, resolved, row_count, validity)?;
+                encode_symbol(out, codes, resolved, row_count, validity, local_symbols)?;
             }
         }
         #[cfg(feature = "arrow-ingress")]
@@ -825,7 +936,13 @@ unsafe fn encode_column(
                 }
                 None => None,
             };
-            arrow_batch::write_arrow_column_body(out, arrow_kind, arr.as_ref(), sym_res)?;
+            arrow_batch::write_arrow_column_body_with_dict(
+                out,
+                arrow_kind,
+                arr.as_ref(),
+                sym_res,
+                local_symbols,
+            )?;
         }
         ColumnKind::NumpyDeferred {
             dtype,
@@ -1183,6 +1300,7 @@ unsafe fn encode_symbol(
     resolved: &RowResolvedSymbol,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
+    local_symbols: Option<&[Vec<u8>]>,
 ) -> Result<()> {
     let validity = validity.filter(|v| v.has_nulls());
     match validity {
@@ -1191,6 +1309,9 @@ unsafe fn encode_symbol(
             out.push(1);
             unsafe { write_qwp_bitmap_from_validity(out, v) };
         }
+    }
+    if let Some(entries) = local_symbols {
+        write_local_symbol_dictionary(out, entries);
     }
     out.reserve(resolved.non_null_count * 4);
     // Specialise on the code's bit width so the per-row loop is a
@@ -1326,6 +1447,97 @@ mod tests {
     use super::*;
     use crate::ingress::TimestampUnit;
     use crate::ingress::column_sender::Validity;
+
+    #[test]
+    fn record_chunks_keep_local_symbols_nulls_and_timestamps_across_flushes() {
+        use crate::ingress::sender::qwp_ws_record::RecordBatch;
+        use crate::tests::qwp_decode::{DecodedValue as V, decode_datagram};
+
+        let mut batch = RecordBatch::new();
+        let mut scratch = EncodeScratch::new();
+        let codes = [2, 0, 2];
+        let offsets = [0, 5, 9, 14];
+        let other_codes = [0, 0, 0];
+        let other_offsets = [0, 5];
+        let timestamps = [101, 102, 103];
+        let validity_bits = [0b101];
+        let validity = Validity::from_bitmap(&validity_bits, 3).unwrap();
+        let mut record = Vec::new();
+        for symbols in [b"alphabetagamma".as_slice(), b"deltazetaomega"] {
+            let mut chunk = Chunk::new("trades");
+            chunk
+                .symbol_i32("sym", &codes, &offsets, symbols, Some(&validity))
+                .unwrap();
+            chunk
+                .symbol_i32("other", &other_codes, &other_offsets, b"bravo", None)
+                .unwrap();
+            chunk.at_nanos(&timestamps).unwrap();
+            record.clear();
+            encode_chunk_record_into(&mut record, &chunk, &mut scratch, false).unwrap();
+            assert_eq!(scratch.record_symbol_dict.as_ref().unwrap().next_id(), 0);
+            assert!(batch.try_append(&record, 1 << 20, 100).unwrap());
+        }
+        let mut frame = Vec::new();
+        batch.encode_frame(&mut frame).unwrap();
+        let table = decode_datagram(&frame).unwrap().table;
+        assert_eq!(
+            table.rows,
+            vec![
+                vec![
+                    V::Symbol("gamma".into()),
+                    V::Symbol("bravo".into()),
+                    V::TimestampNanos(101)
+                ],
+                vec![V::Null, V::Symbol("bravo".into()), V::TimestampNanos(102)],
+                vec![
+                    V::Symbol("gamma".into()),
+                    V::Symbol("bravo".into()),
+                    V::TimestampNanos(103)
+                ],
+                vec![
+                    V::Symbol("omega".into()),
+                    V::Symbol("bravo".into()),
+                    V::TimestampNanos(101)
+                ],
+                vec![V::Null, V::Symbol("bravo".into()), V::TimestampNanos(102)],
+                vec![
+                    V::Symbol("omega".into()),
+                    V::Symbol("bravo".into()),
+                    V::TimestampNanos(103)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn record_chunk_error_rolls_back_bytes_and_reuses_scratch() {
+        let values = [7];
+        let bad_ts = [-1];
+        let mut chunk = Chunk::new("trades");
+        chunk.column_i64("qty", &values, None).unwrap();
+        chunk.at_nanos(&bad_ts).unwrap();
+        let mut scratch = EncodeScratch::new();
+        let mut out = vec![42];
+        let err = encode_chunk_record_into(&mut out, &chunk, &mut scratch, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidTimestamp);
+        assert_eq!(out, [42]);
+        chunk.clear();
+        chunk.column_i64("qty", &values, None).unwrap();
+        chunk.at_scalar_nanos(123).unwrap();
+        let wire_len = encode_chunk_record_into(&mut out, &chunk, &mut scratch, true).unwrap();
+        assert_eq!(&out[1..8], b"QSR1\x01\x01\x00");
+        let mut records = crate::ingress::sender::qwp_ws_record::RecordBatch::new();
+        records.try_append(&out[1..], usize::MAX, 0).unwrap();
+        let mut frame = Vec::new();
+        records.encode_frame(&mut frame).unwrap();
+        assert_eq!(wire_len, frame.len());
+        out.clear();
+        assert_eq!(
+            encode_chunk_record_into(&mut out, &Chunk::new(""), &mut scratch, false).unwrap(),
+            12
+        );
+        assert_eq!(out, b"QSR1\x00\x00\x00");
+    }
 
     fn make_chunk_i64(name: &str, data: &[i64]) -> Vec<u8> {
         let mut chunk = Chunk::new("trades");
@@ -1518,7 +1730,7 @@ mod tests {
                 let mut actual = Vec::new();
                 // SAFETY: typed source buffers and validity cover all four rows.
                 unsafe {
-                    encode_column(&mut actual, column, 4, 0, &[]).unwrap();
+                    encode_column(&mut actual, column, 4, 0, &[], None).unwrap();
                 }
                 let mut expected = if nullable {
                     vec![1, 0b0010, scale]
@@ -1554,7 +1766,7 @@ mod tests {
                 let mut actual = Vec::new();
                 // SAFETY: all three rows occupy a full shape, including NULL rows.
                 unsafe {
-                    encode_column(&mut actual, &chunk.columns[0], 3, 0, &[]).unwrap();
+                    encode_column(&mut actual, &chunk.columns[0], 3, 0, &[], None).unwrap();
                 }
                 let mut expected = if bits[0] == 0b111 {
                     vec![0]

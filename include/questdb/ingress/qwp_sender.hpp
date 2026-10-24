@@ -918,10 +918,11 @@ public:
     }
 
     /**
-     * Block until every frame published on this sender so far reaches `level`.
-     * The SFA queue owns delivery, so this is needed only to *observe* the ack,
-     * never for durability. `timeout` is a no-progress deadline (it fires only
-     * if the ack watermark fails to advance for that long); the default of zero
+     * Close any automatic commit batch through this borrow's pending boundary,
+     * then block until its publications reach `level`. Call before returning
+     * the publishing borrow; a fresh empty borrow does not drain earlier
+     * borrows or the whole pool. `timeout` is a no-progress deadline (it fires
+     * only if the ack watermark fails to advance for that long); zero
      * waits indefinitely. Throws on error.
      */
     void wait(
@@ -1237,7 +1238,8 @@ public:
             ::qwp_sender_flush_buffer, _view.c_ptr(), buffer._impl);
     }
 
-    /** Publish and clear a Buffer, then wait for `level`. */
+    /** Publish and clear a Buffer, close any automatic commit batch through
+     * this publication, then wait for `level`. */
     void flush_and_wait(
         line_sender_buffer& buffer, qwpws_ack_level level = qwpws_ack_level::ok)
     {
@@ -1346,10 +1348,11 @@ public:
     }
 
     /**
-     * Block until every frame published on this sender so far reaches `level`.
-     * The SFA queue owns delivery, so this is needed only to *observe* the ack,
-     * never for durability. `timeout` is a no-progress deadline (it fires only
-     * if the ack watermark fails to advance for that long); the default of zero
+     * Close any automatic commit batch through this borrow's pending boundary,
+     * then block until its publications reach `level`. Call before returning
+     * the publishing borrow; a fresh empty borrow does not drain earlier
+     * borrows or the whole pool. `timeout` is a no-progress deadline (it fires
+     * only if the ack watermark fails to advance for that long); zero
      * waits indefinitely. Throws on error.
      */
     void wait(

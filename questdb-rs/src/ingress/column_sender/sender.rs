@@ -319,7 +319,15 @@ impl PooledSenderCore {
         // side-file for us.
         let delta_dict_enabled = state.delta_dict_enabled;
         let persisted_symbol_dict = state.persisted_symbol_dict.take();
-        let mut foreground = SfaForegroundPublisher::new(delta_dict_enabled, persisted_symbol_dict);
+        let mut foreground = if let Some(global) = state.record_global_dict.take() {
+            debug_assert!(persisted_symbol_dict.is_none());
+            debug_assert!(
+                state.recovered_dict_entries.is_empty() && state.recovered_dict_count == 0
+            );
+            SfaForegroundPublisher::new_shared_memory(global)
+        } else {
+            SfaForegroundPublisher::new(delta_dict_enabled, persisted_symbol_dict)
+        };
         if delta_dict_enabled {
             // Take the recovered entries so the (potentially large) buffer is freed
             // after seeding rather than living dead in `state` -- which the backend
@@ -1611,14 +1619,24 @@ impl SfaBackend {
         // A Buffer is one indivisible publication (no row-range slicing), so
         // only the hard cap applies — there is no split to soft-target.
         let frame_cap = self.effective_frame_caps().hard;
-        let result = {
+        let result = (|| {
             let Self {
                 foreground,
                 state,
                 buffer_scratch,
+                drop_on_return,
                 ..
             } = self;
-            foreground.encode_persist_publish(
+            if state.use_record_for_rows(buffer.row_count())
+                && let SfaPublishOutcome::Published(fsn) = foreground.encode_record_publish(
+                    frame_cap,
+                    |payload| buffer.encode_sfa_record(payload, false),
+                    |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+                )?
+            {
+                return Ok(SfaPublishOutcome::Published(fsn));
+            }
+            let result = foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     buffer.encode_ws_replay_message_with_defer(
@@ -1631,8 +1649,21 @@ impl SfaBackend {
                     )
                 },
                 |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+            );
+            if result
+                .as_ref()
+                .is_err_and(|err| err.code() == ErrorCode::SymbolDictFull)
+            {
+                // A successful local retry must still retire the full allocator.
+                *drop_on_return = true;
+            }
+            foreground.retry_record_after_dict_full(
+                result,
+                frame_cap,
+                |payload| buffer.encode_sfa_record(payload, false),
+                |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
-        };
+        })();
         if let Err(err) = &result {
             self.latch_if_connection_is_spent(err);
         }
@@ -1858,14 +1889,26 @@ impl SfaBackend {
                 &view
             }
         };
-        let result = {
+        let result = (|| {
             let Self {
                 state,
                 foreground,
                 scratch,
+                drop_on_return,
                 ..
             } = self;
-            foreground.encode_persist_publish(
+            if state.use_record_for_rows(target.row_count())
+                && let SfaPublishOutcome::Published(fsn) = foreground.encode_record_publish(
+                    frame_cap,
+                    |payload| {
+                        encoder::encode_chunk_record_into(payload, target, scratch, defer_commit)
+                    },
+                    |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+                )?
+            {
+                return Ok(SfaPublishOutcome::Published(fsn));
+            }
+            let result = foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     if delta_enabled {
@@ -1887,8 +1930,20 @@ impl SfaBackend {
                     }
                 },
                 |encoded| publish_qwp_ws_payload_background(state, encoded, frame_cap),
+            );
+            if result
+                .as_ref()
+                .is_err_and(|err| err.code() == ErrorCode::SymbolDictFull)
+            {
+                *drop_on_return = true;
+            }
+            foreground.retry_record_after_dict_full(
+                result,
+                frame_cap,
+                |payload| encoder::encode_chunk_record_into(payload, target, scratch, defer_commit),
+                |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
-        };
+        })();
         if let Err(err) = &result {
             self.latch_if_connection_is_spent(err);
         }
@@ -2072,11 +2127,32 @@ impl SfaBackend {
                 &sliced
             }
         };
-        let result = {
+        let result = (|| {
             let Self {
-                state, foreground, ..
+                state,
+                foreground,
+                drop_on_return,
+                ..
             } = self;
-            foreground.encode_persist_publish(
+            if state.use_record_for_rows(batch.num_rows())
+                && let SfaPublishOutcome::Published(fsn) = foreground.encode_record_publish(
+                    frame_cap,
+                    |payload| {
+                        arrow_batch::encode_arrow_record_into(
+                            payload,
+                            spec.table,
+                            batch,
+                            spec.ts,
+                            spec.overrides,
+                            defer_commit,
+                        )
+                    },
+                    |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+                )?
+            {
+                return Ok(SfaPublishOutcome::Published(fsn));
+            }
+            let result = foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     if delta_enabled {
@@ -2102,8 +2178,29 @@ impl SfaBackend {
                     }
                 },
                 |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+            );
+            if result
+                .as_ref()
+                .is_err_and(|err| err.code() == ErrorCode::SymbolDictFull)
+            {
+                *drop_on_return = true;
+            }
+            foreground.retry_record_after_dict_full(
+                result,
+                frame_cap,
+                |payload| {
+                    arrow_batch::encode_arrow_record_into(
+                        payload,
+                        spec.table,
+                        batch,
+                        spec.ts,
+                        spec.overrides,
+                        defer_commit,
+                    )
+                },
+                |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
-        };
+        })();
         if let Err(err) = &result {
             self.latch_if_connection_is_spent(err);
         }
@@ -2198,6 +2295,8 @@ impl SfaBackend {
         if last_boundary.is_some_and(|last| last >= boundary) {
             return Ok(());
         }
+
+        crate::ingress::sender::qwp_ws_request_commit_background(&self.state, boundary);
 
         // No-progress deadline: reset every time the ack/durable watermark
         // advances, so this only fires when the peer stays alive yet silent

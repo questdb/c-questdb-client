@@ -257,6 +257,10 @@ pub(crate) enum QwpWsInitialConnectMode {
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone)]
 pub(crate) struct QwpWsConfig {
+    /// Internal pool configuration; standalone SenderBuilder rejects these keys.
+    pub(crate) pool_commit_interval: Option<std::time::Duration>,
+    pub(crate) pool_commit_rows: usize,
+    pub(crate) pool_commit_max_bytes: usize,
     pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
     pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
     /// Per-endpoint TCP connect (dial) budget. `None` (the default) keeps the
@@ -335,6 +339,9 @@ pub(crate) struct QwpWsConfig {
 impl Default for QwpWsConfig {
     fn default() -> Self {
         Self {
+            pool_commit_interval: None,
+            pool_commit_rows: 0,
+            pool_commit_max_bytes: usize::MAX,
             endpoints: ConfigSetting::new_default(Vec::new()),
             auth_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(15)),
             connect_timeout: ConfigSetting::new_default(None),

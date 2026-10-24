@@ -500,6 +500,15 @@ pub(crate) struct QwpWsConnector {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl QwpWsConnector {
+    pub(crate) fn configure_pool_commit_batching(
+        &mut self,
+        interval: Option<Duration>,
+        rows: usize,
+    ) {
+        self.qwp_ws.pool_commit_interval = interval;
+        self.qwp_ws.pool_commit_rows = rows;
+        self.qwp_ws.pool_commit_max_bytes = self.max_buf_size;
+    }
     /// Number of configured endpoints — the pool sizes its shared health
     /// tracker to this.
     pub(crate) fn endpoint_count(&self) -> usize {

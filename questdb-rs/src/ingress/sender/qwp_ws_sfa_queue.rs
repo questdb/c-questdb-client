@@ -496,6 +496,7 @@ struct SfaEngineState {
     topology_io_in_flight: bool,
     // Covers the full off-lock task, including any cleanup returned by finish.
     storage_maintenance_in_flight: bool,
+    hot_spare_creation_in_flight: bool,
     closed: bool,
 }
 
@@ -731,6 +732,7 @@ impl SfaFrameQueue {
                 trim_retry_at: None,
                 topology_io_in_flight: false,
                 storage_maintenance_in_flight: false,
+                hot_spare_creation_in_flight: false,
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
@@ -813,6 +815,7 @@ impl SfaFrameQueue {
                 trim_retry_at: None,
                 topology_io_in_flight: false,
                 storage_maintenance_in_flight: false,
+                hot_spare_creation_in_flight: false,
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
@@ -946,6 +949,7 @@ impl SfaFrameQueue {
                 trim_retry_at: None,
                 topology_io_in_flight: false,
                 storage_maintenance_in_flight: false,
+                hot_spare_creation_in_flight: false,
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
@@ -1355,6 +1359,10 @@ impl SfaFrameQueue {
 }
 
 impl SfaProgressView {
+    pub(crate) fn published_fsn(&self) -> Option<u64> {
+        self.engine.published_fsn()
+    }
+
     /// See [`SfaEngine::has_deferred_commit_headroom`].
     pub(crate) fn has_deferred_commit_headroom(&self) -> bool {
         self.engine.has_deferred_commit_headroom()
@@ -1376,9 +1384,10 @@ impl SfaProgressView {
             return Ok(None);
         };
         Ok(Some(OutboundFrame {
+            first_fsn: fsn,
             fsn,
             wire_seq,
-            payload,
+            payload: payload.into(),
         }))
     }
 
@@ -1403,7 +1412,7 @@ impl SfaProgressView {
         Ok(after > before)
     }
 
-    fn next_cursor_payload_for_fsn(
+    pub(crate) fn next_cursor_payload_for_fsn(
         &self,
         send_cursor: &mut Option<SfaSendCursor>,
         fsn: u64,
@@ -1503,23 +1512,32 @@ impl SfaProducer {
     }
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
+        if let Some(receipt) = self.try_submit_active(payload)? {
+            return Ok(receipt);
+        }
+        self.rotate_active()?;
+        self.try_submit_active(payload)?.ok_or_else(|| {
+            QueueError::PayloadExceedsByteCapacity {
+                payload_len: payload.len(),
+                max_bytes: self.engine.segment_payload_capacity(),
+            }
+            .into()
+        })
+    }
+
+    /// Append without rotating or waiting for capacity.
+    pub(crate) fn try_submit_active(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<Option<QwpReceipt>, SfaQueueError> {
         self.engine.check_durability()?;
         self.engine.validate_submit(payload)?;
         let fsn = self.next_fsn;
         let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
         if self.append_to_active(payload, next_fsn)? {
-            return Ok(QwpReceipt { fsn });
-        }
-
-        self.rotate_active()?;
-        if self.append_to_active(payload, next_fsn)? {
-            Ok(QwpReceipt { fsn })
+            Ok(Some(QwpReceipt { fsn }))
         } else {
-            Err(QueueError::PayloadExceedsByteCapacity {
-                payload_len: payload.len(),
-                max_bytes: self.engine.segment_payload_capacity(),
-            }
-            .into())
+            Ok(None)
         }
     }
 
@@ -1615,6 +1633,11 @@ impl SfaProducer {
             let (candidate, reserved_new_segment) = match state.hot_spare.take() {
                 Some(segment) => (Candidate::Existing(segment), false),
                 None => {
+                    // Reuse the spare already being prepared instead of
+                    // creating and syncing a competing disk segment.
+                    if self.engine.slot_dir.is_some() && state.hot_spare_creation_in_flight {
+                        return Err(self.engine.rotation_backpressure_error(&state).into());
+                    }
                     // The runner normally prepares the spare. If it is parked
                     // in socket I/O, reserve budget and create the successor on
                     // this appender without monopolizing topology readers.
@@ -1894,6 +1917,7 @@ impl SfaEngine {
             });
         }
         state.storage_maintenance_in_flight = false;
+        state.hot_spare_creation_in_flight = false;
         Ok(())
     }
 
@@ -2141,6 +2165,7 @@ impl SfaEngine {
             }
         };
         state.storage_maintenance_in_flight = true;
+        state.hot_spare_creation_in_flight = true;
         Ok(Some(SfaStorageStep::CreateHotSpare {
             path,
             base_seq: self.published_upper.load(Ordering::Acquire),
@@ -3577,6 +3602,25 @@ mod tests {
 
     fn open(dir: &TempDir) -> SfaFrameQueue {
         SfaFrameQueue::open(options(dir)).unwrap()
+    }
+
+    #[test]
+    fn active_only_append_leaves_rotation_and_sequence_to_slow_path() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(128, 256)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        let payload = vec![42; segment_payload_capacity(128)];
+        assert_eq!(
+            producer.try_submit_active(&payload).unwrap().unwrap().fsn,
+            0
+        );
+        let active = Arc::clone(&producer.active);
+        assert_eq!(producer.try_submit_active(&payload).unwrap(), None);
+        assert!(Arc::ptr_eq(&active, &producer.active));
+        assert_eq!(producer.published_fsn(), Some(0));
+        assert_eq!(producer.try_submit(&payload).unwrap().fsn, 1);
+        assert!(!Arc::ptr_eq(&active, &producer.active));
+        assert_eq!(queue.payload_vec_for_fsn(0), Some(payload.clone()));
+        assert_eq!(queue.payload_vec_for_fsn(1), Some(payload));
     }
 
     #[test]
@@ -6055,49 +6099,69 @@ mod tests {
     }
 
     #[test]
-    fn completed_hot_spare_is_abandoned_during_off_lock_rotation() {
+    fn disk_rotation_waits_for_and_reuses_in_flight_hot_spare() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 4)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        producer.try_submit(b"one").unwrap();
+        producer.try_submit(b"two").unwrap();
+        let allocated_before = queue.allocated_segment_bytes();
+
+        let spare_step = queue.take_storage_maintenance_step(true).unwrap().unwrap();
+        assert!(matches!(spare_step, SfaStorageStep::CreateHotSpare { .. }));
+        let spare_result = spare_step.perform().unwrap();
+        assert!(matches!(
+            producer.try_submit(b"tri"),
+            Err(SfaQueueError::Queue(
+                QueueError::StorageSpareNotReady { .. }
+            ))
+        ));
+        assert_eq!(queue.allocated_segment_bytes(), allocated_before);
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(queue.storage_maintenance_in_flight().unwrap());
+        assert!(matches!(
+            queue.close(),
+            Err(SfaQueueError::StorageMaintenanceInFlight)
+        ));
+
+        let finish = queue
+            .finish_storage_maintenance(spare_result, true)
+            .unwrap();
+        assert!(finish.did_change());
+        assert!(finish.into_cleanup().is_none());
+        queue.complete_storage_maintenance().unwrap();
+        assert!(queue.hot_spare_installed());
+        assert_eq!(producer.try_submit(b"tri").unwrap().fsn, 2);
+        assert_eq!(queue.sealed_segment_count(), 2);
+        assert_eq!(queue.allocated_segment_bytes(), 38 * 3);
+        assert_eq!(sfa_file_count(dir.path()), 3);
+        assert_eq!(queue.payload_vec_for_fsn(2).unwrap(), b"tri");
+    }
+
+    #[test]
+    fn disk_rotation_can_create_successor_after_spare_task_is_abandoned() {
         let dir = TempDir::new().unwrap();
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 4)).unwrap();
         let mut producer = queue.take_producer().unwrap();
         producer.try_submit(b"one").unwrap();
         producer.try_submit(b"two").unwrap();
 
-        let spare_step = queue.take_storage_maintenance_step(true).unwrap().unwrap();
-        assert!(matches!(spare_step, SfaStorageStep::CreateHotSpare { .. }));
-        let spare_result = spare_step.perform().unwrap();
-
-        let entered_sync = Arc::new(Barrier::new(2));
-        let release_sync = Arc::new(Barrier::new(2));
-        {
-            let mut state = queue.engine.state.lock().unwrap();
-            let entered_sync = Arc::clone(&entered_sync);
-            let release_sync = Arc::clone(&release_sync);
-            state
-                .manifest
-                .as_mut()
-                .unwrap()
-                .set_before_sync_hook(Arc::new(move || {
-                    entered_sync.wait();
-                    release_sync.wait();
-                    Ok(())
-                }));
-        }
-
-        let rotation = std::thread::spawn(move || producer.try_submit(b"tri"));
-        entered_sync.wait();
-
+        let step = queue.take_storage_maintenance_step(true).unwrap().unwrap();
+        assert!(matches!(step, SfaStorageStep::CreateHotSpare { .. }));
+        assert!(matches!(
+            producer.try_submit(b"tri"),
+            Err(SfaQueueError::Queue(
+                QueueError::StorageSpareNotReady { .. }
+            ))
+        ));
         let finish = queue
-            .finish_storage_maintenance(spare_result, true)
+            .finish_storage_maintenance(step.perform().unwrap(), false)
             .unwrap();
         assert!(!finish.did_change());
         assert!(finish.into_cleanup().unwrap().perform().is_none());
         queue.complete_storage_maintenance().unwrap();
-        assert!(queue.storage_maintenance_in_flight().unwrap());
         assert!(!queue.hot_spare_installed());
-
-        release_sync.wait();
-        assert_eq!(rotation.join().unwrap().unwrap().fsn, 2);
-        assert_eq!(queue.sealed_segment_count(), 2);
+        assert_eq!(producer.try_submit(b"tri").unwrap().fsn, 2);
         assert_eq!(queue.allocated_segment_bytes(), 38 * 3);
         assert_eq!(sfa_file_count(dir.path()), 3);
     }
