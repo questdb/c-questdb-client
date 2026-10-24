@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 
-use crate::ingress::buffer::decode_qwp_varint;
+use crate::ingress::buffer::{MAX_PERSISTED_SYMBOL_ENTRY_LEN, SymbolGlobalDict, decode_qwp_varint};
 use crate::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
 use crate::{Result, error};
 
@@ -423,6 +423,25 @@ pub(crate) struct RecordBatch {
 }
 
 #[derive(Debug, Default)]
+pub(crate) struct RecordDeltaScratch {
+    global_ids: Vec<u64>,
+    symbol_bytes: Vec<u8>,
+    symbol_ends: Vec<usize>,
+}
+
+impl RecordDeltaScratch {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn clear(&mut self) {
+        self.global_ids.clear();
+        self.symbol_bytes.clear();
+        self.symbol_ends.clear();
+    }
+}
+
+#[derive(Debug, Default)]
 struct Table {
     name: Vec<u8>,
     rows: usize,
@@ -712,6 +731,225 @@ impl RecordBatch {
         out[8..12].copy_from_slice(&length.to_le_bytes());
         Ok(())
     }
+
+    /// Encodes against the caller's exclusive symbol allocator. `prefix_start`
+    /// is the registered wire prefix, which may lag the allocator's current tip.
+    /// Returns false when dictionary or frame limits require the local format.
+    /// False and errors leave the logical dictionary and batch unchanged and
+    /// clear `out`; success retains new IDs even if a later send must be retried.
+    pub(crate) fn try_encode_delta_frame(
+        &self,
+        out: &mut Vec<u8>,
+        global: &mut SymbolGlobalDict,
+        prefix_start: u64,
+        max_frame_bytes: usize,
+        scratch: &mut RecordDeltaScratch,
+    ) -> Result<bool> {
+        out.clear();
+        scratch.clear();
+        let initial_tip = global.next_id();
+        if prefix_start > initial_tip {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "record delta starts at symbol id {} past dictionary end {}",
+                prefix_start,
+                initial_tip
+            ));
+        }
+        let mark = global.mark();
+        let result = self.encode_delta_frame_inner(
+            out,
+            global,
+            prefix_start,
+            max_frame_bytes.min(u32::MAX as usize),
+            scratch,
+        );
+        if !matches!(&result, Ok(true)) {
+            if global.next_id() != initial_tip {
+                global.rollback(mark);
+            }
+            out.clear();
+            scratch.clear();
+        }
+        result
+    }
+
+    fn encode_delta_frame_inner(
+        &self,
+        out: &mut Vec<u8>,
+        global: &mut SymbolGlobalDict,
+        prefix_start: u64,
+        max_frame_bytes: usize,
+        scratch: &mut RecordDeltaScratch,
+    ) -> Result<bool> {
+        let mut dictionary_count = (global.next_id() - prefix_start) as usize;
+        let mut frame_size = 0;
+        if !add_frame_bytes(&mut frame_size, 12, max_frame_bytes)
+            || !add_frame_bytes(
+                &mut frame_size,
+                varint_size(prefix_start as usize) + varint_size(dictionary_count),
+                max_frame_bytes,
+            )
+        {
+            return Ok(false);
+        }
+        for entry in global.entries_from(prefix_start).expect("checked prefix") {
+            if !add_frame_bytes(&mut frame_size, string_size(entry.len()), max_frame_bytes) {
+                return Ok(false);
+            }
+        }
+        for table in &self.tables {
+            if !add_frame_bytes(
+                &mut frame_size,
+                string_size(table.name.len())
+                    + varint_size(table.rows)
+                    + varint_size(table.columns.len()),
+                max_frame_bytes,
+            ) {
+                return Ok(false);
+            }
+            for column in &table.columns {
+                if !add_frame_bytes(
+                    &mut frame_size,
+                    string_size(column.name.len())
+                        + 1
+                        + 1
+                        + if column.has_bitmap {
+                            column.bitmap.len()
+                        } else {
+                            0
+                        }
+                        + usize::from(column.metadata.is_some()),
+                    max_frame_bytes,
+                ) {
+                    return Ok(false);
+                }
+                if column.kind != 9 {
+                    if !add_frame_bytes(&mut frame_size, column.offsets.len() * 4, max_frame_bytes)
+                        || !add_frame_bytes(&mut frame_size, column.data.len(), max_frame_bytes)
+                    {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+
+                scratch.global_ids.clear();
+                scratch
+                    .global_ids
+                    .try_reserve(column.symbols.len())
+                    .map_err(|_| delta_allocation_error())?;
+                for symbol in &column.symbols {
+                    let value = &column.symbol_data[symbol.start..][..symbol.len];
+                    if value.len() as u64 > MAX_PERSISTED_SYMBOL_ENTRY_LEN {
+                        return Ok(false);
+                    }
+                    let (id, is_new) = match global.intern(value) {
+                        Ok(resolved) => resolved,
+                        Err(error) if error.code() == crate::ErrorCode::SymbolDictFull => {
+                            return Ok(false);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    scratch.global_ids.push(id);
+                    if is_new {
+                        let previous_count_size = varint_size(dictionary_count);
+                        dictionary_count += 1;
+                        if !add_frame_bytes(
+                            &mut frame_size,
+                            string_size(value.len()) + varint_size(dictionary_count)
+                                - previous_count_size,
+                            max_frame_bytes,
+                        ) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                let max_id_size = varint_size(global.next_id().saturating_sub(1) as usize);
+                scratch
+                    .symbol_bytes
+                    .try_reserve(
+                        column
+                            .values
+                            .saturating_mul(max_id_size)
+                            .min(max_frame_bytes - frame_size),
+                    )
+                    .map_err(|_| delta_allocation_error())?;
+                let mut ids = Reader {
+                    bytes: &column.data,
+                };
+                for _ in 0..column.values {
+                    let local = ids.varint()?;
+                    let id = *scratch.global_ids.get(local).ok_or_else(invalid_record)?;
+                    if !add_frame_bytes(&mut frame_size, varint_size(id as usize), max_frame_bytes)
+                    {
+                        return Ok(false);
+                    }
+                    write_qwp_varint(&mut scratch.symbol_bytes, id);
+                }
+                if !ids.bytes.is_empty() {
+                    return Err(invalid_record());
+                }
+                scratch
+                    .symbol_ends
+                    .try_reserve(1)
+                    .map_err(|_| delta_allocation_error())?;
+                scratch.symbol_ends.push(scratch.symbol_bytes.len());
+            }
+        }
+
+        out.try_reserve(frame_size)
+            .map_err(|_| delta_allocation_error())?;
+        out.extend_from_slice(b"QWP1");
+        out.push(1);
+        out.push(8 | u8::from(self.defer_commit));
+        out.extend_from_slice(&(self.tables.len() as u16).to_le_bytes());
+        out.extend_from_slice(&((frame_size - 12) as u32).to_le_bytes());
+        write_qwp_varint(out, prefix_start);
+        write_qwp_varint(out, dictionary_count as u64);
+        for entry in global.entries_from(prefix_start).expect("checked prefix") {
+            write_qwp_bytes(out, entry);
+        }
+        let mut symbol_start = 0;
+        let mut symbol_ends = scratch.symbol_ends.iter();
+        for table in &self.tables {
+            write_qwp_bytes(out, &table.name);
+            write_qwp_varint(out, table.rows as u64);
+            write_qwp_varint(out, table.columns.len() as u64);
+            for column in &table.columns {
+                write_qwp_bytes(out, &column.name);
+                out.push(column.kind);
+            }
+            for column in &table.columns {
+                if column.kind == 9 {
+                    out.push(u8::from(column.has_bitmap));
+                    if column.has_bitmap {
+                        out.extend_from_slice(&column.bitmap);
+                    }
+                    let end = *symbol_ends.next().expect("prepared symbol column");
+                    out.extend_from_slice(&scratch.symbol_bytes[symbol_start..end]);
+                    symbol_start = end;
+                } else {
+                    column.encode(out);
+                }
+            }
+        }
+        debug_assert_eq!(out.len(), frame_size);
+        Ok(true)
+    }
+}
+
+fn add_frame_bytes(size: &mut usize, additional: usize, limit: usize) -> bool {
+    match size.checked_add(additional) {
+        Some(total) if total <= limit => {
+            *size = total;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn delta_allocation_error() -> crate::Error {
+    error::fmt!(InvalidApiCall, "could not allocate record delta frame")
 }
 
 impl Column {
@@ -1010,6 +1248,320 @@ mod tests {
             DecodedValue::Symbol("alpha".into())
         );
         assert_eq!(decoded.table.rows[18][23], DecodedValue::TimestampNanos(18));
+    }
+
+    #[test]
+    fn delta_frames_match_existing_encoder_for_all_types_nulls_and_multiple_tables() {
+        use crate::ingress::buffer::QwpWsEncodeScratch;
+
+        let mut single = QwpWsColumnarBuffer::new(127);
+        let mut expected = QwpWsColumnarBuffer::new(127);
+        let mut batch = RecordBatch::new();
+        for value in 0..19 {
+            for buffer in [&mut single, &mut expected] {
+                append_all_types(buffer, value);
+                buffer.table("quotes").unwrap();
+                if value % 2 == 0 {
+                    buffer
+                        .symbol("ticker", if value % 4 == 0 { "alpha" } else { "gamma" })
+                        .unwrap();
+                }
+                buffer
+                    .column_i64("qty", value)
+                    .unwrap()
+                    .at(TimestampNanos::new(value))
+                    .unwrap();
+            }
+            let mut payload = record(&single);
+            payload[4] = 1;
+            assert!(batch.try_append(&payload, 1 << 20, 1000).unwrap());
+            single.clear();
+        }
+        let local = frame(&batch);
+        let mut global = SymbolGlobalDict::new();
+        let mut reference_global = SymbolGlobalDict::new();
+        for dictionary in [&mut global, &mut reference_global] {
+            dictionary.intern(b"already registered").unwrap();
+        }
+        let mut scratch = RecordDeltaScratch::new();
+        let mut reference_scratch = QwpWsEncodeScratch::new();
+        let mut actual = Vec::new();
+        let mut reference = Vec::new();
+        assert!(
+            batch
+                .try_encode_delta_frame(&mut actual, &mut global, 1, 1 << 20, &mut scratch)
+                .unwrap()
+        );
+        expected
+            .encode_ws_replay_message_with_defer(
+                &mut reference,
+                &mut reference_scratch,
+                &mut reference_global,
+                1,
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(actual, reference);
+        assert_eq!(actual[5], 9);
+        assert_eq!(frame(&batch), local);
+
+        // A failed send leaves the wire prefix behind the allocated IDs.
+        assert!(
+            batch
+                .try_encode_delta_frame(&mut actual, &mut global, 1, 1 << 20, &mut scratch)
+                .unwrap()
+        );
+        assert_eq!(actual, reference);
+        let registered = global.next_id();
+        assert!(
+            batch
+                .try_encode_delta_frame(
+                    &mut actual,
+                    &mut global,
+                    registered,
+                    1 << 20,
+                    &mut scratch,
+                )
+                .unwrap()
+        );
+        expected
+            .encode_ws_replay_message_with_defer(
+                &mut reference,
+                &mut reference_scratch,
+                &mut reference_global,
+                1,
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(actual, reference);
+        assert_eq!(frame(&batch), local);
+    }
+
+    #[test]
+    fn delta_id_widths_and_exact_frame_caps_are_checked_before_mutation() {
+        let mut global = SymbolGlobalDict::new();
+        for index in 0..=16_384 {
+            global.intern(format!("seed{index}").as_bytes()).unwrap();
+        }
+        let registered = global.next_id();
+        let mut scratch = RecordDeltaScratch::new();
+        let mut out = Vec::new();
+        for id in [127, 128, 16_383, 16_384] {
+            let mut body = vec![1, 0b010, 1];
+            write_qwp_bytes(&mut body, format!("seed{id}").as_bytes());
+            body.extend_from_slice(&[0, 0]);
+            let mut batch = RecordBatch::new();
+            batch
+                .try_append(&one_column(9, 3, &body), 4096, 1000)
+                .unwrap();
+            let local = frame(&batch);
+            assert!(
+                batch
+                    .try_encode_delta_frame(&mut out, &mut global, registered, 4096, &mut scratch)
+                    .unwrap()
+            );
+            let saved = out.clone();
+            let mut reader = Reader { bytes: &out[12..] };
+            assert_eq!(reader.varint().unwrap(), registered as usize);
+            assert_eq!(reader.varint().unwrap(), 0);
+            assert_eq!(reader.string().unwrap(), b"t");
+            assert_eq!(reader.varint().unwrap(), 3);
+            assert_eq!(reader.varint().unwrap(), 1);
+            assert_eq!(reader.string().unwrap(), b"c");
+            assert_eq!(reader.byte().unwrap(), 9);
+            assert_eq!(reader.byte().unwrap(), 1);
+            assert_eq!(reader.byte().unwrap(), 0b010);
+            assert_eq!(reader.varint().unwrap(), id);
+            assert_eq!(reader.varint().unwrap(), id);
+            assert!(reader.bytes.is_empty());
+            assert!(
+                !batch
+                    .try_encode_delta_frame(
+                        &mut out,
+                        &mut global,
+                        registered,
+                        saved.len() - 1,
+                        &mut scratch,
+                    )
+                    .unwrap()
+            );
+            assert!(out.is_empty());
+            assert_eq!(global.next_id(), registered);
+            assert_eq!(frame(&batch), local);
+            assert!(
+                batch
+                    .try_encode_delta_frame(
+                        &mut out,
+                        &mut global,
+                        registered,
+                        saved.len(),
+                        &mut scratch,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(out, saved);
+        }
+    }
+
+    #[test]
+    fn delta_dictionary_limits_roll_back_partial_interning() {
+        let mut body = vec![0, 2];
+        write_qwp_bytes(&mut body, b"a");
+        write_qwp_bytes(&mut body, b"bc");
+        body.extend_from_slice(&[0, 1]);
+        let mut batch = RecordBatch::new();
+        batch
+            .try_append(&one_column(9, 2, &body), 4096, 1000)
+            .unwrap();
+        let local = frame(&batch);
+        for mut global in [
+            SymbolGlobalDict::with_cap(2),
+            SymbolGlobalDict::with_heap_cap(6),
+        ] {
+            global.intern(b"seed").unwrap();
+            let mut scratch = RecordDeltaScratch::new();
+            let mut out = vec![255];
+            assert!(
+                !batch
+                    .try_encode_delta_frame(&mut out, &mut global, 1, 4096, &mut scratch)
+                    .unwrap()
+            );
+            assert!(out.is_empty());
+            assert_eq!(global.next_id(), 1);
+            assert_eq!(global.entry(0), Some(b"seed".as_slice()));
+            assert!(global.entry(1).is_none());
+            assert_eq!(frame(&batch), local);
+            // Both the entry count and the heap accounting must be restored.
+            assert_eq!(global.intern(b"xy").unwrap(), (1, true));
+        }
+    }
+
+    #[test]
+    fn delta_prefix_growth_and_scratch_reuse_keep_exact_sizes() {
+        let mut batch = RecordBatch::new();
+        let payload = one_column(9, 1, &[0, 1, 1, b'a', 0]);
+        batch.try_append(&payload, 4096, 1000).unwrap();
+        let mut global = SymbolGlobalDict::new();
+        for index in 0..127 {
+            global.intern(format!("seed{index}").as_bytes()).unwrap();
+        }
+        let mut scratch = RecordDeltaScratch::new();
+        let mut out = Vec::new();
+        assert!(
+            batch
+                .try_encode_delta_frame(&mut out, &mut global, 0, 4096, &mut scratch)
+                .unwrap()
+        );
+        let saved = out.clone();
+        assert_eq!(global.next_id(), 128);
+        let mut reader = Reader { bytes: &out[12..] };
+        assert_eq!(reader.varint().unwrap(), 0);
+        assert_eq!(reader.varint().unwrap(), 128);
+        assert!(
+            !batch
+                .try_encode_delta_frame(&mut out, &mut global, 0, saved.len() - 1, &mut scratch)
+                .unwrap()
+        );
+        assert!(out.is_empty());
+        batch.clear();
+        batch.try_append(&payload, 4096, 1000).unwrap();
+        assert!(
+            batch
+                .try_encode_delta_frame(&mut out, &mut global, 0, saved.len(), &mut scratch)
+                .unwrap()
+        );
+        assert_eq!(out, saved);
+    }
+
+    #[test]
+    fn delta_encoding_error_rolls_back_new_ids() {
+        let mut batch = RecordBatch::new();
+        batch
+            .try_append(&one_column(9, 1, &[0, 1, 1, b'a', 0]), 4096, 1000)
+            .unwrap();
+        // Only an internal inconsistency can reach this error after append's
+        // validation; even then the shared allocator must remain reusable.
+        batch.tables[0].columns[0].data[0] = 1;
+        let mut global = SymbolGlobalDict::new();
+        let mut out = vec![255];
+        assert!(
+            batch
+                .try_encode_delta_frame(
+                    &mut out,
+                    &mut global,
+                    0,
+                    4096,
+                    &mut RecordDeltaScratch::new(),
+                )
+                .is_err()
+        );
+        assert!(out.is_empty());
+        assert_eq!(global.next_id(), 0);
+        assert_eq!(global.intern(b"different").unwrap(), (0, true));
+    }
+
+    #[test]
+    fn delta_size_and_invalid_prefix_failures_leave_local_fallback_available() {
+        let mut batch = RecordBatch::new();
+        batch
+            .try_append(&one_column(9, 1, &[0, 1, 1, b'a', 0]), 4096, 1000)
+            .unwrap();
+        let local = frame(&batch);
+        let mut global = SymbolGlobalDict::new();
+        let mut scratch = RecordDeltaScratch::new();
+        let mut out = vec![255];
+        assert!(
+            !batch
+                .try_encode_delta_frame(&mut out, &mut global, 0, local.len(), &mut scratch)
+                .unwrap()
+        );
+        assert!(out.is_empty());
+        assert_eq!(global.next_id(), 0);
+        assert!(global.entry(0).is_none());
+        assert_eq!(frame(&batch), local);
+        let error = batch
+            .try_encode_delta_frame(&mut out, &mut global, 1, 4096, &mut scratch)
+            .unwrap_err();
+        assert_eq!(error.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(out.is_empty());
+        assert_eq!(global.next_id(), 0);
+        assert!(
+            batch
+                .try_encode_delta_frame(&mut out, &mut global, 0, local.len() + 1, &mut scratch)
+                .unwrap()
+        );
+        assert_eq!(out.len(), local.len() + 1);
+    }
+
+    #[test]
+    fn delta_entry_limit_does_not_reject_an_accepted_local_record() {
+        let value = vec![b'x'; MAX_PERSISTED_SYMBOL_ENTRY_LEN as usize + 1];
+        let mut body = vec![0, 1];
+        write_qwp_bytes(&mut body, &value);
+        body.push(0);
+        let mut batch = RecordBatch::new();
+        batch
+            .try_append(&one_column(9, 1, &body), 1 << 22, 1000)
+            .unwrap();
+        let local = frame(&batch);
+        let mut global = SymbolGlobalDict::new();
+        let mut out = Vec::new();
+        assert!(
+            !batch
+                .try_encode_delta_frame(
+                    &mut out,
+                    &mut global,
+                    0,
+                    1 << 22,
+                    &mut RecordDeltaScratch::new(),
+                )
+                .unwrap()
+        );
+        assert!(out.is_empty());
+        assert_eq!(global.next_id(), 0);
+        assert_eq!(frame(&batch), local);
     }
 
     #[test]
