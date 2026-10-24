@@ -26,7 +26,7 @@
 
 use super::qwp_ws_sfa_symbol_dict::{PersistedSymbolDict, PersistedSymbolDictMark};
 use crate::ingress::buffer::{SymbolGlobalDict, SymbolGlobalDictMark};
-use crate::{Result, error};
+use crate::{ErrorCode, Result, error};
 use std::sync::{Arc, Mutex};
 
 pub(crate) type SharedSymbolGlobalDict = Arc<Mutex<SymbolGlobalDict>>;
@@ -200,6 +200,28 @@ impl SfaForegroundPublisher {
             });
         }
         publish(&self.payload).map(SfaPublishOutcome::Published)
+    }
+
+    /// A shared allocator can fill while assembling earlier records. Retry the
+    /// rolled-back publication locally, without changing either admission cap.
+    pub(crate) fn retry_record_after_dict_full(
+        &mut self,
+        result: Result<SfaPublishOutcome>,
+        max_buf_size: usize,
+        encode: impl FnOnce(&mut Vec<u8>) -> Result<usize>,
+        publish: impl FnOnce(&[u8]) -> Result<u64>,
+    ) -> Result<SfaPublishOutcome> {
+        let original = match result {
+            Err(err) if self.shared_global.is_some() && err.code() == ErrorCode::SymbolDictFull => {
+                err
+            }
+            other => return other,
+        };
+        match self.encode_record_publish(max_buf_size, encode, publish) {
+            Ok(SfaPublishOutcome::TooLarge { .. }) => Err(original),
+            Err(err) if err.code() == ErrorCode::BatchTooLarge => Err(original),
+            other => other,
+        }
     }
 
     /// Encode, size-check, write-ahead, and append one frame as a single
@@ -496,6 +518,37 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, SfaPublishOutcome::Published(9)));
         assert_eq!(global.lock().unwrap().next_id(), 0);
+    }
+
+    #[test]
+    fn shared_memory_dict_fallback_preserves_both_caps_and_original_error() {
+        for (stored, wire) in [(65, 60), (60, 65)] {
+            let global = Arc::new(Mutex::new(SymbolGlobalDict::with_cap(1)));
+            let mut foreground = SfaForegroundPublisher::new_shared_memory(global);
+            let result = foreground.retry_record_after_dict_full(
+                Err(error::fmt!(SymbolDictFull, "original dictionary error")),
+                64,
+                |payload| {
+                    payload.resize(stored, 0);
+                    Ok(wire)
+                },
+                |_| panic!("oversized fallback must not publish"),
+            );
+            let err = result.unwrap_err();
+            assert_eq!(err.code(), ErrorCode::SymbolDictFull);
+            assert_eq!(err.msg(), "original dictionary error");
+        }
+        let mut foreground = SfaForegroundPublisher::new(true, None);
+        let err = foreground
+            .retry_record_after_dict_full(
+                Err(error::fmt!(SymbolDictFull, "unshared dictionary error")),
+                4096,
+                |_| panic!("unshared publisher must not use this fallback"),
+                |_| panic!("unshared publisher must not use this fallback"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SymbolDictFull);
+        assert_eq!(err.msg(), "unshared dictionary error");
     }
 
     #[test]

@@ -1421,6 +1421,18 @@ fn one_symbol_buffer(db: &QuestDb, symbol: &str) -> crate::ingress::Buffer {
     buffer
 }
 
+fn two_symbol_buffer(db: &QuestDb, symbol: &str) -> crate::ingress::Buffer {
+    let mut buffer = one_symbol_buffer(db, symbol);
+    buffer
+        .table("trades")
+        .unwrap()
+        .symbol("sym", symbol)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    buffer
+}
+
 #[cfg(feature = "arrow-ingress")]
 fn symbol_arrow_batch(values: Vec<&str>) -> arrow::array::RecordBatch {
     use arrow::array::StringArray;
@@ -5648,6 +5660,123 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
         vec![vec![b"alpha".to_vec()], vec![b"bravo".to_vec()]],
         "one chunk per frame, each carrying exactly that frame's new symbols"
     );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn stream_memory_full_shared_dict_retries_each_input_and_retires_after_drain() {
+    use crate::ingress::column_sender::ArrowColumnOverride;
+    use crate::tests::qwp_decode::{DecodedValue, decode_datagram};
+
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    for input in ["buffer", "chunk", "arrow"] {
+        let (server, release, frames) = MockServer::spawn_ack_when_released_capturing(2);
+        let db = QuestDb::connect(&conf_for(server.port(),
+            "query_pool_min=0;sender_pool_max=1;pool_reap=manual;commit_rows=2;commit_interval_ms=1;",
+        )).unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush_buffer(&mut one_symbol_buffer(&db, "alpha"))
+            .unwrap();
+        let first = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            parse_delta_dict_prefix(&first),
+            (0, vec![b"alpha".to_vec()])
+        );
+        // The first record filled the allocator on the background thread. A
+        // larger publication using only that existing ID must remain reusable.
+        sender
+            .flush_buffer(&mut two_symbol_buffer(&db, "alpha"))
+            .unwrap();
+        let known = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(parse_delta_dict_prefix(&known), (1, Vec::new()));
+        drop(sender);
+        assert_eq!(db.free_count(), 1);
+        let mut sender = db.borrow_sender().unwrap();
+        assert_eq!(server.accepted(), 1);
+        assert_eq!(sender.published_fsn().unwrap(), Some(1));
+        match input {
+            "buffer" => {
+                let mut buffer = two_symbol_buffer(&db, "bravo");
+                sender.flush_buffer(&mut buffer).unwrap();
+                assert!(buffer.is_empty());
+            }
+            "chunk" => {
+                let mut chunk = Chunk::new("trades");
+                chunk
+                    .symbol_i32("sym", &[0, 0], &[0, 5], b"bravo", None)
+                    .unwrap();
+                chunk.at_now().unwrap();
+                sender.flush(&mut chunk).unwrap();
+                assert!(chunk.is_empty());
+            }
+            _ => sender
+                .flush_arrow_batch_at_now(
+                    "trades",
+                    &symbol_arrow_batch(vec!["bravo", "bravo"]),
+                    &[ArrowColumnOverride::Symbol { column: "sym" }],
+                )
+                .unwrap(),
+        }
+        assert_eq!(sender.published_fsn().unwrap(), Some(2));
+        let fallback = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(fallback[5] & 8, 0, "{input}");
+        assert_eq!(
+            decode_datagram(&fallback).unwrap().table.rows,
+            vec![vec![DecodedValue::Symbol("bravo".into())]; 2]
+        );
+        release.store(true, Ordering::SeqCst);
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), Some(2));
+        drop(sender);
+        assert_eq!(
+            db.free_count(),
+            0,
+            "a successful retry must still retire the full allocator"
+        );
+        let mut fresh = db.borrow_sender().unwrap();
+        fresh
+            .flush_buffer_and_wait(&mut one_symbol_buffer(&db, "charlie"), AckLevel::Ok)
+            .unwrap();
+        let fresh_frame = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            parse_delta_dict_prefix(&fresh_frame),
+            (0, vec![b"charlie".to_vec()])
+        );
+        assert_eq!(server.accepted(), 2);
+    }
+}
+
+#[test]
+fn stream_memory_full_shared_dict_keeps_original_error_when_buffer_record_cannot_fit() {
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let (server, release, frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "query_pool_min=0;sender_pool_max=1;pool_reap=manual;commit_rows=2;commit_interval_ms=1;\
+         sf_max_segment_bytes=512;sf_max_total_bytes=1024;",
+    ))
+    .unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush_buffer(&mut one_symbol_buffer(&db, "alpha"))
+        .unwrap();
+    let first = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        parse_delta_dict_prefix(&first),
+        (0, vec![b"alpha".to_vec()])
+    );
+    let mut oversized = two_symbol_buffer(&db, &"x".repeat(512));
+    let err = sender.flush_buffer(&mut oversized).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SymbolDictFull);
+    assert_eq!(oversized.row_count(), 2);
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+    release.store(true, Ordering::SeqCst);
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    assert_eq!(sender.acked_fsn().unwrap(), Some(0));
+    assert!(frames.try_recv().is_err());
+    drop(sender);
+    assert_eq!(db.free_count(), 0);
 }
 
 #[test]

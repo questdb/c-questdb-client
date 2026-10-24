@@ -1624,6 +1624,7 @@ impl SfaBackend {
                 foreground,
                 state,
                 buffer_scratch,
+                drop_on_return,
                 ..
             } = self;
             if state.use_record_for_rows(buffer.row_count())
@@ -1635,7 +1636,7 @@ impl SfaBackend {
             {
                 return Ok(SfaPublishOutcome::Published(fsn));
             }
-            foreground.encode_persist_publish(
+            let result = foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     buffer.encode_ws_replay_message_with_defer(
@@ -1647,6 +1648,19 @@ impl SfaBackend {
                         delta_enabled,
                     )
                 },
+                |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+            );
+            if result
+                .as_ref()
+                .is_err_and(|err| err.code() == ErrorCode::SymbolDictFull)
+            {
+                // A successful local retry must still retire the full allocator.
+                *drop_on_return = true;
+            }
+            foreground.retry_record_after_dict_full(
+                result,
+                frame_cap,
+                |payload| buffer.encode_sfa_record(payload, false),
                 |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
         })();
@@ -1880,6 +1894,7 @@ impl SfaBackend {
                 state,
                 foreground,
                 scratch,
+                drop_on_return,
                 ..
             } = self;
             if state.use_record_for_rows(target.row_count())
@@ -1893,7 +1908,7 @@ impl SfaBackend {
             {
                 return Ok(SfaPublishOutcome::Published(fsn));
             }
-            foreground.encode_persist_publish(
+            let result = foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     if delta_enabled {
@@ -1915,6 +1930,18 @@ impl SfaBackend {
                     }
                 },
                 |encoded| publish_qwp_ws_payload_background(state, encoded, frame_cap),
+            );
+            if result
+                .as_ref()
+                .is_err_and(|err| err.code() == ErrorCode::SymbolDictFull)
+            {
+                *drop_on_return = true;
+            }
+            foreground.retry_record_after_dict_full(
+                result,
+                frame_cap,
+                |payload| encoder::encode_chunk_record_into(payload, target, scratch, defer_commit),
+                |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
         })();
         if let Err(err) = &result {
@@ -2102,7 +2129,10 @@ impl SfaBackend {
         };
         let result = (|| {
             let Self {
-                state, foreground, ..
+                state,
+                foreground,
+                drop_on_return,
+                ..
             } = self;
             if state.use_record_for_rows(batch.num_rows())
                 && let SfaPublishOutcome::Published(fsn) = foreground.encode_record_publish(
@@ -2122,7 +2152,7 @@ impl SfaBackend {
             {
                 return Ok(SfaPublishOutcome::Published(fsn));
             }
-            foreground.encode_persist_publish(
+            let result = foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     if delta_enabled {
@@ -2146,6 +2176,27 @@ impl SfaBackend {
                             defer_commit,
                         )
                     }
+                },
+                |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+            );
+            if result
+                .as_ref()
+                .is_err_and(|err| err.code() == ErrorCode::SymbolDictFull)
+            {
+                *drop_on_return = true;
+            }
+            foreground.retry_record_after_dict_full(
+                result,
+                frame_cap,
+                |payload| {
+                    arrow_batch::encode_arrow_record_into(
+                        payload,
+                        spec.table,
+                        batch,
+                        spec.ts,
+                        spec.overrides,
+                        defer_commit,
+                    )
                 },
                 |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
