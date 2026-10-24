@@ -38,7 +38,7 @@ use rand::RngCore;
 
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
-use crate::ingress::buffer::QwpWsColumnarBuffer;
+use crate::ingress::buffer::{QwpWsColumnarBuffer, SymbolGlobalDict};
 use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability};
 use crate::ingress::tls::{TlsSettings, configure_tls};
 use crate::ws::frame::{
@@ -64,6 +64,7 @@ use super::qwp_ws_orphan::{
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
 use super::qwp_ws_queue::{OutboundFrame, SentFrame};
+use super::qwp_ws_sfa_publisher::SharedSymbolGlobalDict;
 use super::qwp_ws_sfa_queue::{
     SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError, segment_payload_capacity,
     two_frame_segment_payload_capacity,
@@ -452,6 +453,7 @@ pub(crate) struct SyncQwpWsHandlerState {
     runner: SyncQwpWsRunner,
     record_first: bool,
     record_first_row_limit: usize,
+    pub(crate) record_global_dict: Option<SharedSymbolGlobalDict>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
     /// Hard cap on a single store-and-forward frame's payload: `sf_max_segment_bytes`
@@ -580,6 +582,7 @@ struct QwpWsPendingConnect {
     /// Empty in memory mode / on a fresh slot.
     recovered_dict_entries: Vec<u8>,
     recovered_dict_count: u32,
+    record_global_dict: Option<SharedSymbolGlobalDict>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1108,6 +1111,7 @@ impl QwpWsPendingConnect {
             delta_dict_enabled,
             recovered_dict_entries,
             recovered_dict_count,
+            record_global_dict: None,
         }
     }
 
@@ -1230,6 +1234,7 @@ impl SyncQwpWsPendingRunnerCore {
                         self.pending_connect.recovered_dict_count,
                     );
                 }
+                send_core.set_record_global_dict(self.pending_connect.record_global_dict.clone());
                 self.connected = Some(SyncQwpWsRunnerCore {
                     send_core,
                     progress: self.progress.clone(),
@@ -3536,6 +3541,10 @@ pub(crate) fn connect_qwp_ws_background_state(
     );
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
     let traffic_gate = Arc::new(TrafficGate::default());
+    // QSR1 does not persist background-assigned global IDs. Sharing is safe in
+    // memory slots, whose allocator and replay mirror survive every reconnect.
+    let record_global_dict = (qwp_ws.sf_dir.is_none() && qwp_ws.pool_commit_interval.is_some())
+        .then(|| Arc::new(Mutex::new(SymbolGlobalDict::new())));
     let (
         runner,
         encoder,
@@ -3589,7 +3598,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         if delta_dict_enabled {
             encoder.seed_global_dict(&recovered_dict_entries, recovered_dict_count)?;
         }
-        let pending_connect = QwpWsPendingConnect::new(
+        let mut pending_connect = QwpWsPendingConnect::new(
             host,
             port,
             use_tls,
@@ -3603,6 +3612,7 @@ pub(crate) fn connect_qwp_ws_background_state(
             try_dup_recovered(&recovered_dict_entries)?,
             recovered_dict_count,
         );
+        pending_connect.record_global_dict = record_global_dict.clone();
         let runner = SyncQwpWsRunner::start_pending_connect(
             queue,
             pending_connect,
@@ -3649,6 +3659,9 @@ pub(crate) fn connect_qwp_ws_background_state(
                 .send_core
                 .enable_delta_dict(&parts.recovered_dict_entries, parts.recovered_dict_count);
         }
+        parts
+            .send_core
+            .set_record_global_dict(record_global_dict.clone());
         let runner = SyncQwpWsRunner::start_with_append_deadline(
             parts.store,
             parts.send_core,
@@ -3678,6 +3691,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         } else {
             qwp_ws.pool_commit_rows.min(1_000)
         },
+        record_global_dict,
         encoder,
         runner,
         server_max_batch_size,

@@ -319,7 +319,15 @@ impl PooledSenderCore {
         // side-file for us.
         let delta_dict_enabled = state.delta_dict_enabled;
         let persisted_symbol_dict = state.persisted_symbol_dict.take();
-        let mut foreground = SfaForegroundPublisher::new(delta_dict_enabled, persisted_symbol_dict);
+        let mut foreground = if let Some(global) = state.record_global_dict.take() {
+            debug_assert!(persisted_symbol_dict.is_none());
+            debug_assert!(
+                state.recovered_dict_entries.is_empty() && state.recovered_dict_count == 0
+            );
+            SfaForegroundPublisher::new_shared_memory(global)
+        } else {
+            SfaForegroundPublisher::new(delta_dict_enabled, persisted_symbol_dict)
+        };
         if delta_dict_enabled {
             // Take the recovered entries so the (potentially large) buffer is freed
             // after seeding rather than living dead in `state` -- which the backend

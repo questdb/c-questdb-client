@@ -33,8 +33,8 @@
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, TryLockError};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -58,11 +58,12 @@ use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderE
 use super::qwp_ws_queue::{
     OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
 };
-use super::qwp_ws_record::{RecordBatch, is_record};
+use super::qwp_ws_record::{RecordBatch, RecordDeltaScratch, is_record};
 use super::qwp_ws_sfa_catchup::{
     CatchUpEntryTooLarge, CatchUpFrameBuildError, CatchUpStreamError, SentDictMirror,
     frame_delta_start,
 };
+use super::qwp_ws_sfa_publisher::SharedSymbolGlobalDict;
 #[cfg(test)]
 use super::qwp_ws_sfa_queue::SfaMemoryQueueOptions;
 use super::qwp_ws_sfa_queue::{
@@ -180,11 +181,13 @@ pub(crate) struct QwpWsSendCore<T> {
     transport: T,
     send_cursor: SendCursor,
     record_batch: RecordBatch,
+    record_global_dict: Option<SharedSymbolGlobalDict>,
+    record_delta_scratch: RecordDeltaScratch,
     record_last_fsn: Option<u64>,
     record_started: Option<Instant>,
     ready_record_through: Option<u64>,
-    /// I/O-thread-local mirror of every symbol dictionary entry sent on this
-    /// connection, used to re-register the whole dictionary via catch-up frame(s)
+    /// I/O-thread-local mirror of sent legacy symbols and accepted memory-record
+    /// symbols prepared for sending, re-registered via catch-up frame(s)
     /// on reconnect. Inert (disabled) unless the store enables delta mode via
     /// [`Self::enable_delta_dict`]; disabled keeps every frame self-sufficient.
     dict_mirror: SentDictMirror,
@@ -867,6 +870,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             transport,
             send_cursor: SendCursor::new(),
             record_batch: RecordBatch::new(),
+            record_global_dict: None,
+            record_delta_scratch: RecordDeltaScratch::new(),
             record_last_fsn: None,
             record_started: None,
             ready_record_through: None,
@@ -883,6 +888,10 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             completed_at_last_role_recycle: None,
             sends_on_connection: 0,
         }
+    }
+
+    pub(crate) fn set_record_global_dict(&mut self, global: Option<SharedSymbolGlobalDict>) {
+        self.record_global_dict = global;
     }
 
     fn apply_response<Q: PublicationLog>(
@@ -1367,8 +1376,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             return Ok(None);
         }
         let mut payload = Vec::new();
-        self.record_batch
-            .encode_frame(&mut payload)
+        self.encode_record_frame(&mut payload, max_bytes)
             .map_err(DriverError::Storage)?;
         let fsn = self.record_last_fsn.take().expect("nonempty record batch");
         self.record_batch.clear();
@@ -1380,6 +1388,42 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             wire_seq,
             payload: payload.into(),
         }))
+    }
+
+    fn encode_record_frame(
+        &mut self,
+        payload: &mut Vec<u8>,
+        max_bytes: usize,
+    ) -> crate::Result<()> {
+        if self.dict_mirror.is_enabled()
+            && let Some(shared) = self.record_global_dict.as_ref()
+        {
+            // A foreground publication can hold this lock while waiting for SF
+            // capacity. Local frames keep the queue draining during that wait.
+            let mut global = match shared.try_lock() {
+                Ok(global) => Some(global),
+                Err(TryLockError::Poisoned(_) | TryLockError::WouldBlock) => None,
+            };
+            if let Some(global) = global.as_deref_mut() {
+                let mark = global.mark();
+                if self.record_batch.try_encode_delta_frame(
+                    payload,
+                    global,
+                    u64::from(self.dict_mirror.count()),
+                    max_bytes,
+                    &mut self.record_delta_scratch,
+                )? {
+                    // Reserve catch-up coverage before foreground deltas can
+                    // reference these IDs, even if this data frame's send fails.
+                    if self.dict_mirror.try_accumulate_delta(payload) {
+                        return Ok(());
+                    }
+                    global.rollback(mark);
+                    payload.clear();
+                }
+            }
+        }
+        self.record_batch.encode_frame(payload)
     }
 
     pub(crate) fn begin_send_batch(&mut self) -> usize {

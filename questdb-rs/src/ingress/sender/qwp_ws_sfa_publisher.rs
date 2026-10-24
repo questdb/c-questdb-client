@@ -27,6 +27,9 @@
 use super::qwp_ws_sfa_symbol_dict::{PersistedSymbolDict, PersistedSymbolDictMark};
 use crate::ingress::buffer::{SymbolGlobalDict, SymbolGlobalDictMark};
 use crate::{Result, error};
+use std::sync::{Arc, Mutex};
+
+pub(crate) type SharedSymbolGlobalDict = Arc<Mutex<SymbolGlobalDict>>;
 
 /// Result of atomically encoding and appending one store-and-forward frame.
 #[derive(Debug)]
@@ -155,6 +158,7 @@ impl SymbolPublishState {
 /// Encoders write directly into `payload`; the queue borrows that same allocation.
 pub(crate) struct SfaForegroundPublisher {
     symbols: SymbolPublishState,
+    shared_global: Option<SharedSymbolGlobalDict>,
     payload: Vec<u8>,
 }
 
@@ -162,7 +166,15 @@ impl SfaForegroundPublisher {
     pub(crate) fn new(delta_enabled: bool, persisted: Option<PersistedSymbolDict>) -> Self {
         Self {
             symbols: SymbolPublishState::new(delta_enabled, persisted),
+            shared_global: None,
             payload: Vec::new(),
+        }
+    }
+
+    pub(crate) fn new_shared_memory(global: SharedSymbolGlobalDict) -> Self {
+        Self {
+            shared_global: Some(global),
+            ..Self::new(true, None)
         }
     }
 
@@ -200,6 +212,30 @@ impl SfaForegroundPublisher {
         encode: impl FnOnce(&mut Vec<u8>, &mut SymbolGlobalDict, bool) -> Result<()>,
         publish: impl FnOnce(&[u8]) -> Result<u64>,
     ) -> Result<SfaPublishOutcome> {
+        if let Some(global) = self.shared_global.as_ref() {
+            // Keep rollback exclusive through publication. The background only
+            // try-locks and can drain local record frames while this waits for space.
+            let mut global = global
+                .lock()
+                .map_err(|_| error::fmt!(SocketError, "QWP symbol dictionary lock is poisoned"))?;
+            let mark = global.mark();
+            self.payload.clear();
+            let result = (|| {
+                encode(&mut self.payload, &mut global, true)?;
+                let encoded_len = self.payload.len();
+                if encoded_len > max_buf_size {
+                    return Ok(SfaPublishOutcome::TooLarge {
+                        encoded_len,
+                        max_buf_size,
+                    });
+                }
+                publish(&self.payload).map(SfaPublishOutcome::Published)
+            })();
+            if !matches!(result, Ok(SfaPublishOutcome::Published(_))) {
+                global.rollback(mark);
+            }
+            return result;
+        }
         self.payload.clear();
         let global_mark = self.symbols.global.mark();
         // The producer's id before this frame — i.e. this frame's `delta_start`.
