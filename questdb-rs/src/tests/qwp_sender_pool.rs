@@ -5670,7 +5670,7 @@ fn stream_memory_full_shared_dict_retries_each_input_and_retires_after_drain() {
 
     let _cap = crate::ingress::TestDictCapGuard::new(1);
     for input in ["buffer", "chunk", "arrow"] {
-        let (server, release, frames) = MockServer::spawn_ack_when_released_capturing(2);
+        let (server, frames) = MockServer::spawn_acking_capturing(2);
         let db = QuestDb::connect(&conf_for(server.port(),
             "query_pool_min=0;sender_pool_max=1;pool_reap=manual;commit_rows=2;commit_interval_ms=1;",
         )).unwrap();
@@ -5725,7 +5725,6 @@ fn stream_memory_full_shared_dict_retries_each_input_and_retires_after_drain() {
             decode_datagram(&fallback).unwrap().table.rows,
             vec![vec![DecodedValue::Symbol("bravo".into())]; 2]
         );
-        release.store(true, Ordering::SeqCst);
         sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
         assert_eq!(sender.acked_fsn().unwrap(), Some(2));
         drop(sender);
