@@ -4306,15 +4306,20 @@ impl QwpWsColumnBuffer {
             return Err(type_mismatch_error_ws(&self.name));
         };
         let bytes = value.as_bytes();
-        let hash = qwp_ws_symbol_hash(bytes);
         // A one-symbol batch needs no hash table. Build the index only when a
         // second distinct symbol arrives, retaining the same dictionary IDs.
-        let existing = if dict.len() == 1 {
-            symbol_entry_bytes(dict, data, 0)
-                .filter(|stored| *stored == bytes)
-                .map(|_| 0)
-        } else {
-            lookup.get(hash, bytes, dict, data)
+        let (existing, hash) = match dict.len() {
+            0 => (None, None),
+            1 => (
+                symbol_entry_bytes(dict, data, 0)
+                    .filter(|stored| *stored == bytes)
+                    .map(|_| 0),
+                None,
+            ),
+            _ => {
+                let hash = qwp_ws_symbol_hash(bytes);
+                (lookup.get(hash, bytes, dict, data), Some(hash))
+            }
         };
         let (local_id, is_new) = if let Some(local_id) = existing {
             (local_id, false)
@@ -4329,7 +4334,7 @@ impl QwpWsColumnBuffer {
                 lookup.insert(qwp_ws_symbol_hash(first), 0);
             }
             if local_id != 0 {
-                lookup.insert(hash, local_id);
+                lookup.insert(hash.unwrap_or_else(|| qwp_ws_symbol_hash(bytes)), local_id);
             }
             (local_id, true)
         };
@@ -11872,13 +11877,19 @@ mod tests {
         column.rollback_rows_from(2);
         column.append_symbol(2, "gamma").unwrap();
         column.append_symbol(3, "beta").unwrap();
+        column.append_symbol(4, "beta").unwrap();
+        column.append_symbol(5, "alpha").unwrap();
+        column.append_symbol(6, "gamma").unwrap();
         assert_eq!(
             values(&column),
             [
                 b"alpha".to_vec(),
                 b"alpha".to_vec(),
                 b"gamma".to_vec(),
-                b"beta".to_vec()
+                b"beta".to_vec(),
+                b"beta".to_vec(),
+                b"alpha".to_vec(),
+                b"gamma".to_vec()
             ]
         );
         cloned.append_symbol(2, "gamma").unwrap();
