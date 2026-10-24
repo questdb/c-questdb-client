@@ -33,8 +33,8 @@
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, TryLockError};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1400,10 +1400,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         {
             // A foreground publication can hold this lock while waiting for SF
             // capacity. Local frames keep the queue draining during that wait.
-            let mut global = match shared.try_lock() {
-                Ok(global) => Some(global),
-                Err(TryLockError::Poisoned(_) | TryLockError::WouldBlock) => None,
-            };
+            let mut global = shared.try_lock().ok();
             if let Some(global) = global.as_deref_mut() {
                 let mark = global.mark();
                 if self.record_batch.try_encode_delta_frame(
@@ -5701,6 +5698,68 @@ mod tests {
             driver.send_core.transport.sent_payloads().last().unwrap()[5] & 8,
             0
         );
+    }
+
+    #[test]
+    fn shared_record_delta_allocation_failure_sends_local_frame_without_leaking_ids() {
+        use crate::tests::qwp_decode::{DecodedValue, decode_datagram};
+
+        let global = Arc::new(std::sync::Mutex::new(SymbolGlobalDict::new()));
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.send_core.enable_delta_dict(&[], 0);
+        driver
+            .send_core
+            .set_record_global_dict(Some(Arc::clone(&global)));
+        driver
+            .try_submit(&shared_legacy_payload(&global, "alpha"))
+            .unwrap();
+        driver.drive_send_once().unwrap();
+
+        let receipt = driver.try_submit(&symbol_record("bravo", 2)).unwrap();
+        driver
+            .send_core
+            .record_delta_scratch
+            .fail_next_symbol_allocation_for_test();
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(frame) if frame.fsn == receipt.fsn
+        ));
+        let payload = driver.send_core.transport.sent_payloads().last().unwrap();
+        assert_eq!(payload[5] & 8, 0);
+        assert_eq!(
+            decode_datagram(payload).unwrap().table.rows[0][0],
+            DecodedValue::Symbol("bravo".into())
+        );
+        {
+            let global = global.lock().unwrap();
+            assert_eq!(global.next_id(), 1);
+            assert_eq!(global.entry(0), Some(b"alpha".as_slice()));
+            assert!(global.entry(1).is_none());
+        }
+        assert_eq!(driver.send_core.dict_mirror.count(), 1);
+        let catch_up = driver
+            .send_core
+            .dict_mirror
+            .build_catch_up_frames(0, 1)
+            .unwrap();
+        assert_catch_up_frame(&catch_up[0], &[b"alpha"]);
+
+        // A subsequent foreground frame can safely reuse the rolled-back id,
+        // and cumulative completion still drains the accepted local record.
+        let last = driver
+            .try_submit(&shared_legacy_payload(&global, "charlie"))
+            .unwrap();
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(frame) if frame.fsn == last.fsn
+        ));
+        assert_eq!(global.lock().unwrap().entry(1), Some(b"charlie".as_slice()));
+        assert_eq!(driver.send_core.dict_mirror.count(), 2);
+        driver
+            .send_core
+            .finish_response(&mut driver.store, TransportResponse::Ack { wire_seq: 2 })
+            .unwrap();
+        assert_eq!(driver.store.queue.completed_fsn(), Some(last.fsn));
     }
 
     #[test]

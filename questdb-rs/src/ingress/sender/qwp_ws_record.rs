@@ -427,6 +427,8 @@ pub(crate) struct RecordDeltaScratch {
     global_ids: Vec<u64>,
     symbol_bytes: Vec<u8>,
     symbol_ends: Vec<usize>,
+    #[cfg(test)]
+    fail_next_symbol_allocation: bool,
 }
 
 impl RecordDeltaScratch {
@@ -438,6 +440,11 @@ impl RecordDeltaScratch {
         self.global_ids.clear();
         self.symbol_bytes.clear();
         self.symbol_ends.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_symbol_allocation_for_test(&mut self) {
+        self.fail_next_symbol_allocation = true;
     }
 }
 
@@ -734,7 +741,8 @@ impl RecordBatch {
 
     /// Encodes against the caller's exclusive symbol allocator. `prefix_start`
     /// is the registered wire prefix, which may lag the allocator's current tip.
-    /// Returns false when dictionary or frame limits require the local format.
+    /// Returns false when dictionary limits, frame limits, or delta allocation
+    /// failures require the local format.
     /// False and errors leave the logical dictionary and batch unchanged and
     /// clear `out`; success retains new IDs even if a later send must be retried.
     pub(crate) fn try_encode_delta_frame(
@@ -834,21 +842,22 @@ impl RecordBatch {
                 }
 
                 scratch.global_ids.clear();
-                scratch
+                if scratch
                     .global_ids
                     .try_reserve(column.symbols.len())
-                    .map_err(|_| delta_allocation_error())?;
+                    .is_err()
+                {
+                    return Ok(false);
+                }
                 for symbol in &column.symbols {
                     let value = &column.symbol_data[symbol.start..][..symbol.len];
                     if value.len() as u64 > MAX_PERSISTED_SYMBOL_ENTRY_LEN {
                         return Ok(false);
                     }
-                    let (id, is_new) = match global.intern(value) {
-                        Ok(resolved) => resolved,
-                        Err(error) if error.code() == crate::ErrorCode::SymbolDictFull => {
-                            return Ok(false);
-                        }
-                        Err(error) => return Err(error),
+                    let Ok((id, is_new)) = global.intern(value) else {
+                        // These records are already accepted. A dictionary cap
+                        // or allocation failure must not stop their local replay.
+                        return Ok(false);
                     };
                     scratch.global_ids.push(id);
                     if is_new {
@@ -865,15 +874,21 @@ impl RecordBatch {
                     }
                 }
                 let max_id_size = varint_size(global.next_id().saturating_sub(1) as usize);
-                scratch
-                    .symbol_bytes
-                    .try_reserve(
-                        column
-                            .values
-                            .saturating_mul(max_id_size)
-                            .min(max_frame_bytes - frame_size),
-                    )
-                    .map_err(|_| delta_allocation_error())?;
+                let symbol_capacity = column
+                    .values
+                    .saturating_mul(max_id_size)
+                    .min(max_frame_bytes - frame_size);
+                #[cfg(test)]
+                let symbol_capacity = if std::mem::take(&mut scratch.fail_next_symbol_allocation) {
+                    // Exercise the real reservation-error path after interning,
+                    // without exhausting process memory or affecting other tests.
+                    usize::MAX
+                } else {
+                    symbol_capacity
+                };
+                if scratch.symbol_bytes.try_reserve(symbol_capacity).is_err() {
+                    return Ok(false);
+                }
                 let mut ids = Reader {
                     bytes: &column.data,
                 };
@@ -889,16 +904,16 @@ impl RecordBatch {
                 if !ids.bytes.is_empty() {
                     return Err(invalid_record());
                 }
-                scratch
-                    .symbol_ends
-                    .try_reserve(1)
-                    .map_err(|_| delta_allocation_error())?;
+                if scratch.symbol_ends.try_reserve(1).is_err() {
+                    return Ok(false);
+                }
                 scratch.symbol_ends.push(scratch.symbol_bytes.len());
             }
         }
 
-        out.try_reserve(frame_size)
-            .map_err(|_| delta_allocation_error())?;
+        if out.try_reserve(frame_size).is_err() {
+            return Ok(false);
+        }
         out.extend_from_slice(b"QWP1");
         out.push(1);
         out.push(8 | u8::from(self.defer_commit));
@@ -946,10 +961,6 @@ fn add_frame_bytes(size: &mut usize, additional: usize, limit: usize) -> bool {
         }
         _ => false,
     }
-}
-
-fn delta_allocation_error() -> crate::Error {
-    error::fmt!(InvalidApiCall, "could not allocate record delta frame")
 }
 
 impl Column {
@@ -1436,6 +1447,42 @@ mod tests {
             // Both the entry count and the heap accounting must be restored.
             assert_eq!(global.intern(b"xy").unwrap(), (1, true));
         }
+    }
+
+    #[test]
+    fn delta_allocation_failure_rolls_back_new_ids_and_preserves_local_frame() {
+        let mut batch = RecordBatch::new();
+        batch
+            .try_append(&one_column(9, 1, &[0, 1, 1, b'a', 0]), 4096, 1000)
+            .unwrap();
+        let local = frame(&batch);
+        let mut global = SymbolGlobalDict::new();
+        global.intern(b"seed").unwrap();
+        let mut scratch = RecordDeltaScratch::new();
+        scratch.fail_next_symbol_allocation_for_test();
+        let mut out = vec![255];
+
+        assert!(
+            !batch
+                .try_encode_delta_frame(&mut out, &mut global, 1, 4096, &mut scratch)
+                .unwrap()
+        );
+        assert!(out.is_empty());
+        assert_eq!(global.next_id(), 1);
+        assert_eq!(global.entry(0), Some(b"seed".as_slice()));
+        assert!(global.entry(1).is_none());
+        assert_eq!(frame(&batch), local);
+        assert!(scratch.global_ids.is_empty());
+        assert!(scratch.symbol_bytes.is_empty());
+        assert!(scratch.symbol_ends.is_empty());
+
+        assert!(
+            batch
+                .try_encode_delta_frame(&mut out, &mut global, 1, 4096, &mut scratch)
+                .unwrap()
+        );
+        assert_eq!(global.next_id(), 2);
+        assert_eq!(global.entry(1), Some(b"a".as_slice()));
     }
 
     #[test]
