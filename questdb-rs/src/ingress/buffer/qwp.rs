@@ -2508,15 +2508,22 @@ struct QwpWsSizeHint {
 
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsSizeHint {
+    #[inline(always)]
     fn mark_dirty(&mut self, table_idx: usize) {
+        if self.tables.get(table_idx).is_some_and(|table| table.dirty) {
+            return;
+        }
+        self.mark_dirty_slow(table_idx);
+    }
+
+    #[inline(never)]
+    fn mark_dirty_slow(&mut self, table_idx: usize) {
         if self.tables.len() <= table_idx {
             self.tables
                 .resize(table_idx + 1, QwpWsTableSizeHint::default());
         }
-        if !self.tables[table_idx].dirty {
-            self.tables[table_idx].dirty = true;
-            self.dirty_tables.push(table_idx);
-        }
+        self.tables[table_idx].dirty = true;
+        self.dirty_tables.push(table_idx);
     }
 
     fn truncate(&mut self, table_count: usize) {
@@ -10764,6 +10771,38 @@ mod tests {
             .unwrap();
         assert_eq!(buf.len(), buf.recompute_len_slow());
         assert_eq!(buf.size_hint_recomputed_tables(), recomputed + 1);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_size_hint_stays_current_between_fields() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for cycle in 0..2 {
+            for table in ["trades", "quotes"] {
+                buf.table(table)
+                    .unwrap()
+                    .symbol("sym", "alpha")
+                    .unwrap()
+                    .column_i64("value", 1)
+                    .unwrap()
+                    .at_now()
+                    .unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+
+                buf.table(table).unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+                buf.symbol("sym", "bravo").unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+                buf.column_i64("value", 2).unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+                buf.column_str("note", "new field").unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+                buf.at_now().unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow(), "cycle {cycle}");
+            }
+            buf.clear();
+            assert_eq!(buf.len(), buf.recompute_len_slow());
+        }
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
