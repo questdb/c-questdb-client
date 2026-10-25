@@ -4119,6 +4119,24 @@ pub(crate) fn qwp_ws_ok_fsn_background(
     state.runner.ok_fsn()
 }
 
+/// Take before checking a completion watermark or error condition.
+pub(crate) fn qwp_ws_progress_generation_background(state: &SyncQwpWsHandlerState) -> u64 {
+    state.runner.backpressure.generation()
+}
+
+/// Wait for runner progress or the absolute deadline. The caller must recheck
+/// its watermark/error predicate: sends and storage maintenance also notify.
+pub(crate) fn qwp_ws_wait_for_progress_background(
+    state: &SyncQwpWsHandlerState,
+    generation: u64,
+    deadline: Option<Instant>,
+) {
+    state
+        .runner
+        .backpressure
+        .wait_for_change(generation, deadline);
+}
+
 pub(crate) fn qwp_ws_request_commit_background(state: &SyncQwpWsHandlerState, boundary: u64) {
     update_atomic_max(
         &state.runner.commit_requested_upper,
