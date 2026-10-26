@@ -6739,6 +6739,7 @@ mod tests {
     #[derive(Debug)]
     struct FailFirstBatchFlushTransport {
         fail_next_flush: bool,
+        unflushed: bool,
         sent_fsns: Arc<Mutex<Vec<u64>>>,
     }
 
@@ -6751,7 +6752,7 @@ mod tests {
             &mut self,
             _force_through: Option<u64>,
         ) -> Result<(), TransportFailure> {
-            if std::mem::take(&mut self.fail_next_flush) {
+            if std::mem::take(&mut self.unflushed) && std::mem::take(&mut self.fail_next_flush) {
                 return Err(TransportFailure::Disconnect(crate::Error::new(
                     crate::ErrorCode::SocketError,
                     "fake batch flush failure",
@@ -6768,6 +6769,7 @@ mod tests {
             &mut self,
             frame: OutboundFrameView<'_>,
         ) -> Result<TransportSendResult, TransportFailure> {
+            self.unflushed = true;
             self.sent_fsns.lock().unwrap().push(frame.sent_frame().fsn);
             Ok(TransportSendResult::NoResponse)
         }
@@ -6782,6 +6784,7 @@ mod tests {
         let sent_fsns = Arc::new(Mutex::new(Vec::new()));
         let transport = FailFirstBatchFlushTransport {
             fail_next_flush: true,
+            unflushed: false,
             sent_fsns: Arc::clone(&sent_fsns),
         };
         let driver = QwpWsCoreTestHarness::from_queue(memory_queue(1024), transport);
