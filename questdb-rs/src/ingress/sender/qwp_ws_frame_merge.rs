@@ -771,6 +771,42 @@ mod tests {
     }
 
     #[test]
+    fn cleared_batch_splices_the_next_window_like_a_fresh_one() {
+        let (frames, _) = frames(&[1; 6], |buffer, value| {
+            buffer
+                .table("trades")
+                .unwrap()
+                .column_i64("id", value)
+                .unwrap();
+            if value % 3 != 1 {
+                buffer
+                    .symbol("sym", format!("s{value}"))
+                    .unwrap()
+                    .column_bool("flag", value % 2 == 0)
+                    .unwrap()
+                    .column_str("note", "x".repeat(value as usize))
+                    .unwrap();
+            }
+            buffer.at(TimestampNanos::new(value)).unwrap();
+        });
+        let mut batch = FrameBatch::default();
+        for (window, has_nulls) in [(0..2, true), (2..4, false), (4..6, true)] {
+            batch.clear();
+            for frame in &frames[window.clone()] {
+                assert!(batch.try_append(frame, usize::MAX, 0));
+            }
+            assert_eq!(
+                batch.tables[0]
+                    .columns
+                    .iter()
+                    .any(|column| column.has_nulls),
+                has_nulls
+            );
+            assert_eq!(encoded(&batch), splice(&frames[window]));
+        }
+    }
+
+    #[test]
     fn splices_multi_table_frames_per_table() {
         let (frames, expected) = frames(&[1, 2, 1], |buffer, value| {
             buffer
@@ -1016,6 +1052,20 @@ mod tests {
         assert!(batch.try_append(&two, usize::MAX, 3));
         assert!(batch.try_append(&frames[0], usize::MAX, 3));
         assert_eq!(batch.rows(), 3);
+    }
+
+    #[test]
+    fn table_block_stops_at_the_server_row_limit() {
+        let bools = |rows: usize| raw_frame(rows as u64, 1, &vec![0; 1 + rows.div_ceil(8)]);
+        let half = MAX_TABLE_ROWS / 2;
+        let mut batch = FrameBatch::default();
+        assert!(batch.try_append(&bools(half), usize::MAX, 0));
+        assert!(batch.try_append(&bools(MAX_TABLE_ROWS - half), usize::MAX, 0));
+        assert_eq!(batch.rows(), MAX_TABLE_ROWS);
+        let full = encoded(&batch);
+        assert!(!batch.try_append(&bools(1), usize::MAX, 0));
+        assert_eq!(batch.rows(), MAX_TABLE_ROWS);
+        assert_eq!(encoded(&batch), full);
     }
 
     fn raw_frame(rows: u64, kind: u8, body: &[u8]) -> Vec<u8> {
