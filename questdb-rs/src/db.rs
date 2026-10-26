@@ -678,17 +678,19 @@ impl QuestDb {
     /// | `idle_timeout_ms`    | 60000   | Above-minimum idle connections are closed after this long. |
     /// | `pool_reap`          | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
     /// | `lazy_connect`       | `false` | Tolerate a down server at startup: connect opens nothing, senders buffer and connect in the background, readers connect on first borrow. |
-    /// | `commit_interval_ms` | unset   | Opt in to background commit batching for ingestion senders; close a window after this many milliseconds. Positive integer. |
-    /// | `commit_rows`        | unset   | Also close a commit window after this many rows. Positive integer; alone enables a 100 ms interval. |
+    /// | `commit_interval_ms` | unset   | Opt in to commit windows for ingestion senders; close a window after this many milliseconds. Positive integer; alone, a window also closes every 1000 rows. |
+    /// | `commit_rows`        | unset   | Close a commit window after this many rows. Positive integer; alone, a window also closes every 100 ms. |
     ///
-    /// Commit windows span leases on the same ingestion slot. `flush` still
-    /// publishes to SF before returning; `wait` forces its pending boundary
-    /// to commit. Returning a lease does not close the window. ACKs, and so
-    /// acked FSNs, advance when a window commits. A server rejection reports
-    /// the FSN range of the whole committed frame, which can include other
-    /// leases' publications on the same slot. Network batching
-    /// of ready frames is automatic and adds no timer to wait for more frames.
-    /// Standalone senders reject the two `commit_*` keys. SF, in memory or on
+    /// A commit window belongs to each ingestion connection and spans the
+    /// leases that share it. `flush` still publishes to SF before returning;
+    /// `wait` forces its pending boundary to commit. Returning a lease does not
+    /// close the window. ACKs, and so acked FSNs, advance when a window
+    /// commits. A server rejection reports the FSN range of the rejected
+    /// message, which can include other leases' publications on the same slot;
+    /// the window's earlier uncommitted frames roll back with it and replay
+    /// unless the rejection is terminal. Network batching of ready frames is
+    /// automatic and adds no timer to wait for more frames. Standalone
+    /// QWP/WebSocket senders accept the same two keys. SF, in memory or on
     /// disk, always holds QWP frames; with a commit window the background
     /// sender combines consecutive small flushes into one QWP message on the
     /// wire.
@@ -851,8 +853,7 @@ impl QuestDb {
             builder.force_async_initial_connect();
         }
         let buffer_max_name_len = builder.configured_max_name_len();
-        let mut connector = builder.build_qwp_ws_connector()?;
-        connector.configure_pool_commit_batching(pool_cfg.commit_interval, pool_cfg.commit_rows);
+        let connector = builder.build_qwp_ws_connector()?;
         let health = QwpWsHostHealthTracker::new(connector.endpoint_count());
         let slot_base_id = connector.sender_id().to_owned();
         let managed_slot_exclusion = if sf_disk {
@@ -2340,6 +2341,13 @@ impl OwnedDirectColumnSender {
     /// with no pool. The builder is only borrowed.
     pub fn from_builder(builder: &SenderBuilder) -> Result<Self> {
         let connector = builder.build_qwp_ws_connector()?;
+        if connector.has_commit_window() {
+            return Err(error::fmt!(
+                ConfigError,
+                "commit_rows and commit_interval_ms require a store-and-forward sender; \
+                 the direct column sender commits every publication"
+            ));
+        }
         let health = Mutex::new(QwpWsHostHealthTracker::new(connector.endpoint_count()));
         let raw = connector.connect_round_pooled(&health, None)?;
         let conn = ColumnConn::from_round_stream(raw)?;

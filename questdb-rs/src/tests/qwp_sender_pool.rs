@@ -381,6 +381,51 @@ fn stream_commit_batching_spans_leases_and_wait_closes_short_tail() {
 }
 
 #[test]
+fn standalone_sender_commit_window_splices_flushes_until_wait() {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{};auth_timeout=2000;commit_rows=1000;commit_interval_ms=60000;",
+        server.port()
+    ))
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    for qty in 0..3 {
+        buffer
+            .table("trades")
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .at(TimestampNanos::new(qty))
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+    }
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(frame_qty_values(&frame), [0, 1, 2]);
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn standalone_direct_sender_rejects_a_commit_window() {
+    for key in ["commit_rows=10;", "commit_interval_ms=10;"] {
+        let Err(err) =
+            crate::db::OwnedDirectColumnSender::from_conf(&format!("ws::addr=127.0.0.1:1;{key}"))
+        else {
+            panic!("a direct sender must not accept {key}");
+        };
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().starts_with(
+                "commit_rows and commit_interval_ms require a store-and-forward sender"
+            )
+        );
+    }
+}
+
+#[test]
 fn stream_commit_batching_idle_timer_and_close_do_not_need_another_flush() {
     for close in [false, true] {
         let (tx, frames) = mpsc::channel();

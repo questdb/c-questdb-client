@@ -79,8 +79,6 @@ pub(crate) struct PoolConfig {
     /// `connect()` pre-opens the warm minimums and fails fast, honoring
     /// `initial_connect_retry`.
     pub(crate) lazy_connect: bool,
-    pub(crate) commit_interval: Option<Duration>,
-    pub(crate) commit_rows: usize,
 }
 
 impl Default for PoolConfig {
@@ -94,8 +92,6 @@ impl Default for PoolConfig {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             pool_reap: PoolReap::Auto,
             lazy_connect: false,
-            commit_interval: None,
-            commit_rows: 0,
         }
     }
 }
@@ -140,12 +136,10 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
     let mut sender_conf = format!("{service}::");
 
     walk_params(params, |key, value| {
-        if !matches!(key, "commit_interval_ms" | "commit_rows") {
-            sender_conf.push_str(key);
-            sender_conf.push('=');
-            sender_conf.push_str(&value.replace(';', ";;"));
-            sender_conf.push(';');
-        }
+        sender_conf.push_str(key);
+        sender_conf.push('=');
+        sender_conf.push_str(&value.replace(';', ";;"));
+        sender_conf.push(';');
         // `sf_dir` selects disk-backed store-and-forward slots;
         // all other `sf_*` / `sender_id` keys are passthrough to the
         // `SenderBuilder`, tuning the in-memory or disk queue — the same as the
@@ -154,26 +148,6 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
             sf_dir_specified = true;
         }
         match key {
-            "commit_interval_ms" => {
-                let interval = parse_pool_timeout_ms(key, value)?;
-                if interval.is_zero() {
-                    return Err(error::fmt!(
-                        ConfigError,
-                        "commit_interval_ms must be greater than 0"
-                    ));
-                }
-                pool.commit_interval = Some(interval);
-            }
-            "commit_rows" => {
-                pool.commit_rows =
-                    value
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|v| *v > 0)
-                        .ok_or_else(|| {
-                            error::fmt!(ConfigError, "commit_rows must be a positive integer")
-                        })?;
-            }
             "request_durable_ack" => {
                 // Syntactic check; the SenderBuilder also parses this
                 // for ColumnConn.
@@ -335,9 +309,6 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         ));
     }
 
-    if pool.commit_rows > 0 && pool.commit_interval.is_none() {
-        pool.commit_interval = Some(Duration::from_millis(100));
-    }
     Ok(ParsedConf {
         pool,
         sender_conf,
@@ -455,26 +426,14 @@ mod tests {
     use crate::ErrorCode;
 
     #[test]
-    fn commit_batching_is_pool_only_and_preserves_escaped_values() {
-        let parsed = parse("ws::addr=localhost:9000;commit_rows=500;token=a;;b;").unwrap();
-        assert_eq!(parsed.pool.commit_rows, 500);
+    fn commit_window_keys_reach_the_sender_conf_with_escaped_values() {
+        let parsed =
+            parse("ws::addr=localhost:9000;commit_rows=500;commit_interval_ms=25;token=a;;b;")
+                .unwrap();
         assert_eq!(
-            parsed.pool.commit_interval,
-            Some(Duration::from_millis(100))
+            parsed.sender_conf,
+            "ws::addr=localhost:9000;commit_rows=500;commit_interval_ms=25;token=a;;b;"
         );
-        assert_eq!(parsed.sender_conf, "ws::addr=localhost:9000;token=a;;b;");
-        assert!(
-            crate::ingress::SenderBuilder::from_conf("ws::addr=localhost:9000;commit_rows=500;")
-                .is_err()
-        );
-        for key in ["commit_rows", "commit_interval_ms"] {
-            for value in ["0", "-1", "invalid", "18446744073709551616"] {
-                assert!(parse(&format!("ws::addr=localhost:9000;{key}={value};")).is_err());
-            }
-        }
-        let parsed = parse("ws::addr=localhost:9000;commit_interval_ms=25;").unwrap();
-        assert_eq!(parsed.pool.commit_interval, Some(Duration::from_millis(25)));
-        assert_eq!(parsed.pool.commit_rows, 0);
     }
 
     fn parse_ok(conf: &str) -> ParsedConf {

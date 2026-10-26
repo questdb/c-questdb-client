@@ -840,8 +840,9 @@ impl Sender {
     /// A terminal server rejection of a frame in the pending range, or a
     /// terminal transport/protocol failure, is returned as an error. Retriable
     /// server rejections reconnect and replay until the frame is acknowledged or
-    /// the sender is stopped. When nothing has been published yet, a valid wait
-    /// returns immediately. QWP/WebSocket only; other
+    /// the sender is stopped. With a commit window the wait closes the window
+    /// instead of waiting for it. When nothing has been published yet, a valid
+    /// wait returns immediately. QWP/WebSocket only; other
     /// protocols return `InvalidApiCall`. In manual progress mode this also
     /// drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -868,6 +869,9 @@ impl Sender {
         let Some(boundary) = self.published_fsn()? else {
             return Ok(());
         };
+        if let SyncProtocolHandler::SyncQwpWs(state) = &self.handler {
+            qwp_ws_request_commit_background(state, boundary);
+        }
 
         // No-progress deadline: reset whenever the completion watermark
         // advances, so it only fires when the peer stays alive yet silent.

@@ -118,16 +118,18 @@ durability barrier; configure both when end-to-end durability is required.
 
 ### Commit windows
 
-When each message borrows its own pooled sender, a commit window lets many
-small flushes share one server commit:
+When each message is flushed on its own, through a pooled or a standalone
+QWP/WebSocket sender, a commit window lets many small flushes share one server
+commit:
 
 ```text
 ws::addr=localhost:9000;commit_rows=1000;commit_interval_ms=10;
 ```
 
 A flush still publishes to store-and-forward before it returns; its rows
-commit when the window closes. `wait` and the `*_and_wait` calls close the
-window early for the borrow that published the rows.
+commit when the window closes. Setting one key defaults the other to 100 ms or
+1000 rows. `wait` and the `*_and_wait` calls close the window early for the
+sender or borrow that published the rows.
 
 ## Getting Started
 

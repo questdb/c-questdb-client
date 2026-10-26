@@ -306,10 +306,10 @@ TEST_CASE("invalid commit window config crosses the C API as ConfigError")
 {
     check_db_config_error(
         conf_for("127.0.0.1:1", "commit_interval_ms=0;"),
-        "commit_interval_ms must be greater than 0");
+        "\"commit_interval_ms\" must be greater than 0");
     check_db_config_error(
         conf_for("127.0.0.1:1", "commit_rows=0;"),
-        "commit_rows must be a positive integer");
+        "\"commit_rows\" must be greater than 0");
 }
 
 TEST_CASE("periodic durability config errors cross the C API as ConfigError")

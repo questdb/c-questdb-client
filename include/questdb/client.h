@@ -109,20 +109,25 @@ typedef struct questdb_db questdb_db;
  *   `commit_interval_ms`  (default unset)
  *                                         opt in to ingestion commit windows;
  *                                         positive milliseconds per window;
+ *                                         alone, a window also closes every
+ *                                         1000 rows;
  *   `commit_rows`         (default unset)
  *                                         positive row threshold per window;
- *                                         alone enables a 100 ms interval.
+ *                                         alone, a window also closes every
+ *                                         100 ms.
  *
- * Commit windows span leases on one ingestion slot. Flush still publishes to
- * SF before returning; wait forces its pending boundary to commit. Returning
- * a lease does not close the window. ACKs, and so acked FSNs, advance when a
- * window commits. A server rejection reports the FSN range of the whole
- * committed frame, which can include other leases' publications on the same
- * slot. Ready frames are automatically batched into network writes with no
- * timer to wait for more frames. Standalone senders reject the two `commit_*`
- * keys. SF, in memory or on disk, always holds QWP frames; with a commit window
- * the background sender combines consecutive small flushes into one QWP
- * message on the wire.
+ * A commit window belongs to each ingestion connection and spans the leases
+ * that share it. Flush still publishes to SF before returning; wait forces its
+ * pending boundary to commit. Returning a lease does not close the window.
+ * ACKs, and so acked FSNs, advance when a window commits. A server rejection
+ * reports the FSN range of the rejected message, which can include other
+ * leases' publications on the same slot; the window's earlier uncommitted
+ * frames roll back with it and replay unless the rejection is terminal. Ready
+ * frames are automatically batched into network writes with no timer to wait
+ * for more frames. Standalone QWP/WebSocket senders accept the same two keys;
+ * a direct column sender rejects them. SF, in memory or on disk, always holds
+ * QWP frames; with a commit window the background sender combines consecutive
+ * small flushes into one QWP message on the wire.
  *
  * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
  * for the public ingestion pool. `sender_id` names the slot *base* (default

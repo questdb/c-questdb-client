@@ -3417,9 +3417,10 @@ impl BlockingQwpWsTransport {
         connected: QwpWsConnectRoundSuccess,
     ) -> Self {
         server_max_batch_size.store(connected.server_max_batch_size, Ordering::Release);
+        let (commit_interval, commit_rows) = qwp_ws.commit_window();
         let batch = super::qwp_ws_batch::QwpWsBatch::new(
-            qwp_ws.pool_commit_interval,
-            qwp_ws.pool_commit_rows,
+            commit_interval,
+            commit_rows,
             commit_byte_limit(&qwp_ws, connected.server_max_batch_size),
         );
         let transport = Self {
@@ -3515,7 +3516,7 @@ impl BlockingQwpWsTransport {
 #[cfg(feature = "sync-sender-qwp-ws")]
 fn commit_byte_limit(config: &QwpWsConfig, server_max: usize) -> usize {
     config
-        .pool_commit_max_bytes
+        .commit_max_bytes
         .min(super::qwp_ws_sfa_queue::segment_payload_capacity(
             *config.sf_max_segment_bytes,
         ))
@@ -3589,9 +3590,10 @@ fn decode_durable_transport_response(
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl QwpWsCoreTransport for BlockingQwpWsTransport {
     fn commit_batch_limits(&self) -> (Option<Duration>, usize, usize) {
+        let (interval, rows) = self.qwp_ws.commit_window();
         (
-            self.qwp_ws.pool_commit_interval,
-            self.qwp_ws.pool_commit_rows,
+            interval,
+            rows,
             commit_byte_limit(&self.qwp_ws, self.server_max_batch_size()),
         )
     }
