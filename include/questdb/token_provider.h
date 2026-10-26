@@ -111,8 +111,11 @@ typedef struct questdb_token questdb_token;
  * instant after 9999-12-31T23:59:59.999Z is treated as that instant.
  * `refresh_at_ms` is the platform's suggested refresh time, or 0 for none.
  *
- * Returns false, recording nothing, when `sink` is NULL, a result was already
- * reported, or the token is not valid UTF-8.
+ * Returns false, recording nothing, when `sink` is NULL or a result was
+ * already reported. A token that is not valid UTF-8 is refused too, but is
+ * recorded as the callback's failure, naming it: it is handled as a token with
+ * any other byte outside printable ASCII would be, and nothing can be reported
+ * after it.
  */
 QUESTDB_CLIENT_API
 bool questdb_token_sink_set_token(

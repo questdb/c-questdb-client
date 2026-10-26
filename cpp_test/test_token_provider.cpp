@@ -448,3 +448,61 @@ TEST_CASE("The connect-string token-provider keys are rejected")
             "wss::addr=localhost:9000;token_provider=azure;"),
         questdb::ingress::line_sender_error);
 }
+
+namespace
+{
+class counting_provider : public questdb::bearer_token_provider
+{
+public:
+    explicit counting_provider(std::string token)
+        : _token{std::move(token)}
+    {
+    }
+
+    std::string token() override
+    {
+        ++calls;
+        return _token;
+    }
+
+    std::atomic<int> calls{0};
+
+private:
+    std::string _token;
+};
+} // namespace
+
+TEST_CASE("A token that is not UTF-8 fails with its reason")
+{
+    auto app = std::make_shared<counting_provider>("\xff\xfetok");
+    auto provider = questdb::token_provider::from(app);
+    try
+    {
+        (void)provider.token();
+        FAIL("a token that is not UTF-8 was served");
+    }
+    catch (const questdb::error& e)
+    {
+        CHECK(
+            std::string{e.what()}.find("not valid UTF-8") != std::string::npos);
+    }
+
+    // As for any unusable token, a connect the caller waits for ends at once
+    // rather than pulling the provider until its budget runs out.
+    auto opts = questdb::ingress::opts::from_conf(
+        "ws::addr=127.0.0.1:1;initial_connect_retry=sync;"
+        "reconnect_max_duration_millis=3000;");
+    opts.token_provider(provider);
+    app->calls = 0;
+    try
+    {
+        questdb::ingress::line_sender sender{opts};
+        FAIL("the sender connected without a usable token");
+    }
+    catch (const questdb::ingress::line_sender_error& e)
+    {
+        CHECK(
+            std::string{e.what()}.find("not valid UTF-8") != std::string::npos);
+    }
+    CHECK(app->calls.load() == 1);
+}

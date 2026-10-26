@@ -172,6 +172,10 @@ enum SinkOutcome {
         expires_at_ms: i64,
         refresh_at_ms: i64,
     },
+    /// A token that is not UTF-8, refused by `questdb_token_sink_set_token`
+    /// but kept as the callback's result, so that a callback which ignores the
+    /// refusal still fails with the reason.
+    NotUtf8,
     Error(Error),
 }
 
@@ -200,6 +204,17 @@ impl questdb_token_sink {
                 refresh_at_ms,
             } => Ok((token, expires_at_ms, refresh_at_ms)),
             SinkOutcome::Error(err) => Err(err),
+            // Left unclassified, like a token with any other byte outside
+            // printable ASCII: a provider's then ends a connect the caller
+            // waits for while background reconnects retry it, and a source's
+            // counts as a retryable fetch failure.
+            SinkOutcome::NotUtf8 => Err(Error::new(
+                ErrorCode::SocketError,
+                format!(
+                    "the {who} callback returned a token that is not valid UTF-8; a Bearer \
+                     token must be printable ASCII"
+                ),
+            )),
             SinkOutcome::Empty => Err(Error::token_unavailable(
                 true,
                 None,
@@ -215,8 +230,11 @@ impl questdb_token_sink {
 /// give it, a provider may pass 0. For a token that does not expire, pass
 /// `INT64_MAX`: an instant after 9999-12-31T23:59:59.999Z is treated as that
 /// instant. `refresh_at_ms` is the platform's suggested refresh time, or 0 for
-/// none. Returns false, setting nothing, when `sink` is NULL, a result was
-/// already reported, or the token is not UTF-8.
+/// none. Returns false, setting nothing, when `sink` is NULL or a result was
+/// already reported. A token that is not UTF-8 is refused too, but is recorded
+/// as the callback's failure, naming it: it is handled as a token with any
+/// other byte outside printable ASCII would be, and nothing can be reported
+/// after it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_token_sink_set_token(
     sink: *mut questdb_token_sink,
@@ -237,6 +255,7 @@ pub unsafe extern "C" fn questdb_token_sink_set_token(
         unsafe { std::slice::from_raw_parts(token.cast::<u8>(), token_len) }
     };
     let Ok(token) = std::str::from_utf8(bytes) else {
+        sink.outcome = SinkOutcome::NotUtf8;
         return false;
     };
     sink.outcome = SinkOutcome::Token {
@@ -1602,6 +1621,107 @@ mod tests {
         assert_eq!(probe.released.load(Ordering::SeqCst), 1);
         assert_eq!(probe.fetches.load(Ordering::SeqCst), 0);
         unsafe { crate::questdb_error_free(err) };
+    }
+
+    const NOT_UTF8_TOKEN: &[u8] = b"\xff\xfetok";
+
+    /// Reports a token that is not UTF-8 and, as the C++ wrappers do, ignores
+    /// whether the sink accepted it.
+    unsafe extern "C" fn not_utf8_callback(_user_data: *mut c_void, sink: *mut questdb_token_sink) {
+        let expires_at_ms = now_ms() + 3_600_000;
+        unsafe {
+            questdb_token_sink_set_token(
+                sink,
+                NOT_UTF8_TOKEN.as_ptr().cast(),
+                NOT_UTF8_TOKEN.len(),
+                expires_at_ms,
+                0,
+            )
+        };
+    }
+
+    #[test]
+    fn a_token_that_is_not_utf8_fails_like_an_unprintable_one() {
+        // The sink refuses it, and the refusal is the callback's result:
+        // nothing can be reported after it.
+        let mut sink = questdb_token_sink::for_provider();
+        let token = NOT_UTF8_TOKEN;
+        assert!(!unsafe {
+            questdb_token_sink_set_token(&mut sink, token.as_ptr().cast(), token.len(), 0, 0)
+        });
+        let msg = "reported too late";
+        assert!(!unsafe {
+            questdb_token_sink_set_error(&mut sink, true, -1, msg.as_ptr().cast(), msg.len())
+        });
+
+        // What a Rust provider gets for a token with a byte outside printable
+        // ASCII.
+        let rust = questdb::egress::ReaderConfig::from_conf("ws::addr=127.0.0.1:1;")
+            .unwrap()
+            .token_provider(|| Ok::<_, Error>("tok\u{1}".to_string()))
+            .unwrap()
+            .upgrade_headers()
+            .unwrap_err();
+
+        let provider = application_provider(not_utf8_callback);
+        let err = transport_failure(provider);
+        assert_eq!(err.code(), rust.code(), "{err}");
+        assert_eq!(
+            err.as_token_unavailable(),
+            rust.as_token_unavailable(),
+            "{err}"
+        );
+        assert!(err.msg().contains("not valid UTF-8"), "{err}");
+        // A direct pull names it too, not "neither a token nor an error".
+        let mut c_err: *mut questdb_error = ptr::null_mut();
+        assert!(unsafe { questdb_token_provider_token(provider, &mut c_err) }.is_null());
+        assert!(!c_err.is_null());
+        let direct = unsafe { &(*c_err).error };
+        assert!(
+            direct
+                .msg()
+                .contains("token provider callback returned a token that is not valid UTF-8"),
+            "{direct}"
+        );
+        unsafe { crate::questdb_error_free(c_err) };
+        unsafe { questdb_token_provider_free(provider) };
+
+        // A refreshing provider's source: a retryable fetch failure, as for any
+        // other unusable token.
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let provider = unsafe {
+            questdb_refreshing_token_provider_new(
+                Some(not_utf8_callback),
+                ptr::null_mut(),
+                None,
+                ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!provider.is_null() && err.is_null());
+        let mut buffer = [0u8; 256];
+        let mut status = unsafe { std::mem::zeroed::<questdb_token_provider_status>() };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            status.struct_size = size_of_val(&status);
+            status.last_failure_msg = buffer.as_mut_ptr().cast();
+            status.last_failure_msg_capacity = buffer.len();
+            assert!(unsafe { questdb_token_provider_get_status(provider, &mut status) });
+            if status.has_last_failure {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no fetch failed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(status.last_failure_retryable);
+        let len = status.last_failure_msg_len.min(buffer.len());
+        let message = std::str::from_utf8(&buffer[..len]).unwrap();
+        assert!(
+            message.contains("token source callback returned a token that is not valid UTF-8"),
+            "{message}"
+        );
+        unsafe { questdb_token_provider_close(provider) };
+        unsafe { questdb_token_provider_free(provider) };
     }
 
     #[test]

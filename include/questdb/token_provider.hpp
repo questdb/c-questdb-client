@@ -219,6 +219,8 @@ void source_trampoline(void* user_data, ::questdb_token_sink* sink) noexcept
     try
     {
         expiring_token result = (*static_cast<Source*>(user_data))();
+        // A token the sink refuses, one that is not UTF-8, is recorded as
+        // this callback's failure, so the result needs no check.
         ::questdb_token_sink_set_token(
             sink,
             result.token.data(),
@@ -247,6 +249,7 @@ inline void provider_get_token(
     {
         const std::string token =
             (*static_cast<shared_provider*>(user_data))->token();
+        // A refused token is recorded as this callback's failure.
         ::questdb_token_sink_set_token(sink, token.data(), token.size(), 0, 0);
     }
     catch (...)
