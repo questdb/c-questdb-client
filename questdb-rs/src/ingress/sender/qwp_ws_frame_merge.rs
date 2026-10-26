@@ -373,7 +373,7 @@ impl Column {
                 }
                 self.values.extend_from_slice(data);
             }
-            _ => self.values.extend_from_slice(values),
+            _ => extend_small(&mut self.values, values),
         }
         self.value_count += body.value_count;
     }
@@ -538,6 +538,20 @@ fn append_bits(dst: &mut Vec<u8>, dst_bits: usize, src: &[u8], count: usize) {
         && let Some(last) = dst.last_mut()
     {
         *last &= (1 << (total % 8)) - 1;
+    }
+}
+
+/// Spliced values are usually a few bytes; fixed-size copies avoid a `memcpy` call.
+fn extend_small(dst: &mut Vec<u8>, src: &[u8]) {
+    if let Ok(bytes) = <&[u8; 8]>::try_from(src) {
+        dst.extend_from_slice(bytes);
+        return;
+    }
+    match *src {
+        [a] => dst.push(a),
+        [a, b] => dst.extend_from_slice(&[a, b]),
+        [a, b, c, d] => dst.extend_from_slice(&[a, b, c, d]),
+        _ => dst.extend_from_slice(src),
     }
 }
 
