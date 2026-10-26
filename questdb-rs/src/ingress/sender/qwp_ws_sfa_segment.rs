@@ -982,8 +982,71 @@ fn detect_torn_tail<S: ReadAt + ?Sized>(
     }
 }
 
+/// Up to this length one CRC instruction per word beats the crate's parallel
+/// kernel, whose setup dominates on short frames.
+const SERIAL_CRC_MAX_LEN: usize = 256;
+
 fn crc32c_update(seed: u32, bytes: &[u8]) -> u32 {
+    if bytes.len() <= SERIAL_CRC_MAX_LEN
+        && let Some(crc) = crc32c_serial(seed, bytes)
+    {
+        return crc;
+    }
     crc32c::crc32c_append(seed, bytes)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn crc32c_serial(seed: u32, bytes: &[u8]) -> Option<u32> {
+    if !std::arch::is_aarch64_feature_detected!("crc") {
+        return None;
+    }
+    // SAFETY: the CRC extension was detected above.
+    Some(unsafe { crc32c_serial_aarch64(seed, bytes) })
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+fn crc32c_serial_aarch64(seed: u32, bytes: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32cb, __crc32cd};
+    let (words, tail) = bytes.as_chunks::<8>();
+    let mut crc = !seed;
+    for word in words {
+        crc = __crc32cd(crc, u64::from_le_bytes(*word));
+    }
+    for &byte in tail {
+        crc = __crc32cb(crc, byte);
+    }
+    !crc
+}
+
+#[cfg(target_arch = "x86_64")]
+fn crc32c_serial(seed: u32, bytes: &[u8]) -> Option<u32> {
+    if !std::arch::is_x86_feature_detected!("sse4.2") {
+        return None;
+    }
+    // SAFETY: SSE4.2 was detected above.
+    Some(unsafe { crc32c_serial_x86_64(seed, bytes) })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+fn crc32c_serial_x86_64(seed: u32, bytes: &[u8]) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+    let (words, tail) = bytes.as_chunks::<8>();
+    let mut crc = u64::from(!seed);
+    for word in words {
+        crc = _mm_crc32_u64(crc, u64::from_le_bytes(*word));
+    }
+    let mut crc = crc as u32;
+    for &byte in tail {
+        crc = _mm_crc32_u8(crc, byte);
+    }
+    !crc
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn crc32c_serial(_seed: u32, _bytes: &[u8]) -> Option<u32> {
+    None
 }
 
 /// Positional-read abstraction so one scanner implementation serves both
@@ -1215,6 +1278,20 @@ mod tests {
         chained = crc32c_update(chained, b"456");
         chained = crc32c_update(chained, b"789");
         assert_eq!(chained, 0xe306_9283);
+    }
+
+    #[test]
+    fn short_input_crc32c_matches_the_crate() {
+        let bytes: Vec<u8> = (0..300u32).map(|i| (i * 131 + 7) as u8).collect();
+        for len in 0..=bytes.len() {
+            for seed in [0, 0xe306_9283, u32::MAX] {
+                assert_eq!(
+                    crc32c_update(seed, &bytes[..len]),
+                    crc32c::crc32c_append(seed, &bytes[..len]),
+                    "len={len} seed={seed:#x}"
+                );
+            }
+        }
     }
 
     #[test]
