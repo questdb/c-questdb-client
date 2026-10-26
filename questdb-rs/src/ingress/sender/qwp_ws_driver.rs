@@ -1305,6 +1305,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 Some(fsn) => fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?,
                 None => first_fsn,
             };
+            let rewind = self
+                .send_cursor
+                .sfa_cursor_mut()
+                .as_ref()
+                .map(SfaSendCursor::released);
             let Some(payload) =
                 progress.next_cursor_payload_for_fsn(self.send_cursor.sfa_cursor_mut(), fsn)?
             else {
@@ -1322,6 +1327,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                         payload: payload.into(),
                     }));
                 }
+                // The next batch starts with this frame; resume from its offset.
+                *self.send_cursor.sfa_cursor_mut() = rewind;
                 ready = true;
                 break;
             }
@@ -3081,7 +3088,9 @@ impl SendCursor {
     }
 
     fn release_sfa_cursor(&mut self) {
-        self.sfa_cursor = None;
+        if let Some(cursor) = &mut self.sfa_cursor {
+            cursor.release_segment();
+        }
     }
 
     pub(crate) fn peek_next_frame_from_oldest(
@@ -4742,7 +4751,13 @@ mod tests {
         let completion = core.finish_ack_response_sfa(&progress, 0).unwrap();
 
         assert_eq!(completion.outcome, DriveOutcome::Acked { wire_seq: 0 });
-        assert!(core.send_cursor.sfa_cursor.is_none());
+        assert!(
+            !core
+                .send_cursor
+                .sfa_cursor
+                .as_ref()
+                .is_some_and(SfaSendCursor::holds_segment)
+        );
         assert_eq!(progress.completed_fsn(), Some(0));
     }
 
@@ -5605,6 +5620,55 @@ mod tests {
             let sent = outbound.sent_frame();
             assert_eq!((sent.first_fsn, sent.fsn), (fsn, fsn));
             outbound.with_view(|view| assert_eq!(view.payload, frame.as_slice()));
+            let (sent, result) = core.send_frame(outbound);
+            core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn frame_that_ends_a_batch_is_reread_from_its_own_offset() {
+        let mut core = QwpWsSendCore::new(
+            StagingTransport(4096),
+            ReconnectPolicy::no_backoff(Duration::MAX),
+        );
+        let mut queue = memory_queue(SfaMemoryQueueOptions {
+            segment_size_bytes: 4096,
+            max_bytes: 64 * 1024,
+        });
+        let progress = queue.progress_view();
+        let frames: Vec<_> = (0..4)
+            .map(|qty| {
+                let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+                buffer
+                    .table(["a", "b"][qty as usize % 2])
+                    .unwrap()
+                    .column_i64("qty", qty)
+                    .unwrap()
+                    .at_now()
+                    .unwrap();
+                replay_payload(&buffer)
+            })
+            .collect();
+        for frame in &frames {
+            queue.try_submit(frame).unwrap();
+        }
+        for (fsn, frame) in (0..).zip(&frames) {
+            let outbound = core
+                .next_outbound_sfa_frame_through(&progress, Some(3), false)
+                .unwrap()
+                .unwrap();
+            let sent = outbound.sent_frame();
+            assert_eq!((sent.first_fsn, sent.fsn), (fsn, fsn));
+            outbound.with_view(|view| assert_eq!(view.payload, frame.as_slice()));
+            if fsn < 3 {
+                assert!(
+                    !core
+                        .send_cursor
+                        .sfa_cursor
+                        .as_ref()
+                        .is_some_and(SfaSendCursor::holds_segment)
+                );
+            }
             let (sent, result) = core.send_frame(outbound);
             core.finish_send_result_hot(sent, result.unwrap()).unwrap();
         }
