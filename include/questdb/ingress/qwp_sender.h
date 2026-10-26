@@ -1554,7 +1554,9 @@ bool qwp_sender_flush_chunk(
  * Publish `chunk` locally through the borrowed store-and-forward QWP sender
  * as a completion boundary, clear it once accepted into the queue, then wait
  * until that frame and all prior frames published through this sender reach
- * `ack_level`.
+ * `ack_level`. If automatic commit batching is enabled, close the pending
+ * batch through this publication without waiting for the batching timer or
+ * row threshold.
  *
  * `ack_level` carries a `qwpws_ack_level_*` constant. It is validated before
  * `chunk` is encoded, so an out-of-range value, or the Enterprise-only
@@ -1590,7 +1592,10 @@ bool qwp_sender_flush_chunk_and_wait(
  * `qwp_sender_wait` for a simple blocking barrier over everything
  * published so far. Use FSNs for non-blocking progress tracking while the
  * same borrowed sender is still held: publish with this function, keep doing
- * work, and compare the saved FSN with `qwp_sender_acked_fsn`.
+ * work, and compare the saved FSN with `qwp_sender_acked_fsn`. With automatic
+ * commit batching, ACKs arrive when the batch commits, so the saved FSN can
+ * stay unacknowledged for up to `commit_interval_ms` unless
+ * `qwp_sender_wait` closes the batch.
  */
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_chunk_and_get_fsn(
@@ -1838,7 +1843,9 @@ bool qwp_sender_flush_arrow_batch_at_now_and_get_fsn(
 /**
  * ACKing counterpart of `qwp_sender_flush_arrow_batch_at_now`: publish
  * `array` as a completion boundary, then wait for `ack_level`. The wait uses
- * the pool-wide `request_timeout` no-progress deadline.
+ * the pool-wide `request_timeout` no-progress deadline. If automatic commit
+ * batching is enabled, close the pending batch through this publication
+ * without waiting for the batching timer or row threshold.
  *
  * `ack_level` carries a `qwpws_ack_level_*` constant. It is validated before
  * the Arrow C Data Interface import consumes `array->release`, so a rejected
@@ -1948,8 +1955,8 @@ bool qwp_sender_flush_arrow_batch_at_column_and_get_fsn(
 /**
  * ACKing counterpart of `qwp_sender_flush_arrow_batch_at_column`: publish
  * `array` (timestamp sourced from `ts_column`) as a completion boundary, then
- * wait for `ack_level`. Same ACK-validation preflight and phase-aware
- * re-export contract as
+ * wait for `ack_level`. Same ACK-validation preflight, phase-aware re-export
+ * contract and commit-batch closure as
  * `qwp_sender_flush_arrow_batch_at_now_and_wait`.
  */
 QUESTDB_CLIENT_API

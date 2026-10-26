@@ -69,6 +69,9 @@ pub(crate) use qwp_ws_driver::{
 };
 
 #[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_frame_merge;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_ownership;
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -83,9 +86,6 @@ mod qwp_ws_publisher;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_queue;
-
-#[cfg(feature = "_sender-qwp-ws")]
-pub(crate) mod qwp_ws_record;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_segment;

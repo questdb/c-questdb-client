@@ -3813,61 +3813,6 @@ impl QwpWsColumnarBuffer {
         result
     }
 
-    pub(crate) fn encode_sfa_record(
-        &self,
-        out: &mut Vec<u8>,
-        defer_commit: bool,
-    ) -> crate::Result<usize> {
-        self.check_can_flush()?;
-        out.clear();
-        let table_count = checked_qwp_u16(
-            self.tables
-                .iter()
-                .filter(|table| table.row_count > 0)
-                .count(),
-            "SF record table count",
-        )?;
-        out.extend_from_slice(b"QSR1");
-        out.push(u8::from(defer_commit));
-        out.extend_from_slice(&table_count.to_le_bytes());
-        let mut column_count = 0;
-        for table in self.tables.iter().filter(|table| table.row_count > 0) {
-            column_count += table.columns.len();
-            write_qwp_bytes(out, &table.table_name);
-            write_qwp_varint(out, table.row_count as u64);
-            write_qwp_varint(out, table.columns.len() as u64);
-            out.extend_from_slice(&table.encoded_column_schema);
-            for column in &table.columns {
-                let length_at = out.len();
-                out.extend_from_slice(&[0; 4]);
-                if let QwpWsColumnValues::Symbol {
-                    cells, dict, data, ..
-                } = &column.values
-                {
-                    let has_bitmap = column.uses_null_bitmap(table.row_count as usize);
-                    out.push(u8::from(has_bitmap));
-                    if has_bitmap {
-                        column
-                            .values
-                            .encode_null_bitmap(table.row_count as usize, out)?;
-                    }
-                    write_qwp_varint(out, dict.len() as u64);
-                    for entry in dict {
-                        write_qwp_bytes(out, &data[entry.offset as usize..][..entry.len as usize]);
-                    }
-                    for cell in cells {
-                        write_qwp_varint(out, cell.local_id as u64);
-                    }
-                } else {
-                    column.encode(table.row_count as usize, &[], out)?;
-                }
-                let length = checked_qwp_u32(out.len() - length_at - 4, "SF column length")?;
-                out[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
-            }
-        }
-        Ok(out.len() - 4 * column_count + 5)
-    }
-
     pub(crate) fn encode_ws_replay_message_with_defer(
         &self,
         out: &mut Vec<u8>,
@@ -3953,18 +3898,9 @@ impl QwpWsColumnarBuffer {
             write_qwp_bytes(out, &table.table_name);
             write_qwp_varint(out, table.row_count as u64);
             write_qwp_varint(out, table.columns.len() as u64);
-
-            scratch.schema_signature.clear();
-            for column in &table.columns {
-                write_qwp_bytes(&mut scratch.schema_signature, &column.name);
-                scratch.schema_signature.push(wire_type_byte(
-                    column.kind,
-                    column.uses_null_bitmap(table.row_count as usize),
-                ));
-            }
             // Columns always travel inline: name + wire-type per column, right
             // after col_count. No schema-mode byte, no schema id.
-            out.extend_from_slice(&scratch.schema_signature);
+            out.extend_from_slice(&table.encoded_column_schema);
 
             for (col_idx, column) in table.columns.iter().enumerate() {
                 let globals = &scratch.per_segment_symbol_globals[table_idx][col_idx];
@@ -6031,6 +5967,7 @@ pub(crate) struct QwpWsEncodeScratch {
     /// definitions: `(varint name_len, name, type_code)*`, spliced inline into
     /// the message right after `col_count` (avoiding a second pass over the
     /// columns).
+    #[cfg(test)]
     schema_signature: Vec<u8>,
 }
 
@@ -6041,6 +5978,7 @@ impl QwpWsEncodeScratch {
             #[cfg(test)]
             message: Vec::with_capacity(16 * 1024),
             per_segment_symbol_globals: Vec::new(),
+            #[cfg(test)]
             schema_signature: Vec::new(),
         }
     }
@@ -10864,13 +10802,12 @@ mod tests {
                 .at_now()
                 .unwrap();
             assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut expected));
-            assert_eq!(sfa_record_bytes(&buf), sfa_record_bytes(&expected));
         }
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
-    fn qwp_ws_sfa_record_schema_replaces_rolled_back_column_type() {
+    fn qwp_ws_schema_replaces_rolled_back_column_type() {
         let mut buf = QwpWsColumnarBuffer::new(127);
         buf.table("trades")
             .unwrap()
@@ -10885,7 +10822,7 @@ mod tests {
             .column_str("discarded", "value")
             .unwrap();
         assert!(buf.column_bool("qty", true).is_err());
-        assert_eq!(sfa_record_bytes(&buf), sfa_record_bytes(&expected));
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut expected));
 
         for buffer in [&mut buf, &mut expected] {
             buffer
@@ -10898,7 +10835,7 @@ mod tests {
                 .at_now()
                 .unwrap();
         }
-        assert_eq!(sfa_record_bytes(&buf), sfa_record_bytes(&expected));
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut expected));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -10992,13 +10929,6 @@ mod tests {
         buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
             .unwrap();
         scratch.message.clone()
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    fn sfa_record_bytes(buf: &QwpWsColumnarBuffer) -> Vec<u8> {
-        let mut record = Vec::new();
-        buf.encode_sfa_record(&mut record, false).unwrap();
-        record
     }
 
     /// A rewind must unwind every row appended after the mark, not only the
@@ -11238,11 +11168,6 @@ mod tests {
                             expected,
                             "{case}: a rewound buffer must encode exactly the surviving rows"
                         );
-                        assert_eq!(
-                            sfa_record_bytes(&buf),
-                            sfa_record_bytes(&reference),
-                            "{case}: SF record schema must discard rewound columns and tables"
-                        );
 
                         // Fixed-width kinds encode by walking row indexes, so a
                         // leftover cell past the row count is invisible above. It
@@ -11269,11 +11194,6 @@ mod tests {
                             ws_replay_bytes(&mut reference),
                             "{case}: rows appended after a rewind must land on \
                          clean row indexes in every column"
-                        );
-                        assert_eq!(
-                            sfa_record_bytes(&buf),
-                            sfa_record_bytes(&reference),
-                            "{case}: SF record schema must grow after a rewind"
                         );
                     }
                 }
@@ -11860,7 +11780,7 @@ mod tests {
 
         cloned.rewind_to_marker().unwrap();
         assert_eq!(cloned.row_count(), 1);
-        assert_eq!(sfa_record_bytes(&cloned), sfa_record_bytes(&original));
+        assert_eq!(ws_replay_bytes(&mut cloned), ws_replay_bytes(&mut original));
 
         original
             .table("trades")
@@ -11886,7 +11806,7 @@ mod tests {
             .unwrap();
         cloned.rewind_to_bookmark(clone_bookmark).unwrap();
         assert_eq!(cloned.row_count(), 1);
-        assert_eq!(sfa_record_bytes(&cloned), sfa_record_bytes(&original));
+        assert_eq!(ws_replay_bytes(&mut cloned), ws_replay_bytes(&mut original));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

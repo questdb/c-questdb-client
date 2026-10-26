@@ -683,13 +683,15 @@ impl QuestDb {
     ///
     /// Commit windows span leases on the same ingestion slot. `flush` still
     /// publishes to SF before returning; `wait` forces its pending boundary
-    /// to commit. Returning a lease does not close the window. Network batching
+    /// to commit. Returning a lease does not close the window. ACKs, and so
+    /// acked FSNs, advance when a window commits. A server rejection reports
+    /// the FSN range of the whole committed frame, which can include other
+    /// leases' publications on the same slot. Network batching
     /// of ready frames is automatic and adds no timer to wait for more frames.
-    /// Standalone senders reject the two `commit_*` keys.
-    /// Enabling a commit window stores small flushes as versioned SF records
-    /// for background frame assembly. This client also replays legacy QWP
-    /// frames; older clients cannot replay the new records. Drain the slot
-    /// before handing it to an older client or a Java client.
+    /// Standalone senders reject the two `commit_*` keys. SF, in memory or on
+    /// disk, always holds QWP frames; with a commit window the background
+    /// sender combines consecutive small flushes into one QWP message on the
+    /// wire.
     ///
     /// Lifecycle key names and defaults match the Java client's `QuestDBBuilder`; the
     /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,
@@ -1660,8 +1662,9 @@ impl Debug for DirectSenderHandle<'_> {
 /// Delivery is completed best-effort when the pool is closed or the connection
 /// is retired, bounded by `close_flush_timeout` (default 5s): an in-memory
 /// queue whose server stays unreachable past that window drops its undelivered
-/// tail, logging a warning. For a hard guarantee, call [`Self::wait`] before
-/// closing the pool — it blocks until the frames published so far reach the
+/// tail, logging a warning. For a hard guarantee, call [`Self::wait`] on the
+/// borrow that published the rows before returning it — it closes any commit
+/// window through that borrow and blocks until its publications reach the
 /// requested [`AckLevel`], i.e. confirms delivery — or configure `sf_dir` for
 /// crash-durable on-disk persistence with replay. [`Self::flush_and_wait`]
 /// combines the two ("publish this batch and return once it is delivered");
@@ -1670,7 +1673,8 @@ impl Debug for DirectSenderHandle<'_> {
 /// timeout instead.
 /// Use FSNs only for non-blocking progress tracking while this borrowed sender
 /// is still held: they are stream watermarks, not portable receipts to check
-/// through an arbitrary later pool borrow.
+/// through an arbitrary later pool borrow. With a commit window, a published
+/// FSN is acknowledged only once its window commits.
 ///
 /// Not `Send` or `Sync`.
 ///
@@ -1769,7 +1773,9 @@ impl<'a> BorrowedSender<'a> {
     /// Publish `chunk` into the store-and-forward queue as a completion
     /// boundary, then wait until every frame published on this handle so far
     /// reaches `ack_level` — [`Self::flush`] followed by [`Self::wait`] in one
-    /// call. Unlike [`Self::wait`], which takes an explicit timeout argument,
+    /// call. Automatic commit batching closes through this publication without
+    /// waiting for its row threshold or timer. Unlike [`Self::wait`], which
+    /// takes an explicit timeout argument,
     /// this call's wait is bounded by the pool-wide `request_timeout` setting
     /// (the no-progress timeout fires when the ack watermark stops advancing
     /// for that long); compose the two calls yourself to choose the timeout

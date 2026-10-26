@@ -26,10 +26,7 @@
 
 use super::qwp_ws_sfa_symbol_dict::{PersistedSymbolDict, PersistedSymbolDictMark};
 use crate::ingress::buffer::{SymbolGlobalDict, SymbolGlobalDictMark};
-use crate::{ErrorCode, Result, error};
-use std::sync::{Arc, Mutex};
-
-pub(crate) type SharedSymbolGlobalDict = Arc<Mutex<SymbolGlobalDict>>;
+use crate::{Result, error};
 
 /// Result of atomically encoding and appending one store-and-forward frame.
 #[derive(Debug)]
@@ -158,7 +155,6 @@ impl SymbolPublishState {
 /// Encoders write directly into `payload`; the queue borrows that same allocation.
 pub(crate) struct SfaForegroundPublisher {
     symbols: SymbolPublishState,
-    shared_global: Option<SharedSymbolGlobalDict>,
     payload: Vec<u8>,
 }
 
@@ -166,15 +162,7 @@ impl SfaForegroundPublisher {
     pub(crate) fn new(delta_enabled: bool, persisted: Option<PersistedSymbolDict>) -> Self {
         Self {
             symbols: SymbolPublishState::new(delta_enabled, persisted),
-            shared_global: None,
             payload: Vec::new(),
-        }
-    }
-
-    pub(crate) fn new_shared_memory(global: SharedSymbolGlobalDict) -> Self {
-        Self {
-            shared_global: Some(global),
-            ..Self::new(true, None)
         }
     }
 
@@ -182,46 +170,6 @@ impl SfaForegroundPublisher {
     /// mirror is seeded from the same byte region and count during connect.
     pub(crate) fn seed(&mut self, entries: &[u8], count: u32) -> Result<()> {
         self.symbols.global.seed(entries, count)
-    }
-
-    pub(crate) fn encode_record_publish(
-        &mut self,
-        max_buf_size: usize,
-        encode: impl FnOnce(&mut Vec<u8>) -> Result<usize>,
-        publish: impl FnOnce(&[u8]) -> Result<u64>,
-    ) -> Result<SfaPublishOutcome> {
-        self.payload.clear();
-        let wire_len = encode(&mut self.payload)?;
-        let encoded_len = self.payload.len().max(wire_len);
-        if encoded_len > max_buf_size {
-            return Ok(SfaPublishOutcome::TooLarge {
-                encoded_len,
-                max_buf_size,
-            });
-        }
-        publish(&self.payload).map(SfaPublishOutcome::Published)
-    }
-
-    /// A shared allocator can fill while assembling earlier records. Retry the
-    /// rolled-back publication locally, without changing either admission cap.
-    pub(crate) fn retry_record_after_dict_full(
-        &mut self,
-        result: Result<SfaPublishOutcome>,
-        max_buf_size: usize,
-        encode: impl FnOnce(&mut Vec<u8>) -> Result<usize>,
-        publish: impl FnOnce(&[u8]) -> Result<u64>,
-    ) -> Result<SfaPublishOutcome> {
-        let original = match result {
-            Err(err) if self.shared_global.is_some() && err.code() == ErrorCode::SymbolDictFull => {
-                err
-            }
-            other => return other,
-        };
-        match self.encode_record_publish(max_buf_size, encode, publish) {
-            Ok(SfaPublishOutcome::TooLarge { .. }) => Err(original),
-            Err(err) if err.code() == ErrorCode::BatchTooLarge => Err(original),
-            other => other,
-        }
     }
 
     /// Encode, size-check, write-ahead, and append one frame as a single
@@ -234,30 +182,6 @@ impl SfaForegroundPublisher {
         encode: impl FnOnce(&mut Vec<u8>, &mut SymbolGlobalDict, bool) -> Result<()>,
         publish: impl FnOnce(&[u8]) -> Result<u64>,
     ) -> Result<SfaPublishOutcome> {
-        if let Some(global) = self.shared_global.as_ref() {
-            // Keep rollback exclusive through publication. The background only
-            // try-locks and can drain local record frames while this waits for space.
-            let mut global = global
-                .lock()
-                .map_err(|_| error::fmt!(SocketError, "QWP symbol dictionary lock is poisoned"))?;
-            let mark = global.mark();
-            self.payload.clear();
-            let result = (|| {
-                encode(&mut self.payload, &mut global, true)?;
-                let encoded_len = self.payload.len();
-                if encoded_len > max_buf_size {
-                    return Ok(SfaPublishOutcome::TooLarge {
-                        encoded_len,
-                        max_buf_size,
-                    });
-                }
-                publish(&self.payload).map(SfaPublishOutcome::Published)
-            })();
-            if !matches!(result, Ok(SfaPublishOutcome::Published(_))) {
-                global.rollback(mark);
-            }
-            return result;
-        }
         self.payload.clear();
         let global_mark = self.symbols.global.mark();
         // The producer's id before this frame — i.e. this frame's `delta_start`.
@@ -306,82 +230,6 @@ mod tests {
     use crate::ErrorCode;
     use crate::ingress::column_sender::{Chunk, encoder};
     use crate::ingress::sender::qwp_ws_sfa_catchup::SentDictMirror;
-
-    #[test]
-    fn record_admission_checks_wire_size_before_publishing() {
-        use crate::ingress::Buffer;
-        use crate::ingress::sender::qwp_ws_record::RecordBatch;
-
-        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
-        buffer
-            .table("trades")
-            .unwrap()
-            .column_str("name", "x".repeat(29))
-            .unwrap()
-            .at_now()
-            .unwrap();
-        let buffer = buffer.as_qwp_ws().unwrap();
-        let mut record = Vec::new();
-        let wire_len = buffer.encode_sfa_record(&mut record, false).unwrap();
-        assert_eq!(record.len(), 64);
-        assert_eq!(wire_len, 65);
-        let mut batch = RecordBatch::new();
-        batch.try_append(&record, usize::MAX, 0).unwrap();
-        let mut frame = Vec::new();
-        batch.encode_frame(&mut frame).unwrap();
-        assert_eq!(frame.len(), wire_len);
-
-        let mut foreground = SfaForegroundPublisher::new(true, None);
-        let outcome = foreground
-            .encode_record_publish(
-                64,
-                |payload| buffer.encode_sfa_record(payload, false),
-                |_| panic!("oversized wire frame must not reach SF"),
-            )
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            SfaPublishOutcome::TooLarge {
-                encoded_len: 65,
-                max_buf_size: 64
-            }
-        ));
-        let outcome = foreground
-            .encode_record_publish(
-                65,
-                |payload| buffer.encode_sfa_record(payload, false),
-                |payload| {
-                    assert_eq!(payload, record);
-                    Ok(4)
-                },
-            )
-            .unwrap();
-        assert!(matches!(outcome, SfaPublishOutcome::Published(4)));
-    }
-
-    #[test]
-    fn record_admission_also_checks_storage_size() {
-        let mut chunk = Chunk::new("trades");
-        chunk.column_i64("a", &[1], None).unwrap();
-        chunk.column_i64("b", &[2], None).unwrap();
-        chunk.at_now().unwrap();
-        let mut scratch = encoder::EncodeScratch::new();
-        let mut record = Vec::new();
-        let wire_len =
-            encoder::encode_chunk_record_into(&mut record, &chunk, &mut scratch, false).unwrap();
-        assert_eq!(record.len(), wire_len + 3);
-        let mut foreground = SfaForegroundPublisher::new(true, None);
-        let outcome = foreground
-            .encode_record_publish(
-                wire_len,
-                |payload| encoder::encode_chunk_record_into(payload, &chunk, &mut scratch, false),
-                |_| panic!("oversized SF record must not reach storage"),
-            )
-            .unwrap();
-        assert!(
-            matches!(outcome, SfaPublishOutcome::TooLarge { encoded_len, max_buf_size } if encoded_len == record.len() && max_buf_size == wire_len)
-        );
-    }
 
     fn one_symbol_chunk<'a>(
         codes: &'a [i32],
@@ -455,100 +303,6 @@ mod tests {
             expected.len() as u32,
             "persisted and in-memory symbol counts must stay in lockstep"
         );
-    }
-
-    #[test]
-    fn shared_memory_transaction_keeps_rollback_exclusive_through_publication() {
-        let global = Arc::new(Mutex::new(SymbolGlobalDict::new()));
-        global.lock().unwrap().intern(b"prior").unwrap();
-        let mut foreground = SfaForegroundPublisher::new_shared_memory(Arc::clone(&global));
-        let mut scratch = encoder::EncodeScratch::new();
-        let chunk = one_symbol_chunk(&[0], &[0, 4], &[1], b"next");
-        let err = publish_chunk(&mut foreground, &mut scratch, &chunk, 4096, |_| {
-            assert!(matches!(
-                global.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            ));
-            Err(error::fmt!(SocketError, "injected publication failure"))
-        })
-        .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::SocketError);
-        assert_eq!(global.lock().unwrap().next_id(), 1);
-        assert!(matches!(
-            publish_chunk(&mut foreground, &mut scratch, &chunk, 1, |_| {
-                panic!("oversized frame must not publish")
-            })
-            .unwrap(),
-            SfaPublishOutcome::TooLarge { .. }
-        ));
-        assert_eq!(global.lock().unwrap().next_id(), 1);
-        assert!(matches!(
-            publish_chunk(&mut foreground, &mut scratch, &chunk, 4096, |payload| {
-                assert_eq!(delta_prefix(payload), (1, vec![b"next".to_vec()]));
-                Ok(7)
-            })
-            .unwrap(),
-            SfaPublishOutcome::Published(7)
-        ));
-        let global = global.lock().unwrap();
-        assert_eq!(global.next_id(), 2);
-        assert_eq!(global.entry(0), Some(b"prior".as_slice()));
-        assert_eq!(global.entry(1), Some(b"next".as_slice()));
-    }
-
-    #[test]
-    fn shared_memory_record_publication_does_not_lock_or_intern() {
-        let global = Arc::new(Mutex::new(SymbolGlobalDict::new()));
-        let mut foreground = SfaForegroundPublisher::new_shared_memory(Arc::clone(&global));
-        let mut scratch = encoder::EncodeScratch::new();
-        let chunk = one_symbol_chunk(&[0], &[0, 4], &[1], b"next");
-        let outcome = foreground
-            .encode_record_publish(
-                4096,
-                |payload| {
-                    assert!(global.try_lock().is_ok());
-                    encoder::encode_chunk_record_into(payload, &chunk, &mut scratch, false)
-                },
-                |payload| {
-                    assert!(global.try_lock().is_ok());
-                    assert!(payload.starts_with(b"QSR1"));
-                    Ok(9)
-                },
-            )
-            .unwrap();
-        assert!(matches!(outcome, SfaPublishOutcome::Published(9)));
-        assert_eq!(global.lock().unwrap().next_id(), 0);
-    }
-
-    #[test]
-    fn shared_memory_dict_fallback_preserves_both_caps_and_original_error() {
-        for (stored, wire) in [(65, 60), (60, 65)] {
-            let global = Arc::new(Mutex::new(SymbolGlobalDict::with_cap(1)));
-            let mut foreground = SfaForegroundPublisher::new_shared_memory(global);
-            let result = foreground.retry_record_after_dict_full(
-                Err(error::fmt!(SymbolDictFull, "original dictionary error")),
-                64,
-                |payload| {
-                    payload.resize(stored, 0);
-                    Ok(wire)
-                },
-                |_| panic!("oversized fallback must not publish"),
-            );
-            let err = result.unwrap_err();
-            assert_eq!(err.code(), ErrorCode::SymbolDictFull);
-            assert_eq!(err.msg(), "original dictionary error");
-        }
-        let mut foreground = SfaForegroundPublisher::new(true, None);
-        let err = foreground
-            .retry_record_after_dict_full(
-                Err(error::fmt!(SymbolDictFull, "unshared dictionary error")),
-                4096,
-                |_| panic!("unshared publisher must not use this fallback"),
-                |_| panic!("unshared publisher must not use this fallback"),
-            )
-            .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::SymbolDictFull);
-        assert_eq!(err.msg(), "unshared dictionary error");
     }
 
     #[test]

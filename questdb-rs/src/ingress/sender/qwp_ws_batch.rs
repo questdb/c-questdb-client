@@ -75,14 +75,21 @@ impl QwpWsBatch {
         }
     }
 
-    pub(super) fn full_before(&self, payload_len: usize) -> bool {
-        !self.frames.is_empty()
-            && self
-                .bytes
-                .len()
-                .saturating_add(payload_len)
-                .saturating_add(14)
-                > self.byte_limit
+    /// Ends the group before a stored split so an aborted split cannot hold an earlier commit.
+    pub(super) fn full_before(&self, payload: &[u8]) -> bool {
+        let Some(tail) = self.frames.last() else {
+            return false;
+        };
+        self.bytes
+            .len()
+            .saturating_add(payload.len())
+            .saturating_add(14)
+            > self.byte_limit
+            || self.interval.is_some()
+                && tail.flags & DEFER_COMMIT == 0
+                && payload
+                    .get(5)
+                    .is_some_and(|flags| flags & DEFER_COMMIT != 0)
     }
 
     /// Copies/masks one complete message; returns whether the group must close.
@@ -119,7 +126,7 @@ impl QwpWsBatch {
         if self.interval.is_some() && self.row_limit > 0 {
             match single_table_rows(payload) {
                 Some(rows) => self.rows = self.rows.saturating_add(rows),
-                // Multi-table/legacy frames close conservatively. No decoding of
+                // Multi-table or non-delta frames close conservatively. No decoding of
                 // column data, and no accidental treatment of a frame as one row.
                 None => unknown_rows = true,
             }
@@ -294,7 +301,7 @@ mod tests {
     fn byte_limit_and_large_frames_keep_complete_messages() {
         let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 0, 48);
         batch.append(0, &frame(1, 8), [0; 4]).unwrap();
-        assert!(batch.full_before(18));
+        assert!(batch.full_before(&frame(1, 8)));
         batch.reset_connection();
         let mut large = frame(1, 8);
         large.resize(70_000, 0);
@@ -303,6 +310,33 @@ mod tests {
         batch.flush(&mut writer).unwrap();
         assert_eq!(writer.0.len(), 1);
         assert_eq!(writer.0[0].len(), 70_014);
+    }
+
+    #[test]
+    fn stored_split_group_starts_after_the_committing_tail_is_sent() {
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 0, 4096);
+        let committing = frame(1, 8);
+        let split = frame(1, 9);
+        assert!(!batch.full_before(&split));
+        batch.append(0, &committing, [0; 4]).unwrap();
+        assert!(!batch.full_before(&committing));
+        assert!(batch.full_before(&split));
+        let mut writer = Writer::default();
+        batch.flush(&mut writer).unwrap();
+        let mut expected = Vec::new();
+        encode_client_frame(&mut expected, Opcode::Binary, [0; 4], &committing);
+        assert_eq!(writer.0, [expected]);
+        assert_eq!(batch.committed_through, Some(0));
+        batch.append(1, &split, [0; 4]).unwrap();
+        assert!(!batch.full_before(&split));
+        assert!(!batch.full_before(&committing));
+    }
+
+    #[test]
+    fn network_only_batching_keeps_split_frames_in_one_write() {
+        let mut batch = QwpWsBatch::new(None, 0, 0);
+        batch.append(0, &frame(1, 8), [0; 4]).unwrap();
+        assert!(!batch.full_before(&frame(1, 9)));
     }
 
     #[test]

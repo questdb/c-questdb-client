@@ -3237,16 +3237,6 @@ pub(crate) fn write_arrow_column_body(
     arr: &dyn Array,
     sym_resolution: Option<&ArrowResolvedSymbolColumn>,
 ) -> Result<()> {
-    write_arrow_column_body_with_dict(out, kind, arr, sym_resolution, None)
-}
-
-pub(crate) fn write_arrow_column_body_with_dict(
-    out: &mut Vec<u8>,
-    kind: ColumnKind,
-    arr: &dyn Array,
-    sym_resolution: Option<&ArrowResolvedSymbolColumn>,
-    local_symbols: Option<&[Vec<u8>]>,
-) -> Result<()> {
     // `null_count()` is consistent with the null buffer the writers below (and
     // the symbol resolve pass) key off via `is_null` / `arr.nulls()`: arrow drops
     // the null buffer entirely when the count is 0 (so `nulls()` is `None` and no
@@ -3642,9 +3632,6 @@ pub(crate) fn write_arrow_column_body_with_dict(
                     "symbol column body writer requires pre-pass resolution"
                 )
             })?;
-            if let Some(entries) = local_symbols {
-                super::encoder::write_local_symbol_dictionary(out, entries);
-            }
             write_symbol_payload(out, res)
         }
         ColumnKind::DictToVarchar { key, value } => {
@@ -3949,7 +3936,6 @@ pub(crate) fn encode_arrow_batch_into(
         symbol_dict,
         defer_commit,
         /* replay_symbols = */ false,
-        /* record = */ false,
     )
 }
 
@@ -3972,36 +3958,7 @@ pub(crate) fn encode_arrow_batch_replay_into(
         symbol_dict,
         defer_commit,
         /* replay_symbols = */ true,
-        /* record = */ false,
     )
-}
-
-pub(crate) fn encode_arrow_record_into(
-    out: &mut Vec<u8>,
-    table: TableName<'_>,
-    batch: &RecordBatch,
-    ts: ArrowTsSource,
-    overrides: &[ArrowColumnOverride<'_>],
-    defer_commit: bool,
-) -> Result<usize> {
-    let start = out.len();
-    encode_arrow_batch_into_mode(
-        out,
-        table,
-        batch,
-        ts,
-        overrides,
-        &mut SymbolGlobalDict::new(),
-        defer_commit,
-        false,
-        true,
-    )?;
-    let column_count = if batch.num_rows() == 0 {
-        0
-    } else {
-        batch.num_columns() + usize::from(matches!(ts, ArrowTsSource::ScalarNanos(_)))
-    };
-    Ok(out.len() - start - 4 * column_count + 5)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4014,7 +3971,6 @@ fn encode_arrow_batch_into_mode(
     symbol_dict: &mut SymbolGlobalDict,
     defer_commit: bool,
     replay_symbols: bool,
-    record: bool,
 ) -> Result<()> {
     let schema = batch.schema();
     let overrides_by_column = if overrides.is_empty() {
@@ -4033,11 +3989,7 @@ fn encode_arrow_batch_into_mode(
         ));
     }
     if row_count == 0 {
-        if record {
-            super::encoder::write_record_header(out, 0, defer_commit);
-        } else {
-            emit_header_only_frame(out, defer_commit);
-        }
+        emit_header_only_frame(out, defer_commit);
         return Ok(());
     }
     if row_count > MAX_ARROW_INGEST_ROWS {
@@ -4054,12 +4006,6 @@ fn encode_arrow_batch_into_mode(
         ArrowTsSource::Column(idx) => Some(idx),
         _ => None,
     };
-    if ts_col_idx.is_some_and(|idx| idx >= total_cols) {
-        return Err(fmt!(
-            ArrowIngest,
-            "designated timestamp column index is out of bounds"
-        ));
-    }
     let user_col_count = total_cols - if ts_col_idx.is_some() { 1 } else { 0 };
     if user_col_count == 0 {
         return Err(fmt!(
@@ -4101,32 +4047,7 @@ fn encode_arrow_batch_into_mode(
     }
 
     let dict_mark = symbol_dict.mark();
-    let mut local_dictionary_ends = Vec::new();
-    let resolve = if record {
-        let mut resolution = ArrowSymbolResolution {
-            delta_start: 0,
-            new_symbols: Vec::new(),
-            per_column: Vec::with_capacity(classified.len()),
-        };
-        let mut gids_pool = Vec::new();
-        (|| {
-            for col in &classified {
-                resolution.per_column.push(resolve_arrow_symbol_column(
-                    col.arr,
-                    col.kind,
-                    symbol_dict,
-                    &mut resolution.new_symbols,
-                    &mut gids_pool,
-                )?);
-                local_dictionary_ends.push(resolution.new_symbols.len());
-                symbol_dict.rollback(dict_mark);
-            }
-            Ok(resolution)
-        })()
-    } else {
-        resolve_arrow_symbols(&classified, symbol_dict)
-    };
-    let mut resolution = match resolve {
+    let mut resolution = match resolve_arrow_symbols(&classified, symbol_dict) {
         Ok(r) => r,
         Err(e) => {
             symbol_dict.rollback(dict_mark);
@@ -4186,19 +4107,13 @@ fn encode_arrow_batch_into_mode(
         ));
     }
 
-    if record {
-        super::encoder::write_record_header(out, 1, defer_commit);
-    } else {
-        write_header_placeholder(out, 1, defer_commit);
-    }
+    write_header_placeholder(out, 1, defer_commit);
     let payload_start = out.len();
 
-    if !record {
-        write_qwp_varint(out, resolution.delta_start);
-        write_qwp_varint(out, resolution.new_symbols.len() as u64);
-        for bytes in &resolution.new_symbols {
-            write_qwp_bytes(out, bytes);
-        }
+    write_qwp_varint(out, resolution.delta_start);
+    write_qwp_varint(out, resolution.new_symbols.len() as u64);
+    for bytes in &resolution.new_symbols {
+        write_qwp_bytes(out, bytes);
     }
 
     write_qwp_bytes(out, table.as_ref().as_bytes());
@@ -4212,20 +4127,9 @@ fn encode_arrow_batch_into_mode(
         e
     };
 
-    let mut dictionary_start = 0;
     for (col_idx, col) in classified.iter().enumerate() {
         let sym_res = resolution.per_column[col_idx].as_ref();
-        let result = if record {
-            let dictionary_end = local_dictionary_ends[col_idx];
-            let dictionary = &resolution.new_symbols[dictionary_start..dictionary_end];
-            dictionary_start = dictionary_end;
-            super::encoder::write_record_column(out, |out| {
-                write_arrow_column_body_with_dict(out, col.kind, col.arr, sym_res, Some(dictionary))
-            })
-        } else {
-            write_arrow_column_body(out, col.kind, col.arr, sym_res)
-        };
-        if let Err(e) = result {
+        if let Err(e) = write_arrow_column_body(out, col.kind, col.arr, sym_res) {
             let col_name = col.name.as_ref().to_string();
             return Err(rollback_on_err(
                 out,
@@ -4235,10 +4139,6 @@ fn encode_arrow_batch_into_mode(
         }
     }
 
-    let designated_length_offset = out.len();
-    if record && ts_wire_type.is_some() {
-        out.extend_from_slice(&[0; 4]);
-    }
     match ts {
         ArrowTsSource::Column(idx) => {
             let arr = batch.column(idx);
@@ -4258,23 +4158,6 @@ fn encode_arrow_batch_into_mode(
             }
         }
         ArrowTsSource::ServerNow => {}
-    }
-
-    if record {
-        if ts_wire_type.is_some() {
-            let length = u32::try_from(out.len() - designated_length_offset - 4).map_err(|_| {
-                fmt!(
-                    ArrowIngest,
-                    "SF record timestamp column exceeds u32::MAX bytes"
-                )
-            });
-            match length {
-                Ok(length) => out[designated_length_offset..designated_length_offset + 4]
-                    .copy_from_slice(&length.to_le_bytes()),
-                Err(e) => return Err(rollback_on_err(out, symbol_dict, e)),
-            }
-        }
-        return Ok(());
     }
 
     let payload_len_usize = out.len() - payload_start;
@@ -4408,112 +4291,6 @@ mod tests {
 
     fn col_name(name: &str) -> ColumnName<'_> {
         ColumnName::new(name).unwrap()
-    }
-
-    #[test]
-    fn record_arrow_preserves_dictionary_overrides_binary_nulls_and_timestamp_units() {
-        use crate::ingress::sender::qwp_ws_record::RecordBatch as PendingRecords;
-        use crate::tests::qwp_decode::{DecodedValue as V, decode_datagram};
-
-        let mut dictionary = StringDictionaryBuilder::<arrow::datatypes::Int8Type>::new();
-        dictionary.append("bravo").unwrap();
-        dictionary.append("bravo").unwrap();
-        dictionary.append_null();
-        let dictionary = dictionary.finish();
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("sym", DataType::Utf8, true),
-            Field::new("other", dictionary.data_type().clone(), true),
-            Field::new("payload", DataType::Binary, true),
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-                false,
-            ),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![Some("alpha"), None, Some("gamma")])),
-                Arc::new(dictionary),
-                Arc::new(BinaryArray::from(vec![
-                    Some(&b"a"[..]),
-                    None,
-                    Some(&b"bc"[..]),
-                ])),
-                Arc::new(TimestampMillisecondArray::from(vec![1, 2, 3])),
-            ],
-        )
-        .unwrap();
-        let mut record = Vec::new();
-        let wire_len = encode_arrow_record_into(
-            &mut record,
-            tbl("trades"),
-            &batch,
-            ArrowTsSource::Column(3),
-            &[ArrowColumnOverride::Symbol { column: "sym" }],
-            false,
-        )
-        .unwrap();
-        let mut records = PendingRecords::new();
-        assert!(records.try_append(&record, 1 << 20, 100).unwrap());
-        let mut frame = Vec::new();
-        records.encode_frame(&mut frame).unwrap();
-        assert_eq!(wire_len, frame.len());
-        let table = decode_datagram(&frame).unwrap().table;
-        assert_eq!(
-            table.rows,
-            vec![
-                vec![
-                    V::Symbol("alpha".into()),
-                    V::Symbol("bravo".into()),
-                    V::Binary(b"a".to_vec()),
-                    V::TimestampMicros(1000)
-                ],
-                vec![
-                    V::Null,
-                    V::Symbol("bravo".into()),
-                    V::Null,
-                    V::TimestampMicros(2000)
-                ],
-                vec![
-                    V::Symbol("gamma".into()),
-                    V::Null,
-                    V::Binary(b"bc".to_vec()),
-                    V::TimestampMicros(3000)
-                ],
-            ]
-        );
-    }
-
-    #[test]
-    fn record_arrow_error_rolls_back_output_and_validates_timestamp_index() {
-        let batch = single_col_batch(
-            Field::new("id", DataType::Binary, false),
-            BinaryArray::from(vec![&b"short"[..]]),
-        );
-        let mut out = vec![42];
-        let error = encode_arrow_record_into(
-            &mut out,
-            tbl("trades"),
-            &batch,
-            ArrowTsSource::ScalarNanos(1),
-            &[ArrowColumnOverride::Uuid { column: "id" }],
-            false,
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), ErrorCode::ArrowIngest);
-        assert_eq!(out, [42]);
-        let error = encode_arrow_record_into(
-            &mut out,
-            tbl("trades"),
-            &batch,
-            ArrowTsSource::Column(1),
-            &[],
-            false,
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), ErrorCode::ArrowIngest);
-        assert_eq!(out, [42]);
     }
 
     #[test]

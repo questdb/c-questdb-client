@@ -115,13 +115,14 @@ typedef struct questdb_db questdb_db;
  *
  * Commit windows span leases on one ingestion slot. Flush still publishes to
  * SF before returning; wait forces its pending boundary to commit. Returning
- * a lease does not close the window. Ready frames are automatically batched
- * into network writes with no timer to wait for more frames. Standalone
- * senders reject the two `commit_*` keys.
- * Enabling a commit window stores small flushes as versioned SF records for
- * background frame assembly. This client also replays legacy QWP frames;
- * older clients cannot replay the new records. Drain the slot before handing
- * it to an older client or a Java client.
+ * a lease does not close the window. ACKs, and so acked FSNs, advance when a
+ * window commits. A server rejection reports the FSN range of the whole
+ * committed frame, which can include other leases' publications on the same
+ * slot. Ready frames are automatically batched into network writes with no
+ * timer to wait for more frames. Standalone senders reject the two `commit_*`
+ * keys. SF, in memory or on disk, always holds QWP frames; with a commit window
+ * the background sender combines consecutive small flushes into one QWP
+ * message on the wire.
  *
  * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
  * for the public ingestion pool. `sender_id` names the slot *base* (default

@@ -29,18 +29,14 @@
 //! On reconnect/failover the fresh server starts with an empty dictionary, so
 //! before the queued delta frames replay, the whole dictionary must be
 //! re-registered. [`SentDictMirror`] is the I/O-thread-local record of every
-//! symbol the loop has sent or reserved for accepted memory-SF records, from
-//! which it builds the catch-up frame(s).
+//! symbol the loop has sent, from which it builds the catch-up frame(s).
 //!
-//! The mirror is populated three ways, all encoder-agnostic (it parses the wire
+//! The mirror is populated two ways, both encoder-agnostic (it parses the wire
 //! bytes, never the [`SymbolGlobalDict`](crate::ingress::buffer::SymbolGlobalDict)):
 //!
 //! * [`accumulate`](SentDictMirror::accumulate) — after each frame is sent, its
 //!   delta section is appended to the mirror if it extends the mirror's tip.
 //!   Replayed or empty-delta frames are no-ops, so this is idempotent.
-//! * [`try_accumulate_delta`](SentDictMirror::try_accumulate_delta) — before a
-//!   memory-SF record frame exposes new shared symbol ids to the foreground,
-//!   retain its prefix so reconnect can register it even if its send fails.
 //! * [`seed`](SentDictMirror::seed) — on recovery/orphan-drain the mirror is
 //!   seeded from the slot's [`PersistedSymbolDict`](super::qwp_ws_sfa_symbol_dict)
 //!   before the first connection.
@@ -78,11 +74,6 @@ const FAIL_CATCH_UP_ALLOCATION_SYMBOL: &[u8] = b"qdb-test-catch-up-allocation";
 static FAIL_NEXT_MATCHING_CATCH_UP_ALLOCATION: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
-const FAIL_MIRROR_ALLOCATION_SYMBOL: &[u8] = b"qdb-test-mirror-allocation";
-#[cfg(test)]
-static FAIL_NEXT_MATCHING_MIRROR_ALLOCATION: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
 pub(crate) fn fail_next_catch_up_allocation_for_test() {
     FAIL_NEXT_MATCHING_CATCH_UP_ALLOCATION.store(true, Ordering::Release);
 }
@@ -93,19 +84,6 @@ fn should_fail_catch_up_allocation_for_test(entries: &[u8]) -> bool {
         .windows(FAIL_CATCH_UP_ALLOCATION_SYMBOL.len())
         .any(|window| window == FAIL_CATCH_UP_ALLOCATION_SYMBOL)
         && FAIL_NEXT_MATCHING_CATCH_UP_ALLOCATION.swap(false, Ordering::AcqRel)
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_mirror_allocation_for_test() {
-    FAIL_NEXT_MATCHING_MIRROR_ALLOCATION.store(true, Ordering::Release);
-}
-
-#[cfg(test)]
-fn should_fail_mirror_allocation_for_test(entries: &[u8]) -> bool {
-    entries
-        .windows(FAIL_MIRROR_ALLOCATION_SYMBOL.len())
-        .any(|window| window == FAIL_MIRROR_ALLOCATION_SYMBOL)
-        && FAIL_NEXT_MATCHING_MIRROR_ALLOCATION.swap(false, Ordering::AcqRel)
 }
 
 /// A single symbol dictionary entry did not fit a catch-up frame even alone,
@@ -119,8 +97,7 @@ pub(crate) struct CatchUpEntryTooLarge {
 }
 
 /// I/O-thread-local mirror of every symbol dictionary entry the send loop has
-/// transmitted or reserved for accepted memory-SF records, in ascending
-/// global-id order, held as the concatenated
+/// transmitted, in ascending global-id order, held as the concatenated
 /// `[len varint][utf8]` bytes exactly as a delta section carries them. Inert
 /// (all operations no-ops / empty) when delta mode is disabled.
 ///
@@ -372,53 +349,6 @@ impl SentDictMirror {
         true
     }
 
-    /// Retains a memory-SF record frame's dictionary before its shared symbol
-    /// ids become visible to later foreground encodes. The caller must hold the
-    /// shared dictionary lock through this call and roll back its new ids if it
-    /// returns `false`. After success, reconnect catch-up can advertise the ids
-    /// even if the original data frame never reaches the socket.
-    ///
-    /// Unlike [`accumulate`](Self::accumulate), success means the entire valid
-    /// delta section is retained, including any identical overlap. A disabled
-    /// mirror, malformed section, gap, conflicting overlap, or allocation failure
-    /// returns `false` without changing the retained entries, count, or enabled
-    /// state, so the caller can fall back to a self-contained frame.
-    #[must_use = "on failure, roll back unpublished shared symbol ids before releasing the lock"]
-    pub(crate) fn try_accumulate_delta(&mut self, frame: &[u8]) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        let Some(section) = parse_delta_section(frame) else {
-            return false;
-        };
-        let tip = u64::from(self.count);
-        let Some(frame_end) = section
-            .delta_start
-            .checked_add(u64::from(section.delta_count))
-            .and_then(|end| u32::try_from(end).ok())
-        else {
-            return false;
-        };
-        if section.delta_start > tip || self.conflicts_with_section(&section) {
-            return false;
-        }
-        if frame_end <= self.count {
-            return true;
-        }
-        let suffix_off = skip_entries(section.entries, (tip - section.delta_start) as usize);
-        let suffix = &section.entries[suffix_off..];
-        #[cfg(test)]
-        if should_fail_mirror_allocation_for_test(suffix) {
-            return false;
-        }
-        if self.bytes.try_reserve(suffix.len()).is_err() {
-            return false;
-        }
-        self.bytes.extend_from_slice(suffix);
-        self.count = frame_end;
-        true
-    }
-
     /// Returns `true` when `frame`'s delta section redefines an already-mirrored
     /// symbol id to a **different** symbol.
     ///
@@ -447,10 +377,6 @@ impl SentDictMirror {
         let Some(section) = parse_delta_section(frame) else {
             return false;
         };
-        self.conflicts_with_section(&section)
-    }
-
-    fn conflicts_with_section(&self, section: &DeltaSection<'_>) -> bool {
         let tip = u64::from(self.count);
         // No already-held ids: an empty delta, a gap, or an exactly-contiguous
         // extension (`delta_start == tip`) introduces nothing the mirror holds.
@@ -918,90 +844,6 @@ mod tests {
         assert_eq!(
             symbols_from_catch_up(&frames),
             vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
-        );
-    }
-
-    #[test]
-    fn eager_delta_is_available_to_catch_up_before_send() {
-        let mut m = SentDictMirror::new(true);
-        // A later accepted legacy frame already owns id 0 when the earlier
-        // record frame allocates id 1. The record must carry both entries.
-        let record_frame = make_frame(0, &[b"legacy", b"record"], b"record-data");
-        assert!(m.try_accumulate_delta(&record_frame));
-        assert_eq!(
-            symbols_from_catch_up(&m.build_catch_up_frames(0, 1).unwrap()),
-            vec![b"legacy".to_vec(), b"record".to_vec()],
-            "a failed send must not lose ids already visible to the foreground"
-        );
-
-        // Normal post-send accumulation and the later legacy frame repeat
-        // prefixes the eager mirror already retains.
-        assert!(m.accumulate(&record_frame));
-        assert!(m.accumulate(&make_frame(0, &[b"legacy"], b"legacy-data")));
-        assert!(m.try_accumulate_delta(&make_frame(2, &[], b"data")));
-        assert_eq!(m.count(), 2);
-
-        assert!(m.try_accumulate_delta(&make_frame(1, &[b"record", b"next"], b"")));
-        assert_eq!(
-            symbols_from_catch_up(&m.build_catch_up_frames(0, 1).unwrap()),
-            vec![b"legacy".to_vec(), b"record".to_vec(), b"next".to_vec()]
-        );
-    }
-
-    #[test]
-    fn eager_delta_rejects_unretained_or_conflicting_prefixes() {
-        let mut disabled = SentDictMirror::new(false);
-        assert!(!disabled.try_accumulate_delta(&make_frame(0, &[b"A"], b"")));
-        assert!(!disabled.is_enabled());
-        assert_eq!(disabled.count(), 0);
-        assert!(disabled.bytes.is_empty());
-
-        let mut m = SentDictMirror::new(true);
-        assert!(m.accumulate(&make_frame(0, &[b"A", b"B"], b"")));
-        let original = m.bytes.clone();
-        let mut non_delta = make_frame(2, &[b"C"], b"");
-        non_delta[HEADER_OFFSET_FLAGS] = 0;
-        let mut truncated = make_frame(2, &[b"C"], b"");
-        truncated.pop();
-        for frame in [
-            make_frame(3, &[b"gap"], b""),
-            make_frame(3, &[], b""),
-            make_frame(1, &[b"different"], b""),
-            make_frame(1, &[b"different", b"new"], b""),
-            make_frame(u64::MAX, &[b"overflow"], b""),
-            non_delta,
-            truncated,
-        ] {
-            assert!(!m.try_accumulate_delta(&frame));
-            assert!(m.is_enabled());
-            assert_eq!(m.count(), 2);
-            assert_eq!(m.bytes, original);
-        }
-        assert!(m.try_accumulate_delta(&make_frame(0, &[b"A", b"B"], b"")));
-    }
-
-    #[test]
-    fn eager_delta_allocation_failure_preserves_existing_catch_up() {
-        let mut m = SentDictMirror::new(true);
-        assert!(m.accumulate(&make_frame(0, &[b"accepted"], b"")));
-        let original = m.bytes.clone();
-        let frame = make_frame(0, &[b"accepted", FAIL_MIRROR_ALLOCATION_SYMBOL], b"");
-        fail_next_mirror_allocation_for_test();
-        assert!(!m.try_accumulate_delta(&frame));
-        assert!(m.is_enabled());
-        assert_eq!(m.count(), 1);
-        assert_eq!(m.bytes, original);
-        assert_eq!(
-            symbols_from_catch_up(&m.build_catch_up_frames(0, 1).unwrap()),
-            vec![b"accepted".to_vec()]
-        );
-
-        // The failed reservation leaves the mirror usable for a later retry.
-        assert!(m.try_accumulate_delta(&frame));
-        assert_eq!(m.count(), 2);
-        assert_eq!(
-            symbols_from_catch_up(&m.build_catch_up_frames(0, 1).unwrap()),
-            vec![b"accepted".to_vec(), FAIL_MIRROR_ALLOCATION_SYMBOL.to_vec()]
         );
     }
 

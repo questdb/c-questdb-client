@@ -38,7 +38,7 @@ use rand::RngCore;
 
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
-use crate::ingress::buffer::{QwpWsColumnarBuffer, SymbolGlobalDict};
+use crate::ingress::buffer::QwpWsColumnarBuffer;
 use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability};
 use crate::ingress::tls::{TlsSettings, configure_tls};
 use crate::ws::frame::{
@@ -64,7 +64,6 @@ use super::qwp_ws_orphan::{
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
 use super::qwp_ws_queue::{OutboundFrame, SentFrame};
-use super::qwp_ws_sfa_publisher::SharedSymbolGlobalDict;
 use super::qwp_ws_sfa_queue::{
     SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError, segment_payload_capacity,
     two_frame_segment_payload_capacity,
@@ -451,9 +450,6 @@ struct QwpWsConnectedParts {
 pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     runner: SyncQwpWsRunner,
-    record_first: bool,
-    record_first_row_limit: usize,
-    pub(crate) record_global_dict: Option<SharedSymbolGlobalDict>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
     /// Hard cap on a single store-and-forward frame's payload: `sf_max_segment_bytes`
@@ -500,9 +496,6 @@ pub(crate) struct SyncQwpWsHandlerState {
 }
 
 impl SyncQwpWsHandlerState {
-    pub(crate) fn use_record_for_rows(&self, rows: usize) -> bool {
-        self.record_first && rows < self.record_first_row_limit
-    }
     /// Releases the recovered dictionary seeded into the standalone replay
     /// encoder at connect. The pooled core uses its own dictionary and never
     /// touches this encoder, so that seed is dead weight once the pooled core
@@ -582,7 +575,6 @@ struct QwpWsPendingConnect {
     /// Empty in memory mode / on a fresh slot.
     recovered_dict_entries: Vec<u8>,
     recovered_dict_count: u32,
-    record_global_dict: Option<SharedSymbolGlobalDict>,
     #[cfg(test)]
     terminal_error_for_test: Option<crate::Error>,
 }
@@ -1113,7 +1105,6 @@ impl QwpWsPendingConnect {
             delta_dict_enabled,
             recovered_dict_entries,
             recovered_dict_count,
-            record_global_dict: None,
             #[cfg(test)]
             terminal_error_for_test: None,
         }
@@ -1242,7 +1233,6 @@ impl SyncQwpWsPendingRunnerCore {
                         self.pending_connect.recovered_dict_count,
                     );
                 }
-                send_core.set_record_global_dict(self.pending_connect.record_global_dict.clone());
                 self.connected = Some(SyncQwpWsRunnerCore {
                     send_core,
                     progress: self.progress.clone(),
@@ -1351,7 +1341,7 @@ where
             ) {
                 Ok(Some(outbound)) => outbound,
                 Ok(None) => {
-                    if self.send_core.has_more_record_input(&self.progress) {
+                    if self.send_core.has_more_batch_input(&self.progress) {
                         send_step = RunnerStep::Continue;
                     }
                     break;
@@ -3553,10 +3543,6 @@ pub(crate) fn connect_qwp_ws_background_state(
     );
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
     let traffic_gate = Arc::new(TrafficGate::default());
-    // QSR1 does not persist background-assigned global IDs. Sharing is safe in
-    // memory slots, whose allocator and replay mirror survive every reconnect.
-    let record_global_dict = (qwp_ws.sf_dir.is_none() && qwp_ws.pool_commit_interval.is_some())
-        .then(|| Arc::new(Mutex::new(SymbolGlobalDict::new())));
     let (
         runner,
         encoder,
@@ -3610,7 +3596,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         if delta_dict_enabled {
             encoder.seed_global_dict(&recovered_dict_entries, recovered_dict_count)?;
         }
-        let mut pending_connect = QwpWsPendingConnect::new(
+        let pending_connect = QwpWsPendingConnect::new(
             host,
             port,
             use_tls,
@@ -3624,7 +3610,6 @@ pub(crate) fn connect_qwp_ws_background_state(
             try_dup_recovered(&recovered_dict_entries)?,
             recovered_dict_count,
         );
-        pending_connect.record_global_dict = record_global_dict.clone();
         let runner = SyncQwpWsRunner::start_pending_connect(
             queue,
             pending_connect,
@@ -3671,9 +3656,6 @@ pub(crate) fn connect_qwp_ws_background_state(
                 .send_core
                 .enable_delta_dict(&parts.recovered_dict_entries, parts.recovered_dict_count);
         }
-        parts
-            .send_core
-            .set_record_global_dict(record_global_dict.clone());
         let runner = SyncQwpWsRunner::start_with_append_deadline(
             parts.store,
             parts.send_core,
@@ -3697,13 +3679,6 @@ pub(crate) fn connect_qwp_ws_background_state(
     );
 
     Ok(SyncQwpWsHandlerState {
-        record_first: qwp_ws.pool_commit_interval.is_some(),
-        record_first_row_limit: if qwp_ws.pool_commit_rows == 0 {
-            1_000
-        } else {
-            qwp_ws.pool_commit_rows.min(1_000)
-        },
-        record_global_dict,
         encoder,
         runner,
         server_max_batch_size,
@@ -4813,9 +4788,6 @@ mod tests {
         let state = SyncQwpWsHandlerState {
             encoder: QwpWsReplayEncoder::new(1),
             runner,
-            record_first: false,
-            record_first_row_limit: 1000,
-            record_global_dict: None,
             server_max_batch_size: Arc::new(AtomicUsize::new(4096)),
             request_durable_ack: durable,
             sfa_frame_payload_cap: segment_payload_capacity(4096),
@@ -6761,6 +6733,74 @@ mod tests {
                 "immediate transport failure was not recorded as sent before reconnect: {events:?}"
             );
         }
+        drop(runner);
+    }
+
+    #[derive(Debug)]
+    struct FailFirstBatchFlushTransport {
+        fail_next_flush: bool,
+        sent_fsns: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl QwpWsCoreTransport for FailFirstBatchFlushTransport {
+        fn begin_send_batch(&mut self) -> usize {
+            64 * 1024
+        }
+
+        fn finish_send_batch(
+            &mut self,
+            _force_through: Option<u64>,
+        ) -> Result<(), TransportFailure> {
+            if std::mem::take(&mut self.fail_next_flush) {
+                return Err(TransportFailure::Disconnect(crate::Error::new(
+                    crate::ErrorCode::SocketError,
+                    "fake batch flush failure",
+                )));
+            }
+            Ok(())
+        }
+
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            self.sent_fsns.lock().unwrap().push(frame.sent_frame().fsn);
+            Ok(TransportSendResult::NoResponse)
+        }
+
+        fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn threaded_runner_replays_frames_whose_batch_write_failed() {
+        let sent_fsns = Arc::new(Mutex::new(Vec::new()));
+        let transport = FailFirstBatchFlushTransport {
+            fail_next_flush: true,
+            sent_fsns: Arc::clone(&sent_fsns),
+        };
+        let driver = QwpWsCoreTestHarness::from_queue(memory_queue(1024), transport);
+        let mut runner = SyncQwpWsRunner::start(driver);
+
+        runner.publish_replay_payload(b"first").unwrap();
+        let replayed = || {
+            runner
+                .lock_shared()
+                .unwrap()
+                .counters()
+                .total_frames_replayed
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while replayed() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(replayed(), 1);
+        assert_eq!(*sent_fsns.lock().unwrap(), [0, 0]);
         drop(runner);
     }
 }
