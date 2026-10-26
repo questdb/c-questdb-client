@@ -32,6 +32,7 @@
 use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libc::size_t;
@@ -334,6 +335,9 @@ struct CallbackSource {
     fetch: questdb_token_source_fn,
     release: Option<questdb_token_release_fn>,
     user_data: *mut c_void,
+    /// Cleared when the provider could not be created: a failed call leaves
+    /// `user_data` with the caller, so `release` must not run for it.
+    owns_user_data: AtomicBool,
 }
 
 // The C contract: the callbacks and `user_data` are usable from any thread.
@@ -355,7 +359,9 @@ impl TokenSource for CallbackSource {
 
 impl Drop for CallbackSource {
     fn drop(&mut self) {
-        if let Some(release) = self.release {
+        if *self.owns_user_data.get_mut()
+            && let Some(release) = self.release
+        {
             unsafe { release(self.user_data) };
         }
     }
@@ -566,7 +572,9 @@ pub unsafe extern "C" fn questdb_refreshing_token_provider_options_init(
     unsafe { write_versioned_output(options, written, &value) };
 }
 
-/// Create a refreshing provider around a C token source.
+/// Create a refreshing provider around a C token source. On success the
+/// provider owns `user_data`; on failure it stays with the caller and
+/// `release` does not run, as for every registration in this C API.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_refreshing_token_provider_new(
     source: Option<questdb_token_source_fn>,
@@ -580,20 +588,10 @@ pub unsafe extern "C" fn questdb_refreshing_token_provider_new(
         ptr::null_mut()
     };
     let Some(fetch) = source else {
-        // Ownership transfers on entry, including this earliest rejection.
-        if let Some(release) = release {
-            unsafe { release(user_data) };
-        }
         return fail(
             err_out,
             "token source callback must not be NULL".to_string(),
         );
-    };
-    // Own `user_data` from here on: every exit releases it exactly once.
-    let source = CallbackSource {
-        fetch,
-        release,
-        user_data,
     };
     let options = if options.is_null() {
         questdb_refreshing_token_provider_options::default()
@@ -610,37 +608,56 @@ pub unsafe extern "C" fn questdb_refreshing_token_provider_new(
         }
         unsafe { options.read() }
     };
-    let ms = Duration::from_millis;
-    let mut builder = RefreshingTokenProvider::builder(source)
-        .refresh_margin(ms(options.refresh_margin_ms))
-        .min_refresh_interval(ms(options.min_refresh_interval_ms))
-        .handout_floor(ms(options.handout_floor_ms))
-        .cold_wait(ms(options.cold_wait_ms))
-        .backoff_initial(ms(options.backoff_initial_ms))
-        .backoff_max(ms(options.backoff_max_ms))
-        .retry_after_max(ms(options.retry_after_max_ms))
-        .forced_min_interval(ms(options.forced_min_interval_ms))
-        .forced_wait(ms(options.forced_wait_ms));
-    if !options.name.is_null() && options.name_len > 0 {
+    let name = if !options.name.is_null() && options.name_len > 0 {
         let bytes =
             unsafe { std::slice::from_raw_parts(options.name.cast::<u8>(), options.name_len) };
         match std::str::from_utf8(bytes) {
-            Ok(name) => builder = builder.name(name),
+            Ok(name) => Some(name),
             Err(_) => return fail(err_out, "token provider name is not UTF-8".to_string()),
         }
+    } else {
+        None
+    };
+    // Shared with the builder so that a failed build can hand `user_data`
+    // back: `build` drops its copy before it returns.
+    let source = Arc::new(CallbackSource {
+        fetch,
+        release,
+        user_data,
+        owns_user_data: AtomicBool::new(true),
+    });
+    let ms = Duration::from_millis;
+    let mut builder = RefreshingTokenProvider::builder({
+        let source = Arc::clone(&source);
+        move || source.fetch_token()
+    })
+    .refresh_margin(ms(options.refresh_margin_ms))
+    .min_refresh_interval(ms(options.min_refresh_interval_ms))
+    .handout_floor(ms(options.handout_floor_ms))
+    .cold_wait(ms(options.cold_wait_ms))
+    .backoff_initial(ms(options.backoff_initial_ms))
+    .backoff_max(ms(options.backoff_max_ms))
+    .retry_after_max(ms(options.retry_after_max_ms))
+    .forced_min_interval(ms(options.forced_min_interval_ms))
+    .forced_wait(ms(options.forced_wait_ms));
+    if let Some(name) = name {
+        builder = builder.name(name);
     }
     match builder.build() {
         Ok(provider) => new_handle(ProviderKind::Refreshing(provider)),
         Err(err) => {
+            // A failed build starts no refresher, so the source never ran.
+            source.owns_user_data.store(false, Ordering::Relaxed);
             unsafe { set_err_out_from_error(err_out, err) };
             ptr::null_mut()
         }
     }
 }
 
-/// Create a provider from an application-implemented function table. Once
-/// the vtable is readable the provider owns `user_data`, failed calls
-/// included: `release` runs once when it is no longer needed.
+/// Create a provider from an application-implemented function table. On
+/// success the provider owns `user_data`: `release` runs once when it is no
+/// longer needed. On failure it stays with the caller and `release` does not
+/// run.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_token_provider_new(
     vtable: *const questdb_token_provider_vtable,
@@ -669,11 +686,6 @@ pub unsafe extern "C" fn questdb_token_provider_new(
     }
     let vtable = unsafe { vtable.read() };
     let Some(get_token) = vtable.get_token else {
-        // The provider owns `user_data` once the vtable is readable, failed
-        // calls included, like `questdb_refreshing_token_provider_new`.
-        if let Some(release) = vtable.release {
-            unsafe { release(user_data) };
-        }
         return invalid(
             err_out,
             "token provider vtable.get_token must not be NULL".to_string(),
@@ -1582,7 +1594,7 @@ mod tests {
             )
         };
         assert!(provider.is_null() && !err.is_null());
-        assert_eq!(probe.released.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.released.load(Ordering::SeqCst), 0);
         assert_eq!(probe.fetches.load(Ordering::SeqCst), 0);
         unsafe { crate::questdb_error_free(err) };
         err = ptr::null_mut();
@@ -1600,26 +1612,68 @@ mod tests {
         assert!(!unsafe { questdb_token_sink_set_token(ptr::null_mut(), ptr::null(), 0, 0, 0) });
     }
 
+    /// A failed constructor leaves `user_data` with the caller, as a failed
+    /// `questdb_oidc_builder_event_handler` does, so one cleanup rule fits
+    /// every registration in the C API.
     #[test]
-    fn invalid_refreshing_options_release_the_source_once() {
+    fn a_failed_constructor_leaves_user_data_with_the_caller() {
+        let not_utf8 = [0xffu8];
+        let refused = [
+            (
+                "undersized options",
+                questdb_refreshing_token_provider_options {
+                    struct_size: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "a name that is not UTF-8",
+                questdb_refreshing_token_provider_options {
+                    name: not_utf8.as_ptr().cast(),
+                    name_len: not_utf8.len(),
+                    ..Default::default()
+                },
+            ),
+            // Refused by the provider's own build, after the source is wrapped.
+            (
+                "a zero backoff_initial_ms",
+                questdb_refreshing_token_provider_options {
+                    backoff_initial_ms: 0,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (label, options) in &refused {
+            let mut probe = Probe::default();
+            let mut err = ptr::null_mut();
+            let provider = unsafe {
+                questdb_refreshing_token_provider_new(
+                    Some(source),
+                    ptr::from_mut(&mut probe).cast(),
+                    Some(release),
+                    options,
+                    &mut err,
+                )
+            };
+            assert!(provider.is_null() && !err.is_null(), "{label}");
+            assert_eq!(probe.released.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(probe.fetches.load(Ordering::SeqCst), 0, "{label}");
+            unsafe { crate::questdb_error_free(err) };
+        }
+
         let mut probe = Probe::default();
-        let options = questdb_refreshing_token_provider_options {
-            struct_size: 0,
-            ..Default::default()
+        let vtable = questdb_token_provider_vtable {
+            struct_size: size_of::<questdb_token_provider_vtable>(),
+            get_token: None,
+            on_rejected: None,
+            release: Some(release),
         };
         let mut err = ptr::null_mut();
         let provider = unsafe {
-            questdb_refreshing_token_provider_new(
-                Some(source),
-                ptr::from_mut(&mut probe).cast(),
-                Some(release),
-                &options,
-                &mut err,
-            )
+            questdb_token_provider_new(&vtable, ptr::from_mut(&mut probe).cast(), &mut err)
         };
         assert!(provider.is_null() && !err.is_null());
-        assert_eq!(probe.released.load(Ordering::SeqCst), 1);
-        assert_eq!(probe.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.released.load(Ordering::SeqCst), 0);
         unsafe { crate::questdb_error_free(err) };
     }
 

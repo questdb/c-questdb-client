@@ -449,6 +449,24 @@ TEST_CASE("The connect-string token-provider keys are rejected")
         questdb::ingress::line_sender_error);
 }
 
+TEST_CASE("A refused provider's source is freed exactly once")
+{
+    // The library leaves the source of a provider it refuses with the caller:
+    // a leak would keep `witness` shared, and a double free would crash.
+    const auto witness = std::make_shared<int>(0);
+    questdb::refreshing_token_provider_options options;
+    options.backoff_initial = 0ms;
+    CHECK_THROWS_AS(
+        questdb::token_provider::refreshing(
+            [witness] {
+                return questdb::expiring_token{
+                    "unused", std::chrono::system_clock::now() + 1h};
+            },
+            options),
+        questdb::error);
+    CHECK(witness.use_count() == 1);
+}
+
 namespace
 {
 class counting_provider : public questdb::bearer_token_provider

@@ -337,14 +337,17 @@ public:
             options.forced_min_interval,
             "forced_min_interval");
         set(c_options.forced_wait_ms, options.forced_wait, "forced_wait");
-        // The provider owns the copy from here on, failed calls included.
-        auto* heap = new Source{std::move(source)};
-        return token_provider{::questdb::error::wrapped_call(
+        // The provider owns the copy once it is created; a failed call leaves
+        // it here, to be freed by `heap`.
+        auto heap = std::make_unique<Source>(std::move(source));
+        ::questdb_token_provider* raw = ::questdb::error::wrapped_call(
             ::questdb_refreshing_token_provider_new,
             &detail::source_trampoline<Source>,
-            static_cast<void*>(heap),
+            static_cast<void*>(heap.get()),
             &detail::delete_trampoline<Source>,
-            &c_options)};
+            &c_options);
+        heap.release();
+        return token_provider{raw};
     }
 
     /** A provider implemented by the application. */
@@ -357,9 +360,14 @@ public:
             &detail::provider_get_token,
             &detail::provider_on_rejected,
             &detail::delete_trampoline<detail::shared_provider>};
-        auto* heap = new detail::shared_provider{std::move(provider)};
-        return token_provider{::questdb::error::wrapped_call(
-            ::questdb_token_provider_new, &vtable, static_cast<void*>(heap))};
+        auto heap =
+            std::make_unique<detail::shared_provider>(std::move(provider));
+        ::questdb_token_provider* raw = ::questdb::error::wrapped_call(
+            ::questdb_token_provider_new,
+            &vtable,
+            static_cast<void*>(heap.get()));
+        heap.release();
+        return token_provider{raw};
     }
 
     /**

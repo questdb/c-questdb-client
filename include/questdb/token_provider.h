@@ -71,6 +71,8 @@
  *   provider is stopped with `questdb_token_provider_close`.
  * - `release` runs once, on any thread, when the provider no longer needs
  *   `user_data`. It may run after the call that created the provider returns.
+ *   A call that fails (returns NULL) leaves `user_data` with the caller and
+ *   never runs `release`, as for the callbacks in `questdb/oidc.h`.
  * - Providers and clients must not be used across `fork()`. Use spawn/exec
  *   workers and create providers there, or fork before creating any providers
  *   or clients. A fresh provider alone cannot repair a multithreaded parent's
@@ -244,9 +246,10 @@ void questdb_refreshing_token_provider_options_init(
  * Create a refreshing provider around `source`. Its first fetch starts at
  * once, on the provider's own thread. `options` may be NULL for the defaults.
  *
- * The provider owns `user_data` from this call on, failed calls included:
- * `release` (may be NULL) runs once when it is no longer needed. Free the
- * handle with `questdb_token_provider_free`.
+ * On success the provider owns `user_data`: `release` (may be NULL) runs once
+ * when it is no longer needed. On failure `user_data` stays with the caller
+ * and `release` does not run. Free the handle with
+ * `questdb_token_provider_free`.
  *
  * Returns NULL and sets `*err_out` on invalid arguments.
  */
@@ -275,10 +278,9 @@ typedef struct questdb_token_provider_vtable
  * Create a provider from an application-implemented function table. Free the
  * handle with `questdb_token_provider_free`.
  *
- * Once `vtable` is readable -- non-NULL, with a sufficient `struct_size` --
- * the provider owns `user_data`, failed calls included: `vtable->release` (may
- * be NULL) runs once when it is no longer needed. For a NULL or undersized
- * `vtable`, `user_data` stays with the caller.
+ * On success the provider owns `user_data`: `vtable->release` (may be NULL)
+ * runs once when it is no longer needed. On failure `user_data` stays with the
+ * caller and `release` does not run.
  *
  * Returns NULL and sets `*err_out` on invalid arguments.
  */
