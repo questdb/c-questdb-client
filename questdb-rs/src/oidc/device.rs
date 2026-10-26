@@ -2980,9 +2980,10 @@ impl OidcDeviceAuth {
                 let tokens = match self.tokenset_from_response(body, None) {
                     Ok(tokens) => tokens,
                     Err(error) => {
-                        self.renderer.on_failure(
-                            "Sign-in failed: the identity provider returned an unsupported token type.",
-                        );
+                        // Name the field the response failed on: its
+                        // token_type, its expires_in or its refresh token.
+                        self.renderer
+                            .on_failure(&format!("Sign-in failed: {}", error.message()));
                         return Err(error);
                     }
                 };

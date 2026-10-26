@@ -1201,6 +1201,64 @@ fn initial_malformed_token_types_are_rejected() {
     }
 }
 
+#[test]
+fn a_refused_token_response_is_rendered_with_its_cause() {
+    // The failure line named an unsupported token type for every response the
+    // grant refused, a bad expires_in or refresh token included.
+    struct RecordFailures(Arc<Mutex<Vec<String>>>);
+    impl Renderer for RecordFailures {
+        fn on_failure(&self, message: &str) {
+            self.0.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    for (response, cause) in [
+        (
+            r#"{"access_token":"AT-1","token_type":"DPoP","expires_in":300}"#,
+            "unsupported token_type \"DPoP\"",
+        ),
+        (
+            r#"{"access_token":"AT-1","token_type":"Bearer","expires_in":-1}"#,
+            "expires_in must be a non-negative integer",
+        ),
+        (
+            r#"{"access_token":"AT-1","token_type":"Bearer","expires_in":"soon"}"#,
+            "expires_in must be a non-negative integer",
+        ),
+        (
+            r#"{"access_token":"AT-1","token_type":"Bearer","expires_in":300,"refresh_token":"RT\u0007X"}"#,
+            "refresh token containing characters",
+        ),
+    ] {
+        let mock = MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => (200, response.to_string()),
+            _ => (404, "{}".to_string()),
+        });
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .sleep_hook(no_sleep())
+            .renderer(RecordFailures(Arc::clone(&failures)))
+            .build()
+            .expect("build auth");
+
+        let error = auth.sign_in().unwrap_err();
+        assert!(error.message().contains(cause), "{response}: {error}");
+        assert_eq!(
+            *failures.lock().unwrap(),
+            [format!("Sign-in failed: {}", error.message())],
+            "{response}"
+        );
+    }
+}
+
 /// A `/device` response carrying an exact, mutation-discriminating device code.
 fn device_response_with_code(device_code: &str) -> String {
     serde_json::json!({
