@@ -2431,6 +2431,7 @@ struct QwpWsTableBuffer {
     in_progress_column_count: usize,
     column_access_cursor: usize,
     columns: Vec<QwpWsColumnBuffer>,
+    encoded_column_schema: Vec<u8>,
     column_lookup: std::collections::HashMap<Box<[u8]>, usize>,
     row_mark: Option<QwpWsRowRollbackMark>,
 }
@@ -2898,6 +2899,7 @@ impl QwpWsColumnarBuffer {
         for table in &self.tables {
             cap += table.table_name.capacity();
             cap += table.columns.capacity() * std::mem::size_of::<QwpWsColumnBuffer>();
+            cap += table.encoded_column_schema.capacity();
             for column in &table.columns {
                 cap += column.name.capacity() + column.lower_name.capacity() + column.capacity();
             }
@@ -3896,18 +3898,9 @@ impl QwpWsColumnarBuffer {
             write_qwp_bytes(out, &table.table_name);
             write_qwp_varint(out, table.row_count as u64);
             write_qwp_varint(out, table.columns.len() as u64);
-
-            scratch.schema_signature.clear();
-            for column in &table.columns {
-                write_qwp_bytes(&mut scratch.schema_signature, &column.name);
-                scratch.schema_signature.push(wire_type_byte(
-                    column.kind,
-                    column.uses_null_bitmap(table.row_count as usize),
-                ));
-            }
             // Columns always travel inline: name + wire-type per column, right
             // after col_count. No schema-mode byte, no schema id.
-            out.extend_from_slice(&scratch.schema_signature);
+            out.extend_from_slice(&table.encoded_column_schema);
 
             for (col_idx, column) in table.columns.iter().enumerate() {
                 let globals = &scratch.per_segment_symbol_globals[table_idx][col_idx];
@@ -3945,6 +3938,7 @@ impl QwpWsTableBuffer {
             in_progress_column_count: 0,
             column_access_cursor: 0,
             columns: Vec::new(),
+            encoded_column_schema: Vec::new(),
             column_lookup: std::collections::HashMap::new(),
             row_mark: None,
         }
@@ -3987,7 +3981,7 @@ impl QwpWsTableBuffer {
         }
         if self.columns.len() > mark.columns_len {
             self.columns.truncate(mark.columns_len);
-            self.rebuild_column_lookup();
+            self.rebuild_column_metadata();
         }
         self.row_count = mark.row_count;
         self.in_progress = mark.in_progress;
@@ -4037,15 +4031,21 @@ impl QwpWsTableBuffer {
         let idx = self.columns.len();
         self.columns.push(QwpWsColumnBuffer::new(name, kind));
         self.column_lookup.insert(lookup_key, idx);
+        write_qwp_bytes(&mut self.encoded_column_schema, name);
+        self.encoded_column_schema.push(wire_type_byte(kind, false));
         Ok(idx)
     }
 
-    fn rebuild_column_lookup(&mut self) {
+    fn rebuild_column_metadata(&mut self) {
         self.column_lookup.clear();
+        self.encoded_column_schema.clear();
         for (idx, column) in self.columns.iter().enumerate() {
             if let Ok(key) = column_lookup_key(&column.name) {
                 self.column_lookup.insert(key, idx);
             }
+            write_qwp_bytes(&mut self.encoded_column_schema, &column.name);
+            self.encoded_column_schema
+                .push(wire_type_byte(column.kind, false));
         }
     }
 }
@@ -5967,6 +5967,7 @@ pub(crate) struct QwpWsEncodeScratch {
     /// definitions: `(varint name_len, name, type_code)*`, spliced inline into
     /// the message right after `col_count` (avoiding a second pass over the
     /// columns).
+    #[cfg(test)]
     schema_signature: Vec<u8>,
 }
 
@@ -5977,6 +5978,7 @@ impl QwpWsEncodeScratch {
             #[cfg(test)]
             message: Vec::with_capacity(16 * 1024),
             per_segment_symbol_globals: Vec::new(),
+            #[cfg(test)]
             schema_signature: Vec::new(),
         }
     }
@@ -10805,6 +10807,39 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn qwp_ws_schema_replaces_rolled_back_column_type() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let mut expected = buf.clone();
+
+        buf.table("trades")
+            .unwrap()
+            .column_str("discarded", "value")
+            .unwrap();
+        assert!(buf.column_bool("qty", true).is_err());
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut expected));
+
+        for buffer in [&mut buf, &mut expected] {
+            buffer
+                .table("trades")
+                .unwrap()
+                .column_bool("discarded", false)
+                .unwrap()
+                .column_i64("qty", 2)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut expected));
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn qwp_ws_columnar_clear_drops_the_rewind_point() {
         for api in ["marker", "bookmark"] {
             let mut buf = QwpWsColumnarBuffer::new(127);
@@ -11731,6 +11766,8 @@ mod tests {
             .unwrap()
             .column_i64("qty", 3)
             .unwrap()
+            .column_bool("discarded", true)
+            .unwrap()
             .at_now()
             .unwrap();
 
@@ -11743,6 +11780,7 @@ mod tests {
 
         cloned.rewind_to_marker().unwrap();
         assert_eq!(cloned.row_count(), 1);
+        assert_eq!(ws_replay_bytes(&mut cloned), ws_replay_bytes(&mut original));
 
         original
             .table("trades")
@@ -11768,6 +11806,7 @@ mod tests {
             .unwrap();
         cloned.rewind_to_bookmark(clone_bookmark).unwrap();
         assert_eq!(cloned.row_count(), 1);
+        assert_eq!(ws_replay_bytes(&mut cloned), ws_replay_bytes(&mut original));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
