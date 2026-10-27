@@ -518,21 +518,22 @@ impl SfaSegment {
         Ok(())
     }
 
+    /// `start` is a known `(fsn, offset)` frame boundary in this segment to scan from.
     pub(crate) fn frame_offset_for_fsn_with_limit(
         &self,
         fsn: u64,
         frame_count: u64,
         append_offset: u64,
+        start: Option<(u64, u64)>,
     ) -> Option<u64> {
-        if fsn < self.header.base_seq {
+        let base_seq = self.header.base_seq;
+        if fsn.checked_sub(base_seq)? >= frame_count {
             return None;
         }
-        let frame_index = fsn.checked_sub(self.header.base_seq)?;
-        if frame_index >= frame_count {
-            return None;
-        }
-        let mut pos = HEADER_SIZE as u64;
-        for _ in 0..frame_index {
+        let (start_fsn, mut pos) = start
+            .filter(|(start_fsn, _)| (base_seq..=fsn).contains(start_fsn))
+            .unwrap_or((base_seq, HEADER_SIZE as u64));
+        for _ in start_fsn..fsn {
             pos = self.next_frame_offset_with_limit(pos, append_offset)?;
         }
         Some(pos)

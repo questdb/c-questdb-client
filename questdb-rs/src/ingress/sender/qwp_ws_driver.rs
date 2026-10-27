@@ -2916,7 +2916,9 @@ impl SendCursor {
     }
 
     fn release_sfa_cursor(&mut self) {
-        self.sfa_cursor = None;
+        if let Some(cursor) = &mut self.sfa_cursor {
+            cursor.release_segment();
+        }
     }
 
     pub(crate) fn peek_next_frame_from_oldest(
@@ -4354,7 +4356,13 @@ mod tests {
         let completion = core.finish_ack_response_sfa(&progress, 0).unwrap();
 
         assert_eq!(completion.outcome, DriveOutcome::Acked { wire_seq: 0 });
-        assert!(core.send_cursor.sfa_cursor.is_none());
+        assert!(
+            !core
+                .send_cursor
+                .sfa_cursor
+                .as_ref()
+                .is_some_and(SfaSendCursor::holds_segment)
+        );
         assert_eq!(progress.completed_fsn(), Some(0));
     }
 

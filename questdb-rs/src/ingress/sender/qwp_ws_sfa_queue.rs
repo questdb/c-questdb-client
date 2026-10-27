@@ -1412,27 +1412,17 @@ impl SfaProgressView {
         send_cursor: &mut Option<SfaSendCursor>,
         fsn: u64,
     ) -> Result<Option<SfaMappedPayload>, SfaQueueError> {
-        let Some(mut cursor) = Self::reusable_send_cursor(send_cursor, fsn)
-            .or_else(|| self.position_send_cursor_for_fsn(fsn))
-        else {
-            *send_cursor = None;
-            return Ok(None);
-        };
-
-        let (payload, segment_append_offset) = match payload_at_send_cursor(&cursor) {
-            Some(payload) => payload,
-            None => {
-                *send_cursor = None;
-                let Some(repositioned) = self.position_send_cursor_for_fsn(fsn) else {
-                    return Ok(None);
-                };
-                cursor = repositioned;
-                let Some(payload) = payload_at_send_cursor(&cursor) else {
-                    *send_cursor = None;
-                    return Ok(None);
-                };
-                payload
+        let found = Self::reusable_send_cursor(send_cursor, fsn)
+            .and_then(|cursor| Some((payload_at_send_cursor(&cursor)?, cursor)))
+            .or_else(|| {
+                let cursor = self.position_send_cursor_for_fsn(fsn, send_cursor.as_ref())?;
+                Some((payload_at_send_cursor(&cursor)?, cursor))
+            });
+        let Some(((payload, segment_append_offset), cursor)) = found else {
+            if let Some(cursor) = send_cursor {
+                cursor.release_segment();
             }
+            return Ok(None);
         };
         let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
         let next_offset = cursor
@@ -1449,20 +1439,29 @@ impl SfaProgressView {
         send_cursor: &Option<SfaSendCursor>,
         fsn: u64,
     ) -> Option<SfaSendCursor> {
-        let cursor = send_cursor.clone()?;
-        if cursor.fsn != fsn {
-            return None;
-        }
-        Some(cursor)
+        send_cursor
+            .clone()
+            .filter(|cursor| cursor.fsn == fsn && cursor.segment.is_some())
     }
 
-    fn position_send_cursor_for_fsn(&self, fsn: u64) -> Option<SfaSendCursor> {
+    /// Scans from `hint` when it lies in the same segment; segment bases are
+    /// unique because FSNs never repeat.
+    fn position_send_cursor_for_fsn(
+        &self,
+        fsn: u64,
+        hint: Option<&SfaSendCursor>,
+    ) -> Option<SfaSendCursor> {
         let segment = self.engine.segment_for_fsn(fsn)?;
-        let offset = segment.frame_offset_for_fsn(fsn)?;
+        let segment_base_seq = segment.base_seq();
+        let start = hint
+            .filter(|hint| hint.segment_base_seq == segment_base_seq)
+            .map(|hint| (hint.fsn, hint.offset));
+        let offset = segment.frame_offset_for_fsn(fsn, start)?;
         Some(SfaSendCursor {
             fsn,
-            segment,
             offset,
+            segment_base_seq,
+            segment: Some(segment),
         })
     }
 
@@ -1482,13 +1481,17 @@ impl SfaProgressView {
         }
 
         if next_offset == segment_append_offset
-            && let Some(next_segment) = self.engine.next_segment_after(&cursor.segment)
+            && let Some(next_segment) = cursor
+                .segment
+                .as_ref()
+                .and_then(|segment| self.engine.next_segment_after(segment))
             && next_segment.base_seq() == next_fsn
         {
             return SfaSendCursor {
                 fsn: next_fsn,
-                segment: next_segment,
                 offset: HEADER_SIZE as u64,
+                segment_base_seq: next_fsn,
+                segment: Some(next_segment),
             };
         }
 
@@ -2501,9 +2504,12 @@ impl SfaSharedSegment {
     fn payload_for_fsn(&self, fsn: u64) -> Option<SfaMappedPayload> {
         let published_offset = self.published_offset();
         let frame_count = self.published_frame_count_after_offset();
-        let offset =
-            self.segment
-                .frame_offset_for_fsn_with_limit(fsn, frame_count, published_offset)?;
+        let offset = self.segment.frame_offset_for_fsn_with_limit(
+            fsn,
+            frame_count,
+            published_offset,
+            None,
+        )?;
         self.segment
             .mapped_payload_at_offset_with_limit(offset, published_offset)
     }
@@ -2514,11 +2520,11 @@ impl SfaSharedSegment {
             .mapped_payload_at_offset_with_limit(offset, published_offset)
     }
 
-    fn frame_offset_for_fsn(&self, fsn: u64) -> Option<u64> {
+    fn frame_offset_for_fsn(&self, fsn: u64, start: Option<(u64, u64)>) -> Option<u64> {
         let published_offset = self.published_offset();
         let frame_count = self.published_frame_count_after_offset();
         self.segment
-            .frame_offset_for_fsn_with_limit(fsn, frame_count, published_offset)
+            .frame_offset_for_fsn_with_limit(fsn, frame_count, published_offset, start)
     }
 
     fn last_fsn(&self) -> Option<u64> {
@@ -2700,7 +2706,29 @@ pub(crate) enum SfaRecoveryDiagnostic {
 pub(crate) struct SfaSendCursor {
     fsn: u64,
     offset: u64,
-    segment: Arc<SfaSharedSegment>,
+    segment_base_seq: u64,
+    /// `None` once released: the position then only marks where to resume scanning.
+    segment: Option<Arc<SfaSharedSegment>>,
+}
+
+impl SfaSendCursor {
+    pub(crate) fn release_segment(&mut self) {
+        self.segment = None;
+    }
+
+    pub(crate) fn released(&self) -> Self {
+        Self {
+            fsn: self.fsn,
+            offset: self.offset,
+            segment_base_seq: self.segment_base_seq,
+            segment: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holds_segment(&self) -> bool {
+        self.segment.is_some()
+    }
 }
 
 #[derive(Debug)]
@@ -3519,8 +3547,9 @@ fn first_unresolved_fsn_from_optional_segments(
 }
 
 fn payload_at_send_cursor(cursor: &SfaSendCursor) -> Option<(SfaMappedPayload, u64)> {
-    let payload = cursor.segment.mapped_payload_at_offset(cursor.offset)?;
-    Some((payload, cursor.segment.published_offset()))
+    let segment = cursor.segment.as_ref()?;
+    let payload = segment.mapped_payload_at_offset(cursor.offset)?;
+    Some((payload, segment.published_offset()))
 }
 
 #[cfg(test)]
@@ -3873,7 +3902,11 @@ mod tests {
     }
 
     fn send_cursor_segment_base_seq(cursor: &Option<SfaSendCursor>) -> Option<u64> {
-        cursor.as_ref().map(|cursor| cursor.segment.base_seq())
+        cursor
+            .as_ref()?
+            .segment
+            .as_ref()
+            .map(|segment| segment.base_seq())
     }
 
     fn sfa_file_count(dir: &Path) -> usize {
@@ -5986,6 +6019,28 @@ mod tests {
         assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 2), b"tri");
         assert_eq!(send_cursor_segment_base_seq(&send_cursor).unwrap(), 3);
         assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 3), b"for");
+    }
+
+    #[test]
+    fn send_cursor_released_at_the_tail_resumes_within_and_across_segments() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(128, 128 * 8)).unwrap();
+        let mut send_cursor = None;
+        for fsn in 0..20u64 {
+            let payload = format!("frame{fsn:02}");
+            assert_eq!(queue.try_submit(payload.as_bytes()).unwrap().fsn, fsn);
+            assert_eq!(
+                next_cursor_payload_vec(&queue, &mut send_cursor, fsn),
+                payload.as_bytes()
+            );
+            assert!(
+                queue
+                    .next_cursor_payload_for_fsn(&mut send_cursor, fsn + 1)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!send_cursor.as_ref().unwrap().holds_segment());
+        }
+        assert!(queue.sealed_segment_count() >= 3);
     }
 
     #[test]
