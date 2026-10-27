@@ -572,6 +572,8 @@ struct QwpWsPendingConnect {
     /// Empty in memory mode / on a fresh slot.
     recovered_dict_entries: Vec<u8>,
     recovered_dict_count: u32,
+    #[cfg(test)]
+    terminal_error_for_test: Option<crate::Error>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1092,6 +1094,8 @@ impl QwpWsPendingConnect {
             delta_dict_enabled,
             recovered_dict_entries,
             recovered_dict_count,
+            #[cfg(test)]
+            terminal_error_for_test: None,
         }
     }
 
@@ -1099,6 +1103,10 @@ impl QwpWsPendingConnect {
         &self,
         stop: &AtomicBool,
     ) -> Result<Option<BlockingQwpWsTransport>, crate::Error> {
+        #[cfg(test)]
+        if let Some(err) = &self.terminal_error_for_test {
+            return Err(err.clone());
+        }
         let started = Instant::now();
         let deadline = started.checked_add(self.reconnect_policy.max_duration());
         let endpoints = qwp_ws_configured_endpoints(&self.host, &self.port, &self.qwp_ws);
@@ -1232,7 +1240,11 @@ impl SyncQwpWsPendingRunnerCore {
                 }
                 let mut store = match shared.lock() {
                     Ok(store) => store,
-                    Err(_) => return RunnerStep::Stop,
+                    Err(_) => {
+                        self.lifecycle.terminalize();
+                        self.backpressure.notify_all();
+                        return RunnerStep::Stop;
+                    }
                 };
                 store.mark_terminal(Some(err));
                 self.backpressure.notify_all();
@@ -4655,6 +4667,69 @@ mod tests {
         let generation = notifier.generation();
 
         assert!(!notifier.wait_for_change(generation, Some(Instant::now())));
+    }
+
+    #[test]
+    fn pending_connect_terminal_failure_with_poisoned_store_wakes_waiters() {
+        let qwp_ws = crate::ingress::SenderBuilder::from_conf("ws::addr=127.0.0.1:1;")
+            .unwrap()
+            .qwp_ws
+            .unwrap();
+        let mut pending_connect = QwpWsPendingConnect::new(
+            "127.0.0.1",
+            "1",
+            false,
+            None,
+            &qwp_ws,
+            None,
+            false,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(TrafficGate::default()),
+            false,
+            Vec::new(),
+            0,
+        );
+        // Fail before any real socket operation, through the production
+        // pending-connect error branch.
+        pending_connect.terminal_error_for_test = Some(crate::Error::new(
+            crate::ErrorCode::AuthError,
+            "injected initial-connect failure",
+        ));
+        let mut store = QwpWsPublicationStore::new(memory_queue(1024), 32);
+        store.try_submit(b"waiting").unwrap();
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let poison_target = Arc::clone(&shared);
+        assert!(
+            thread::spawn(move || {
+                let _guard = poison_target.lock().unwrap();
+                panic!("injected store-lock poison");
+            })
+            .join()
+            .is_err()
+        );
+        let notifier = Arc::new(BackpressureNotifier::new());
+        let generation = notifier.generation();
+        let mut core = SyncQwpWsPendingRunnerCore {
+            connected: None,
+            pending_connect,
+            progress,
+            backpressure: Arc::clone(&notifier),
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            lifecycle: lifecycle.clone(),
+        };
+
+        assert_eq!(
+            core.drive_step(&shared, &AtomicBool::new(false)),
+            RunnerStep::Stop
+        );
+        assert!(lifecycle.is_terminal());
+        assert_ne!(notifier.generation(), generation);
+        assert!(
+            notifier.wait_for_change(generation, None),
+            "even an unlimited wait must observe the poisoned initial-connect failure"
+        );
     }
 
     fn pooled_boundary_wait_sender<T: QwpWsCoreTransport + Send + 'static>(
