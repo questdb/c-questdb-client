@@ -6538,6 +6538,26 @@ fn owned_buffer_sender_observes_pool_close_and_drops_after_close() {
 }
 
 #[test]
+fn fixed_size_pool_reuses_sender_after_idle_timeout() {
+    let server = MockServer::spawn_acking(1);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=1;idle_timeout_ms=1;pool_reap=manual;",
+    ))
+    .unwrap();
+    for _ in 0..2 {
+        let mut sender = db.borrow_sender().unwrap();
+        let mut buffer = one_symbol_buffer(&db, "alpha");
+        sender.flush_buffer(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        drop(sender);
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(db.reap_idle(), 0);
+        assert_eq!(db.free_count(), 1);
+    }
+}
+
+#[test]
 fn manual_reap_closes_idle_buffer_senders() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(

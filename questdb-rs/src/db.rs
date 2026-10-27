@@ -439,7 +439,8 @@ impl<S> PoolState<S> {
 struct PoolEntry<S> {
     sender: S,
     slot_index: Option<usize>,
-    last_idle_at: Instant,
+    // Fixed-size SF pools never reap idle entries.
+    last_idle_at: Option<Instant>,
 }
 
 struct PooledSender<S> {
@@ -641,7 +642,8 @@ fn preopen_recovery_sender(
                 state.free.push(PoolEntry {
                     sender,
                     slot_index,
-                    last_idle_at: Instant::now(),
+                    last_idle_at: (inner.sender_pool_min < inner.sender_pool_max)
+                        .then(Instant::now),
                 });
             }
             slot.commit();
@@ -3011,7 +3013,7 @@ fn return_sfa_to_pool(
             state.free.push(PoolEntry {
                 sender,
                 slot_index,
-                last_idle_at: Instant::now(),
+                last_idle_at: (inner.sender_pool_min < inner.sender_pool_max).then(Instant::now),
             });
             inner.cv.notify_all();
             return;
@@ -3045,7 +3047,7 @@ fn return_direct_to_pool(inner: &Arc<DbInner>, sender: DirectSenderCore) {
             state.free.push(PoolEntry {
                 sender,
                 slot_index: None,
-                last_idle_at: Instant::now(),
+                last_idle_at: Some(Instant::now()),
             });
         }
     }
@@ -3064,7 +3066,7 @@ fn finish_replaced_sender(inner: &Arc<DbInner>, sender: DirectSenderCore) {
             state.free.push(PoolEntry {
                 sender,
                 slot_index: None,
-                last_idle_at: Instant::now(),
+                last_idle_at: Some(Instant::now()),
             });
         }
     }
@@ -3208,13 +3210,15 @@ fn take_reapable_column_sender(
         if state.total() <= inner.sender_pool_min {
             return None;
         }
-        let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
+        let expired = state.free[i]
+            .last_idle_at
+            .is_some_and(|idle_at| now.saturating_duration_since(idle_at) > inner.idle_timeout);
         // Never evict a connection whose store-and-forward queue still holds
         // undelivered frames: its background runner is still delivering, and
         // dropping it now would lose that data. It becomes reapable once the
         // runner drains it (or the transport goes terminal). `sfa_fully_delivered`
         // is a lock-free progress read in the healthy case.
-        if idle_for > inner.idle_timeout && state.free[i].sender.sfa_fully_delivered(durable) {
+        if expired && state.free[i].sender.sfa_fully_delivered(durable) {
             let entry = state.free.remove(i);
             if entry.slot_index.is_some() {
                 state.closing += 1;
@@ -3236,8 +3240,10 @@ fn reap_idle_direct_senders(inner: &DbInner) -> usize {
         let now = Instant::now();
         let mut i = 0;
         while i < state.free.len() {
-            let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
-            if idle_for > inner.idle_timeout {
+            let expired = state.free[i]
+                .last_idle_at
+                .is_some_and(|idle_at| now.saturating_duration_since(idle_at) > inner.idle_timeout);
+            if expired {
                 let entry = state.free.remove(i);
                 to_drop.push(entry.sender);
             } else {
