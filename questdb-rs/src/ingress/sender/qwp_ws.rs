@@ -523,6 +523,7 @@ pub(crate) struct ManualQwpWsHandlerState {
 
 pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
+    sender_errors_pending: Arc<AtomicBool>,
     producer: Option<SfaProducer>,
     lifecycle: PublicationLifecycle,
     backpressure: Arc<BackpressureNotifier>,
@@ -632,6 +633,7 @@ where
         let lifecycle = store.lifecycle();
         let progress = store.progress_view();
         let producer = store.take_producer();
+        let sender_errors_pending = store.sender_errors_pending();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
@@ -661,6 +663,7 @@ where
 
         Self {
             shared,
+            sender_errors_pending,
             producer,
             lifecycle,
             backpressure,
@@ -685,6 +688,7 @@ where
         let lifecycle = store.lifecycle();
         let progress = store.progress_view();
         let producer = store.take_producer();
+        let sender_errors_pending = store.sender_errors_pending();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
@@ -715,6 +719,7 @@ where
 
         Self {
             shared,
+            sender_errors_pending,
             producer,
             lifecycle,
             backpressure,
@@ -862,11 +867,17 @@ where
     }
 
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
+        if !self.sender_errors_pending.load(Ordering::Acquire) && !self.shared.is_poisoned() {
+            return Ok(None);
+        }
         let mut store = self.lock_shared()?;
         Ok(store.poll_sender_error())
     }
 
     fn poll_sender_error_notification(&self) -> crate::Result<Option<QwpWsSenderError>> {
+        if !self.sender_errors_pending.load(Ordering::Acquire) && !self.shared.is_poisoned() {
+            return Ok(None);
+        }
         let mut store = self.lock_shared()?;
         Ok(store.poll_sender_error_notification())
     }
@@ -5744,6 +5755,33 @@ mod tests {
         runner.drain_to_deadline(None).unwrap();
 
         SfaSlotQueue::open(slot_options).unwrap();
+    }
+
+    #[test]
+    fn empty_sender_error_polls_do_not_wait_for_storage_maintenance() {
+        let driver =
+            QwpWsCoreTestHarness::from_queue(memory_queue(8192), FakeOrderedServer::no_response());
+        let runner =
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
+        let shared = Arc::clone(&runner.shared);
+        let guard = shared.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let runner = &runner;
+            let polling = scope.spawn(move || {
+                tx.send((
+                    runner.poll_sender_error(),
+                    runner.poll_sender_error_notification(),
+                ))
+                .unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            drop(guard);
+            polling.join().unwrap();
+            let (error, notification) = result.expect("empty polls must not wait on the store");
+            assert_eq!(error.unwrap(), None);
+            assert_eq!(notification.unwrap(), None);
+        });
     }
 
     #[test]

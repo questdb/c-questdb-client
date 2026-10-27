@@ -34,7 +34,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -778,6 +778,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
     pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
         self.sender_errors.poll()
+    }
+
+    pub(crate) fn sender_errors_pending(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.sender_errors.pending)
     }
 
     pub(crate) fn poll_sender_error_notification(&mut self) -> Option<QwpWsSenderError> {
@@ -3832,6 +3836,7 @@ struct DriverEventRing {
 #[derive(Debug)]
 struct SenderErrorLog {
     errors: VecDeque<QwpWsSenderError>,
+    pending: Arc<AtomicBool>,
     capacity: usize,
     dropped_total: u64,
     first_seq: u64,
@@ -3974,6 +3979,7 @@ impl SenderErrorLog {
     fn new(capacity: usize) -> Self {
         Self {
             errors: VecDeque::with_capacity(capacity),
+            pending: Arc::new(AtomicBool::new(false)),
             capacity,
             dropped_total: 0,
             first_seq: 0,
@@ -4003,6 +4009,7 @@ impl SenderErrorLog {
         }
         debug_assert_eq!(self.first_seq + self.errors.len() as u64, seq);
         self.errors.push_back(error);
+        self.pending.store(true, Ordering::Release);
     }
 
     fn poll(&mut self) -> Option<QwpWsSenderError> {
@@ -4037,6 +4044,9 @@ impl SenderErrorLog {
             self.errors.pop_front();
             self.first_seq = self.first_seq.saturating_add(1);
         }
+        // Both cursors must consume a record before empty polls can skip the lock.
+        self.pending
+            .store(!self.errors.is_empty(), Ordering::Release);
     }
 
     fn capacity(&self) -> usize {
@@ -9505,11 +9515,16 @@ mod tests {
     fn sender_error_log_cursors_are_independent() {
         let mut log = SenderErrorLog::new(2);
         let error = sender_error(0);
+        let pending = Arc::clone(&log.pending);
+        assert!(!pending.load(Ordering::Acquire));
 
         log.push(error.clone());
+        assert!(pending.load(Ordering::Acquire));
 
         assert_eq!(log.poll_notification(), Some(error.clone()));
+        assert!(pending.load(Ordering::Acquire));
         assert_eq!(log.poll(), Some(error));
+        assert!(!pending.load(Ordering::Acquire));
         assert_eq!(log.poll_notification(), None);
         assert_eq!(log.poll(), None);
         assert_eq!(log.dropped_total(), 0);
@@ -9528,7 +9543,21 @@ mod tests {
 
         assert_eq!(log.dropped_total(), 1);
         assert_eq!(log.poll_notification(), Some(second.clone()));
+        assert!(log.pending.load(Ordering::Acquire));
         assert_eq!(log.poll(), Some(second));
+        assert!(!log.pending.load(Ordering::Acquire));
+        log.push(sender_error(2));
+        assert!(log.pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn disabled_sender_error_log_never_reports_pending_entries() {
+        let mut log = SenderErrorLog::new(0);
+        log.push(sender_error(0));
+        assert!(!log.pending.load(Ordering::Acquire));
+        assert_eq!(log.poll(), None);
+        assert_eq!(log.poll_notification(), None);
+        assert_eq!(log.dropped_total(), 1);
     }
 
     #[test]
