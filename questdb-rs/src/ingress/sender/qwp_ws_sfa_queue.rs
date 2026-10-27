@@ -1503,23 +1503,32 @@ impl SfaProducer {
     }
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
+        if let Some(receipt) = self.try_submit_active(payload)? {
+            return Ok(receipt);
+        }
+        self.rotate_active()?;
+        self.try_submit_active(payload)?.ok_or_else(|| {
+            QueueError::PayloadExceedsByteCapacity {
+                payload_len: payload.len(),
+                max_bytes: self.engine.segment_payload_capacity(),
+            }
+            .into()
+        })
+    }
+
+    /// Append without rotating or waiting for capacity.
+    pub(crate) fn try_submit_active(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<Option<QwpReceipt>, SfaQueueError> {
         self.engine.check_durability()?;
         self.engine.validate_submit(payload)?;
         let fsn = self.next_fsn;
         let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
         if self.append_to_active(payload, next_fsn)? {
-            return Ok(QwpReceipt { fsn });
-        }
-
-        self.rotate_active()?;
-        if self.append_to_active(payload, next_fsn)? {
-            Ok(QwpReceipt { fsn })
+            Ok(Some(QwpReceipt { fsn }))
         } else {
-            Err(QueueError::PayloadExceedsByteCapacity {
-                payload_len: payload.len(),
-                max_bytes: self.engine.segment_payload_capacity(),
-            }
-            .into())
+            Ok(None)
         }
     }
 
@@ -3577,6 +3586,25 @@ mod tests {
 
     fn open(dir: &TempDir) -> SfaFrameQueue {
         SfaFrameQueue::open(options(dir)).unwrap()
+    }
+
+    #[test]
+    fn active_only_append_leaves_rotation_and_sequence_to_slow_path() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(128, 256)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        let payload = vec![42; segment_payload_capacity(128)];
+        assert_eq!(
+            producer.try_submit_active(&payload).unwrap().unwrap().fsn,
+            0
+        );
+        let active = Arc::clone(&producer.active);
+        assert_eq!(producer.try_submit_active(&payload).unwrap(), None);
+        assert!(Arc::ptr_eq(&active, &producer.active));
+        assert_eq!(producer.published_fsn(), Some(0));
+        assert_eq!(producer.try_submit(&payload).unwrap().fsn, 1);
+        assert!(!Arc::ptr_eq(&active, &producer.active));
+        assert_eq!(queue.payload_vec_for_fsn(0), Some(payload.clone()));
+        assert_eq!(queue.payload_vec_for_fsn(1), Some(payload));
     }
 
     #[test]

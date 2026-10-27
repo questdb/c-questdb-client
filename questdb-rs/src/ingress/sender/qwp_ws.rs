@@ -728,6 +728,17 @@ where
     }
 
     fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<u64> {
+        self.check_publication_open()?;
+        if let Some(producer) = self.producer.as_mut()
+            && let Some(receipt) = producer
+                .try_submit_active(payload)
+                .map_err(DriverError::from)
+                .map_err(driver_error_to_error_without_state)?
+        {
+            return Ok(receipt.fsn);
+        }
+        // Start the wait budget before rotation or backpressure, not on every
+        // successful append to an already allocated segment.
         let deadline = Instant::now().checked_add(self.append_deadline);
         loop {
             let backpressure_generation = self.backpressure.generation();
