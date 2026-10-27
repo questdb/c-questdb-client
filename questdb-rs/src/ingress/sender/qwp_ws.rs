@@ -4071,6 +4071,24 @@ pub(crate) fn qwp_ws_ok_fsn_background(
     state.runner.ok_fsn()
 }
 
+/// Take before checking a completion watermark or error condition.
+pub(crate) fn qwp_ws_progress_generation_background(state: &SyncQwpWsHandlerState) -> u64 {
+    state.runner.backpressure.generation()
+}
+
+/// Wait for runner progress or the absolute deadline. The caller must recheck
+/// its watermark/error predicate: sends and storage maintenance also notify.
+pub(crate) fn qwp_ws_wait_for_progress_background(
+    state: &SyncQwpWsHandlerState,
+    generation: u64,
+    deadline: Option<Instant>,
+) {
+    state
+        .runner
+        .backpressure
+        .wait_for_change(generation, deadline);
+}
+
 pub(crate) fn qwp_ws_published_fsn_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
@@ -4637,6 +4655,153 @@ mod tests {
         let generation = notifier.generation();
 
         assert!(!notifier.wait_for_change(generation, Some(Instant::now())));
+    }
+
+    fn pooled_boundary_wait_sender<T: QwpWsCoreTransport + Send + 'static>(
+        transport: T,
+        durable: bool,
+    ) -> (
+        crate::ingress::column_sender::PooledSenderCore,
+        Arc<BackpressureNotifier>,
+    ) {
+        let queue = SfaSlotQueue::open_memory(SfaMemoryQueueOptions {
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+        })
+        .unwrap();
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            queue,
+            transport,
+            ReconnectPolicy::bounded(Duration::MAX, Duration::ZERO, Duration::ZERO),
+            durable,
+        );
+        driver.try_submit(b"boundary").unwrap();
+        let runner = SyncQwpWsRunner::start(driver);
+        let notifier = Arc::clone(&runner.backpressure);
+        let state = SyncQwpWsHandlerState {
+            encoder: QwpWsReplayEncoder::new(1),
+            runner,
+            server_max_batch_size: Arc::new(AtomicUsize::new(4096)),
+            request_durable_ack: durable,
+            sfa_frame_payload_cap: segment_payload_capacity(4096),
+            sfa_frame_split_target: two_frame_segment_payload_capacity(4096),
+            orphan_pool: None,
+            close_drain_timeout: Duration::ZERO,
+            delta_dict_enabled: false,
+            recovered_dict_entries: Vec::new(),
+            recovered_dict_count: 0,
+            persisted_symbol_dict: None,
+            sfa_split_deferral_enabled: true,
+        };
+        let sender = crate::ingress::column_sender::PooledSenderCore::new_store_and_forward(
+            state,
+            4096,
+            durable,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        (sender, notifier)
+    }
+
+    #[test]
+    fn pooled_boundary_wait_unrelated_notifications_do_not_extend_timeout() {
+        let (mut sender, notifier) =
+            pooled_boundary_wait_sender(FakeOrderedServer::no_response(), false);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let notifying = scope.spawn(move || {
+                while matches!(
+                    stop_rx.recv_timeout(Duration::from_millis(5)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    notifier.notify_all();
+                }
+            });
+            let waiting = scope.spawn(move || {
+                let result = sender.wait(crate::ingress::AckLevel::Ok, Duration::from_millis(40));
+                let _ = result_tx.send(result);
+            });
+            let result = result_rx.recv_timeout(Duration::from_secs(5));
+            let _ = stop_tx.send(());
+            notifying.join().unwrap();
+            waiting.join().unwrap();
+            let err = result
+                .expect("unrelated notifications must not renew the no-progress deadline")
+                .unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::FailoverRetry);
+            assert!(err.msg().contains("no ack progress"));
+        });
+    }
+
+    #[test]
+    fn pooled_boundary_wait_wakes_for_ack_and_terminal_error() {
+        for terminal in [false, true] {
+            let (sent_tx, sent_rx) = mpsc::channel();
+            let (ack_tx, ack_rx) = mpsc::channel();
+            let (terminal_tx, terminal_rx) = mpsc::channel();
+            let transport = SignalResponseTransport {
+                sent_frame: sent_tx,
+                ack: ack_rx,
+                terminal: terminal_rx,
+                sent_frames: Vec::new(),
+            };
+            let (mut sender, notifier) = pooled_boundary_wait_sender(transport, false);
+            sent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(move || {
+                    waiting_tx.send(()).unwrap();
+                    let result = sender.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10));
+                    let _ = result_tx.send(result);
+                });
+                waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                if terminal {
+                    terminal_tx.send(()).unwrap();
+                } else {
+                    ack_tx.send(()).unwrap();
+                }
+                let result = result_rx.recv_timeout(Duration::from_secs(2));
+                if result.is_err() {
+                    // Rescue the waiter before asserting a missing notification;
+                    // reaching its own deadline must not make this test pass.
+                    notifier.notify_all();
+                }
+                waiting.join().unwrap();
+                let result = result.expect("ACK and terminal errors must wake a boundary wait");
+                if terminal {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.code(), crate::ErrorCode::SocketError);
+                    assert!(err.msg().contains("synthetic terminal failure"));
+                } else {
+                    result.unwrap();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn pooled_boundary_wait_keeps_ok_and_durable_notifications_distinct() {
+        let ack_ready = Arc::new(AtomicBool::new(false));
+        let transport = DurableAckWhenReadyTransport {
+            ack_ready: Arc::clone(&ack_ready),
+            sent_frames: Vec::new(),
+        };
+        let (mut sender, _) = pooled_boundary_wait_sender(transport, true);
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), None);
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_millis(20))
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::FailoverRetry);
+        ack_ready.store(true, Ordering::Release);
+        sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), Some(0));
     }
 
     #[test]
@@ -5624,6 +5789,54 @@ mod tests {
             "the runner must finish the initial periodic sync and arm its configured cadence"
         );
         store.close_queue().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn runner_periodic_sync_failure_notifies_completion_waiters() {
+        use super::super::qwp_ws_sfa_segment::fail_sync_after_for_test;
+
+        let dir = TempDir::new().unwrap();
+        let qwp_ws = periodic_qwp_ws_config(dir.path(), "periodic-wait-error");
+        let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+        let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
+        let (mut store, send_core) = driver.into_parts();
+        store.try_submit(b"periodic").unwrap();
+        let producer = store.take_producer().unwrap();
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let notifier = Arc::new(BackpressureNotifier::new());
+        let mut core = SyncQwpWsRunnerCore {
+            send_core,
+            progress,
+            cold_effects: VecDeque::new(),
+            backpressure: Arc::clone(&notifier),
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            lifecycle,
+        };
+
+        let generation = notifier.generation();
+        producer.check_durability().unwrap();
+        fail_sync_after_for_test(0);
+        assert_eq!(
+            core.finish_storage_maintenance(&shared),
+            RunnerStep::Continue
+        );
+        assert!(
+            notifier.wait_for_change(generation, Some(Instant::now())),
+            "a periodic failure must be observable even if it precedes the wait"
+        );
+        assert!(matches!(
+            producer.check_durability(),
+            Err(SfaQueueError::Durability(_))
+        ));
+        assert!(
+            !core.lifecycle.is_terminal(),
+            "periodic sync failure is retryable"
+        );
+        drop(producer);
+        shared.lock().unwrap().close_queue().unwrap();
     }
 
     #[cfg(any(unix, windows))]

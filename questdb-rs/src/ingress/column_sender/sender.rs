@@ -26,7 +26,6 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
@@ -39,7 +38,8 @@ use crate::ingress::sender::qwp_ws::{
     qwp_ws_begin_close_background, qwp_ws_check_error_background,
     qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
-    qwp_ws_published_fsn_background, qwp_ws_sender_errors_dropped_background,
+    qwp_ws_progress_generation_background, qwp_ws_published_fsn_background,
+    qwp_ws_sender_errors_dropped_background, qwp_ws_wait_for_progress_background,
     sfa_has_deferred_commit_slot,
 };
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
@@ -2208,6 +2208,9 @@ impl SfaBackend {
         let mut last_completed: Option<u64> = None;
 
         loop {
+            // Snapshot before checking progress so an ACK/error between the
+            // check and the condvar wait cannot be lost.
+            let generation = qwp_ws_progress_generation_background(&self.state);
             let completed = match ack_level {
                 AckLevel::Ok => qwp_ws_ok_fsn_background(&self.state)?,
                 AckLevel::Durable => qwp_ws_acked_fsn_background(&self.state)?,
@@ -2229,7 +2232,15 @@ impl SfaBackend {
             if !timeout.is_zero() && deadline_anchor.elapsed() >= timeout {
                 return Err(sfa_sync_timeout(timeout, ack_level, boundary, completed));
             }
-            thread::sleep(Duration::from_millis(10));
+            let deadline = if timeout.is_zero() {
+                None
+            } else {
+                deadline_anchor.checked_add(timeout)
+            };
+            qwp_ws_wait_for_progress_background(&self.state, generation, deadline);
+            // Sending and maintenance also notify. Only watermark advancement
+            // above resets the no-progress deadline; always recheck after waking,
+            // including a timeout racing the final ACK or a terminal error.
         }
     }
 
