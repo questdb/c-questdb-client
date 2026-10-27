@@ -1266,6 +1266,22 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         progress.next_outbound_frame(&mut self.send_cursor)
     }
 
+    /// Opens one bounded send burst; returns its byte budget.
+    pub(crate) fn begin_send_batch(&mut self) -> usize {
+        self.transport.begin_send_batch()
+    }
+
+    /// True once a send inside the burst replaced or lost the connection, so
+    /// the burst must stop before it mixes frames across connections.
+    pub(crate) fn send_batch_interrupted(&self) -> bool {
+        self.has_pending_reconnect() || self.catch_up_pending || self.sends_on_connection == 0
+    }
+
+    /// Closes the burst: everything the transport still holds goes to the socket.
+    pub(crate) fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
+        self.transport.finish_send_batch()
+    }
+
     pub(crate) fn send_frame(
         &mut self,
         outbound: OutboundFrame,
@@ -3025,6 +3041,17 @@ impl SendCursor {
 }
 
 pub(crate) trait QwpWsCoreTransport {
+    /// Byte budget for one bounded background send burst. Manual drivers keep
+    /// their immediate-write behavior; test transports default to one frame.
+    fn begin_send_batch(&mut self) -> usize {
+        1
+    }
+
+    /// Writes whatever the burst left grouped in the transport.
+    fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
+        Ok(())
+    }
+
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure>;
 
     fn send_durable_ack_keepalive_if_due(
@@ -3122,6 +3149,9 @@ pub(crate) struct BlockingQwpWsTransport {
     stream: WsStream,
     reader: WsFrameReader,
     send_buf: Vec<u8>,
+    /// Frames grouped for one socket write while a background burst is open.
+    batch: super::qwp_ws_batch::QwpWsBatch,
+    batching: bool,
     pending_wire_sequences: PendingWireSequenceRun,
     last_durable_keepalive_ping: Option<Instant>,
 }
@@ -3201,6 +3231,8 @@ impl BlockingQwpWsTransport {
             stream: connected.stream,
             reader: WsFrameReader::with_initial_input(connected.leftover),
             send_buf: Vec::with_capacity(16 * 1024),
+            batch: super::qwp_ws_batch::QwpWsBatch::new(),
+            batching: false,
             pending_wire_sequences: PendingWireSequenceRun::default(),
             last_durable_keepalive_ping: None,
         };
@@ -3213,6 +3245,9 @@ impl BlockingQwpWsTransport {
     }
 
     fn reconnect(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
+        // Unwritten frames die with the connection; the SF log replays them.
+        self.batch.clear();
+        self.batching = false;
         if let Some(gate) = self.traffic_gate.as_deref() {
             gate.clear();
         }
@@ -3330,6 +3365,22 @@ fn decode_durable_transport_response(
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl QwpWsCoreTransport for BlockingQwpWsTransport {
+    fn begin_send_batch(&mut self) -> usize {
+        self.batching = true;
+        super::qwp_ws_batch::NETWORK_BYTES
+    }
+
+    fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
+        self.batching = false;
+        self.batch.flush(&mut self.stream).map_err(|io| {
+            TransportFailure::Disconnect(error::fmt!(
+                SocketError,
+                "Could not flush WebSocket batch: {}",
+                io
+            ))
+        })
+    }
+
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
         if self.pending_wire_sequences.is_empty() && !*self.qwp_ws.request_durable_ack {
             return Ok(TransportPoll::Idle);
@@ -3433,6 +3484,26 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
         &mut self,
         frame: OutboundFrameView<'_>,
     ) -> Result<TransportSendResult, TransportFailure> {
+        if self.batching {
+            let grouped = (|| {
+                if self.batch.full_before(frame.payload.len()) {
+                    self.batch.flush(&mut self.stream)?;
+                }
+                if self.batch.append(frame.payload, rand::random())? {
+                    self.batch.flush(&mut self.stream)?;
+                }
+                std::io::Result::Ok(())
+            })();
+            grouped.map_err(|io| {
+                TransportFailure::Disconnect(error::fmt!(
+                    SocketError,
+                    "Could not send WebSocket batch: {}",
+                    io
+                ))
+            })?;
+            self.pending_wire_sequences.push(frame.wire_seq);
+            return Ok(TransportSendResult::NoResponse);
+        }
         write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload).map_err(|io| {
             TransportFailure::Disconnect(error::fmt!(
                 SocketError,
