@@ -1262,7 +1262,7 @@ private:
     static inline ::line_sender_utf8 name()
     {
         // Maintained by .bumpversion.cfg
-        static const char user_agent[] = "questdb/c++/7.2.0";
+        static const char user_agent[] = "questdb/c++/7.2.1";
         ::line_sender_utf8 utf8 =
             ::line_sender_utf8_assert(sizeof(user_agent) - 1, user_agent);
         return utf8;
