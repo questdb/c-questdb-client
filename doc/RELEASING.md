@@ -18,10 +18,10 @@ git fetch origin --tags --prune
 git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
-git switch -c release/7.2.0
+git switch -c release/7.2.1
 ```
 
-Replace `7.2.0` throughout these examples with the intended version.
+Replace `7.2.1` throughout these examples with the intended version.
 
 Confirm publisher access, a crates.io token configured with `cargo login` or a
 protected environment variable, a release verifier, and a merge-ready
@@ -38,13 +38,13 @@ uv tool install bump-my-version
 Preview and then apply the version update:
 
 ```bash
-bump-my-version replace --new-version 7.2.0 --dry-run
-bump-my-version replace --new-version 7.2.0
+bump-my-version replace --new-version 7.2.1 --dry-run
+bump-my-version replace --new-version 7.2.1
 ```
 
 Review every changed version and update the release notes, compatibility
 statements, and this repository's documentation. The QWP/WebSocket floor for
-7.2.0 is QuestDB 10.0 and the Rust MSRV is 1.91.0.
+7.2.1 is QuestDB 10.0 and the Rust MSRV is 1.91.0.
 
 Refresh every tracked lockfile containing this client:
 
@@ -85,7 +85,7 @@ Enterprise check, and release-candidate soak.
 From a clean checkout of the approved `main` commit:
 
 ```bash
-VERSION=7.2.0
+VERSION=7.2.1
 RELEASE_SHA="$(git rev-parse HEAD)"
 
 cd questdb-rs
