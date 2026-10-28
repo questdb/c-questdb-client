@@ -234,7 +234,8 @@ The 7.0.0 feature branch already declares 7.0.0. Verify at least:
 Search for stale release references:
 
 ```bash
-rg -n '6\.1\.0|7\.0\.0' \
+PREV_VERSION="$(git describe --tags --abbrev=0)"
+rg -nF "$PREV_VERSION" \
   .bumpversion.toml CMakeLists.txt include doc questdb-rs questdb-rs-ffi \
   system_test
 ```
@@ -617,8 +618,8 @@ version and tag. Record the abandoned version so it is not accidentally reused.
 A crates.io version cannot be overwritten or deleted.
 
 1. Assess severity and customer impact.
-2. Prepare and publish a corrected version, normally 7.0.1 for a compatible
-   fix.
+2. Prepare and publish a corrected version, normally the next patch version
+   for a compatible fix.
 3. Add a prominent warning and mitigation to the affected GitHub Release.
 4. Correct the website documentation.
 5. Yank the affected crate only when leaving it selectable for new dependency
