@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "questdb-rs"
-version = "7.2.0"
+version = "7.2.1"
 dependencies = [
  "aligned-vec",
  "arrow",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "questdb-rs-ffi"
-version = "7.2.0"
+version = "7.2.1"
 dependencies = [
  "arrow",
  "libc",

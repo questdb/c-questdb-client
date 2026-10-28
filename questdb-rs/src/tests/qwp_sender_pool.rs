@@ -1036,10 +1036,19 @@ fn refuses_non_qwp_ws_schema() {
 
 #[test]
 fn at_cap_borrow_waits_for_a_return_within_acquire_timeout() {
+    check_at_cap_borrow_waits_for_a_return_within_acquire_timeout("manual");
+}
+
+#[test]
+fn at_cap_borrow_waits_for_a_return_with_auto_reaper() {
+    check_at_cap_borrow_waits_for_a_return_within_acquire_timeout("auto");
+}
+
+fn check_at_cap_borrow_waits_for_a_return_within_acquire_timeout(reap: &str) {
     let server = MockServer::spawn(2);
     let conf = conf_for_endpoints(
         &[server.port()],
-        "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
+        &format!("sender_pool_min=1;sender_pool_max=1;pool_reap={reap};"),
     );
     let db = std::sync::Arc::new(QuestDb::connect(&conf).unwrap());
     let held = db.borrow_sender().expect("first borrow fills the cap");
@@ -2880,10 +2889,13 @@ fn mixed_sfa_namespace_survives_endpoint_failover_and_catch_up() {
         .expect("the replacement endpoint must receive a dictionary catch-up");
     let (catch_up_start, catch_up_symbols) = parse_delta_dict_prefix(catch_up);
     assert_eq!(catch_up_start, 0);
+    // A send burst can put both the bravo (Chunk) and charlie (Arrow) frames on
+    // the dead socket before the close is read, so the catch-up may already
+    // re-register charlie; replayed frames that overlap it are the tolerated case.
+    let expected = [b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()];
     assert!(
-        catch_up_symbols == vec![b"alpha".to_vec()]
-            || catch_up_symbols == vec![b"alpha".to_vec(), b"bravo".to_vec()],
-        "the old socket may fail before or after its final write, but catch-up must be a contiguous alpha[/bravo] prefix: {catch_up_symbols:?}"
+        (1..=expected.len()).any(|n| catch_up_symbols == expected[..n]),
+        "catch-up must be a contiguous alpha[/bravo[/charlie]] prefix: {catch_up_symbols:?}"
     );
     assert_eq!(data_frames.len(), 3);
     assert_eq!(
@@ -6538,6 +6550,26 @@ fn owned_buffer_sender_observes_pool_close_and_drops_after_close() {
 }
 
 #[test]
+fn fixed_size_pool_reuses_sender_after_idle_timeout() {
+    let server = MockServer::spawn_acking(1);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=1;idle_timeout_ms=1;pool_reap=manual;",
+    ))
+    .unwrap();
+    for _ in 0..2 {
+        let mut sender = db.borrow_sender().unwrap();
+        let mut buffer = one_symbol_buffer(&db, "alpha");
+        sender.flush_buffer(&mut buffer).unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        drop(sender);
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(db.reap_idle(), 0);
+        assert_eq!(db.free_count(), 1);
+    }
+}
+
+#[test]
 fn manual_reap_closes_idle_buffer_senders() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(
@@ -7668,8 +7700,9 @@ fn close_joins_reaper_cleanly() {
         server.port(),
         // close_flush_timeout_millis bounds the per-Sender close drain, which
         // otherwise can wait up to 5s for the mock server's (absent) WS close
-        // handshake. We only care here that the reaper thread joins.
-        "sender_pool_min=1;sender_pool_max=2;idle_timeout_ms=500;pool_reap=auto;close_flush_timeout_millis=200;",
+        // handshake. A 15s reaper tick exceeds the 10s assertion below, so
+        // shutdown must wake the reaper rather than wait for its next tick.
+        "sender_pool_min=1;sender_pool_max=2;idle_timeout_ms=180000;pool_reap=auto;close_flush_timeout_millis=200;",
     ))
     .unwrap();
     // Borrow + return so we have something to reap eventually.
