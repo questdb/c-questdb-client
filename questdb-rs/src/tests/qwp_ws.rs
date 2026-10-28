@@ -1104,6 +1104,35 @@ fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
     predicate()
 }
 
+fn reopen_orphan_before_deadline(conf: &str, deadline: Instant) -> crate::ingress::Sender {
+    loop {
+        match SenderBuilder::from_conf(conf).unwrap().build() {
+            Ok(sender) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "orphan slot was not reusable within the shutdown deadline"
+                );
+                return sender;
+            }
+            Err(err)
+                if err.code() == ErrorCode::SocketError
+                    && err
+                        .msg()
+                        .starts_with("QWP/WebSocket store-and-forward slot is already in use ")
+                    && Instant::now() < deadline =>
+            {
+                // Bounded close may detach a cancelled worker while it finishes cleanup.
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
+            }
+            Err(err) => panic!("orphan slot was not reusable after close: {err}"),
+        }
+    }
+}
+
 fn spawn_upgrade_only_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1642,22 +1671,36 @@ fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8
     (port, rx, release_tx)
 }
 
-fn spawn_stalled_background_orphan_connect_server() -> (u16, mpsc::Receiver<()>, mpsc::Sender<()>) {
+fn spawn_stalled_background_orphan_connect_server() -> (
+    u16,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    thread::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (accepted_tx, accepted_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
 
-    thread::spawn(move || {
+    let server = thread::spawn(move || {
         let (mut foreground, _) = listener.accept().unwrap();
         perform_server_upgrade(&mut foreground).unwrap();
 
-        let (_orphan, _) = listener.accept().unwrap();
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = read_request_until_blank(&mut orphan).unwrap();
+        assert!(request.ends_with(b"\r\n\r\n"));
         accepted_tx.send(()).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        assert_ne!(
+            release_rx.recv_timeout(Duration::from_secs(10)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "stalled-connect mock expired before explicit release"
+        );
     });
 
-    (port, accepted_rx, release_tx)
+    (port, accepted_rx, release_tx, server)
 }
 
 fn spawn_stalled_first_background_orphan_connect_server() -> (
@@ -1675,9 +1718,18 @@ fn spawn_stalled_first_background_orphan_connect_server() -> (
         let (mut foreground, _) = listener.accept().unwrap();
         perform_server_upgrade(&mut foreground).unwrap();
 
-        let (_orphan, _) = listener.accept().unwrap();
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = read_request_until_blank(&mut orphan).unwrap();
+        assert!(request.ends_with(b"\r\n\r\n"));
         accepted_tx.send(listener.try_clone().unwrap()).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        assert_ne!(
+            release_rx.recv_timeout(Duration::from_secs(10)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "stalled-connect mock expired before explicit release"
+        );
     });
 
     (port, accepted_rx, release_tx, server)
@@ -4825,7 +4877,7 @@ fn qwp_ws_background_orphan_close_interrupts_stalled_connect() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
 
-    let (port, orphan_accepted, release_stalled_orphan) =
+    let (port, orphan_accepted, release_stalled_orphan, server) =
         spawn_stalled_background_orphan_connect_server();
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{port};\
@@ -4855,15 +4907,14 @@ fn qwp_ws_background_orphan_close_interrupts_stalled_connect() {
          sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
-    let mut recover_sender = SenderBuilder::from_conf(&recover_conf)
-        .unwrap()
-        .build()
-        .expect("stalled orphan worker retained the slot lock after close");
+    let mut recover_sender =
+        reopen_orphan_before_deadline(&recover_conf, started + Duration::from_secs(5));
     recover_sender.close_drain().unwrap();
     let recovered = recover_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(recovered.received_frames.len(), 1);
 
     let _ = release_stalled_orphan.send(());
+    server.join().unwrap();
 }
 
 #[test]
@@ -4897,16 +4948,9 @@ fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
         "background orphan shutdown took {elapsed:?}"
     );
 
-    listener.set_nonblocking(true).unwrap();
-    assert!(matches!(
-        listener.accept(),
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
-    ));
-
     // The close bound alone cannot tell an interrupted worker from one the
-    // pool gave up on and detached, which would still hold the slot lock.
-    // Which slot stalled depends on unsorted `read_dir` order, so reopen
-    // both: every slot lock must be free once the worker has exited.
+    // pool detached. Allow cleanup only within the original close deadline.
+    // Which slot stalled depends on unsorted `read_dir` order, so reopen both.
     for slot in ["orphan-a", "orphan-b"] {
         let reopen_port = spawn_upgrade_only_server();
         let reopen_conf = format!(
@@ -4914,16 +4958,18 @@ fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
              sf_dir={};sender_id={slot};sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
             sf_dir.path().display()
         );
-        let reopened = SenderBuilder::from_conf(&reopen_conf)
-            .unwrap()
-            .build()
-            .unwrap_or_else(|err| {
-                panic!("stalled orphan worker retained the {slot} slot lock after close: {err}")
-            });
+        let reopened =
+            reopen_orphan_before_deadline(&reopen_conf, started + Duration::from_secs(5));
         drop(reopened);
     }
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-a")));
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-b")));
+
+    listener.set_nonblocking(true).unwrap();
+    assert!(matches!(
+        listener.accept(),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+    ));
 
     let _ = release_stalled_orphan.send(());
     server.join().unwrap();
@@ -4962,10 +5008,7 @@ fn qwp_ws_background_orphan_close_interrupts_blocked_send() {
          sf_dir={};sender_id=orphan;sf_max_segment_bytes=16777216;",
         sf_dir.path().display()
     );
-    let reopened = SenderBuilder::from_conf(&reopen_conf)
-        .unwrap()
-        .build()
-        .expect("blocked orphan worker retained the slot lock after close");
+    let reopened = reopen_orphan_before_deadline(&reopen_conf, started + Duration::from_secs(5));
     drop(reopened);
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan")));
 

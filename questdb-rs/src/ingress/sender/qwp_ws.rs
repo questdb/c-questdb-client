@@ -523,6 +523,7 @@ pub(crate) struct ManualQwpWsHandlerState {
 
 pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
+    sender_errors_pending: Arc<AtomicBool>,
     producer: Option<SfaProducer>,
     lifecycle: PublicationLifecycle,
     backpressure: Arc<BackpressureNotifier>,
@@ -571,6 +572,8 @@ struct QwpWsPendingConnect {
     /// Empty in memory mode / on a fresh slot.
     recovered_dict_entries: Vec<u8>,
     recovered_dict_count: u32,
+    #[cfg(test)]
+    terminal_error_for_test: Option<crate::Error>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -632,6 +635,7 @@ where
         let lifecycle = store.lifecycle();
         let progress = store.progress_view();
         let producer = store.take_producer();
+        let sender_errors_pending = store.sender_errors_pending();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
@@ -661,6 +665,7 @@ where
 
         Self {
             shared,
+            sender_errors_pending,
             producer,
             lifecycle,
             backpressure,
@@ -685,6 +690,7 @@ where
         let lifecycle = store.lifecycle();
         let progress = store.progress_view();
         let producer = store.take_producer();
+        let sender_errors_pending = store.sender_errors_pending();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
@@ -715,6 +721,7 @@ where
 
         Self {
             shared,
+            sender_errors_pending,
             producer,
             lifecycle,
             backpressure,
@@ -728,6 +735,17 @@ where
     }
 
     fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<u64> {
+        self.check_publication_open()?;
+        if let Some(producer) = self.producer.as_mut()
+            && let Some(receipt) = producer
+                .try_submit_active(payload)
+                .map_err(DriverError::from)
+                .map_err(driver_error_to_error_without_state)?
+        {
+            return Ok(receipt.fsn);
+        }
+        // Start the wait budget before rotation or backpressure, not on every
+        // successful append to an already allocated segment.
         let deadline = Instant::now().checked_add(self.append_deadline);
         loop {
             let backpressure_generation = self.backpressure.generation();
@@ -851,11 +869,17 @@ where
     }
 
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
+        if !self.sender_errors_pending.load(Ordering::Acquire) && !self.shared.is_poisoned() {
+            return Ok(None);
+        }
         let mut store = self.lock_shared()?;
         Ok(store.poll_sender_error())
     }
 
     fn poll_sender_error_notification(&self) -> crate::Result<Option<QwpWsSenderError>> {
+        if !self.sender_errors_pending.load(Ordering::Acquire) && !self.shared.is_poisoned() {
+            return Ok(None);
+        }
         let mut store = self.lock_shared()?;
         Ok(store.poll_sender_error_notification())
     }
@@ -1070,6 +1094,8 @@ impl QwpWsPendingConnect {
             delta_dict_enabled,
             recovered_dict_entries,
             recovered_dict_count,
+            #[cfg(test)]
+            terminal_error_for_test: None,
         }
     }
 
@@ -1077,6 +1103,10 @@ impl QwpWsPendingConnect {
         &self,
         stop: &AtomicBool,
     ) -> Result<Option<BlockingQwpWsTransport>, crate::Error> {
+        #[cfg(test)]
+        if let Some(err) = &self.terminal_error_for_test {
+            return Err(err.clone());
+        }
         let started = Instant::now();
         let deadline = started.checked_add(self.reconnect_policy.max_duration());
         let endpoints = qwp_ws_configured_endpoints(&self.host, &self.port, &self.qwp_ws);
@@ -1210,7 +1240,11 @@ impl SyncQwpWsPendingRunnerCore {
                 }
                 let mut store = match shared.lock() {
                     Ok(store) => store,
-                    Err(_) => return RunnerStep::Stop,
+                    Err(_) => {
+                        self.lifecycle.terminalize();
+                        self.backpressure.notify_all();
+                        return RunnerStep::Stop;
+                    }
                 };
                 store.mark_terminal(Some(err));
                 self.backpressure.notify_all();
@@ -1274,26 +1308,42 @@ where
             }
         }
 
-        let outbound = match self.send_core.next_outbound_sfa_frame(&self.progress) {
-            Ok(outbound) => outbound,
-            Err(err) => return self.store_shared_driver_error(shared, err),
-        };
-        // Torn-dictionary guard (file mode): a replayed delta frame whose base
-        // exceeds the re-registered dictionary is unrecoverable -- fail loudly
-        // rather than send the server a frame it cannot decode.
-        if let Some(frame) = outbound.as_ref()
-            && let Err(err) =
-                frame.with_view(|view| self.send_core.guard_dict_not_torn(view.payload))
-        {
-            return self.store_shared_driver_error(shared, DriverError::Storage(err));
+        // Bounded send burst: ready frames are handed to the transport back to
+        // back and reach the socket in grouped writes when the burst closes.
+        let budget = self.send_core.begin_send_batch();
+        let mut bytes = 0usize;
+        let mut send_step = RunnerStep::Idle;
+        while bytes < budget {
+            if stop.load(Ordering::Acquire) {
+                return RunnerStep::Stop;
+            }
+            let outbound = match self.send_core.next_outbound_sfa_frame(&self.progress) {
+                Ok(Some(outbound)) => outbound,
+                Ok(None) => break,
+                Err(err) => return self.store_shared_driver_error(shared, err),
+            };
+            // Torn-dictionary guard (file mode): a replayed delta frame whose
+            // base exceeds the re-registered dictionary is unrecoverable --
+            // fail loudly rather than send the server a frame it cannot
+            // decode. Checked per frame even within a burst.
+            if let Err(err) =
+                outbound.with_view(|view| self.send_core.guard_dict_not_torn(view.payload))
+            {
+                return self.store_shared_driver_error(shared, DriverError::Storage(err));
+            }
+            bytes = bytes
+                .saturating_add(outbound.sent_frame().payload_len)
+                .saturating_add(14);
+            send_step = self.finish_send(shared, stop, outbound);
+            if send_step == RunnerStep::Stop {
+                return RunnerStep::Stop;
+            }
+            if self.send_core.send_batch_interrupted() {
+                return send_step;
+            }
         }
-
-        let send_step = match outbound {
-            Some(outbound) => self.finish_send(shared, stop, outbound),
-            None => self.finish_receive(shared, stop),
-        };
-        if send_step == RunnerStep::Stop {
-            return RunnerStep::Stop;
+        if let Err(failure) = self.send_core.finish_send_batch() {
+            return self.apply_transport_failure(shared, stop, failure);
         }
 
         let receive_step = self.drain_receive_ready(shared, stop);
@@ -4033,6 +4083,24 @@ pub(crate) fn qwp_ws_ok_fsn_background(
     state.runner.ok_fsn()
 }
 
+/// Take before checking a completion watermark or error condition.
+pub(crate) fn qwp_ws_progress_generation_background(state: &SyncQwpWsHandlerState) -> u64 {
+    state.runner.backpressure.generation()
+}
+
+/// Wait for runner progress or the absolute deadline. The caller must recheck
+/// its watermark/error predicate: sends and storage maintenance also notify.
+pub(crate) fn qwp_ws_wait_for_progress_background(
+    state: &SyncQwpWsHandlerState,
+    generation: u64,
+    deadline: Option<Instant>,
+) {
+    state
+        .runner
+        .backpressure
+        .wait_for_change(generation, deadline);
+}
+
 pub(crate) fn qwp_ws_published_fsn_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
@@ -4599,6 +4667,216 @@ mod tests {
         let generation = notifier.generation();
 
         assert!(!notifier.wait_for_change(generation, Some(Instant::now())));
+    }
+
+    #[test]
+    fn pending_connect_terminal_failure_with_poisoned_store_wakes_waiters() {
+        let qwp_ws = crate::ingress::SenderBuilder::from_conf("ws::addr=127.0.0.1:1;")
+            .unwrap()
+            .qwp_ws
+            .unwrap();
+        let mut pending_connect = QwpWsPendingConnect::new(
+            "127.0.0.1",
+            "1",
+            false,
+            None,
+            &qwp_ws,
+            None,
+            false,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(TrafficGate::default()),
+            false,
+            Vec::new(),
+            0,
+        );
+        // Fail before any real socket operation, through the production
+        // pending-connect error branch.
+        pending_connect.terminal_error_for_test = Some(crate::Error::new(
+            crate::ErrorCode::AuthError,
+            "injected initial-connect failure",
+        ));
+        let mut store = QwpWsPublicationStore::new(memory_queue(1024), 32);
+        store.try_submit(b"waiting").unwrap();
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let poison_target = Arc::clone(&shared);
+        assert!(
+            thread::spawn(move || {
+                let _guard = poison_target.lock().unwrap();
+                panic!("injected store-lock poison");
+            })
+            .join()
+            .is_err()
+        );
+        let notifier = Arc::new(BackpressureNotifier::new());
+        let generation = notifier.generation();
+        let mut core = SyncQwpWsPendingRunnerCore {
+            connected: None,
+            pending_connect,
+            progress,
+            backpressure: Arc::clone(&notifier),
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            lifecycle: lifecycle.clone(),
+        };
+
+        assert_eq!(
+            core.drive_step(&shared, &AtomicBool::new(false)),
+            RunnerStep::Stop
+        );
+        assert!(lifecycle.is_terminal());
+        assert_ne!(notifier.generation(), generation);
+        assert!(
+            notifier.wait_for_change(generation, None),
+            "even an unlimited wait must observe the poisoned initial-connect failure"
+        );
+    }
+
+    fn pooled_boundary_wait_sender<T: QwpWsCoreTransport + Send + 'static>(
+        transport: T,
+        durable: bool,
+    ) -> (
+        crate::ingress::column_sender::PooledSenderCore,
+        Arc<BackpressureNotifier>,
+    ) {
+        let queue = SfaSlotQueue::open_memory(SfaMemoryQueueOptions {
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+        })
+        .unwrap();
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            queue,
+            transport,
+            ReconnectPolicy::bounded(Duration::MAX, Duration::ZERO, Duration::ZERO),
+            durable,
+        );
+        driver.try_submit(b"boundary").unwrap();
+        let runner = SyncQwpWsRunner::start(driver);
+        let notifier = Arc::clone(&runner.backpressure);
+        let state = SyncQwpWsHandlerState {
+            encoder: QwpWsReplayEncoder::new(1),
+            runner,
+            server_max_batch_size: Arc::new(AtomicUsize::new(4096)),
+            request_durable_ack: durable,
+            sfa_frame_payload_cap: segment_payload_capacity(4096),
+            sfa_frame_split_target: two_frame_segment_payload_capacity(4096),
+            orphan_pool: None,
+            close_drain_timeout: Duration::ZERO,
+            delta_dict_enabled: false,
+            recovered_dict_entries: Vec::new(),
+            recovered_dict_count: 0,
+            persisted_symbol_dict: None,
+            sfa_split_deferral_enabled: true,
+        };
+        let sender = crate::ingress::column_sender::PooledSenderCore::new_store_and_forward(
+            state,
+            4096,
+            durable,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        (sender, notifier)
+    }
+
+    #[test]
+    fn pooled_boundary_wait_unrelated_notifications_do_not_extend_timeout() {
+        let (mut sender, notifier) =
+            pooled_boundary_wait_sender(FakeOrderedServer::no_response(), false);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let notifying = scope.spawn(move || {
+                while matches!(
+                    stop_rx.recv_timeout(Duration::from_millis(5)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    notifier.notify_all();
+                }
+            });
+            let waiting = scope.spawn(move || {
+                let result = sender.wait(crate::ingress::AckLevel::Ok, Duration::from_millis(40));
+                let _ = result_tx.send(result);
+            });
+            let result = result_rx.recv_timeout(Duration::from_secs(5));
+            let _ = stop_tx.send(());
+            notifying.join().unwrap();
+            waiting.join().unwrap();
+            let err = result
+                .expect("unrelated notifications must not renew the no-progress deadline")
+                .unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::FailoverRetry);
+            assert!(err.msg().contains("no ack progress"));
+        });
+    }
+
+    #[test]
+    fn pooled_boundary_wait_wakes_for_ack_and_terminal_error() {
+        for terminal in [false, true] {
+            let (sent_tx, sent_rx) = mpsc::channel();
+            let (ack_tx, ack_rx) = mpsc::channel();
+            let (terminal_tx, terminal_rx) = mpsc::channel();
+            let transport = SignalResponseTransport {
+                sent_frame: sent_tx,
+                ack: ack_rx,
+                terminal: terminal_rx,
+                sent_frames: Vec::new(),
+            };
+            let (mut sender, notifier) = pooled_boundary_wait_sender(transport, false);
+            sent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(move || {
+                    waiting_tx.send(()).unwrap();
+                    let result = sender.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10));
+                    let _ = result_tx.send(result);
+                });
+                waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                if terminal {
+                    terminal_tx.send(()).unwrap();
+                } else {
+                    ack_tx.send(()).unwrap();
+                }
+                let result = result_rx.recv_timeout(Duration::from_secs(2));
+                if result.is_err() {
+                    // Rescue the waiter before asserting a missing notification;
+                    // reaching its own deadline must not make this test pass.
+                    notifier.notify_all();
+                }
+                waiting.join().unwrap();
+                let result = result.expect("ACK and terminal errors must wake a boundary wait");
+                if terminal {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.code(), crate::ErrorCode::SocketError);
+                    assert!(err.msg().contains("synthetic terminal failure"));
+                } else {
+                    result.unwrap();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn pooled_boundary_wait_keeps_ok_and_durable_notifications_distinct() {
+        let ack_ready = Arc::new(AtomicBool::new(false));
+        let transport = DurableAckWhenReadyTransport {
+            ack_ready: Arc::clone(&ack_ready),
+            sent_frames: Vec::new(),
+        };
+        let (mut sender, _) = pooled_boundary_wait_sender(transport, true);
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), None);
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_millis(20))
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::FailoverRetry);
+        ack_ready.store(true, Ordering::Release);
+        sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), Some(0));
     }
 
     #[test]
@@ -5590,6 +5868,54 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn runner_periodic_sync_failure_notifies_completion_waiters() {
+        use super::super::qwp_ws_sfa_segment::fail_sync_after_for_test;
+
+        let dir = TempDir::new().unwrap();
+        let qwp_ws = periodic_qwp_ws_config(dir.path(), "periodic-wait-error");
+        let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+        let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
+        let (mut store, send_core) = driver.into_parts();
+        store.try_submit(b"periodic").unwrap();
+        let producer = store.take_producer().unwrap();
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let notifier = Arc::new(BackpressureNotifier::new());
+        let mut core = SyncQwpWsRunnerCore {
+            send_core,
+            progress,
+            cold_effects: VecDeque::new(),
+            backpressure: Arc::clone(&notifier),
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            lifecycle,
+        };
+
+        let generation = notifier.generation();
+        producer.check_durability().unwrap();
+        fail_sync_after_for_test(0);
+        assert_eq!(
+            core.finish_storage_maintenance(&shared),
+            RunnerStep::Continue
+        );
+        assert!(
+            notifier.wait_for_change(generation, Some(Instant::now())),
+            "a periodic failure must be observable even if it precedes the wait"
+        );
+        assert!(matches!(
+            producer.check_durability(),
+            Err(SfaQueueError::Durability(_))
+        ));
+        assert!(
+            !core.lifecycle.is_terminal(),
+            "periodic sync failure is retryable"
+        );
+        drop(producer);
+        shared.lock().unwrap().close_queue().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn threaded_runner_waits_for_in_flight_periodic_sync_before_close() {
         let dir = TempDir::new().unwrap();
         let sender_id = "periodic-runner";
@@ -5717,6 +6043,33 @@ mod tests {
         runner.drain_to_deadline(None).unwrap();
 
         SfaSlotQueue::open(slot_options).unwrap();
+    }
+
+    #[test]
+    fn empty_sender_error_polls_do_not_wait_for_storage_maintenance() {
+        let driver =
+            QwpWsCoreTestHarness::from_queue(memory_queue(8192), FakeOrderedServer::no_response());
+        let runner =
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
+        let shared = Arc::clone(&runner.shared);
+        let guard = shared.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let runner = &runner;
+            let polling = scope.spawn(move || {
+                tx.send((
+                    runner.poll_sender_error(),
+                    runner.poll_sender_error_notification(),
+                ))
+                .unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            drop(guard);
+            polling.join().unwrap();
+            let (error, notification) = result.expect("empty polls must not wait on the store");
+            assert_eq!(error.unwrap(), None);
+            assert_eq!(notification.unwrap(), None);
+        });
     }
 
     #[test]
@@ -6343,6 +6696,159 @@ mod tests {
                 "immediate transport failure was not recorded as sent before reconnect: {events:?}"
             );
         }
+        drop(runner);
+    }
+
+    /// Records which frames each bounded send burst hands to the transport.
+    #[derive(Debug)]
+    struct BurstRecordingTransport {
+        open: bool,
+        current: Vec<u64>,
+        bursts: Arc<Mutex<Vec<Vec<u64>>>>,
+    }
+
+    impl QwpWsCoreTransport for BurstRecordingTransport {
+        fn begin_send_batch(&mut self) -> usize {
+            self.open = true;
+            64 * 1024
+        }
+
+        fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
+            assert!(self.open, "finish_send_batch without begin_send_batch");
+            self.open = false;
+            let burst = std::mem::take(&mut self.current);
+            if !burst.is_empty() {
+                self.bursts.lock().unwrap().push(burst);
+            }
+            Ok(())
+        }
+
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            assert!(self.open, "background sends must happen inside a burst");
+            self.current.push(frame.sent_frame().fsn);
+            Ok(TransportSendResult::NoResponse)
+        }
+
+        fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn runner_step_sends_every_ready_frame_in_one_burst() {
+        let bursts = Arc::new(Mutex::new(Vec::new()));
+        let transport = BurstRecordingTransport {
+            open: false,
+            current: Vec::new(),
+            bursts: Arc::clone(&bursts),
+        };
+        let driver = QwpWsCoreTestHarness::from_queue(memory_queue(4096), transport);
+        let (mut store, send_core) = driver.into_parts();
+        for payload in [b"first".as_slice(), b"second", b"third"] {
+            store.try_submit(payload).unwrap();
+        }
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let mut core = SyncQwpWsRunnerCore {
+            send_core,
+            progress,
+            cold_effects: VecDeque::new(),
+            backpressure: Arc::new(BackpressureNotifier::new()),
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            lifecycle,
+        };
+
+        assert_eq!(
+            core.drive_step(&shared, &AtomicBool::new(false)),
+            RunnerStep::Continue
+        );
+        assert_eq!(*bursts.lock().unwrap(), [vec![0, 1, 2]]);
+
+        let mut store = shared.lock().unwrap();
+        let counters = store.counters();
+        assert_eq!(counters.total_frames_sent, 3);
+        let mut sent = Vec::new();
+        while let Some(event) = store.poll_event() {
+            if let DriverEvent::Sent { fsn, wire_seq } = event {
+                sent.push((fsn, wire_seq));
+            }
+        }
+        assert_eq!(sent, [(0, 0), (1, 1), (2, 2)]);
+    }
+
+    #[derive(Debug)]
+    struct FailFirstBatchFlushTransport {
+        fail_next_flush: bool,
+        unflushed: bool,
+        sent_fsns: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl QwpWsCoreTransport for FailFirstBatchFlushTransport {
+        fn begin_send_batch(&mut self) -> usize {
+            64 * 1024
+        }
+
+        fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
+            if std::mem::take(&mut self.unflushed) && std::mem::take(&mut self.fail_next_flush) {
+                return Err(TransportFailure::Disconnect(crate::Error::new(
+                    crate::ErrorCode::SocketError,
+                    "fake batch flush failure",
+                )));
+            }
+            Ok(())
+        }
+
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            self.unflushed = true;
+            self.sent_fsns.lock().unwrap().push(frame.sent_frame().fsn);
+            Ok(TransportSendResult::NoResponse)
+        }
+
+        fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn threaded_runner_replays_frames_whose_batch_write_failed() {
+        let sent_fsns = Arc::new(Mutex::new(Vec::new()));
+        let transport = FailFirstBatchFlushTransport {
+            fail_next_flush: true,
+            unflushed: false,
+            sent_fsns: Arc::clone(&sent_fsns),
+        };
+        let driver = QwpWsCoreTestHarness::from_queue(memory_queue(1024), transport);
+        let mut runner = SyncQwpWsRunner::start(driver);
+
+        runner.publish_replay_payload(b"first").unwrap();
+        let replayed = || {
+            runner
+                .lock_shared()
+                .unwrap()
+                .counters()
+                .total_frames_replayed
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while replayed() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(replayed(), 1);
+        assert_eq!(*sent_fsns.lock().unwrap(), [0, 0]);
         drop(runner);
     }
 }

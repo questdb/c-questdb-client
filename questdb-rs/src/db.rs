@@ -314,9 +314,12 @@ struct DbInner {
     /// `2 * sender_pool_max + query_pool_max`.
     #[cfg(feature = "_egress")]
     reader_state: Mutex<ReaderPoolState>,
-    /// Wakes the reaper thread on `shutdown` and lets a disk-SF borrow wait
-    /// briefly for an in-flight slot close to release its flock.
+    /// Wakes at-cap store-and-forward borrows when a sender is returned or
+    /// an in-flight disk slot close releases its flock. Paired with `state`.
     cv: Condvar,
+    /// Wakes the reaper on shutdown, without triggering a sweep on every
+    /// store-and-forward sender return. Also paired with `state`.
+    reaper_cv: Condvar,
     /// Wakes at-cap direct-pool borrows when a direct sender is returned
     /// or a reservation is rolled back. Paired with `direct_state`.
     direct_cv: Condvar,
@@ -439,7 +442,8 @@ impl<S> PoolState<S> {
 struct PoolEntry<S> {
     sender: S,
     slot_index: Option<usize>,
-    last_idle_at: Instant,
+    // Fixed-size SF pools never reap idle entries.
+    last_idle_at: Option<Instant>,
 }
 
 struct PooledSender<S> {
@@ -641,7 +645,8 @@ fn preopen_recovery_sender(
                 state.free.push(PoolEntry {
                     sender,
                     slot_index,
-                    last_idle_at: Instant::now(),
+                    last_idle_at: (inner.sender_pool_min < inner.sender_pool_max)
+                        .then(Instant::now),
                 });
             }
             slot.commit();
@@ -897,6 +902,7 @@ impl QuestDb {
             #[cfg(feature = "_egress")]
             reader_state: Mutex::new(ReaderPoolState::default()),
             cv: Condvar::new(),
+            reaper_cv: Condvar::new(),
             direct_cv: Condvar::new(),
             #[cfg(feature = "_egress")]
             reader_cv: Condvar::new(),
@@ -1446,6 +1452,7 @@ impl Drop for QuestDb {
         {
             let _g = lock_state(&self.inner.state);
             self.inner.cv.notify_all();
+            self.inner.reaper_cv.notify_all();
         }
         {
             let _g = lock_state(&self.inner.direct_state);
@@ -3011,7 +3018,7 @@ fn return_sfa_to_pool(
             state.free.push(PoolEntry {
                 sender,
                 slot_index,
-                last_idle_at: Instant::now(),
+                last_idle_at: (inner.sender_pool_min < inner.sender_pool_max).then(Instant::now),
             });
             inner.cv.notify_all();
             return;
@@ -3045,7 +3052,7 @@ fn return_direct_to_pool(inner: &Arc<DbInner>, sender: DirectSenderCore) {
             state.free.push(PoolEntry {
                 sender,
                 slot_index: None,
-                last_idle_at: Instant::now(),
+                last_idle_at: Some(Instant::now()),
             });
         }
     }
@@ -3064,7 +3071,7 @@ fn finish_replaced_sender(inner: &Arc<DbInner>, sender: DirectSenderCore) {
             state.free.push(PoolEntry {
                 sender,
                 slot_index: None,
-                last_idle_at: Instant::now(),
+                last_idle_at: Some(Instant::now()),
             });
         }
     }
@@ -3112,7 +3119,7 @@ fn reaper_loop(inner: Arc<DbInner>, tick: Duration) {
             break;
         }
         let (state, _) = inner
-            .cv
+            .reaper_cv
             .wait_timeout(state, tick)
             .unwrap_or_else(|e| e.into_inner());
         if inner.shutdown.load(Ordering::SeqCst) {
@@ -3208,13 +3215,15 @@ fn take_reapable_column_sender(
         if state.total() <= inner.sender_pool_min {
             return None;
         }
-        let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
+        let expired = state.free[i]
+            .last_idle_at
+            .is_some_and(|idle_at| now.saturating_duration_since(idle_at) > inner.idle_timeout);
         // Never evict a connection whose store-and-forward queue still holds
         // undelivered frames: its background runner is still delivering, and
         // dropping it now would lose that data. It becomes reapable once the
         // runner drains it (or the transport goes terminal). `sfa_fully_delivered`
         // is a lock-free progress read in the healthy case.
-        if idle_for > inner.idle_timeout && state.free[i].sender.sfa_fully_delivered(durable) {
+        if expired && state.free[i].sender.sfa_fully_delivered(durable) {
             let entry = state.free.remove(i);
             if entry.slot_index.is_some() {
                 state.closing += 1;
@@ -3236,8 +3245,10 @@ fn reap_idle_direct_senders(inner: &DbInner) -> usize {
         let now = Instant::now();
         let mut i = 0;
         while i < state.free.len() {
-            let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
-            if idle_for > inner.idle_timeout {
+            let expired = state.free[i]
+                .last_idle_at
+                .is_some_and(|idle_at| now.saturating_duration_since(idle_at) > inner.idle_timeout);
+            if expired {
                 let entry = state.free.remove(i);
                 to_drop.push(entry.sender);
             } else {

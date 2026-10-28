@@ -61,6 +61,9 @@ mod qwp_ws_codec;
 mod qwp_ws_driver;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
+mod qwp_ws_batch;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws_driver::{
     ReconnectPolicy, ReconnectReason, reconnect_backoff_step, reconnect_error_is_terminal,
 };
