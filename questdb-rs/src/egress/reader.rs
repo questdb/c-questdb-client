@@ -1842,8 +1842,13 @@ impl<'r> Cursor<'r> {
     /// producing a batch; surfaces drift as
     /// [`ErrorCode::SchemaDrift`].
     ///
+    /// With `interrupt_on_eintr=on`, an [`ErrorCode::Interrupted`] ends the
+    /// cursor: the rows gathered so far are discarded, so re-execute the
+    /// query rather than calling this again.
+    ///
     /// [`ErrorCode::NoSchema`]: crate::ErrorCode::NoSchema
     /// [`ErrorCode::SchemaDrift`]: crate::ErrorCode::SchemaDrift
+    /// [`ErrorCode::Interrupted`]: crate::ErrorCode::Interrupted
     #[cfg(feature = "arrow-egress")]
     pub fn fetch_all_arrow(
         &mut self,
@@ -2734,7 +2739,9 @@ impl<'r> Cursor<'r> {
     ///
     /// With `interrupt_on_eintr=on`, a drain interrupted by a signal returns
     /// [`ErrorCode::Interrupted`]; call `cancel()` again to finish it —
-    /// CANCEL is not re-sent.
+    /// CANCEL is not re-sent. Each resumed call re-arms the drain read
+    /// timeout, so under continuous signals it is the caller's retry loop
+    /// that bounds the drain.
     pub fn cancel(&mut self) -> Result<()> {
         if self.done {
             return Ok(());

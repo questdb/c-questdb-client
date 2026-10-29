@@ -254,6 +254,10 @@ enum Action {
     /// The captured request_id semantics are unchanged — CANCEL has
     /// no separate id to track on the wire.
     AwaitClientCancel,
+    /// Read client frames until the connection closes, adding the number
+    /// of CANCEL frames among them to the counter.
+    #[cfg(unix)]
+    CountClientCancels(Arc<AtomicUsize>),
     /// Reply with RESULT_END (using the request_id from the most-recent
     /// AwaitQueryRequest).
     SendResultEnd,
@@ -565,6 +569,12 @@ fn run_script(
             Action::AwaitClientCancel => {
                 if !read_until_client_cancel(&mut ws) {
                     return;
+                }
+            }
+            #[cfg(unix)]
+            Action::CountClientCancels(counter) => {
+                while read_until_client_cancel(&mut ws) {
+                    counter.fetch_add(1, Ordering::SeqCst);
                 }
             }
             Action::SendResultEnd => {
@@ -5775,10 +5785,12 @@ fn eintr_fails_the_read_by_default() {
 }
 
 /// A `cancel()` drain interrupted by a signal returns `Interrupted`;
-/// calling `cancel()` again finishes it.
+/// calling `cancel()` again finishes it, without re-sending CANCEL.
 #[cfg(unix)]
 #[test]
 fn interrupted_cancel_drain_resumes() {
+    // CANCELs after the one `AwaitClientCancel` consumes.
+    let resent_cancels = Arc::new(AtomicUsize::new(0));
     let srv = MockServer::start(vec![vec![
         Action::SendServerInfo {
             role: ServerRole::Standalone,
@@ -5791,6 +5803,7 @@ fn interrupted_cancel_drain_resumes() {
             status: 0x0A, // CANCELLED
             message: "cancelled".into(),
         },
+        Action::CountClientCancels(Arc::clone(&resent_cancels)),
     ]]);
     let mut reader = Reader::from_conf(format!(
         "ws::addr={};failover=off;interrupt_on_eintr=on",
@@ -5812,7 +5825,55 @@ fn interrupted_cancel_drain_resumes() {
     assert!(interrupts > 0, "signals during the drain must interrupt");
     assert!(cursor.connection_reusable());
     drop(cursor);
+    drop(reader); // close the connection so `CountClientCancels` returns
     assert_eq!(srv.accepts(), 1);
+    drop(srv); // join the worker
+    assert_eq!(
+        resent_cancels.load(Ordering::SeqCst),
+        0,
+        "exactly one CANCEL must be sent across the interrupted and resumed cancel()"
+    );
+}
+
+/// Connect-time reads retry `EINTR` but must still time out on schedule:
+/// each retried `recv` would restart `SO_RCVTIMEO`, so without a deadline
+/// a steady stream of signals keeps a silent server from ever timing out.
+/// Covers both the WS upgrade (`auth_timeout_ms`) and `SERVER_INFO`
+/// (`server_info_timeout_ms`). The mock hangs up after `HOLD`, so a
+/// regression fails on the elapsed-time check instead of hanging.
+#[cfg(unix)]
+#[test]
+fn eintr_retry_still_times_out_at_connect() {
+    use questdb::egress::ReaderConfig;
+    const TIMEOUT: Duration = Duration::from_millis(300);
+    const HOLD: Duration = Duration::from_secs(2);
+    for (what, action) in [
+        ("upgrade", Action::StallUpgrade(HOLD)),
+        ("SERVER_INFO", Action::Sleep(HOLD)),
+    ] {
+        let srv = MockServer::start(vec![vec![action]]);
+        let mut cfg = ReaderConfig::from_conf(format!(
+            "ws::addr={};failover=off;interrupt_on_eintr=on",
+            srv.url()
+        ))
+        .expect("conf parse");
+        cfg.auth_timeout_ms = TIMEOUT.as_millis() as u64;
+        cfg.server_info_timeout_ms = TIMEOUT.as_millis() as u64;
+        let started = Instant::now();
+        let err = {
+            let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+            match Reader::from_config(&cfg) {
+                Ok(_) => panic!("{what}: a silent server must fail the connect"),
+                Err(e) => e,
+            }
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < TIMEOUT * 2,
+            "{what}: EINTR retries defeated the {TIMEOUT:?} timeout; took {elapsed:?}: {err}"
+        );
+        assert_eq!(err.code(), ErrorCode::SocketError, "{what}: {err}");
+    }
 }
 
 /// Neither the `RecordBatchReader` adapter nor `next_arrow_batch` treat
@@ -5887,4 +5948,30 @@ fn interrupted_fetch_all_arrow_ends_the_cursor() {
     assert_eq!(err.code(), ErrorCode::Interrupted);
     let err = cursor.next_arrow_batch().expect_err("cursor ended");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{err}");
+}
+
+/// The Polars iterator does not poison on `Interrupted`: looping on it
+/// yields every row.
+#[cfg(all(unix, feature = "polars"))]
+#[test]
+fn interrupt_does_not_poison_polars_iter() {
+    let srv = MockServer::start(vec![stalling_script(&[STALL])]);
+    let mut reader = Reader::from_conf(format!(
+        "ws::addr={};failover=off;interrupt_on_eintr=on",
+        srv.url()
+    ))
+    .expect("connect");
+    let mut cursor = reader.prepare("select v").execute().expect("execute");
+    let iter = cursor.iter_polars().expect("first batch + schema");
+    let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+    let (mut rows, mut interrupts) = (0, 0);
+    for df in iter {
+        match df {
+            Ok(df) => rows += df.height(),
+            Err(e) if e.code() == ErrorCode::Interrupted => interrupts += 1,
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    assert_eq!(rows, 6);
+    assert!(interrupts > 0, "the Polars iterator saw no interrupt");
 }

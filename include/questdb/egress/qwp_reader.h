@@ -1435,7 +1435,8 @@ QUESTDB_CLIENT_API bool qwp_reader_cursor_connection_reusable(
  * With `interrupt_on_eintr=on`, a drain interrupted by a signal fails with
  * `questdb_error_interrupted` and leaves the cursor live: call this again
  * (after the host's interrupt handling) to resume the drain. CANCEL is not
- * re-sent.
+ * re-sent. Each resumed call re-arms the drain read timeout, so under
+ * continuous signals the caller's retry loop bounds the drain.
  */
 QUESTDB_CLIENT_API bool qwp_reader_cursor_cancel(
     qwp_reader_cursor* cursor, questdb_error** err_out);

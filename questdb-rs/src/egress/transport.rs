@@ -54,11 +54,9 @@ use crate::egress::tls::build_client_config;
 use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::roles;
-use crate::egress::ws::client::{EintrMode, Stream, TlsSock, WsClient, WsReadError};
+use crate::egress::ws::client::{EintrMode, RetryEintr, Stream, TlsSock, WsClient, WsReadError};
 use crate::error::{Error, ErrorCode, Result, fmt};
-use crate::ws::handshake::{
-    self, HandshakeError as WsHandshakeError, Headers, HttpReject, RetryEintr,
-};
+use crate::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
 use crate::ws::mask::MaskKeySource;
 use crate::ws::nosigpipe::NoSigpipeTcp;
 
@@ -239,7 +237,7 @@ impl WsTransport {
         let extra_headers = config.upgrade_headers();
         let handshake_result = if config.interrupt_on_eintr {
             handshake::upgrade(
-                &mut RetryEintr(&mut stream),
+                &mut RetryEintr::new(&mut stream),
                 &host_header,
                 &path,
                 &extra_headers,

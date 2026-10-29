@@ -523,9 +523,13 @@ pub struct ReaderConfig {
     /// so the host can run its handlers. The cursor is intact: nothing was
     /// lost, no reconnect or replay happens, and the next `next_batch` /
     /// `next_arrow_batch` (or `cancel`) resumes where the read stopped.
-    /// Connect-time reads (WS upgrade, `SERVER_INFO`, including during a
-    /// failover reconnect) retry `EINTR` instead, as they cannot be resumed;
-    /// the host's interrupt is then honoured at the next result-stream read.
+    /// Connect-time reads (TLS handshake, WS upgrade, `SERVER_INFO`,
+    /// including during a failover reconnect) retry `EINTR` instead, as
+    /// they cannot be resumed, but still time out on schedule
+    /// ([`auth_timeout_ms`](Self::auth_timeout_ms),
+    /// [`server_info_timeout_ms`](Self::server_info_timeout_ms)); the
+    /// host's interrupt is honoured once the call returns, or at the next
+    /// result-stream read.
     ///
     /// A signal that arrives just before the thread enters `recv` interrupts
     /// nothing, so a host must keep re-signalling the blocked thread until

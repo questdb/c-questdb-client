@@ -52,6 +52,12 @@ impl Cursor<'_> {
     /// only a stream without a schema (e.g. cancelled pre-prelude)
     /// errors as `NoSchema`. Drift detection is inherited from
     /// [`Cursor::iter_polars`].
+    ///
+    /// With `interrupt_on_eintr=on`, an [`ErrorCode::Interrupted`] ends the
+    /// cursor: the rows gathered so far are discarded, so re-execute the
+    /// query rather than calling this again.
+    ///
+    /// [`ErrorCode::Interrupted`]: crate::ErrorCode::Interrupted
     pub fn fetch_all_polars(&mut self) -> Result<DataFrame> {
         let result = self.fetch_all_polars_inner();
         self.end_if_interrupted(result, "fetch_all_polars")
