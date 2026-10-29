@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use questdb::ErrorCode;
 use questdb::egress::{Reader, ServerRole};
@@ -184,6 +185,12 @@ struct TlsMockServer {
 
 impl TlsMockServer {
     fn start() -> Self {
+        Self::start_with_stall(Duration::ZERO)
+    }
+
+    /// Like [`start`](Self::start), but waits `stall` after the
+    /// QUERY_REQUEST before replying.
+    fn start_with_stall(stall: Duration) -> Self {
         // Bind via the same hostname the client will resolve. On
         // macOS `localhost` returns both `::1` and `127.0.0.1`, and
         // the egress client only attempts the first address — so
@@ -212,7 +219,7 @@ impl TlsMockServer {
                 };
                 accept_count_clone.fetch_add(1, Ordering::SeqCst);
                 let cfg = Arc::clone(&cfg);
-                let worker = thread::spawn(move || serve_one(stream, cfg));
+                let worker = thread::spawn(move || serve_one(stream, cfg, stall));
                 workers_clone.lock().unwrap().push(worker);
             }
         });
@@ -257,7 +264,7 @@ impl Drop for TlsMockServer {
 }
 
 #[allow(clippy::result_large_err)]
-fn serve_one(tcp: TcpStream, cfg: Arc<ServerConfig>) {
+fn serve_one(tcp: TcpStream, cfg: Arc<ServerConfig>, stall: Duration) {
     // Drive the TLS handshake to completion before handing the stream
     // to tungstenite. `rustls::StreamOwned` is `Read + Write`, so the
     // WS upgrade negotiates over the encrypted channel transparently.
@@ -298,6 +305,7 @@ fn serve_one(tcp: TcpStream, cfg: Arc<ServerConfig>) {
         }
     };
 
+    thread::sleep(stall);
     let end = result_end_frame(request_id);
     let _ = ws.send(Message::Binary(end.into()));
     // Best-effort clean shutdown; ignore errors during close.
@@ -513,4 +521,65 @@ fn tls_certs_fixture_present() {
             .unwrap_or_else(|e| panic!("read {:?}: {}", p, e));
         assert!(!buf.is_empty(), "{:?} is empty", p);
     }
+}
+
+// ---------------------------------------------------------------------------
+// EINTR over TLS. rustls retries `EINTR` itself, so with
+// `interrupt_on_eintr=on` it only reaches the reader through `TlsSock`.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod eintr;
+
+#[cfg(unix)]
+fn tls_conf(srv: &TlsMockServer) -> String {
+    format!(
+        "wss::addr={};tls_ca=pem_file;tls_roots={};failover=off",
+        srv.url(),
+        root_ca_path().display()
+    )
+}
+
+/// Default: rustls retries `EINTR` internally, as before
+/// `interrupt_on_eintr` existed.
+#[cfg(unix)]
+#[test]
+fn qwps_eintr_is_retried_by_default() {
+    let srv = TlsMockServer::start_with_stall(Duration::from_millis(300));
+    let mut reader = Reader::from_conf(tls_conf(&srv)).expect("TLS connect");
+    {
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+        assert!(cursor.next_batch().expect("EINTR retried").is_none());
+    }
+    drop(reader);
+    assert_eq!(srv.accepts(), 1);
+}
+
+/// `interrupt_on_eintr=on`: a signal during the TLS handshake and WS
+/// upgrade is retried; one during the stalled result-stream read returns
+/// `Interrupted`, and the next call resumes the stream.
+#[cfg(unix)]
+#[test]
+fn qwps_eintr_interrupts_and_resumes_when_enabled() {
+    let srv = TlsMockServer::start_with_stall(Duration::from_millis(300));
+    let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+    let mut reader = Reader::from_conf(format!("{};interrupt_on_eintr=on", tls_conf(&srv)))
+        .expect("TLS connect retries EINTR");
+    {
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
+        let mut interrupts = 0;
+        loop {
+            match cursor.next_batch() {
+                Ok(None) => break,
+                Ok(Some(_)) => panic!("no rows expected"),
+                Err(e) if e.code() == ErrorCode::Interrupted => interrupts += 1,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(interrupts > 0, "signals during the stall must interrupt");
+        assert!(cursor.terminal().is_some());
+    }
+    drop(reader);
+    assert_eq!(srv.accepts(), 1);
 }

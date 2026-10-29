@@ -1111,7 +1111,9 @@ typedef struct qwp_reader_batch qwp_reader_batch;
  *         `qwp_reader_cursor_free`, or mid-query failover.
  * @return NULL with `*err_out` left untouched when the stream has
  *         terminated normally — no batch is available.
- * @return NULL with `*err_out` set on error; the cursor must be freed.
+ * @return NULL with `*err_out` set on error; the cursor must be freed —
+ *         except for `questdb_error_interrupted`, after which the cursor
+ *         stays live and the next call resumes the stream.
  */
 QUESTDB_CLIENT_API
 const qwp_reader_batch* qwp_reader_cursor_next_batch(
@@ -1429,6 +1431,12 @@ QUESTDB_CLIENT_API bool qwp_reader_cursor_connection_reusable(
  * Send CANCEL and drain to terminal. Idempotent after terminal. On failure,
  * use `qwp_reader_cursor_connection_reusable` to decide whether the
  * connection can be reused.
+ *
+ * With `interrupt_on_eintr=on`, a drain interrupted by a signal fails with
+ * `questdb_error_interrupted` and leaves the cursor live: call this again
+ * (after the host's interrupt handling) to resume the drain. CANCEL is not
+ * re-sent. Each resumed call re-arms the drain read timeout, so under
+ * continuous signals the caller's retry loop bounds the drain.
  */
 QUESTDB_CLIENT_API bool qwp_reader_cursor_cancel(
     qwp_reader_cursor* cursor, questdb_error** err_out);
@@ -1834,6 +1842,9 @@ typedef enum qwp_reader_arrow_batch_result
  * cleared so the next call re-snapshots the new schema and resumes. The
  * batch that triggered the drift is preserved and re-delivered (under the
  * new schema) by that next call, not discarded.
+ *
+ * `questdb_error_interrupted` keeps both the cursor and its pinned schema;
+ * the next call resumes.
  */
 QUESTDB_CLIENT_API
 qwp_reader_arrow_batch_result qwp_reader_cursor_next_arrow_batch(

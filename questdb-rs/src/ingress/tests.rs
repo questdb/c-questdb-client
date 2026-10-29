@@ -365,6 +365,8 @@ const EGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "failover_max_duration_ms",
     // Egress-only per-query timeout default
     "query_timeout_ms",
+    // Egress-only EINTR handling
+    "interrupt_on_eintr",
     // Java-egress-only decoded-batch pool size (Rust egress is sync/pull,
     // see comment in `egress/config.rs`); still ignored on ingress
     // because that's an egress-side concern either way.
