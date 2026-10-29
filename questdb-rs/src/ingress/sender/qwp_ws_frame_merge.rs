@@ -89,6 +89,21 @@ struct Body {
     values: Range<usize>,
 }
 
+struct Header {
+    flags: u8,
+    table_count: usize,
+    delta_start: u64,
+    delta_count: u64,
+    entries: Range<usize>,
+}
+
+struct Prefix<'a> {
+    header: Header,
+    name: &'a [u8],
+    rows: usize,
+    schema: &'a [u8],
+}
+
 struct Plan {
     defer_commit: bool,
     delta_start: u64,
@@ -121,19 +136,47 @@ impl FrameBatch {
         }
     }
 
+    /// Whether `payload` can open a message, judged from its first table header.
+    /// A frame at `max_bytes` or `max_rows` on its own is sent as is.
+    pub(crate) fn may_start(payload: &[u8], max_bytes: usize, max_rows: usize) -> bool {
+        payload.len() < max_bytes
+            && prefix(payload).is_some_and(|prefix| {
+                prefix.rows <= MAX_TABLE_ROWS && (max_rows == 0 || prefix.rows < max_rows)
+            })
+    }
+
+    /// Whether `next` may follow `first` in one message, judged from their first
+    /// table headers. False is final; true still needs [`Self::try_append`].
+    pub(crate) fn may_join(first: &[u8], next: &[u8], max_rows: usize) -> bool {
+        let (Some(first), Some(next)) = (prefix(first), prefix(next)) else {
+            return false;
+        };
+        let rows = first.rows.saturating_add(next.rows);
+        first.header.table_count == next.header.table_count
+            && first.name == next.name
+            && first.schema == next.schema
+            && first
+                .header
+                .delta_start
+                .checked_add(first.header.delta_count)
+                == Some(next.header.delta_start)
+            && (first.header.flags & FLAG_DEFER_COMMIT != 0
+                || next.header.flags & FLAG_DEFER_COMMIT == 0)
+            && rows <= MAX_TABLE_ROWS
+            && (max_rows == 0 || rows <= max_rows)
+    }
+
     /// Returns false, leaving the batch unchanged, when `payload` cannot join it.
     /// A frame at `max_bytes` or `max_rows` on its own never joins; send it as is.
     pub(crate) fn try_append(&mut self, payload: &[u8], max_bytes: usize, max_rows: usize) -> bool {
         if payload.len() >= max_bytes {
             return false;
         }
-        let Some(plan) = self.plan(payload) else {
+        let Some(plan) = self.plan(payload, max_rows) else {
             return false;
         };
         let rows = self.rows.saturating_add(plan.rows);
-        if plan.len > max_bytes.min(MAX_MESSAGE_LEN)
-            || max_rows > 0 && (rows > max_rows || self.is_empty() && rows == max_rows)
-        {
+        if plan.len > max_bytes.min(MAX_MESSAGE_LEN) {
             return false;
         }
         if self.is_empty() {
@@ -202,31 +245,23 @@ impl FrameBatch {
         out[8..HEADER_LEN].copy_from_slice(&payload_len.to_le_bytes());
     }
 
-    fn plan(&mut self, payload: &[u8]) -> Option<Plan> {
-        let header = payload.first_chunk::<HEADER_LEN>()?;
-        let flags = header[5];
-        let table_count = usize::from(u16::from_le_bytes([header[6], header[7]]));
-        let payload_len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    fn plan(&mut self, payload: &[u8], max_rows: usize) -> Option<Plan> {
+        let Header {
+            flags,
+            table_count,
+            delta_start,
+            delta_count,
+            entries,
+        } = header(payload)?;
         let empty = self.is_empty();
-        if header[..4] != *b"QWP1"
-            || header[4] != VERSION
-            || flags & FLAG_DELTA_SYMBOL_DICT == 0
-            || flags & !(FLAG_DELTA_SYMBOL_DICT | FLAG_DEFER_COMMIT) != 0
-            || table_count == 0
-            || usize::try_from(payload_len).ok()? != payload.len() - HEADER_LEN
-            || !empty && table_count != self.tables.len()
-            // A committed batch must not wait on a split that may never finish.
-            || !empty && !self.defer_commit && flags & FLAG_DEFER_COMMIT != 0
+        if !empty
+            && (table_count != self.tables.len()
+                // A committed batch must not wait on a split that may never finish.
+                || !self.defer_commit && flags & FLAG_DEFER_COMMIT != 0)
         {
             return None;
         }
-        let (delta_start, pos) = decode_qwp_varint(payload, HEADER_LEN)?;
-        let (delta_count, mut pos) = decode_qwp_varint(payload, pos)?;
-        let entries_start = pos;
-        for _ in 0..delta_count {
-            pos = skip_bytes(payload, pos)?;
-        }
-        let entries = entries_start..pos;
+        let mut pos = entries.end;
         let (delta_start, delta_count) = if empty {
             (delta_start, delta_count)
         } else if Some(delta_start) == self.delta_start.checked_add(self.delta_count) {
@@ -240,6 +275,7 @@ impl FrameBatch {
             .saturating_add(self.delta_entries.len())
             .saturating_add(entries.len());
 
+        let batch_rows = self.rows;
         let Self {
             tables,
             parsed,
@@ -298,6 +334,10 @@ impl FrameBatch {
                 .checked_add(table_rows)
                 .filter(|rows| *rows <= MAX_TABLE_ROWS)?;
             rows = rows.checked_add(table_rows)?;
+            let merged_rows = batch_rows.saturating_add(rows);
+            if max_rows > 0 && (merged_rows > max_rows || empty && merged_rows >= max_rows) {
+                return None;
+            }
             len = len
                 .saturating_add(name.len())
                 .saturating_add(varint_len(total_rows as u64))
@@ -450,6 +490,54 @@ fn parse_body(payload: &[u8], start: usize, kind: u8, rows: usize) -> Option<Bod
         bitmap,
         value_count,
         values: pos..end,
+    })
+}
+
+fn header(payload: &[u8]) -> Option<Header> {
+    let fixed = payload.first_chunk::<HEADER_LEN>()?;
+    let flags = fixed[5];
+    let table_count = usize::from(u16::from_le_bytes([fixed[6], fixed[7]]));
+    let payload_len = u32::from_le_bytes([fixed[8], fixed[9], fixed[10], fixed[11]]);
+    if fixed[..4] != *b"QWP1"
+        || fixed[4] != VERSION
+        || flags & FLAG_DELTA_SYMBOL_DICT == 0
+        || flags & !(FLAG_DELTA_SYMBOL_DICT | FLAG_DEFER_COMMIT) != 0
+        || table_count == 0
+        || usize::try_from(payload_len).ok()? != payload.len() - HEADER_LEN
+    {
+        return None;
+    }
+    let (delta_start, pos) = decode_qwp_varint(payload, HEADER_LEN)?;
+    let (delta_count, mut pos) = decode_qwp_varint(payload, pos)?;
+    let entries_start = pos;
+    for _ in 0..delta_count {
+        pos = skip_bytes(payload, pos)?;
+    }
+    Some(Header {
+        flags,
+        table_count,
+        delta_start,
+        delta_count,
+        entries: entries_start..pos,
+    })
+}
+
+fn prefix(payload: &[u8]) -> Option<Prefix<'_>> {
+    let header = header(payload)?;
+    let name_start = header.entries.end;
+    let pos = skip_bytes(payload, name_start)?;
+    let name = payload.get(name_start..pos)?;
+    let (rows, pos) = decode_qwp_varint(payload, pos)?;
+    let schema_start = pos;
+    let (columns, mut pos) = decode_qwp_varint(payload, pos)?;
+    for _ in 0..columns {
+        pos = skip_bytes(payload, pos)?.checked_add(1)?;
+    }
+    Some(Prefix {
+        header,
+        name,
+        rows: usize::try_from(rows).ok()?,
+        schema: payload.get(schema_start..pos)?,
     })
 }
 
@@ -1066,6 +1154,64 @@ mod tests {
         assert!(!batch.try_append(&bools(1), usize::MAX, 0));
         assert_eq!(batch.rows(), MAX_TABLE_ROWS);
         assert_eq!(encoded(&batch), full);
+    }
+
+    #[test]
+    fn pre_checks_stop_cheap_mismatches_and_never_refuse_a_merge() {
+        let deferred = |frame: &Vec<u8>| {
+            let mut frame = frame.clone();
+            frame[5] |= FLAG_DEFER_COMMIT;
+            frame
+        };
+        let quotes = |buffer: &mut QwpWsColumnarBuffer, value: i64| {
+            buffer
+                .table("quotes")
+                .unwrap()
+                .column_i64("qty", value)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        };
+        let (trades, _) = frames(&[1, 1], qty);
+        let (other, _) = frames(&[1], quotes);
+        let (typed, _) = frames(&[1, 1, 1], all_types);
+        assert!(FrameBatch::may_start(&trades[0], usize::MAX, 2));
+        assert!(!FrameBatch::may_start(&trades[0], usize::MAX, 1));
+        assert!(!FrameBatch::may_start(&trades[0], trades[0].len(), 0));
+        assert!(FrameBatch::may_join(&trades[0], &trades[1], 2));
+        assert!(!FrameBatch::may_join(&trades[0], &trades[1], 1));
+        assert!(!FrameBatch::may_join(&trades[0], &other[0], 0));
+        assert!(!FrameBatch::may_join(&trades[0], &typed[0], 0));
+        assert!(!FrameBatch::may_join(&typed[0], &typed[2], 0));
+        assert!(!FrameBatch::may_join(&trades[0], &deferred(&trades[1]), 0));
+        assert!(FrameBatch::may_join(&deferred(&trades[0]), &trades[1], 0));
+
+        let mut pool: Vec<_> = [trades, other, typed, frames(&[2, 1], sparse).0]
+            .into_iter()
+            .flatten()
+            .collect();
+        pool.extend([
+            raw_frame(2, 15, &varchar_body(&[0, 1, 3], b"abc")),
+            raw_frame(3, 1, &[0, 0b101]),
+        ]);
+        pool.extend(pool.iter().map(deferred).collect::<Vec<_>>());
+        for max_rows in 0..5 {
+            for first in &pool {
+                for max_bytes in [first.len(), usize::MAX] {
+                    if FrameBatch::default().try_append(first, max_bytes, max_rows) {
+                        assert!(FrameBatch::may_start(first, max_bytes, max_rows));
+                    }
+                }
+                for next in &pool {
+                    let mut batch = FrameBatch::default();
+                    if batch.try_append(first, usize::MAX, max_rows)
+                        && batch.try_append(next, usize::MAX, max_rows)
+                    {
+                        assert!(FrameBatch::may_join(first, next, max_rows));
+                    }
+                }
+            }
+        }
     }
 
     fn raw_frame(rows: u64, kind: u8, body: &[u8]) -> Vec<u8> {

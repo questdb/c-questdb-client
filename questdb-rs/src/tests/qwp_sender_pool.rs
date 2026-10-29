@@ -60,6 +60,8 @@ use crate::tests::qwp_ws::{
 use tempfile::TempDir;
 
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
+const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
+const QWP_STATUS_NOT_WRITABLE: u8 = 0x0C;
 
 #[test]
 fn stream_commit_window_disk_orphan_keeps_qwp_frames() {
@@ -700,6 +702,242 @@ fn stream_commit_window_splices_recovered_and_mixed_input_frames() {
     );
 }
 
+#[test]
+fn stream_commit_window_chains_alternating_tables_into_one_commit() {
+    const FLUSHES: i64 = 40;
+    let table = |value: i64| if value % 2 == 0 { "trades" } else { "quotes" };
+    for disk in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (tx, frames) = mpsc::channel();
+        let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+        let sf = if disk {
+            format!("sf_dir={};sender_id=alternating;", dir.path().display())
+        } else {
+            String::new()
+        };
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            &format!(
+                "{sf}sender_pool_max=1;pool_reap=manual;commit_rows=1000;commit_interval_ms=60000;"
+            ),
+        ))
+        .unwrap();
+        for value in 0..FLUSHES - 1 {
+            let mut sender = db.borrow_sender().unwrap();
+            sender
+                .flush(&mut one_i64_row(table(value), &[value], &[value]))
+                .unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        let last = FLUSHES - 1;
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush(&mut one_i64_row(table(last), &[last], &[last]))
+            .unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+
+        let captured: Vec<_> = frames.try_iter().collect();
+        assert_eq!(
+            captured
+                .iter()
+                .map(|f| frame_table_name(f))
+                .collect::<Vec<_>>(),
+            (0..FLUSHES).map(table).collect::<Vec<_>>(),
+            "alternating tables cannot share a message, disk={disk}"
+        );
+        assert_eq!(
+            captured
+                .iter()
+                .flat_map(|f| frame_qty_values(f))
+                .collect::<Vec<_>>(),
+            (0..FLUSHES).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            captured.iter().map(|f| f[5] & 1 == 0).collect::<Vec<_>>(),
+            (0..FLUSHES).map(|value| value == last).collect::<Vec<_>>(),
+            "the window must commit once, at its tail, disk={disk}"
+        );
+    }
+}
+
+#[test]
+fn stream_commit_window_replays_a_rejected_merge_frame_by_frame() {
+    for disk in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (tx, frames) = mpsc::channel();
+        let server = MockServer::spawn_with_mode_capture(
+            2,
+            MockMode::DeferAwareParseRejecting {
+                max_rows: 500,
+                poison: i64::MIN,
+            },
+            Some(tx),
+        );
+        let sf = if disk {
+            format!("sf_dir={};sender_id=mergereject;", dir.path().display())
+        } else {
+            String::new()
+        };
+        let (errors_tx, errors) = mpsc::channel();
+        let db = QuestDb::connect_with_handlers(
+            &conf_for(
+                server.port(),
+                &format!(
+                    "{sf}sender_pool_max=1;pool_reap=manual;commit_rows=1000;commit_interval_ms=60000;\
+                     reconnect_initial_backoff_millis=1;"
+                ),
+            ),
+            crate::db::ConnectHandlers {
+                error_handler: Some(crate::ingress::QwpWsErrorHandler::new(move |error| {
+                    let _ = errors_tx.send(error.clone());
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let mut fsns = Vec::new();
+        for half in 0..2 {
+            let values: Vec<i64> = (half * 400..(half + 1) * 400).collect();
+            let mut chunk = Chunk::new("trades");
+            chunk.column_i64("qty", &values, None).unwrap();
+            chunk.at_nanos(&values).unwrap();
+            fsns.push(sender.flush_and_get_fsn(&mut chunk).unwrap().unwrap());
+        }
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+
+        let captured: Vec<_> = frames.try_iter().collect();
+        let connections: Vec<_> = captured.split(Vec::is_empty).collect();
+        assert_eq!(
+            connections[0]
+                .iter()
+                .map(|f| frame_row_count(f))
+                .collect::<Vec<_>>(),
+            [800],
+            "the window merges both flushes, disk={disk}"
+        );
+        let replay = connections[1];
+        assert_eq!(
+            replay
+                .iter()
+                .map(|f| frame_row_count(f))
+                .collect::<Vec<_>>(),
+            [400, 400],
+            "the rejected merge replays frame by frame, disk={disk}"
+        );
+        assert!(replay.iter().all(|f| f[5] & 1 == 0));
+        assert_eq!(
+            replay
+                .iter()
+                .flat_map(|f| frame_qty_values(f))
+                .collect::<Vec<_>>(),
+            (0..800).collect::<Vec<_>>()
+        );
+        assert_eq!(server.accepted(), 2);
+        let error = errors
+            .recv_timeout(Duration::from_secs(2))
+            .expect("merge rejection diagnostic");
+        assert_eq!(error.status, Some(QWP_STATUS_PARSE_ERROR));
+        assert_eq!((error.from_fsn, error.to_fsn), (fsns[0], fsns[1]));
+        assert_ne!(
+            error.applied_policy,
+            crate::ingress::QwpWsErrorPolicy::Terminal
+        );
+    }
+}
+
+#[test]
+fn stream_commit_window_terminal_reject_names_only_the_bad_frame() {
+    const BAD: i64 = 99;
+    let shapes: [&[(&str, i64)]; 2] = [
+        &[("trades", 0), ("trades", 1), ("trades", BAD)],
+        &[("trades", 0), ("quotes", BAD)],
+    ];
+    for rows in shapes {
+        let (tx, frames) = mpsc::channel();
+        let server = MockServer::spawn_with_mode_capture(
+            2,
+            MockMode::DeferAwareParseRejecting {
+                max_rows: u64::MAX,
+                poison: BAD,
+            },
+            Some(tx),
+        );
+        let (errors_tx, errors) = mpsc::channel();
+        let db = QuestDb::connect_with_handlers(
+            &conf_for(
+                server.port(),
+                "sender_pool_max=1;pool_reap=manual;commit_rows=1000;commit_interval_ms=60000;\
+                 reconnect_initial_backoff_millis=1;close_flush_timeout_millis=0;",
+            ),
+            crate::db::ConnectHandlers {
+                error_handler: Some(crate::ingress::QwpWsErrorHandler::new(move |error| {
+                    let _ = errors_tx.send(error.clone());
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let fsns: Vec<u64> = rows
+            .iter()
+            .map(|&(table, value)| {
+                sender
+                    .flush_and_get_fsn(&mut one_i64_row(table, &[value], &[value]))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        sender
+            .wait(AckLevel::Ok, Duration::from_secs(5))
+            .expect_err("a frame rejected on its own ends the sender");
+
+        let bad = *fsns.last().unwrap();
+        let terminal = loop {
+            let error = errors
+                .recv_timeout(Duration::from_secs(2))
+                .expect("terminal rejection diagnostic");
+            assert_eq!(error.status, Some(QWP_STATUS_PARSE_ERROR));
+            if error.applied_policy == crate::ingress::QwpWsErrorPolicy::Terminal {
+                break error;
+            }
+            assert_eq!(error.to_fsn, bad, "{rows:?}");
+        };
+        assert_eq!((terminal.from_fsn, terminal.to_fsn), (bad, bad), "{rows:?}");
+
+        let captured: Vec<_> = frames.try_iter().collect();
+        let mut connections = captured.split(Vec::is_empty);
+        let first = connections.next().unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .flat_map(|f| frame_qty_values(f))
+                .collect::<Vec<_>>(),
+            rows.iter().map(|&(_, value)| value).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first.iter().filter(|f| f[5] & 1 == 0).count(),
+            1,
+            "the window held the earlier frames uncommitted, {rows:?}"
+        );
+        let replay = connections.next().expect("a replay connection");
+        assert_eq!(
+            replay
+                .iter()
+                .map(|f| frame_qty_values(f))
+                .collect::<Vec<_>>(),
+            rows.iter()
+                .map(|&(_, value)| vec![value])
+                .collect::<Vec<_>>(),
+            "each frame replays alone, the good ones first, {rows:?}"
+        );
+        assert!(replay.iter().all(|f| f[5] & 1 == 0), "{rows:?}");
+        assert_eq!(server.accepted(), 2);
+    }
+}
+
 #[derive(Clone, Debug)]
 enum MockMode {
     /// Park the connection after upgrade — used by pool-only tests.
@@ -736,6 +974,11 @@ enum MockMode {
     /// that becomes a read-only replica while it holds a deferred group. Later
     /// connections ack normally so the client can replay onto the new primary.
     DeferAwareRejectingFrame(usize),
+    /// As [`MockMode::DeferAwareAck`] on every connection, but a data frame
+    /// with more than `max_rows` rows, or with `poison` among its `qty`
+    /// values, gets a terminal `PARSE_ERROR` — a server with a lowered
+    /// `qwp.max.rows.per.table`, or a row it can never accept.
+    DeferAwareParseRejecting { max_rows: u64, poison: i64 },
     /// Read (consume) the first `n` binary frames — so the client's writes
     /// provably succeed — then close **without** acking. Models a peer that
     /// ingests a published frame and then dies before acknowledging it: the
@@ -998,7 +1241,28 @@ fn run_mock_server_accept_loop(
                                     &mut stream,
                                     &stop,
                                     capture,
-                                    (accept_index == 0).then_some(reject_at),
+                                    |index, _| {
+                                        (accept_index == 0 && index == reject_at).then_some((
+                                            QWP_STATUS_NOT_WRITABLE,
+                                            b"table is read only".as_slice(),
+                                        ))
+                                    },
+                                )
+                            }
+                            MockMode::DeferAwareParseRejecting { max_rows, poison } => {
+                                defer_aware_ack_rejecting(
+                                    &mut stream,
+                                    &stop,
+                                    capture,
+                                    |_, payload| {
+                                        (u16::from_le_bytes([payload[6], payload[7]]) != 0
+                                            && (frame_row_count(payload) > max_rows
+                                                || frame_qty_values(payload).contains(&poison)))
+                                        .then_some((
+                                            QWP_STATUS_PARSE_ERROR,
+                                            b"row count exceeds maximum".as_slice(),
+                                        ))
+                                    },
                                 )
                             }
                             MockMode::ReadThenClose(n) => {
@@ -1326,19 +1590,17 @@ fn defer_aware_ack(
     }
 }
 
-/// As [`defer_aware_ack`], but with `reject_at = Some(n)` the `n`-th data
-/// frame (0-based) is answered with a retriable `NOT_WRITABLE` rejection
-/// instead of being acked or withheld — the role-switch response a primary
-/// gives while it is still holding a deferred group.
+/// As [`defer_aware_ack`], but a data frame for which `reject(index, payload)`
+/// returns a status (`index` is 0-based on this connection) is answered with
+/// that rejection instead of being acked or withheld.
 fn defer_aware_ack_rejecting(
     stream: &mut std::net::TcpStream,
     stop: &AtomicBool,
     capture: Option<mpsc::Sender<Vec<u8>>>,
-    reject_at: Option<usize>,
+    reject: impl Fn(usize, &[u8]) -> Option<(u8, &'static [u8])>,
 ) {
     const FLAG_DEFER_COMMIT: u8 = 0x01;
     const QWP_FLAGS_OFFSET: usize = 5;
-    const QWP_STATUS_NOT_WRITABLE: u8 = 0x0C;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut frame_index: u64 = 0;
     let mut read = 0usize;
@@ -1369,16 +1631,12 @@ fn defer_aware_ack_rejecting(
                 read += 1;
                 let deferred = payload.len() > QWP_FLAGS_OFFSET
                     && (payload[QWP_FLAGS_OFFSET] & FLAG_DEFER_COMMIT) != 0;
+                let rejection = reject(index, &payload);
                 if let Some(tx) = capture.as_ref() {
                     let _ = tx.send(payload);
                 }
-                if reject_at == Some(index) {
-                    let _ = write_qwp_error_response(
-                        stream,
-                        QWP_STATUS_NOT_WRITABLE,
-                        frame_index,
-                        b"table is read only",
-                    );
+                if let Some((status, message)) = rejection {
+                    let _ = write_qwp_error_response(stream, status, frame_index, message);
                     // Mark the boundary so a reader can split this peer's
                     // frames from the replay without assuming a count.
                     if let Some(tx) = capture.as_ref() {

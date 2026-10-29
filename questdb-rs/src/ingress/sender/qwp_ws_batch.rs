@@ -96,7 +96,15 @@ impl QwpWsBatch {
     }
 
     /// Copies/masks one complete message; returns whether the group must close.
-    pub(super) fn append(&mut self, fsn: u64, payload: &[u8], mask: [u8; 4]) -> io::Result<bool> {
+    /// A frame outside the commit window commits on its own: the tail keeps its
+    /// flags and the group closes.
+    pub(super) fn append(
+        &mut self,
+        fsn: u64,
+        payload: &[u8],
+        mask: [u8; 4],
+        windowed: bool,
+    ) -> io::Result<bool> {
         if payload.len() < 12 || &payload[..4] != b"QWP1" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -110,6 +118,7 @@ impl QwpWsBatch {
             .try_reserve(1)
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         if self.interval.is_some()
+            && windowed
             && let Some(tail) = self.frames.last()
         {
             self.bytes[tail.flags_at] = (tail.flags | DEFER_COMMIT) ^ tail.mask;
@@ -122,6 +131,9 @@ impl QwpWsBatch {
             mask: mask[1],
             fsn,
         });
+        if self.interval.is_some() && !windowed {
+            return Ok(true);
+        }
         if self.interval.is_some() {
             self.started.get_or_insert_with(Instant::now);
         }
@@ -237,9 +249,9 @@ mod tests {
     fn network_batch_preserves_frames_and_does_not_wait_for_more_rows() {
         let mut batch = QwpWsBatch::new(None, 0, 1);
         let original = frame(1, 8);
-        batch.append(0, &original, [1, 2, 3, 4]).unwrap();
+        batch.append(0, &original, [1, 2, 3, 4], true).unwrap();
         assert!(batch.should_flush(None));
-        batch.append(1, &original, [1, 2, 3, 4]).unwrap();
+        batch.append(1, &original, [1, 2, 3, 4], true).unwrap();
         let mut expected = Vec::new();
         for _ in 0..2 {
             encode_client_frame(&mut expected, Opcode::Binary, [1, 2, 3, 4], &original);
@@ -254,9 +266,9 @@ mod tests {
         let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 5, 4096);
         let first = frame(2, 8);
         let last = frame(3, 8);
-        assert!(!batch.append(0, &first, [0; 4]).unwrap());
+        assert!(!batch.append(0, &first, [0; 4], true).unwrap());
         assert!(!batch.should_flush(None));
-        assert!(batch.append(1, &last, [0; 4]).unwrap());
+        assert!(batch.append(1, &last, [0; 4], true).unwrap());
         let mut expected = Vec::new();
         let mut deferred = first.clone();
         deferred[5] |= 1;
@@ -271,25 +283,42 @@ mod tests {
     #[test]
     fn wait_barrier_flushes_once_and_is_rearmed_after_reconnect() {
         let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 1000, 4096);
-        batch.append(4, &frame(1, 8), [0; 4]).unwrap();
+        batch.append(4, &frame(1, 8), [0; 4], true).unwrap();
         assert!(!batch.should_flush(Some(5)));
         assert!(batch.should_flush(Some(4)));
         batch.flush(&mut Writer::default()).unwrap();
-        batch.append(5, &frame(1, 8), [0; 4]).unwrap();
+        batch.append(5, &frame(1, 8), [0; 4], true).unwrap();
         assert!(
             !batch.should_flush(Some(4)),
             "old waits must not disable the next window"
         );
         batch.reset_connection();
-        batch.append(4, &frame(1, 8), [0; 4]).unwrap();
+        batch.append(4, &frame(1, 8), [0; 4], true).unwrap();
         assert!(batch.should_flush(Some(4)));
+    }
+
+    #[test]
+    fn unwindowed_frame_commits_alone_and_leaves_the_tail_committing() {
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 1000, 4096);
+        let first = frame(1, 8);
+        assert!(!batch.append(0, &first, [0; 4], true).unwrap());
+        assert!(batch.append(1, &first, [0; 4], false).unwrap());
+        let mut writer = Writer::default();
+        batch.flush(&mut writer).unwrap();
+        let mut expected = Vec::new();
+        for _ in 0..2 {
+            encode_client_frame(&mut expected, Opcode::Binary, [0; 4], &first);
+        }
+        assert_eq!(writer.0, [expected]);
+        assert_eq!(batch.committed_through, Some(1));
+        assert!(batch.started.is_none());
     }
 
     #[test]
     fn idle_tail_expires_and_stored_defer_is_never_cleared() {
         let mut batch = QwpWsBatch::new(Some(Duration::from_millis(10)), 0, 4096);
         let original = frame(1, 9);
-        batch.append(0, &original, [0; 4]).unwrap();
+        batch.append(0, &original, [0; 4], true).unwrap();
         batch.started = Some(Instant::now() - Duration::from_millis(10));
         assert!(batch.should_flush(None));
         let mut writer = Writer::default();
@@ -303,12 +332,12 @@ mod tests {
     #[test]
     fn byte_limit_and_large_frames_keep_complete_messages() {
         let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 0, 48);
-        batch.append(0, &frame(1, 8), [0; 4]).unwrap();
+        batch.append(0, &frame(1, 8), [0; 4], true).unwrap();
         assert!(batch.full_before(&frame(1, 8)));
         batch.reset_connection();
         let mut large = frame(1, 8);
         large.resize(70_000, 0);
-        assert!(batch.append(0, &large, [0; 4]).unwrap());
+        assert!(batch.append(0, &large, [0; 4], true).unwrap());
         let mut writer = Writer::default();
         batch.flush(&mut writer).unwrap();
         assert_eq!(writer.0.len(), 1);
@@ -321,7 +350,7 @@ mod tests {
         let committing = frame(1, 8);
         let split = frame(1, 9);
         assert!(!batch.full_before(&split));
-        batch.append(0, &committing, [0; 4]).unwrap();
+        batch.append(0, &committing, [0; 4], true).unwrap();
         assert!(!batch.full_before(&committing));
         assert!(batch.full_before(&split));
         let mut writer = Writer::default();
@@ -330,7 +359,7 @@ mod tests {
         encode_client_frame(&mut expected, Opcode::Binary, [0; 4], &committing);
         assert_eq!(writer.0, [expected]);
         assert_eq!(batch.committed_through, Some(0));
-        batch.append(1, &split, [0; 4]).unwrap();
+        batch.append(1, &split, [0; 4], true).unwrap();
         assert!(!batch.full_before(&split));
         assert!(!batch.full_before(&committing));
     }
@@ -338,7 +367,7 @@ mod tests {
     #[test]
     fn network_only_batching_keeps_split_frames_in_one_write() {
         let mut batch = QwpWsBatch::new(None, 0, 0);
-        batch.append(0, &frame(1, 8), [0; 4]).unwrap();
+        batch.append(0, &frame(1, 8), [0; 4], true).unwrap();
         assert!(!batch.full_before(&frame(1, 9)));
     }
 
@@ -346,7 +375,7 @@ mod tests {
     fn unknown_or_truncated_row_metadata_closes_conservatively() {
         let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 10, 4096);
         for payload in [frame(1, 8)[..12].to_vec(), frame(1, 0)] {
-            assert!(batch.append(0, &payload, [0; 4]).unwrap());
+            assert!(batch.append(0, &payload, [0; 4], true).unwrap());
             batch.reset_connection();
         }
         let mut multi = frame(1, 8);
@@ -366,7 +395,7 @@ mod tests {
             }
         }
         let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 0, 4096);
-        batch.append(0, &frame(1, 8), [0; 4]).unwrap();
+        batch.append(0, &frame(1, 8), [0; 4], true).unwrap();
         assert!(batch.flush(&mut Broken).is_err());
         assert!(batch.should_flush(Some(0)));
         assert_eq!(batch.frames.len(), 1);
@@ -391,15 +420,15 @@ mod tests {
         }
         let original = frame(1, 8);
         let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 0, 4096);
-        batch.append(0, &original, [1, 2, 3, 4]).unwrap();
-        batch.append(1, &original, [5, 6, 7, 8]).unwrap();
+        batch.append(0, &original, [1, 2, 3, 4], true).unwrap();
+        batch.append(1, &original, [5, 6, 7, 8], true).unwrap();
         assert!(batch.flush(&mut Partial(false)).is_err());
         assert!(batch.committed_through.is_none());
         assert_eq!(original[5], 8);
 
         batch.reset_connection();
         batch.set_byte_limit(24);
-        assert!(batch.append(0, &original, [1, 2, 3, 4]).unwrap());
+        assert!(batch.append(0, &original, [1, 2, 3, 4], true).unwrap());
         let mut writer = Writer::default();
         batch.flush(&mut writer).unwrap();
         let mut expected = Vec::new();

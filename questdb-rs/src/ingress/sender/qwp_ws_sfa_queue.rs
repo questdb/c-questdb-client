@@ -1388,6 +1388,7 @@ impl SfaProgressView {
             fsn,
             wire_seq,
             payload: payload.into(),
+            windowed: false,
         }))
     }
 

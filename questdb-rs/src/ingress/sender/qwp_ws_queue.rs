@@ -65,6 +65,8 @@ pub(crate) struct OutboundFrame {
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
     pub(crate) payload: OutboundPayload,
+    /// Joins the open commit window instead of committing on its own.
+    pub(crate) windowed: bool,
 }
 
 #[derive(Debug)]
@@ -107,6 +109,7 @@ pub(crate) struct OutboundFrameView<'a> {
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
     pub(crate) payload: &'a [u8],
+    pub(crate) windowed: bool,
 }
 
 impl OutboundFrame {
@@ -126,6 +129,7 @@ impl OutboundFrame {
                 fsn: self.fsn,
                 wire_seq: self.wire_seq,
                 payload,
+                windowed: self.windowed,
             })
         })
     }
