@@ -35,7 +35,7 @@
 //! HTTP→WebSocket upgrade, then either parks on the connection or reads each
 //! QWP frame and replies with an OK ack (status 0x00).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -758,6 +758,94 @@ fn stream_commit_window_chains_alternating_tables_into_one_commit() {
             (0..FLUSHES).map(|value| value == last).collect::<Vec<_>>(),
             "the window must commit once, at its tail, disk={disk}"
         );
+    }
+}
+
+#[test]
+fn stream_commit_window_delivers_frames_that_fail_to_join_exactly_once() {
+    const FLUSHES: i64 = 20;
+    enum Shape {
+        DecimalScale,
+        SecondTable,
+        Oversize,
+    }
+    for shape in [Shape::DecimalScale, Shape::SecondTable, Shape::Oversize] {
+        for disk in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (tx, frames) = mpsc::channel();
+            let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+            let sf = if disk {
+                format!("sf_dir={};sender_id=failedjoin;", dir.path().display())
+            } else {
+                String::new()
+            };
+            let window = match shape {
+                Shape::Oversize => "commit_rows=100000;max_buf_size=65536;",
+                _ => "commit_rows=1000;",
+            };
+            let db = QuestDb::connect(&conf_for(
+                server.port(),
+                &format!(
+                    "{sf}sender_pool_max=1;pool_reap=manual;commit_interval_ms=60000;{window}"
+                ),
+            ))
+            .unwrap();
+            let mut expected: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+            for flush in 0..FLUSHES {
+                let mut sender = db.borrow_sender().unwrap();
+                let mut buffer = sender.new_buffer();
+                let rows = match shape {
+                    Shape::Oversize => 4500,
+                    _ => 1,
+                };
+                for row in 0..rows {
+                    let qty = flush * 10_000 + row;
+                    buffer
+                        .table("trades")
+                        .unwrap()
+                        .column_i64("qty", qty)
+                        .unwrap();
+                    if matches!(shape, Shape::DecimalScale) {
+                        let price = if flush % 2 == 0 { "1.5" } else { "1.25" };
+                        buffer.column_dec64("price", price).unwrap();
+                    }
+                    buffer.at_now().unwrap();
+                    expected.entry("trades".into()).or_default().push(qty);
+                }
+                if matches!(shape, Shape::SecondTable) {
+                    let table = if flush % 2 == 0 { "quotes" } else { "fills" };
+                    buffer
+                        .table(table)
+                        .unwrap()
+                        .column_i64("qty", flush)
+                        .unwrap()
+                        .at_now()
+                        .unwrap();
+                    expected.entry(table.into()).or_default().push(flush);
+                }
+                sender.flush_buffer(&mut buffer).unwrap();
+                if flush == FLUSHES - 1 {
+                    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                    assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+                }
+            }
+
+            let captured: Vec<_> = frames.try_iter().collect();
+            let mut delivered: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+            for frame in &captured {
+                for (table, values) in frame_table_qty_values(frame) {
+                    delivered.entry(table).or_default().extend(values);
+                }
+            }
+            assert_eq!(delivered, expected, "disk={disk}");
+            if !matches!(shape, Shape::Oversize) {
+                assert_eq!(
+                    captured.iter().filter(|frame| frame[5] & 1 == 0).count(),
+                    1,
+                    "the window must commit once, disk={disk}"
+                );
+            }
+        }
     }
 }
 
@@ -1898,6 +1986,50 @@ fn frame_qty_values(payload: &[u8]) -> Vec<i64> {
             i64::from_le_bytes(payload[at..at + 8].try_into().unwrap())
         })
         .collect()
+}
+
+fn frame_table_qty_values(payload: &[u8]) -> Vec<(String, Vec<i64>)> {
+    assert_eq!(&payload[..4], b"QWP1");
+    assert_ne!(payload[5] & 0x08, 0);
+    let mut pos = 12;
+    read_test_varint(payload, &mut pos);
+    for _ in 0..read_test_varint(payload, &mut pos) {
+        read_test_bytes(payload, &mut pos);
+    }
+    let mut tables = Vec::new();
+    for _ in 0..u16::from_le_bytes([payload[6], payload[7]]) {
+        let table = String::from_utf8(read_test_bytes(payload, &mut pos).to_vec()).unwrap();
+        let rows = read_test_varint(payload, &mut pos) as usize;
+        let columns: Vec<_> = (0..read_test_varint(payload, &mut pos))
+            .map(|_| {
+                let name = read_test_bytes(payload, &mut pos).to_vec();
+                pos += 1;
+                (name, payload[pos - 1])
+            })
+            .collect();
+        let mut qty = Vec::new();
+        for (name, kind) in columns {
+            assert_eq!(payload[pos], 0, "null bitmap");
+            pos += 1;
+            match kind {
+                0x05 => {
+                    let values = (0..rows).map(|row| {
+                        let at = pos + row * 8;
+                        i64::from_le_bytes(payload[at..at + 8].try_into().unwrap())
+                    });
+                    if name == b"qty" {
+                        qty.extend(values);
+                    }
+                }
+                0x13 => pos += 1,
+                other => panic!("unexpected column type {other:#x}"),
+            }
+            pos += rows * 8;
+        }
+        tables.push((table, qty));
+    }
+    assert_eq!(pos, payload.len());
+    tables
 }
 
 fn slot_holds_only_qwp_frames(slot_dir: &Path) -> bool {

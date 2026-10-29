@@ -5755,42 +5755,77 @@ mod tests {
         }
     }
 
+    fn decimal_payload(price: &str) -> Vec<u8> {
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        buffer
+            .table("trades")
+            .unwrap()
+            .column_dec64("price", price)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        replay_payload(&buffer)
+    }
+
+    fn two_table_payload(second: &str, qty: i64) -> Vec<u8> {
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        for table in ["trades", second] {
+            buffer
+                .table(table)
+                .unwrap()
+                .column_i64("qty", qty)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        replay_payload(&buffer)
+    }
+
     #[test]
     fn frame_that_ends_a_batch_is_reread_from_its_own_offset() {
-        let mut core = QwpWsSendCore::new(
-            StagingTransport(4096),
-            ReconnectPolicy::no_backoff(Duration::MAX),
-        );
-        let mut queue = memory_queue(SfaMemoryQueueOptions {
-            segment_size_bytes: 4096,
-            max_bytes: 64 * 1024,
-        });
-        let progress = queue.progress_view();
-        let frames: Vec<_> = (0..4)
-            .map(|qty| table_payload(["a", "b"][qty as usize % 2], qty))
-            .collect();
-        for frame in &frames {
-            queue.try_submit(frame).unwrap();
-        }
-        for (fsn, frame) in (0..).zip(&frames) {
-            let outbound = core
-                .next_outbound_sfa_frame_through(&progress, Some(3), false)
-                .unwrap()
-                .unwrap();
-            let sent = outbound.sent_frame();
-            assert_eq!((sent.first_fsn, sent.fsn), (fsn, fsn));
-            outbound.with_view(|view| assert_eq!(view.payload, frame.as_slice()));
-            if fsn < 3 {
-                assert!(
-                    !core
-                        .send_cursor
-                        .sfa_cursor
-                        .as_ref()
-                        .is_some_and(SfaSendCursor::holds_segment)
-                );
+        let sequences: [Vec<Vec<u8>>; 3] = [
+            (0..4)
+                .map(|qty| table_payload(["a", "b"][qty as usize % 2], qty))
+                .collect(),
+            ["1.5", "1.25", "1.5", "1.25"].map(decimal_payload).to_vec(),
+            (0..4)
+                .map(|qty| two_table_payload(["quotes", "fills"][qty as usize % 2], qty))
+                .collect(),
+        ];
+        for frames in sequences {
+            let mut core = QwpWsSendCore::new(
+                StagingTransport(4096),
+                ReconnectPolicy::no_backoff(Duration::MAX),
+            );
+            let mut queue = memory_queue(SfaMemoryQueueOptions {
+                segment_size_bytes: 4096,
+                max_bytes: 64 * 1024,
+            });
+            let progress = queue.progress_view();
+            for frame in &frames {
+                queue.try_submit(frame).unwrap();
             }
-            let (sent, result) = core.send_frame(outbound);
-            core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+            for (fsn, frame) in (0..).zip(&frames) {
+                let outbound = core
+                    .next_outbound_sfa_frame_through(&progress, Some(3), false)
+                    .unwrap()
+                    .unwrap();
+                let sent = outbound.sent_frame();
+                assert_eq!((sent.first_fsn, sent.fsn), (fsn, fsn));
+                outbound.with_view(|view| assert_eq!(view.payload, frame.as_slice()));
+                assert!(core.frame_batch.is_empty());
+                if fsn < 3 {
+                    assert!(
+                        !core
+                            .send_cursor
+                            .sfa_cursor
+                            .as_ref()
+                            .is_some_and(SfaSendCursor::holds_segment)
+                    );
+                }
+                let (sent, result) = core.send_frame(outbound);
+                core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+            }
         }
     }
 
@@ -6258,6 +6293,38 @@ mod tests {
     }
 
     #[test]
+    fn unmerged_frame_rejected_behind_an_unacked_frame_is_terminal() {
+        let mut driver = window_driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWireParseError { wire_seq: 0 },
+            FakeSendResult::NoResponse,
+            FakeSendResult::RejectWireParseError { wire_seq: 1 },
+        ]));
+        let mut split = frame_payload(0);
+        split[5] |= 1;
+        driver.try_submit(&split).unwrap();
+        driver.try_submit(&frame_payload(1)).unwrap();
+        assert_eq!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        driver.poll_sender_error().unwrap();
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame {
+                first_fsn: 0,
+                fsn: 0,
+                ..
+            })
+        ));
+        assert_eq!(driver.drive_send_once().unwrap(), DriveOutcome::Terminal);
+        let terminal = driver.terminal_sender_error().unwrap();
+        assert_eq!((terminal.from_fsn, terminal.to_fsn), (1, 1));
+        assert_eq!(driver.send_core.transport.sent_frames().len(), 3);
+    }
+
+    #[test]
     fn terminal_rejection_of_a_lone_window_frame_is_not_replayed() {
         let mut driver = window_driver(FakeOrderedServer::scripted([
             FakeSendResult::RejectWireParseError { wire_seq: 0 },
@@ -6360,40 +6427,46 @@ mod tests {
 
     #[test]
     fn reconnect_discards_staged_frames_and_resplices_from_sf() {
-        let mut driver = QwpWsCoreTestHarness::from_queue(
-            memory_queue(SfaMemoryQueueOptions {
-                segment_size_bytes: 4096,
-                max_bytes: 64 * 1024,
-            }),
-            FakeOrderedServer::no_response().with_commit_window(Duration::from_secs(60)),
-        );
-        let frame = frame_payload(1);
-        for _ in 0..3 {
-            driver.try_submit(&frame).unwrap();
-        }
-        let progress = driver.store.progress_view();
-        assert!(
+        for staged in [1, 3] {
+            let mut driver = QwpWsCoreTestHarness::from_queue(
+                memory_queue(SfaMemoryQueueOptions {
+                    segment_size_bytes: 4096,
+                    max_bytes: 64 * 1024,
+                }),
+                FakeOrderedServer::no_response().with_commit_window(Duration::from_secs(60)),
+            );
+            let frame = frame_payload(1);
+            for _ in 0..staged {
+                driver.try_submit(&frame).unwrap();
+            }
+            let progress = driver.store.progress_view();
+            assert!(
+                driver
+                    .send_core
+                    .next_outbound_sfa_frame_through(&progress, None, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(driver.send_core.batch_last_fsn, Some(staged - 1));
             driver
                 .send_core
-                .next_outbound_sfa_frame_through(&progress, None, false)
+                .finish_reconnect_success(&mut driver.store, ReconnectReason::Disconnect);
+            assert!(driver.send_core.frame_batch.is_empty());
+            assert!(driver.send_core.pending_frame.is_none());
+            assert_eq!(driver.send_core.batch_last_fsn, None);
+            assert_eq!(driver.send_core.batch_started, None);
+            driver.try_submit(&frame).unwrap();
+            let outbound = driver
+                .send_core
+                .next_outbound_sfa_frame_through(&progress, Some(staged), false)
                 .unwrap()
-                .is_none()
-        );
-        assert!(!driver.send_core.frame_batch.is_empty());
-        driver
-            .send_core
-            .finish_reconnect_success(&mut driver.store, ReconnectReason::Disconnect);
-        assert!(driver.send_core.frame_batch.is_empty());
-        assert_eq!(driver.send_core.batch_last_fsn, None);
-        driver.try_submit(&frame).unwrap();
-        let outbound = driver
-            .send_core
-            .next_outbound_sfa_frame_through(&progress, Some(3), false)
-            .unwrap()
-            .unwrap();
-        let sent = outbound.sent_frame();
-        assert_eq!((sent.first_fsn, sent.fsn, sent.wire_seq), (0, 3, 0));
-        outbound.with_view(|view| assert_eq!(view.payload, qty_payload(&[1; 4])));
+                .unwrap();
+            let sent = outbound.sent_frame();
+            assert_eq!((sent.first_fsn, sent.fsn, sent.wire_seq), (0, staged, 0));
+            outbound.with_view(|view| {
+                assert_eq!(view.payload, qty_payload(&vec![1; staged as usize + 1]))
+            });
+        }
     }
 
     fn qwp_error_payload(status: u8, sequence: u64, message: &str) -> Vec<u8> {
