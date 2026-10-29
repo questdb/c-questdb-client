@@ -44,7 +44,7 @@ fn install_handler_without_sa_restart() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = noop_handler as usize;
+        sa.sa_sigaction = noop_handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
         sa.sa_flags = 0; // deliberately no SA_RESTART
         libc::sigemptyset(&mut sa.sa_mask);
         assert_eq!(
