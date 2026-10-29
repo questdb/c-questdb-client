@@ -846,7 +846,7 @@ impl QuestDb {
         let sf_disk = parsed.sf_disk;
         let pool_cfg = parsed.pool;
 
-        let mut builder = SenderBuilder::from_conf(&parsed.sender_conf)?;
+        let mut builder = SenderBuilder::from_conf(conf)?;
         if pool_cfg.lazy_connect {
             // Java's lazy_connect injects an async initial connect into the
             // ingest config once; every pooled sender then inherits it.
@@ -890,7 +890,7 @@ impl QuestDb {
 
         let inner = Arc::new(DbInner {
             #[cfg(feature = "_egress")]
-            conf: parsed.sender_conf,
+            conf: conf.to_owned(),
             connector,
             buffer_max_name_len,
             health: Mutex::new(health),

@@ -99,8 +99,6 @@ impl Default for PoolConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedConf {
     pub(crate) pool: PoolConfig,
-    /// Pool-only batching keys removed; shared by ingress and egress builders.
-    pub(crate) sender_conf: String,
     /// `sf_dir` was set: store-and-forward senders use disk-backed,
     /// pool-minted slot directories. When false they use in-memory queues.
     pub(crate) sf_disk: bool,
@@ -109,9 +107,11 @@ pub(crate) struct ParsedConf {
 /// Validate and extract pool-specific knobs from a QuestDb pool connect
 /// string.
 ///
-/// Remove the pool-only commit keys before passing the string to ingress or
-/// egress builders. Other pool keys are already accepted by those builders.
-/// Preserve escaped values while validating the schema and pool settings.
+/// The conf string itself is **not** rewritten — the underlying
+/// `SenderBuilder` silently ignores the pool keys, so a single parse over the
+/// original conf is enough. This function only sanity-checks the schema,
+/// validates store-and-forward opt-in, and returns the [`PoolConfig`] the
+/// pool machinery needs.
 pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
     let Some((service, params)) = conf.split_once("::") else {
         return Err(error::fmt!(
@@ -133,13 +133,8 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
     let mut sf_dir_specified = false;
     let mut query_pool_min_specified = false;
     let mut initial_connect_retry: Option<String> = None;
-    let mut sender_conf = format!("{service}::");
 
     walk_params(params, |key, value| {
-        sender_conf.push_str(key);
-        sender_conf.push('=');
-        sender_conf.push_str(&value.replace(';', ";;"));
-        sender_conf.push(';');
         // `sf_dir` selects disk-backed store-and-forward slots;
         // all other `sf_*` / `sender_id` keys are passthrough to the
         // `SenderBuilder`, tuning the in-memory or disk queue — the same as the
@@ -311,7 +306,6 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
 
     Ok(ParsedConf {
         pool,
-        sender_conf,
         sf_disk: sf_dir_specified,
     })
 }
@@ -424,17 +418,6 @@ where
 mod tests {
     use super::*;
     use crate::ErrorCode;
-
-    #[test]
-    fn commit_window_keys_reach_the_sender_conf_with_escaped_values() {
-        let parsed =
-            parse("ws::addr=localhost:9000;commit_rows=500;commit_interval_ms=25;token=a;;b;")
-                .unwrap();
-        assert_eq!(
-            parsed.sender_conf,
-            "ws::addr=localhost:9000;commit_rows=500;commit_interval_ms=25;token=a;;b;"
-        );
-    }
 
     fn parse_ok(conf: &str) -> ParsedConf {
         parse(conf).unwrap_or_else(|e| panic!("expected ok, got {e}"))
