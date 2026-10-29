@@ -701,8 +701,7 @@ impl QuestDb {
     /// therefore costs a rejection and a reconnect per window. Standalone
     /// QWP/WebSocket senders accept the same two keys. A direct column sender
     /// has its own explicit [`commit`](BorrowedDirectColumnSender::commit), so
-    /// the keys do not apply to it: a direct borrow ignores them and
-    /// [`OwnedDirectColumnSender`] rejects them.
+    /// the keys do not apply to it and a direct borrow ignores them.
     ///
     /// Lifecycle key names and defaults match the Java client's `QuestDBBuilder`; the
     /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,
