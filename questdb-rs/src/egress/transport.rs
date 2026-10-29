@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::egress::config::ReaderConfig;
+use crate::egress::config::{MAX_CONNECT_TIMEOUT_MS, ReaderConfig};
 use crate::egress::server_event::UpgradeReject;
 use crate::egress::tls::build_client_config;
 use crate::egress::wire::MsgKind;
@@ -158,9 +158,20 @@ impl WsTransport {
                 // `> 0` uses the native non-blocking connect + poll +
                 // SO_ERROR check that `connect_timeout` implements per
                 // platform, bounded per resolved address.
-                let res = match config.connect_timeout_ms {
-                    0 => TcpStream::connect(addr),
-                    ms => TcpStream::connect_timeout(addr, Duration::from_millis(ms)),
+                // Under `interrupt_on_eintr` the blocking dial is unsafe: on
+                // macOS a blocking `connect` that a signal interrupts keeps
+                // connecting in the background, and std's retry can report
+                // success before the handshake completes (ENOTCONN on first
+                // write). The non-blocking dial polls through EINTR and
+                // checks SO_ERROR; the kernel's own SYN retry limit still
+                // ends it, so the hour cap only bounds the poll.
+                let res = match (config.connect_timeout_ms, config.interrupt_on_eintr) {
+                    (0, false) => TcpStream::connect(addr),
+                    (0, true) => TcpStream::connect_timeout(
+                        addr,
+                        Duration::from_millis(MAX_CONNECT_TIMEOUT_MS),
+                    ),
+                    (ms, _) => TcpStream::connect_timeout(addr, Duration::from_millis(ms)),
                 };
                 match res {
                     Ok(s) => {

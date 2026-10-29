@@ -523,6 +523,8 @@ pub struct ReaderConfig {
     /// so the host can run its handlers. The cursor is intact: nothing was
     /// lost, no reconnect or replay happens, and the next `next_batch` /
     /// `next_arrow_batch` (or `cancel`) resumes where the read stopped.
+    /// With `connect_timeout = 0` the TCP dial becomes non-blocking (bounded
+    /// by the kernel's SYN retries), since a signal can break a blocking one.
     /// Connect-time reads (TLS handshake, WS upgrade, `SERVER_INFO`,
     /// including during a failover reconnect) retry `EINTR` instead, as
     /// they cannot be resumed, but still time out on schedule
