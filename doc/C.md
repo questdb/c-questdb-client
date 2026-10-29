@@ -82,6 +82,7 @@ Durable acknowledgement requires QuestDB Enterprise. Enable
 - [ILP authentication with TLS](../examples/line_sender_c_example_auth_tls.c)
 - [Custom certificate authority](../examples/line_sender_c_example_tls_ca.c)
 - [QWP/UDP](../examples/line_sender_c_example_udp.c)
+- [Rotating bearer tokens](../examples/token_provider_c_example.c)
 
 QWP/UDP is best effort and provides no acknowledgement, authentication, or
 TLS. ILP/HTTP and ILP/TCP remain available for compatibility, but they do not
@@ -93,6 +94,7 @@ The committed headers are the authoritative native API reference:
 - [`qwp_sender.h`](../include/questdb/ingress/qwp_sender.h) — `questdb_db_borrow_sender`
 - [`qwp_reader.h`](../include/questdb/egress/qwp_reader.h) — `questdb_db_borrow_reader`
 - [`line_sender.h`](../include/questdb/ingress/line_sender.h)
+- [`token_provider.h`](../include/questdb/token_provider.h) — rotating bearer tokens
 
 For connection-string keys, Enterprise multi-host failover, store-and-forward,
 and deployment guidance, use the public

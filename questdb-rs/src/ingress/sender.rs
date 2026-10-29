@@ -55,6 +55,9 @@ mod qwp_udp;
 pub(crate) use qwp_udp::*;
 
 #[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_auth_rejection;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_codec;
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -65,7 +68,8 @@ mod qwp_ws_batch;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws_driver::{
-    ReconnectPolicy, ReconnectReason, reconnect_backoff_step, reconnect_error_is_terminal,
+    ReconnectPolicy, ReconnectReason, ack_wait_timeout_error, reconnect_backoff_step,
+    reconnect_error_is_foreground_terminal,
 };
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -555,6 +559,15 @@ impl Sender {
                     0.0f64
                 };
 
+                // The auth header is resolved inside `http_send_with_retries`.
+                // Its first retryable failure starts the same `retry_timeout`
+                // deadline later used by request retries. A token provider is
+                // called there, and a recoverable provider failure is
+                // re-resolved rather than ending the flush:
+                // resolving out here returned a `SocketError` after zero
+                // requests, and the Python binding clears its sender-owned
+                // buffer on any flush failure, so the batch died on a transient
+                // the budget was meant to cover.
                 match http_send_with_retries(
                     state,
                     bytes,
@@ -570,7 +583,7 @@ impl Sender {
                             Ok(())
                         }
                     }
-                    Err(err) => Err(crate::error::Error::from_ureq_error(err, &state.url)),
+                    Err(err) => Err(err),
                 }
             }
             #[cfg(feature = "sync-sender-qwp-udp")]
@@ -652,7 +665,11 @@ impl Sender {
     /// mode, the caller must use `Sender::drive_once` or
     /// `Sender::wait` to advance WebSocket progress. Server or
     /// transport failures observed later are reported by subsequent sender
-    /// calls.
+    /// calls. If local capacity does not free up within
+    /// `sf_append_deadline_millis` while the sender is disconnected and
+    /// reconnecting keeps failing, the error names that failure and carries
+    /// its OIDC detail (`Error::oidc_error`), as a `Sender::wait` timeout
+    /// does.
     ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.
@@ -832,15 +849,23 @@ impl Sender {
     /// large batch keeps waiting. `Duration::ZERO` waits indefinitely. On
     /// expiry it returns an
     /// [`ErrorCode::FailoverRetry`](crate::ErrorCode::FailoverRetry)
-    /// error and the published frames are retained for replay.
+    /// error and the published frames are retained for replay. If the sender
+    /// is disconnected and reconnecting keeps failing, that error names the
+    /// failure and carries its OIDC detail (`Error::oidc_error`) -- for
+    /// example the `InteractionRequired` of a credential that needs a new
+    /// sign-in.
     ///
     /// A terminal server rejection of a frame in the pending range, or a
     /// terminal transport/protocol failure, is returned as an error. Retriable
     /// server rejections reconnect and replay until the frame is acknowledged or
-    /// the sender is stopped. When nothing has been published yet, a valid wait
-    /// returns immediately. QWP/WebSocket only; other
-    /// protocols return `InvalidApiCall`. In manual progress mode this also
-    /// drives WebSocket progress while waiting.
+    /// the sender is stopped. A wait made from inside one of its OIDC auth's
+    /// callbacks (e.g. a persistence-warning handler) returns a retryable
+    /// provider error, and retains the publication, once this sender's
+    /// reconnect is blocked on a token that the auth cannot supply until that
+    /// callback returns. A wait on any other thread keeps waiting.
+    /// When nothing has been published yet, a valid wait returns immediately.
+    /// QWP/WebSocket only; other protocols return `InvalidApiCall`. In manual
+    /// progress mode this also drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         let result = self.wait_inner(ack_level, timeout);
@@ -876,12 +901,40 @@ impl Sender {
             if completed.is_some_and(|fsn| fsn >= boundary) {
                 return Ok(());
             }
+            // This wait may be running inside an auth callback (e.g. a
+            // persistence warning) whose return this sender's reconnect needs.
+            // Reject it instead of parking the callback forever. A connected
+            // sender, or a wait on any other thread, is unaffected. The
+            // publication remains queued for replay.
+            let provider = match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => state.token_provider.as_ref(),
+                SyncProtocolHandler::ManualQwpWs(state) => state.token_provider.as_ref(),
+                _ => None,
+            };
+            if let Some(err) = provider.and_then(|provider| provider.callback_wait_error()) {
+                return Err(err);
+            }
             if completed != last_completed {
                 last_completed = completed;
                 deadline_anchor = Instant::now();
             }
             if !timeout.is_zero() && deadline_anchor.elapsed() >= timeout {
-                return Err(qwp_ws_wait_timeout(ack_level, timeout, boundary, completed));
+                let reconnect_failure = match &self.handler {
+                    SyncProtocolHandler::SyncQwpWs(state) => {
+                        qwp_ws_reconnect_failure_background(state)
+                    }
+                    SyncProtocolHandler::ManualQwpWs(state) => {
+                        qwp_ws_reconnect_failure_manual(state)
+                    }
+                    _ => None,
+                };
+                return Err(qwp_ws_wait_timeout(
+                    ack_level,
+                    timeout,
+                    boundary,
+                    completed,
+                    reconnect_failure.as_ref(),
+                ));
             }
 
             match &mut self.handler {
@@ -1061,7 +1114,10 @@ impl Sender {
     ///
     /// The wait is bounded by the QWP/WebSocket `close_flush_timeout_millis`
     /// setting. Its default is 5000 ms, matching the Java sender. Values less
-    /// than or equal to zero skip the wait.
+    /// than or equal to zero skip the wait. If the deadline passes while the
+    /// sender is disconnected and reconnecting keeps failing, in either
+    /// progress mode, the error names that failure and carries its OIDC detail
+    /// (`Error::oidc_error`).
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn close_drain(&mut self) -> Result<()> {
         let result = match &mut self.handler {
@@ -1203,33 +1259,26 @@ fn qwp_ws_sleep_until(deadline: Option<Instant>) {
 /// no-progress `timeout`. Classified [`ErrorCode::FailoverRetry`]: the
 /// published frames are retained and the background runner keeps delivering
 /// them, so recover by retrying `wait()` until it returns `Ok` — not by
-/// re-flushing, which would duplicate the rows. Mirrors the column-major
-/// store-and-forward wait.
+/// re-flushing, which would duplicate the rows. While the sender is
+/// disconnected it names why reconnecting keeps failing, with that failure's
+/// OIDC detail. Mirrors the column-major store-and-forward wait.
 #[cfg(feature = "sync-sender-qwp-ws")]
 fn qwp_ws_wait_timeout(
     ack_level: AckLevel,
     timeout: Duration,
     boundary: u64,
     completed: Option<u64>,
+    reconnect_failure: Option<&crate::Error>,
 ) -> crate::Error {
     let level = match ack_level {
         AckLevel::Ok => "ok",
         AckLevel::Durable => "durable",
     };
-    let progress = match completed {
-        Some(fsn) => format!("reached FSN {fsn}"),
-        None => "reached no frame".to_string(),
-    };
-    error::Error::new(
-        error::ErrorCode::FailoverRetry,
-        format!(
-            "QWP/WebSocket wait({level}) timed out after {timeout:?} with no ack \
-             progress (target FSN {boundary}, {progress}); the connection is alive \
-             but the server is not advancing the watermark. The published frames \
-             remain queued and the background runner keeps delivering them: retry \
-             wait() to keep awaiting the ack, or close the pool to drain. Do not \
-             re-flush the same data, which is already accepted and would be \
-             delivered twice."
-        ),
+    ack_wait_timeout_error(
+        &format!("QWP/WebSocket wait({level})"),
+        timeout,
+        boundary,
+        completed,
+        reconnect_failure,
     )
 }

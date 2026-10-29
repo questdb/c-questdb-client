@@ -55,7 +55,9 @@ use super::qwp_ws_driver::{
     QwpWsCounters, QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore,
     QwpWsReconnectState, QwpWsReconnectStep, QwpWsSendCore, QwpWsTransportFailureAction,
     ReconnectPolicy, ReconnectReason, TransportFailure, TransportPoll, TransportResponse,
-    reconnect_error_is_terminal, reconnect_sleep_duration, retry_budget_exhausted_error,
+    reconnect_error_is_foreground_terminal, reconnect_error_is_terminal,
+    reconnect_error_is_terminal_when_established, reconnect_sleep_duration,
+    retry_budget_exhausted_error,
 };
 use super::qwp_ws_orphan::{
     ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, is_candidate_orphan,
@@ -281,13 +283,13 @@ fn shutdown_socket(stream: &TcpStream) -> std::io::Result<()> {
 ///
 /// `Foreground` is a caller-thread initial connect: the user is synchronously
 /// waiting and no bounded-shutdown deadline depends on the dial returning.
-/// `ForegroundBounded` is foreground work whose dial a bounded wait does
-/// depend on -- I/O-runner reconnects and the async initial-connect retry
-/// loop (both raced by the 30s runner shutdown), and manual-mode reconnects
-/// inside `drive_once`. Only orphan-slot drainers use `BackgroundDrainer`,
-/// matching Java's background-connect policy; a transport stores the kind of
-/// its lifecycle (`Foreground`/`BackgroundDrainer`) and derives the bounded
-/// variant per reconnect via [`Self::for_reconnect`].
+/// `ForegroundBounded` is foreground work whose connection setup a bounded
+/// wait depends on -- I/O-runner reconnects and the async initial-connect
+/// retry loop (both raced by the 30s runner shutdown), and manual-mode
+/// reconnects inside `drive_once`. Only orphan-slot drainers use
+/// `BackgroundDrainer`, matching Java's background-connect policy; a transport
+/// stores the kind of its lifecycle (`Foreground`/`BackgroundDrainer`) and
+/// derives the bounded variant per reconnect via [`Self::for_reconnect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QwpWsConnectKind {
     Foreground,
@@ -452,6 +454,10 @@ pub(crate) struct SyncQwpWsHandlerState {
     runner: SyncQwpWsRunner,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
+    /// Retained for a pending ACK wait's callback guard. Reconnects use the
+    /// same provider through the runner; a warning handler may be waiting on
+    /// this sender while that runner joins the handler's token worker.
+    pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     /// Hard cap on a single store-and-forward frame's payload: `sf_max_segment_bytes`
     /// minus the segment and frame headers. The queue rejects anything larger,
     /// so publishers must size-check and split against THIS bound —
@@ -513,6 +519,7 @@ pub(crate) struct ManualQwpWsHandlerState {
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
+    pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     /// Hard cap on a single queued frame's payload, as on
     /// [`SyncQwpWsHandlerState::sfa_frame_payload_cap`].
     pub(crate) sfa_frame_payload_cap: usize,
@@ -760,8 +767,9 @@ where
                             if !self
                                 .wait_for_publication_capacity(backpressure_generation, deadline)
                             {
-                                return Err(driver_error_to_error_without_state(
-                                    DriverError::SubmitTimedOut { backpressure },
+                                return Err(submit_timeout_error(
+                                    backpressure,
+                                    self.reconnect_failure().as_ref(),
                                 ));
                             }
                             continue;
@@ -780,10 +788,9 @@ where
                 Ok(receipt) => return Ok(receipt.fsn),
                 Err(err) if driver_error_is_backpressure(&err) => {
                     if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
-                        return Err(driver_error_to_error_without_state(
-                            DriverError::SubmitTimedOut {
-                                backpressure: driver_error_backpressure_queue(&err),
-                            },
+                        return Err(submit_timeout_error(
+                            driver_error_backpressure_queue(&err),
+                            self.reconnect_failure().as_ref(),
                         ));
                     }
                 }
@@ -826,6 +833,14 @@ where
             ));
         }
         Ok(())
+    }
+
+    /// Why the runner's latest attempt to (re)connect failed, while it has no
+    /// connection.
+    fn reconnect_failure(&self) -> Option<crate::Error> {
+        self.lock_shared()
+            .ok()
+            .and_then(|store| store.reconnect_failure().cloned())
     }
 
     fn published_fsn(&self) -> crate::Result<Option<u64>> {
@@ -925,8 +940,9 @@ where
     /// Block until every published frame has resolved its receipt, then close
     /// the queue; give up with a `SocketError` once `deadline` passes (an
     /// already-elapsed deadline fails fast, which is what bounds a batched pool
-    /// close). `deadline == None` waits indefinitely. Assumes
-    /// [`Self::begin_close`] has already run.
+    /// close). While reconnecting keeps failing, that error names the latest
+    /// failure, as the manual close drain's does. `deadline == None` waits
+    /// indefinitely. Assumes [`Self::begin_close`] has already run.
     fn drain_to_deadline(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
         // No publication can pass the Closing lifecycle latch. Release the
         // detached producer's active-segment mapping before queue.close()
@@ -961,10 +977,7 @@ where
             }
 
             if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
-                return Err(error::fmt!(
-                    SocketError,
-                    "QWP/WebSocket close drain timed out before all published frames were acknowledged"
-                ));
+                return Err(close_drain_timeout_error(self.reconnect_failure().as_ref()));
             }
         }
     }
@@ -1099,9 +1112,11 @@ impl QwpWsPendingConnect {
         }
     }
 
+    /// `on_failure` sees each failed attempt that will be retried.
     fn connect_with_retry(
         &self,
         stop: &AtomicBool,
+        on_failure: &dyn Fn(&crate::Error),
     ) -> Result<Option<BlockingQwpWsTransport>, crate::Error> {
         #[cfg(test)]
         if let Some(err) = &self.terminal_error_for_test {
@@ -1151,6 +1166,7 @@ impl QwpWsPendingConnect {
                 }
                 Err(err) if reconnect_error_is_terminal(&err) => return Err(err),
                 Err(err) => {
+                    on_failure(&err);
                     let role_reject = is_qwp_ws_role_reject_error(&err);
                     last_error = Some(err);
                     let sleep_for = reconnect_sleep_duration(
@@ -1196,8 +1212,24 @@ impl SyncQwpWsPendingRunnerCore {
             return connected.drive_step(shared, stop);
         }
 
-        match self.pending_connect.connect_with_retry(stop) {
+        // An ACK wait that times out before the first connection reports why
+        // connecting keeps failing, exactly as after a later drop. Wake the
+        // ACK waiters as after a later drop's failed attempt: see
+        // `SyncQwpWsRunnerCore::record_reconnect_failure`.
+        let record_failure = |err: &crate::Error| {
+            if let Ok(mut store) = shared.lock() {
+                store.record_reconnect_failure(err);
+            }
+            self.backpressure.notify_all();
+        };
+        match self
+            .pending_connect
+            .connect_with_retry(stop, &record_failure)
+        {
             Ok(Some(transport)) => {
+                if let Ok(mut store) = shared.lock() {
+                    store.clear_reconnect_failure();
+                }
                 let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
                     transport,
                     self.pending_connect.reconnect_policy,
@@ -1792,12 +1824,27 @@ where
                 Ok(QwpWsReconnectStep::RetryAfter {
                     sleep_for: retry_sleep,
                 }) => {
+                    if let Some(step) =
+                        self.record_reconnect_failure(shared, reconnect.last_error())
+                    {
+                        return step;
+                    }
                     deadline = reconnect.deadline();
                     sleep_for = retry_sleep;
                 }
                 Ok(QwpWsReconnectStep::Terminal(err)) => {
-                    if reconnect_error_is_terminal(&err) {
+                    return self.mark_store_terminal(shared, err);
+                }
+                Ok(QwpWsReconnectStep::BudgetExhausted(err)) => {
+                    if reconnect_error_is_terminal_when_established(&err) {
                         return self.mark_store_terminal(shared, err);
+                    }
+                    // As in the manual driver: a budget spent before its
+                    // first attempt has no reconnect failure to report.
+                    if reconnect.attempts() > 0
+                        && let Some(step) = self.record_reconnect_failure(shared, &err)
+                    {
+                        return step;
                     }
                     sleep_for = reconnect.initial_backoff();
                     *reconnect = reconnect.next_after_retryable_terminal(err);
@@ -1817,6 +1864,30 @@ where
             RunnerStep::Stop
         } else {
             RunnerStep::Continue
+        }
+    }
+
+    /// Latch why this reconnect attempt failed, for an ACK wait that times out
+    /// while the transport is down, and wake the ACK waiters: the attempt's
+    /// token pull may have just found that a wait inside an auth callback can
+    /// never complete (`TokenProvider::callback_wait_error`), and such a wait
+    /// must be rejected now, not at its deadline (never, with none). `Some`
+    /// only when the store lock was poisoned and the runner must stop.
+    fn record_reconnect_failure<Q>(
+        &self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        err: &crate::Error,
+    ) -> Option<RunnerStep>
+    where
+        Q: PublicationLog,
+    {
+        match shared.lock() {
+            Ok(mut store) => {
+                store.record_reconnect_failure(err);
+                self.backpressure.notify_all();
+                None
+            }
+            Err(_) => Some(self.handle_poisoned_lock()),
         }
     }
 
@@ -1963,6 +2034,9 @@ fn driver_error_to_error_from_store<Q: PublicationLog>(
             .terminal_error()
             .cloned()
             .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")),
+        DriverError::SubmitTimedOut { backpressure } => {
+            submit_timeout_error(backpressure, store.reconnect_failure())
+        }
         err => driver_error_to_error_without_state(err),
     }
 }
@@ -3163,13 +3237,13 @@ fn qwp_ws_all_endpoints_unreachable_error(
     last_failure: Option<(usize, crate::Error)>,
 ) -> crate::Error {
     match last_failure {
-        Some((idx, err)) => error::fmt!(
-            SocketError,
-            "QWP/WebSocket all endpoints unreachable; last endpoint {}:{} failed: {}",
-            endpoints[idx].host,
-            endpoints[idx].port,
-            err
-        ),
+        Some((idx, err)) => {
+            let msg = format!(
+                "QWP/WebSocket all endpoints unreachable; last endpoint {}:{} failed: {}",
+                endpoints[idx].host, endpoints[idx].port, err
+            );
+            err.reclassified(crate::ErrorCode::SocketError, msg)
+        }
         None => error::fmt!(SocketError, "QWP/WebSocket all endpoints unreachable"),
     }
 }
@@ -3292,6 +3366,37 @@ pub(crate) fn establish_connection(
     Ok((stream, handshake_result, leftover))
 }
 
+/// Whether a provider acquisition failed only because the transport's own
+/// traffic gate shut down (the user closed or dropped the sender): a normal
+/// close, not a credential outage, so it must not be narrated as one.
+fn provider_cancelled_by_shutdown(err: &crate::Error, traffic_gate: Option<&TrafficGate>) -> bool {
+    traffic_gate.is_some_and(TrafficGate::is_shutdown)
+        && crate::token_provider::is_provider_shutdown_error(err)
+}
+
+fn acquire_qwp_ws_provider_header(
+    provider: &crate::token_provider::TokenProvider,
+    connect_kind: QwpWsConnectKind,
+    traffic_gate: Option<&TrafficGate>,
+) -> crate::Result<String> {
+    // Without a traffic gate (manual progress) the pull runs on the thread
+    // driving progress, which may be an ACK wait inside one of the auth's
+    // callbacks: record a failed pull there so that wait can be rejected.
+    match traffic_gate {
+        Some(gate) if connect_kind.bounded_dial() => {
+            provider.bearer_header_isolated_until(|| gate.is_shutdown())
+        }
+        // A manual-progress reconnect, or a manual orphan drainer's connect,
+        // runs inside the caller's `drive_once`, `wait`, `close_drain` or a
+        // `flush` waiting for queue space. Their deadlines are checked only
+        // between attempts, so a refreshing provider's cold wait (30 s by
+        // default) would overrun them. Fail the attempt at once instead: the
+        // provider's refresher keeps fetching, and a later attempt pulls again.
+        None if connect_kind.bounded_dial() => provider.bearer_header_on_caller_without_waiting(),
+        _ => provider.bearer_header_on_caller(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     endpoints: &Arc<[QwpWsEndpoint]>,
@@ -3318,6 +3423,59 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     if let Some(idx) = previous_idx.take() {
         health.with_tracker(|t| t.record_mid_stream_failure(idx, previous_failure));
     }
+
+    // A token provider (e.g. OIDC) is pulled fresh on every (re)connect round,
+    // overriding the static basic/token header, so a long-lived sender keeps a
+    // valid Bearer as the token rotates. Provider acquisition/validation failures
+    // are normally retryable SocketErrors: the next invocation may recover, and
+    // accepted store-and-forward frames must remain drainable. An InvalidApiCall
+    // from the callback is a caller-contract violation and arrives re-coded as a
+    // terminal ConfigError (`classify_provider_error`). Server authentication
+    // rejections happen later in the handshake and end the round with an
+    // AuthError: terminal before the first connection, retried by a sender that
+    // has connected (`reconnect_error_is_terminal_when_established`).
+    let mut provided_header = match qwp_ws.token_provider.as_ref() {
+        Some(provider) => {
+            let acquired = acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate);
+            // Narrate before propagating. This returns above the endpoint loop,
+            // so `auth_failed` (inside it) and `all_endpoints_unreachable`
+            // (after it) are both unreachable from here: without this the round
+            // produces no event and no log at all. Combined with a retryable
+            // provider error and a reconnect budget that restarts each round,
+            // the caller would otherwise observe an indefinite silent stall
+            // whose first symptom is unrelated store backpressure.
+            Some(acquired.map_err(|err| {
+                if provider_cancelled_by_shutdown(&err, traffic_gate) {
+                    log::debug!(
+                        "questdb: QWP/WebSocket token provider acquisition \
+                         abandoned because the transport is shutting down"
+                    );
+                    return err;
+                }
+                match events {
+                    // Foreground rounds narrate; background (orphan-drainer)
+                    // walks deliberately do not, so as not to claim an outage
+                    // against an endpoint the foreground may be using happily.
+                    Some(events) => {
+                        events.token_provider_failed(None, &err, events.next_attempt());
+                        log::warn!(
+                            "questdb: QWP/WebSocket token provider failed before \
+                             dialling any endpoint; abandoning this connection \
+                             round: {err}"
+                        );
+                    }
+                    None => log::debug!(
+                        "questdb: QWP/WebSocket token provider failed on a \
+                         background walk: {err}"
+                    ),
+                }
+                err
+            })?)
+        }
+        None => None,
+    };
+    let static_auth_header = auth_header;
+
     let mut last_role_mismatch = None;
     let mut last_transport_failure: Option<(usize, crate::Error)> = None;
     let mut role_reject_count = 0usize;
@@ -3332,19 +3490,77 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // contender can claim the just-reset round before this caller does.
     // Do this only for the first pick so failed attempts terminate normally.
     let mut first_pick = true;
+    let mut auth_rotation_retry_used = false;
     while let Some(idx) = health.with_tracker(|t| t.pick_next_and_claim_connect_round(first_pick)) {
         first_pick = false;
         let endpoint = &endpoints[idx];
-        let connected = establish_connection(
+        let mut connected = establish_connection(
             &endpoint.host,
             &endpoint.port,
             use_tls,
             tls_settings.clone(),
             connect_kind,
             qwp_ws,
-            auth_header,
+            provided_header.as_deref().or(static_auth_header),
             traffic_gate,
         );
+        // A credential can expire during DNS/TCP/TLS setup. Resolve once more
+        // after a definite 401 and replay this endpoint only when the rotating
+        // provider actually supplies a changed header. Static credentials, 403,
+        // unchanged values, and a second 401 end the round, as does a 401
+        // whose Bearer challenge names an error other than `invalid_token`
+        // (spec §8.2): a new token cannot fix `insufficient_scope`.
+        if matches!(&connected, Err(err) if err.upgrade_401_allows_token_refresh())
+            && !auth_rotation_retry_used
+            && let Some(provider) = qwp_ws.token_provider.as_ref()
+        {
+            auth_rotation_retry_used = true;
+            // Name the rejected token, so a cache-first provider such as
+            // `OidcDeviceAuth` refreshes it rather than handing it back.
+            let rotated = match crate::token_provider::with_rejected_credential(
+                provided_header.as_deref(),
+                || acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate),
+            ) {
+                Ok(rotated) => rotated,
+                Err(err) => {
+                    // A credential was already presented to this endpoint. Keep
+                    // the provider's retryable/terminal classification and OIDC
+                    // detail, but do not report a pre-dial failure or lose the
+                    // server rejection that prompted the second acquisition.
+                    let code = err.code();
+                    let message = format!(
+                        "QWP/WebSocket credential rejected with HTTP 401 at {}:{}; \
+                         token provider failed to refresh it: {}",
+                        endpoint.host,
+                        endpoint.port,
+                        err.msg()
+                    );
+                    let shutdown = provider_cancelled_by_shutdown(&err, traffic_gate);
+                    let err = err.reclassified(code, message);
+                    if let Some(events) = events.filter(|_| !shutdown) {
+                        events.token_provider_failed(
+                            Some((&endpoint.host, &endpoint.port)),
+                            &err,
+                            events.next_attempt(),
+                        );
+                    }
+                    return Err(err);
+                }
+            };
+            if Some(rotated.as_str()) != provided_header.as_deref() {
+                provided_header = Some(rotated);
+                connected = establish_connection(
+                    &endpoint.host,
+                    &endpoint.port,
+                    use_tls,
+                    tls_settings.clone(),
+                    connect_kind,
+                    qwp_ws,
+                    provided_header.as_deref(),
+                    traffic_gate,
+                );
+            }
+        }
         if traffic_gate.is_some_and(TrafficGate::is_shutdown) {
             return Err(match connected {
                 Ok(_) => error::fmt!(
@@ -3502,6 +3718,17 @@ pub(super) fn try_dup_recovered(src: &[u8]) -> crate::Result<Vec<u8>> {
     Ok(v)
 }
 
+/// Give one sender its own token-provider attachment: shared acquisition, but
+/// a private callback-blocked state, so senders cloned from one pool or one
+/// options object never see each other's failed reconnects. Orphan drainers
+/// keep the unattached provider: nothing waits on their ACKs.
+fn attach_qwp_ws_token_provider(qwp_ws: &QwpWsConfig) -> Option<QwpWsConfig> {
+    let provider = qwp_ws.token_provider.as_ref()?;
+    let mut attached = qwp_ws.clone();
+    attached.token_provider = Some(provider.for_attachment());
+    Some(attached)
+}
+
 pub(crate) fn connect_qwp_ws_background_state(
     host: &str,
     port: &str,
@@ -3518,6 +3745,8 @@ pub(crate) fn connect_qwp_ws_background_state(
         qwp_ws,
         auth_header.clone(),
     );
+    let attached = attach_qwp_ws_token_provider(qwp_ws);
+    let qwp_ws = attached.as_ref().unwrap_or(qwp_ws);
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
     let traffic_gate = Arc::new(TrafficGate::default());
     let (
@@ -3660,6 +3889,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         runner,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
+        token_provider: qwp_ws.token_provider.clone(),
         sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
         sfa_frame_split_target: two_frame_segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
         orphan_pool,
@@ -3711,6 +3941,8 @@ pub(crate) fn open_manual_qwp_ws(
         qwp_ws,
         auth_header.clone(),
     );
+    let attached = attach_qwp_ws_token_provider(qwp_ws);
+    let qwp_ws = attached.as_ref().unwrap_or(qwp_ws);
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
     let mut parts = open_qwp_ws_parts(
         host,
@@ -3753,6 +3985,7 @@ pub(crate) fn open_manual_qwp_ws(
         send_core: parts.send_core,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
+        token_provider: qwp_ws.token_provider.clone(),
         sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
@@ -3908,7 +4141,7 @@ fn connect_blocking_transport_with_retry(
                     connected,
                 ));
             }
-            Err(err) if reconnect_error_is_terminal(&err) => return Err(err),
+            Err(err) if reconnect_error_is_foreground_terminal(&err) => return Err(err),
             Err(err) => {
                 let role_reject = is_qwp_ws_role_reject_error(&err);
                 last_error = Some(err);
@@ -4083,13 +4316,30 @@ pub(crate) fn qwp_ws_ok_fsn_background(
     state.runner.ok_fsn()
 }
 
+/// Why the background runner's latest attempt to (re)connect failed, while it
+/// has no connection.
+pub(crate) fn qwp_ws_reconnect_failure_background(
+    state: &SyncQwpWsHandlerState,
+) -> Option<crate::Error> {
+    state.runner.reconnect_failure()
+}
+
+/// Why the latest manually driven attempt to (re)connect failed, while there
+/// is no connection.
+pub(crate) fn qwp_ws_reconnect_failure_manual(
+    state: &ManualQwpWsHandlerState,
+) -> Option<crate::Error> {
+    state.store.reconnect_failure().cloned()
+}
+
 /// Take before checking a completion watermark or error condition.
 pub(crate) fn qwp_ws_progress_generation_background(state: &SyncQwpWsHandlerState) -> u64 {
     state.runner.backpressure.generation()
 }
 
 /// Wait for runner progress or the absolute deadline. The caller must recheck
-/// its watermark/error predicate: sends and storage maintenance also notify.
+/// its watermark/error predicate: sends, storage maintenance and failed
+/// reconnect attempts also notify.
 pub(crate) fn qwp_ws_wait_for_progress_background(
     state: &SyncQwpWsHandlerState,
     generation: u64,
@@ -4245,14 +4495,19 @@ pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> 
                 sleep_for,
                 deadline: reconnect_deadline,
             }) => {
+                // A retryable provider/connect failure keeps the driver in
+                // `Waiting`. Once the outer close budget expires, the sleep
+                // helper returns immediately; without this check the loop
+                // drives reconnect continuously, spins a core and never lets
+                // close (or a language runtime's Ctrl-C handling) return.
+                if backpressure_deadline_expired(deadline) {
+                    return Err(qwp_ws_manual_close_timeout_error(state));
+                }
                 sleep_before_manual_reconnect(reconnect_deadline, sleep_for, deadline);
             }
             Ok(CloseOutcome::Timeout) => {
                 if backpressure_deadline_expired(deadline) {
-                    return Err(error::fmt!(
-                        SocketError,
-                        "QWP/WebSocket close drain timed out before all published frames were acknowledged"
-                    ));
+                    return Err(qwp_ws_manual_close_timeout_error(state));
                 }
                 thread::sleep(BACKPRESSURE_PARK);
             }
@@ -4359,6 +4614,27 @@ fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Re
         .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")))
 }
 
+fn qwp_ws_manual_close_timeout_error(state: &ManualQwpWsHandlerState) -> crate::Error {
+    close_drain_timeout_error(state.store.reconnect_failure())
+}
+
+/// The error of a close drain, in either progress mode, whose deadline passed
+/// before every published frame was acknowledged, naming the latest reconnect
+/// failure if there is one. As for an ACK-wait timeout, the failure's
+/// diagnostics are kept except a server-rejection diagnostic, which marks a
+/// terminal error.
+fn close_drain_timeout_error(reconnect_failure: Option<&crate::Error>) -> crate::Error {
+    let prefix =
+        "QWP/WebSocket close drain timed out before all published frames were acknowledged";
+    match reconnect_failure {
+        Some(cause) => cause.clone().without_qwp_ws_rejection().reclassified(
+            crate::ErrorCode::SocketError,
+            format!("{prefix}; the latest reconnect failed: {}", cause.msg()),
+        ),
+        None => error::fmt!(SocketError, "{prefix}"),
+    }
+}
+
 fn double_duration(duration: Duration) -> Duration {
     duration.checked_mul(2).unwrap_or(Duration::MAX)
 }
@@ -4371,7 +4647,7 @@ fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
             "QWP/WebSocket queue rejected publication: {:?}",
             err
         ),
-        DriverError::SubmitTimedOut { backpressure } => submit_timeout_error(backpressure),
+        DriverError::SubmitTimedOut { backpressure } => submit_timeout_error(backpressure, None),
         DriverError::Terminal => error::fmt!(SocketError, "QWP/WebSocket sender is terminal"),
         DriverError::Closing => error::fmt!(InvalidApiCall, "QWP/WebSocket sender is closing"),
         DriverError::UnknownReceipt { fsn } => error::fmt!(
@@ -4398,8 +4674,49 @@ fn driver_error_backpressure_queue(err: &DriverError) -> Option<super::qwp_ws_qu
     }
 }
 
-fn submit_timeout_error(backpressure: Option<super::qwp_ws_queue::QueueError>) -> crate::Error {
+/// The error of a publication that waited out its append deadline on
+/// store-and-forward back-pressure.
+///
+/// While the connection is down and reconnecting keeps failing, that failure is
+/// why no acknowledgement frees queue space, so the error names it instead of
+/// advising a larger `sf_max_total_bytes`, which would send the caller to fix
+/// the wrong thing. As for an ACK-wait timeout, the failure's diagnostics are
+/// kept except a server-rejection diagnostic, which marks a terminal error.
+fn submit_timeout_error(
+    backpressure: Option<super::qwp_ws_queue::QueueError>,
+    reconnect_failure: Option<&crate::Error>,
+) -> crate::Error {
     use super::qwp_ws_queue::QueueError;
+    if let Some(cause) = reconnect_failure {
+        let waited_for = match backpressure {
+            Some(QueueError::StorageSpareNotReady {
+                segment_size_bytes,
+                allocated_segment_bytes,
+                max_total_bytes,
+            }) => format!(
+                "a prepared segment spare [segment_size_bytes={segment_size_bytes}, allocated_segment_bytes={allocated_segment_bytes}, max_total_bytes={max_total_bytes}]"
+            ),
+            Some(QueueError::StorageSegmentCapFull {
+                segment_size_bytes,
+                allocated_segment_bytes,
+                max_total_bytes,
+            }) => format!(
+                "ACK-driven segment trim [segment_size_bytes={segment_size_bytes}, allocated_segment_bytes={allocated_segment_bytes}, max_total_bytes={max_total_bytes}]"
+            ),
+            _ => "local queue capacity".to_string(),
+        };
+        let msg = format!(
+            "QWP/WebSocket Store-and-Forward append timed out waiting for {waited_for}; the \
+             connection is down and reconnecting keeps failing: {}. The frames already \
+             published remain queued and the sender keeps reconnecting: retry the flush once \
+             that is resolved, or close the sender to give up.",
+            cause.msg()
+        );
+        return cause
+            .clone()
+            .without_qwp_ws_rejection()
+            .reclassified(crate::ErrorCode::SocketError, msg);
+    }
     match backpressure {
         Some(QueueError::StorageSpareNotReady {
             segment_size_bytes,
@@ -4446,6 +4763,117 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn endpoint_aggregation_preserves_oidc_detail() {
+        let endpoints = [QwpWsEndpoint::new("localhost".into(), "9000".into())];
+        let original = crate::Error::from(crate::oidc::OidcError::interaction_required("sign in"));
+
+        let err = qwp_ws_all_endpoints_unreachable_error(&endpoints, Some((0, original)));
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("localhost:9000"));
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn retry_budget_exhaustion_preserves_oidc_detail() {
+        let original = crate::Error::from(crate::oidc::OidcError::interaction_required("sign in"))
+            .reclassified(crate::ErrorCode::SocketError, "token provider failed");
+
+        let err = retry_budget_exhausted_error(
+            "QWP/WebSocket initial connect",
+            3,
+            Instant::now(),
+            Some(original),
+        );
+
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("retry budget exhausted"));
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
+    }
+
+    fn retriable_server_rejection(msg: &str) -> crate::Error {
+        crate::Error::new(crate::ErrorCode::ServerRejection, msg).with_qwp_ws_rejection(
+            crate::ingress::QwpWsSenderError {
+                category: crate::ingress::QwpWsErrorCategory::WriteError,
+                applied_policy: crate::ingress::QwpWsErrorPolicy::Retriable,
+                status: Some(0x09),
+                message: Some(msg.to_string()),
+                message_sequence: Some(0),
+                from_fsn: 0,
+                to_fsn: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn close_drain_timeout_carries_no_server_rejection_diagnostic() {
+        // A close-drain timeout is not a terminal error, so it must not carry
+        // the structured rejection that marks one (`line_sender_error_qwpws_get_view`).
+        let cause = retriable_server_rejection("write failed");
+
+        let err = close_drain_timeout_error(Some(&cause));
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg()
+                .contains("the latest reconnect failed: write failed"),
+            "{err}"
+        );
+        assert!(err.qwp_ws_rejection().is_none());
+
+        let err = close_drain_timeout_error(None);
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.qwp_ws_rejection().is_none());
+    }
+
+    #[test]
+    fn append_timeout_names_a_failing_reconnect_instead_of_the_buffer_size() {
+        use super::super::qwp_ws_queue::QueueError;
+        let cap_full = Some(QueueError::StorageSegmentCapFull {
+            segment_size_bytes: 512,
+            allocated_segment_bytes: 1024,
+            max_total_bytes: 1024,
+        });
+
+        // Connected: the queue really is too small for what the server acks.
+        let err = submit_timeout_error(cap_full, None);
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("increase sf_max_total_bytes"), "{err}");
+
+        // Disconnected: the failing reconnect is why nothing is acked.
+        let cause = crate::Error::new(
+            crate::ErrorCode::AuthError,
+            "WebSocket upgrade authentication failed: HTTP status 401",
+        )
+        .with_ws_http_status(401);
+        let err = submit_timeout_error(cap_full, Some(&cause));
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg()
+                .starts_with("QWP/WebSocket Store-and-Forward append timed out"),
+            "{err}"
+        );
+        assert!(
+            err.msg().contains(
+                "reconnecting keeps failing: WebSocket upgrade authentication failed: HTTP status 401"
+            ),
+            "{err}"
+        );
+        assert!(err.msg().contains("max_total_bytes=1024"), "{err}");
+        assert!(!err.msg().contains("increase sf_max_total_bytes"), "{err}");
+        assert!(!err.in_doubt());
+
+        let err = submit_timeout_error(cap_full, Some(&retriable_server_rejection("rejected")));
+        assert!(err.qwp_ws_rejection().is_none(), "{err}");
+    }
+
     #[cfg(any(unix, windows))]
     fn periodic_qwp_ws_config(sf_dir: &std::path::Path, sender_id: &str) -> QwpWsConfig {
         crate::ingress::SenderBuilder::from_conf(format!(
@@ -4457,6 +4885,65 @@ mod tests {
         .unwrap()
         .qwp_ws
         .unwrap()
+    }
+
+    #[cfg(any(unix, windows))]
+    struct BlockedProviderControl {
+        started: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+        finished: mpsc::Receiver<()>,
+    }
+
+    #[cfg(any(unix, windows))]
+    impl BlockedProviderControl {
+        fn wait_until_started(&self) {
+            self.started
+                .recv_timeout(Duration::from_secs(5))
+                .expect("token provider did not start");
+        }
+
+        fn release_and_wait(self) {
+            self.release.send(()).unwrap();
+            self.finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("token provider did not finish after release");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn qwp_ws_config_with_blocked_provider(
+        sf_dir: &std::path::Path,
+        sender_id: &str,
+    ) -> (QwpWsConfig, BlockedProviderControl) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let qwp_ws = crate::ingress::SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:1;sf_dir={};sender_id={sender_id};\
+             sf_max_segment_bytes=4096;sf_max_total_bytes=8192;\
+             initial_connect_retry=async;",
+            sf_dir.display()
+        ))
+        .unwrap()
+        .qwp_ws_token_provider(move || {
+            let _ = started_tx.send(());
+            release_rx.lock().unwrap().recv().unwrap();
+            let _ = finished_tx.send(());
+            Ok::<_, crate::Error>("eventual-token".to_string())
+        })
+        .unwrap()
+        .qwp_ws
+        .unwrap();
+
+        (
+            qwp_ws,
+            BlockedProviderControl {
+                started: started_rx,
+                release: release_tx,
+                finished: finished_rx,
+            },
+        )
     }
 
     #[test]
@@ -4758,6 +5245,7 @@ mod tests {
             runner,
             server_max_batch_size: Arc::new(AtomicUsize::new(4096)),
             request_durable_ack: durable,
+            token_provider: None,
             sfa_frame_payload_cap: segment_payload_capacity(4096),
             sfa_frame_split_target: two_frame_segment_payload_capacity(4096),
             orphan_pool: None,
@@ -4909,6 +5397,76 @@ mod tests {
             QwpWsConnectKind::BackgroundDrainer.for_reconnect(),
             QwpWsConnectKind::BackgroundDrainer
         );
+    }
+
+    /// A refreshing provider whose every fetch stalls until `release` fires.
+    fn stalled_refreshing_provider(
+        cold_wait: Duration,
+    ) -> (
+        crate::token_provider::RefreshingTokenProvider,
+        mpsc::Sender<()>,
+    ) {
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let provider = crate::token_provider::RefreshingTokenProvider::builder(
+            move || -> crate::Result<crate::token_provider::ExpiringToken> {
+                let _ = released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30));
+                Err(crate::Error::token_unavailable(
+                    true,
+                    None,
+                    "stalled source",
+                ))
+            },
+        )
+        .name("stalled")
+        .cold_wait(cold_wait)
+        .build()
+        .unwrap();
+        (provider, release)
+    }
+
+    #[test]
+    fn a_manual_reconnect_does_not_wait_for_a_refreshing_provider() {
+        // A manual-progress reconnect, and a manual orphan drainer's connect,
+        // run inside a caller's close_drain, wait or flush: waiting out the
+        // cold wait there overran the caller's deadline.
+        let (refreshing, release) = stalled_refreshing_provider(Duration::from_secs(20));
+        let provider = crate::token_provider::TokenProvider::new(refreshing.clone());
+        for kind in [
+            QwpWsConnectKind::ForegroundBounded,
+            QwpWsConnectKind::BackgroundDrainer,
+        ] {
+            let started = Instant::now();
+            let err = acquire_qwp_ws_provider_header(&provider, kind, None)
+                .expect_err("no token is held");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{kind:?} waited {:?} for the provider",
+                started.elapsed()
+            );
+            assert_eq!(err.code(), crate::ErrorCode::SocketError, "{err}");
+            assert!(err.is_provider_failure(), "{err}");
+            assert!(err.msg().contains("no usable token"), "{err}");
+        }
+        let _ = release.send(());
+        refreshing.close();
+
+        // A connect the caller waits for still waits for the provider's fetch.
+        let (refreshing, release) = stalled_refreshing_provider(Duration::from_millis(300));
+        let provider = crate::token_provider::TokenProvider::new(refreshing.clone());
+        let started = Instant::now();
+        acquire_qwp_ws_provider_header(&provider, QwpWsConnectKind::Foreground, None)
+            .expect_err("no token is held");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "a waited-for connect gave up after {:?}",
+            started.elapsed()
+        );
+        let _ = release.send(());
+        refreshing.close();
     }
 
     #[test]
@@ -5829,6 +6387,125 @@ mod tests {
                 Err(err) => panic!("slot did not become reusable after worker exit: {err:?}"),
             }
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn async_initial_connect_shutdown_releases_slot_while_provider_is_blocked() {
+        let dir = TempDir::new().unwrap();
+        let (qwp_ws, provider) =
+            qwp_ws_config_with_blocked_provider(dir.path(), "blocked-initial-provider");
+        let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+        let traffic_gate = Arc::new(TrafficGate::default());
+        let pending_connect = QwpWsPendingConnect::new(
+            "127.0.0.1",
+            "1",
+            false,
+            None,
+            &qwp_ws,
+            None,
+            *qwp_ws.request_durable_ack,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&traffic_gate),
+            false,
+            Vec::new(),
+            0,
+        );
+        let mut runner = SyncQwpWsRunner::start_pending_connect(
+            queue,
+            pending_connect,
+            Duration::from_secs(1),
+            *qwp_ws.error_inbox_capacity,
+            None,
+        );
+        runner.shutdown_timeout = Duration::from_millis(100);
+        provider.wait_until_started();
+
+        let started = Instant::now();
+        drop(runner);
+        let drop_elapsed = started.elapsed();
+        let reopened = open_configured_qwp_ws_queue(&qwp_ws);
+        provider.release_and_wait();
+
+        assert!(
+            drop_elapsed < Duration::from_secs(1),
+            "runner shutdown waited for the blocked token provider: {drop_elapsed:?}"
+        );
+        drop(reopened.unwrap_or_else(|err| {
+            panic!("blocked initial-connect provider retained the SFA slot after shutdown: {err}")
+        }));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn reconnect_shutdown_releases_slot_while_provider_is_blocked() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let dir = TempDir::new().unwrap();
+        let (qwp_ws, provider) =
+            qwp_ws_config_with_blocked_provider(dir.path(), "blocked-reconnect-provider");
+        let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+
+        // Seed the transport with an already-connected socket, then close its
+        // peer. The first publication drives the real blocking transport into
+        // its reconnect path, where token acquisition deliberately blocks.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        drop(peer);
+
+        let traffic_gate = Arc::new(TrafficGate::default());
+        let endpoints = qwp_ws_configured_endpoints("127.0.0.1", &port.to_string(), &qwp_ws);
+        let transport = BlockingQwpWsTransport::from_connected(
+            Arc::clone(&endpoints),
+            QwpWsHostHealthTracker::new(endpoints.len()),
+            false,
+            None,
+            QwpWsConnectKind::Foreground,
+            qwp_ws.clone(),
+            None,
+            Arc::new(AtomicUsize::new(0)),
+            Some(Arc::clone(&traffic_gate)),
+            QwpWsConnectRoundSuccess {
+                endpoint_idx: 0,
+                stream: WsStream::Plain(NoSigpipeTcp::new(client).unwrap()),
+                negotiated_version: 1,
+                server_max_batch_size: 0,
+                leftover: Vec::new(),
+            },
+        );
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let (store, send_core) = driver.into_parts();
+        let mut runner = SyncQwpWsRunner::start_with_append_deadline(
+            store,
+            send_core,
+            Duration::from_secs(1),
+            traffic_gate,
+        );
+        runner.shutdown_timeout = Duration::from_millis(100);
+        runner.publish_replay_payload(b"blocked reconnect").unwrap();
+        provider.wait_until_started();
+
+        let started = Instant::now();
+        drop(runner);
+        let drop_elapsed = started.elapsed();
+        let reopened = open_configured_qwp_ws_queue(&qwp_ws);
+        provider.release_and_wait();
+
+        assert!(
+            drop_elapsed < Duration::from_secs(1),
+            "runner shutdown waited for the blocked reconnect provider: {drop_elapsed:?}"
+        );
+        drop(reopened.unwrap_or_else(|err| {
+            panic!("blocked reconnect provider retained the SFA slot after shutdown: {err}")
+        }));
     }
 
     #[cfg(any(unix, windows))]

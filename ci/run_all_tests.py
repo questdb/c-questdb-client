@@ -46,13 +46,29 @@ def run_cargo_tests():
     run_cmd('cargo', 'test', '--lib', '--examples', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-reader',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--features=almost-all-features',
+    # The C ABI builds questdb-rs with `ffi-support`, and the pool's owned
+    # handles and borrow-with-retry paths, with their tests, compile only
+    # under it. `almost-all-features` leaves it out, so add it here; the
+    # arrow/polars run below still covers the cut without it.
+    run_cmd('cargo', 'test', '--features=almost-all-features,ffi-support',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--locked',
             '--features=almost-all-features,arrow,polars',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--locked', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',
+            '--', '--nocapture', cwd='questdb-rs')
+    # The shape the `oidc` feature's own documentation recommends: the OIDC
+    # opt-in plus a TLS root source and a crypto provider, and nothing else.
+    # `almost-all-features` also covers oidc, but with the QWP/WS sender and
+    # the egress reader switched on, so it never compiles this cfg cut --
+    # where, for instance, the isolated-worker path in `token_provider` and
+    # its statics disappear.
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,oidc',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=aws-lc-crypto,tls-native-certs,oidc',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--locked', cwd='questdb-rs-ffi')
     run_cmd('cargo', 'test', '--locked', '--features=arrow',
@@ -75,6 +91,9 @@ def run_cpp_tests():
         'test_arrow_egress',
         'test_arrow_ingress',
         'test_column_sender',
+        'test_oidc',
+        'test_oidc_examples',
+        'test_token_provider',
     ]
     # Each C++ target may also have a `_cxx20` twin (QUESTDB_TEST_CXX20_VARIANTS);
     # run it too when present so the C++20 header paths are exercised.
