@@ -65,8 +65,15 @@ pub(crate) struct OutboundFrame {
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
     pub(crate) payload: OutboundPayload,
-    /// Joins the open commit window instead of committing on its own.
-    pub(crate) windowed: bool,
+    pub(crate) window: CommitWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitWindow {
+    /// Commits on its own.
+    Outside,
+    /// Joins the open commit window; an unknown row count closes it.
+    Joins { rows: Option<usize> },
 }
 
 #[derive(Debug)]
@@ -109,7 +116,7 @@ pub(crate) struct OutboundFrameView<'a> {
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
     pub(crate) payload: &'a [u8],
-    pub(crate) windowed: bool,
+    pub(crate) window: CommitWindow,
 }
 
 impl OutboundFrame {
@@ -129,7 +136,7 @@ impl OutboundFrame {
                 fsn: self.fsn,
                 wire_seq: self.wire_seq,
                 payload,
-                windowed: self.windowed,
+                window: self.window,
             })
         })
     }

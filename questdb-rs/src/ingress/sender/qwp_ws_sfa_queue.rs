@@ -42,7 +42,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::error;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
-use super::qwp_ws_queue::{OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_queue::{CommitWindow, OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_catchup::SentDictMirror;
 use super::qwp_ws_sfa_manifest::{
     SfManifest, SfaAckWatermark, ack_watermark_path, manifest_path, sync_directory,
@@ -1388,7 +1388,7 @@ impl SfaProgressView {
             fsn,
             wire_seq,
             payload: payload.into(),
-            windowed: false,
+            window: CommitWindow::Outside,
         }))
     }
 

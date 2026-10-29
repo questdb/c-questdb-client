@@ -57,7 +57,8 @@ use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_frame_merge::FrameBatch;
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
 use super::qwp_ws_queue::{
-    OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
+    CommitWindow, OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus,
+    SentFrame,
 };
 use super::qwp_ws_sfa_catchup::{
     CatchUpEntryTooLarge, CatchUpFrameBuildError, CatchUpStreamError, SentDictMirror,
@@ -1389,7 +1390,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                         fsn,
                         wire_seq,
                         payload: payload.into(),
-                        windowed,
+                        window: if windowed {
+                            CommitWindow::Joins { rows: None }
+                        } else {
+                            CommitWindow::Outside
+                        },
                     }));
                 }
                 self.pending_frame = Some(payload);
@@ -1424,13 +1429,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         if !closed && !ended {
             return Ok(None);
         }
-        let payload = match self.pending_frame.take() {
-            Some(payload) => payload.into(),
+        let (payload, rows) = match self.pending_frame.take() {
+            Some(payload) => {
+                let rows = payload.with_bytes(FrameBatch::message_rows);
+                (payload.into(), rows)
+            }
             None => {
+                let rows = self.frame_batch.rows();
                 let mut payload = Vec::new();
                 self.frame_batch.encode(&mut payload);
                 self.frame_batch.clear();
-                payload.into()
+                (payload.into(), Some(rows))
             }
         };
         self.batch_last_fsn = None;
@@ -1443,7 +1452,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             fsn,
             wire_seq,
             payload,
-            windowed: true,
+            window: CommitWindow::Joins { rows },
         }))
     }
 
@@ -1665,7 +1674,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     fsn: 0,
                     wire_seq,
                     payload: frame_bytes,
-                    windowed: false,
+                    window: CommitWindow::Outside,
                 };
                 wire_seq += 1;
                 transport.send_frame(view).map(|_| ())
@@ -3832,7 +3841,7 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
                 }
                 if self
                     .batch
-                    .append(frame.fsn, frame.payload, rand::random(), frame.windowed)?
+                    .append(frame.fsn, frame.payload, rand::random(), frame.window)?
                 {
                     self.batch.flush(&mut self.stream)?;
                 }
@@ -5875,7 +5884,7 @@ mod tests {
             assert!(
                 !self
                     .batch
-                    .append(frame.fsn, frame.payload, [0; 4], frame.windowed)
+                    .append(frame.fsn, frame.payload, [0; 4], frame.window)
                     .unwrap()
             );
             Ok(TransportSendResult::NoResponse)
@@ -5997,8 +6006,8 @@ mod tests {
                 .unwrap();
             assert!(matches!(outbound.payload, OutboundPayload::Mapped(_)));
             assert_eq!(
-                (outbound.first_fsn, outbound.fsn, outbound.windowed),
-                (fsn, fsn, true)
+                (outbound.first_fsn, outbound.fsn, outbound.window),
+                (fsn, fsn, CommitWindow::Joins { rows: Some(1) })
             );
             outbound.with_view(|view| assert_eq!(view.payload, frame.as_slice()));
             let (sent, result) = core.send_frame(outbound);
@@ -6049,7 +6058,7 @@ mod tests {
             .next_outbound_sfa_frame_through(&progress, None, false)
             .unwrap()
         {
-            assert!(outbound.windowed);
+            assert_ne!(outbound.window, CommitWindow::Outside);
             let (sent, result) = core.send_frame(outbound);
             core.finish_send_result_hot(sent, result.unwrap()).unwrap();
         }

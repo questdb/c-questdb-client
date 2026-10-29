@@ -166,6 +166,35 @@ impl FrameBatch {
             && (max_rows == 0 || rows <= max_rows)
     }
 
+    /// Rows across every table of `payload`; only tables before the last are walked.
+    pub(crate) fn message_rows(payload: &[u8]) -> Option<usize> {
+        let header = header(payload)?;
+        let mut pos = header.entries.end;
+        let mut total = 0usize;
+        for remaining in (0..header.table_count).rev() {
+            pos = skip_bytes(payload, pos)?;
+            let (rows, next) = decode_qwp_varint(payload, pos)?;
+            let rows = usize::try_from(rows).ok()?;
+            total = total.checked_add(rows)?;
+            if remaining == 0 {
+                break;
+            }
+            let (columns, mut schema) = decode_qwp_varint(payload, next)?;
+            pos = schema;
+            for _ in 0..columns {
+                pos = skip_bytes(payload, pos)?.checked_add(1)?;
+            }
+            for _ in 0..columns {
+                schema = skip_bytes(payload, schema)?;
+                pos = parse_body(payload, pos, *payload.get(schema)?, rows)?
+                    .values
+                    .end;
+                schema += 1;
+            }
+        }
+        Some(total)
+    }
+
     /// Returns false, leaving the batch unchanged, when `payload` cannot join it.
     /// A frame at `max_bytes` or `max_rows` on its own never joins; send it as is.
     pub(crate) fn try_append(&mut self, payload: &[u8], max_bytes: usize, max_rows: usize) -> bool {
@@ -834,6 +863,27 @@ mod tests {
         buffer.at(TimestampNanos::new(value)).unwrap();
     }
 
+    fn two_tables(buffer: &mut QwpWsColumnarBuffer, value: i64) {
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", format!("s{value}"))
+            .unwrap()
+            .column_f64("px", value as f64)
+            .unwrap()
+            .at(TimestampNanos::new(value))
+            .unwrap();
+        buffer
+            .table("quotes")
+            .unwrap()
+            .column_i64("bid", value)
+            .unwrap()
+            .column_str("venue", format!("v{value}"))
+            .unwrap()
+            .at(TimestampNanos::new(value))
+            .unwrap();
+    }
+
     fn qty(buffer: &mut QwpWsColumnarBuffer, value: i64) {
         buffer
             .table("trades")
@@ -896,28 +946,31 @@ mod tests {
 
     #[test]
     fn splices_multi_table_frames_per_table() {
-        let (frames, expected) = frames(&[1, 2, 1], |buffer, value| {
-            buffer
-                .table("trades")
-                .unwrap()
-                .symbol("sym", format!("s{value}"))
-                .unwrap()
-                .column_f64("px", value as f64)
-                .unwrap()
-                .at(TimestampNanos::new(value))
-                .unwrap();
-            buffer
-                .table("quotes")
-                .unwrap()
-                .column_i64("bid", value)
-                .unwrap()
-                .column_str("venue", format!("v{value}"))
-                .unwrap()
-                .at(TimestampNanos::new(value))
-                .unwrap();
-        });
+        let (frames, expected) = frames(&[1, 2, 1], two_tables);
         assert_eq!(u16::from_le_bytes([expected[6], expected[7]]), 2);
         assert_eq!(splice(&frames), expected);
+    }
+
+    #[test]
+    fn message_rows_counts_rows_of_every_table() {
+        let (frames, expected) = frames(&[1, 2, 1], two_tables);
+        let rows: Vec<_> = frames
+            .iter()
+            .map(|frame| FrameBatch::message_rows(frame))
+            .collect();
+        assert_eq!(rows, [Some(2), Some(4), Some(2)]);
+        assert_eq!(FrameBatch::message_rows(&expected), Some(8));
+        assert_eq!(
+            FrameBatch::message_rows(&raw_tables(&[(2, 5, &[0; 17]), (3, 5, &[0; 25])])),
+            Some(5)
+        );
+        assert_eq!(
+            FrameBatch::message_rows(&raw_tables(&[(2, 8, &[0; 17]), (3, 5, &[0; 25])])),
+            None
+        );
+        let mut no_delta = frames[0].clone();
+        no_delta[5] = 0;
+        assert_eq!(FrameBatch::message_rows(&no_delta), None);
     }
 
     #[test]
@@ -1215,11 +1268,19 @@ mod tests {
     }
 
     fn raw_frame(rows: u64, kind: u8, body: &[u8]) -> Vec<u8> {
-        let mut payload = vec![0, 0, 1, b't'];
-        write_varint(&mut payload, rows);
-        payload.extend_from_slice(&[1, 1, b'c', kind]);
-        payload.extend_from_slice(body);
-        let mut frame = b"QWP1\x01\x08\x01\x00".to_vec();
+        raw_tables(&[(rows, kind, body)])
+    }
+
+    fn raw_tables(tables: &[(u64, u8, &[u8])]) -> Vec<u8> {
+        let mut payload = vec![0, 0];
+        for &(rows, kind, body) in tables {
+            payload.extend_from_slice(&[1, b't']);
+            write_varint(&mut payload, rows);
+            payload.extend_from_slice(&[1, 1, b'c', kind]);
+            payload.extend_from_slice(body);
+        }
+        let mut frame = b"QWP1\x01\x08".to_vec();
+        frame.extend_from_slice(&(tables.len() as u16).to_le_bytes());
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&payload);
         frame
