@@ -162,6 +162,29 @@ inline int64_t epoch_ms(std::chrono::system_clock::time_point t) noexcept
         .count();
 }
 
+/** The instant `ms` milliseconds after the Unix epoch, saturated to the
+ *  clock's range: a token that does not expire is reported as expiring in
+ *  9999, which lies past the end of a nanosecond `system_clock`. */
+inline std::chrono::system_clock::time_point from_epoch_ms(int64_t ms) noexcept
+{
+    // `(f)()` keeps `max` and `min` safe from `<windows.h>` macros.
+    using clock = std::chrono::system_clock;
+    constexpr int64_t max_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            (clock::time_point::max)().time_since_epoch())
+            .count();
+    constexpr int64_t min_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            (clock::time_point::min)().time_since_epoch())
+            .count();
+    if (ms >= max_ms)
+        return (clock::time_point::max)();
+    if (ms <= min_ms)
+        return (clock::time_point::min)();
+    return clock::time_point{std::chrono::duration_cast<clock::duration>(
+        std::chrono::milliseconds{ms})};
+}
+
 inline void set_sink_error(
     ::questdb_token_sink* sink,
     bool retryable,
@@ -274,6 +297,40 @@ inline void provider_on_rejected(
     }
 }
 } // namespace detail
+
+/** The most recent failed fetch of a refreshing provider; see
+ *  `token_provider_status`. */
+struct token_fetch_failure
+{
+    /** Whether the source classified the failure as retryable. */
+    bool retryable{false};
+    /** The source's suggested wait before retrying, if it gave one. */
+    std::optional<std::chrono::milliseconds> retry_after{};
+    /** When the fetch failed. */
+    std::chrono::system_clock::time_point at{};
+    /** The failure message, sanitized and at most 256 characters. */
+    std::string message{};
+};
+
+/**
+ * A snapshot of a refreshing provider's state, from `token_provider::status()`.
+ * Never contains the token. The same snapshot is
+ * `questdb_token_provider_get_status` in C and
+ * `RefreshingTokenProvider::status` in Rust.
+ */
+struct token_provider_status
+{
+    /** Whether the provider is closed. */
+    bool closed{false};
+    /** Failed fetches since the last successful one. */
+    uint32_t consecutive_failures{0};
+    /** When the held token expires, if one is held. */
+    std::optional<std::chrono::system_clock::time_point> token_expires_at{};
+    /** When the last successful fetch completed. */
+    std::optional<std::chrono::system_clock::time_point> last_success_at{};
+    /** The most recent failed fetch, kept after the source recovers. */
+    std::optional<token_fetch_failure> last_failure{};
+};
 
 /**
  * A rotating Bearer-token provider for senders, readers and pools; see
@@ -471,6 +528,63 @@ public:
     void close() const
     {
         ::questdb_token_provider_close(_raw);
+    }
+
+    /**
+     * A refreshing provider's state: whether it is closed, when its token
+     * expires, its last successful fetch and its most recent failure. Never
+     * contains the token. `std::nullopt` for a provider implemented by the
+     * application, which keeps no such state.
+     * @throws questdb::error with `invalid_api_call` if this handle is empty
+     *         or moved from.
+     */
+    std::optional<token_provider_status> status() const
+    {
+        if (!_raw)
+        {
+            throw ::questdb::error{
+                ::questdb::error_code::invalid_api_call,
+                "Cannot read the status of an empty or moved-from "
+                "questdb::token_provider."};
+        }
+        // 1024 bytes hold any message (`questdb_token_provider_get_status`);
+        // a longer one is read again into a buffer of its reported length.
+        std::string message(1024, '\0');
+        ::questdb_token_provider_status raw{};
+        for (;;)
+        {
+            raw = ::questdb_token_provider_status{};
+            raw.struct_size = sizeof raw;
+            raw.last_failure_msg = message.data();
+            raw.last_failure_msg_capacity = message.size();
+            if (!::questdb_token_provider_get_status(_raw, &raw))
+                return std::nullopt;
+            if (raw.last_failure_msg_len <= message.size())
+                break;
+            message.resize(raw.last_failure_msg_len);
+        }
+        token_provider_status status;
+        status.closed = raw.closed;
+        status.consecutive_failures = raw.consecutive_failures;
+        if (raw.token_expires_at_ms != -1)
+            status.token_expires_at =
+                detail::from_epoch_ms(raw.token_expires_at_ms);
+        if (raw.last_success_at_ms != -1)
+            status.last_success_at =
+                detail::from_epoch_ms(raw.last_success_at_ms);
+        if (raw.has_last_failure)
+        {
+            token_fetch_failure failure;
+            failure.retryable = raw.last_failure_retryable;
+            if (raw.last_failure_retry_after_ms != -1)
+                failure.retry_after =
+                    std::chrono::milliseconds{raw.last_failure_retry_after_ms};
+            failure.at = detail::from_epoch_ms(raw.last_failure_at_ms);
+            message.resize(raw.last_failure_msg_len);
+            failure.message = std::move(message);
+            status.last_failure = std::move(failure);
+        }
+        return status;
     }
 
     const ::questdb_token_provider* raw() const noexcept

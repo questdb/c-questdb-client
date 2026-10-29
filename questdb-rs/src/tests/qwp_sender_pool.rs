@@ -10470,6 +10470,82 @@ fn pooled_lease_wait_inside_auth_callback_is_rejected() {
         .expect("the frame must drain after the callback returns");
 }
 
+#[test]
+fn pooled_lease_wait_inside_a_callback_that_starts_during_the_reconnect_pull_is_rejected() {
+    // As above, except that the callback starts only once the lease's runner
+    // has begun its reconnect pull, whose isolated worker the callback then
+    // refuses. The wait must be rejected after that attempt, not one
+    // reconnect backoff later at the next one.
+    thread_local! {
+        static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    const REFUSAL: &str = "simulated auth callback is running; no token";
+    // Jittered into [backoff / 2, 3 * backoff / 2): a rejection deferred to
+    // the next attempt takes at least 2.5 s.
+    const BACKOFF_MS: u64 = 5000;
+    let active = Arc::new(AtomicBool::new(false));
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let isolation = crate::TokenProviderIsolation::with_callback_guards(
+        {
+            let active = Arc::clone(&active);
+            move || active.load(Ordering::SeqCst)
+        },
+        || IN_CALLBACK.with(std::cell::Cell::get),
+    );
+    let server = MockServer::spawn_reconnecting(8);
+    let conf = format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;auth_timeout=2000;\
+         reconnect_max_duration_millis=60000;reconnect_initial_backoff_millis={BACKOFF_MS};\
+         reconnect_max_backoff_millis={BACKOFF_MS};sender_pool_min=1;sender_pool_max=1;\
+         pool_reap=manual;close_flush_timeout_millis=0;",
+        server.port()
+    );
+    let db = QuestDb::connect_with_handlers_and_token_provider_with_isolation(
+        &conf,
+        crate::db::ConnectHandlers::default(),
+        {
+            let active = Arc::clone(&active);
+            let pulls = Arc::clone(&pulls);
+            move || {
+                // Pull 0 is the initial connect. Pull 1 is the reconnect after
+                // the mock drops the connection: the callback starts now,
+                // after the runner's entry check, and refuses it.
+                if pulls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    active.store(true, Ordering::SeqCst);
+                }
+                if active.load(Ordering::SeqCst) {
+                    Err(crate::Error::new(ErrorCode::AuthError, REFUSAL))
+                } else {
+                    Ok::<_, crate::Error>("tok".to_string())
+                }
+            }
+        },
+        isolation,
+    )
+    .unwrap();
+    let mut sender = db.borrow_sender().expect("SFA borrow");
+    let mut buffer = one_symbol_buffer(&db, "alpha");
+
+    IN_CALLBACK.with(|c| c.set(true));
+    sender.flush_buffer_and_get_fsn(&mut buffer).unwrap();
+    let started = Instant::now();
+    let result = sender.wait(AckLevel::Ok, Duration::from_secs(30));
+    let elapsed = started.elapsed();
+    IN_CALLBACK.with(|c| c.set(false));
+    active.store(false, Ordering::SeqCst);
+
+    let err = result.expect_err("the in-callback wait must be rejected");
+    assert!(
+        err.msg().contains(REFUSAL),
+        "expected the provider's refusal, got: {}",
+        err.msg()
+    );
+    assert!(
+        elapsed < Duration::from_millis(BACKOFF_MS / 4),
+        "the wait was rejected only after {elapsed:?}, at the next reconnect attempt"
+    );
+}
+
 /// Every connect answers `421` with `X-QuestDB-Role: REPLICA`, until `done`.
 #[cfg(feature = "ffi-support")]
 fn spawn_replica_role_rejector(done: Arc<AtomicBool>) -> (u16, thread::JoinHandle<usize>) {

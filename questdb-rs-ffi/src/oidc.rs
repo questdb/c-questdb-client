@@ -2384,6 +2384,27 @@ pub(crate) unsafe fn write_versioned_output<T>(out: *mut T, capacity: usize, val
     };
 }
 
+/// The field at `offset` of a caller's size-prefixed input struct, or
+/// `default` when the caller's `struct_size` ends before the field does: a
+/// caller built against an older header never set the fields appended since.
+///
+/// # Safety
+/// `input` must point to at least `struct_size` readable bytes, laid out as
+/// the prefix of `S` they cover, and `offset` must be that of a `T` field.
+pub(crate) unsafe fn read_versioned_input_field<S, T: Copy>(
+    input: *const S,
+    struct_size: usize,
+    offset: usize,
+    default: T,
+) -> T {
+    match offset.checked_add(std::mem::size_of::<T>()) {
+        Some(end) if end <= struct_size => unsafe {
+            input.cast::<u8>().add(offset).cast::<T>().read()
+        },
+        _ => default,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_auth_get_config(
     auth: *const questdb_oidc_auth,

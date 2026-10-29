@@ -97,6 +97,61 @@ TEST_CASE("A token that never expires is served")
     });
     CHECK(provider.await_ready(10s));
     CHECK(provider.token() == "forever");
+
+    // Its expiry can lie past the end of a nanosecond clock: the status
+    // saturates rather than overflows.
+    const auto status = provider.status();
+    REQUIRE(status.has_value());
+    REQUIRE(status->token_expires_at.has_value());
+    CHECK(
+        *status->token_expires_at >
+        std::chrono::system_clock::now() + 24h * 365 * 100);
+}
+
+TEST_CASE("A refreshing provider reports its status")
+{
+    std::atomic<bool> fail{true};
+    questdb::refreshing_token_provider_options options;
+    options.cold_wait = 50ms;
+    auto provider = questdb::token_provider::refreshing(
+        [&fail]() -> questdb::expiring_token {
+            if (fail.load())
+                throw questdb::token_unavailable{
+                    "identity not assigned", false, 20ms};
+            return questdb::expiring_token{
+                "T", std::chrono::system_clock::now() + 1h};
+        },
+        options);
+    CHECK_THROWS_AS(provider.token(), questdb::error);
+
+    auto status = provider.status();
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->closed);
+    CHECK(status->consecutive_failures >= 1);
+    CHECK_FALSE(status->token_expires_at.has_value());
+    CHECK_FALSE(status->last_success_at.has_value());
+    REQUIRE(status->last_failure.has_value());
+    CHECK_FALSE(status->last_failure->retryable);
+    REQUIRE(status->last_failure->retry_after.has_value());
+    CHECK(*status->last_failure->retry_after == 20ms);
+    CHECK(status->last_failure->message == "identity not assigned");
+    CHECK(status->last_failure->at <= std::chrono::system_clock::now());
+
+    // The source recovers: the token is reported and the failure is kept.
+    fail = false;
+    REQUIRE(provider.await_ready(10s));
+    status = provider.status();
+    REQUIRE(status.has_value());
+    CHECK(status->consecutive_failures == 0);
+    REQUIRE(status->token_expires_at.has_value());
+    CHECK(*status->token_expires_at > std::chrono::system_clock::now() + 30min);
+    CHECK(status->last_success_at.has_value());
+    CHECK(status->last_failure.has_value());
+
+    provider.close();
+    status = provider.status();
+    REQUIRE(status.has_value());
+    CHECK(status->closed);
 }
 
 TEST_CASE("Negative provider durations are rejected before conversion")
@@ -241,6 +296,16 @@ TEST_CASE("An application provider hears rejections and is released")
         CHECK(provider.await_ready(0ms));
     }
     CHECK(watch.expired());
+}
+
+TEST_CASE("Only a refreshing provider has a status")
+{
+    auto provider =
+        questdb::token_provider::from(std::make_shared<recording_provider>());
+    CHECK_FALSE(provider.status().has_value());
+
+    auto moved = std::move(provider);
+    CHECK_THROWS_AS(provider.status(), questdb::error);
 }
 
 TEST_CASE("A provider attaches to HTTP and WebSocket sender options only")

@@ -989,6 +989,7 @@ impl TokenProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
+            let callback_active = self.callback_is_active();
             match &*done {
                 // Another caller's acquisition, which did not tell the
                 // provider about this caller's rejection. It has retired:
@@ -996,11 +997,20 @@ impl TokenProvider {
                 IsolatedOutcome::Done(_) if only_with_rejection && !carries_rejection => {
                     return None;
                 }
+                // A refusal published while one of the auth's callbacks runs.
+                // The callback began after the entry check above, and the
+                // worker's pull records nothing for this attachment. Resolve
+                // on this thread below, as the other callback-active paths
+                // do, so `callback_wait_error` sees this attempt's outcome:
+                // returning the worker's error left a wait inside that
+                // callback parked until the next reconnect attempt, a full
+                // backoff later.
+                IsolatedOutcome::Done(Err(_)) if callback_active => {}
                 IsolatedOutcome::Done(result) => return Some((result.clone(), carries_rejection)),
                 IsolatedOutcome::Abandoned => return None,
                 IsolatedOutcome::Pending => {}
             }
-            if self.callback_is_active() {
+            if callback_active {
                 drop(done);
                 return Some((self.resolve_during_callback(), true));
             }
@@ -1983,6 +1993,71 @@ mod tests {
             let o = owner.clone();
             assert!(on_callback_thread(move || o.callback_wait_error()).is_none());
             assert!(!owner.callback_blocked.load(Ordering::SeqCst));
+        }
+
+        #[cfg(feature = "_sender-qwp-ws")]
+        #[test]
+        fn a_callback_that_starts_during_the_workers_pull_blocks_the_attempt() {
+            // The callback begins after the lead's entry check, while its
+            // worker pulls, and refuses that pull. The attempt must still
+            // record that a wait inside the callback cannot complete, or the
+            // wait stays parked until the next reconnect attempt.
+            std::thread_local! {
+                static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            // Whether the lead sees the published refusal or the active
+            // callback first is decided per attempt, so repeat it.
+            for _ in 0..20 {
+                let callback_active = Arc::new(AtomicBool::new(false));
+                let isolation = TokenProviderIsolation::with_callback_guards(
+                    {
+                        let callback_active = Arc::clone(&callback_active);
+                        move || callback_active.load(Ordering::SeqCst)
+                    },
+                    || IN_CALLBACK.with(|c| c.get()),
+                );
+                let calls = Arc::new(AtomicUsize::new(0));
+                let provider = TokenProvider::new_with_isolation(
+                    {
+                        let callback_active = Arc::clone(&callback_active);
+                        let calls = Arc::clone(&calls);
+                        move || {
+                            // The first pull is the worker's: the callback
+                            // starts now and refuses it, as OIDC refuses an
+                            // uncached pull while one of its callbacks runs.
+                            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                callback_active.store(true, Ordering::SeqCst);
+                                return Err(crate::error::fmt!(SocketError, "worker refused"));
+                            }
+                            Err(crate::error::fmt!(
+                                SocketError,
+                                "callback must return first"
+                            ))
+                        }
+                    },
+                    isolation,
+                )
+                .for_attachment();
+
+                let lead = provider.clone();
+                let err = std::thread::spawn(move || lead.bearer_header_isolated_until(|| false))
+                    .join()
+                    .unwrap()
+                    .unwrap_err();
+                // Resolved again on the lead's thread, not the worker's error.
+                assert!(err.msg().contains("callback must return first"), "{err}");
+                let p = provider.clone();
+                let rejected = std::thread::spawn(move || {
+                    IN_CALLBACK.with(|c| c.set(true));
+                    p.callback_wait_error()
+                })
+                .join()
+                .unwrap();
+                assert!(
+                    rejected.is_some(),
+                    "a wait inside the callback must be rejected after this attempt"
+                );
+            }
         }
 
         #[cfg(feature = "_sender-qwp-ws")]

@@ -200,6 +200,11 @@ typedef void (*questdb_token_release_fn)(void* user_data);
  * `questdb_refreshing_token_provider_options_init(&options, sizeof options)`,
  * which fills in the specification's defaults, then override what you need.
  * `struct_size` records the caller's allocation size; do not modify it.
+ *
+ * Fields may be appended in later versions. A library reads only the fields
+ * that lie within `struct_size` and keeps its defaults for the rest, so a
+ * program built against an older header works with a newer library, and an
+ * older library ignores the fields it does not know.
  */
 typedef struct questdb_refreshing_token_provider_options
 {
@@ -237,7 +242,9 @@ typedef struct questdb_refreshing_token_provider_options
     uint64_t forced_wait_ms;
 } questdb_refreshing_token_provider_options;
 
-/** Fill `options` with the defaults. `struct_size` is `sizeof *options`. */
+/** Fill `options` with the defaults and record `struct_size`, which is
+ *  `sizeof *options`, in `options->struct_size`. Only the fields this library
+ *  knows are written. */
 QUESTDB_CLIENT_API
 void questdb_refreshing_token_provider_options_init(
     questdb_refreshing_token_provider_options* options, size_t struct_size);
@@ -264,7 +271,8 @@ questdb_token_provider* questdb_refreshing_token_provider_new(
 /**
  * Function table of an application-implemented provider. Set `struct_size` to
  * `sizeof(questdb_token_provider_vtable)`. `get_token` is required; the other
- * entries may be NULL.
+ * entries may be NULL. Entries may be appended in later versions: a library
+ * treats an entry that lies past `struct_size` as NULL.
  */
 typedef struct questdb_token_provider_vtable
 {
@@ -388,7 +396,9 @@ typedef struct questdb_token_provider_status
  * buffer for the message (1024 bytes always suffice), which is truncated at a
  * character boundary to fit. Returns false for NULL, an application provider,
  * or an undersized `out`, whose `struct_size` is then set to the size this
- * library requires.
+ * library requires. On success `struct_size` is replaced with the prefix the
+ * library wrote; code that can load an older shared library must re-read it
+ * before accessing a field appended later.
  */
 QUESTDB_CLIENT_API
 bool questdb_token_provider_get_status(
@@ -408,7 +418,9 @@ typedef struct questdb_token_unavailable_view
  * source or provider failed to supply a token. Set `out->struct_size` to
  * `sizeof *out`. Returns false when the error carries none, or for an
  * undersized `out`, whose `struct_size` is then set to the size this library
- * requires.
+ * requires. On success `struct_size` is replaced with the prefix the library
+ * wrote; code that can load an older shared library must re-read it before
+ * accessing a field appended later.
  */
 QUESTDB_CLIENT_API
 bool questdb_error_token_unavailable_get_view(

@@ -42,7 +42,7 @@ use questdb::token_provider::{
 use questdb::{Error, ErrorCode, TokenProviderIsolation};
 use zeroize::Zeroizing;
 
-use crate::oidc::{versioned_output_capacity, write_versioned_output};
+use crate::oidc::{read_versioned_input_field, versioned_output_capacity, write_versioned_output};
 use crate::{line_sender_opts, questdb_error, set_err_out_from_error};
 
 /// Fetch a new token for a refreshing provider: call exactly one of
@@ -76,8 +76,13 @@ pub struct questdb_token_provider_vtable {
     pub release: Option<questdb_token_release_fn>,
 }
 
+// The first published layout ends at `release`. Keep this minimum pinned when
+// entries are appended: a newer library must keep accepting an older caller's
+// complete v1 table, and `read_vtable` treats every entry past the caller's
+// `struct_size` as absent.
 const QUESTDB_TOKEN_PROVIDER_VTABLE_V1_SIZE: usize =
-    std::mem::size_of::<questdb_token_provider_vtable>();
+    std::mem::offset_of!(questdb_token_provider_vtable, release)
+        + std::mem::size_of::<Option<questdb_token_release_fn>>();
 
 /// Parameters of a refreshing provider (spec §5.1). Initialize with
 /// `questdb_refreshing_token_provider_options_init`, which fills in the
@@ -98,8 +103,13 @@ pub struct questdb_refreshing_token_provider_options {
     pub forced_wait_ms: u64,
 }
 
+// The first published layout ends at `forced_wait_ms`. Keep this minimum
+// pinned when fields are appended: a newer library must keep accepting an
+// older caller's complete v1 options, and `read_refreshing_options` defaults
+// every field past the caller's `struct_size`.
 const QUESTDB_REFRESHING_TOKEN_PROVIDER_OPTIONS_V1_SIZE: usize =
-    std::mem::size_of::<questdb_refreshing_token_provider_options>();
+    std::mem::offset_of!(questdb_refreshing_token_provider_options, forced_wait_ms)
+        + std::mem::size_of::<u64>();
 
 impl Default for questdb_refreshing_token_provider_options {
     fn default() -> Self {
@@ -138,8 +148,11 @@ pub struct questdb_token_provider_status {
     pub last_failure_msg_len: size_t,
 }
 
+// Pin the initial output layouts independently of future appended fields, as
+// for the OIDC views: an older caller's v1 struct keeps receiving its prefix.
 const QUESTDB_TOKEN_PROVIDER_STATUS_V1_SIZE: usize =
-    std::mem::size_of::<questdb_token_provider_status>();
+    std::mem::offset_of!(questdb_token_provider_status, last_failure_msg_len)
+        + std::mem::size_of::<size_t>();
 
 /// The token-unavailable classification of an error.
 #[repr(C)]
@@ -150,7 +163,78 @@ pub struct questdb_token_unavailable_view {
 }
 
 const QUESTDB_TOKEN_UNAVAILABLE_VIEW_V1_SIZE: usize =
-    std::mem::size_of::<questdb_token_unavailable_view>();
+    std::mem::offset_of!(questdb_token_unavailable_view, retry_after_ms)
+        + std::mem::size_of::<i64>();
+
+/// The caller's function table, read entry by entry up to its `struct_size`:
+/// an entry appended after the caller's header was published reads as absent.
+/// Every entry is listed, so a new one cannot be read past an older caller's
+/// table.
+///
+/// # Safety
+/// `vtable` must point to at least `struct_size` readable bytes.
+unsafe fn read_vtable(
+    vtable: *const questdb_token_provider_vtable,
+    struct_size: usize,
+) -> questdb_token_provider_vtable {
+    macro_rules! entry {
+        ($name:ident) => {
+            unsafe {
+                read_versioned_input_field(
+                    vtable,
+                    struct_size,
+                    std::mem::offset_of!(questdb_token_provider_vtable, $name),
+                    None,
+                )
+            }
+        };
+    }
+    questdb_token_provider_vtable {
+        struct_size,
+        get_token: entry!(get_token),
+        on_rejected: entry!(on_rejected),
+        release: entry!(release),
+    }
+}
+
+/// The caller's options, read field by field up to its `struct_size`: a field
+/// appended after the caller's header was published keeps its default. Every
+/// field is listed, so a new one cannot be read past an older caller's struct.
+///
+/// # Safety
+/// `options` must point to at least `struct_size` readable bytes.
+unsafe fn read_refreshing_options(
+    options: *const questdb_refreshing_token_provider_options,
+    struct_size: usize,
+) -> questdb_refreshing_token_provider_options {
+    let defaults = questdb_refreshing_token_provider_options::default();
+    macro_rules! field {
+        ($name:ident) => {
+            unsafe {
+                read_versioned_input_field(
+                    options,
+                    struct_size,
+                    std::mem::offset_of!(questdb_refreshing_token_provider_options, $name),
+                    defaults.$name,
+                )
+            }
+        };
+    }
+    questdb_refreshing_token_provider_options {
+        struct_size,
+        name: field!(name),
+        name_len: field!(name_len),
+        refresh_margin_ms: field!(refresh_margin_ms),
+        min_refresh_interval_ms: field!(min_refresh_interval_ms),
+        handout_floor_ms: field!(handout_floor_ms),
+        cold_wait_ms: field!(cold_wait_ms),
+        backoff_initial_ms: field!(backoff_initial_ms),
+        backoff_max_ms: field!(backoff_max_ms),
+        retry_after_max_ms: field!(retry_after_max_ms),
+        forced_min_interval_ms: field!(forced_min_interval_ms),
+        forced_wait_ms: field!(forced_wait_ms),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Sink
@@ -557,7 +641,9 @@ fn new_handle(kind: ProviderKind) -> *mut questdb_token_provider {
 }
 
 /// Fill `options` with the specification's defaults. `struct_size` is the
-/// caller's allocation size.
+/// caller's allocation size, and is recorded in `options->struct_size`. Only
+/// the fields this library knows are written: a newer caller's later fields
+/// are left as they are, and this library never reads them.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_refreshing_token_provider_options_init(
     options: *mut questdb_refreshing_token_provider_options,
@@ -566,10 +652,11 @@ pub unsafe extern "C" fn questdb_refreshing_token_provider_options_init(
     if options.is_null() || struct_size < std::mem::size_of::<size_t>() {
         return;
     }
-    let mut value = questdb_refreshing_token_provider_options::default();
-    let written = struct_size.min(std::mem::size_of::<questdb_refreshing_token_provider_options>());
-    value.struct_size = written;
-    unsafe { write_versioned_output(options, written, &value) };
+    let value = questdb_refreshing_token_provider_options {
+        struct_size,
+        ..Default::default()
+    };
+    unsafe { write_versioned_output(options, struct_size, &value) };
 }
 
 /// Create a refreshing provider around a C token source. On success the
@@ -606,7 +693,7 @@ pub unsafe extern "C" fn questdb_refreshing_token_provider_new(
                 ),
             );
         }
-        unsafe { options.read() }
+        unsafe { read_refreshing_options(options, size) }
     };
     let name = if !options.name.is_null() && options.name_len > 0 {
         let bytes =
@@ -684,7 +771,7 @@ pub unsafe extern "C" fn questdb_token_provider_new(
             ),
         );
     }
-    let vtable = unsafe { vtable.read() };
+    let vtable = unsafe { read_vtable(vtable, size) };
     let Some(get_token) = vtable.get_token else {
         return invalid(
             err_out,
@@ -1099,6 +1186,243 @@ mod tests {
             c_struct_fields(TOKEN_PROVIDER_H, "questdb_token_unavailable_view"),
             ["struct_size", "retryable", "retry_after_ms"]
         );
+    }
+
+    // Frozen copies of the first published layouts. They deliberately remain
+    // unchanged when fields are appended to the live structs: a library has to
+    // keep serving callers built against them.
+    #[repr(C)]
+    struct TokenProviderVtableV1 {
+        struct_size: size_t,
+        get_token: Option<questdb_token_get_fn>,
+        on_rejected: Option<questdb_token_rejected_fn>,
+        release: Option<questdb_token_release_fn>,
+    }
+
+    #[repr(C)]
+    struct RefreshingTokenProviderOptionsV1 {
+        struct_size: size_t,
+        name: *const c_char,
+        name_len: size_t,
+        refresh_margin_ms: u64,
+        min_refresh_interval_ms: u64,
+        handout_floor_ms: u64,
+        cold_wait_ms: u64,
+        backoff_initial_ms: u64,
+        backoff_max_ms: u64,
+        retry_after_max_ms: u64,
+        forced_min_interval_ms: u64,
+        forced_wait_ms: u64,
+    }
+
+    #[repr(C)]
+    struct GuardedRefreshingTokenProviderOptionsV1 {
+        options: RefreshingTokenProviderOptionsV1,
+        canary: [u8; 16],
+    }
+
+    #[repr(C)]
+    struct TokenProviderStatusV1 {
+        struct_size: size_t,
+        closed: bool,
+        has_last_failure: bool,
+        last_failure_retryable: bool,
+        consecutive_failures: u32,
+        token_expires_at_ms: i64,
+        last_success_at_ms: i64,
+        last_failure_retry_after_ms: i64,
+        last_failure_at_ms: i64,
+        last_failure_msg: *mut c_char,
+        last_failure_msg_capacity: size_t,
+        last_failure_msg_len: size_t,
+    }
+
+    #[repr(C)]
+    struct GuardedTokenProviderStatusV1 {
+        status: TokenProviderStatusV1,
+        canary: [u8; 16],
+    }
+
+    #[repr(C)]
+    struct TokenUnavailableViewV1 {
+        struct_size: size_t,
+        retryable: bool,
+        retry_after_ms: i64,
+    }
+
+    #[repr(C)]
+    struct GuardedTokenUnavailableViewV1 {
+        view: TokenUnavailableViewV1,
+        canary: [u8; 16],
+    }
+
+    #[test]
+    fn the_minimum_struct_sizes_stay_pinned_to_the_first_published_layouts() {
+        // Each minimum ends where the frozen layout's last field does, so
+        // appending a field to a live struct must not raise it.
+        assert_eq!(
+            std::mem::offset_of!(TokenProviderVtableV1, release)
+                + size_of::<Option<questdb_token_release_fn>>(),
+            QUESTDB_TOKEN_PROVIDER_VTABLE_V1_SIZE
+        );
+        assert_eq!(
+            std::mem::offset_of!(RefreshingTokenProviderOptionsV1, forced_wait_ms)
+                + size_of::<u64>(),
+            QUESTDB_REFRESHING_TOKEN_PROVIDER_OPTIONS_V1_SIZE
+        );
+        assert_eq!(
+            std::mem::offset_of!(TokenProviderStatusV1, last_failure_msg_len) + size_of::<size_t>(),
+            QUESTDB_TOKEN_PROVIDER_STATUS_V1_SIZE
+        );
+        assert_eq!(
+            std::mem::offset_of!(TokenUnavailableViewV1, retry_after_ms) + size_of::<i64>(),
+            QUESTDB_TOKEN_UNAVAILABLE_VIEW_V1_SIZE
+        );
+    }
+
+    #[test]
+    fn input_fields_past_the_callers_struct_size_keep_their_defaults() {
+        // As if the caller's header predated the last field: it is not read.
+        let defaults = questdb_refreshing_token_provider_options::default();
+        let options = questdb_refreshing_token_provider_options {
+            cold_wait_ms: 7,
+            forced_wait_ms: 9,
+            ..Default::default()
+        };
+        let cut = std::mem::offset_of!(questdb_refreshing_token_provider_options, forced_wait_ms);
+        let read = unsafe { read_refreshing_options(&options, cut) };
+        assert_eq!(read.struct_size, cut);
+        assert_eq!(read.cold_wait_ms, 7);
+        assert_eq!(read.forced_wait_ms, defaults.forced_wait_ms);
+
+        let vtable = questdb_token_provider_vtable {
+            struct_size: size_of::<questdb_token_provider_vtable>(),
+            get_token: Some(get_token),
+            on_rejected: Some(on_rejected),
+            release: Some(release),
+        };
+        let cut = std::mem::offset_of!(questdb_token_provider_vtable, release);
+        let read = unsafe { read_vtable(&vtable, cut) };
+        assert!(read.get_token.is_some() && read.on_rejected.is_some());
+        assert!(read.release.is_none());
+    }
+
+    #[test]
+    fn options_init_records_the_callers_size_and_leaves_a_newer_tail_alone() {
+        #[repr(C)]
+        struct NewerOptions {
+            options: questdb_refreshing_token_provider_options,
+            tail: [u64; 2],
+        }
+        let mut newer = unsafe { std::mem::zeroed::<NewerOptions>() };
+        newer.tail = [0xDEAD_BEEF, 0xCAFE_BABE];
+        unsafe {
+            questdb_refreshing_token_provider_options_init(
+                &mut newer.options,
+                size_of::<NewerOptions>(),
+            )
+        };
+        assert_eq!(newer.options.struct_size, size_of::<NewerOptions>());
+        assert_eq!(
+            newer.options.forced_wait_ms,
+            questdb_refreshing_token_provider_options::default().forced_wait_ms
+        );
+        assert_eq!(newer.tail, [0xDEAD_BEEF, 0xCAFE_BABE]);
+
+        let mut older = unsafe { std::mem::zeroed::<GuardedRefreshingTokenProviderOptionsV1>() };
+        older.canary = [0xA5; 16];
+        unsafe {
+            questdb_refreshing_token_provider_options_init(
+                (&mut older.options as *mut RefreshingTokenProviderOptionsV1).cast(),
+                size_of::<RefreshingTokenProviderOptionsV1>(),
+            )
+        };
+        assert_eq!(
+            older.options.struct_size,
+            size_of::<RefreshingTokenProviderOptionsV1>()
+        );
+        assert_eq!(older.canary, [0xA5; 16]);
+
+        for options in [
+            ptr::from_ref(&newer.options),
+            (&older.options as *const RefreshingTokenProviderOptionsV1).cast(),
+        ] {
+            let probe = Box::leak(Box::new(Probe::default()));
+            let mut err: *mut questdb_error = ptr::null_mut();
+            let provider = unsafe {
+                questdb_refreshing_token_provider_new(
+                    Some(source),
+                    ptr::from_mut(probe).cast(),
+                    None,
+                    options,
+                    &mut err,
+                )
+            };
+            assert!(!provider.is_null() && err.is_null());
+            unsafe { questdb_token_provider_free(provider) };
+        }
+    }
+
+    #[test]
+    fn outputs_are_written_only_within_an_older_callers_struct() {
+        let probe = Box::leak(Box::new(Probe {
+            fail: true,
+            ..Probe::default()
+        }));
+        let mut options =
+            unsafe { std::mem::zeroed::<questdb_refreshing_token_provider_options>() };
+        unsafe {
+            questdb_refreshing_token_provider_options_init(&mut options, size_of_val(&options))
+        };
+        options.cold_wait_ms = 50;
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let provider = unsafe {
+            questdb_refreshing_token_provider_new(
+                Some(source),
+                ptr::from_mut(probe).cast(),
+                None,
+                &options,
+                &mut err,
+            )
+        };
+        assert!(!provider.is_null());
+        await_count(&probe.fetches, 1);
+        let token = unsafe { questdb_token_provider_token(provider, &mut err) };
+        assert!(token.is_null() && !err.is_null());
+
+        let mut view = unsafe { std::mem::zeroed::<GuardedTokenUnavailableViewV1>() };
+        view.canary = [0x5A; 16];
+        view.view.struct_size = size_of::<TokenUnavailableViewV1>();
+        assert!(unsafe {
+            questdb_error_token_unavailable_get_view(
+                err,
+                (&mut view.view as *mut TokenUnavailableViewV1).cast(),
+            )
+        });
+        assert_eq!(view.view.struct_size, size_of::<TokenUnavailableViewV1>());
+        assert!(!view.view.retryable);
+        assert!(view.view.retry_after_ms > 0);
+        assert_eq!(view.canary, [0x5A; 16]);
+        unsafe { crate::questdb_error_free(err) };
+
+        let mut status = unsafe { std::mem::zeroed::<GuardedTokenProviderStatusV1>() };
+        status.canary = [0xA5; 16];
+        status.status.struct_size = size_of::<TokenProviderStatusV1>();
+        assert!(unsafe {
+            questdb_token_provider_get_status(
+                provider,
+                (&mut status.status as *mut TokenProviderStatusV1).cast(),
+            )
+        });
+        assert_eq!(
+            status.status.struct_size,
+            size_of::<TokenProviderStatusV1>()
+        );
+        assert!(status.status.has_last_failure && !status.status.closed);
+        assert!(status.status.consecutive_failures >= 1);
+        assert_eq!(status.canary, [0xA5; 16]);
+
+        unsafe { questdb_token_provider_free(provider) };
     }
 
     fn now_ms() -> i64 {
