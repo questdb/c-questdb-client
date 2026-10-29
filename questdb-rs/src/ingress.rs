@@ -1009,9 +1009,13 @@ impl SenderBuilder {
     ///
     /// `commit_interval_ms` and `commit_rows` open a commit window: each flush
     /// still publishes to store-and-forward before it returns, but flushes
-    /// share one server commit and one wire message until the window closes
-    /// after the interval or the row count, or until [`Sender::wait`]. Setting
-    /// one key defaults the other to 100 ms or 1000 rows. They require
+    /// share one server commit until the window closes after the interval,
+    /// after the row count, when store-and-forward needs room, or at
+    /// [`Sender::wait`]. Consecutive compatible flushes also share one wire
+    /// message; a table or schema change starts a new message in the same
+    /// commit. Setting one key defaults the other to 100 ms or 1000 rows. Keep
+    /// `commit_rows` at or below the server's `qwp.max.rows.per.table`: a
+    /// larger window is rejected and then resent frame by frame. They require
     /// `qwp_ws_progress=background`.
     ///
     /// `sf_max_segment_bytes` defaults to 4 MiB. Smaller disk-backed segments

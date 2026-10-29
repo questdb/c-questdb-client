@@ -89,7 +89,9 @@ that destroying an unflushed row buffer or column chunk publishes its contents.
 With a commit window (`commit_interval_ms`, `commit_rows`), a flush still
 publishes to store-and-forward before it returns, but its rows commit when the
 window closes. `wait` and the `*_and_wait` calls close the window early for the
-borrow that published the rows; a wait on a fresh borrow does not.
+borrow that published the rows; a wait on a fresh borrow does not. Keep
+`commit_rows` at or below the server's `qwp.max.rows.per.table`: above it, each
+window is rejected and resent frame by frame.
 
 ## Buffering and backpressure
 

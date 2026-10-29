@@ -127,9 +127,12 @@ ws::addr=localhost:9000;commit_rows=1000;commit_interval_ms=10;
 ```
 
 A flush still publishes to store-and-forward before it returns; its rows
-commit when the window closes. Setting one key defaults the other to 100 ms or
-1000 rows. `wait` and the `*_and_wait` calls close the window early for the
-sender or borrow that published the rows.
+commit when the window closes, after `commit_interval_ms` or `commit_rows`
+rows. Flushes to different tables or with different schemas share the same
+commit. Setting one key defaults the other to 100 ms or 1000 rows. Keep
+`commit_rows` at or below the server's `qwp.max.rows.per.table`. `wait` and the
+`*_and_wait` calls close the window early for the sender or borrow that
+published the rows.
 
 ## Getting Started
 

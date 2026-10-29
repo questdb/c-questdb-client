@@ -678,22 +678,29 @@ impl QuestDb {
     /// | `idle_timeout_ms`    | 60000   | Above-minimum idle connections are closed after this long. |
     /// | `pool_reap`          | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
     /// | `lazy_connect`       | `false` | Tolerate a down server at startup: connect opens nothing, senders buffer and connect in the background, readers connect on first borrow. |
-    /// | `commit_interval_ms` | unset   | Opt in to commit windows for ingestion senders; close a window after this many milliseconds. Positive integer; alone, a window also closes every 1000 rows. |
-    /// | `commit_rows`        | unset   | Close a commit window after this many rows. Positive integer; alone, a window also closes every 100 ms. |
+    /// | `commit_interval_ms` | unset   | Opt in to commit windows for ingestion senders; close a window after this many milliseconds. Positive integer; alone, sets `commit_rows` to 1000. |
+    /// | `commit_rows`        | unset   | Close a commit window after this many rows; at most the server's `qwp.max.rows.per.table`. Positive integer; alone, sets `commit_interval_ms` to 100. |
     ///
     /// A commit window belongs to each ingestion connection and spans the
-    /// leases that share it. `flush` still publishes to SF before returning;
-    /// `wait` forces its pending boundary to commit. Returning a lease does not
-    /// close the window. ACKs, and so acked FSNs, advance when a window
-    /// commits. A server rejection reports the FSN range of the rejected
-    /// message, which can include other leases' publications on the same slot;
-    /// the window's earlier uncommitted frames roll back with it and replay
-    /// unless the rejection is terminal. Network batching of ready frames is
-    /// automatic and adds no timer to wait for more frames. Standalone
-    /// QWP/WebSocket senders accept the same two keys. SF, in memory or on
-    /// disk, always holds QWP frames; with a commit window the background
-    /// sender combines consecutive small flushes into one QWP message on the
-    /// wire.
+    /// leases that share it. It closes after `commit_interval_ms`, after
+    /// `commit_rows` rows, when SF needs room, or when `wait` forces its
+    /// pending boundary to commit. `flush` still publishes to SF before
+    /// returning. Returning a lease does not close the window. ACKs, and so
+    /// acked FSNs, advance when a window commits. SF, in memory or on disk,
+    /// always holds QWP frames; the background sender combines consecutive
+    /// compatible flushes into one QWP message on the wire, and a table or
+    /// schema change starts a new message in the same commit.
+    ///
+    /// A retryable server rejection reports the FSN range of the rejected
+    /// message, which can include other leases' publications on the same
+    /// slot; the window's uncommitted frames roll back and replay. Before a
+    /// terminal rejection ends the sender, the frames the server rolled back
+    /// are resent one by one, each committed on its own, so the error names
+    /// only the publication the server rejects on its own and the publications
+    /// before it commit. A `commit_rows` above `qwp.max.rows.per.table`
+    /// therefore costs a rejection and a reconnect per window. Standalone
+    /// QWP/WebSocket senders accept the same two keys; a direct borrow ignores
+    /// them, because a direct sender commits every publication.
     ///
     /// Lifecycle key names and defaults match the Java client's `QuestDBBuilder`; the
     /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,

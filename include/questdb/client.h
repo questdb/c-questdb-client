@@ -80,8 +80,8 @@ typedef struct questdb_db questdb_db;
  * replay run in the background. `sender_pool_min` (default 1) is the warm
  * minimum the reaper keeps.
  *
- * `conf` is a `ws::` / `wss::` connect string. Pool lifecycle keys are aligned
- * with the Java client's `QuestDBBuilder`:
+ * `conf` is a `ws::` / `wss::` connect string. Pool-specific keys (aligned
+ * with the Java client's `QuestDBBuilder`):
  *   `sender_pool_min`      (default 1)    warm/min sender connections,
  *                                         pre-opened at connect unless
  *                                         `lazy_connect=true`;
@@ -105,29 +105,41 @@ typedef struct questdb_db questdb_db;
  *                                         connect opens nothing, senders
  *                                         buffer and connect in the
  *                                         background, readers connect on
- *                                         first borrow;
+ *                                         first borrow.
+ *
+ * Commit-window keys, which have no Java client counterpart:
  *   `commit_interval_ms`  (default unset)
  *                                         opt in to ingestion commit windows;
  *                                         positive milliseconds per window;
- *                                         alone, a window also closes every
- *                                         1000 rows;
+ *                                         alone, sets `commit_rows` to 1000;
  *   `commit_rows`         (default unset)
- *                                         positive row threshold per window;
- *                                         alone, a window also closes every
- *                                         100 ms.
+ *                                         positive row threshold per window,
+ *                                         at most the server's
+ *                                         `qwp.max.rows.per.table`; alone,
+ *                                         sets `commit_interval_ms` to 100.
  *
  * A commit window belongs to each ingestion connection and spans the leases
- * that share it. Flush still publishes to SF before returning; wait forces its
- * pending boundary to commit. Returning a lease does not close the window.
- * ACKs, and so acked FSNs, advance when a window commits. A server rejection
- * reports the FSN range of the rejected message, which can include other
- * leases' publications on the same slot; the window's earlier uncommitted
- * frames roll back with it and replay unless the rejection is terminal. Ready
- * frames are automatically batched into network writes with no timer to wait
- * for more frames. Standalone QWP/WebSocket senders accept the same two keys;
- * a direct column sender rejects them. SF, in memory or on disk, always holds
- * QWP frames; with a commit window the background sender combines consecutive
- * small flushes into one QWP message on the wire.
+ * that share it. It closes after `commit_interval_ms`, after `commit_rows`
+ * rows, when SF needs room, or when wait forces its pending boundary to
+ * commit. Flush still publishes to SF before returning. Returning a lease does
+ * not close the window. ACKs, and so acked FSNs, advance when a window
+ * commits. SF, in memory or on disk, always holds QWP frames; the background
+ * sender combines consecutive compatible flushes into one QWP message on the
+ * wire, and a table or schema change starts a new message in the same commit.
+ *
+ * A retryable server rejection reports the FSN range of the rejected message,
+ * which can include other leases' publications on the same slot; the window's
+ * uncommitted frames roll back and replay. Before a terminal rejection ends
+ * the sender, the frames the server rolled back are resent one by one, each
+ * committed on its own, so the error names only the publication the server
+ * rejects on its own and the publications before it commit. A `commit_rows`
+ * above `qwp.max.rows.per.table` therefore costs a rejection and a reconnect
+ * per window.
+ *
+ * Standalone QWP/WebSocket senders accept the same two keys. A standalone
+ * direct column sender (`qwp_direct_sender_from_conf`,
+ * `qwp_direct_sender_from_opts`) rejects them, and direct borrows from a pool
+ * ignore them: a direct sender commits every publication.
  *
  * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
  * for the public ingestion pool. `sender_id` names the slot *base* (default

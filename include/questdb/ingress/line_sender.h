@@ -2124,7 +2124,10 @@ bool line_sender_qwpws_published_fsn(
 
 /**
  * Return the highest QWP/WebSocket frame sequence number completed by ACK, or
- * no value if no frame has completed.
+ * no value if no frame has completed. With a commit window
+ * (`commit_interval_ms`, `commit_rows`), ACKs arrive when the window commits,
+ * so a published FSN can stay unacknowledged for up to `commit_interval_ms`
+ * unless `line_sender_qwpws_wait` closes the window.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_acked_fsn(
@@ -2159,7 +2162,8 @@ typedef enum qwpws_ack_level
  * Returns `false` and sets `err_out` on the no-progress timeout
  * (`line_sender_error_failover_retry`), a server rejection, a transport
  * failure, or an invalid `ack_level`. With nothing published yet it succeeds
- * immediately.
+ * immediately. With a commit window (`commit_interval_ms`, `commit_rows`), the
+ * wait closes the window through its boundary instead of waiting for it.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_wait(
