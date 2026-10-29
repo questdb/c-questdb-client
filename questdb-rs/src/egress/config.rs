@@ -606,6 +606,8 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "idle_timeout_ms",
     "lazy_connect",
     "pool_reap",
+    "commit_interval_ms",
+    "commit_rows",
 ];
 
 impl ReaderConfig {
@@ -2265,6 +2267,14 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn egress_accepts_a_pool_conf_with_commit_window() {
+        ReaderConfig::from_conf(
+            "ws::addr=h:1;sender_pool_max=1;commit_rows=1000;commit_interval_ms=10;",
+        )
+        .unwrap();
     }
 
     #[test]

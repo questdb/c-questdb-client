@@ -500,6 +500,11 @@ pub(crate) struct QwpWsConnector {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl QwpWsConnector {
+    #[cfg(feature = "ffi-support")]
+    pub(crate) fn has_commit_window(&self) -> bool {
+        self.qwp_ws.commit_window().0.is_some()
+    }
+
     /// Number of configured endpoints — the pool sizes its shared health
     /// tracker to this.
     pub(crate) fn endpoint_count(&self) -> usize {
@@ -999,7 +1004,19 @@ impl SenderBuilder {
     /// `sf_append_deadline_millis`, `auth_timeout_ms`, `close_flush_timeout_millis`,
     /// `request_durable_ack`,
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
-    /// `max_background_drainers`, and `error_inbox_capacity`.
+    /// `max_background_drainers`, `error_inbox_capacity`, `commit_interval_ms`
+    /// and `commit_rows`.
+    ///
+    /// `commit_interval_ms` and `commit_rows` open a commit window: each flush
+    /// still publishes to store-and-forward before it returns, but flushes
+    /// share one server commit until the window closes after the interval,
+    /// after the row count, when store-and-forward needs room, or at
+    /// [`Sender::wait`]. Consecutive compatible flushes also share one wire
+    /// message; a table or schema change starts a new message in the same
+    /// commit. Setting one key defaults the other to 100 ms or 1000 rows. Keep
+    /// `commit_rows` at or below the server's `qwp.max.rows.per.table`: a
+    /// larger window is rejected and then resent frame by frame. They require
+    /// `qwp_ws_progress=background`.
     ///
     /// `sf_max_segment_bytes` defaults to 4 MiB. Smaller disk-backed segments
     /// release acknowledged space more granularly, but rotate more often and
@@ -1171,6 +1188,12 @@ impl SenderBuilder {
                 "sf_append_deadline_millis" => builder.store_and_forward_append_deadline(
                     Duration::from_millis(parse_conf_value(key, val)?),
                 )?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "commit_interval_ms" => {
+                    builder.commit_interval(Duration::from_millis(parse_conf_value(key, val)?))?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "commit_rows" => builder.commit_rows(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "reconnect_max_duration_millis" => builder
                     .reconnect_max_duration(Duration::from_millis(parse_conf_value(key, val)?))?,
@@ -1858,6 +1881,46 @@ impl SenderBuilder {
         qwp_ws
             .sf_append_deadline
             .set_specified("sf_append_deadline_millis", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn commit_interval(mut self, value: Duration) -> Result<Self> {
+        if value.is_zero() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"commit_interval_ms\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"commit_interval_ms\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .commit_interval
+            .set_specified("commit_interval_ms", Some(value))?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn commit_rows(mut self, value: usize) -> Result<Self> {
+        if value == 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"commit_rows\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"commit_rows\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .commit_rows
+            .set_specified("commit_rows", Some(value))?;
         Ok(self)
     }
 
@@ -2751,6 +2814,7 @@ impl SenderBuilder {
                 let mut qwp_ws = qwp_ws.clone();
                 qwp_ws.initial_connect_retry =
                     ConfigSetting::Specified(actual_initial_connect_retry);
+                qwp_ws.commit_max_bytes = *self.max_buf_size;
                 let qwp_ws = &qwp_ws;
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
@@ -2759,6 +2823,12 @@ impl SenderBuilder {
                         return Err(error::fmt!(
                             ConfigError,
                             "initial_connect_retry=async requires QWP/WebSocket background progress; use qwp_ws_progress=background or initial_connect_retry=sync"
+                        ));
+                    }
+                    if qwp_ws.commit_window().0.is_some() {
+                        return Err(error::fmt!(
+                            ConfigError,
+                            "commit_rows and commit_interval_ms require QWP/WebSocket background progress; use qwp_ws_progress=background"
                         ));
                     }
                     SyncProtocolHandler::ManualQwpWs(Box::new(open_manual_qwp_ws(
@@ -2921,7 +2991,8 @@ impl SenderBuilder {
 
         let auth = self.build_auth()?;
         let auth_header = qwp_ws_auth_header(&auth)?;
-        let qwp_ws = qwp_ws.clone();
+        let mut qwp_ws = qwp_ws.clone();
+        qwp_ws.commit_max_bytes = *self.max_buf_size;
         reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
         if *qwp_ws.progress == QwpWsProgress::Manual
             && *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async

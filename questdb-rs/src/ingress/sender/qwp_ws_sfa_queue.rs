@@ -42,7 +42,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::error;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
-use super::qwp_ws_queue::{OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_queue::{CommitWindow, OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_catchup::SentDictMirror;
 use super::qwp_ws_sfa_manifest::{
     SfManifest, SfaAckWatermark, ack_watermark_path, manifest_path, sync_directory,
@@ -1359,6 +1359,10 @@ impl SfaFrameQueue {
 }
 
 impl SfaProgressView {
+    pub(crate) fn published_fsn(&self) -> Option<u64> {
+        self.engine.published_fsn()
+    }
+
     /// See [`SfaEngine::has_deferred_commit_headroom`].
     pub(crate) fn has_deferred_commit_headroom(&self) -> bool {
         self.engine.has_deferred_commit_headroom()
@@ -1380,9 +1384,11 @@ impl SfaProgressView {
             return Ok(None);
         };
         Ok(Some(OutboundFrame {
+            first_fsn: fsn,
             fsn,
             wire_seq,
-            payload,
+            payload: payload.into(),
+            window: CommitWindow::Outside,
         }))
     }
 
@@ -1407,7 +1413,7 @@ impl SfaProgressView {
         Ok(after > before)
     }
 
-    fn next_cursor_payload_for_fsn(
+    pub(crate) fn next_cursor_payload_for_fsn(
         &self,
         send_cursor: &mut Option<SfaSendCursor>,
         fsn: u64,

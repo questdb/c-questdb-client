@@ -138,6 +138,11 @@ pub(crate) const QWP_WS_DEFAULT_SF_SYNC_INTERVAL: std::time::Duration =
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS: usize = 4;
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_COMMIT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_COMMIT_ROWS: usize = 1000;
+#[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 #[cfg(feature = "_sender-qwp-ws")]
@@ -257,6 +262,9 @@ pub(crate) enum QwpWsInitialConnectMode {
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone)]
 pub(crate) struct QwpWsConfig {
+    pub(crate) commit_interval: ConfigSetting<Option<std::time::Duration>>,
+    pub(crate) commit_rows: ConfigSetting<Option<usize>>,
+    pub(crate) commit_max_bytes: usize,
     pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
     pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
     /// Per-endpoint TCP connect (dial) budget. `None` (the default) keeps the
@@ -335,6 +343,9 @@ pub(crate) struct QwpWsConfig {
 impl Default for QwpWsConfig {
     fn default() -> Self {
         Self {
+            commit_interval: ConfigSetting::new_default(None),
+            commit_rows: ConfigSetting::new_default(None),
+            commit_max_bytes: usize::MAX,
             endpoints: ConfigSetting::new_default(Vec::new()),
             auth_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(15)),
             connect_timeout: ConfigSetting::new_default(None),
@@ -387,6 +398,16 @@ impl QwpWsConfig {
                 .copied()
                 .unwrap_or(QWP_WS_DEFAULT_SF_SYNC_INTERVAL)
         })
+    }
+
+    pub(crate) fn commit_window(&self) -> (Option<std::time::Duration>, usize) {
+        match (*self.commit_interval, *self.commit_rows) {
+            (None, None) => (None, 0),
+            (interval, rows) => (
+                Some(interval.unwrap_or(QWP_WS_DEFAULT_COMMIT_INTERVAL)),
+                rows.unwrap_or(QWP_WS_DEFAULT_COMMIT_ROWS),
+            ),
+        }
     }
 
     pub(crate) fn sf_max_total_bytes(&self) -> u64 {

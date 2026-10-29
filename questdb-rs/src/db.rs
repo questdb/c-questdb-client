@@ -678,8 +678,32 @@ impl QuestDb {
     /// | `idle_timeout_ms`    | 60000   | Above-minimum idle connections are closed after this long. |
     /// | `pool_reap`          | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
     /// | `lazy_connect`       | `false` | Tolerate a down server at startup: connect opens nothing, senders buffer and connect in the background, readers connect on first borrow. |
+    /// | `commit_interval_ms` | unset   | Opt in to commit windows for ingestion senders; close a window after this many milliseconds. Positive integer; alone, sets `commit_rows` to 1000. |
+    /// | `commit_rows`        | unset   | Close a commit window after this many rows; at most the server's `qwp.max.rows.per.table`. Positive integer; alone, sets `commit_interval_ms` to 100. |
     ///
-    /// Key names and defaults match the Java client's `QuestDBBuilder`; the
+    /// A commit window belongs to each ingestion connection and spans the
+    /// leases that share it. It closes after `commit_interval_ms`, after
+    /// `commit_rows` rows, when SF needs room, or when `wait` forces its
+    /// pending boundary to commit. `flush` still publishes to SF before
+    /// returning. Returning a lease does not close the window. ACKs, and so
+    /// acked FSNs, advance when a window commits. SF, in memory or on disk,
+    /// always holds QWP frames; the background sender combines consecutive
+    /// compatible flushes into one QWP message on the wire, and a table or
+    /// schema change starts a new message in the same commit.
+    ///
+    /// A retryable server rejection reports the FSN range of the rejected
+    /// message, which can include other leases' publications on the same
+    /// slot; the window's uncommitted frames roll back and replay. Before a
+    /// terminal rejection ends the sender, the frames the server rolled back
+    /// are resent one by one, each committed on its own, so the error names
+    /// only the publication the server rejects on its own and the publications
+    /// before it commit. A `commit_rows` above `qwp.max.rows.per.table`
+    /// therefore costs a rejection and a reconnect per window. Standalone
+    /// QWP/WebSocket senders accept the same two keys. A direct column sender
+    /// has its own explicit [`commit`](BorrowedDirectColumnSender::commit), so
+    /// the keys do not apply to it and a direct borrow ignores them.
+    ///
+    /// Lifecycle key names and defaults match the Java client's `QuestDBBuilder`; the
     /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,
     /// `query_close_timeout_ms`) have no counterpart here — the reaper tick
     /// and `close_flush_timeout` own those responsibilities.
@@ -1647,8 +1671,9 @@ impl Debug for DirectSenderHandle<'_> {
 /// Delivery is completed best-effort when the pool is closed or the connection
 /// is retired, bounded by `close_flush_timeout` (default 5s): an in-memory
 /// queue whose server stays unreachable past that window drops its undelivered
-/// tail, logging a warning. For a hard guarantee, call [`Self::wait`] before
-/// closing the pool — it blocks until the frames published so far reach the
+/// tail, logging a warning. For a hard guarantee, call [`Self::wait`] on the
+/// borrow that published the rows before returning it — it closes any commit
+/// window through that borrow and blocks until its publications reach the
 /// requested [`AckLevel`], i.e. confirms delivery — or configure `sf_dir` for
 /// crash-durable on-disk persistence with replay. [`Self::flush_and_wait`]
 /// combines the two ("publish this batch and return once it is delivered");
@@ -1657,7 +1682,8 @@ impl Debug for DirectSenderHandle<'_> {
 /// timeout instead.
 /// Use FSNs only for non-blocking progress tracking while this borrowed sender
 /// is still held: they are stream watermarks, not portable receipts to check
-/// through an arbitrary later pool borrow.
+/// through an arbitrary later pool borrow. With a commit window, a published
+/// FSN is acknowledged only once its window commits.
 ///
 /// Not `Send` or `Sync`.
 ///
@@ -1742,7 +1768,9 @@ impl<'a> BorrowedSender<'a> {
     }
 
     /// Publish and clear a QWP/WebSocket [`Buffer`], then wait for the requested
-    /// ACK boundary using the pool's configured request timeout.
+    /// ACK boundary using the pool's configured request timeout. Automatic
+    /// commit batching closes through this publication without waiting for
+    /// its row threshold or timer.
     pub fn flush_buffer_and_wait(
         &mut self,
         buffer: &mut Buffer,
@@ -1754,7 +1782,9 @@ impl<'a> BorrowedSender<'a> {
     /// Publish `chunk` into the store-and-forward queue as a completion
     /// boundary, then wait until every frame published on this handle so far
     /// reaches `ack_level` — [`Self::flush`] followed by [`Self::wait`] in one
-    /// call. Unlike [`Self::wait`], which takes an explicit timeout argument,
+    /// call. Automatic commit batching closes through this publication without
+    /// waiting for its row threshold or timer. Unlike [`Self::wait`], which
+    /// takes an explicit timeout argument,
     /// this call's wait is bounded by the pool-wide `request_timeout` setting
     /// (the no-progress timeout fires when the ack watermark stops advancing
     /// for that long); compose the two calls yourself to choose the timeout
@@ -1833,6 +1863,10 @@ impl<'a> BorrowedSender<'a> {
     /// [`QuestDb::connect_with_handlers`]) rather than raised here;
     /// retriable ones are replayed by the queue. `AckLevel::Durable` requires
     /// QuestDB Enterprise and a pool opened with `request_durable_ack=on`.
+    ///
+    /// With automatic commit batching, a pending boundary requests immediate
+    /// batch closure before waiting. Call on the publishing lease before
+    /// returning it; this is not a drain across earlier leases or all slots.
     ///
     /// `timeout` is a no-progress deadline (it fires only if the ack watermark
     /// fails to advance for that long); `Duration::ZERO` waits indefinitely.
@@ -2315,6 +2349,13 @@ impl OwnedDirectColumnSender {
     /// with no pool. The builder is only borrowed.
     pub fn from_builder(builder: &SenderBuilder) -> Result<Self> {
         let connector = builder.build_qwp_ws_connector()?;
+        if connector.has_commit_window() {
+            return Err(error::fmt!(
+                ConfigError,
+                "commit_rows and commit_interval_ms require a store-and-forward sender; \
+                 the direct column sender has its own explicit commit"
+            ));
+        }
         let health = Mutex::new(QwpWsHostHealthTracker::new(connector.endpoint_count()));
         let raw = connector.connect_round_pooled(&health, None)?;
         let conn = ColumnConn::from_round_stream(raw)?;

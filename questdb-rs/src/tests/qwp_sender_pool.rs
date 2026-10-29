@@ -35,7 +35,7 @@
 //! HTTP→WebSocket upgrade, then either parks on the connection or reads each
 //! QWP frame and replies with an OK ack (status 0x00).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -60,6 +60,1030 @@ use crate::tests::qwp_ws::{
 use tempfile::TempDir;
 
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
+const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
+const QWP_STATUS_NOT_WRITABLE: u8 = 0x0C;
+
+#[test]
+fn stream_commit_window_disk_orphan_keeps_qwp_frames() {
+    let dir = TempDir::new().unwrap();
+    let seed_port = unused_local_port();
+    let config = format!(
+        "ws::addr=127.0.0.1:{seed_port};lazy_connect=true;auth_timeout=200;\
+         reconnect_max_duration_millis=10000;sf_dir={};sender_id=windoworphan;\
+         sender_pool_min=1;sender_pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;\
+         commit_rows=1000;commit_interval_ms=60000;",
+        dir.path().display()
+    );
+    {
+        let db = QuestDb::connect(&config).unwrap();
+        let _first_slot = db.borrow_sender().unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        for value in 0..3 {
+            sender
+                .flush(&mut one_i64_row("trades", &[value], &[value]))
+                .unwrap();
+        }
+    }
+    let orphan = dir.path().join("windoworphan-ingest-1");
+    assert!(slot_has_sfa_file(&orphan));
+    assert!(slot_holds_only_qwp_frames(&orphan));
+    let (server, frames) = MockServer::spawn_acking_capturing(4);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        &format!(
+            "sf_dir={};sender_id=windoworphan;sender_pool_min=1;sender_pool_max=1;\
+         pool_reap=manual;max_background_drainers=1;",
+            dir.path().display()
+        ),
+    ))
+    .unwrap();
+    let _sender = db.borrow_sender().unwrap();
+    let mut replayed = Vec::new();
+    while replayed.len() < 3 {
+        let frame = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(&frame[..4], b"QWP1");
+        assert_eq!(frame[5] & 1, 0);
+        replayed.extend(frame_qty_values(&frame));
+    }
+    assert_eq!(replayed, [0, 1, 2]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while slot_has_sfa_file(&orphan) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!slot_has_sfa_file(&orphan));
+}
+
+#[test]
+fn stream_commit_window_size_checks_preserve_flush_acceptance() {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let db = QuestDb::connect(&conf_for(server.port(),
+        "sender_pool_max=1;pool_reap=manual;commit_rows=1000;commit_interval_ms=60000;max_buf_size=1024;"
+    )).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let mut buffer = db.new_buffer();
+    buffer
+        .table("t")
+        .unwrap()
+        .column_i64("a", 1)
+        .unwrap()
+        .column_i64("b", 2)
+        .unwrap()
+        .column_i64("c", 3)
+        .unwrap()
+        .column_i64("d", 4)
+        .unwrap()
+        .column_str("value", "x".repeat(942))
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(frame.len(), 1024);
+    assert_ne!(frame[5] & 8, 0);
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+    assert!(buffer.is_empty());
+
+    buffer
+        .table("trades")
+        .unwrap()
+        .column_str("name", "x".repeat(989))
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let error = sender.flush_buffer(&mut buffer).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::BatchTooLarge);
+    assert!(!error.in_doubt());
+    assert!(!buffer.is_empty());
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+}
+
+#[test]
+fn stream_commit_window_splices_names_longer_than_127_bytes() {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_max=1;pool_reap=manual;max_name_len=255;commit_rows=100;",
+    ))
+    .unwrap();
+    let table = "t".repeat(150);
+    let mut sender = db.borrow_sender().unwrap();
+    for value in 0..2 {
+        let mut buffer = db.new_buffer();
+        buffer
+            .table(table.as_str())
+            .unwrap()
+            .column_i64("c".repeat(200).as_str(), value)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush_buffer(&mut buffer).unwrap();
+    }
+    sender.wait(AckLevel::Ok, Duration::from_secs(2)).unwrap();
+    let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(frame_table_name(&frame), table);
+    assert_eq!(frame_row_count(&frame), 2);
+    let mut next = one_symbol_buffer(&db, "after");
+    sender
+        .flush_buffer_and_wait(&mut next, AckLevel::Ok)
+        .unwrap();
+}
+
+#[test]
+fn stream_commit_batching_handles_large_publications_and_a_small_tail() {
+    for rows_config in ["", "commit_rows=5000;"] {
+        let (tx, frames) = mpsc::channel();
+        let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            &format!("sender_pool_max=1;pool_reap=manual;commit_interval_ms=60000;{rows_config}"),
+        ))
+        .unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let values = vec![42; 1_000];
+        let mut chunk = Chunk::new("trades");
+        chunk.column_i64("qty", &values, None).unwrap();
+        chunk.at_nanos(&values).unwrap();
+        sender.flush_and_wait(&mut chunk, AckLevel::Ok).unwrap();
+        let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_ne!(frame[5] & 8, 0);
+        assert_eq!(frame_qty_values(&frame), values);
+        sender
+            .flush_and_wait(&mut one_i64_row("trades", &[43], &[43]), AckLevel::Ok)
+            .unwrap();
+        let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(frame_qty_values(&frame), [43]);
+    }
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn stream_commit_window_inputs_share_one_symbol_namespace() {
+    use crate::ingress::column_sender::ArrowColumnOverride;
+
+    for initial_connect in ["off", "async"] {
+        let (server, frames) = MockServer::spawn_acking_capturing(1);
+        let db = QuestDb::connect(&format!(
+            "ws::addr=127.0.0.1:{};lazy_connect=false;initial_connect_retry={initial_connect};auth_timeout=2000;\
+             sender_pool_min=1;sender_pool_max=1;query_pool_min=0;pool_reap=manual;\
+             commit_rows=2;commit_interval_ms=60000;",
+            server.port(),
+        ))
+        .unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush_buffer_and_wait(&mut one_symbol_buffer(&db, "alpha"), AckLevel::Ok)
+            .unwrap();
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .symbol_i32("sym", &[0, 1], &[0, 5, 10], b"alphabravo", None)
+            .unwrap();
+        chunk.at_now().unwrap();
+        sender.flush_and_wait(&mut chunk, AckLevel::Ok).unwrap();
+        let overrides = [ArrowColumnOverride::Symbol { column: "sym" }];
+        sender
+            .flush_arrow_batch_at_now("trades", &symbol_arrow_batch(vec!["charlie"]), &overrides)
+            .unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        let mut buffer = one_symbol_buffer(&db, "alpha");
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "delta")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .unwrap();
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .symbol_i32("sym", &[0], &[0, 5], b"bravo", None)
+            .unwrap();
+        chunk.at_now().unwrap();
+        sender.flush_and_wait(&mut chunk, AckLevel::Ok).unwrap();
+        sender
+            .flush_arrow_batch_at_now(
+                "trades",
+                &symbol_arrow_batch(vec!["charlie", "echo"]),
+                &overrides,
+            )
+            .unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        sender
+            .flush_buffer_and_wait(&mut one_symbol_buffer(&db, "alpha"), AckLevel::Ok)
+            .unwrap();
+        assert_eq!(sender.published_fsn().unwrap(), Some(6));
+        assert_eq!(sender.acked_fsn().unwrap(), Some(6));
+
+        let captured: Vec<_> = frames
+            .try_iter()
+            .filter(|frame| frame.len() >= 12 && u16::from_le_bytes([frame[6], frame[7]]) != 0)
+            .collect();
+        let expected = [
+            vec!["alpha"],
+            vec!["alpha", "bravo"],
+            vec!["charlie"],
+            vec!["alpha", "delta"],
+            vec!["bravo"],
+            vec!["charlie", "echo"],
+            vec!["alpha"],
+        ];
+        assert_eq!(captured.len(), expected.len());
+        let mut dictionary: Vec<Vec<u8>> = Vec::new();
+        for (frame, expected) in captured.iter().zip(expected) {
+            assert_ne!(frame[5] & 8, 0);
+            let mut pos = 12;
+            let start = read_test_varint(frame, &mut pos) as usize;
+            let count = read_test_varint(frame, &mut pos) as usize;
+            assert!(start <= dictionary.len());
+            for id in start..start + count {
+                let value = read_test_bytes(frame, &mut pos);
+                if id == dictionary.len() {
+                    dictionary.push(value.to_vec());
+                } else {
+                    assert_eq!(dictionary[id], value);
+                }
+            }
+            assert_eq!(read_test_bytes(frame, &mut pos), b"trades");
+            let rows = read_test_varint(frame, &mut pos) as usize;
+            assert_eq!(rows, expected.len());
+            assert_eq!(read_test_varint(frame, &mut pos), 1);
+            assert_eq!(read_test_bytes(frame, &mut pos), b"sym");
+            assert_eq!(frame[pos..pos + 2], [9, 0]);
+            pos += 2;
+            for symbol in expected {
+                let id = read_test_varint(frame, &mut pos) as usize;
+                assert_eq!(dictionary[id], symbol.as_bytes());
+            }
+            assert_eq!(pos, frame.len());
+        }
+        assert_eq!(
+            dictionary,
+            ["alpha", "bravo", "charlie", "delta", "echo"].map(|s| s.as_bytes().to_vec())
+        );
+    }
+}
+
+#[test]
+fn stream_commit_batching_spans_leases_and_wait_closes_short_tail() {
+    for disk in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (tx, frames) = mpsc::channel();
+        let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+        let sf = if disk {
+            format!("sf_dir={};sender_id=streamwait;", dir.path().display())
+        } else {
+            String::new()
+        };
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            &format!(
+                "{sf}sender_pool_max=1;pool_reap=manual;commit_rows=2;commit_interval_ms=60000;"
+            ),
+        ))
+        .unwrap();
+        for value in 0..4 {
+            let mut sender = db.borrow_sender().unwrap();
+            sender
+                .flush(&mut one_i64_row("trades", &[value], &[value]))
+                .unwrap();
+        }
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush(&mut one_i64_row("trades", &[4], &[4]))
+            .unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(2)).unwrap();
+        let captured: Vec<_> = (0..3)
+            .map(|_| frames.recv_timeout(Duration::from_secs(1)).unwrap())
+            .collect();
+        assert_eq!(
+            captured.iter().map(|f| f[5] & 1).collect::<Vec<_>>(),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            captured
+                .iter()
+                .map(|f| frame_row_count(f))
+                .collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+        assert_eq!(
+            captured
+                .iter()
+                .flat_map(|f| frame_qty_values(f))
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+    }
+}
+
+#[test]
+fn standalone_sender_commit_window_splices_flushes_until_wait() {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{};auth_timeout=2000;commit_rows=1000;commit_interval_ms=60000;",
+        server.port()
+    ))
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut buffer = sender.new_buffer();
+    for qty in 0..3 {
+        buffer
+            .table("trades")
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .at(TimestampNanos::new(qty))
+            .unwrap();
+        sender.flush(&mut buffer).unwrap();
+    }
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(frame_qty_values(&frame), [0, 1, 2]);
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn standalone_direct_sender_rejects_a_commit_window() {
+    for key in ["commit_rows=10;", "commit_interval_ms=10;"] {
+        let Err(err) =
+            crate::db::OwnedDirectColumnSender::from_conf(&format!("ws::addr=127.0.0.1:1;{key}"))
+        else {
+            panic!("a direct sender must not accept {key}");
+        };
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().starts_with(
+                "commit_rows and commit_interval_ms require a store-and-forward sender"
+            )
+        );
+    }
+}
+
+#[test]
+fn stream_commit_batching_idle_timer_and_close_do_not_need_another_flush() {
+    for close in [false, true] {
+        let (tx, frames) = mpsc::channel();
+        let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+        let interval = if close { 60_000 } else { 20 };
+        let db = QuestDb::connect(&conf_for(server.port(), &format!(
+            "sender_pool_max=1;pool_reap=manual;commit_interval_ms={interval};close_flush_timeout_millis=2000;"
+        ))).unwrap();
+        {
+            let mut sender = db.borrow_sender().unwrap();
+            sender
+                .flush(&mut one_i64_row("trades", &[42], &[42]))
+                .unwrap();
+        }
+        if close {
+            drop(db);
+        }
+        let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(frame[5] & 1, 0);
+        assert_eq!(frame_qty_values(&frame), [42]);
+    }
+}
+
+#[test]
+fn stream_commit_batching_waits_for_durable_ack_through_the_whole_window() {
+    for disk in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (server, frames) = MockServer::spawn_acking_durable_capturing(1);
+        let sf = if disk {
+            format!("sf_dir={};sender_id=streamdurable;", dir.path().display())
+        } else {
+            String::new()
+        };
+        let db = QuestDb::connect(&conf_for(server.port(), &format!(
+            "{sf}sender_pool_max=1;pool_reap=manual;request_durable_ack=on;durable_ack_keepalive_interval_millis=1;commit_interval_ms=60000;"
+        ))).unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        for value in 0..3 {
+            sender
+                .flush(&mut one_i64_row("trades", &[value], &[value]))
+                .unwrap();
+        }
+        sender
+            .wait(AckLevel::Durable, Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+        let frame = frames.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(frame[5] & 1, 0);
+        assert_eq!(frame_qty_values(&frame), [0, 1, 2]);
+        assert!(frames.try_recv().is_err());
+    }
+}
+
+#[test]
+fn stream_commit_batching_replays_every_row_after_disconnect_or_rejection() {
+    for disk in [false, true] {
+        for mode in [
+            MockMode::ReconnectAfterFirstFrame,
+            MockMode::DeferAwareRejectingFrame(0),
+        ] {
+            let rejected = matches!(mode, MockMode::DeferAwareRejectingFrame(_));
+            let dir = TempDir::new().unwrap();
+            let (tx, frames) = mpsc::channel();
+            let server = MockServer::spawn_with_mode_capture(2, mode, Some(tx));
+            let sf = if disk {
+                format!("sf_dir={};sender_id=streamreplay;", dir.path().display())
+            } else {
+                String::new()
+            };
+            let (errors_tx, errors) = mpsc::channel();
+            let db = QuestDb::connect_with_handlers(&conf_for(server.port(), &format!(
+                "{sf}sender_pool_max=1;pool_reap=manual;commit_rows=2;commit_interval_ms=60000;reconnect_initial_backoff_millis=1;"
+            )), crate::db::ConnectHandlers {
+                error_handler: Some(crate::ingress::QwpWsErrorHandler::new(move |error| {
+                    let _ = errors_tx.send(error.clone());
+                })),
+                ..Default::default()
+            }).unwrap();
+            let mut sender = db.borrow_sender().unwrap();
+            let mut fsns = Vec::new();
+            for value in 0..4 {
+                fsns.push(
+                    sender
+                        .flush_and_get_fsn(&mut one_i64_row("trades", &[value], &[value]))
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+            let captured: Vec<_> = frames.try_iter().collect();
+            assert_eq!(frame_qty_values(&captured[0]), [0, 1]);
+            let replayed: Vec<_> = captured[1..]
+                .iter()
+                .flat_map(|f| frame_qty_values(f))
+                .collect();
+            assert_eq!(
+                replayed,
+                [0, 1, 2, 3],
+                "whole uncommitted window must replay, disk={disk}"
+            );
+            assert_eq!(server.accepted(), 2);
+            assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+            if rejected {
+                let error = errors
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("group rejection diagnostic");
+                assert_eq!(error.status, Some(0x0c));
+                assert_eq!((error.from_fsn, error.to_fsn), (fsns[0], fsns[1]));
+                assert_eq!(error.message_sequence, Some(0));
+            }
+        }
+    }
+}
+
+#[test]
+fn stream_commit_window_disk_restart_replays_qwp_frames() {
+    let dir = TempDir::new().unwrap();
+    let sf = format!(
+        "sf_dir={};sender_id=streamrestart;sender_pool_max=1;pool_reap=manual;",
+        dir.path().display()
+    );
+    {
+        let (server, _release, frames) = MockServer::spawn_ack_when_released_capturing(1);
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            &format!("{sf}commit_rows=4;commit_interval_ms=60000;close_flush_timeout_millis=0;"),
+        ))
+        .unwrap();
+        {
+            let mut sender = db.borrow_sender().unwrap();
+            for value in 0..4 {
+                sender
+                    .flush(&mut one_i64_row("trades", &[value], &[value]))
+                    .unwrap();
+            }
+        }
+        let first = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first[5] & 1, 0);
+        assert_eq!(frame_qty_values(&first), [0, 1, 2, 3]);
+        db.close();
+    }
+    let slot = dir.path().join("streamrestart-ingest-0");
+    assert!(slot_has_sfa_file(&slot));
+    assert!(slot_holds_only_qwp_frames(&slot));
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let _db = QuestDb::connect(&conf_for(server.port(), &sf)).unwrap();
+    let mut replayed = Vec::new();
+    while replayed.len() < 4 {
+        let frame = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(frame[5] & 1, 0);
+        replayed.extend(frame_qty_values(&frame));
+    }
+    assert_eq!(replayed, [0, 1, 2, 3]);
+}
+
+#[test]
+fn stream_commit_batching_wait_forces_only_its_own_boundary() {
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_max=1;pool_reap=manual;commit_rows=2;commit_interval_ms=60000;",
+    ))
+    .unwrap();
+    {
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush(&mut one_i64_row("trades", &[0], &[0]))
+            .unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(2)).unwrap();
+    }
+    assert_eq!(
+        frame_qty_values(&frames.recv_timeout(Duration::from_secs(1)).unwrap()),
+        [0]
+    );
+    {
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush(&mut one_i64_row("trades", &[1], &[1]))
+            .unwrap();
+    }
+    assert!(matches!(
+        frames.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush(&mut one_i64_row("trades", &[2], &[2]))
+        .unwrap();
+    let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(frame_qty_values(&frame), [1, 2]);
+    sender.wait(AckLevel::Ok, Duration::from_secs(2)).unwrap();
+    assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+    assert!(frames.try_recv().is_err());
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn stream_commit_window_splices_recovered_and_mixed_input_frames() {
+    use crate::ingress::column_sender::ArrowColumnOverride;
+
+    let dir = TempDir::new().unwrap();
+    let sf = format!(
+        "sf_dir={};sender_id=mixedsplice;sender_pool_max=1;pool_reap=manual;",
+        dir.path().display()
+    );
+    {
+        let (server, _release, frames) = MockServer::spawn_ack_when_released_capturing(1);
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            &format!("{sf}close_flush_timeout_millis=0;"),
+        ))
+        .unwrap();
+        {
+            let mut sender = db.borrow_sender().unwrap();
+            sender
+                .flush_buffer(&mut one_symbol_buffer(&db, "alpha"))
+                .unwrap();
+        }
+        frames.recv_timeout(Duration::from_secs(2)).unwrap();
+        db.close();
+    }
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        &format!("{sf}commit_rows=3;commit_interval_ms=60000;"),
+    ))
+    .unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush_buffer(&mut one_symbol_buffer(&db, "bravo"))
+        .unwrap();
+    let mut chunk = Chunk::new("trades");
+    chunk
+        .symbol_i32("sym", &[0], &[0, 7], b"charlie", None)
+        .unwrap();
+    chunk.at_now().unwrap();
+    sender.flush(&mut chunk).unwrap();
+    sender
+        .flush_arrow_batch_at_now(
+            "trades",
+            &symbol_arrow_batch(vec!["delta"]),
+            &[ArrowColumnOverride::Symbol { column: "sym" }],
+        )
+        .unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+    assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+    let data: Vec<_> = frames
+        .try_iter()
+        .filter(|frame| u16::from_le_bytes([frame[6], frame[7]]) != 0)
+        .collect();
+    assert_eq!(
+        data.iter()
+            .map(|frame| frame_row_count(frame))
+            .collect::<Vec<_>>(),
+        [3, 1]
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(&data[0]),
+        (
+            0,
+            ["alpha", "bravo", "charlie"]
+                .map(|s| s.as_bytes().to_vec())
+                .to_vec()
+        )
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(&data[1]),
+        (3, vec![b"delta".to_vec()])
+    );
+}
+
+#[test]
+fn stream_commit_window_chains_alternating_tables_into_one_commit() {
+    const FLUSHES: i64 = 40;
+    let table = |value: i64| if value % 2 == 0 { "trades" } else { "quotes" };
+    for disk in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (tx, frames) = mpsc::channel();
+        let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+        let sf = if disk {
+            format!("sf_dir={};sender_id=alternating;", dir.path().display())
+        } else {
+            String::new()
+        };
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            &format!(
+                "{sf}sender_pool_max=1;pool_reap=manual;commit_rows=1000;commit_interval_ms=60000;"
+            ),
+        ))
+        .unwrap();
+        for value in 0..FLUSHES - 1 {
+            let mut sender = db.borrow_sender().unwrap();
+            sender
+                .flush(&mut one_i64_row(table(value), &[value], &[value]))
+                .unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        let last = FLUSHES - 1;
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush(&mut one_i64_row(table(last), &[last], &[last]))
+            .unwrap();
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+
+        let captured: Vec<_> = frames.try_iter().collect();
+        assert_eq!(
+            captured
+                .iter()
+                .map(|f| frame_table_name(f))
+                .collect::<Vec<_>>(),
+            (0..FLUSHES).map(table).collect::<Vec<_>>(),
+            "alternating tables cannot share a message, disk={disk}"
+        );
+        assert_eq!(
+            captured
+                .iter()
+                .flat_map(|f| frame_qty_values(f))
+                .collect::<Vec<_>>(),
+            (0..FLUSHES).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            captured.iter().map(|f| f[5] & 1 == 0).collect::<Vec<_>>(),
+            (0..FLUSHES).map(|value| value == last).collect::<Vec<_>>(),
+            "the window must commit once, at its tail, disk={disk}"
+        );
+    }
+}
+
+#[test]
+fn stream_commit_window_commits_at_commit_rows_without_a_wait() {
+    let rows = [("trades", 0_i64), ("quotes", 1)];
+    for one_buffer in [false, true] {
+        for disk in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (tx, frames) = mpsc::channel();
+            let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+            let sf = if disk {
+                format!("sf_dir={};sender_id=fullwindow;", dir.path().display())
+            } else {
+                String::new()
+            };
+            let db = QuestDb::connect(&conf_for(
+                server.port(),
+                &format!(
+                    "{sf}sender_pool_max=1;pool_reap=manual;commit_rows=2;commit_interval_ms=60000;"
+                ),
+            ))
+            .unwrap();
+            let mut sender = db.borrow_sender().unwrap();
+            let mut buffer = sender.new_buffer();
+            for (table, qty) in rows {
+                buffer
+                    .table(table)
+                    .unwrap()
+                    .column_i64("qty", qty)
+                    .unwrap()
+                    .at_now()
+                    .unwrap();
+                if !one_buffer {
+                    sender.flush_buffer(&mut buffer).unwrap();
+                }
+            }
+            if one_buffer {
+                sender.flush_buffer(&mut buffer).unwrap();
+            }
+
+            let mut delivered = Vec::new();
+            while delivered
+                .last()
+                .is_none_or(|frame: &Vec<u8>| frame[5] & 1 != 0)
+            {
+                delivered.push(frames.recv_timeout(Duration::from_secs(5)).expect(
+                    "a window at commit_rows must commit without waiting for its interval",
+                ));
+            }
+            assert_eq!(
+                delivered
+                    .iter()
+                    .flat_map(|frame| frame_table_qty_values(frame))
+                    .collect::<Vec<_>>(),
+                rows.map(|(table, qty)| (table.to_string(), vec![qty])),
+                "one_buffer={one_buffer}, disk={disk}"
+            );
+        }
+    }
+}
+
+#[test]
+fn stream_commit_window_delivers_frames_that_fail_to_join_exactly_once() {
+    const FLUSHES: i64 = 20;
+    enum Shape {
+        DecimalScale,
+        SecondTable,
+        Oversize,
+    }
+    for shape in [Shape::DecimalScale, Shape::SecondTable, Shape::Oversize] {
+        for disk in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (tx, frames) = mpsc::channel();
+            let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+            let sf = if disk {
+                format!("sf_dir={};sender_id=failedjoin;", dir.path().display())
+            } else {
+                String::new()
+            };
+            let window = match shape {
+                Shape::Oversize => "commit_rows=100000;max_buf_size=65536;",
+                _ => "commit_rows=1000;",
+            };
+            let db = QuestDb::connect(&conf_for(
+                server.port(),
+                &format!(
+                    "{sf}sender_pool_max=1;pool_reap=manual;commit_interval_ms=60000;{window}"
+                ),
+            ))
+            .unwrap();
+            let mut expected: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+            for flush in 0..FLUSHES {
+                let mut sender = db.borrow_sender().unwrap();
+                let mut buffer = sender.new_buffer();
+                let rows = match shape {
+                    Shape::Oversize => 4500,
+                    _ => 1,
+                };
+                for row in 0..rows {
+                    let qty = flush * 10_000 + row;
+                    buffer
+                        .table("trades")
+                        .unwrap()
+                        .column_i64("qty", qty)
+                        .unwrap();
+                    if matches!(shape, Shape::DecimalScale) {
+                        let price = if flush % 2 == 0 { "1.5" } else { "1.25" };
+                        buffer.column_dec64("price", price).unwrap();
+                    }
+                    buffer.at_now().unwrap();
+                    expected.entry("trades".into()).or_default().push(qty);
+                }
+                if matches!(shape, Shape::SecondTable) {
+                    let table = if flush % 2 == 0 { "quotes" } else { "fills" };
+                    buffer
+                        .table(table)
+                        .unwrap()
+                        .column_i64("qty", flush)
+                        .unwrap()
+                        .at_now()
+                        .unwrap();
+                    expected.entry(table.into()).or_default().push(flush);
+                }
+                sender.flush_buffer(&mut buffer).unwrap();
+                if flush == FLUSHES - 1 {
+                    sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+                    assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+                }
+            }
+
+            let captured: Vec<_> = frames.try_iter().collect();
+            let mut delivered: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+            for frame in &captured {
+                for (table, values) in frame_table_qty_values(frame) {
+                    delivered.entry(table).or_default().extend(values);
+                }
+            }
+            assert_eq!(delivered, expected, "disk={disk}");
+            if !matches!(shape, Shape::Oversize) {
+                assert_eq!(
+                    captured.iter().filter(|frame| frame[5] & 1 == 0).count(),
+                    1,
+                    "the window must commit once, disk={disk}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stream_commit_window_replays_a_rejected_merge_frame_by_frame() {
+    for disk in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (tx, frames) = mpsc::channel();
+        let server = MockServer::spawn_with_mode_capture(
+            2,
+            MockMode::DeferAwareParseRejecting {
+                max_rows: 500,
+                poison: i64::MIN,
+            },
+            Some(tx),
+        );
+        let sf = if disk {
+            format!("sf_dir={};sender_id=mergereject;", dir.path().display())
+        } else {
+            String::new()
+        };
+        let (errors_tx, errors) = mpsc::channel();
+        let db = QuestDb::connect_with_handlers(
+            &conf_for(
+                server.port(),
+                &format!(
+                    "{sf}sender_pool_max=1;pool_reap=manual;commit_rows=1000;commit_interval_ms=60000;\
+                     reconnect_initial_backoff_millis=1;"
+                ),
+            ),
+            crate::db::ConnectHandlers {
+                error_handler: Some(crate::ingress::QwpWsErrorHandler::new(move |error| {
+                    let _ = errors_tx.send(error.clone());
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let mut fsns = Vec::new();
+        for half in 0..2 {
+            let values: Vec<i64> = (half * 400..(half + 1) * 400).collect();
+            let mut chunk = Chunk::new("trades");
+            chunk.column_i64("qty", &values, None).unwrap();
+            chunk.at_nanos(&values).unwrap();
+            fsns.push(sender.flush_and_get_fsn(&mut chunk).unwrap().unwrap());
+        }
+        sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), sender.published_fsn().unwrap());
+
+        let captured: Vec<_> = frames.try_iter().collect();
+        let connections: Vec<_> = captured.split(Vec::is_empty).collect();
+        assert_eq!(
+            connections[0]
+                .iter()
+                .map(|f| frame_row_count(f))
+                .collect::<Vec<_>>(),
+            [800],
+            "the window merges both flushes, disk={disk}"
+        );
+        let replay = connections[1];
+        assert_eq!(
+            replay
+                .iter()
+                .map(|f| frame_row_count(f))
+                .collect::<Vec<_>>(),
+            [400, 400],
+            "the rejected merge replays frame by frame, disk={disk}"
+        );
+        assert!(replay.iter().all(|f| f[5] & 1 == 0));
+        assert_eq!(
+            replay
+                .iter()
+                .flat_map(|f| frame_qty_values(f))
+                .collect::<Vec<_>>(),
+            (0..800).collect::<Vec<_>>()
+        );
+        assert_eq!(server.accepted(), 2);
+        let error = errors
+            .recv_timeout(Duration::from_secs(2))
+            .expect("merge rejection diagnostic");
+        assert_eq!(error.status, Some(QWP_STATUS_PARSE_ERROR));
+        assert_eq!((error.from_fsn, error.to_fsn), (fsns[0], fsns[1]));
+        assert_ne!(
+            error.applied_policy,
+            crate::ingress::QwpWsErrorPolicy::Terminal
+        );
+    }
+}
+
+#[test]
+fn stream_commit_window_terminal_reject_names_only_the_bad_frame() {
+    const BAD: i64 = 99;
+    let shapes: [&[(&str, i64)]; 2] = [
+        &[("trades", 0), ("trades", 1), ("trades", BAD)],
+        &[("trades", 0), ("quotes", BAD)],
+    ];
+    for rows in shapes {
+        let (tx, frames) = mpsc::channel();
+        let server = MockServer::spawn_with_mode_capture(
+            2,
+            MockMode::DeferAwareParseRejecting {
+                max_rows: u64::MAX,
+                poison: BAD,
+            },
+            Some(tx),
+        );
+        let (errors_tx, errors) = mpsc::channel();
+        let db = QuestDb::connect_with_handlers(
+            &conf_for(
+                server.port(),
+                "sender_pool_max=1;pool_reap=manual;commit_rows=1000;commit_interval_ms=60000;\
+                 reconnect_initial_backoff_millis=1;close_flush_timeout_millis=0;",
+            ),
+            crate::db::ConnectHandlers {
+                error_handler: Some(crate::ingress::QwpWsErrorHandler::new(move |error| {
+                    let _ = errors_tx.send(error.clone());
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let fsns: Vec<u64> = rows
+            .iter()
+            .map(|&(table, value)| {
+                sender
+                    .flush_and_get_fsn(&mut one_i64_row(table, &[value], &[value]))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        sender
+            .wait(AckLevel::Ok, Duration::from_secs(5))
+            .expect_err("a frame rejected on its own ends the sender");
+
+        let bad = *fsns.last().unwrap();
+        let terminal = loop {
+            let error = errors
+                .recv_timeout(Duration::from_secs(2))
+                .expect("terminal rejection diagnostic");
+            assert_eq!(error.status, Some(QWP_STATUS_PARSE_ERROR));
+            if error.applied_policy == crate::ingress::QwpWsErrorPolicy::Terminal {
+                break error;
+            }
+            assert_eq!(error.to_fsn, bad, "{rows:?}");
+        };
+        assert_eq!((terminal.from_fsn, terminal.to_fsn), (bad, bad), "{rows:?}");
+
+        let captured: Vec<_> = frames.try_iter().collect();
+        let mut connections = captured.split(Vec::is_empty);
+        let first = connections.next().unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .flat_map(|f| frame_qty_values(f))
+                .collect::<Vec<_>>(),
+            rows.iter().map(|&(_, value)| value).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first.iter().filter(|f| f[5] & 1 == 0).count(),
+            1,
+            "the window held the earlier frames uncommitted, {rows:?}"
+        );
+        let replay = connections.next().expect("a replay connection");
+        assert_eq!(
+            replay
+                .iter()
+                .map(|f| frame_qty_values(f))
+                .collect::<Vec<_>>(),
+            rows.iter()
+                .map(|&(_, value)| vec![value])
+                .collect::<Vec<_>>(),
+            "each frame replays alone, the good ones first, {rows:?}"
+        );
+        assert!(replay.iter().all(|f| f[5] & 1 == 0), "{rows:?}");
+        assert_eq!(server.accepted(), 2);
+    }
+}
 
 #[derive(Clone, Debug)]
 enum MockMode {
@@ -97,6 +1121,11 @@ enum MockMode {
     /// that becomes a read-only replica while it holds a deferred group. Later
     /// connections ack normally so the client can replay onto the new primary.
     DeferAwareRejectingFrame(usize),
+    /// As [`MockMode::DeferAwareAck`] on every connection, but a data frame
+    /// with more than `max_rows` rows, or with `poison` among its `qty`
+    /// values, gets a terminal `PARSE_ERROR` — a server with a lowered
+    /// `qwp.max.rows.per.table`, or a row it can never accept.
+    DeferAwareParseRejecting { max_rows: u64, poison: i64 },
     /// Read (consume) the first `n` binary frames — so the client's writes
     /// provably succeed — then close **without** acking. Models a peer that
     /// ingests a published frame and then dies before acknowledging it: the
@@ -104,7 +1133,7 @@ enum MockMode {
     /// failure.
     ReadThenClose(usize),
     /// Durable-ACK mode: upgrade with `X-QWP-Durable-Ack: enabled`, OK each
-    /// data frame with a `trades` table seq_txn, and answer every keepalive
+    /// committing frame with a `trades` table seq_txn, and answer every keepalive
     /// ping with a pong + a durable-ACK frame so a `Durable` boundary commits.
     AckEachFrameDurable,
     /// The first accepted connection reads one data frame and closes without
@@ -359,7 +1388,28 @@ fn run_mock_server_accept_loop(
                                     &mut stream,
                                     &stop,
                                     capture,
-                                    (accept_index == 0).then_some(reject_at),
+                                    |index, _| {
+                                        (accept_index == 0 && index == reject_at).then_some((
+                                            QWP_STATUS_NOT_WRITABLE,
+                                            b"table is read only".as_slice(),
+                                        ))
+                                    },
+                                )
+                            }
+                            MockMode::DeferAwareParseRejecting { max_rows, poison } => {
+                                defer_aware_ack_rejecting(
+                                    &mut stream,
+                                    &stop,
+                                    capture,
+                                    |_, payload| {
+                                        (u16::from_le_bytes([payload[6], payload[7]]) != 0
+                                            && (frame_row_count(payload) > max_rows
+                                                || frame_qty_values(payload).contains(&poison)))
+                                        .then_some((
+                                            QWP_STATUS_PARSE_ERROR,
+                                            b"row count exceeds maximum".as_slice(),
+                                        ))
+                                    },
                                 )
                             }
                             MockMode::ReadThenClose(n) => {
@@ -404,7 +1454,7 @@ impl Drop for MockServer {
     }
 }
 
-/// Durable-ACK variant of [`ack_each_frame`]: OK each data frame with a
+/// Durable-ACK variant of [`ack_each_frame`]: OK each committing frame with a
 /// `("trades", seq_txn)` table entry and answer each keepalive ping (opcode
 /// 0x9) with a pong (0xA) + a durable-ACK frame carrying the same seq_txn, so
 /// the runner's durable watermark advances and a `Durable` boundary commits.
@@ -431,20 +1481,25 @@ fn ack_each_frame_durable(
                     }
                 }
                 0x2 => {
+                    let deferred = payload.len() > 5 && payload[5] & 1 != 0;
                     if let Some(tx) = &capture {
                         let _ = tx.send(payload);
+                    }
+                    let wire_seq = next_wire_seq;
+                    next_wire_seq += 1;
+                    if deferred {
+                        continue;
                     }
                     seq_txn += 1;
                     if write_qwp_ok_response_with_table_entries(
                         stream,
-                        next_wire_seq,
+                        wire_seq,
                         &[("trades", seq_txn)],
                     )
                     .is_err()
                     {
                         break;
                     }
-                    next_wire_seq += 1;
                 }
                 _ => {}
             },
@@ -682,19 +1737,17 @@ fn defer_aware_ack(
     }
 }
 
-/// As [`defer_aware_ack`], but with `reject_at = Some(n)` the `n`-th data
-/// frame (0-based) is answered with a retriable `NOT_WRITABLE` rejection
-/// instead of being acked or withheld — the role-switch response a primary
-/// gives while it is still holding a deferred group.
+/// As [`defer_aware_ack`], but a data frame for which `reject(index, payload)`
+/// returns a status (`index` is 0-based on this connection) is answered with
+/// that rejection instead of being acked or withheld.
 fn defer_aware_ack_rejecting(
     stream: &mut std::net::TcpStream,
     stop: &AtomicBool,
     capture: Option<mpsc::Sender<Vec<u8>>>,
-    reject_at: Option<usize>,
+    reject: impl Fn(usize, &[u8]) -> Option<(u8, &'static [u8])>,
 ) {
     const FLAG_DEFER_COMMIT: u8 = 0x01;
     const QWP_FLAGS_OFFSET: usize = 5;
-    const QWP_STATUS_NOT_WRITABLE: u8 = 0x0C;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut frame_index: u64 = 0;
     let mut read = 0usize;
@@ -725,16 +1778,12 @@ fn defer_aware_ack_rejecting(
                 read += 1;
                 let deferred = payload.len() > QWP_FLAGS_OFFSET
                     && (payload[QWP_FLAGS_OFFSET] & FLAG_DEFER_COMMIT) != 0;
+                let rejection = reject(index, &payload);
                 if let Some(tx) = capture.as_ref() {
                     let _ = tx.send(payload);
                 }
-                if reject_at == Some(index) {
-                    let _ = write_qwp_error_response(
-                        stream,
-                        QWP_STATUS_NOT_WRITABLE,
-                        frame_index,
-                        b"table is read only",
-                    );
+                if let Some((status, message)) = rejection {
+                    let _ = write_qwp_error_response(stream, status, frame_index, message);
                     // Mark the boundary so a reader can split this peer's
                     // frames from the replay without assuming a count.
                     if let Some(tx) = capture.as_ref() {
@@ -922,10 +1971,12 @@ fn read_symbol_prefix(payload: &[u8]) -> (u64, Vec<Vec<u8>>) {
 fn frame_table_name(payload: &[u8]) -> String {
     const QWP_HEADER_LEN: usize = 12;
     let mut pos = QWP_HEADER_LEN;
-    read_test_varint(payload, &mut pos); // delta_start
-    let new_symbols = read_test_varint(payload, &mut pos);
-    for _ in 0..new_symbols {
-        read_test_bytes(payload, &mut pos);
+    if payload[5] & 0x08 != 0 {
+        read_test_varint(payload, &mut pos); // delta_start
+        let new_symbols = read_test_varint(payload, &mut pos);
+        for _ in 0..new_symbols {
+            read_test_bytes(payload, &mut pos);
+        }
     }
     std::str::from_utf8(read_test_bytes(payload, &mut pos))
         .unwrap()
@@ -942,10 +1993,12 @@ fn unused_local_port() -> u16 {
 fn frame_row_count(payload: &[u8]) -> u64 {
     const QWP_HEADER_LEN: usize = 12;
     let mut pos = QWP_HEADER_LEN;
-    read_test_varint(payload, &mut pos); // delta_start
-    let new_symbols = read_test_varint(payload, &mut pos);
-    for _ in 0..new_symbols {
-        read_test_bytes(payload, &mut pos);
+    if payload[5] & 0x08 != 0 {
+        read_test_varint(payload, &mut pos); // delta_start
+        let new_symbols = read_test_varint(payload, &mut pos);
+        for _ in 0..new_symbols {
+            read_test_bytes(payload, &mut pos);
+        }
     }
     read_test_bytes(payload, &mut pos); // table name
     read_test_varint(payload, &mut pos)
@@ -971,10 +2024,12 @@ fn frame_qty_values(payload: &[u8]) -> Vec<i64> {
         return Vec::new();
     }
     let mut pos = QWP_HEADER_LEN;
-    read_test_varint(payload, &mut pos); // delta_start
-    let new_symbols = read_test_varint(payload, &mut pos);
-    for _ in 0..new_symbols {
-        read_test_bytes(payload, &mut pos);
+    if payload[5] & 0x08 != 0 {
+        read_test_varint(payload, &mut pos); // delta_start
+        let new_symbols = read_test_varint(payload, &mut pos);
+        for _ in 0..new_symbols {
+            read_test_bytes(payload, &mut pos);
+        }
     }
     read_test_bytes(payload, &mut pos); // table name
     let row_count = read_test_varint(payload, &mut pos) as usize;
@@ -990,6 +2045,77 @@ fn frame_qty_values(payload: &[u8]) -> Vec<i64> {
             i64::from_le_bytes(payload[at..at + 8].try_into().unwrap())
         })
         .collect()
+}
+
+fn frame_table_qty_values(payload: &[u8]) -> Vec<(String, Vec<i64>)> {
+    assert_eq!(&payload[..4], b"QWP1");
+    assert_ne!(payload[5] & 0x08, 0);
+    let mut pos = 12;
+    read_test_varint(payload, &mut pos);
+    for _ in 0..read_test_varint(payload, &mut pos) {
+        read_test_bytes(payload, &mut pos);
+    }
+    let mut tables = Vec::new();
+    for _ in 0..u16::from_le_bytes([payload[6], payload[7]]) {
+        let table = String::from_utf8(read_test_bytes(payload, &mut pos).to_vec()).unwrap();
+        let rows = read_test_varint(payload, &mut pos) as usize;
+        let columns: Vec<_> = (0..read_test_varint(payload, &mut pos))
+            .map(|_| {
+                let name = read_test_bytes(payload, &mut pos).to_vec();
+                pos += 1;
+                (name, payload[pos - 1])
+            })
+            .collect();
+        let mut qty = Vec::new();
+        for (name, kind) in columns {
+            assert_eq!(payload[pos], 0, "null bitmap");
+            pos += 1;
+            match kind {
+                0x05 => {
+                    let values = (0..rows).map(|row| {
+                        let at = pos + row * 8;
+                        i64::from_le_bytes(payload[at..at + 8].try_into().unwrap())
+                    });
+                    if name == b"qty" {
+                        qty.extend(values);
+                    }
+                }
+                0x13 => pos += 1,
+                other => panic!("unexpected column type {other:#x}"),
+            }
+            pos += rows * 8;
+        }
+        tables.push((table, qty));
+    }
+    assert_eq!(pos, payload.len());
+    tables
+}
+
+fn slot_holds_only_qwp_frames(slot_dir: &Path) -> bool {
+    let mut frames = 0;
+    for entry in fs::read_dir(slot_dir).unwrap().flatten() {
+        if entry.path().extension().is_none_or(|ext| ext != "sfa") {
+            continue;
+        }
+        let segment = fs::read(entry.path()).unwrap();
+        let mut pos = 24;
+        while let Some(header) = segment.get(pos..pos + 8) {
+            let len = i32::from_le_bytes(header[4..].try_into().unwrap());
+            let Some(payload) = usize::try_from(len)
+                .ok()
+                .filter(|len| *len > 0)
+                .and_then(|len| segment.get(pos + 8..pos + 8 + len))
+            else {
+                break;
+            };
+            if !payload.starts_with(b"QWP1") {
+                return false;
+            }
+            frames += 1;
+            pos += 8 + payload.len();
+        }
+    }
+    frames > 0
 }
 
 fn sorted_slot_names(sf_dir: &Path) -> Vec<String> {

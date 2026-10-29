@@ -54,9 +54,11 @@ use super::qwp_ws::{
     write_binary_frame, write_ping_frame,
 };
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
+use super::qwp_ws_frame_merge::FrameBatch;
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
 use super::qwp_ws_queue::{
-    OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
+    CommitWindow, OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus,
+    SentFrame,
 };
 use super::qwp_ws_sfa_catchup::{
     CatchUpEntryTooLarge, CatchUpFrameBuildError, CatchUpStreamError, SentDictMirror,
@@ -68,6 +70,7 @@ use super::qwp_ws_sfa_queue::{
     SfaCleanupFailure, SfaFrameQueue, SfaProducer, SfaProgressView, SfaSendCursor,
     SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
+use super::qwp_ws_sfa_segment::SfaMappedPayload;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ws::frame::OPCODE_BINARY;
 
@@ -178,6 +181,16 @@ pub(crate) struct QwpWsCoreTestHarness<Q, T> {
 pub(crate) struct QwpWsSendCore<T> {
     transport: T,
     send_cursor: SendCursor,
+    frame_batch: FrameBatch,
+    /// First frame of the next message and its rows, held unparsed until a
+    /// second frame joins it.
+    pending_frame: Option<(SfaMappedPayload, usize)>,
+    batch_last_fsn: Option<u64>,
+    batch_started: Option<Instant>,
+    ready_batch_through: Option<u64>,
+    /// Frames through this FSN are sent one by one, each committed on its own,
+    /// so a rejection inside a commit window names only its own frame.
+    unmerged_through: Option<u64>,
     /// I/O-thread-local mirror of every symbol dictionary entry sent on this
     /// connection, used to re-register the whole dictionary via catch-up frame(s)
     /// on reconnect. Inert (disabled) unless the store enables delta mode via
@@ -646,18 +659,20 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     fn record_rejected_frame(
         &mut self,
         fsn: u64,
+        last_fsn: u64,
         wire_seq: u64,
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
     ) -> QwpWsSenderError {
         self.last_server_error = Some(error.clone());
-        let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
+        let sender_error = sender_error_for_qwp_error_span(&error, wire_seq, fsn, last_fsn, policy);
         if self.sender_errors.capacity() != 0 {
             if self.rejected_frames.len() == self.sender_errors.capacity() {
                 self.rejected_frames.pop_front();
             }
             self.rejected_frames.push_back(QwpRejectedFrame {
                 fsn,
+                last_fsn,
                 wire_seq,
                 error,
             });
@@ -815,7 +830,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     pub(crate) fn rejected_frame(&self, receipt: QwpReceipt) -> Option<&QwpRejectedFrame> {
         self.rejected_frames
             .iter()
-            .find(|rejected| rejected.fsn == receipt.fsn)
+            .find(|rejected| (rejected.fsn..=rejected.last_fsn).contains(&receipt.fsn))
     }
 
     fn push_event(&mut self, event: DriverEvent) {
@@ -859,6 +874,12 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         Self {
             transport,
             send_cursor: SendCursor::new(),
+            frame_batch: FrameBatch::default(),
+            pending_frame: None,
+            batch_last_fsn: None,
+            batch_started: None,
+            ready_batch_through: None,
+            unmerged_through: None,
             dict_mirror: SentDictMirror::new(false),
             catch_up_pending: false,
             catch_up_retry_strikes: 0,
@@ -907,8 +928,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             TransportResponse::Reject { wire_seq, error } => {
                 store.counters.total_server_errors += 1;
                 let policy = server_error_policy(error.status);
-                let Some((fsn, _effect_wire_seq)) =
-                    self.send_cursor.reject_fsn_for_wire_seq(wire_seq)?
+                let Some((fsn, last_fsn, _effect_wire_seq)) =
+                    self.send_cursor.fsn_range_for_wire_seq(wire_seq)?
                 else {
                     return self.record_presend_reject(
                         store,
@@ -942,14 +963,6 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     return Ok(DriveOutcome::Idle);
                 }
 
-                if policy == QwpWsErrorPolicy::Terminal {
-                    let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
-                    let terminal_error =
-                        server_rejection_error(error.error.clone(), sender_error.clone());
-                    store.record_terminal_sender_error(sender_error, terminal_error, Some(error));
-                    return Ok(DriveOutcome::Terminal);
-                }
-
                 // A read-only/role reject (RetriableOther, e.g. a replica
                 // after an in-place role switch) is a node-state verdict, not
                 // a frame verdict: the frame is well-formed, the node just
@@ -959,9 +972,21 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 // recycles below instead, bounded in rate by the zero-progress
                 // pace so a persistent window churns at the backoff cap
                 // rather than at handshake RTT rate.
-                if policy != QwpWsErrorPolicy::RetriableOther
-                    && self.rejected_frame_is_poison(store, fsn)
-                {
+                let poisoned = policy == QwpWsErrorPolicy::Retriable
+                    && self.rejected_frame_is_poison(store, fsn);
+                let replay = (policy == QwpWsErrorPolicy::Terminal || poisoned)
+                    && self.replay_unmerged(store, fsn, last_fsn);
+
+                if policy == QwpWsErrorPolicy::Terminal && !replay {
+                    let sender_error =
+                        sender_error_for_qwp_error_span(&error, wire_seq, fsn, last_fsn, policy);
+                    let terminal_error =
+                        server_rejection_error(error.error.clone(), sender_error.clone());
+                    store.record_terminal_sender_error(sender_error, terminal_error, Some(error));
+                    return Ok(DriveOutcome::Terminal);
+                }
+
+                if poisoned && !replay {
                     let strikes = self.poison_tracker.strikes();
                     let reason = if error.message.is_empty() {
                         format!(
@@ -980,10 +1005,16 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     return Ok(DriveOutcome::Terminal);
                 }
 
+                let applied_policy = if replay {
+                    QwpWsErrorPolicy::Retriable
+                } else {
+                    policy
+                };
                 let error_for_reconnect = error.error.clone();
                 let reconnect_reason = reconnect_reason_for_policy(policy);
                 let pace = self.reconnect_pace_for_reject_policy(store, policy);
-                let sender_error = store.record_rejected_frame(fsn, wire_seq, error, policy);
+                let sender_error =
+                    store.record_rejected_frame(fsn, last_fsn, wire_seq, error, applied_policy);
                 store.push_event(DriverEvent::Rejected { fsn, wire_seq });
                 let initial_error = server_rejection_error(error_for_reconnect, sender_error);
                 self.pending_reconnect = Some(
@@ -997,6 +1028,28 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 self.continue_or_defer_reconnect(store, defer_reconnect)
             }
         }
+    }
+
+    /// A commit window rolls back all its uncommitted frames with a rejected
+    /// one. Before such a rejection ends the sender, resend those frames one by
+    /// one, each committed on its own, so only a frame rejected alone is fatal.
+    fn replay_unmerged<Q: PublicationLog>(
+        &mut self,
+        store: &QwpWsPublicationStore<Q>,
+        fsn: u64,
+        last_fsn: u64,
+    ) -> bool {
+        let alone = fsn == last_fsn && store.queue.oldest_unresolved_fsn() == Some(fsn);
+        if alone
+            || self.transport.commit_batch_limits().0.is_none()
+            || self
+                .unmerged_through
+                .is_some_and(|through| through >= last_fsn)
+        {
+            return false;
+        }
+        self.unmerged_through = Some(last_fsn);
+        true
     }
 
     fn reject_target_already_accounted<Q: PublicationLog>(
@@ -1198,9 +1251,10 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 wire_seq: ack_wire_seq,
             });
         }
+        let first_fsn = self.send_cursor.first_unacknowledged_fsn().unwrap_or(fsn);
         self.send_cursor.ack_through(fsn);
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
-        tracker.enqueue_ok(ack_wire_seq, fsn, table_seq_txns);
+        tracker.enqueue_ok_range(ack_wire_seq, first_fsn, fsn, table_seq_txns);
         self.complete_ready_durable(store)
     }
 
@@ -1260,6 +1314,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         // Windows keeps the active segment undeletable even after a complete
         // drain.
         self.send_cursor.release_sfa_cursor();
+        self.pending_frame = None;
         store.close_queue()
     }
 
@@ -1267,12 +1322,167 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         progress: &SfaProgressView,
     ) -> Result<Option<OutboundFrame>, DriverError> {
-        progress.next_outbound_frame(&mut self.send_cursor)
+        self.next_outbound_sfa_frame_through(progress, None, true)
+    }
+
+    pub(crate) fn next_outbound_sfa_frame_through(
+        &mut self,
+        progress: &SfaProgressView,
+        force_through: Option<u64>,
+        drain_ready: bool,
+    ) -> Result<Option<OutboundFrame>, DriverError> {
+        let Some((first_fsn, wire_seq)) = self
+            .send_cursor
+            .peek_next_frame_from_oldest(progress.oldest_unresolved_fsn())?
+        else {
+            return Ok(None);
+        };
+        let force_through = force_through.filter(|boundary| *boundary >= first_fsn);
+        let (interval, max_rows, max_bytes) = self.transport.commit_batch_limits();
+        let mut bytes_read = 0usize;
+        // `closed` ends the commit window; `ended` only the message.
+        let mut closed = false;
+        let mut ended = false;
+        loop {
+            let fsn = match self.batch_last_fsn {
+                Some(fsn) => fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?,
+                None => first_fsn,
+            };
+            let rewind = self
+                .send_cursor
+                .sfa_cursor_mut()
+                .as_ref()
+                .map(SfaSendCursor::released);
+            let Some(payload) =
+                progress.next_cursor_payload_for_fsn(self.send_cursor.sfa_cursor_mut(), fsn)?
+            else {
+                break;
+            };
+            let len = payload.len();
+            let joined = if let Some((first, _)) = &self.pending_frame {
+                let frame_batch = &mut self.frame_batch;
+                let joined = first.with_bytes(|first| {
+                    payload.with_bytes(|next| {
+                        FrameBatch::may_join(first, next, max_rows)
+                            && frame_batch.try_append(first, max_bytes, max_rows)
+                            && frame_batch.try_append(next, max_bytes, max_rows)
+                    })
+                });
+                if joined {
+                    self.pending_frame = None;
+                } else {
+                    frame_batch.clear();
+                }
+                joined
+            } else if !self.frame_batch.is_empty() {
+                payload.with_bytes(|next| self.frame_batch.try_append(next, max_bytes, max_rows))
+            } else {
+                let windowed =
+                    interval.is_some() && self.unmerged_through.is_none_or(|through| fsn > through);
+                let rows = windowed
+                    .then(|| {
+                        payload
+                            .with_bytes(|bytes| FrameBatch::start_rows(bytes, max_bytes, max_rows))
+                    })
+                    .flatten();
+                let Some(rows) = rows else {
+                    if windowed {
+                        self.batch_started.get_or_insert_with(Instant::now);
+                    }
+                    return Ok(Some(OutboundFrame {
+                        first_fsn: fsn,
+                        fsn,
+                        wire_seq,
+                        payload: payload.into(),
+                        window: if windowed {
+                            CommitWindow::Joins { rows: None }
+                        } else {
+                            CommitWindow::Outside
+                        },
+                    }));
+                };
+                self.pending_frame = Some((payload, rows));
+                true
+            };
+            if !joined {
+                // The next message starts with this frame; resume from its offset.
+                *self.send_cursor.sfa_cursor_mut() = rewind;
+                ended = true;
+                break;
+            }
+            self.batch_started.get_or_insert_with(Instant::now);
+            self.batch_last_fsn = Some(fsn);
+            bytes_read = bytes_read.saturating_add(len);
+            let window_rows = self
+                .transport
+                .window_rows()
+                .saturating_add(self.staged_rows());
+            if max_rows > 0 && window_rows >= max_rows
+                || force_through.is_some_and(|boundary| fsn >= boundary)
+            {
+                closed = true;
+                break;
+            }
+            if bytes_read >= 64 * 1024 {
+                break;
+            }
+        }
+        let Some(fsn) = self.batch_last_fsn else {
+            return Ok(None);
+        };
+        closed |= drain_ready
+            || force_through.is_some_and(|boundary| fsn >= boundary)
+            || self.commit_window_expired(interval)
+            || !progress.has_deferred_commit_headroom();
+        if !closed && !ended {
+            return Ok(None);
+        }
+        let rows = self.staged_rows();
+        let payload = match self.pending_frame.take() {
+            Some((payload, _)) => payload.into(),
+            None => {
+                let mut payload = Vec::new();
+                self.frame_batch.encode(&mut payload);
+                self.frame_batch.clear();
+                payload.into()
+            }
+        };
+        self.batch_last_fsn = None;
+        if closed {
+            self.batch_started = None;
+            self.ready_batch_through = Some(fsn);
+        }
+        Ok(Some(OutboundFrame {
+            first_fsn,
+            fsn,
+            wire_seq,
+            payload,
+            window: CommitWindow::Joins { rows: Some(rows) },
+        }))
+    }
+
+    fn staged_rows(&self) -> usize {
+        self.pending_frame
+            .as_ref()
+            .map_or_else(|| self.frame_batch.rows(), |(_, rows)| *rows)
+    }
+
+    fn commit_window_expired(&self, interval: Option<Duration>) -> bool {
+        self.batch_started
+            .zip(interval)
+            .is_some_and(|(start, interval)| start.elapsed() >= interval)
     }
 
     /// Opens one bounded send burst; returns its byte budget.
     pub(crate) fn begin_send_batch(&mut self) -> usize {
+        self.ready_batch_through = None;
         self.transport.begin_send_batch()
+    }
+
+    pub(crate) fn has_more_batch_input(&self, progress: &SfaProgressView) -> bool {
+        self.batch_last_fsn
+            .zip(progress.published_fsn())
+            .is_some_and(|(staged, published)| staged < published)
     }
 
     /// True once a send inside the burst replaced or lost the connection, so
@@ -1281,9 +1491,25 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         self.has_pending_reconnect() || self.catch_up_pending || self.sends_on_connection == 0
     }
 
-    /// Closes the burst: everything the transport still holds goes to the socket.
-    pub(crate) fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
-        self.transport.finish_send_batch()
+    pub(crate) fn finish_send_batch(
+        &mut self,
+        force_through: Option<u64>,
+    ) -> Result<(), TransportFailure> {
+        if self.batch_last_fsn.is_none()
+            && self.commit_window_expired(self.transport.commit_batch_limits().0)
+        {
+            // Every frame of the expired window is already on the wire.
+            self.batch_started = None;
+            self.ready_batch_through = self.ready_batch_through.max(
+                self.send_cursor
+                    .next_fsn
+                    .and_then(|next| next.checked_sub(1)),
+            );
+        }
+        let force_through = force_through
+            .filter(|fsn| self.send_cursor.next_fsn.is_some_and(|next| *fsn < next))
+            .max(self.ready_batch_through.take());
+        self.transport.finish_send_batch(force_through)
     }
 
     pub(crate) fn send_frame(
@@ -1455,9 +1681,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 // the FIFO ack stream aligned (their acks resolve to no real FSN --
                 // see `SendCursor::ack_fsn_for_wire_seq`).
                 let view = OutboundFrameView {
+                    first_fsn: 0,
                     fsn: 0,
                     wire_seq,
                     payload: frame_bytes,
+                    window: CommitWindow::Outside,
                 };
                 wire_seq += 1;
                 transport.send_frame(view).map(|_| ())
@@ -1688,9 +1916,10 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             });
         }
 
+        let first_fsn = self.send_cursor.first_unacknowledged_fsn().unwrap_or(fsn);
         self.send_cursor.ack_through(fsn);
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
-        tracker.enqueue_ok(ack_wire_seq, fsn, table_seq_txns);
+        tracker.enqueue_ok_range(ack_wire_seq, first_fsn, fsn, table_seq_txns);
         Ok(self.complete_ready_durable_sfa(progress)?.with_ok_fsn(fsn))
     }
 
@@ -1829,6 +2058,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             self.poison_min_escalation_window,
             now,
         ) {
+            let last_sent = self
+                .send_cursor
+                .next_fsn
+                .and_then(|next| next.checked_sub(1))
+                .unwrap_or(fsn);
+            if self.replay_unmerged(store, fsn, last_sent) {
+                return None;
+            }
             let strikes = self.poison_tracker.strikes();
             return Some(store.record_protocol_violation(
                 None,
@@ -1899,6 +2136,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     ) -> DriveOutcome {
         self.pending_reconnect = None;
         self.sends_on_connection = 0;
+        self.frame_batch.clear();
+        self.pending_frame = None;
+        self.batch_last_fsn = None;
+        self.batch_started = None;
+        self.ready_batch_through = None;
         self.send_cursor.restart(&store.queue);
         if self.durable_ack.is_some() {
             store.clear_unresolved_rejected_frames();
@@ -2827,28 +3069,43 @@ pub(crate) struct SendCursor {
     /// mapping is unchanged there. Reset by [`Self::restart`].
     catch_up_offset: u64,
     last_sent_wire_seq: Option<u64>,
-    /// The sent-but-unacked frames, as an anchor plus a count rather than one
-    /// entry per frame.
-    ///
-    /// [`Self::commit_sent`] only accepts the frame matching `next_fsn` /
-    /// `next_wire_seq` and advances both by one, so the run is always
-    /// contiguous in both sequences and the anchor describes it completely.
-    /// The run is bounded only by the segment ring's byte budget, so a
-    /// per-frame `VecDeque` would reach millions of entries of derivable state
-    /// that `sf_max_total_bytes` does not account for. The anchor-plus-count
-    /// form is O(1) regardless. This matches the Java client, whose send loop
-    /// also tracks acked frames by FSN arithmetic and keeps no per-frame heap.
     in_flight: InFlightRun,
+    acknowledged: Option<InFlightSpan>,
+    grouped: bool,
     sfa_cursor: Option<SfaSendCursor>,
 }
 
-/// A contiguous run of sent-but-unacked frames. `len == 0` means empty and
-/// leaves the anchor fields meaningless.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct InFlightRun {
-    front_fsn: u64,
-    front_wire_seq: u64,
+    spans: VecDeque<InFlightSpan>,
     len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InFlightSpan {
+    first_fsn: u64,
+    first_wire_seq: u64,
+    fsns_per_frame: u64,
+    frames: usize,
+}
+
+impl InFlightSpan {
+    fn last_fsn(&self) -> u64 {
+        self.first_fsn + self.fsns_per_frame * self.frames as u64 - 1
+    }
+
+    fn last_wire_seq(&self) -> u64 {
+        self.first_wire_seq + self.frames as u64 - 1
+    }
+
+    fn range_for_wire_seq(&self, wire_seq: u64) -> Option<(u64, u64)> {
+        let offset = wire_seq.checked_sub(self.first_wire_seq)?;
+        if offset >= self.frames as u64 {
+            return None;
+        }
+        let first = self.first_fsn + offset * self.fsns_per_frame;
+        Some((first, first + self.fsns_per_frame - 1))
+    }
 }
 
 impl InFlightRun {
@@ -2857,43 +3114,81 @@ impl InFlightRun {
     }
 
     fn clear(&mut self) {
+        self.spans.clear();
         self.len = 0;
     }
 
-    /// Append the frame that [`SendCursor::commit_sent`] has just validated as
-    /// the next in both sequences.
-    fn push(&mut self, frame: &SentFrame) {
-        if self.len == 0 {
-            self.front_fsn = frame.fsn;
-            self.front_wire_seq = frame.wire_seq;
+    fn push(&mut self, frame: &SentFrame) -> Result<(), DriverError> {
+        let fsns_per_frame = frame.fsn - frame.first_fsn + 1;
+        let len = self
+            .len
+            .checked_add(1)
+            .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
+        if let Some(tail) = self.spans.back_mut()
+            && tail.fsns_per_frame == fsns_per_frame
+            && tail.last_fsn().checked_add(1) == Some(frame.first_fsn)
+            && tail.last_wire_seq().checked_add(1) == Some(frame.wire_seq)
+        {
+            tail.frames += 1;
+        } else {
+            self.spans.try_reserve(1).map_err(|_| {
+                DriverError::Storage(error::fmt!(
+                    InvalidApiCall,
+                    "could not reserve QWP acknowledgement range"
+                ))
+            })?;
+            self.spans.push_back(InFlightSpan {
+                first_fsn: frame.first_fsn,
+                first_wire_seq: frame.wire_seq,
+                fsns_per_frame,
+                frames: 1,
+            });
         }
-        self.len += 1;
+        self.len = len;
+        Ok(())
     }
 
-    /// Drop every frame through `acked_fsn`, advancing the anchor by as many
-    /// places as were dropped. The FSN run is contiguous, so the count is
-    /// arithmetic rather than a walk.
-    fn ack_through(&mut self, acked_fsn: u64) {
-        if self.len == 0 || acked_fsn < self.front_fsn {
-            return;
+    fn ack_through(&mut self, acked_fsn: u64) -> Option<InFlightSpan> {
+        let mut acknowledged = None;
+        while let Some(front) = self.spans.front_mut() {
+            if acked_fsn < front.first_fsn {
+                break;
+            }
+            let dropped = ((u128::from(acked_fsn) + 1 - u128::from(front.first_fsn))
+                / u128::from(front.fsns_per_frame))
+            .min(front.frames as u128) as usize;
+            if dropped == 0 {
+                break;
+            }
+            acknowledged = Some(InFlightSpan {
+                frames: dropped,
+                ..*front
+            });
+            self.len -= dropped;
+            if dropped == front.frames {
+                self.spans.pop_front();
+            } else {
+                front.first_fsn += front.fsns_per_frame * dropped as u64;
+                front.first_wire_seq += dropped as u64;
+                front.frames -= dropped;
+                break;
+            }
         }
-        let dropped = (acked_fsn - self.front_fsn + 1).min(self.len as u64);
-        self.front_fsn += dropped;
-        self.front_wire_seq += dropped;
-        self.len -= dropped as usize;
+        acknowledged
     }
 
-    /// The wire sequence carrying `fsn`, or `None` when that FSN is not in the
-    /// run.
+    fn range_for_wire_seq(&self, wire_seq: u64) -> Option<(u64, u64)> {
+        let index = self
+            .spans
+            .partition_point(|span| span.last_wire_seq() < wire_seq);
+        self.spans.get(index)?.range_for_wire_seq(wire_seq)
+    }
+
     fn wire_seq_for_fsn(&self, fsn: u64) -> Option<u64> {
-        if self.len == 0 {
-            return None;
-        }
-        let offset = fsn.checked_sub(self.front_fsn)?;
-        if offset >= self.len as u64 {
-            return None;
-        }
-        Some(self.front_wire_seq + offset)
+        let index = self.spans.partition_point(|span| span.last_fsn() < fsn);
+        let span = self.spans.get(index)?;
+        let offset = fsn.checked_sub(span.first_fsn)? / span.fsns_per_frame;
+        Some(span.first_wire_seq + offset)
     }
 }
 
@@ -2907,6 +3202,8 @@ impl SendCursor {
             catch_up_offset: 0,
             last_sent_wire_seq: None,
             in_flight: InFlightRun::default(),
+            acknowledged: None,
+            grouped: false,
             sfa_cursor: None,
         }
     }
@@ -2943,28 +3240,31 @@ impl SendCursor {
     /// Commits a successfully handed-off frame and reports whether it belongs
     /// to the replay window armed by [`Self::restart`].
     fn commit_sent(&mut self, frame: SentFrame) -> Result<bool, DriverError> {
-        if self.next_fsn != Some(frame.fsn) || self.next_wire_seq != frame.wire_seq {
+        if self.next_fsn != Some(frame.first_fsn)
+            || self.next_wire_seq != frame.wire_seq
+            || frame.first_fsn > frame.fsn
+        {
             return Err(DriverError::Queue(QueueError::OutboundFrameUnavailable {
                 fsn: frame.fsn,
                 wire_seq: frame.wire_seq,
             }));
         }
-        let replayed = self
-            .replay_target_fsn
-            .is_some_and(|target_fsn| frame.fsn <= target_fsn);
-
-        self.next_fsn = Some(
-            frame
-                .fsn
-                .checked_add(1)
-                .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?,
-        );
-        self.next_wire_seq = self
+        let next_fsn = frame
+            .fsn
+            .checked_add(1)
+            .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
+        let next_wire_seq = self
             .next_wire_seq
             .checked_add(1)
             .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
+        let replayed = self
+            .replay_target_fsn
+            .is_some_and(|target_fsn| frame.first_fsn <= target_fsn);
+        self.in_flight.push(&frame)?;
+        self.grouped |= frame.first_fsn != frame.fsn;
+        self.next_fsn = Some(next_fsn);
+        self.next_wire_seq = next_wire_seq;
         self.last_sent_wire_seq = Some(frame.wire_seq);
-        self.in_flight.push(&frame);
         if self
             .replay_target_fsn
             .is_some_and(|target_fsn| frame.fsn >= target_fsn)
@@ -2974,49 +3274,68 @@ impl SendCursor {
         Ok(replayed)
     }
 
+    fn fsn_range_for_wire_seq(
+        &self,
+        wire_seq: u64,
+    ) -> Result<Option<(u64, u64, u64)>, DriverError> {
+        let (Some(fsn_at_zero), Some(last_sent_wire_seq)) =
+            (self.fsn_at_zero, self.last_sent_wire_seq)
+        else {
+            return Ok(None);
+        };
+        let wire_seq = wire_seq.min(last_sent_wire_seq);
+        let Some(real_delta) = wire_seq.checked_sub(self.catch_up_offset) else {
+            return Ok(None);
+        };
+        if !self.grouped {
+            let fsn = fsn_at_zero
+                .checked_add(real_delta)
+                .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
+            return Ok(Some((fsn, fsn, wire_seq)));
+        }
+        if let Some((first, last)) = self.in_flight.range_for_wire_seq(wire_seq) {
+            return Ok(Some((first, last, wire_seq)));
+        }
+        if let Some(acknowledged) = self.acknowledged {
+            if let Some((first, last)) = acknowledged.range_for_wire_seq(wire_seq) {
+                return Ok(Some((first, last, wire_seq)));
+            }
+            if wire_seq < acknowledged.first_wire_seq {
+                // Older mappings are reclaimed; an already-acknowledged FSN
+                // keeps a stale response from resolving or rejecting new data.
+                let fsn = acknowledged.last_fsn();
+                return Ok(Some((fsn, fsn, wire_seq)));
+            }
+        }
+        Ok(None)
+    }
+
     fn reject_fsn_for_wire_seq(&self, wire_seq: u64) -> Result<Option<(u64, u64)>, DriverError> {
-        let Some(fsn_at_zero) = self.fsn_at_zero else {
-            return Ok(None);
-        };
-        let Some(last_sent_wire_seq) = self.last_sent_wire_seq else {
-            return Ok(None);
-        };
-        let effect_wire_seq = wire_seq.min(last_sent_wire_seq);
-        let Some(real_delta) = effect_wire_seq.checked_sub(self.catch_up_offset) else {
-            return Ok(None); // a catch-up frame; no real FSN to resolve
-        };
-        let fsn = fsn_at_zero
-            .checked_add(real_delta)
-            .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
-        Ok(Some((fsn, effect_wire_seq)))
+        Ok(self
+            .fsn_range_for_wire_seq(wire_seq)?
+            .map(|(first, _, wire_seq)| (first, wire_seq)))
     }
 
     fn ack_fsn_for_wire_seq(&self, wire_seq: u64) -> Result<Option<(u64, u64)>, DriverError> {
-        let Some(fsn_at_zero) = self.fsn_at_zero else {
-            return Ok(None);
-        };
-        let Some(last_sent_wire_seq) = self.last_sent_wire_seq else {
-            return Ok(None);
-        };
-        let ack_wire_seq = wire_seq.min(last_sent_wire_seq);
-        // Catch-up frames occupy wire seqs [0, catch_up_offset); their acks map to
-        // no real FSN (a harmless no-op — nothing to complete). Real replay frames
-        // start at catch_up_offset and map onto fsn_at_zero.
-        let Some(real_delta) = ack_wire_seq.checked_sub(self.catch_up_offset) else {
-            return Ok(None);
-        };
-        let fsn = fsn_at_zero
-            .checked_add(real_delta)
-            .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
-        Ok(Some((fsn, ack_wire_seq)))
+        Ok(self
+            .fsn_range_for_wire_seq(wire_seq)?
+            .map(|(_, last, wire_seq)| (last, wire_seq)))
+    }
+
+    fn first_unacknowledged_fsn(&self) -> Option<u64> {
+        self.in_flight.spans.front().map(|span| span.first_fsn)
     }
 
     fn ack_through(&mut self, acked_fsn: u64) {
-        self.in_flight.ack_through(acked_fsn);
+        if let Some(acknowledged) = self.in_flight.ack_through(acked_fsn) {
+            self.acknowledged = Some(acknowledged);
+        }
     }
 
     fn restart<Q: PublicationLog>(&mut self, log: &Q) {
         self.in_flight.clear();
+        self.acknowledged = None;
+        self.grouped = false;
         self.fsn_at_zero = log.oldest_unresolved_fsn();
         self.next_fsn = self.fsn_at_zero;
         self.replay_target_fsn = match (self.fsn_at_zero, log.published_fsn()) {
@@ -3047,14 +3366,22 @@ impl SendCursor {
 }
 
 pub(crate) trait QwpWsCoreTransport {
+    fn commit_batch_limits(&self) -> (Option<Duration>, usize, usize) {
+        (None, 0, usize::MAX)
+    }
+
+    /// Rows already handed to the open commit window.
+    fn window_rows(&self) -> usize {
+        0
+    }
+
     /// Byte budget for one bounded background send burst. Manual drivers keep
     /// their immediate-write behavior; test transports default to one frame.
     fn begin_send_batch(&mut self) -> usize {
         1
     }
 
-    /// Writes whatever the burst left grouped in the transport.
-    fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
+    fn finish_send_batch(&mut self, _force_through: Option<u64>) -> Result<(), TransportFailure> {
         Ok(())
     }
 
@@ -3155,7 +3482,6 @@ pub(crate) struct BlockingQwpWsTransport {
     stream: WsStream,
     reader: WsFrameReader,
     send_buf: Vec<u8>,
-    /// Frames grouped for one socket write while a background burst is open.
     batch: super::qwp_ws_batch::QwpWsBatch,
     batching: bool,
     pending_wire_sequences: PendingWireSequenceRun,
@@ -3222,6 +3548,12 @@ impl BlockingQwpWsTransport {
         connected: QwpWsConnectRoundSuccess,
     ) -> Self {
         server_max_batch_size.store(connected.server_max_batch_size, Ordering::Release);
+        let (commit_interval, commit_rows) = qwp_ws.commit_window();
+        let batch = super::qwp_ws_batch::QwpWsBatch::new(
+            commit_interval,
+            commit_rows,
+            commit_byte_limit(&qwp_ws, connected.server_max_batch_size),
+        );
         let transport = Self {
             endpoints,
             previous_idx: Some(connected.endpoint_idx),
@@ -3237,7 +3569,7 @@ impl BlockingQwpWsTransport {
             stream: connected.stream,
             reader: WsFrameReader::with_initial_input(connected.leftover),
             send_buf: Vec::with_capacity(16 * 1024),
-            batch: super::qwp_ws_batch::QwpWsBatch::new(),
+            batch,
             batching: false,
             pending_wire_sequences: PendingWireSequenceRun::default(),
             last_durable_keepalive_ping: None,
@@ -3252,7 +3584,7 @@ impl BlockingQwpWsTransport {
 
     fn reconnect(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
         // Unwritten frames die with the connection; the SF log replays them.
-        self.batch.clear();
+        self.batch.reset_connection();
         self.batching = false;
         if let Some(gate) = self.traffic_gate.as_deref() {
             gate.clear();
@@ -3286,6 +3618,10 @@ impl BlockingQwpWsTransport {
         self.negotiated_version = connected.negotiated_version;
         self.server_max_batch_size
             .store(connected.server_max_batch_size, Ordering::Release);
+        self.batch.set_byte_limit(commit_byte_limit(
+            &self.qwp_ws,
+            connected.server_max_batch_size,
+        ));
         self.reader = WsFrameReader::with_initial_input(connected.leftover);
         self.send_buf.clear();
         self.pending_wire_sequences.clear();
@@ -3307,6 +3643,20 @@ impl BlockingQwpWsTransport {
     fn complete_pending_through(&mut self, sequence: u64) {
         self.pending_wire_sequences.complete_through(sequence);
     }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn commit_byte_limit(config: &QwpWsConfig, server_max: usize) -> usize {
+    config
+        .commit_max_bytes
+        .min(super::qwp_ws_sfa_queue::segment_payload_capacity(
+            *config.sf_max_segment_bytes,
+        ))
+        .min(if server_max == 0 {
+            usize::MAX
+        } else {
+            server_max
+        })
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -3371,20 +3721,36 @@ fn decode_durable_transport_response(
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl QwpWsCoreTransport for BlockingQwpWsTransport {
+    fn commit_batch_limits(&self) -> (Option<Duration>, usize, usize) {
+        let (interval, rows) = self.qwp_ws.commit_window();
+        (
+            interval,
+            rows,
+            commit_byte_limit(&self.qwp_ws, self.server_max_batch_size()),
+        )
+    }
+
+    fn window_rows(&self) -> usize {
+        self.batch.rows()
+    }
+
     fn begin_send_batch(&mut self) -> usize {
         self.batching = true;
         super::qwp_ws_batch::NETWORK_BYTES
     }
 
-    fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
+    fn finish_send_batch(&mut self, force_through: Option<u64>) -> Result<(), TransportFailure> {
         self.batching = false;
-        self.batch.flush(&mut self.stream).map_err(|io| {
-            TransportFailure::Disconnect(error::fmt!(
-                SocketError,
-                "Could not flush WebSocket batch: {}",
-                io
-            ))
-        })
+        if self.batch.should_flush(force_through) {
+            self.batch.flush(&mut self.stream).map_err(|io| {
+                TransportFailure::Disconnect(error::fmt!(
+                    SocketError,
+                    "Could not flush WebSocket batch: {}",
+                    io
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
@@ -3491,16 +3857,19 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
         frame: OutboundFrameView<'_>,
     ) -> Result<TransportSendResult, TransportFailure> {
         if self.batching {
-            let grouped = (|| {
-                if self.batch.full_before(frame.payload.len()) {
+            let result = (|| {
+                if self.batch.full_before(frame.payload) {
                     self.batch.flush(&mut self.stream)?;
                 }
-                if self.batch.append(frame.payload, rand::random())? {
+                if self
+                    .batch
+                    .append(frame.fsn, frame.payload, rand::random(), frame.window)?
+                {
                     self.batch.flush(&mut self.stream)?;
                 }
                 std::io::Result::Ok(())
             })();
-            grouped.map_err(|io| {
+            result.map_err(|io| {
                 TransportFailure::Disconnect(error::fmt!(
                     SocketError,
                     "Could not send WebSocket batch: {}",
@@ -3591,6 +3960,7 @@ pub(crate) struct QwpServerError {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QwpRejectedFrame {
     pub(crate) fsn: u64,
+    pub(crate) last_fsn: u64,
     pub(crate) wire_seq: u64,
     pub(crate) error: QwpServerError,
 }
@@ -3863,6 +4233,7 @@ struct DurableAckTracker {
 enum PendingDurableFrame {
     Ok {
         wire_seq: u64,
+        first_fsn: u64,
         fsn: u64,
         table_seq_txns: Vec<TableSeqTxn>,
     },
@@ -3892,8 +4263,19 @@ impl DurableAckTracker {
     }
 
     fn enqueue_ok(&mut self, wire_seq: u64, fsn: u64, table_seq_txns: Vec<TableSeqTxn>) {
+        self.enqueue_ok_range(wire_seq, fsn, fsn, table_seq_txns);
+    }
+
+    fn enqueue_ok_range(
+        &mut self,
+        wire_seq: u64,
+        first_fsn: u64,
+        fsn: u64,
+        table_seq_txns: Vec<TableSeqTxn>,
+    ) {
         self.pending.push_back(PendingDurableFrame::Ok {
             wire_seq,
+            first_fsn,
             fsn,
             table_seq_txns,
         });
@@ -3916,25 +4298,20 @@ impl DurableAckTracker {
     fn pending_wire_seq_for_fsn(&self, fsn: u64) -> Option<u64> {
         let front = self.pending.front()?;
         let back = self.pending.back()?;
-        if fsn < front.fsn() || fsn > back.fsn() {
+        if fsn < front.first_fsn() || fsn > back.fsn() {
             return None;
         }
-
-        // Ordinary OKs arrive in wire order, so pending FSNs form an ordered
-        // run. Most servers ACK each frame, making the run contiguous: index
-        // that case arithmetically. Cumulative OKs may leave gaps, so fall back
-        // to binary search rather than walking every durable-waiting frame.
-        let offset = usize::try_from(fsn - front.fsn()).ok()?;
+        let offset = usize::try_from(fsn - front.first_fsn()).ok()?;
         if let Some(entry) = self.pending.get(offset)
-            && entry.fsn() == fsn
+            && entry.first_fsn() <= fsn
+            && fsn <= entry.fsn()
         {
             return Some(entry.wire_seq());
         }
+        let index = self.pending.partition_point(|entry| entry.fsn() < fsn);
         self.pending
-            .binary_search_by_key(&fsn, PendingDurableFrame::fsn)
-            .ok()
-            .and_then(|index| self.pending.get(index))
-            .map(PendingDurableFrame::wire_seq)
+            .get(index)
+            .and_then(|entry| (entry.first_fsn() <= fsn).then(|| entry.wire_seq()))
     }
 
     fn pop_ready(&mut self) -> Option<DurableCompletion> {
@@ -3954,6 +4331,12 @@ impl DurableAckTracker {
 }
 
 impl PendingDurableFrame {
+    fn first_fsn(&self) -> u64 {
+        match self {
+            PendingDurableFrame::Ok { first_fsn, .. } => *first_fsn,
+        }
+    }
+
     fn is_covered_by(&self, table_watermarks: &HashMap<String, i64>) -> bool {
         match self {
             PendingDurableFrame::Ok { table_seq_txns, .. } => table_seq_txns.iter().all(|entry| {
@@ -4105,6 +4488,7 @@ pub(crate) struct FakeOrderedServer {
     /// Advertised max batch size in bytes (0 = uncapped), used to drive the
     /// reconnect symbol-dict catch-up frame splitting.
     server_max_batch_size: usize,
+    commit_window: Option<Duration>,
 }
 
 #[cfg(test)]
@@ -4143,6 +4527,11 @@ impl FakeOrderedServer {
         self
     }
 
+    pub(crate) fn with_commit_window(mut self, interval: Duration) -> Self {
+        self.commit_window = Some(interval);
+        self
+    }
+
     fn with_default(default_send_result: FakeSendResult) -> Self {
         Self {
             send_results: VecDeque::new(),
@@ -4151,12 +4540,17 @@ impl FakeOrderedServer {
             sent_frames: Vec::new(),
             sent_payloads: Vec::new(),
             server_max_batch_size: 0,
+            commit_window: None,
         }
     }
 }
 
 #[cfg(test)]
 impl QwpWsCoreTransport for FakeOrderedServer {
+    fn commit_batch_limits(&self) -> (Option<Duration>, usize, usize) {
+        (self.commit_window, 0, usize::MAX)
+    }
+
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
         Ok(self
             .poll_responses
@@ -4191,6 +4585,16 @@ impl QwpWsCoreTransport for FakeOrderedServer {
                         status: codec::WS_STATUS_WRITE_ERROR,
                         message: "fake write error".to_string(),
                         error: Error::new(ErrorCode::ServerFlushError, "fake write error"),
+                    },
+                })
+            }
+            FakeSendResult::RejectWireParseError { wire_seq } => {
+                TransportSendResult::Response(TransportResponse::Reject {
+                    wire_seq,
+                    error: QwpServerError {
+                        status: codec::WS_STATUS_PARSE_ERROR,
+                        message: "fake parse error".to_string(),
+                        error: Error::new(ErrorCode::InvalidApiCall, "fake parse error"),
                     },
                 })
             }
@@ -4230,6 +4634,9 @@ pub(crate) enum FakeSendResult {
         wire_seq: u64,
     },
     RejectWire {
+        wire_seq: u64,
+    },
+    RejectWireParseError {
         wire_seq: u64,
     },
     /// A read-only / role reject (`WS_STATUS_NOT_WRITABLE`) — e.g. a replica
@@ -4287,6 +4694,7 @@ mod tests {
         // Two replay frames follow the catch-up: fsn 5 @ wire 3, fsn 6 @ wire 4.
         cursor
             .commit_sent(SentFrame {
+                first_fsn: 5,
                 fsn: 5,
                 wire_seq: 3,
                 payload_len: 0,
@@ -4294,6 +4702,7 @@ mod tests {
             .unwrap();
         cursor
             .commit_sent(SentFrame {
+                first_fsn: 6,
                 fsn: 6,
                 wire_seq: 4,
                 payload_len: 0,
@@ -4320,6 +4729,7 @@ mod tests {
         cursor.next_fsn = Some(10);
         cursor
             .commit_sent(SentFrame {
+                first_fsn: 10,
                 fsn: 10,
                 wire_seq: 0,
                 payload_len: 0,
@@ -4327,6 +4737,7 @@ mod tests {
             .unwrap();
         cursor
             .commit_sent(SentFrame {
+                first_fsn: 11,
                 fsn: 11,
                 wire_seq: 1,
                 payload_len: 0,
@@ -4334,6 +4745,142 @@ mod tests {
             .unwrap();
         assert_eq!(cursor.ack_fsn_for_wire_seq(0).unwrap(), Some((10, 0)));
         assert_eq!(cursor.ack_fsn_for_wire_seq(1).unwrap(), Some((11, 1)));
+    }
+
+    fn sent_range(first_fsn: u64, fsn: u64, wire_seq: u64) -> SentFrame {
+        SentFrame {
+            first_fsn,
+            fsn,
+            wire_seq,
+            payload_len: 1,
+        }
+    }
+
+    #[test]
+    fn grouped_frames_map_every_fsn_and_ack_only_complete_groups() {
+        let mut cursor = SendCursor::new();
+        assert_eq!(
+            cursor.peek_next_frame_from_oldest(Some(10)).unwrap(),
+            Some((10, 0))
+        );
+        for frame in [
+            sent_range(10, 10, 0),
+            sent_range(11, 1010, 1),
+            sent_range(1011, 1013, 2),
+        ] {
+            cursor.commit_sent(frame).unwrap();
+            for fsn in frame.first_fsn..=frame.fsn {
+                assert_eq!(cursor.wire_seq_for_fsn(fsn), Some(frame.wire_seq));
+            }
+            assert_eq!(
+                cursor.ack_fsn_for_wire_seq(frame.wire_seq).unwrap(),
+                Some((frame.fsn, frame.wire_seq))
+            );
+            assert_eq!(
+                cursor.reject_fsn_for_wire_seq(frame.wire_seq).unwrap(),
+                Some((frame.first_fsn, frame.wire_seq))
+            );
+        }
+        assert_eq!(cursor.next_fsn, Some(1014));
+        assert_eq!(cursor.next_wire_seq, 3);
+        assert_eq!(cursor.wire_seq_for_fsn(9), None);
+        assert_eq!(cursor.wire_seq_for_fsn(1014), None);
+        assert_eq!(
+            cursor.ack_fsn_for_wire_seq(u64::MAX).unwrap(),
+            Some((1013, 2))
+        );
+
+        cursor.ack_through(10);
+        assert_eq!(cursor.first_unacknowledged_fsn(), Some(11));
+        cursor.ack_through(1009);
+        assert_eq!(cursor.first_unacknowledged_fsn(), Some(11));
+        assert_eq!(cursor.wire_seq_for_fsn(11), Some(1));
+        cursor.ack_through(1010);
+        assert_eq!(cursor.first_unacknowledged_fsn(), Some(1011));
+        assert_eq!(cursor.wire_seq_for_fsn(11), None);
+        assert_eq!(cursor.ack_fsn_for_wire_seq(1).unwrap(), Some((1010, 1)));
+        assert_eq!(cursor.reject_fsn_for_wire_seq(1).unwrap(), Some((11, 1)));
+
+        cursor.ack_through(1013);
+        assert_eq!(cursor.in_flight.len(), 0);
+        assert_eq!(cursor.first_unacknowledged_fsn(), None);
+        assert_eq!(cursor.ack_fsn_for_wire_seq(0).unwrap(), Some((1013, 0)));
+        assert_eq!(cursor.reject_fsn_for_wire_seq(0).unwrap(), Some((1013, 0)));
+    }
+
+    #[test]
+    fn grouped_cursor_reconnect_discards_old_mapping_and_rebases_catch_up() {
+        let mut queue = SfaFrameQueue::open_memory(SfaMemoryQueueOptions {
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+        })
+        .unwrap();
+        for _ in 0..6 {
+            queue.try_submit(b"frame").unwrap();
+        }
+        let mut cursor = SendCursor::new();
+        cursor.peek_next_frame_from_oldest(Some(0)).unwrap();
+        cursor.commit_sent(sent_range(0, 2, 0)).unwrap();
+        cursor.commit_sent(sent_range(3, 5, 1)).unwrap();
+        queue.progress_view().complete_through_fsn(2).unwrap();
+        cursor.ack_through(2);
+        cursor.restart(&queue);
+        cursor.begin_catch_up(2);
+        assert_eq!(
+            cursor.peek_next_frame_from_oldest(Some(3)).unwrap(),
+            Some((3, 2))
+        );
+        assert!(cursor.commit_sent(sent_range(3, 5, 2)).unwrap());
+        assert_eq!(cursor.ack_fsn_for_wire_seq(1).unwrap(), None);
+        assert_eq!(cursor.reject_fsn_for_wire_seq(0).unwrap(), None);
+        assert_eq!(cursor.ack_fsn_for_wire_seq(2).unwrap(), Some((5, 2)));
+        assert_eq!(cursor.reject_fsn_for_wire_seq(2).unwrap(), Some((3, 2)));
+        assert_eq!(cursor.wire_seq_for_fsn(2), None);
+        assert_eq!(cursor.wire_seq_for_fsn(4), Some(2));
+        assert_eq!(cursor.replay_target_fsn, None);
+    }
+
+    #[test]
+    fn grouped_cursor_rejects_gaps_and_overflow_without_advancing() {
+        let mut cursor = SendCursor::new();
+        cursor.peek_next_frame_from_oldest(Some(7)).unwrap();
+        for frame in [
+            sent_range(8, 9, 0),
+            sent_range(7, 6, 0),
+            sent_range(7, 9, 1),
+            sent_range(7, u64::MAX, 0),
+        ] {
+            assert!(cursor.commit_sent(frame).is_err());
+            assert_eq!(cursor.next_fsn, Some(7));
+            assert_eq!(cursor.next_wire_seq, 0);
+            assert_eq!(cursor.in_flight.len(), 0);
+        }
+        cursor.next_wire_seq = u64::MAX;
+        assert!(cursor.commit_sent(sent_range(7, 9, u64::MAX)).is_err());
+        assert_eq!(cursor.next_fsn, Some(7));
+        assert_eq!(cursor.next_wire_seq, u64::MAX);
+        assert_eq!(cursor.in_flight.len(), 0);
+    }
+
+    #[test]
+    fn equal_width_groups_keep_constant_mapping_state() {
+        for width in [1, 1000] {
+            let mut run = InFlightRun::default();
+            for wire_seq in 0..10_000 {
+                run.push(&sent_range(
+                    wire_seq * width,
+                    (wire_seq + 1) * width - 1,
+                    wire_seq,
+                ))
+                .unwrap();
+            }
+            assert_eq!(run.spans.len(), 1);
+            assert_eq!(run.len(), 10_000);
+            run.ack_through(5000 * width - 1);
+            assert_eq!(run.spans.len(), 1);
+            assert_eq!(run.len(), 5000);
+            assert_eq!(run.wire_seq_for_fsn(5000 * width), Some(5000));
+        }
     }
 
     #[test]
@@ -5141,6 +5688,866 @@ mod tests {
         scratch.message
     }
 
+    fn qty_payload(values: &[i64]) -> Vec<u8> {
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        for &qty in values {
+            buffer
+                .table("trades")
+                .unwrap()
+                .column_i64("qty", qty)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        replay_payload(&buffer)
+    }
+
+    fn frame_payload(qty: i64) -> Vec<u8> {
+        qty_payload(&[qty])
+    }
+
+    fn window_driver(server: FakeOrderedServer) -> FakeDriver {
+        driver(server.with_commit_window(Duration::from_secs(60)))
+    }
+
+    struct StagingTransport(usize);
+
+    impl QwpWsCoreTransport for StagingTransport {
+        fn commit_batch_limits(&self) -> (Option<Duration>, usize, usize) {
+            (Some(Duration::from_secs(60)), 0, self.0)
+        }
+
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
+        }
+
+        fn send_frame(
+            &mut self,
+            _frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            Ok(TransportSendResult::NoResponse)
+        }
+    }
+
+    #[test]
+    fn frame_batch_closes_when_sf_cannot_reserve_a_commit_segment() {
+        for (max_bytes, ready) in [(64 * 1024, false), (8192, true)] {
+            let mut core = QwpWsSendCore::new(
+                StagingTransport(4096),
+                ReconnectPolicy::no_backoff(Duration::MAX),
+            );
+            let mut queue = memory_queue(SfaMemoryQueueOptions {
+                segment_size_bytes: 4096,
+                max_bytes,
+            });
+            let progress = queue.progress_view();
+            queue.try_submit(&frame_payload(1)).unwrap();
+            let outbound = core
+                .next_outbound_sfa_frame_through(&progress, None, false)
+                .unwrap();
+            assert_eq!(outbound.is_some(), ready, "max_bytes={max_bytes}");
+        }
+    }
+
+    #[test]
+    fn frame_over_the_current_cap_is_sent_unchanged() {
+        let mut core = QwpWsSendCore::new(
+            StagingTransport(16),
+            ReconnectPolicy::no_backoff(Duration::MAX),
+        );
+        let mut queue = memory_queue(SfaMemoryQueueOptions {
+            segment_size_bytes: 4096,
+            max_bytes: 64 * 1024,
+        });
+        let progress = queue.progress_view();
+        let frames = [frame_payload(1), frame_payload(2)];
+        for frame in &frames {
+            queue.try_submit(frame).unwrap();
+        }
+        for (fsn, frame) in (0..).zip(&frames) {
+            let outbound = core
+                .next_outbound_sfa_frame_through(&progress, None, false)
+                .unwrap()
+                .unwrap();
+            let sent = outbound.sent_frame();
+            assert_eq!((sent.first_fsn, sent.fsn), (fsn, fsn));
+            outbound.with_view(|view| assert_eq!(view.payload, frame.as_slice()));
+            let (sent, result) = core.send_frame(outbound);
+            core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+        }
+    }
+
+    fn decimal_payload(price: &str) -> Vec<u8> {
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        buffer
+            .table("trades")
+            .unwrap()
+            .column_dec64("price", price)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        replay_payload(&buffer)
+    }
+
+    fn two_table_payload(second: &str, qty: i64) -> Vec<u8> {
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        for table in ["trades", second] {
+            buffer
+                .table(table)
+                .unwrap()
+                .column_i64("qty", qty)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        replay_payload(&buffer)
+    }
+
+    #[test]
+    fn frame_that_ends_a_batch_is_reread_from_its_own_offset() {
+        let sequences: [Vec<Vec<u8>>; 3] = [
+            (0..4)
+                .map(|qty| table_payload(["a", "b"][qty as usize % 2], qty))
+                .collect(),
+            ["1.5", "1.25", "1.5", "1.25"].map(decimal_payload).to_vec(),
+            (0..4)
+                .map(|qty| two_table_payload(["quotes", "fills"][qty as usize % 2], qty))
+                .collect(),
+        ];
+        for frames in sequences {
+            let mut core = QwpWsSendCore::new(
+                StagingTransport(4096),
+                ReconnectPolicy::no_backoff(Duration::MAX),
+            );
+            let mut queue = memory_queue(SfaMemoryQueueOptions {
+                segment_size_bytes: 4096,
+                max_bytes: 64 * 1024,
+            });
+            let progress = queue.progress_view();
+            for frame in &frames {
+                queue.try_submit(frame).unwrap();
+            }
+            for (fsn, frame) in (0..).zip(&frames) {
+                let outbound = core
+                    .next_outbound_sfa_frame_through(&progress, Some(3), false)
+                    .unwrap()
+                    .unwrap();
+                let sent = outbound.sent_frame();
+                assert_eq!((sent.first_fsn, sent.fsn), (fsn, fsn));
+                outbound.with_view(|view| assert_eq!(view.payload, frame.as_slice()));
+                assert!(core.frame_batch.is_empty());
+                if fsn < 3 {
+                    assert!(
+                        !core
+                            .send_cursor
+                            .sfa_cursor
+                            .as_ref()
+                            .is_some_and(SfaSendCursor::holds_segment)
+                    );
+                }
+                let (sent, result) = core.send_frame(outbound);
+                core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn wait_request_flushes_already_staged_frames_without_new_publications() {
+        for sent_prefix in [false, true] {
+            let mut core = QwpWsSendCore::new(
+                StagingTransport(4096),
+                ReconnectPolicy::no_backoff(Duration::MAX),
+            );
+            let mut queue = memory_queue(SfaMemoryQueueOptions {
+                segment_size_bytes: 4096,
+                max_bytes: 64 * 1024,
+            });
+            let progress = queue.progress_view();
+            if sent_prefix {
+                queue
+                    .try_submit(&replay_payload(&qwp_buffer("prefix", 1, 1)))
+                    .unwrap();
+                let outbound = core
+                    .next_outbound_sfa_frame_through(&progress, Some(0), false)
+                    .unwrap()
+                    .unwrap();
+                let (sent, result) = core.send_frame(outbound);
+                core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+            }
+            queue.try_submit(&frame_payload(43)).unwrap();
+            let fsn = u64::from(sent_prefix);
+            let stale_boundary = fsn.checked_sub(1);
+            assert!(
+                core.next_outbound_sfa_frame_through(&progress, stale_boundary, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                core.next_outbound_sfa_frame_through(&progress, Some(fsn + 1), false)
+                    .unwrap()
+                    .is_none(),
+                "a future boundary must wait for its publication"
+            );
+            assert!(
+                core.next_outbound_sfa_frame_through(&progress, stale_boundary, false)
+                    .unwrap()
+                    .is_none(),
+                "an earlier wait must not close the next batch"
+            );
+            let outbound = core
+                .next_outbound_sfa_frame_through(&progress, Some(fsn), false)
+                .unwrap()
+                .expect("a wait must flush frames staged before the request arrived");
+            let sent = outbound.sent_frame();
+            assert_eq!((sent.first_fsn, sent.fsn), (fsn, fsn));
+            assert_eq!(core.ready_batch_through, Some(fsn));
+        }
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    struct WireBatchTransport {
+        interval: Duration,
+        max_rows: usize,
+        max_bytes: usize,
+        batch: super::super::qwp_ws_batch::QwpWsBatch,
+        written: Vec<u8>,
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    impl WireBatchTransport {
+        fn new(interval: Duration, max_rows: usize, max_bytes: usize) -> Self {
+            Self {
+                interval,
+                max_rows,
+                max_bytes,
+                batch: super::super::qwp_ws_batch::QwpWsBatch::new(Some(interval), max_rows, 4096),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    impl QwpWsCoreTransport for WireBatchTransport {
+        fn commit_batch_limits(&self) -> (Option<Duration>, usize, usize) {
+            (Some(self.interval), self.max_rows, self.max_bytes)
+        }
+
+        fn window_rows(&self) -> usize {
+            self.batch.rows()
+        }
+
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            if self
+                .batch
+                .append(frame.fsn, frame.payload, [0; 4], frame.window)
+                .unwrap()
+            {
+                self.batch.flush(&mut self.written).unwrap();
+            }
+            Ok(TransportSendResult::NoResponse)
+        }
+
+        fn finish_send_batch(
+            &mut self,
+            force_through: Option<u64>,
+        ) -> Result<(), TransportFailure> {
+            if self.batch.should_flush(force_through) {
+                self.batch.flush(&mut self.written).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn wire_frames(frames: &[Vec<u8>], deferred: usize) -> Vec<u8> {
+        use crate::ws::frame::{Opcode, encode_client_frame};
+
+        let mut wire = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            let mut frame = frame.clone();
+            if index < deferred {
+                frame[5] |= 1;
+            }
+            encode_client_frame(&mut wire, Opcode::Binary, [0; 4], &frame);
+        }
+        wire
+    }
+
+    fn table_payload(table: &str, qty: i64) -> Vec<u8> {
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        buffer
+            .table(table)
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        replay_payload(&buffer)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn frame_batch_deadline_flushes_wire_batch_without_a_second_interval() {
+        for deferred in [false, true] {
+            let interval = Duration::from_secs(60);
+            let transport = WireBatchTransport::new(interval, 0, 4096);
+            let mut core =
+                QwpWsSendCore::new(transport, ReconnectPolicy::no_backoff(Duration::MAX));
+            let mut queue = memory_queue(SfaMemoryQueueOptions {
+                segment_size_bytes: 4096,
+                max_bytes: 64 * 1024,
+            });
+            let mut frame = frame_payload(1);
+            frame[5] |= u8::from(deferred);
+            queue.try_submit(&frame).unwrap();
+            let progress = queue.progress_view();
+            core.begin_send_batch();
+            assert!(
+                core.next_outbound_sfa_frame_through(&progress, None, false)
+                    .unwrap()
+                    .is_none()
+            );
+            core.batch_started = Some(Instant::now() - interval);
+            let outbound = core
+                .next_outbound_sfa_frame_through(&progress, None, false)
+                .unwrap()
+                .unwrap();
+            outbound.with_view(|view| assert_eq!(view.payload, frame.as_slice()));
+            let expected = wire_frames(std::slice::from_ref(&frame), 0);
+            let (sent, result) = core.send_frame(outbound);
+            core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+            assert!(core.transport.written.is_empty());
+            assert!(!core.transport.batch.should_flush(None));
+            core.finish_send_batch(Some(1000)).unwrap();
+            assert_eq!(core.transport.written, expected);
+            assert_eq!(core.ready_batch_through, None);
+
+            queue.try_submit(&frame).unwrap();
+            core.begin_send_batch();
+            assert!(
+                core.next_outbound_sfa_frame_through(&progress, None, false)
+                    .unwrap()
+                    .is_none()
+            );
+            core.finish_send_batch(None).unwrap();
+            assert_eq!(core.transport.written, expected);
+        }
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn unmergeable_messages_share_the_window_commit() {
+        use super::super::qwp_ws_queue::OutboundPayload;
+
+        let interval = Duration::from_secs(60);
+        let mut core = QwpWsSendCore::new(
+            WireBatchTransport::new(interval, 0, 4096),
+            ReconnectPolicy::no_backoff(Duration::MAX),
+        );
+        let mut queue = memory_queue(SfaMemoryQueueOptions {
+            segment_size_bytes: 4096,
+            max_bytes: 64 * 1024,
+        });
+        let progress = queue.progress_view();
+        let frames: Vec<_> = (0..4)
+            .map(|qty| table_payload(["a", "b"][qty as usize % 2], qty))
+            .collect();
+        for frame in &frames {
+            queue.try_submit(frame).unwrap();
+        }
+        core.begin_send_batch();
+        for (fsn, frame) in (0..3).zip(&frames) {
+            let outbound = core
+                .next_outbound_sfa_frame_through(&progress, None, false)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(outbound.payload, OutboundPayload::Mapped(_)));
+            assert_eq!(
+                (outbound.first_fsn, outbound.fsn, outbound.window),
+                (fsn, fsn, CommitWindow::Joins { rows: Some(1) })
+            );
+            outbound.with_view(|view| assert_eq!(view.payload, frame.as_slice()));
+            let (sent, result) = core.send_frame(outbound);
+            core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+            assert_eq!(core.ready_batch_through, None);
+        }
+        assert!(
+            core.next_outbound_sfa_frame_through(&progress, None, false)
+                .unwrap()
+                .is_none()
+        );
+        core.finish_send_batch(None).unwrap();
+        assert!(core.transport.written.is_empty());
+
+        core.begin_send_batch();
+        core.batch_started = Some(Instant::now() - interval);
+        let outbound = core
+            .next_outbound_sfa_frame_through(&progress, None, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!((outbound.first_fsn, outbound.fsn), (3, 3));
+        let (sent, result) = core.send_frame(outbound);
+        core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+        core.finish_send_batch(None).unwrap();
+        assert_eq!(core.transport.written, wire_frames(&frames, 3));
+        assert_eq!(core.batch_started, None);
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn window_commits_once_its_messages_reach_the_row_limit() {
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        for table in ["a", "b"] {
+            buffer
+                .table(table)
+                .unwrap()
+                .column_i64("qty", 0)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        let two_tables = replay_payload(&buffer);
+        let cases = [
+            (2, vec![table_payload("a", 0), table_payload("b", 1)]),
+            (2, vec![two_tables.clone()]),
+            (3, vec![two_tables, table_payload("a", 1)]),
+        ];
+        for (max_rows, frames) in cases {
+            let mut core = QwpWsSendCore::new(
+                WireBatchTransport::new(Duration::from_secs(60), max_rows, 4096),
+                ReconnectPolicy::no_backoff(Duration::MAX),
+            );
+            let mut queue = memory_queue(SfaMemoryQueueOptions {
+                segment_size_bytes: 4096,
+                max_bytes: 64 * 1024,
+            });
+            let progress = queue.progress_view();
+            for frame in &frames {
+                queue.try_submit(frame).unwrap();
+            }
+            core.begin_send_batch();
+            while let Some(outbound) = core
+                .next_outbound_sfa_frame_through(&progress, None, false)
+                .unwrap()
+            {
+                let (sent, result) = core.send_frame(outbound);
+                core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+            }
+            core.finish_send_batch(None).unwrap();
+            assert_eq!(
+                core.transport.written,
+                wire_frames(&frames, frames.len() - 1),
+                "max_rows={max_rows}, frames={}",
+                frames.len()
+            );
+        }
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn expired_window_commits_frames_already_on_the_wire() {
+        let interval = Duration::from_secs(60);
+        let mut core = QwpWsSendCore::new(
+            WireBatchTransport::new(interval, 0, 16),
+            ReconnectPolicy::no_backoff(Duration::MAX),
+        );
+        let mut queue = memory_queue(SfaMemoryQueueOptions {
+            segment_size_bytes: 4096,
+            max_bytes: 64 * 1024,
+        });
+        let progress = queue.progress_view();
+        let frames = [frame_payload(1), frame_payload(2)];
+        for frame in &frames {
+            queue.try_submit(frame).unwrap();
+        }
+        core.begin_send_batch();
+        while let Some(outbound) = core
+            .next_outbound_sfa_frame_through(&progress, None, false)
+            .unwrap()
+        {
+            assert_ne!(outbound.window, CommitWindow::Outside);
+            let (sent, result) = core.send_frame(outbound);
+            core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+        }
+        core.finish_send_batch(None).unwrap();
+        assert!(core.transport.written.is_empty());
+
+        core.batch_started = Some(Instant::now() - interval);
+        core.begin_send_batch();
+        assert!(
+            core.next_outbound_sfa_frame_through(&progress, None, false)
+                .unwrap()
+                .is_none()
+        );
+        core.finish_send_batch(None).unwrap();
+        assert_eq!(core.transport.written, wire_frames(&frames, 1));
+        assert_eq!(core.batch_started, None);
+    }
+
+    #[test]
+    fn grouped_frames_keep_unmergeable_boundaries_and_map_ack_ranges() {
+        let queue = memory_queue(SfaMemoryQueueOptions {
+            segment_size_bytes: 128 * 1024,
+            max_bytes: 256 * 1024,
+        });
+        let mut driver = QwpWsCoreTestHarness::from_queue(
+            queue,
+            FakeOrderedServer::ack_each_send().with_commit_window(Duration::from_secs(60)),
+        );
+        let other = replay_payload(&qwp_buffer("other", 1, 1));
+        driver.try_submit(&other).unwrap();
+        let frame = frame_payload(2);
+        for _ in 0..1000 {
+            driver.try_submit(&frame).unwrap();
+        }
+        driver.try_submit(&other).unwrap();
+        for _ in 0..3 {
+            driver.try_submit(&frame).unwrap();
+        }
+        for (wire_seq, first, last) in [(0, 0, 0), (1, 1, 1000), (2, 1001, 1001), (3, 1002, 1004)] {
+            assert_eq!(
+                driver.drive_send_once().unwrap(),
+                DriveOutcome::Acked { wire_seq }
+            );
+            assert_eq!(driver.acked_fsn(), Some(last));
+            let sent = driver.send_core.transport.sent_frames().last().unwrap();
+            assert_eq!(
+                (sent.first_fsn, sent.fsn, sent.wire_seq),
+                (first, last, wire_seq)
+            );
+            for fsn in first..=last {
+                assert_eq!(
+                    driver.receipt_status(QwpReceipt { fsn }),
+                    QwpReceiptStatus::Completed { fsn }
+                );
+            }
+        }
+        let payloads = driver.send_core.transport.sent_payloads();
+        assert_eq!(payloads.len(), 4);
+        assert_eq!(payloads[0], other);
+        assert_eq!(payloads[1], qty_payload(&[2; 1000]));
+        assert_eq!(payloads[2], other);
+    }
+
+    #[test]
+    fn grouped_frame_rejection_attributes_and_replays_every_frame() {
+        let mut driver = window_driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWire { wire_seq: 0 },
+            FakeSendResult::AckSent,
+        ]));
+        let frame = frame_payload(1);
+        let receipts: Vec<_> = (0..6).map(|_| driver.try_submit(&frame).unwrap()).collect();
+        assert_eq!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        assert_eq!(driver.acked_fsn(), None);
+        let rejected = driver.poll_sender_error().unwrap();
+        assert_eq!((rejected.from_fsn, rejected.to_fsn), (0, 5));
+        for &receipt in &receipts {
+            assert_eq!(
+                driver.receipt_status(receipt),
+                QwpReceiptStatus::Published { fsn: receipt.fsn }
+            );
+        }
+        assert_eq!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        let sent = driver.send_core.transport.sent_frames();
+        assert_eq!(sent.len(), 2);
+        assert_eq!((sent[0].first_fsn, sent[0].fsn), (0, 5));
+        assert_eq!((sent[1].first_fsn, sent[1].fsn), (0, 5));
+        assert_eq!(
+            driver.send_core.transport.sent_payloads()[0],
+            driver.send_core.transport.sent_payloads()[1]
+        );
+        for receipt in receipts {
+            assert_eq!(
+                driver.receipt_status(receipt),
+                QwpReceiptStatus::Completed { fsn: receipt.fsn }
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_rejection_of_a_grouped_frame_replays_each_frame_alone() {
+        let mut script = vec![FakeSendResult::RejectWireParseError { wire_seq: 0 }];
+        script.extend([FakeSendResult::AckSent; 6]);
+        let mut driver = window_driver(FakeOrderedServer::scripted(script));
+        let frames: Vec<_> = (0..6).map(frame_payload).collect();
+        let receipts: Vec<_> = frames
+            .iter()
+            .map(|frame| driver.try_submit(frame).unwrap())
+            .collect();
+        assert_eq!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        let rejected = driver.poll_sender_error().unwrap();
+        assert_eq!((rejected.from_fsn, rejected.to_fsn), (0, 5));
+        assert_eq!(rejected.category, QwpWsErrorCategory::ParseError);
+        assert_eq!(rejected.applied_policy, QwpWsErrorPolicy::Retriable);
+        for wire_seq in 0..6 {
+            assert_eq!(
+                driver.drive_send_once().unwrap(),
+                DriveOutcome::Acked { wire_seq }
+            );
+        }
+        let sent = driver.send_core.transport.sent_frames();
+        assert_eq!((sent[0].first_fsn, sent[0].fsn), (0, 5));
+        for (fsn, frame) in (0..).zip(&sent[1..]) {
+            assert_eq!((frame.first_fsn, frame.fsn), (fsn, fsn));
+        }
+        assert_eq!(&driver.send_core.transport.sent_payloads()[1..], frames);
+        for receipt in receipts {
+            assert_eq!(
+                driver.receipt_status(receipt),
+                QwpReceiptStatus::Completed { fsn: receipt.fsn }
+            );
+        }
+
+        let receipt = driver.try_submit(&frames[0]).unwrap();
+        driver.try_submit(&frames[1]).unwrap();
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame {
+                first_fsn: 6,
+                fsn: 7,
+                ..
+            })
+        ));
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 6,
+                wire_seq: 6
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_rejection_after_an_unmerged_replay_names_only_its_frame() {
+        let mut driver = window_driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWireParseError { wire_seq: 0 },
+            FakeSendResult::AckSent,
+            FakeSendResult::AckSent,
+            FakeSendResult::RejectWireParseError { wire_seq: 2 },
+        ]));
+        let receipts: Vec<_> = (0..6)
+            .map(|qty| driver.try_submit(&frame_payload(qty)).unwrap())
+            .collect();
+        assert_eq!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        driver.poll_sender_error().unwrap();
+        for wire_seq in 0..2 {
+            assert_eq!(
+                driver.drive_send_once().unwrap(),
+                DriveOutcome::Acked { wire_seq }
+            );
+        }
+        assert_eq!(driver.drive_send_once().unwrap(), DriveOutcome::Terminal);
+        let terminal = driver.terminal_sender_error().unwrap();
+        assert_eq!((terminal.from_fsn, terminal.to_fsn), (2, 2));
+        assert_eq!(terminal.applied_policy, QwpWsErrorPolicy::Terminal);
+        for (fsn, receipt) in (0..).zip(receipts) {
+            let completed = driver.receipt_status(receipt) == QwpReceiptStatus::Completed { fsn };
+            assert_eq!(completed, fsn < 2, "fsn {fsn}");
+        }
+    }
+
+    #[test]
+    fn unmerged_frame_rejected_behind_an_unacked_frame_is_terminal() {
+        let mut driver = window_driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWireParseError { wire_seq: 0 },
+            FakeSendResult::NoResponse,
+            FakeSendResult::RejectWireParseError { wire_seq: 1 },
+        ]));
+        let mut split = frame_payload(0);
+        split[5] |= 1;
+        driver.try_submit(&split).unwrap();
+        driver.try_submit(&frame_payload(1)).unwrap();
+        assert_eq!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        driver.poll_sender_error().unwrap();
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame {
+                first_fsn: 0,
+                fsn: 0,
+                ..
+            })
+        ));
+        assert_eq!(driver.drive_send_once().unwrap(), DriveOutcome::Terminal);
+        let terminal = driver.terminal_sender_error().unwrap();
+        assert_eq!((terminal.from_fsn, terminal.to_fsn), (1, 1));
+        assert_eq!(driver.send_core.transport.sent_frames().len(), 3);
+    }
+
+    #[test]
+    fn terminal_rejection_of_a_lone_window_frame_is_not_replayed() {
+        let mut driver = window_driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWireParseError { wire_seq: 0 },
+        ]));
+        driver.try_submit(&frame_payload(1)).unwrap();
+        assert_eq!(driver.drive_send_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(driver.send_core.transport.sent_frames().len(), 1);
+        let terminal = driver.terminal_sender_error().unwrap();
+        assert_eq!((terminal.from_fsn, terminal.to_fsn), (0, 0));
+    }
+
+    #[test]
+    fn poisoned_grouped_frame_replays_each_frame_alone() {
+        let mut script =
+            vec![FakeSendResult::RejectWire { wire_seq: 0 }; DEFAULT_MAX_FRAME_REJECTIONS];
+        script.extend([FakeSendResult::AckSent; 6]);
+        let mut driver = window_driver(FakeOrderedServer::scripted(script));
+        let receipts: Vec<_> = (0..6)
+            .map(|qty| driver.try_submit(&frame_payload(qty)).unwrap())
+            .collect();
+        for _ in 0..DEFAULT_MAX_FRAME_REJECTIONS {
+            assert_eq!(
+                driver.drive_send_once().unwrap(),
+                DriveOutcome::Reconnected {
+                    reason: ReconnectReason::RetryableFailure
+                }
+            );
+        }
+        for wire_seq in 0..6 {
+            assert_eq!(
+                driver.drive_send_once().unwrap(),
+                DriveOutcome::Acked { wire_seq }
+            );
+        }
+        let sent = driver.send_core.transport.sent_frames();
+        assert!(
+            sent[..DEFAULT_MAX_FRAME_REJECTIONS]
+                .iter()
+                .all(|frame| (frame.first_fsn, frame.fsn) == (0, 5))
+        );
+        for receipt in receipts {
+            assert_eq!(
+                driver.receipt_status(receipt),
+                QwpReceiptStatus::Completed { fsn: receipt.fsn }
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_frame_durable_ok_preserves_receipts_until_durable_ack() {
+        let mut driver = durable_driver(
+            FakeOrderedServer::no_response().with_commit_window(Duration::from_secs(60)),
+        );
+        let frame = frame_payload(1);
+        let receipts: Vec<_> = (0..6).map(|_| driver.try_submit(&frame).unwrap()).collect();
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame {
+                first_fsn: 0,
+                fsn: 5,
+                wire_seq: 0,
+                ..
+            })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver.drive_receive_once().unwrap();
+        assert_eq!(driver.acked_fsn(), None);
+        for &receipt in &receipts {
+            assert_eq!(
+                driver.receipt_status(receipt),
+                QwpReceiptStatus::Sent {
+                    fsn: receipt.fsn,
+                    wire_seq: 0
+                }
+            );
+        }
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        for receipt in receipts {
+            assert_eq!(
+                driver.receipt_status(receipt),
+                QwpReceiptStatus::Completed { fsn: receipt.fsn }
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_discards_staged_frames_and_resplices_from_sf() {
+        for staged in [1, 3] {
+            let mut driver = QwpWsCoreTestHarness::from_queue(
+                memory_queue(SfaMemoryQueueOptions {
+                    segment_size_bytes: 4096,
+                    max_bytes: 64 * 1024,
+                }),
+                FakeOrderedServer::no_response().with_commit_window(Duration::from_secs(60)),
+            );
+            let frame = frame_payload(1);
+            for _ in 0..staged {
+                driver.try_submit(&frame).unwrap();
+            }
+            let progress = driver.store.progress_view();
+            assert!(
+                driver
+                    .send_core
+                    .next_outbound_sfa_frame_through(&progress, None, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(driver.send_core.batch_last_fsn, Some(staged - 1));
+            driver
+                .send_core
+                .finish_reconnect_success(&mut driver.store, ReconnectReason::Disconnect);
+            assert!(driver.send_core.frame_batch.is_empty());
+            assert!(driver.send_core.pending_frame.is_none());
+            assert_eq!(driver.send_core.batch_last_fsn, None);
+            assert_eq!(driver.send_core.batch_started, None);
+            driver.try_submit(&frame).unwrap();
+            let outbound = driver
+                .send_core
+                .next_outbound_sfa_frame_through(&progress, Some(staged), false)
+                .unwrap()
+                .unwrap();
+            let sent = outbound.sent_frame();
+            assert_eq!((sent.first_fsn, sent.fsn, sent.wire_seq), (0, staged, 0));
+            outbound.with_view(|view| {
+                assert_eq!(view.payload, qty_payload(&vec![1; staged as usize + 1]))
+            });
+        }
+    }
+
     fn qwp_error_payload(status: u8, sequence: u64, message: &str) -> Vec<u8> {
         let msg = message.as_bytes();
         let mut payload = Vec::with_capacity(11 + msg.len());
@@ -5346,6 +6753,7 @@ mod tests {
         assert_eq!(
             outcome,
             DriveOutcome::Sent(SentFrame {
+                first_fsn: 0,
                 fsn: 0,
                 wire_seq: 0,
                 payload_len: expected.len(),
@@ -5712,6 +7120,7 @@ mod tests {
         assert_eq!(
             driver.drive_send_once().unwrap(),
             DriveOutcome::Sent(SentFrame {
+                first_fsn: first.fsn,
                 fsn: first.fsn,
                 wire_seq: 0,
                 payload_len: b"first".len(),
@@ -5720,6 +7129,7 @@ mod tests {
         assert_eq!(
             driver.drive_send_once().unwrap(),
             DriveOutcome::Sent(SentFrame {
+                first_fsn: second.fsn,
                 fsn: second.fsn,
                 wire_seq: 1,
                 payload_len: b"second".len(),
@@ -5744,11 +7154,13 @@ mod tests {
             driver.send_core.transport.sent_frames.as_slice(),
             &[
                 SentFrame {
+                    first_fsn: first.fsn,
                     fsn: first.fsn,
                     wire_seq: 0,
                     payload_len: b"first".len(),
                 },
                 SentFrame {
+                    first_fsn: second.fsn,
                     fsn: second.fsn,
                     wire_seq: 1,
                     payload_len: b"second".len(),
@@ -6033,6 +7445,7 @@ mod tests {
 
     fn sent(fsn: u64, wire_seq: u64) -> SentFrame {
         SentFrame {
+            first_fsn: fsn,
             fsn,
             wire_seq,
             payload_len: 1,
@@ -6050,7 +7463,7 @@ mod tests {
 
         // A run anchored away from zero: fsn 10..=12 on wire seqs 4..=6.
         for (fsn, wire_seq) in [(10, 4), (11, 5), (12, 6)] {
-            run.push(&sent(fsn, wire_seq));
+            run.push(&sent(fsn, wire_seq)).unwrap();
         }
         assert_eq!(run.len(), 3);
         assert_eq!(run.wire_seq_for_fsn(10), Some(4));
@@ -6075,7 +7488,7 @@ mod tests {
         assert_eq!(run.wire_seq_for_fsn(12), None);
 
         // Draining fully then re-pushing re-anchors rather than resuming.
-        run.push(&sent(40, 7));
+        run.push(&sent(40, 7)).unwrap();
         assert_eq!(run.len(), 1);
         assert_eq!(run.wire_seq_for_fsn(40), Some(7));
         assert_eq!(run.wire_seq_for_fsn(13), None);
@@ -6128,6 +7541,96 @@ mod tests {
         assert_eq!(tracker.pending_wire_seq_for_fsn(103), Some(43));
         assert_eq!(tracker.pending_wire_seq_for_fsn(99), None);
         assert_eq!(tracker.pending_wire_seq_for_fsn(104), None);
+    }
+
+    #[test]
+    fn durable_groups_cover_each_fsn_until_every_table_is_durable() {
+        let txn = |table: &str, seq_txn| TableSeqTxn {
+            table: table.to_owned(),
+            seq_txn,
+        };
+        let mut tracker = DurableAckTracker::new();
+        tracker.enqueue_ok_range(1, 10, 1010, vec![txn("a", 3), txn("b", 5)]);
+        tracker.enqueue_ok_range(2, 1011, 1013, vec![txn("a", 4)]);
+        for fsn in 10..=1010 {
+            assert_eq!(tracker.pending_wire_seq_for_fsn(fsn), Some(1));
+        }
+        for fsn in 1011..=1013 {
+            assert_eq!(tracker.pending_wire_seq_for_fsn(fsn), Some(2));
+        }
+        assert_eq!(tracker.pending_wire_seq_for_fsn(9), None);
+        assert_eq!(tracker.pending_wire_seq_for_fsn(1014), None);
+        tracker.apply_ack(vec![txn("a", 3), txn("b", 4)]);
+        assert_eq!(tracker.pop_ready(), None);
+        tracker.apply_ack(vec![txn("b", 5)]);
+        assert_eq!(
+            tracker.pop_ready(),
+            Some(DurableCompletion {
+                wire_seq: 1,
+                fsn: 1010
+            })
+        );
+        assert_eq!(tracker.pending_wire_seq_for_fsn(10), None);
+        assert_eq!(tracker.pending_wire_seq_for_fsn(1011), Some(2));
+        assert_eq!(tracker.pop_ready(), None);
+        tracker.apply_ack(vec![txn("a", 4)]);
+        assert_eq!(
+            tracker.pop_ready(),
+            Some(DurableCompletion {
+                wire_seq: 2,
+                fsn: 1013
+            })
+        );
+        assert!(!tracker.has_pending());
+    }
+
+    #[test]
+    fn grouped_receipts_stay_sent_between_ok_and_durable_ack() {
+        let mut queue = SfaFrameQueue::open_memory(SfaMemoryQueueOptions {
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+        })
+        .unwrap();
+        for _ in 0..6 {
+            queue.try_submit(b"frame").unwrap();
+        }
+        let store = QwpWsPublicationStore::new(queue, 8);
+        let mut cursor = SendCursor::new();
+        cursor.peek_next_frame_from_oldest(Some(0)).unwrap();
+        cursor.commit_sent(sent_range(0, 2, 0)).unwrap();
+        cursor.commit_sent(sent_range(3, 5, 1)).unwrap();
+        for fsn in 0..6 {
+            assert_eq!(
+                store.receipt_status(&cursor, None, QwpReceipt { fsn }),
+                QwpReceiptStatus::Sent {
+                    fsn,
+                    wire_seq: fsn / 3
+                }
+            );
+        }
+        let first_fsn = cursor.first_unacknowledged_fsn().unwrap();
+        let (fsn, wire_seq) = cursor.ack_fsn_for_wire_seq(1).unwrap().unwrap();
+        cursor.ack_through(fsn);
+        let mut tracker = DurableAckTracker::new();
+        tracker.enqueue_ok_range(wire_seq, first_fsn, fsn, Vec::new());
+        for fsn in 0..6 {
+            assert_eq!(
+                store.receipt_status(&cursor, Some(&tracker), QwpReceipt { fsn }),
+                QwpReceiptStatus::Sent { fsn, wire_seq: 1 }
+            );
+        }
+        assert_eq!(store.queue.completed_fsn(), None);
+        let complete = tracker.pop_ready().unwrap();
+        store
+            .progress_view()
+            .complete_through_fsn(complete.fsn)
+            .unwrap();
+        for fsn in 0..6 {
+            assert_eq!(
+                store.receipt_status(&cursor, Some(&tracker), QwpReceipt { fsn }),
+                QwpReceiptStatus::Completed { fsn }
+            );
+        }
     }
 
     /// The wire cursor streams every buffered frame without an in-flight cap:
@@ -7169,6 +8672,7 @@ mod tests {
         assert_eq!(
             driver.drive_send_once().unwrap(),
             DriveOutcome::Sent(SentFrame {
+                first_fsn: 1,
                 fsn: 1,
                 wire_seq: 1,
                 payload_len: 6,
@@ -7706,6 +9210,7 @@ mod tests {
         assert_eq!(
             driver.drive_send_once().unwrap(),
             DriveOutcome::Sent(SentFrame {
+                first_fsn: 0,
                 fsn: 0,
                 wire_seq: 0,
                 payload_len: 7,
@@ -7742,6 +9247,7 @@ mod tests {
         assert_eq!(
             driver.drive_send_once().unwrap(),
             DriveOutcome::Sent(SentFrame {
+                first_fsn: 0,
                 fsn: 0,
                 wire_seq: 0,
                 payload_len: 7,
@@ -8634,6 +10140,7 @@ mod tests {
         assert_eq!(
             driver.drive_once().unwrap(),
             DriveOutcome::Sent(SentFrame {
+                first_fsn: 0,
                 fsn: 0,
                 wire_seq: 0,
                 payload_len: 5
@@ -8666,16 +10173,19 @@ mod tests {
             driver.send_core.transport.sent_frames(),
             &[
                 SentFrame {
+                    first_fsn: 0,
                     fsn: 0,
                     wire_seq: 0,
                     payload_len: 5,
                 },
                 SentFrame {
+                    first_fsn: 1,
                     fsn: 1,
                     wire_seq: 1,
                     payload_len: 6,
                 },
                 SentFrame {
+                    first_fsn: 0,
                     fsn: 0,
                     wire_seq: 0,
                     payload_len: 5,

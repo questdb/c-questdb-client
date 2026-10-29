@@ -173,6 +173,56 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
+fn qwpws_commit_window_keys_open_one_window() {
+    let window = |keys: &str| {
+        SenderBuilder::from_conf(format!("ws::addr=localhost:9000;{keys}"))
+            .unwrap()
+            .qwp_ws
+            .unwrap()
+            .commit_window()
+    };
+    assert_eq!(window(""), (None, 0));
+    assert_eq!(
+        window("commit_rows=500;"),
+        (Some(Duration::from_millis(100)), 500)
+    );
+    assert_eq!(
+        window("commit_interval_ms=25;"),
+        (Some(Duration::from_millis(25)), 1000)
+    );
+    assert_eq!(
+        window("commit_interval_ms=25;commit_rows=500;"),
+        (Some(Duration::from_millis(25)), 500)
+    );
+    for key in ["commit_rows", "commit_interval_ms"] {
+        assert_conf_err(
+            SenderBuilder::from_conf(format!("ws::addr=localhost:9000;{key}=0;")),
+            format!("\"{key}\" must be greater than 0."),
+        );
+        for value in ["-1", "invalid", "18446744073709551616"] {
+            let conf = format!("ws::addr=localhost:9000;{key}={value};");
+            assert_eq!(
+                SenderBuilder::from_conf(conf).unwrap_err().code(),
+                ErrorCode::ConfigError
+            );
+        }
+        #[cfg(feature = "sync-sender-tcp")]
+        assert_conf_err(
+            SenderBuilder::from_conf(format!("tcp::addr=localhost:9009;{key}=10;")),
+            format!("The \"{key}\" setting is only supported for QWP/WebSocket."),
+        );
+    }
+    assert_conf_err(
+        SenderBuilder::from_conf("ws::addr=localhost:1;qwp_ws_progress=manual;commit_rows=10;")
+            .unwrap()
+            .build(),
+        "commit_rows and commit_interval_ms require QWP/WebSocket background progress; \
+         use qwp_ws_progress=background",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
 fn qwpws_addr_accepts_bracketed_ipv6() {
     let builder = SenderBuilder::from_conf("ws::addr=[::1]:9001;").unwrap();
     assert_specified_eq(&builder.host, "::1");

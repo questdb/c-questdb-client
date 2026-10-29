@@ -851,10 +851,10 @@ public:
     }
 
     /**
-     * Publish `chunk` as a completion boundary, then wait until it and all
-     * prior frames published through this sender reach `level`. Uses the
-     * pool-wide `request_timeout` as the wait's no-progress deadline. Throws on
-     * error.
+     * Publish `chunk` as a completion boundary, close any automatic commit
+     * batch through it, then wait until it and all prior frames published
+     * through this sender reach `level`. Uses the pool-wide `request_timeout`
+     * as the wait's no-progress deadline. Throws on error.
      */
     void flush_and_wait(
         column_chunk& chunk, qwpws_ack_level level = qwpws_ack_level::ok)
@@ -918,10 +918,11 @@ public:
     }
 
     /**
-     * Block until every frame published on this sender so far reaches `level`.
-     * The SFA queue owns delivery, so this is needed only to *observe* the ack,
-     * never for durability. `timeout` is a no-progress deadline (it fires only
-     * if the ack watermark fails to advance for that long); the default of zero
+     * Close any automatic commit batch through this borrow's pending boundary,
+     * then block until its publications reach `level`. Call before returning
+     * the publishing borrow; a fresh empty borrow does not drain earlier
+     * borrows or the whole pool. `timeout` is a no-progress deadline (it fires
+     * only if the ack watermark fails to advance for that long); zero
      * waits indefinitely. Throws on error.
      */
     void wait(
@@ -966,7 +967,7 @@ public:
 
     /**
      * ACKing counterpart of `flush_arrow_batch_at_now`: publish as a boundary,
-     * then wait for `level`.
+     * close any automatic commit batch through it, then wait for `level`.
      */
     void flush_arrow_batch_at_now_and_wait(
         table_name_view table,
@@ -1052,8 +1053,8 @@ public:
     }
 
     /**
-     * ACKing counterpart of `flush_arrow_batch`: publish as a boundary, then
-     * wait for `level`.
+     * ACKing counterpart of `flush_arrow_batch`: publish as a boundary, close
+     * any automatic commit batch through it, then wait for `level`.
      */
     void flush_arrow_batch_and_wait(
         table_name_view table,
@@ -1153,7 +1154,8 @@ private:
  * accepted frames; `wait()` is an ack barrier, not a commit step. The
  * destructor is non-blocking by design. Use `wait()` for a simple barrier over
  * everything published so far; use FSNs for non-blocking progress tracking
- * while you still hold the same borrowed sender.
+ * while you still hold the same borrowed sender. With automatic commit
+ * batching, ACKs arrive when the batch commits.
  *
  * With `sf_dir`, `sf_durability=memory` is the default and uses the OS page
  * cache. Use `sf_durability=periodic` to checkpoint the local replay log.
@@ -1237,7 +1239,8 @@ public:
             ::qwp_sender_flush_buffer, _view.c_ptr(), buffer._impl);
     }
 
-    /** Publish and clear a Buffer, then wait for `level`. */
+    /** Publish and clear a Buffer, close any automatic commit batch through
+     * this publication, then wait for `level`. */
     void flush_and_wait(
         line_sender_buffer& buffer, qwpws_ack_level level = qwpws_ack_level::ok)
     {
@@ -1308,8 +1311,9 @@ public:
     }
 
     /**
-     * Publish `chunk` as a completion boundary, then wait until it and all
-     * prior frames published through this sender reach `level`.
+     * Publish `chunk` as a completion boundary, close any automatic commit
+     * batch through it, then wait until it and all prior frames published
+     * through this sender reach `level`.
      */
     void flush_and_wait(
         column_chunk& chunk, qwpws_ack_level level = qwpws_ack_level::ok)
@@ -1346,10 +1350,11 @@ public:
     }
 
     /**
-     * Block until every frame published on this sender so far reaches `level`.
-     * The SFA queue owns delivery, so this is needed only to *observe* the ack,
-     * never for durability. `timeout` is a no-progress deadline (it fires only
-     * if the ack watermark fails to advance for that long); the default of zero
+     * Close any automatic commit batch through this borrow's pending boundary,
+     * then block until its publications reach `level`. Call before returning
+     * the publishing borrow; a fresh empty borrow does not drain earlier
+     * borrows or the whole pool. `timeout` is a no-progress deadline (it fires
+     * only if the ack watermark fails to advance for that long); zero
      * waits indefinitely. Throws on error.
      */
     void wait(
@@ -1377,7 +1382,8 @@ public:
     }
 
     /**
-     * ACKing counterpart of `flush_arrow_batch_at_now`.
+     * ACKing counterpart of `flush_arrow_batch_at_now`; closes any automatic
+     * commit batch through the publication.
      */
     void flush_arrow_batch_at_now_and_wait(
         table_name_view table,
@@ -1435,7 +1441,8 @@ public:
     }
 
     /**
-     * ACKing counterpart of `flush_arrow_batch`.
+     * ACKing counterpart of `flush_arrow_batch`; closes any automatic commit
+     * batch through the publication.
      */
     void flush_arrow_batch_and_wait(
         table_name_view table,

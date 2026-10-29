@@ -347,6 +347,10 @@ required-features = ["sync-reader-qwp-ws"]
 name = "qwp_ws_unified_sfa_bench"
 required-features = ["sync-sender-qwp-ws", "arrow-ingress"]
 
+[[example]]
+name = "qwp_pool_bench"
+required-features = ["sync-sender-qwp-ws"]
+
 # Synthetic equities L1 quote feed → QuestDB via the column-major
 # sender. End-to-end throughput sanity check against a real server.
 [[example]]

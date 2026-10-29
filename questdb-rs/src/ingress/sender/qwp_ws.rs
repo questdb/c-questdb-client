@@ -528,6 +528,7 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     lifecycle: PublicationLifecycle,
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
+    commit_requested_upper: Arc<AtomicU64>,
     append_deadline: Duration,
     stop: Arc<AtomicBool>,
     traffic_gate: Arc<TrafficGate>,
@@ -541,6 +542,7 @@ struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     cold_effects: VecDeque<RunnerColdEffect>,
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
+    commit_requested_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -550,6 +552,7 @@ struct SyncQwpWsPendingRunnerCore {
     progress: SfaProgressView,
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
+    commit_requested_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -639,10 +642,12 @@ where
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
+        let commit_requested_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
         let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
+        let thread_commit_requested_upper = Arc::clone(&commit_requested_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -652,6 +657,7 @@ where
                 cold_effects: VecDeque::new(),
                 backpressure: thread_backpressure,
                 ok_completed_upper: thread_ok_completed_upper,
+                commit_requested_upper: thread_commit_requested_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -670,6 +676,7 @@ where
             lifecycle,
             backpressure,
             ok_completed_upper,
+            commit_requested_upper,
             append_deadline,
             stop,
             traffic_gate,
@@ -694,11 +701,13 @@ where
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let ok_completed_upper = Arc::new(AtomicU64::new(0));
+        let commit_requested_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let traffic_gate = Arc::clone(&pending_connect.traffic_gate);
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
         let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
+        let thread_commit_requested_upper = Arc::clone(&commit_requested_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -708,6 +717,7 @@ where
                 progress,
                 backpressure: thread_backpressure,
                 ok_completed_upper: thread_ok_completed_upper,
+                commit_requested_upper: thread_commit_requested_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -726,6 +736,7 @@ where
             lifecycle,
             backpressure,
             ok_completed_upper,
+            commit_requested_upper,
             append_deadline,
             stop,
             traffic_gate,
@@ -1228,6 +1239,7 @@ impl SyncQwpWsPendingRunnerCore {
                     cold_effects: VecDeque::new(),
                     backpressure: Arc::clone(&self.backpressure),
                     ok_completed_upper: Arc::clone(&self.ok_completed_upper),
+                    commit_requested_upper: Arc::clone(&self.commit_requested_upper),
                     lifecycle: self.lifecycle.clone(),
                 });
                 RunnerStep::Continue
@@ -1308,8 +1320,13 @@ where
             }
         }
 
-        // Bounded send burst: ready frames are handed to the transport back to
-        // back and reach the socket in grouped writes when the burst closes.
+        let force_through = if self.lifecycle.load() == PublicationState::Closing {
+            self.progress.published_fsn()
+        } else {
+            self.commit_requested_upper
+                .load(Ordering::Acquire)
+                .checked_sub(1)
+        };
         let budget = self.send_core.begin_send_batch();
         let mut bytes = 0usize;
         let mut send_step = RunnerStep::Idle;
@@ -1317,9 +1334,18 @@ where
             if stop.load(Ordering::Acquire) {
                 return RunnerStep::Stop;
             }
-            let outbound = match self.send_core.next_outbound_sfa_frame(&self.progress) {
+            let outbound = match self.send_core.next_outbound_sfa_frame_through(
+                &self.progress,
+                force_through,
+                false,
+            ) {
                 Ok(Some(outbound)) => outbound,
-                Ok(None) => break,
+                Ok(None) => {
+                    if self.send_core.has_more_batch_input(&self.progress) {
+                        send_step = RunnerStep::Continue;
+                    }
+                    break;
+                }
                 Err(err) => return self.store_shared_driver_error(shared, err),
             };
             // Torn-dictionary guard (file mode): a replayed delta frame whose
@@ -1342,7 +1368,7 @@ where
                 return send_step;
             }
         }
-        if let Err(failure) = self.send_core.finish_send_batch() {
+        if let Err(failure) = self.send_core.finish_send_batch(force_through) {
             return self.apply_transport_failure(shared, stop, failure);
         }
 
@@ -4101,6 +4127,14 @@ pub(crate) fn qwp_ws_wait_for_progress_background(
         .wait_for_change(generation, deadline);
 }
 
+pub(crate) fn qwp_ws_request_commit_background(state: &SyncQwpWsHandlerState, boundary: u64) {
+    update_atomic_max(
+        &state.runner.commit_requested_upper,
+        boundary.saturating_add(1),
+    );
+    state.runner.backpressure.notify_all();
+}
+
 pub(crate) fn qwp_ws_published_fsn_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
@@ -4717,6 +4751,7 @@ mod tests {
             progress,
             backpressure: Arc::clone(&notifier),
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle: lifecycle.clone(),
         };
 
@@ -5849,6 +5884,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure: Arc::new(BackpressureNotifier::new()),
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
 
@@ -5888,6 +5924,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure: Arc::clone(&notifier),
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
 
@@ -6143,6 +6180,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure,
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -6195,6 +6233,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure,
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -6257,6 +6296,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure,
             ok_completed_upper: Arc::clone(&ok_completed_upper),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -6713,7 +6753,10 @@ mod tests {
             64 * 1024
         }
 
-        fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
+        fn finish_send_batch(
+            &mut self,
+            _force_through: Option<u64>,
+        ) -> Result<(), TransportFailure> {
             assert!(self.open, "finish_send_batch without begin_send_batch");
             self.open = false;
             let burst = std::mem::take(&mut self.current);
@@ -6763,6 +6806,7 @@ mod tests {
             cold_effects: VecDeque::new(),
             backpressure: Arc::new(BackpressureNotifier::new()),
             ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
 
@@ -6796,7 +6840,10 @@ mod tests {
             64 * 1024
         }
 
-        fn finish_send_batch(&mut self) -> Result<(), TransportFailure> {
+        fn finish_send_batch(
+            &mut self,
+            _force_through: Option<u64>,
+        ) -> Result<(), TransportFailure> {
             if std::mem::take(&mut self.unflushed) && std::mem::take(&mut self.fail_next_flush) {
                 return Err(TransportFailure::Disconnect(crate::Error::new(
                     crate::ErrorCode::SocketError,

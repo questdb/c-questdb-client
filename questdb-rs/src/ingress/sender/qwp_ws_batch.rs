@@ -22,80 +22,188 @@
  *
  ******************************************************************************/
 
-//! Bounded wire-only batching for background sends.
-//!
-//! Every QWP message keeps its own WebSocket frame, wire sequence and ACK;
-//! only the socket writes are grouped, so the server sees exactly the frame
-//! stream it would have seen with one write per frame. The SF log retains
-//! every frame until the server ACKs it, so a group whose write fails is
-//! recovered by the ordinary reconnect replay.
+//! Bounded wire-only batching. The SF log retains every original frame until ACK.
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
+use super::qwp_ws_queue::CommitWindow;
 use crate::ws::frame::{Opcode, encode_client_frame};
 
-/// Upper bound for one grouped socket write.
 pub(super) const NETWORK_BYTES: usize = 64 * 1024;
 
 /// Largest masked client frame header (64-bit length).
 const FRAME_OVERHEAD: usize = 14;
+const DEFER_COMMIT: u8 = 1;
+
+struct Frame {
+    end: usize,
+    flags_at: usize,
+    flags: u8,
+    mask: u8,
+    fsn: u64,
+}
 
 pub(super) struct QwpWsBatch {
+    interval: Option<Duration>,
+    row_limit: usize,
+    byte_limit: usize,
     bytes: Vec<u8>,
-    frames: usize,
+    frames: Vec<Frame>,
+    rows: usize,
+    started: Option<Instant>,
+    committed_through: Option<u64>,
 }
 
 impl QwpWsBatch {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(interval: Option<Duration>, rows: usize, bytes: usize) -> Self {
         Self {
+            interval,
+            row_limit: rows,
+            byte_limit: if interval.is_some() {
+                bytes.max(1)
+            } else {
+                NETWORK_BYTES
+            },
             bytes: Vec::new(),
-            frames: 0,
+            frames: Vec::new(),
+            rows: 0,
+            started: None,
+            committed_through: None,
         }
     }
 
-    /// True when the group already holds frames and `payload_len` more would
-    /// push the write past [`NETWORK_BYTES`]. An empty group accepts any frame.
-    pub(super) fn full_before(&self, payload_len: usize) -> bool {
-        self.frames > 0
-            && self
-                .bytes
-                .len()
-                .saturating_add(payload_len)
-                .saturating_add(FRAME_OVERHEAD)
-                > NETWORK_BYTES
+    pub(super) fn set_byte_limit(&mut self, limit: usize) {
+        if self.interval.is_some() {
+            self.byte_limit = limit.max(1);
+        }
     }
 
-    /// Encodes and masks one complete message into the group; returns whether
-    /// the group has reached the write limit.
-    pub(super) fn append(&mut self, payload: &[u8], mask: [u8; 4]) -> io::Result<bool> {
+    pub(super) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Ends the group before a stored split so an aborted split cannot hold an earlier commit.
+    pub(super) fn full_before(&self, payload: &[u8]) -> bool {
+        let Some(tail) = self.frames.last() else {
+            return false;
+        };
+        self.bytes
+            .len()
+            .saturating_add(payload.len())
+            .saturating_add(FRAME_OVERHEAD)
+            > self.byte_limit
+            || self.interval.is_some()
+                && tail.flags & DEFER_COMMIT == 0
+                && payload
+                    .get(5)
+                    .is_some_and(|flags| flags & DEFER_COMMIT != 0)
+    }
+
+    /// Copies/masks one complete message; returns whether the group must close.
+    /// A frame outside the commit window commits on its own: the tail keeps its
+    /// flags and the group closes.
+    pub(super) fn append(
+        &mut self,
+        fsn: u64,
+        payload: &[u8],
+        mask: [u8; 4],
+        window: CommitWindow,
+    ) -> io::Result<bool> {
+        if payload.len() < 12 || &payload[..4] != b"QWP1" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid QWP batch header",
+            ));
+        }
         self.bytes
             .try_reserve(payload.len().saturating_add(FRAME_OVERHEAD))
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        self.frames
+            .try_reserve(1)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let windowed = window != CommitWindow::Outside;
+        if self.interval.is_some()
+            && windowed
+            && let Some(tail) = self.frames.last()
+        {
+            self.bytes[tail.flags_at] = (tail.flags | DEFER_COMMIT) ^ tail.mask;
+        }
         encode_client_frame(&mut self.bytes, Opcode::Binary, mask, payload);
-        self.frames += 1;
-        Ok(self.bytes.len() >= NETWORK_BYTES)
+        self.frames.push(Frame {
+            end: self.bytes.len(),
+            flags_at: self.bytes.len() - payload.len() + 5,
+            flags: payload[5],
+            mask: mask[1],
+            fsn,
+        });
+        if self.interval.is_some() && !windowed {
+            return Ok(true);
+        }
+        if self.interval.is_some() {
+            self.started.get_or_insert_with(Instant::now);
+        }
+        let mut unknown_rows = false;
+        if self.interval.is_some() && self.row_limit > 0 {
+            match window {
+                CommitWindow::Joins { rows: Some(rows) } => {
+                    self.rows = self.rows.saturating_add(rows)
+                }
+                _ => unknown_rows = true,
+            }
+        }
+        Ok(unknown_rows
+            || self.bytes.len() >= self.byte_limit
+            || self.row_limit > 0 && self.rows >= self.row_limit)
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.frames == 0
+    pub(super) fn should_flush(&self, force_through: Option<u64>) -> bool {
+        let Some(tail) = self.frames.last() else {
+            return false;
+        };
+        self.interval.is_none()
+            || self
+                .started
+                .zip(self.interval)
+                .is_some_and(|(start, interval)| start.elapsed() >= interval)
+            || force_through.is_some_and(|fsn| {
+                tail.fsn >= fsn && self.committed_through.is_none_or(|sent| sent < fsn)
+            })
     }
 
-    /// Writes the whole group in one call and clears it. A failed write keeps
-    /// the group so the caller's reconnect discards it together with the
-    /// connection; the frames stay in the SF log for replay.
     pub(super) fn flush(&mut self, stream: &mut impl Write) -> io::Result<()> {
-        if self.frames == 0 {
+        if self.frames.is_empty() {
             return Ok(());
         }
-        stream.write_all(&self.bytes)?;
+        let mut start = 0;
+        let mut end = 0;
+        for frame in &self.frames {
+            if end > start && frame.end - start > NETWORK_BYTES {
+                stream.write_all(&self.bytes[start..end])?;
+                start = end;
+            }
+            end = frame.end;
+        }
+        stream.write_all(&self.bytes[start..end])?;
         stream.flush()?;
+        if let Some(tail) = self.frames.last()
+            && tail.flags & DEFER_COMMIT == 0
+        {
+            self.committed_through = Some(tail.fsn);
+        }
         self.clear();
         Ok(())
     }
 
     pub(super) fn clear(&mut self) {
         self.bytes.clear();
-        self.frames = 0;
+        self.frames.clear();
+        self.rows = 0;
+        self.started = None;
+    }
+
+    pub(super) fn reset_connection(&mut self) {
+        self.clear();
+        self.committed_through = None;
     }
 }
 
@@ -105,70 +213,174 @@ mod tests {
 
     #[derive(Default)]
     struct Writer(Vec<Vec<u8>>);
-
     impl Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.push(bytes.to_vec());
             Ok(bytes.len())
         }
-
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
-    fn frame(len: usize) -> Vec<u8> {
+    fn rows(rows: usize) -> CommitWindow {
+        CommitWindow::Joins { rows: Some(rows) }
+    }
+
+    fn frame(rows: u8, flags: u8) -> Vec<u8> {
         let mut p = b"QWP1\x01\x08\x01\x00\x06\x00\x00\x00\x00\x00\x01t\x01\x00".to_vec();
-        p.resize(len.max(p.len()), 0);
+        p[5] = flags;
+        p[16] = rows;
         p
     }
 
     #[test]
-    fn grouped_frames_are_written_once_and_byte_for_byte() {
-        let mut batch = QwpWsBatch::new();
-        assert!(batch.is_empty());
-        let first = frame(0);
-        let second = frame(200);
-        assert!(!batch.append(&first, [1, 2, 3, 4]).unwrap());
-        assert!(!batch.append(&second, [5, 6, 7, 8]).unwrap());
-        assert!(!batch.is_empty());
+    fn network_batch_preserves_frames_and_does_not_wait_for_more_rows() {
+        let mut batch = QwpWsBatch::new(None, 0, 1);
+        let original = frame(1, 8);
+        let outside = CommitWindow::Outside;
+        batch.append(0, &original, [1, 2, 3, 4], outside).unwrap();
+        assert!(batch.should_flush(None));
+        batch.append(1, &original, [1, 2, 3, 4], outside).unwrap();
         let mut expected = Vec::new();
-        encode_client_frame(&mut expected, Opcode::Binary, [1, 2, 3, 4], &first);
-        encode_client_frame(&mut expected, Opcode::Binary, [5, 6, 7, 8], &second);
+        for _ in 0..2 {
+            encode_client_frame(&mut expected, Opcode::Binary, [1, 2, 3, 4], &original);
+        }
         let mut writer = Writer::default();
         batch.flush(&mut writer).unwrap();
         assert_eq!(writer.0, [expected]);
-        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn row_threshold_counts_rows_not_frames_and_changes_only_wire_flags() {
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 5, 4096);
+        let first = frame(2, 8);
+        let last = frame(3, 8);
+        assert!(!batch.append(0, &first, [0; 4], rows(2)).unwrap());
+        assert!(!batch.should_flush(None));
+        assert!(batch.append(1, &last, [0; 4], rows(3)).unwrap());
+        let mut expected = Vec::new();
+        let mut deferred = first.clone();
+        deferred[5] |= 1;
+        encode_client_frame(&mut expected, Opcode::Binary, [0; 4], &deferred);
+        encode_client_frame(&mut expected, Opcode::Binary, [0; 4], &last);
+        let mut writer = Writer::default();
         batch.flush(&mut writer).unwrap();
-        assert_eq!(writer.0.len(), 1, "an empty group writes nothing");
+        assert_eq!(writer.0, [expected]);
+        assert_eq!(first[5], 8);
     }
 
     #[test]
-    fn full_before_keeps_a_non_empty_group_under_the_network_limit() {
-        let mut batch = QwpWsBatch::new();
-        let large = frame(NETWORK_BYTES);
+    fn wait_barrier_flushes_once_and_is_rearmed_after_reconnect() {
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 1000, 4096);
+        batch.append(4, &frame(1, 8), [0; 4], rows(1)).unwrap();
+        assert!(!batch.should_flush(Some(5)));
+        assert!(batch.should_flush(Some(4)));
+        batch.flush(&mut Writer::default()).unwrap();
+        batch.append(5, &frame(1, 8), [0; 4], rows(1)).unwrap();
         assert!(
-            !batch.full_before(large.len()),
-            "an empty group takes any frame"
+            !batch.should_flush(Some(4)),
+            "old waits must not disable the next window"
         );
-        assert!(!batch.append(&frame(NETWORK_BYTES / 2), [0; 4]).unwrap());
-        assert!(!batch.full_before(16));
-        assert!(batch.full_before(NETWORK_BYTES / 2));
+        batch.reset_connection();
+        batch.append(4, &frame(1, 8), [0; 4], rows(1)).unwrap();
+        assert!(batch.should_flush(Some(4)));
     }
 
     #[test]
-    fn a_frame_at_the_limit_closes_the_group_and_is_written_whole() {
-        let mut batch = QwpWsBatch::new();
-        let large = frame(NETWORK_BYTES + 1);
-        assert!(batch.append(&large, [0; 4]).unwrap());
+    fn unwindowed_frame_commits_alone_and_leaves_the_tail_committing() {
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 1000, 4096);
+        let first = frame(1, 8);
+        assert!(!batch.append(0, &first, [0; 4], rows(1)).unwrap());
+        assert!(
+            batch
+                .append(1, &first, [0; 4], CommitWindow::Outside)
+                .unwrap()
+        );
+        let mut writer = Writer::default();
+        batch.flush(&mut writer).unwrap();
+        let mut expected = Vec::new();
+        for _ in 0..2 {
+            encode_client_frame(&mut expected, Opcode::Binary, [0; 4], &first);
+        }
+        assert_eq!(writer.0, [expected]);
+        assert_eq!(batch.committed_through, Some(1));
+        assert!(batch.started.is_none());
+    }
+
+    #[test]
+    fn idle_tail_expires_and_stored_defer_is_never_cleared() {
+        let mut batch = QwpWsBatch::new(Some(Duration::from_millis(10)), 0, 4096);
+        let original = frame(1, 9);
+        batch.append(0, &original, [0; 4], rows(1)).unwrap();
+        batch.started = Some(Instant::now() - Duration::from_millis(10));
+        assert!(batch.should_flush(None));
+        let mut writer = Writer::default();
+        batch.flush(&mut writer).unwrap();
+        let mut expected = Vec::new();
+        encode_client_frame(&mut expected, Opcode::Binary, [0; 4], &original);
+        assert_eq!(writer.0, [expected]);
+        assert!(batch.committed_through.is_none());
+    }
+
+    #[test]
+    fn byte_limit_and_large_frames_keep_complete_messages() {
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 0, 48);
+        batch.append(0, &frame(1, 8), [0; 4], rows(1)).unwrap();
+        assert!(batch.full_before(&frame(1, 8)));
+        batch.reset_connection();
+        let mut large = frame(1, 8);
+        large.resize(70_000, 0);
+        assert!(batch.append(0, &large, [0; 4], rows(1)).unwrap());
         let mut writer = Writer::default();
         batch.flush(&mut writer).unwrap();
         assert_eq!(writer.0.len(), 1);
-        assert_eq!(writer.0[0].len(), large.len() + FRAME_OVERHEAD);
+        assert_eq!(writer.0[0].len(), 70_014);
     }
 
     #[test]
-    fn failed_write_keeps_the_group_until_it_is_cleared() {
+    fn stored_split_group_starts_after_the_committing_tail_is_sent() {
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 0, 4096);
+        let committing = frame(1, 8);
+        let split = frame(1, 9);
+        assert!(!batch.full_before(&split));
+        batch.append(0, &committing, [0; 4], rows(1)).unwrap();
+        assert!(!batch.full_before(&committing));
+        assert!(batch.full_before(&split));
+        let mut writer = Writer::default();
+        batch.flush(&mut writer).unwrap();
+        let mut expected = Vec::new();
+        encode_client_frame(&mut expected, Opcode::Binary, [0; 4], &committing);
+        assert_eq!(writer.0, [expected]);
+        assert_eq!(batch.committed_through, Some(0));
+        batch.append(1, &split, [0; 4], rows(1)).unwrap();
+        assert!(!batch.full_before(&split));
+        assert!(!batch.full_before(&committing));
+    }
+
+    #[test]
+    fn network_only_batching_keeps_split_frames_in_one_write() {
+        let mut batch = QwpWsBatch::new(None, 0, 0);
+        batch
+            .append(0, &frame(1, 8), [0; 4], CommitWindow::Outside)
+            .unwrap();
+        assert!(!batch.full_before(&frame(1, 9)));
+    }
+
+    #[test]
+    fn unknown_row_count_closes_and_multi_table_rows_accumulate() {
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 10, 4096);
+        let unknown = CommitWindow::Joins { rows: None };
+        assert!(batch.append(0, &frame(1, 8), [0; 4], unknown).unwrap());
+        batch.reset_connection();
+        let mut multi = frame(1, 8);
+        multi[6] = 2;
+        assert!(!batch.append(0, &multi, [0; 4], rows(9)).unwrap());
+        assert!(batch.append(1, &multi, [0; 4], rows(1)).unwrap());
+    }
+
+    #[test]
+    fn failed_write_does_not_satisfy_commit_barrier() {
         struct Broken;
         impl Write for Broken {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
@@ -178,11 +390,46 @@ mod tests {
                 Ok(())
             }
         }
-        let mut batch = QwpWsBatch::new();
-        batch.append(&frame(0), [0; 4]).unwrap();
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 0, 4096);
+        batch.append(0, &frame(1, 8), [0; 4], rows(1)).unwrap();
         assert!(batch.flush(&mut Broken).is_err());
-        assert!(!batch.is_empty());
-        batch.clear();
-        assert!(batch.is_empty());
+        assert!(batch.should_flush(Some(0)));
+        assert_eq!(batch.frames.len(), 1);
+        batch.reset_connection();
+        assert!(batch.frames.is_empty());
+    }
+
+    #[test]
+    fn partial_write_is_replayed_from_original_frames_after_reset() {
+        struct Partial(bool);
+        impl Write for Partial {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if std::mem::replace(&mut self.0, true) {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(bytes.len().min(7))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let original = frame(1, 8);
+        let mut batch = QwpWsBatch::new(Some(Duration::from_secs(60)), 0, 4096);
+        batch.append(0, &original, [1, 2, 3, 4], rows(1)).unwrap();
+        batch.append(1, &original, [5, 6, 7, 8], rows(1)).unwrap();
+        assert!(batch.flush(&mut Partial(false)).is_err());
+        assert!(batch.committed_through.is_none());
+        assert_eq!(original[5], 8);
+
+        batch.reset_connection();
+        batch.set_byte_limit(24);
+        assert!(batch.append(0, &original, [1, 2, 3, 4], rows(1)).unwrap());
+        let mut writer = Writer::default();
+        batch.flush(&mut writer).unwrap();
+        let mut expected = Vec::new();
+        encode_client_frame(&mut expected, Opcode::Binary, [1, 2, 3, 4], &original);
+        assert_eq!(writer.0, [expected]);
+        assert_eq!(batch.committed_through, Some(0));
     }
 }

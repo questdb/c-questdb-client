@@ -2712,6 +2712,63 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                   for row in rows]
         self.assertEqual(actual, expected_rows)
 
+    def test_native_pool_commit_window_batches_borrow_per_message(self):
+        import ctypes as c
+
+        def bind(name, result, *args):
+            return c.CFUNCTYPE(result, *args)((name, qls._DLL))
+
+        ptr, size, err = c.c_void_p, c.c_size_t, qls.c_line_sender_error_p_p
+        check = qls._error_wrapped_call
+        connect = bind('questdb_db_connect', ptr, c.c_char_p, size, err)
+        close = bind('questdb_db_close', None, ptr)
+        borrow = bind('questdb_db_borrow_sender', ptr, ptr, err)
+        give_back = bind('questdb_db_return_sender', None, ptr, ptr)
+        chunk_new = bind('qwp_chunk_new', ptr, c.c_char_p, size, err)
+        chunk_free = bind('qwp_chunk_free', None, ptr)
+        column_i64 = bind('qwp_chunk_column_i64', c.c_bool, ptr, c.c_char_p, size,
+                          c.POINTER(c.c_int64), size, c.c_void_p, err)
+        at_nanos = bind('qwp_chunk_at_nanos', c.c_bool, ptr,
+                        c.POINTER(c.c_int64), size, err)
+        flush = bind('qwp_sender_flush_chunk', c.c_bool, ptr, ptr, err)
+        flush_and_wait = bind('qwp_sender_flush_chunk_and_wait', c.c_bool,
+                              ptr, ptr, c.c_uint32, err)
+
+        table = 'qwp_commit_window_' + uuid.uuid4().hex
+        self.addCleanup(sql_query, f'DROP TABLE IF EXISTS {table}')
+        messages = 2000
+        conf = (f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
+                'sender_pool_max=1;commit_rows=500;commit_interval_ms=50;')
+        conf_bytes = conf.encode()
+        table_bytes = table.encode()
+        db = check(connect, conf_bytes, len(conf_bytes))
+        chunk = check(chunk_new, table_bytes, len(table_bytes))
+        try:
+            for seq in range(messages):
+                qty = (c.c_int64 * 1)(seq)
+                ts = (c.c_int64 * 1)(1_726_401_600_000_000_000 + seq)
+                sender = check(borrow, db)
+                try:
+                    check(column_i64, chunk, b'qty', 3, qty, 1, None)
+                    check(at_nanos, chunk, ts, 1)
+                    last = seq == messages - 1
+                    if last:
+                        check(flush_and_wait, sender, chunk, 0)  # qwpws_ack_level_ok
+                    else:
+                        check(flush, sender, chunk)
+                finally:
+                    give_back(db, sender)
+        finally:
+            chunk_free(chunk)
+            close(db)
+
+        self._wait_for_row_count(table, messages)
+        resp = sql_query(f'SELECT count(), sum(qty) FROM \'{table}\'')
+        self.assertEqual(resp['dataset'][0],
+                         [messages, messages * (messages - 1) // 2])
+        resp = sql_query(f'SELECT count() FROM wal_transactions(\'{table}\')')
+        self.assertLess(int(resp['dataset'][0][0]), messages // 10)
+
     def test_uuid_with_zero_low_half_is_not_null(self):
         table_name = 'qwp_uuid_sentinel_' + uuid.uuid4().hex[:8]
         self._created_tables.append(table_name)

@@ -86,11 +86,19 @@ in-memory store-and-forward, pool shutdown drains best-effort within
 or configure `sf_dir` for crash-recoverable disk-backed replay. Never assume
 that destroying an unflushed row buffer or column chunk publishes its contents.
 
+With a commit window (`commit_interval_ms`, `commit_rows`), a flush still
+publishes to store-and-forward before it returns, but its rows commit when the
+window closes. `wait` and the `*_and_wait` calls close the window early for the
+borrow that published the rows; a wait on a fresh borrow does not. Keep
+`commit_rows` at or below the server's `qwp.max.rows.per.table`: above it, each
+window is rejected and resent frame by frame.
+
 ## Buffering and backpressure
 
 Batch rows and flush periodically based on elapsed time and data volume.
 Flushing every row increases overhead, while unbounded buffers increase memory
-use and recovery time.
+use and recovery time. When each message is flushed on its own, set a commit
+window so that many small flushes share one server commit.
 
 For ILP, the buffer length is the exact pending encoded byte length. For
 QWP/UDP it is a size hint rather than an eventual datagram size. For a

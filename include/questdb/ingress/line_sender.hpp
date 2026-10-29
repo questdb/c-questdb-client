@@ -2100,7 +2100,10 @@ public:
 
     /**
      * Return the highest QWP/WebSocket frame sequence number completed by ACK,
-     * or `std::nullopt` if none has completed.
+     * or `std::nullopt` if none has completed. With a commit window
+     * (`commit_interval_ms`, `commit_rows`), ACKs arrive when the window
+     * commits, so a published FSN can stay unacknowledged for up to
+     * `commit_interval_ms` unless `wait` closes the window.
      */
     std::optional<uint64_t> acked_fsn() const
     {
@@ -2120,7 +2123,9 @@ public:
      * Enterprise and `request_durable_ack=on`; otherwise this throws
      * `invalid_api_call` even when nothing has been published. Throws on the
      * no-progress timeout, a server rejection, or a transport failure; returns
-     * immediately when nothing has been published yet.
+     * immediately when nothing has been published yet. With a commit window
+     * (`commit_interval_ms`, `commit_rows`), the wait closes the window
+     * through its boundary instead of waiting for it.
      */
     void wait(
         qwpws_ack_level ack_level = qwpws_ack_level::ok,
