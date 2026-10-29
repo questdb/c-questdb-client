@@ -136,10 +136,11 @@ typedef struct questdb_db questdb_db;
  * above `qwp.max.rows.per.table` therefore costs a rejection and a reconnect
  * per window.
  *
- * Standalone QWP/WebSocket senders accept the same two keys. A standalone
- * direct column sender (`qwp_direct_sender_from_conf`,
- * `qwp_direct_sender_from_opts`) rejects them, and direct borrows from a pool
- * ignore them: a direct sender commits every publication.
+ * Standalone QWP/WebSocket senders accept the same two keys. A direct column
+ * sender has its own explicit commit (`qwp_direct_sender_commit`), so the keys
+ * do not apply to it: a standalone direct sender
+ * (`qwp_direct_sender_from_conf`, `qwp_direct_sender_from_opts`) rejects them,
+ * and direct borrows from a pool ignore them.
  *
  * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
  * for the public ingestion pool. `sender_id` names the slot *base* (default

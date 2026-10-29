@@ -699,8 +699,10 @@ impl QuestDb {
     /// only the publication the server rejects on its own and the publications
     /// before it commit. A `commit_rows` above `qwp.max.rows.per.table`
     /// therefore costs a rejection and a reconnect per window. Standalone
-    /// QWP/WebSocket senders accept the same two keys; a direct borrow ignores
-    /// them, because a direct sender commits every publication.
+    /// QWP/WebSocket senders accept the same two keys. A direct column sender
+    /// has its own explicit [`commit`](BorrowedDirectColumnSender::commit), so
+    /// the keys do not apply to it: a direct borrow ignores them and
+    /// [`OwnedDirectColumnSender`] rejects them.
     ///
     /// Lifecycle key names and defaults match the Java client's `QuestDBBuilder`; the
     /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,
@@ -2352,7 +2354,7 @@ impl OwnedDirectColumnSender {
             return Err(error::fmt!(
                 ConfigError,
                 "commit_rows and commit_interval_ms require a store-and-forward sender; \
-                 the direct column sender commits every publication"
+                 the direct column sender has its own explicit commit"
             ));
         }
         let health = Mutex::new(QwpWsHostHealthTracker::new(connector.endpoint_count()));
