@@ -136,7 +136,8 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
                 None
             }
             Err(e) => {
-                self.poisoned = true;
+                // An interrupt leaves the cursor live; the next call resumes.
+                self.poisoned = e.code() != ErrorCode::Interrupted;
                 Some(Err(external_arrow_error(e)))
             }
         }

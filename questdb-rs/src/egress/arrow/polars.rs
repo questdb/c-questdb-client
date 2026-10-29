@@ -53,6 +53,11 @@ impl Cursor<'_> {
     /// errors as `NoSchema`. Drift detection is inherited from
     /// [`Cursor::iter_polars`].
     pub fn fetch_all_polars(&mut self) -> Result<DataFrame> {
+        let result = self.fetch_all_polars_inner();
+        self.end_if_interrupted(result, "fetch_all_polars")
+    }
+
+    fn fetch_all_polars_inner(&mut self) -> Result<DataFrame> {
         // Materialise-whole: the full result is built internally before
         // anything is handed back, so a mid-query failover replays the
         // query from `batch_seq 0` transparently. Opt into replay and
@@ -193,7 +198,8 @@ impl Iterator for CursorPolarsIter<'_, '_> {
                     return None;
                 }
                 Err(e) => {
-                    self.poisoned = true;
+                    // An interrupt leaves the cursor live; the next call resumes.
+                    self.poisoned = e.code() != ErrorCode::Interrupted;
                     return Some(Err(e));
                 }
             }

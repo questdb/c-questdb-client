@@ -262,6 +262,14 @@ enum Action {
     /// rides only `batch_seq == 0`; a `batch_seq > 0` frame carries rows
     /// only and relies on the client's retained per-query schema.
     SendBatch { batch_seq: u64, column: BatchColumn },
+    /// Like `SendBatch`, but writes the WS frame in two halves with
+    /// `pause` between them, so the client sees a partial frame.
+    #[cfg(unix)]
+    SendBatchSplit {
+        batch_seq: u64,
+        column: BatchColumn,
+        pause: Duration,
+    },
     /// Reply with QUERY_ERROR (using the request_id from the most-recent
     /// AwaitQueryRequest). `status` is a raw `StatusCode` discriminant,
     /// e.g. `0x06` (InternalError) for a generic server-side failure.
@@ -577,6 +585,38 @@ fn run_script(
                 let rid = last_request_id.expect("AwaitQueryRequest before SendBatch");
                 let frame = result_batch_frame(rid, batch_seq, &column);
                 if ws.send(Message::Binary(frame.into())).is_err() {
+                    return;
+                }
+            }
+            #[cfg(unix)]
+            Action::SendBatchSplit {
+                batch_seq,
+                column,
+                pause,
+            } => {
+                let rid = last_request_id.expect("AwaitQueryRequest before SendBatchSplit");
+                let payload = result_batch_frame(rid, batch_seq, &column);
+                // Unmasked server-to-client binary frame (RFC 6455 §5.2).
+                let mut frame = vec![0x82];
+                match payload.len() {
+                    n @ 0..=125 => frame.push(n as u8),
+                    n @ 126..=0xFFFF => {
+                        frame.push(126);
+                        frame.extend_from_slice(&(n as u16).to_be_bytes());
+                    }
+                    n => {
+                        frame.push(127);
+                        frame.extend_from_slice(&(n as u64).to_be_bytes());
+                    }
+                }
+                frame.extend_from_slice(&payload);
+                let (head, tail) = frame.split_at(frame.len() / 2);
+                let tcp = ws.get_mut();
+                if tcp.write_all(head).and_then(|_| tcp.flush()).is_err() {
+                    return;
+                }
+                std::thread::sleep(pause);
+                if ws.get_mut().write_all(tail).is_err() {
                     return;
                 }
             }
@@ -5614,4 +5654,237 @@ fn failover_replay_resets_symbol_cache_to_new_node_values() {
         cursor.next_arrow_batch().expect("terminal").is_none(),
         "B's RESULT_END must terminate the cursor"
     );
+}
+
+// ---------------------------------------------------------------------------
+// EINTR handling (`interrupt_on_eintr`).
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod eintr;
+
+/// One query: batches `[1,2]`, `[3,4]`, a `stall`, then `[5,6]` written
+/// as a frame split in two with a `stall` pause, then `RESULT_END`.
+#[cfg(unix)]
+fn stalling_query(stall: Duration) -> Vec<Action> {
+    let batch = |seq: u64, v: Vec<i64>| Action::SendBatch {
+        batch_seq: seq,
+        column: BatchColumn::Long(v),
+    };
+    vec![
+        Action::AwaitQueryRequest,
+        batch(0, vec![1, 2]),
+        batch(1, vec![3, 4]),
+        Action::Sleep(stall),
+        Action::SendBatchSplit {
+            batch_seq: 2,
+            column: BatchColumn::Long(vec![5, 6]),
+            pause: stall,
+        },
+        Action::SendResultEnd,
+    ]
+}
+
+/// `SERVER_INFO`, then one [`stalling_query`] per entry of `stalls`.
+#[cfg(unix)]
+fn stalling_script(stalls: &[Duration]) -> Script {
+    let mut script = vec![Action::SendServerInfo {
+        role: ServerRole::Standalone,
+        node_id: "n1".into(),
+    }];
+    for &stall in stalls {
+        script.extend(stalling_query(stall));
+    }
+    script
+}
+
+#[cfg(unix)]
+const STALL: Duration = Duration::from_millis(300);
+
+/// Next batch's LONG values; `None` at end of stream.
+#[cfg(unix)]
+fn next_longs(cursor: &mut questdb::egress::Cursor<'_>) -> questdb::Result<Option<Vec<i64>>> {
+    Ok(cursor.next_batch()?.map(|view| {
+        let ColumnView::Long(c) = view.column(0).expect("col 0") else {
+            panic!("expected a LONG column");
+        };
+        (0..view.row_count()).map(|i| c.value(i)).collect()
+    }))
+}
+
+/// With `interrupt_on_eintr=on`, every signal that interrupts a blocked
+/// result-stream read returns `Interrupted`; looping on it yields every
+/// row exactly once, with no reconnect or replay — including a frame the
+/// signal split mid-read. Signals also land during connect (WS upgrade,
+/// `SERVER_INFO`), which must retry rather than fail.
+#[cfg(unix)]
+#[test]
+fn eintr_interrupts_and_resumes_when_enabled() {
+    let srv = MockServer::start(vec![stalling_script(&[STALL])]);
+    let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+    let mut reader = Reader::from_conf(format!("ws::addr={};interrupt_on_eintr=on", srv.url()))
+        .expect("connect retries EINTR");
+    let mut cursor = reader
+        .prepare("select v")
+        .on_failover_reset(|_| {})
+        .execute()
+        .expect("execute");
+    let (mut rows, mut interrupts) = (Vec::new(), 0);
+    loop {
+        match next_longs(&mut cursor) {
+            Ok(Some(v)) => rows.extend(v),
+            Ok(None) => break,
+            Err(e) if e.code() == ErrorCode::Interrupted => {
+                assert!(cursor.terminal().is_none());
+                interrupts += 1;
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    assert_eq!(rows, vec![1, 2, 3, 4, 5, 6]);
+    assert!(interrupts > 0, "signals during the stall must interrupt");
+    assert_eq!(cursor.failover_resets(), 0, "EINTR must not fail over");
+    drop(cursor);
+    assert_eq!(srv.accepts(), 1, "no reconnect");
+    assert_eq!(srv.captured_requests().len(), 1, "no replay");
+}
+
+/// Default (`interrupt_on_eintr` unset): an interrupted read keeps its
+/// pre-existing behaviour and fails as a `SocketError`, so hosts that
+/// rely on `EINTR` to abandon a stalled read (e.g. Python's `Ctrl-C`)
+/// still can.
+#[cfg(unix)]
+#[test]
+fn eintr_fails_the_read_by_default() {
+    let srv = MockServer::start(vec![stalling_script(&[STALL])]);
+    let mut reader =
+        Reader::from_conf(format!("ws::addr={};failover=off", srv.url())).expect("connect");
+    let mut cursor = reader.prepare("select v").execute().expect("execute");
+    let err = {
+        let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+        loop {
+            match next_longs(&mut cursor) {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("EINTR was swallowed"),
+                Err(e) => break e,
+            }
+        }
+    };
+    assert_eq!(err.code(), ErrorCode::SocketError, "{err}");
+    assert!(cursor.next_batch().is_err(), "the cursor is dead");
+}
+
+/// A `cancel()` drain interrupted by a signal returns `Interrupted`;
+/// calling `cancel()` again finishes it.
+#[cfg(unix)]
+#[test]
+fn interrupted_cancel_drain_resumes() {
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::AwaitClientCancel,
+        Action::Sleep(STALL),
+        Action::SendQueryError {
+            status: 0x0A, // CANCELLED
+            message: "cancelled".into(),
+        },
+    ]]);
+    let mut reader = Reader::from_conf(format!(
+        "ws::addr={};failover=off;interrupt_on_eintr=on",
+        srv.url()
+    ))
+    .expect("connect");
+    let mut cursor = reader.prepare("select v").execute().expect("execute");
+    let mut interrupts = 0;
+    {
+        let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+        loop {
+            match cursor.cancel() {
+                Ok(()) => break,
+                Err(e) if e.code() == ErrorCode::Interrupted => interrupts += 1,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+    }
+    assert!(interrupts > 0, "signals during the drain must interrupt");
+    assert!(cursor.connection_reusable());
+    drop(cursor);
+    assert_eq!(srv.accepts(), 1);
+}
+
+/// Neither the `RecordBatchReader` adapter nor `next_arrow_batch` treat
+/// `Interrupted` as terminal.
+#[cfg(all(unix, feature = "arrow-egress"))]
+#[test]
+fn interrupt_does_not_poison_arrow_paths() {
+    use arrow::array::{Array, Int64Array};
+    let longs = |rb: &arrow::array::RecordBatch| -> Vec<i64> {
+        let col = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        (0..col.len()).map(|i| col.value(i)).collect()
+    };
+    let srv = MockServer::start(vec![stalling_script(&[STALL, STALL])]);
+    let mut reader = Reader::from_conf(format!(
+        "ws::addr={};failover=off;interrupt_on_eintr=on",
+        srv.url()
+    ))
+    .expect("connect");
+
+    let (mut rows, mut interrupts) = (Vec::new(), 0);
+    {
+        let mut cursor = reader.prepare("select v").execute().expect("execute");
+        let arrow_reader = cursor.as_arrow_reader().expect("first batch + schema");
+        let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+        for rb in arrow_reader {
+            match rb {
+                Ok(rb) => rows.extend(longs(&rb)),
+                Err(e) if e.to_string().contains("interrupted") => interrupts += 1,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+    }
+    assert_eq!(rows, vec![1, 2, 3, 4, 5, 6]);
+    assert!(interrupts > 0, "RecordBatchReader saw no interrupt");
+
+    let (mut rows, mut interrupts) = (Vec::new(), 0);
+    {
+        let mut cursor = reader.prepare("select v").execute().expect("execute");
+        let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+        loop {
+            match cursor.next_arrow_batch() {
+                Ok(Some(rb)) => rows.extend(longs(&rb)),
+                Ok(None) => break,
+                Err(e) if e.code() == ErrorCode::Interrupted => interrupts += 1,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+    }
+    assert_eq!(rows, vec![1, 2, 3, 4, 5, 6]);
+    assert!(interrupts > 0, "next_arrow_batch saw no interrupt");
+    drop(reader);
+    assert_eq!(srv.accepts(), 1);
+}
+
+/// `fetch_all_arrow` discards what it read when it returns early, so an
+/// interrupt there must end the cursor rather than let a retry return
+/// only the tail of the result.
+#[cfg(all(unix, feature = "arrow-egress"))]
+#[test]
+fn interrupted_fetch_all_arrow_ends_the_cursor() {
+    let srv = MockServer::start(vec![stalling_script(&[STALL])]);
+    let mut reader = Reader::from_conf(format!(
+        "ws::addr={};failover=off;interrupt_on_eintr=on",
+        srv.url()
+    ))
+    .expect("connect");
+    let mut cursor = reader.prepare("select v").execute().expect("execute");
+    let err = {
+        let _pelter = eintr::Pelter::start(Duration::from_millis(1));
+        cursor.fetch_all_arrow().expect_err("interrupted")
+    };
+    assert_eq!(err.code(), ErrorCode::Interrupted);
+    let err = cursor.next_arrow_batch().expect_err("cursor ended");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{err}");
 }

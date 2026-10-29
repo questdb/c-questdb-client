@@ -911,6 +911,24 @@ TEST_CASE("mock: connect-string query_timeout_ms applies to every query")
     }
 }
 
+TEST_CASE("mock: connect-string interrupt_on_eintr is accepted")
+{
+    qm::Script s = {
+        server_info_with(qm::CAP_QUERY_FLAGS),
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    const std::string conf =
+        "ws::addr=" + srv.addr() + ";interrupt_on_eintr=on;";
+    eg::reader reader{questdb::ingress::utf8_view{conf}};
+    auto cur = reader.execute("X"_utf8);
+    while (cur.next_batch())
+    {
+    }
+    CHECK(srv.captured_requests().size() == 1);
+}
+
 TEST_CASE("mock: per-query timeout overrides the connect-string default")
 {
     qm::Script s = {

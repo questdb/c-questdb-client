@@ -509,6 +509,39 @@ fn read_to_fill<S: Read>(
     Ok(filled)
 }
 
+/// Retries `read` / `flush` that fail with `Interrupted` (a signal handler
+/// installed without `SA_RESTART`). Wraps the stream passed to [`upgrade`]
+/// when the reader opted into `interrupt_on_eintr`: a half-read handshake
+/// cannot be resumed by a later call, so the host's interrupt is honoured
+/// at the next result-stream read instead. `write_all` already retries.
+pub(crate) struct RetryEintr<'a, S>(pub(crate) &'a mut S);
+
+impl<S: Read> Read for RetryEintr<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.0.read(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                r => return r,
+            }
+        }
+    }
+}
+
+impl<S: Write> Write for RetryEintr<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        loop {
+            match self.0.flush() {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                r => return r,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +610,61 @@ mod tests {
         // Confirm the extra header made it onto the wire.
         let req = std::str::from_utf8(&server.written).unwrap();
         assert!(req.contains("X-Extra: abc\r\n"), "{req}");
+    }
+
+    /// Fails every other `read` / `flush` with `Interrupted`, the way a
+    /// socket does when a host signal handler lacks `SA_RESTART`.
+    struct Eintr<S> {
+        inner: S,
+        fail_next: bool,
+    }
+
+    impl<S> Eintr<S> {
+        fn tick(&mut self) -> std::io::Result<()> {
+            self.fail_next = !self.fail_next;
+            if self.fail_next {
+                Err(std::io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl<S: Read> Read for Eintr<S> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.tick()?;
+            self.inner.read(buf)
+        }
+    }
+
+    impl<S: Write> Write for Eintr<S> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.tick()?;
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn upgrade_eintr_fails_unless_retried() {
+        let mut stream = Eintr {
+            inner: MockServer::default(),
+            fail_next: false,
+        };
+        let err = upgrade(&mut stream, "host:1234", "/path", &[]).unwrap_err();
+        assert!(
+            matches!(&err, HandshakeError::Io(e) if e.kind() == std::io::ErrorKind::Interrupted),
+            "{err:?}"
+        );
+
+        let mut stream = Eintr {
+            inner: MockServer::default(),
+            fail_next: false,
+        };
+        let result = upgrade(&mut RetryEintr(&mut stream), "host:1234", "/path", &[]);
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]

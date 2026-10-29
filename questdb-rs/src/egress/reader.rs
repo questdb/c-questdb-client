@@ -357,6 +357,9 @@ impl Reader {
         } else {
             None
         };
+        if cfg.interrupt_on_eintr {
+            transport.enable_eintr_interrupts();
+        }
         if !matches!(cfg.target, Target::Any) {
             match server_info.as_ref() {
                 None => {
@@ -1753,6 +1756,12 @@ impl<'r> Cursor<'r> {
     /// If you need bounded latency, set `failover_max_attempts` and
     /// `failover_backoff_max_ms` to values appropriate for your SLA, or set
     /// `failover=off` and handle reconnect at the application layer.
+    ///
+    /// **Interrupts.** With `interrupt_on_eintr=on` (see
+    /// [`ReaderConfig::interrupt_on_eintr`]), a signal that interrupts the
+    /// blocking read returns [`ErrorCode::Interrupted`]. It is not terminal:
+    /// the cursor stays live and the next call resumes the stream where this
+    /// one stopped, with no reconnect or replay.
     pub fn next_batch(&mut self) -> Result<Option<BatchView<'_>>> {
         // Replay-on-terminal guard. If the cursor previously terminated
         // with an error, surface that error on every subsequent call
@@ -1837,6 +1846,14 @@ impl<'r> Cursor<'r> {
     /// [`ErrorCode::SchemaDrift`]: crate::ErrorCode::SchemaDrift
     #[cfg(feature = "arrow-egress")]
     pub fn fetch_all_arrow(
+        &mut self,
+    ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>)> {
+        let result = self.fetch_all_arrow_inner();
+        self.end_if_interrupted(result, "fetch_all_arrow")
+    }
+
+    #[cfg(feature = "arrow-egress")]
+    fn fetch_all_arrow_inner(
         &mut self,
     ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>)> {
         // Materialise-whole: nothing leaves the library until the full
@@ -2034,12 +2051,35 @@ impl<'r> Cursor<'r> {
         }
     }
 
+    // The `fetch_all_*` adapters drop what they accumulated when they return
+    // early, so an interrupt there cannot be resumed: end the cursor, or a
+    // retry would silently return only the rest of the result. The caller
+    // still sees `Interrupted`; later calls see why the cursor is dead.
+    #[cfg(feature = "arrow-egress")]
+    pub(crate) fn end_if_interrupted<T>(&mut self, result: Result<T>, what: &str) -> Result<T> {
+        if let Err(e) = &result
+            && e.code() == ErrorCode::Interrupted
+        {
+            self.stash_arrow_terminal_error(&fmt!(
+                InvalidApiCall,
+                "{} was interrupted and discarded the rows it had read; re-execute the query",
+                what
+            ));
+        }
+        result
+    }
+
     fn next_batch_inner(&mut self) -> Result<NextOutcome> {
         loop {
             // Transport read: a failure here (socket closed, TLS
             // reset, truncated WS frame) is what failover is for.
             let (header, payload) = match self.read_frame_raw() {
                 Ok(hp) => hp,
+                // A signal interrupted the read (`interrupt_on_eintr`): the
+                // connection is fine and any partial frame is still
+                // buffered, so leave the cursor live for the next call to
+                // resume rather than failing over.
+                Err(e) if e.code() == ErrorCode::Interrupted => return Err(e),
                 Err(e) => {
                     self.failover_after_stream_failure(e, StreamFailureKind::Read)?;
                     continue;
@@ -2691,10 +2731,18 @@ impl<'r> Cursor<'r> {
     /// CANCEL write itself fails, the transport is torn down before
     /// the error is returned so the cursor's flags and the underlying
     /// connection state are left coherent.
+    ///
+    /// With `interrupt_on_eintr=on`, a drain interrupted by a signal returns
+    /// [`ErrorCode::Interrupted`]; call `cancel()` again to finish it —
+    /// CANCEL is not re-sent.
     pub fn cancel(&mut self) -> Result<()> {
         if self.done {
             return Ok(());
         }
+        // Under `interrupt_on_eintr`, a previous `cancel()` whose drain
+        // returned `Interrupted` already put CANCEL on the wire; resume the
+        // drain without sending it again.
+        let resuming = self.cancelling && self.reader.cfg.interrupt_on_eintr;
         // Record the user's intent to cancel BEFORE attempting any
         // network write. If the CANCEL write (or the credit-nudge
         // write) fails because the transport just died, a subsequent
@@ -2723,6 +2771,7 @@ impl<'r> Cursor<'r> {
         // flags and the transport in lockstep with the other terminal
         // paths in `next_batch`.
         let write_outcome = match self.reader.transport_mut() {
+            Ok(_) if resuming => Ok(()),
             Ok(t) => t.write_message(Bytes::from(payload)),
             Err(e) => Err(e),
         };
@@ -2765,7 +2814,7 @@ impl<'r> Cursor<'r> {
         // If the nudge succeeds the drain proceeds normally. Either
         // way, swallowing the error here gives the user the truthful
         // signal: the cancellation request was delivered.
-        if self.credit_enabled {
+        if self.credit_enabled && !resuming {
             // No-accounting variant: this 1-byte nudge exists only to
             // unstick a credit-suspended server so it can deliver the
             // QUERY_ERROR for our CANCEL. Bumping
@@ -3663,6 +3712,8 @@ mod tests {
             // work under the same budget and, for a write, risk applying
             // a statement the first attempt may already have applied.
             QueryTimeout,
+            // An interrupted read leaves the cursor live to resume.
+            Interrupted,
         ] {
             assert!(
                 !is_failover_eligible(code),

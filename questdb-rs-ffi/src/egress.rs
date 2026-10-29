@@ -2561,7 +2561,10 @@ pub unsafe extern "C" fn qwp_reader_cursor_free(cursor: *mut qwp_reader_cursor) 
 ///     mid-query failover.
 ///   * NULL with `*err_out` left untouched when the stream has terminated
 ///     normally (no batch available).
-///   * NULL with `*err_out` set on error; the cursor must be freed.
+///   * NULL with `*err_out` set on error; the cursor must be freed —
+///     except for `line_sender_error_interrupted` (`interrupt_on_eintr=on`),
+///     after which the cursor stays live and the next call resumes the
+///     stream.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_cursor_next_batch(
     cursor: *mut qwp_reader_cursor,
@@ -2927,7 +2930,9 @@ pub unsafe extern "C" fn qwp_reader_cursor_connection_reusable(
 
 /// Send `CANCEL` and drain to terminal. On failure, use
 /// `qwp_reader_cursor_connection_reusable` to decide whether the connection
-/// can be reused.
+/// can be reused. A drain interrupted by a signal (`interrupt_on_eintr=on`)
+/// fails with `line_sender_error_interrupted`; call this again to resume it
+/// without re-sending `CANCEL`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_cursor_cancel(
     cursor: *mut qwp_reader_cursor,
@@ -3880,6 +3885,7 @@ mod tests {
             ErrorCode::NoSchema,
             ErrorCode::ArrowExport,
             ErrorCode::ConnectTimeout,
+            ErrorCode::Interrupted,
         ];
         for code in codes {
             let c: questdb_error_code = code.into();

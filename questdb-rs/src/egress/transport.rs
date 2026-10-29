@@ -54,9 +54,11 @@ use crate::egress::tls::build_client_config;
 use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::roles;
-use crate::egress::ws::client::{Stream, WsClient, WsReadError};
+use crate::egress::ws::client::{EintrMode, Stream, TlsSock, WsClient, WsReadError};
 use crate::error::{Error, ErrorCode, Result, fmt};
-use crate::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
+use crate::ws::handshake::{
+    self, HandshakeError as WsHandshakeError, Headers, HttpReject, RetryEintr,
+};
 use crate::ws::mask::MaskKeySource;
 use crate::ws::nosigpipe::NoSigpipeTcp;
 
@@ -235,7 +237,16 @@ impl WsTransport {
         let host_header = endpoint.to_string();
         let path = config.path.clone();
         let extra_headers = config.upgrade_headers();
-        let handshake_result = handshake::upgrade(&mut stream, &host_header, &path, &extra_headers);
+        let handshake_result = if config.interrupt_on_eintr {
+            handshake::upgrade(
+                &mut RetryEintr(&mut stream),
+                &host_header,
+                &path,
+                &extra_headers,
+            )
+        } else {
+            handshake::upgrade(&mut stream, &host_header, &path, &extra_headers)
+        };
 
         let handshake = match handshake_result {
             Ok(h) => h,
@@ -290,7 +301,21 @@ impl WsTransport {
         set_tcp_read_timeout(stream.tcp_mut(), None);
 
         let mask_keys = MaskKeySource::new().map_err(|e| fmt!(ConfigError, "{}", e.0))?;
-        let socket = WsClient::new(stream, handshake.leftover, mask_keys, MAX_BATCH_WIRE_BYTES);
+        // Connect-time reads (`SERVER_INFO`) cannot be resumed by a later
+        // call, so under `interrupt_on_eintr` they retry `EINTR`;
+        // `enable_eintr_interrupts` switches over once the connection is up.
+        let eintr = if config.interrupt_on_eintr {
+            EintrMode::Retry
+        } else {
+            EintrMode::Surface
+        };
+        let socket = WsClient::new(
+            stream,
+            handshake.leftover,
+            mask_keys,
+            MAX_BATCH_WIRE_BYTES,
+            eintr,
+        );
 
         Ok(WsTransport {
             socket,
@@ -374,6 +399,13 @@ impl WsTransport {
         Ok((header, payload))
     }
 
+    /// From now on a read interrupted by a signal returns
+    /// [`ErrorCode::Interrupted`] instead of retrying. Called once the
+    /// connection is up when the reader opted into `interrupt_on_eintr`.
+    pub(crate) fn enable_eintr_interrupts(&mut self) {
+        self.socket.set_eintr_mode(EintrMode::Interrupt);
+    }
+
     /// Apply (or clear) a TCP read timeout on the underlying stream.
     ///
     /// `Some(t)` causes the next blocking read that goes longer than `t`
@@ -454,7 +486,7 @@ fn build_stream(tcp: &NoSigpipeTcp, host: &str, config: &ReaderConfig) -> Result
             .map_err(|e| fmt!(ConfigError, "invalid TLS server name {:?}: {}", host, e))?;
         let conn = rustls::ClientConnection::new(Arc::clone(&client_config), server_name)
             .map_err(|e| fmt!(TlsError, "rustls handshake setup failed: {}", e))?;
-        let stream_owned = rustls::StreamOwned::new(conn, owned);
+        let stream_owned = rustls::StreamOwned::new(conn, TlsSock::new(owned));
         Ok(Stream::Tls(Box::new(stream_owned)))
     } else {
         Ok(Stream::Plain(owned))
@@ -583,6 +615,10 @@ fn map_ws_read_error(e: WsReadError) -> Error {
     match e {
         WsReadError::Io(io_err) => Error::new(ErrorCode::SocketError, io_err.to_string()),
         WsReadError::Protocol(msg) => Error::new(ErrorCode::ProtocolError, msg),
+        WsReadError::Interrupted => Error::new(
+            ErrorCode::Interrupted,
+            "egress read interrupted by a signal (interrupt_on_eintr=on)",
+        ),
         WsReadError::ServerClose { code } => Error::new(
             ErrorCode::SocketError,
             match code {

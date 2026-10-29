@@ -85,7 +85,7 @@ const READ_CHUNK: usize = 4 * 1024 * 1024;
 /// kill an FFI host process with `SIGPIPE` — see `nosigpipe.rs`.
 pub(crate) enum Stream {
     Plain(NoSigpipeTcp),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, NoSigpipeTcp>>),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TlsSock>>),
 }
 
 impl Stream {
@@ -94,7 +94,7 @@ impl Stream {
     pub(crate) fn tcp_mut(&mut self) -> &mut TcpStream {
         match self {
             Stream::Plain(s) => s.tcp_mut(),
-            Stream::Tls(s) => s.sock.tcp_mut(),
+            Stream::Tls(s) => s.sock.tcp.tcp_mut(),
         }
     }
 
@@ -131,6 +131,63 @@ impl Write for Stream {
     }
 }
 
+/// The TCP socket under a rustls session.
+///
+/// rustls' `complete_io` swallows `Interrupted` from the socket and
+/// retries the read itself, so an `EINTR` would never reach `fill_more`.
+/// With `raise_eintr` set (only in [`EintrMode::Interrupt`]), an `EINTR`
+/// is re-raised as [`EintrMarker`], which rustls propagates
+/// untouched; the bytes it already took off the socket stay buffered in
+/// the session, so the next read resumes where this one stopped.
+/// Otherwise `EINTR` passes through to rustls' retry.
+pub(crate) struct TlsSock {
+    tcp: NoSigpipeTcp,
+    raise_eintr: bool,
+}
+
+impl TlsSock {
+    pub(crate) fn new(tcp: NoSigpipeTcp) -> Self {
+        Self {
+            tcp,
+            raise_eintr: false,
+        }
+    }
+}
+
+impl Read for TlsSock {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.tcp.read(buf) {
+            Err(e) if self.raise_eintr && e.kind() == io::ErrorKind::Interrupted => {
+                Err(io::Error::other(EintrMarker))
+            }
+            r => r,
+        }
+    }
+}
+
+impl Write for TlsSock {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.tcp.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+/// Marker payload of the `io::Error` [`TlsSock`] raises for an `EINTR`
+/// in [`EintrMode::Interrupt`].
+#[derive(Debug)]
+struct EintrMarker;
+
+impl std::fmt::Display for EintrMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("egress read interrupted")
+    }
+}
+
+impl std::error::Error for EintrMarker {}
+
 /// Why a `read_binary_frame` call returned without yielding a Binary
 /// payload. Internal-only — the public API surfaces these as
 /// crate-wide [`Error`](crate::Error) variants in the transport layer.
@@ -146,6 +203,25 @@ pub(crate) enum WsReadError {
     /// Caller decides whether to surface as `SocketError` or treat as
     /// graceful.
     ServerClose { code: Option<u16> },
+    /// A signal interrupted the read in [`EintrMode::Interrupt`].
+    /// Nothing was lost: any partial frame stays in the recv buffer and
+    /// the next call resumes it.
+    Interrupted,
+}
+
+/// How a recv that fails with `EINTR` (a signal handler installed without
+/// `SA_RESTART`) is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EintrMode {
+    /// Default: plain TCP surfaces it as an `Io` error; rustls retries it
+    /// internally under TLS.
+    Surface,
+    /// Retry the read. Used for connect-time reads when the reader opted
+    /// into `interrupt_on_eintr`: they cannot be resumed by a later call.
+    Retry,
+    /// Return [`WsReadError::Interrupted`], leaving any partial frame
+    /// buffered. Result-stream reads under `interrupt_on_eintr`.
+    Interrupt,
 }
 
 impl From<io::Error> for WsReadError {
@@ -171,6 +247,7 @@ pub(crate) struct WsClient {
     /// as a `Protocol` error rather than letting the buffer grow
     /// unboundedly under a corrupted-frame scenario.
     max_payload: usize,
+    eintr: EintrMode,
 }
 
 impl WsClient {
@@ -183,19 +260,30 @@ impl WsClient {
         leftover: Vec<u8>,
         mask_keys: MaskKeySource,
         max_payload: usize,
+        eintr: EintrMode,
     ) -> Self {
         let mut recv = BytesMut::with_capacity(INITIAL_RECV_CAPACITY.max(leftover.len()));
         recv.extend_from_slice(&leftover);
-        Self {
+        let mut client = Self {
             stream,
             recv,
             mask_keys,
             max_payload,
-        }
+            eintr: EintrMode::Surface,
+        };
+        client.set_eintr_mode(eintr);
+        client
     }
 
     pub(crate) fn stream_mut(&mut self) -> &mut Stream {
         &mut self.stream
+    }
+
+    pub(crate) fn set_eintr_mode(&mut self, mode: EintrMode) {
+        if let Stream::Tls(s) = &mut self.stream {
+            s.sock.raise_eintr = mode == EintrMode::Interrupt;
+        }
+        self.eintr = mode;
     }
 
     /// Read the next Binary frame from the peer, returning its payload
@@ -345,7 +433,19 @@ impl WsClient {
         // stabilises (rust-lang/rust#78485, #117693).
         let slice =
             unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
-        let n = self.stream.read(slice)?;
+        let n = loop {
+            match self.stream.read(slice) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted || is_eintr_marker(&e) => {
+                    match self.eintr {
+                        EintrMode::Retry => continue,
+                        EintrMode::Interrupt => return Err(WsReadError::Interrupted),
+                        EintrMode::Surface => return Err(e.into()),
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         if n == 0 {
             return Err(WsReadError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -358,6 +458,10 @@ impl WsClient {
         unsafe { self.recv.set_len(self.recv.len() + n) };
         Ok(())
     }
+}
+
+fn is_eintr_marker(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|i| i.is::<EintrMarker>())
 }
 
 /// `BytesMut::advance(usize)` requires `Buf` to be in scope.

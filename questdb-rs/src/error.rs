@@ -324,6 +324,19 @@ pub enum ErrorCode {
     /// **by code** and take that specific action, without matching on the error
     /// message text.
     SymbolDictFull,
+
+    /// A signal interrupted a blocking query read (`EINTR`). Only produced
+    /// when the reader's connect string sets `interrupt_on_eintr=on`, which
+    /// is meant for language bindings that run their own signal or
+    /// interrupt handling: the call returns so the host can run it.
+    ///
+    /// Not a failure of the query or the connection: the cursor is intact,
+    /// and the next `next_batch` / `next_arrow_batch` (or `cancel`) call
+    /// resumes the same result stream where this one stopped, without
+    /// reconnecting or replaying. Never failover-eligible. Exception:
+    /// `fetch_all_arrow` / `fetch_all_polars` discard what they had read, so
+    /// they end the cursor. Never produced on Windows, which has no `EINTR`.
+    Interrupted,
 }
 
 /// An error that occurred when using the QuestDB client library.
@@ -643,6 +656,7 @@ mod tests {
                 ErrorCode::BatchTooLarge => {}
                 ErrorCode::StoreResendRequired => {}
                 ErrorCode::SymbolDictFull => {}
+                ErrorCode::Interrupted => {}
             }
         }
         let _ = _exhaustive;

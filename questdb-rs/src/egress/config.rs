@@ -47,6 +47,7 @@
 //! | `failover_max_attempts`        | total Execute attempts, including the initial attempt (`8`, must be `>= 1`); ignored when `failover=off` |
 //! | `failover_backoff_initial_ms`  | first post-failure sleep (`50`; `0` disables sleeps); ignored when `failover=off` |
 //! | `failover_backoff_max_ms`      | max backoff between attempts (`1000`); ignored when `failover=off` |
+//! | `interrupt_on_eintr` | `on`/`off` — a result-stream read interrupted by a signal returns a resumable `Interrupted` error (default `off`); for language bindings with their own signal handling, see [`ReaderConfig::interrupt_on_eintr`] |
 //! | `username`         | basic auth                                               |
 //! | `password`         | basic auth                                               |
 //! | `token`            | OIDC access token or QuestDB REST token — sent as `Bearer <token>` |
@@ -507,6 +508,31 @@ pub struct ReaderConfig {
     /// ceiling, so this may legitimately exceed `query.timeout` — which is
     /// the point for long transforms. Connect-string key: `query_timeout_ms`.
     pub query_timeout_ms: u64,
+    /// What a blocking read does when a signal interrupts it (`EINTR`, from
+    /// a handler installed without `SA_RESTART`). Connect-string key:
+    /// `interrupt_on_eintr` (`on`/`off`, default `off`).
+    ///
+    /// `false` (default): unchanged behaviour. Over plain TCP the
+    /// interrupted read fails with `SocketError` (and fails over when
+    /// [`failover`](Self::failover) is on); under TLS it is retried.
+    ///
+    /// `true`: intended for language bindings that run their own signal or
+    /// interrupt handling (e.g. a Ruby thread interrupt, Python `Ctrl-C`).
+    /// A result-stream read interrupted by a signal returns
+    /// [`crate::ErrorCode::Interrupted`], over plain TCP and TLS alike,
+    /// so the host can run its handlers. The cursor is intact: nothing was
+    /// lost, no reconnect or replay happens, and the next `next_batch` /
+    /// `next_arrow_batch` (or `cancel`) resumes where the read stopped.
+    /// Connect-time reads (WS upgrade, `SERVER_INFO`, including during a
+    /// failover reconnect) retry `EINTR` instead, as they cannot be resumed;
+    /// the host's interrupt is then honoured at the next result-stream read.
+    ///
+    /// A signal that arrives just before the thread enters `recv` interrupts
+    /// nothing, so a host must keep re-signalling the blocked thread until
+    /// the call returns (Ruby's `RUBY_UBF_IO` does), not signal it once.
+    ///
+    /// No effect on Windows, which has no `EINTR`.
+    pub interrupt_on_eintr: bool,
     /// Client's zone identifier — opaque case-insensitive string (e.g.
     /// `eu-west-1a`, `dc-amsterdam`). When set, the host-health tracker
     /// prefers endpoints whose server-advertised `zone_id` matches
@@ -789,6 +815,7 @@ impl ReaderConfig {
         let server_info_timeout_ms: u64 = DEFAULT_SERVER_INFO_TIMEOUT_MS;
         let mut connect_timeout_ms: u64 = 0;
         let mut query_timeout_ms: u64 = DEFAULT_QUERY_TIMEOUT_MS;
+        let mut interrupt_on_eintr = false;
         let mut zone: Option<String> = None;
         let mut tls_verify = TlsVerify::On;
         let mut tls_ca = default_tls_ca();
@@ -936,6 +963,9 @@ impl ReaderConfig {
                 "query_timeout_ms" => {
                     query_timeout_ms = parse_value("query_timeout_ms", val)?;
                 }
+                "interrupt_on_eintr" => {
+                    interrupt_on_eintr = parse_bool("interrupt_on_eintr", val)?;
+                }
                 "zone" => {
                     // Empty / whitespace-only is treated as unset
                     // (zone-blind). Reject CR/LF — these are headers /
@@ -1067,6 +1097,7 @@ impl ReaderConfig {
             server_info_timeout_ms,
             connect_timeout_ms,
             query_timeout_ms,
+            interrupt_on_eintr,
             zone,
             auth,
             tls_verify,
@@ -2007,6 +2038,34 @@ mod tests {
         let err = ReaderConfig::from_conf(&conf).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("connect_timeout"), "msg: {}", err.msg());
+    }
+
+    // --- interrupt_on_eintr ---
+
+    #[test]
+    fn interrupt_on_eintr_defaults_off() {
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
+        assert!(!c.interrupt_on_eintr);
+    }
+
+    #[test]
+    fn interrupt_on_eintr_parses() {
+        for (val, want) in [
+            ("on", true),
+            ("true", true),
+            ("off", false),
+            ("false", false),
+        ] {
+            let c =
+                ReaderConfig::from_conf(format!("ws::addr=h:1;interrupt_on_eintr={val}")).unwrap();
+            assert_eq!(c.interrupt_on_eintr, want, "{val}");
+        }
+    }
+
+    #[test]
+    fn interrupt_on_eintr_rejects_non_boolean() {
+        let err = ReaderConfig::from_conf("ws::addr=h:1;interrupt_on_eintr=sometimes").unwrap_err();
+        assert!(err.msg().contains("interrupt_on_eintr"), "{}", err.msg());
     }
 
     // --- query_timeout_ms (per-query timeout default) ---

@@ -464,6 +464,16 @@ pub enum line_sender_error_code {
     /// DDL / INSERT / UPDATE that timed out waiting for the table writer may
     /// still be applied by that writer afterwards.
     line_sender_error_query_timeout = 38,
+
+    /// A signal interrupted a blocking query read (`EINTR`). Only produced
+    /// when the reader's connect string sets `interrupt_on_eintr=on`, meant
+    /// for language bindings that run their own signal handling: the call
+    /// returns so the host can run it. Not a failure of the query or the
+    /// connection: the cursor stays live, and the next
+    /// `qwp_reader_cursor_next_batch` / `_next_arrow_batch*` (or
+    /// `qwp_reader_cursor_cancel`) call resumes where this one stopped,
+    /// without reconnecting or replaying. Never produced on Windows.
+    line_sender_error_interrupted = 39,
 }
 
 /// Neutral spelling of the client-wide error category. The released
@@ -556,6 +566,7 @@ impl From<ErrorCode> for line_sender_error_code {
             }
             ErrorCode::SymbolDictFull => line_sender_error_code::line_sender_error_symbol_dict_full,
             ErrorCode::QueryTimeout => line_sender_error_code::line_sender_error_query_timeout,
+            ErrorCode::Interrupted => line_sender_error_code::line_sender_error_interrupted,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -5940,6 +5951,7 @@ mod tests {
             ),
             (E::SymbolDictFull, line_sender_error_symbol_dict_full, 37),
             (E::QueryTimeout, line_sender_error_query_timeout, 38),
+            (E::Interrupted, line_sender_error_interrupted, 39),
         ]
     }
 
