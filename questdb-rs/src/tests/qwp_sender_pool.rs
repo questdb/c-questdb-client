@@ -762,6 +762,65 @@ fn stream_commit_window_chains_alternating_tables_into_one_commit() {
 }
 
 #[test]
+fn stream_commit_window_commits_at_commit_rows_without_a_wait() {
+    let rows = [("trades", 0_i64), ("quotes", 1)];
+    for one_buffer in [false, true] {
+        for disk in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (tx, frames) = mpsc::channel();
+            let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+            let sf = if disk {
+                format!("sf_dir={};sender_id=fullwindow;", dir.path().display())
+            } else {
+                String::new()
+            };
+            let db = QuestDb::connect(&conf_for(
+                server.port(),
+                &format!(
+                    "{sf}sender_pool_max=1;pool_reap=manual;commit_rows=2;commit_interval_ms=60000;"
+                ),
+            ))
+            .unwrap();
+            let mut sender = db.borrow_sender().unwrap();
+            let mut buffer = sender.new_buffer();
+            for (table, qty) in rows {
+                buffer
+                    .table(table)
+                    .unwrap()
+                    .column_i64("qty", qty)
+                    .unwrap()
+                    .at_now()
+                    .unwrap();
+                if !one_buffer {
+                    sender.flush_buffer(&mut buffer).unwrap();
+                }
+            }
+            if one_buffer {
+                sender.flush_buffer(&mut buffer).unwrap();
+            }
+
+            let mut delivered = Vec::new();
+            while delivered
+                .last()
+                .is_none_or(|frame: &Vec<u8>| frame[5] & 1 != 0)
+            {
+                delivered.push(frames.recv_timeout(Duration::from_secs(5)).expect(
+                    "a window at commit_rows must commit without waiting for its interval",
+                ));
+            }
+            assert_eq!(
+                delivered
+                    .iter()
+                    .flat_map(|frame| frame_table_qty_values(frame))
+                    .collect::<Vec<_>>(),
+                rows.map(|(table, qty)| (table.to_string(), vec![qty])),
+                "one_buffer={one_buffer}, disk={disk}"
+            );
+        }
+    }
+}
+
+#[test]
 fn stream_commit_window_delivers_frames_that_fail_to_join_exactly_once() {
     const FLUSHES: i64 = 20;
     enum Shape {

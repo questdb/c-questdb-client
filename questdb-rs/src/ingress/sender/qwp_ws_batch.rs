@@ -78,6 +78,10 @@ impl QwpWsBatch {
         }
     }
 
+    pub(super) fn rows(&self) -> usize {
+        self.rows
+    }
+
     /// Ends the group before a stored split so an aborted split cannot hold an earlier commit.
     pub(super) fn full_before(&self, payload: &[u8]) -> bool {
         let Some(tail) = self.frames.last() else {

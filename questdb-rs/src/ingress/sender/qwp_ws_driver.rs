@@ -182,8 +182,9 @@ pub(crate) struct QwpWsSendCore<T> {
     transport: T,
     send_cursor: SendCursor,
     frame_batch: FrameBatch,
-    /// First frame of the next message, held unparsed until a second joins it.
-    pending_frame: Option<SfaMappedPayload>,
+    /// First frame of the next message and its rows, held unparsed until a
+    /// second frame joins it.
+    pending_frame: Option<(SfaMappedPayload, usize)>,
     batch_last_fsn: Option<u64>,
     batch_started: Option<Instant>,
     ready_batch_through: Option<u64>,
@@ -1358,7 +1359,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 break;
             };
             let len = payload.len();
-            let joined = if let Some(first) = &self.pending_frame {
+            let joined = if let Some((first, _)) = &self.pending_frame {
                 let frame_batch = &mut self.frame_batch;
                 let joined = first.with_bytes(|first| {
                     payload.with_bytes(|next| {
@@ -1378,10 +1379,13 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             } else {
                 let windowed =
                     interval.is_some() && self.unmerged_through.is_none_or(|through| fsn > through);
-                if !windowed
-                    || !payload
-                        .with_bytes(|bytes| FrameBatch::may_start(bytes, max_bytes, max_rows))
-                {
+                let rows = windowed
+                    .then(|| {
+                        payload
+                            .with_bytes(|bytes| FrameBatch::start_rows(bytes, max_bytes, max_rows))
+                    })
+                    .flatten();
+                let Some(rows) = rows else {
                     if windowed {
                         self.batch_started.get_or_insert_with(Instant::now);
                     }
@@ -1396,8 +1400,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                             CommitWindow::Outside
                         },
                     }));
-                }
-                self.pending_frame = Some(payload);
+                };
+                self.pending_frame = Some((payload, rows));
                 true
             };
             if !joined {
@@ -1409,7 +1413,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             self.batch_started.get_or_insert_with(Instant::now);
             self.batch_last_fsn = Some(fsn);
             bytes_read = bytes_read.saturating_add(len);
-            if max_rows > 0 && self.frame_batch.rows() >= max_rows
+            let window_rows = self
+                .transport
+                .window_rows()
+                .saturating_add(self.staged_rows());
+            if max_rows > 0 && window_rows >= max_rows
                 || force_through.is_some_and(|boundary| fsn >= boundary)
             {
                 closed = true;
@@ -1429,17 +1437,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         if !closed && !ended {
             return Ok(None);
         }
-        let (payload, rows) = match self.pending_frame.take() {
-            Some(payload) => {
-                let rows = payload.with_bytes(FrameBatch::message_rows);
-                (payload.into(), rows)
-            }
+        let rows = self.staged_rows();
+        let payload = match self.pending_frame.take() {
+            Some((payload, _)) => payload.into(),
             None => {
-                let rows = self.frame_batch.rows();
                 let mut payload = Vec::new();
                 self.frame_batch.encode(&mut payload);
                 self.frame_batch.clear();
-                (payload.into(), Some(rows))
+                payload.into()
             }
         };
         self.batch_last_fsn = None;
@@ -1452,8 +1457,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             fsn,
             wire_seq,
             payload,
-            window: CommitWindow::Joins { rows },
+            window: CommitWindow::Joins { rows: Some(rows) },
         }))
+    }
+
+    fn staged_rows(&self) -> usize {
+        self.pending_frame
+            .as_ref()
+            .map_or_else(|| self.frame_batch.rows(), |(_, rows)| *rows)
     }
 
     fn commit_window_expired(&self, interval: Option<Duration>) -> bool {
@@ -3358,6 +3369,12 @@ pub(crate) trait QwpWsCoreTransport {
     fn commit_batch_limits(&self) -> (Option<Duration>, usize, usize) {
         (None, 0, usize::MAX)
     }
+
+    /// Rows already handed to the open commit window.
+    fn window_rows(&self) -> usize {
+        0
+    }
+
     /// Byte budget for one bounded background send burst. Manual drivers keep
     /// their immediate-write behavior; test transports default to one frame.
     fn begin_send_batch(&mut self) -> usize {
@@ -3712,6 +3729,11 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
             commit_byte_limit(&self.qwp_ws, self.server_max_batch_size()),
         )
     }
+
+    fn window_rows(&self) -> usize {
+        self.batch.rows()
+    }
+
     fn begin_send_batch(&mut self) -> usize {
         self.batching = true;
         super::qwp_ws_batch::NETWORK_BYTES
@@ -5885,6 +5907,7 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     struct WireBatchTransport {
         interval: Duration,
+        max_rows: usize,
         max_bytes: usize,
         batch: super::super::qwp_ws_batch::QwpWsBatch,
         written: Vec<u8>,
@@ -5892,11 +5915,12 @@ mod tests {
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     impl WireBatchTransport {
-        fn new(interval: Duration, max_bytes: usize) -> Self {
+        fn new(interval: Duration, max_rows: usize, max_bytes: usize) -> Self {
             Self {
                 interval,
+                max_rows,
                 max_bytes,
-                batch: super::super::qwp_ws_batch::QwpWsBatch::new(Some(interval), 0, 4096),
+                batch: super::super::qwp_ws_batch::QwpWsBatch::new(Some(interval), max_rows, 4096),
                 written: Vec::new(),
             }
         }
@@ -5905,7 +5929,11 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     impl QwpWsCoreTransport for WireBatchTransport {
         fn commit_batch_limits(&self) -> (Option<Duration>, usize, usize) {
-            (Some(self.interval), 0, self.max_bytes)
+            (Some(self.interval), self.max_rows, self.max_bytes)
+        }
+
+        fn window_rows(&self) -> usize {
+            self.batch.rows()
         }
 
         fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
@@ -5916,12 +5944,13 @@ mod tests {
             &mut self,
             frame: OutboundFrameView<'_>,
         ) -> Result<TransportSendResult, TransportFailure> {
-            assert!(
-                !self
-                    .batch
-                    .append(frame.fsn, frame.payload, [0; 4], frame.window)
-                    .unwrap()
-            );
+            if self
+                .batch
+                .append(frame.fsn, frame.payload, [0; 4], frame.window)
+                .unwrap()
+            {
+                self.batch.flush(&mut self.written).unwrap();
+            }
             Ok(TransportSendResult::NoResponse)
         }
 
@@ -5968,7 +5997,7 @@ mod tests {
     fn frame_batch_deadline_flushes_wire_batch_without_a_second_interval() {
         for deferred in [false, true] {
             let interval = Duration::from_secs(60);
-            let transport = WireBatchTransport::new(interval, 4096);
+            let transport = WireBatchTransport::new(interval, 0, 4096);
             let mut core =
                 QwpWsSendCore::new(transport, ReconnectPolicy::no_backoff(Duration::MAX));
             let mut queue = memory_queue(SfaMemoryQueueOptions {
@@ -6019,7 +6048,7 @@ mod tests {
 
         let interval = Duration::from_secs(60);
         let mut core = QwpWsSendCore::new(
-            WireBatchTransport::new(interval, 4096),
+            WireBatchTransport::new(interval, 0, 4096),
             ReconnectPolicy::no_backoff(Duration::MAX),
         );
         let mut queue = memory_queue(SfaMemoryQueueOptions {
@@ -6073,10 +6102,60 @@ mod tests {
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[test]
+    fn window_commits_once_its_messages_reach_the_row_limit() {
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        for table in ["a", "b"] {
+            buffer
+                .table(table)
+                .unwrap()
+                .column_i64("qty", 0)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        let two_tables = replay_payload(&buffer);
+        let cases = [
+            (2, vec![table_payload("a", 0), table_payload("b", 1)]),
+            (2, vec![two_tables.clone()]),
+            (3, vec![two_tables, table_payload("a", 1)]),
+        ];
+        for (max_rows, frames) in cases {
+            let mut core = QwpWsSendCore::new(
+                WireBatchTransport::new(Duration::from_secs(60), max_rows, 4096),
+                ReconnectPolicy::no_backoff(Duration::MAX),
+            );
+            let mut queue = memory_queue(SfaMemoryQueueOptions {
+                segment_size_bytes: 4096,
+                max_bytes: 64 * 1024,
+            });
+            let progress = queue.progress_view();
+            for frame in &frames {
+                queue.try_submit(frame).unwrap();
+            }
+            core.begin_send_batch();
+            while let Some(outbound) = core
+                .next_outbound_sfa_frame_through(&progress, None, false)
+                .unwrap()
+            {
+                let (sent, result) = core.send_frame(outbound);
+                core.finish_send_result_hot(sent, result.unwrap()).unwrap();
+            }
+            core.finish_send_batch(None).unwrap();
+            assert_eq!(
+                core.transport.written,
+                wire_frames(&frames, frames.len() - 1),
+                "max_rows={max_rows}, frames={}",
+                frames.len()
+            );
+        }
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
     fn expired_window_commits_frames_already_on_the_wire() {
         let interval = Duration::from_secs(60);
         let mut core = QwpWsSendCore::new(
-            WireBatchTransport::new(interval, 16),
+            WireBatchTransport::new(interval, 0, 16),
             ReconnectPolicy::no_backoff(Duration::MAX),
         );
         let mut queue = memory_queue(SfaMemoryQueueOptions {

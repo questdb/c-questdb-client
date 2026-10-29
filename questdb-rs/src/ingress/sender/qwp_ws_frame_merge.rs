@@ -136,13 +136,13 @@ impl FrameBatch {
         }
     }
 
-    /// Whether `payload` can open a message, judged from its first table header.
+    /// Rows across every table of `payload` when it can open a message.
     /// A frame at `max_bytes` or `max_rows` on its own is sent as is.
-    pub(crate) fn may_start(payload: &[u8], max_bytes: usize, max_rows: usize) -> bool {
-        payload.len() < max_bytes
-            && prefix(payload).is_some_and(|prefix| {
-                prefix.rows <= MAX_TABLE_ROWS && (max_rows == 0 || prefix.rows < max_rows)
-            })
+    pub(crate) fn start_rows(payload: &[u8], max_bytes: usize, max_rows: usize) -> Option<usize> {
+        if payload.len() >= max_bytes {
+            return None;
+        }
+        Self::message_rows(payload).filter(|rows| max_rows == 0 || *rows < max_rows)
     }
 
     /// Whether `next` may follow `first` in one message, judged from their first
@@ -167,7 +167,7 @@ impl FrameBatch {
     }
 
     /// Rows across every table of `payload`; only tables before the last are walked.
-    pub(crate) fn message_rows(payload: &[u8]) -> Option<usize> {
+    fn message_rows(payload: &[u8]) -> Option<usize> {
         let header = header(payload)?;
         let mut pos = header.entries.end;
         let mut total = 0usize;
@@ -1228,9 +1228,12 @@ mod tests {
         let (trades, _) = frames(&[1, 1], qty);
         let (other, _) = frames(&[1], quotes);
         let (typed, _) = frames(&[1, 1, 1], all_types);
-        assert!(FrameBatch::may_start(&trades[0], usize::MAX, 2));
-        assert!(!FrameBatch::may_start(&trades[0], usize::MAX, 1));
-        assert!(!FrameBatch::may_start(&trades[0], trades[0].len(), 0));
+        let (multi, _) = frames(&[1, 2], two_tables);
+        assert_eq!(FrameBatch::start_rows(&trades[0], usize::MAX, 2), Some(1));
+        assert_eq!(FrameBatch::start_rows(&trades[0], usize::MAX, 1), None);
+        assert_eq!(FrameBatch::start_rows(&trades[0], trades[0].len(), 0), None);
+        assert_eq!(FrameBatch::start_rows(&multi[0], usize::MAX, 3), Some(2));
+        assert_eq!(FrameBatch::start_rows(&multi[0], usize::MAX, 2), None);
         assert!(FrameBatch::may_join(&trades[0], &trades[1], 2));
         assert!(!FrameBatch::may_join(&trades[0], &trades[1], 1));
         assert!(!FrameBatch::may_join(&trades[0], &other[0], 0));
@@ -1239,7 +1242,7 @@ mod tests {
         assert!(!FrameBatch::may_join(&trades[0], &deferred(&trades[1]), 0));
         assert!(FrameBatch::may_join(&deferred(&trades[0]), &trades[1], 0));
 
-        let mut pool: Vec<_> = [trades, other, typed, frames(&[2, 1], sparse).0]
+        let mut pool: Vec<_> = [trades, other, typed, multi, frames(&[2, 1], sparse).0]
             .into_iter()
             .flatten()
             .collect();
@@ -1251,8 +1254,12 @@ mod tests {
         for max_rows in 0..5 {
             for first in &pool {
                 for max_bytes in [first.len(), usize::MAX] {
-                    if FrameBatch::default().try_append(first, max_bytes, max_rows) {
-                        assert!(FrameBatch::may_start(first, max_bytes, max_rows));
+                    let mut batch = FrameBatch::default();
+                    if batch.try_append(first, max_bytes, max_rows) {
+                        assert_eq!(
+                            FrameBatch::start_rows(first, max_bytes, max_rows),
+                            Some(batch.rows())
+                        );
                     }
                 }
                 for next in &pool {
