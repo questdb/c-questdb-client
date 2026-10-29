@@ -1372,6 +1372,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         }))
     }
 
+    /// Opens one bounded send burst; returns its byte budget.
     pub(crate) fn begin_send_batch(&mut self) -> usize {
         self.ready_batch_through = None;
         self.transport.begin_send_batch()
@@ -1383,6 +1384,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .is_some_and(|(staged, published)| staged < published)
     }
 
+    /// True once a send inside the burst replaced or lost the connection, so
+    /// the burst must stop before it mixes frames across connections.
     pub(crate) fn send_batch_interrupted(&self) -> bool {
         self.has_pending_reconnect() || self.catch_up_pending || self.sends_on_connection == 0
     }
@@ -3452,6 +3455,7 @@ impl BlockingQwpWsTransport {
     }
 
     fn reconnect(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
+        // Unwritten frames die with the connection; the SF log replays them.
         self.batch.reset_connection();
         self.batching = false;
         if let Some(gate) = self.traffic_gate.as_deref() {

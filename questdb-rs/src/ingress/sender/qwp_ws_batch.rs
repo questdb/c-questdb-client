@@ -30,6 +30,9 @@ use crate::ingress::buffer::decode_qwp_varint;
 use crate::ws::frame::{Opcode, encode_client_frame};
 
 pub(super) const NETWORK_BYTES: usize = 64 * 1024;
+
+/// Largest masked client frame header (64-bit length).
+const FRAME_OVERHEAD: usize = 14;
 const DEFER_COMMIT: u8 = 1;
 
 struct Frame {
@@ -83,7 +86,7 @@ impl QwpWsBatch {
         self.bytes
             .len()
             .saturating_add(payload.len())
-            .saturating_add(14)
+            .saturating_add(FRAME_OVERHEAD)
             > self.byte_limit
             || self.interval.is_some()
                 && tail.flags & DEFER_COMMIT == 0
@@ -101,7 +104,7 @@ impl QwpWsBatch {
             ));
         }
         self.bytes
-            .try_reserve(payload.len().saturating_add(14))
+            .try_reserve(payload.len().saturating_add(FRAME_OVERHEAD))
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         self.frames
             .try_reserve(1)

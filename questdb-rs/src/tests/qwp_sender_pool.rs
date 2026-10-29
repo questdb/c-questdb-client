@@ -3566,10 +3566,13 @@ fn mixed_sfa_namespace_survives_endpoint_failover_and_catch_up() {
         .expect("the replacement endpoint must receive a dictionary catch-up");
     let (catch_up_start, catch_up_symbols) = parse_delta_dict_prefix(catch_up);
     assert_eq!(catch_up_start, 0);
-    let published_symbols = [b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()];
+    // A send burst can put both the bravo (Chunk) and charlie (Arrow) frames on
+    // the dead socket before the close is read, so the catch-up may already
+    // re-register charlie; replayed frames that overlap it are the tolerated case.
+    let expected = [b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()];
     assert!(
-        !catch_up_symbols.is_empty() && published_symbols.starts_with(&catch_up_symbols),
-        "a send burst may stage any contiguous prefix before disconnect: {catch_up_symbols:?}"
+        (1..=expected.len()).any(|n| catch_up_symbols == expected[..n]),
+        "catch-up must be a contiguous alpha[/bravo[/charlie]] prefix: {catch_up_symbols:?}"
     );
     assert_eq!(data_frames.len(), 3);
     assert_eq!(

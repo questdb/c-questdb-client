@@ -1348,7 +1348,10 @@ where
                 }
                 Err(err) => return self.store_shared_driver_error(shared, err),
             };
-            // Keep dictionary validation per frame even within a send burst.
+            // Torn-dictionary guard (file mode): a replayed delta frame whose
+            // base exceeds the re-registered dictionary is unrecoverable --
+            // fail loudly rather than send the server a frame it cannot
+            // decode. Checked per frame even within a burst.
             if let Err(err) =
                 outbound.with_view(|view| self.send_core.guard_dict_not_torn(view.payload))
             {
@@ -6734,6 +6737,95 @@ mod tests {
             );
         }
         drop(runner);
+    }
+
+    /// Records which frames each bounded send burst hands to the transport.
+    #[derive(Debug)]
+    struct BurstRecordingTransport {
+        open: bool,
+        current: Vec<u64>,
+        bursts: Arc<Mutex<Vec<Vec<u64>>>>,
+    }
+
+    impl QwpWsCoreTransport for BurstRecordingTransport {
+        fn begin_send_batch(&mut self) -> usize {
+            self.open = true;
+            64 * 1024
+        }
+
+        fn finish_send_batch(
+            &mut self,
+            _force_through: Option<u64>,
+        ) -> Result<(), TransportFailure> {
+            assert!(self.open, "finish_send_batch without begin_send_batch");
+            self.open = false;
+            let burst = std::mem::take(&mut self.current);
+            if !burst.is_empty() {
+                self.bursts.lock().unwrap().push(burst);
+            }
+            Ok(())
+        }
+
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            assert!(self.open, "background sends must happen inside a burst");
+            self.current.push(frame.sent_frame().fsn);
+            Ok(TransportSendResult::NoResponse)
+        }
+
+        fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn runner_step_sends_every_ready_frame_in_one_burst() {
+        let bursts = Arc::new(Mutex::new(Vec::new()));
+        let transport = BurstRecordingTransport {
+            open: false,
+            current: Vec::new(),
+            bursts: Arc::clone(&bursts),
+        };
+        let driver = QwpWsCoreTestHarness::from_queue(memory_queue(4096), transport);
+        let (mut store, send_core) = driver.into_parts();
+        for payload in [b"first".as_slice(), b"second", b"third"] {
+            store.try_submit(payload).unwrap();
+        }
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let mut core = SyncQwpWsRunnerCore {
+            send_core,
+            progress,
+            cold_effects: VecDeque::new(),
+            backpressure: Arc::new(BackpressureNotifier::new()),
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            commit_requested_upper: Arc::new(AtomicU64::new(0)),
+            lifecycle,
+        };
+
+        assert_eq!(
+            core.drive_step(&shared, &AtomicBool::new(false)),
+            RunnerStep::Continue
+        );
+        assert_eq!(*bursts.lock().unwrap(), [vec![0, 1, 2]]);
+
+        let mut store = shared.lock().unwrap();
+        let counters = store.counters();
+        assert_eq!(counters.total_frames_sent, 3);
+        let mut sent = Vec::new();
+        while let Some(event) = store.poll_event() {
+            if let DriverEvent::Sent { fsn, wire_seq } = event {
+                sent.push((fsn, wire_seq));
+            }
+        }
+        assert_eq!(sent, [(0, 0), (1, 1), (2, 2)]);
     }
 
     #[derive(Debug)]
