@@ -906,9 +906,8 @@ impl Sender {
         }
     }
 
-    /// An explicit durable request is refused unless the configured tier owns
-    /// the sender's completion/trim watermark; this avoids answering with a
-    /// weaker guarantee.
+    /// A durable level is refused unless the sender was opened for it, so
+    /// the watermark read for it is never a weaker one.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn check_durable_ack_opt_in(&self, ack_level: AckLevel) -> Result<()> {
         let tiers = match &self.handler {
@@ -916,25 +915,7 @@ impl Sender {
             SyncProtocolHandler::ManualQwpWs(state) => state.request_durable_ack,
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
-        let supported = match ack_level {
-            AckLevel::Ok => true,
-            AckLevel::Durable => tiers.has_replicated(),
-            AckLevel::LocalDurable => tiers.trims_on_local(),
-        };
-        if !supported {
-            return Err(match ack_level {
-                AckLevel::Durable => error::fmt!(
-                    InvalidApiCall,
-                    "AckLevel::Durable requires `request_durable_ack=on`, `replicated`, or `local,replicated` in the connect string."
-                ),
-                AckLevel::LocalDurable => error::fmt!(
-                    InvalidApiCall,
-                    "AckLevel::LocalDurable requires `request_durable_ack=local` in the connect string."
-                ),
-                AckLevel::Ok => unreachable!(),
-            });
-        }
-        Ok(())
+        tiers.check_ack_level(ack_level)
     }
 
     /// Completion watermark for `ack_level` across both QWP/WebSocket progress

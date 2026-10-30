@@ -1200,7 +1200,7 @@ impl SyncQwpWsPendingRunnerCore {
 
         match self.pending_connect.connect_with_retry(stop) {
             Ok(Some(transport)) => {
-                let mut send_core = QwpWsSendCore::new_with_durable_ack_tiers_and_rejection_limit(
+                let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
                     transport,
                     self.pending_connect.reconnect_policy,
                     self.pending_connect.durable_ack,
@@ -2767,7 +2767,7 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
     auth_header: Option<&str>,
     max_version: u32,
     client_id: Option<&str>,
-    request_durable_ack: bool,
+    request_durable_ack: DurableAckTiers,
 ) -> crate::Result<(u8, Vec<u8>)> {
     let extras = codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
     let handshake = crate::ws::handshake::upgrade(stream, host_header, codec::WS_PATH, &extras)
@@ -3809,7 +3809,7 @@ fn open_qwp_ws_parts(
     let persisted_symbol_dict = queue.take_persisted_symbol_dict();
     let mut store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
     store.set_rejection_sink(qwp_ws.rejection_sink.clone());
-    let send_core = QwpWsSendCore::new_with_durable_ack_tiers_and_rejection_limit(
+    let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
         transport,
         ReconnectPolicy::bounded(
             *qwp_ws.reconnect_max_duration,
@@ -4747,7 +4747,7 @@ mod tests {
 
     fn pooled_boundary_wait_sender<T: QwpWsCoreTransport + Send + 'static>(
         transport: T,
-        durable: bool,
+        durable: DurableAckTiers,
     ) -> (
         crate::ingress::column_sender::PooledSenderCore,
         Arc<BackpressureNotifier>,
@@ -4770,7 +4770,7 @@ mod tests {
             encoder: QwpWsReplayEncoder::new(1),
             runner,
             server_max_batch_size: Arc::new(AtomicUsize::new(4096)),
-            request_durable_ack: durable.into(),
+            request_durable_ack: durable,
             sfa_frame_payload_cap: segment_payload_capacity(4096),
             sfa_frame_split_target: two_frame_segment_payload_capacity(4096),
             orphan_pool: None,
@@ -4784,7 +4784,7 @@ mod tests {
         let sender = crate::ingress::column_sender::PooledSenderCore::new_store_and_forward(
             state,
             4096,
-            durable.into(),
+            durable,
             Duration::from_secs(5),
         )
         .unwrap();
@@ -4794,7 +4794,7 @@ mod tests {
     #[test]
     fn pooled_boundary_wait_unrelated_notifications_do_not_extend_timeout() {
         let (mut sender, notifier) =
-            pooled_boundary_wait_sender(FakeOrderedServer::no_response(), false);
+            pooled_boundary_wait_sender(FakeOrderedServer::no_response(), DurableAckTiers::Off);
         let (stop_tx, stop_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         std::thread::scope(|scope| {
@@ -4834,7 +4834,8 @@ mod tests {
                 terminal: terminal_rx,
                 sent_frames: Vec::new(),
             };
-            let (mut sender, notifier) = pooled_boundary_wait_sender(transport, false);
+            let (mut sender, notifier) =
+                pooled_boundary_wait_sender(transport, DurableAckTiers::Off);
             sent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let (waiting_tx, waiting_rx) = mpsc::channel();
             let (result_tx, result_rx) = mpsc::channel();
@@ -4876,7 +4877,8 @@ mod tests {
             ack_ready: Arc::clone(&ack_ready),
             sent_frames: Vec::new(),
         };
-        let (mut sender, _) = pooled_boundary_wait_sender(transport, true);
+        let (mut sender, _) =
+            pooled_boundary_wait_sender(transport, DurableAckTiers::LegacyReplicated);
         sender
             .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap();
@@ -5397,11 +5399,13 @@ mod tests {
         // consume them without losing the leading frame.
         let mut stream = UpgradeResponseWithFrame::new(b"\x02\x00");
 
-        let extras = codec::qwp_extra_headers(None, 1, None, false);
+        let extras = codec::qwp_extra_headers(None, 1, None, DurableAckTiers::Off);
         let handshake =
             crate::ws::handshake::upgrade(&mut stream, "localhost:9000", codec::WS_PATH, &extras)
                 .unwrap();
-        let result = codec::validate_qwp_handshake_headers(&handshake.headers, 1, false).unwrap();
+        let result =
+            codec::validate_qwp_handshake_headers(&handshake.headers, 1, DurableAckTiers::Off)
+                .unwrap();
         let leftover = handshake.leftover;
 
         assert_eq!(result.version, 1);
@@ -6254,7 +6258,7 @@ mod tests {
             queue,
             transport,
             ReconnectPolicy::bounded(Duration::MAX, Duration::ZERO, Duration::ZERO),
-            true,
+            DurableAckTiers::LegacyReplicated,
         );
         let receipt = driver.try_submit(b"sfa-first").unwrap();
         assert_eq!(receipt.fsn, 0);

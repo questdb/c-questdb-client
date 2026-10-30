@@ -208,19 +208,7 @@ impl ColumnConn {
     /// logic, so tests can drive `process_response` / `push_pending`
     /// against a dummy connected pair.
     #[cfg(test)]
-    pub(crate) fn for_test(stream: WsStream, durable_ack_opt_in: bool) -> Self {
-        Self::for_test_tiers(
-            stream,
-            if durable_ack_opt_in {
-                DurableAckTiers::LegacyReplicated
-            } else {
-                DurableAckTiers::Off
-            },
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test_tiers(stream: WsStream, durable_ack_tiers: DurableAckTiers) -> Self {
+    pub(crate) fn for_test(stream: WsStream, durable_ack_tiers: DurableAckTiers) -> Self {
         Self {
             stream,
             leftover: Vec::new(),
@@ -416,25 +404,7 @@ impl ColumnConn {
     }
 
     pub(crate) fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
-        let supported = match ack_level {
-            AckLevel::Ok => true,
-            AckLevel::Durable => self.durable_ack_tiers.has_replicated(),
-            AckLevel::LocalDurable => self.durable_ack_tiers.trims_on_local(),
-        };
-        if !supported {
-            return Err(match ack_level {
-                AckLevel::Durable => error::fmt!(
-                    InvalidApiCall,
-                    "AckLevel::Durable requires `request_durable_ack=on`, `replicated`, or `local,replicated` in the connect string."
-                ),
-                AckLevel::LocalDurable => error::fmt!(
-                    InvalidApiCall,
-                    "AckLevel::LocalDurable requires `request_durable_ack=local` in the connect string."
-                ),
-                AckLevel::Ok => unreachable!(),
-            });
-        }
-        Ok(())
+        self.durable_ack_tiers.check_ack_level(ack_level)
     }
 
     /// Drain any QWP responses available without blocking, processing each
@@ -1433,7 +1403,7 @@ mod tests {
 
     #[test]
     fn process_ok_pops_pending_and_tracks_durable_when_opted_in() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), true);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::LegacyReplicated);
         conn.push_pending(0);
         conn.process_response(QwpResponse::Ok {
             sequence: 0,
@@ -1447,7 +1417,7 @@ mod tests {
 
     #[test]
     fn direct_column_uses_only_configured_trim_tier() {
-        let mut local = ColumnConn::for_test_tiers(dummy_ws_stream(), DurableAckTiers::Local);
+        let mut local = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Local);
         local.pending_durable_targets.insert("trades".to_owned(), 7);
         local
             .process_response(QwpResponse::DurableAck {
@@ -1464,8 +1434,7 @@ mod tests {
         assert!(local.validate_ack_level(AckLevel::LocalDurable).is_ok());
         assert!(local.validate_ack_level(AckLevel::Durable).is_err());
 
-        let mut both =
-            ColumnConn::for_test_tiers(dummy_ws_stream(), DurableAckTiers::LocalAndReplicated);
+        let mut both = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::LocalAndReplicated);
         both.pending_durable_targets.insert("trades".to_owned(), 7);
         both.process_response(QwpResponse::LocalDurableAck {
             tables: vec![("trades".to_owned(), 7)],
@@ -1486,7 +1455,7 @@ mod tests {
 
     #[test]
     fn process_ok_skips_durable_targets_without_opt_in() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Off);
         conn.push_pending(0);
         conn.process_response(QwpResponse::Ok {
             sequence: 0,
@@ -1503,7 +1472,7 @@ mod tests {
 
     #[test]
     fn process_unmatched_ok_is_tolerated_as_noop() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Off);
         // No pending frame: a cumulative OK that advances nothing is a
         // redundant progress ack, not a fatal error. It is a no-op and
         // leaves the connection reusable.
@@ -1517,7 +1486,7 @@ mod tests {
 
     #[test]
     fn process_stale_ok_below_pending_fsn_is_noop_and_keeps_pending() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Off);
         conn.push_pending(5);
         // An OK whose sequence precedes the oldest pending frame advances
         // nothing; it is tolerated as a no-op and the pending frame stays
@@ -1573,7 +1542,7 @@ mod tests {
 
         let mut conn = ColumnConn::for_test(
             WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
-            false,
+            DurableAckTiers::Off,
         );
         conn.request_timeout = Duration::from_millis(150);
         conn.push_pending(5);
@@ -1664,7 +1633,7 @@ mod tests {
             let (server, _) = listener.accept().expect("accept");
             let peer = spawn_durable_ack_on_ping_peer(server, status);
 
-            let mut conn = ColumnConn::for_test_tiers(
+            let mut conn = ColumnConn::for_test(
                 WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
                 tiers,
             );
@@ -1707,7 +1676,7 @@ mod tests {
         let (server, _) = listener.accept().expect("accept");
         let peer = spawn_durable_ack_on_ping_peer(server, QWP_STATUS_LOCAL_DURABLE_ACK);
 
-        let mut conn = ColumnConn::for_test_tiers(
+        let mut conn = ColumnConn::for_test(
             WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
             DurableAckTiers::Local,
         );
@@ -1725,7 +1694,7 @@ mod tests {
 
     #[test]
     fn redundant_ok_after_durable_prune_does_not_strand_sync() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), true);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::LegacyReplicated);
         // Table `t` runs the full OK -> DurableAck -> satisfied cycle; its
         // satisfied pending target is pruned (the prune `sync_all_acks` runs).
         conn.push_pending(0);
@@ -1780,7 +1749,7 @@ mod tests {
             (QWP_STATUS_SECURITY_ERROR, crate::ErrorCode::AuthError),
             (QWP_STATUS_WRITE_ERROR, crate::ErrorCode::ServerFlushError),
         ] {
-            let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+            let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Off);
             let err = conn
                 .process_response(QwpResponse::Error {
                     sequence: 0,

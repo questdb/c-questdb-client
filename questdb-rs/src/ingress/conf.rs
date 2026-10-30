@@ -268,18 +268,18 @@ pub(crate) enum DurableAckTiers {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-impl From<bool> for DurableAckTiers {
-    fn from(value: bool) -> Self {
-        if value {
-            Self::LegacyReplicated
-        } else {
-            Self::Off
-        }
-    }
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
 impl DurableAckTiers {
+    /// Parse a `request_durable_ack` value, with the error both the sender
+    /// builder and the pool's connect-string check report.
+    pub(crate) fn parse_conf(value: &str) -> Result<Self> {
+        Self::parse(value).ok_or_else(|| {
+            crate::error::fmt!(
+                ConfigError,
+                "invalid request_durable_ack [value={value}, allowed-values=[on, off, local, replicated, local,replicated]]"
+            )
+        })
+    }
+
     pub(crate) fn parse(value: &str) -> Option<Self> {
         let value = value.trim();
         if value.eq_ignore_ascii_case("off") {
@@ -321,6 +321,34 @@ impl DurableAckTiers {
             Self::Local => Some("local"),
             Self::Replicated => Some("replicated"),
             Self::LocalAndReplicated => Some("local,replicated"),
+        }
+    }
+
+    /// Refuse a wait or poll at `ack_level` unless this set makes the server
+    /// send the acknowledgement that answers it, so a caller never gets a
+    /// weaker guarantee than it asked for. As in the Java client, a set that
+    /// includes the replicated level trims only on the replicated
+    /// acknowledgement, so the local level is not offered with it.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn check_ack_level(self, ack_level: crate::ingress::AckLevel) -> Result<()> {
+        use crate::ingress::AckLevel;
+        match ack_level {
+            AckLevel::Ok => Ok(()),
+            AckLevel::Durable if self.has_replicated() => Ok(()),
+            AckLevel::Durable => Err(crate::error::fmt!(
+                InvalidApiCall,
+                "AckLevel::Durable requires `request_durable_ack=on`, `replicated`, or `local,replicated` in the connect string."
+            )),
+            AckLevel::LocalDurable if self.trims_on_local() => Ok(()),
+            AckLevel::LocalDurable if self.has_replicated() => Err(crate::error::fmt!(
+                InvalidApiCall,
+                "AckLevel::LocalDurable is not available with `request_durable_ack={}`: the sender trims on the replicated acknowledgement, so wait for AckLevel::Durable.",
+                self.config_value()
+            )),
+            AckLevel::LocalDurable => Err(crate::error::fmt!(
+                InvalidApiCall,
+                "AckLevel::LocalDurable requires `request_durable_ack=local` in the connect string."
+            )),
         }
     }
 

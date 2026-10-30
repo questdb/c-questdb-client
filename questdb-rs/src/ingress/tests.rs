@@ -504,6 +504,51 @@ fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
     }
 }
 
+/// Each tier set answers only the level whose acknowledgement trims it; with
+/// the replicated level requested the local one is refused, as in Java.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn durable_ack_tiers_answer_only_their_trim_level() {
+    use super::conf::DurableAckTiers::*;
+    const NEEDS_REPLICATED: &str = "AckLevel::Durable requires `request_durable_ack=on`, \
+        `replicated`, or `local,replicated` in the connect string.";
+    const NEEDS_LOCAL: &str =
+        "AckLevel::LocalDurable requires `request_durable_ack=local` in the connect string.";
+    let not_with = |value: &str| {
+        format!(
+            "AckLevel::LocalDurable is not available with `request_durable_ack={value}`: \
+             the sender trims on the replicated acknowledgement, so wait for AckLevel::Durable."
+        )
+    };
+    for (tiers, durable, local_durable) in [
+        (
+            Off,
+            Some(NEEDS_REPLICATED.to_owned()),
+            Some(NEEDS_LOCAL.to_owned()),
+        ),
+        (LegacyReplicated, None, Some(not_with("on"))),
+        (Local, Some(NEEDS_REPLICATED.to_owned()), None),
+        (Replicated, None, Some(not_with("replicated"))),
+        (LocalAndReplicated, None, Some(not_with("local,replicated"))),
+    ] {
+        assert!(tiers.check_ack_level(AckLevel::Ok).is_ok(), "{tiers:?}");
+        for (level, expected) in [
+            (AckLevel::Durable, durable),
+            (AckLevel::LocalDurable, local_durable),
+        ] {
+            let result = tiers.check_ack_level(level);
+            match expected {
+                None => assert!(result.is_ok(), "{tiers:?} {level:?}: {result:?}"),
+                Some(msg) => {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{tiers:?} {level:?}");
+                    assert_eq!(err.msg(), msg, "{tiers:?} {level:?}");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {

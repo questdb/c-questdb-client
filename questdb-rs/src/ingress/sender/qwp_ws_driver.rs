@@ -833,13 +833,13 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
 impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     pub(crate) fn new(transport: T, reconnect_policy: ReconnectPolicy) -> Self {
-        Self::new_with_durable_ack(transport, reconnect_policy, false)
+        Self::new_with_durable_ack(transport, reconnect_policy, DurableAckTiers::Off)
     }
 
     pub(crate) fn new_with_durable_ack(
         transport: T,
         reconnect_policy: ReconnectPolicy,
-        durable_ack: bool,
+        durable_ack: DurableAckTiers,
     ) -> Self {
         Self::new_with_durable_ack_and_rejection_limit(
             transport,
@@ -853,27 +853,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     pub(crate) fn new_with_durable_ack_and_rejection_limit(
         transport: T,
         reconnect_policy: ReconnectPolicy,
-        durable_ack: bool,
-        max_frame_rejections: usize,
-        poison_min_escalation_window: Duration,
-    ) -> Self {
-        Self::new_with_durable_ack_tiers_and_rejection_limit(
-            transport,
-            reconnect_policy,
-            if durable_ack {
-                DurableAckTiers::LegacyReplicated
-            } else {
-                DurableAckTiers::Off
-            },
-            max_frame_rejections,
-            poison_min_escalation_window,
-        )
-    }
-
-    pub(crate) fn new_with_durable_ack_tiers_and_rejection_limit(
-        transport: T,
-        reconnect_policy: ReconnectPolicy,
-        durable_ack_tiers: DurableAckTiers,
+        durable_ack: DurableAckTiers,
         max_frame_rejections: usize,
         poison_min_escalation_window: Duration,
     ) -> Self {
@@ -883,9 +863,9 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             dict_mirror: SentDictMirror::new(false),
             catch_up_pending: false,
             catch_up_retry_strikes: 0,
-            durable_ack: durable_ack_tiers
+            durable_ack: durable_ack
                 .is_enabled()
-                .then(|| DurableAckTracker::new(durable_ack_tiers.trims_on_local())),
+                .then(|| DurableAckTracker::new(durable_ack.trims_on_local())),
             reconnect_policy,
             pending_reconnect: None,
             poison_tracker: PoisonFrameTracker::default(),
@@ -2374,7 +2354,7 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
         queue: Q,
         transport: T,
         reconnect_policy: ReconnectPolicy,
-        durable_ack: bool,
+        durable_ack: DurableAckTiers,
     ) -> Self {
         Self {
             store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
@@ -2397,7 +2377,7 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
             send_core: QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
                 transport,
                 ReconnectPolicy::no_backoff(Duration::MAX),
-                false,
+                DurableAckTiers::Off,
                 max_frame_rejections,
                 poison_min_escalation_window,
             ),
@@ -2421,7 +2401,7 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
             send_core: QwpWsSendCore::new_with_durable_ack(
                 transport,
                 ReconnectPolicy::no_backoff(Duration::MAX),
-                true,
+                DurableAckTiers::LegacyReplicated,
             ),
         }
     }
@@ -6265,7 +6245,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             ReconnectPolicy::no_backoff(Duration::from_secs(1)),
-            false,
+            DurableAckTiers::Off,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
 
@@ -6334,7 +6314,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6376,7 +6356,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6420,7 +6400,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             FakeOrderedServer::no_response(),
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -6517,7 +6497,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6585,7 +6565,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"first").unwrap();
 
@@ -6630,7 +6610,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6670,7 +6650,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             ReconnectPolicy::no_backoff(Duration::MAX),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6694,7 +6674,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -8846,7 +8826,7 @@ mod tests {
                 Duration::from_millis(10),
                 Duration::from_millis(10),
             ),
-            false,
+            DurableAckTiers::Off,
         );
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();

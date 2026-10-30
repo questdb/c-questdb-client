@@ -1559,25 +1559,7 @@ impl SfaBackend {
     /// durable-without-opt-in request *before* encode mutates the symbol dict
     /// or the Arrow import consumes the caller's array.
     fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
-        let supported = match ack_level {
-            AckLevel::Ok => true,
-            AckLevel::Durable => self.request_durable_ack.has_replicated(),
-            AckLevel::LocalDurable => self.request_durable_ack.trims_on_local(),
-        };
-        if !supported {
-            return Err(match ack_level {
-                AckLevel::Durable => error::fmt!(
-                    InvalidApiCall,
-                    "AckLevel::Durable requires `request_durable_ack=on`, `replicated`, or `local,replicated` in the connect string."
-                ),
-                AckLevel::LocalDurable => error::fmt!(
-                    InvalidApiCall,
-                    "AckLevel::LocalDurable requires `request_durable_ack=local` in the connect string."
-                ),
-                AckLevel::Ok => unreachable!(),
-            });
-        }
-        Ok(())
+        self.request_durable_ack.check_ack_level(ack_level)
     }
 
     /// Marks the connection for retirement (`drop_on_return`) when `err` reports

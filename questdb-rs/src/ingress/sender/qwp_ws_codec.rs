@@ -69,9 +69,8 @@ pub(super) fn qwp_extra_headers(
     auth_header: Option<&str>,
     max_version: u32,
     client_id: Option<&str>,
-    request_durable_ack: impl Into<DurableAckTiers>,
+    request_durable_ack: DurableAckTiers,
 ) -> Vec<(&'static str, String)> {
-    let request_durable_ack = request_durable_ack.into();
     let mut extras = Vec::with_capacity(4);
     extras.push(("X-QWP-Max-Version", max_version.to_string()));
     if let Some(cid) = client_id {
@@ -108,9 +107,8 @@ pub(crate) struct QwpWsHandshakeResult {
 pub(super) fn validate_qwp_handshake_headers(
     headers: &crate::ws::handshake::Headers,
     max_version: u32,
-    request_durable_ack: impl Into<DurableAckTiers>,
+    request_durable_ack: DurableAckTiers,
 ) -> crate::Result<QwpWsHandshakeResult> {
-    let request_durable_ack = request_durable_ack.into();
     let version: u8 = match headers.find_ci("x-qwp-version") {
         Some(v) => v.parse().map_err(|_| {
             error::fmt!(
@@ -522,7 +520,7 @@ mod tests {
 
     #[test]
     fn qwp_extra_headers_includes_durable_ack_when_requested() {
-        let extras = qwp_extra_headers(None, 1, None, true);
+        let extras = qwp_extra_headers(None, 1, None, DurableAckTiers::LegacyReplicated);
         assert!(
             extras
                 .iter()
@@ -548,7 +546,7 @@ mod tests {
 
     #[test]
     fn qwp_extra_headers_omits_durable_ack_by_default() {
-        let extras = qwp_extra_headers(None, 1, None, false);
+        let extras = qwp_extra_headers(None, 1, None, DurableAckTiers::Off);
         assert!(
             !extras
                 .iter()
@@ -560,7 +558,7 @@ mod tests {
 
     #[test]
     fn qwp_extra_headers_includes_authorization_when_provided() {
-        let extras = qwp_extra_headers(Some("Basic dXNlcjpwYXNz"), 1, None, false);
+        let extras = qwp_extra_headers(Some("Basic dXNlcjpwYXNz"), 1, None, DurableAckTiers::Off);
         assert!(
             extras
                 .iter()
@@ -574,7 +572,7 @@ mod tests {
     fn validate_qwp_handshake_headers_negotiates_version() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, false)
+            validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off)
                 .unwrap()
                 .version,
             1
@@ -584,7 +582,7 @@ mod tests {
     #[test]
     fn validate_qwp_handshake_headers_rejects_version_above_max() {
         let headers = Headers::from_pairs([("X-QWP-Version", "2")]);
-        let err = validate_qwp_handshake_headers(&headers, 1, false).unwrap_err();
+        let err = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg().contains("unsupported X-QWP-Version"),
@@ -596,7 +594,7 @@ mod tests {
     #[test]
     fn validate_qwp_handshake_headers_rejects_zero_version() {
         let headers = Headers::from_pairs([("X-QWP-Version", "0")]);
-        let err = validate_qwp_handshake_headers(&headers, 1, false).unwrap_err();
+        let err = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg().contains("invalid X-QWP-Version"),
@@ -608,7 +606,7 @@ mod tests {
     #[test]
     fn validate_qwp_handshake_headers_rejects_invalid_version_string() {
         let headers = Headers::from_pairs([("X-QWP-Version", "not-a-version")]);
-        let err = validate_qwp_handshake_headers(&headers, 1, false).unwrap_err();
+        let err = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg().contains("invalid X-QWP-Version"),
@@ -621,7 +619,7 @@ mod tests {
     fn validate_qwp_handshake_headers_defaults_to_v1_when_missing() {
         let headers = Headers::default();
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, false)
+            validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off)
                 .unwrap()
                 .version,
             1
@@ -631,7 +629,8 @@ mod tests {
     #[test]
     fn validate_qwp_handshake_headers_requires_durable_ack_echo_when_requested() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
-        let err = validate_qwp_handshake_headers(&headers, 1, true).unwrap_err();
+        let err = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::LegacyReplicated)
+            .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
         assert_eq!(
             err.msg(),
@@ -642,7 +641,7 @@ mod tests {
         let headers =
             Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", "enabled")]);
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, true)
+            validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::LegacyReplicated)
                 .unwrap()
                 .version,
             1
@@ -687,7 +686,7 @@ mod tests {
     fn validate_qwp_handshake_headers_allows_missing_durable_ack_by_default() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, false)
+            validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off)
                 .unwrap()
                 .version,
             1
@@ -697,7 +696,7 @@ mod tests {
     #[test]
     fn extract_server_max_batch_size_absent_returns_zero() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 0);
     }
 
@@ -705,7 +704,7 @@ mod tests {
     fn extract_server_max_batch_size_parses_valid_value() {
         let headers =
             Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Max-Batch-Size", "16777202")]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 16_777_202);
     }
 
@@ -715,7 +714,7 @@ mod tests {
             ("X-QWP-Version", "1"),
             ("X-QWP-Max-Batch-Size", "not-a-number"),
         ]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 0);
     }
 
@@ -723,7 +722,7 @@ mod tests {
     fn extract_server_max_batch_size_negative_returns_zero() {
         let headers =
             Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Max-Batch-Size", "-100")]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 0);
     }
 
@@ -733,7 +732,7 @@ mod tests {
             ("X-QWP-Version", "1"),
             ("X-QWP-Max-Batch-Size", " 2097138 "),
         ]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 2_097_138);
     }
 

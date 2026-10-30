@@ -144,18 +144,9 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         }
         match key {
             "request_durable_ack" => {
-                // Syntactic check; the SenderBuilder also parses and
-                // canonicalizes this for ColumnConn.
-                let normalized = value.trim().to_ascii_lowercase();
-                if !matches!(
-                    normalized.as_str(),
-                    "off" | "on" | "local" | "replicated" | "local,replicated" | "replicated,local"
-                ) {
-                    return Err(error::fmt!(
-                        ConfigError,
-                        "invalid request_durable_ack [value={value}, allowed-values=[on, off, local, replicated, local,replicated]]"
-                    ));
-                }
+                // Syntactic check; the SenderBuilder parses the same value
+                // again for ColumnConn.
+                crate::ingress::DurableAckTiers::parse_conf(value)?;
             }
             "qwp_ws_progress" if value != "background" => {
                 return Err(error::fmt!(

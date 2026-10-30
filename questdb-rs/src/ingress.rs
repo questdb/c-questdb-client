@@ -2097,12 +2097,7 @@ impl SenderBuilder {
                 "The \"request_durable_ack\" setting is only supported for QWP/WebSocket."
             ));
         };
-        let tiers = conf::DurableAckTiers::parse(value).ok_or_else(|| {
-            error::fmt!(
-                ConfigError,
-                "invalid request_durable_ack [value={value}, allowed-values=[on, off, local, replicated, local,replicated]]"
-            )
-        })?;
+        let tiers = conf::DurableAckTiers::parse_conf(value)?;
         qwp_ws
             .request_durable_ack
             .set_specified("request_durable_ack", tiers)?;
