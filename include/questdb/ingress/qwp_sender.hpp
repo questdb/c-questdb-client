@@ -1159,8 +1159,12 @@ private:
  * cache. Use `sf_durability=periodic` to checkpoint the local replay log.
  * `sf_sync_interval_millis` defaults to 5000; it is a target, not a maximum
  * loss window. `sf_durability=flush` and `sf_durability=append` are not yet
- * supported. End-to-end durability also requires
- * `request_durable_ack=on` and a durable ACK from QuestDB Enterprise.
+ * supported. Server durability is selected independently with
+ * `request_durable_ack`: `local` (a server running
+ * `cairo.commit.mode=adaptive`), `replicated` or its original name `on`
+ * (QuestDB Enterprise), or `local,replicated` (both: QuestDB Enterprise with
+ * `cairo.commit.mode=adaptive`, which a replicating primary runs only when the
+ * mode is set explicitly).
  */
 class borrowed_sender
 {

@@ -1014,17 +1014,21 @@ impl QuestDb {
     ///
     /// `ack_level` chooses how far the call blocks before returning:
     /// * `None` — wait for the connect string's default, i.e. the same level
-    ///   the store-and-forward senders use: [`AckLevel::Durable`] when the
-    ///   Enterprise-only durable mode is enabled with
-    ///   `request_durable_ack=on`, otherwise [`AckLevel::Ok`].
+    ///   the store-and-forward senders use: [`AckLevel::LocalDurable`] for
+    ///   `request_durable_ack=local`, [`AckLevel::Durable`] for `on`,
+    ///   `replicated`, or `local,replicated`, otherwise [`AckLevel::Ok`].
     /// * `Some(level)` — wait for exactly `level`. [`AckLevel::Durable`]
-    ///   requires QuestDB Enterprise and `request_durable_ack=on`; otherwise
-    ///   the call is rejected with [`ErrorCode::InvalidApiCall`].
+    ///   requires QuestDB Enterprise and `request_durable_ack=on`,
+    ///   `replicated`, or `local,replicated`; [`AckLevel::LocalDurable`]
+    ///   requires `request_durable_ack=local`; otherwise the call is rejected
+    ///   with [`ErrorCode::InvalidApiCall`].
     ///
     /// The call publishes the batch as a commit boundary and blocks until the
     /// resolved acknowledgement level is reached. An `Ok` acknowledgement
-    /// confirms server acceptance; only the Enterprise durable level confirms
-    /// durable coverage. On a transient [`ErrorCode::FailoverRetry`] it
+    /// confirms server acceptance only; the durable levels confirm durability:
+    /// [`AckLevel::LocalDurable`] on the server's own disk, the Enterprise
+    /// [`AckLevel::Durable`] in replication storage. On a transient
+    /// [`ErrorCode::FailoverRetry`] it
     /// surfaces the error rather than replaying (the batch is fully owned by
     /// the caller, so retrying is a plain re-call); the DataFrame path
     /// ([`Self::flush_polars_dataframe`]) re-drives automatically instead.
@@ -1057,17 +1061,12 @@ impl QuestDb {
     }
 
     /// The ack level these convenience flushes wait for when the caller does
-    /// not name one: [`AckLevel::Durable`] when the connect string enabled the
-    /// Enterprise-only durable mode with `request_durable_ack=on`, otherwise
-    /// [`AckLevel::Ok`]. Mirrors the level the store-and-forward senders use
-    /// for the same pool.
+    /// not name one: local-durable for `request_durable_ack=local`,
+    /// replicated-durable for `on`, `replicated`, or `local,replicated`, and
+    /// [`AckLevel::Ok`] for `off`.
     #[cfg(feature = "arrow-ingress")]
     pub(crate) fn default_ack_level(&self) -> AckLevel {
-        if self.inner.connector.request_durable_ack() {
-            AckLevel::Durable
-        } else {
-            AckLevel::Ok
-        }
+        default_ack_level_for_tiers(self.inner.connector.request_durable_ack())
     }
 
     /// FFI escape hatch: like [`Self::borrow_sender`] but the returned
@@ -1764,8 +1763,10 @@ impl<'a> BorrowedSender<'a> {
     /// times out here even though delivery is progressing.
     ///
     /// `AckLevel::Durable` requires QuestDB Enterprise and a pool opened with
-    /// `request_durable_ack=on`; otherwise the call is rejected up front
-    /// (`InvalidApiCall`) before `chunk` is touched.
+    /// `request_durable_ack=on`, `replicated`, or `local,replicated`, and
+    /// `AckLevel::LocalDurable` a pool opened with `request_durable_ack=local`;
+    /// otherwise the call is rejected up front (`InvalidApiCall`) before
+    /// `chunk` is touched.
     ///
     /// Failure contract: if local publication fails, `chunk` is untouched and
     /// retryable. Once the frame is accepted into the queue `chunk` is cleared
@@ -1816,10 +1817,12 @@ impl<'a> BorrowedSender<'a> {
     /// Return the highest frame sequence number completed by server ACK or
     /// server-side reject-and-continue, or `None` if no frame has completed.
     ///
-    /// In Enterprise durable-ACK mode this watermark advances after durable
-    /// ACK coverage; use [`Self::wait`] when you need an explicit
-    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier. Compare it only with
-    /// FSNs produced by this same sender stream.
+    /// With durable ACKs this watermark advances only once the durable level
+    /// the pool was opened for covers the frame: the local one for
+    /// `request_durable_ack=local`, the replicated one for any value that
+    /// includes `replicated`. Use [`Self::wait`] when you need an explicit
+    /// [`AckLevel::Ok`], [`AckLevel::LocalDurable`], or [`AckLevel::Durable`]
+    /// barrier. Compare it only with FSNs produced by this same sender stream.
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         self.0.inner_ref().acked_fsn()
     }
@@ -1832,7 +1835,9 @@ impl<'a> BorrowedSender<'a> {
     /// pool's rejection handler (default: logged; see
     /// [`QuestDb::connect_with_handlers`]) rather than raised here;
     /// retriable ones are replayed by the queue. `AckLevel::Durable` requires
-    /// QuestDB Enterprise and a pool opened with `request_durable_ack=on`.
+    /// QuestDB Enterprise and a pool opened with `request_durable_ack=on`,
+    /// `replicated`, or `local,replicated`; `AckLevel::LocalDurable` requires
+    /// a pool opened with `request_durable_ack=local`.
     ///
     /// `timeout` is a no-progress deadline (it fires only if the ack watermark
     /// fails to advance for that long); `Duration::ZERO` waits indefinitely.
@@ -2205,7 +2210,10 @@ impl Drop for DirectSenderHandle<'_> {
         let Some(mut sender) = self.sender.take() else {
             return;
         };
-        commit_in_flight_on_drop(self.db.inner.connector.request_durable_ack(), &mut sender);
+        commit_in_flight_on_drop(
+            default_ack_level_for_tiers(self.db.inner.connector.request_durable_ack()),
+            &mut sender,
+        );
         return_direct_to_pool(&self.db.inner, sender);
     }
 }
@@ -2282,7 +2290,7 @@ impl Drop for OwnedSender {
 #[cfg(feature = "ffi-support")]
 enum DirectBacking {
     Pool(Arc<DbInner>),
-    Standalone { request_durable_ack: bool },
+    Standalone { default_ack_level: AckLevel },
 }
 
 /// Owned variant of the hidden direct sender used by the C FFI. Either
@@ -2326,7 +2334,7 @@ impl OwnedDirectColumnSender {
         );
         Ok(Self {
             backing: DirectBacking::Standalone {
-                request_durable_ack: connector.request_durable_ack(),
+                default_ack_level: default_ack_level_for_tiers(connector.request_durable_ack()),
             },
             sender: Some(sender),
         })
@@ -2368,13 +2376,14 @@ impl Drop for OwnedDirectColumnSender {
         };
         match &self.backing {
             DirectBacking::Pool(inner) => {
-                commit_in_flight_on_drop(inner.connector.request_durable_ack(), &mut sender);
+                commit_in_flight_on_drop(
+                    default_ack_level_for_tiers(inner.connector.request_durable_ack()),
+                    &mut sender,
+                );
                 return_direct_to_pool(inner, sender);
             }
-            DirectBacking::Standalone {
-                request_durable_ack,
-            } => {
-                commit_in_flight_on_drop(*request_durable_ack, &mut sender);
+            DirectBacking::Standalone { default_ack_level } => {
+                commit_in_flight_on_drop(*default_ack_level, &mut sender);
             }
         }
     }
@@ -2904,10 +2913,23 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
     ColumnConn::from_round_stream(raw)
 }
 
+/// The ack level a pool waits for when the caller names none: the level whose
+/// acknowledgement trims the store-and-forward copy for the pool's
+/// `request_durable_ack` setting.
+fn default_ack_level_for_tiers(tiers: crate::ingress::DurableAckTiers) -> AckLevel {
+    if tiers.has_replicated() {
+        AckLevel::Durable
+    } else if tiers.trims_on_local() {
+        AckLevel::LocalDurable
+    } else {
+        AckLevel::Ok
+    }
+}
+
 /// Best-effort commit of un-sync'd deferred frames on drop, so the natural
 /// `flush()`-loop-then-drop path doesn't silently lose data. Commits at the
-/// pool's default ack level so a `request_durable_ack=on` pool still waits for
-/// the durability ACK instead of silently downgrading to `Ok`. On failure the
+/// pool's default ack level so a tiered durable-ack pool still waits for its
+/// selected durability ACK instead of silently downgrading to `Ok`. On failure the
 /// connection is latched `must_close` so the next borrower can't commit these
 /// frames under a foreign table.
 ///
@@ -2918,15 +2940,10 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
 /// symbols — is committed here rather than discarded. A symbol-less commit
 /// interns nothing, so the full dictionary does not block it. Only a hard latch
 /// (transport death, or a prior failed commit) skips the attempt.
-fn commit_in_flight_on_drop(request_durable_ack: bool, sender: &mut DirectSenderCore) {
+fn commit_in_flight_on_drop(ack: AckLevel, sender: &mut DirectSenderCore) {
     if sender.in_flight() == 0 {
         return;
     }
-    let ack = if request_durable_ack {
-        AckLevel::Durable
-    } else {
-        AckLevel::Ok
-    };
     let committed = sender.can_drain_in_flight() && sender.sync(ack).is_ok();
     if !committed {
         log::warn!(
@@ -2950,7 +2967,7 @@ fn drain_sfa_before_drop(inner: &DbInner, sender: &mut PooledSenderCore) {
     if timeout.is_zero() {
         return;
     }
-    let durable = inner.connector.request_durable_ack();
+    let durable = inner.connector.request_durable_ack().is_enabled();
     if sender.sfa_fully_delivered(durable) {
         return;
     }
@@ -2979,7 +2996,7 @@ fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [PooledSenderCore]) 
     if timeout.is_zero() || senders.is_empty() {
         return;
     }
-    let durable = inner.connector.request_durable_ack();
+    let durable = inner.connector.request_durable_ack().is_enabled();
     // Anchor the shared deadline before the orphan closes, which can block on
     // queue back-pressure: the "one close_flush_timeout" bound is on the whole
     // retirement, not just the drain.
@@ -3186,7 +3203,7 @@ fn drain_idle_readers(inner: &DbInner) -> usize {
 }
 
 fn reap_idle_senders(inner: &DbInner) -> usize {
-    let durable = inner.connector.request_durable_ack();
+    let durable = inner.connector.request_durable_ack().is_enabled();
     let mut dropped = 0;
     while let Some((sender, slot_index)) = take_reapable_column_sender(inner, durable) {
         let _release = slot_index.is_some().then_some(SenderSlotRelease {

@@ -410,7 +410,7 @@ fn open_ws_connection(config: &ProbeConfig, client_id: &str) -> ProbeResult<TcpS
         config.auth_header.as_deref(),
         1,
         Some(client_id),
-        false,
+        crate::ingress::DurableAckTiers::Off,
     )?;
 
     Ok(stream)

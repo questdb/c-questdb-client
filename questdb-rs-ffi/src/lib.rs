@@ -3796,6 +3796,8 @@ pub unsafe extern "C" fn line_sender_qwpws_acked_fsn(
 pub const qwpws_ack_level_ok: u32 = 0;
 #[allow(non_upper_case_globals)]
 pub const qwpws_ack_level_durable: u32 = 1;
+#[allow(non_upper_case_globals)]
+pub const qwpws_ack_level_local_durable: u32 = 2;
 
 /// Wait until every QWP/WebSocket frame published so far on `sender` reaches
 /// `ack_level` (a `qwpws_ack_level_*` value). This is the
@@ -3804,8 +3806,11 @@ pub const qwpws_ack_level_durable: u32 = 1;
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
 /// `qwpws_ack_level_durable` requires QuestDB Enterprise and the sender to be
-/// opened with `request_durable_ack=on`; otherwise this returns
-/// `line_sender_error_invalid_api_call` even when nothing has been published.
+/// opened with `request_durable_ack=on`, `replicated`, or `local,replicated`;
+/// `qwpws_ack_level_local_durable` requires a server running
+/// `cairo.commit.mode=adaptive` and `request_durable_ack=local`. Otherwise
+/// this returns `line_sender_error_invalid_api_call` even when nothing has
+/// been published.
 ///
 /// Returns `true` once the boundary is acknowledged. Returns `false` and sets
 /// `err_out` on the no-progress timeout (`line_sender_error_failover_retry`), a
@@ -3822,11 +3827,16 @@ pub unsafe extern "C" fn line_sender_qwpws_wait(
         let ack_level = match ack_level {
             value if value == qwpws_ack_level_ok => questdb::ingress::AckLevel::Ok,
             value if value == qwpws_ack_level_durable => questdb::ingress::AckLevel::Durable,
+            value if value == qwpws_ack_level_local_durable => {
+                questdb::ingress::AckLevel::LocalDurable
+            }
             other => {
                 set_err_out(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    format!("line_sender_qwpws_wait: invalid ack_level {other} (expected 0 or 1)"),
+                    format!(
+                        "line_sender_qwpws_wait: invalid ack_level {other} (expected 0, 1, or 2)"
+                    ),
                 );
                 return false;
             }
@@ -7441,6 +7451,60 @@ mod tests {
 
             line_sender_qwpws_error_free(raw);
         }
+    }
+
+    #[test]
+    fn qwpws_wait_refuses_local_durable_level_without_local_opt_in() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            upgrade_mock_stream(&mut stream);
+            // Hold the connection until the client closes it.
+            let mut sink = [0u8; 256];
+            while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+        });
+
+        unsafe {
+            let mut err = ptr::null_mut();
+            let opts = line_sender_opts_new(
+                line_sender_protocol::line_sender_protocol_ws,
+                utf8(b"127.0.0.1"),
+                port,
+            );
+            assert!(!opts.is_null());
+            let sender = line_sender_build(opts, &mut err);
+            line_sender_opts_free(opts);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            // Level 2 must reach the local durable level, which a sender
+            // opened without `request_durable_ack=local` refuses; read as the
+            // OK level, the wait would succeed on acceptance alone.
+            assert!(!line_sender_qwpws_wait(
+                sender,
+                qwpws_ack_level_local_durable,
+                0,
+                &mut err
+            ));
+            assert!(!err.is_null());
+            assert_err_code(
+                line_sender_error_get_code(err),
+                line_sender_error_code::line_sender_error_invalid_api_call,
+            );
+            let msg = read_error_message(err);
+            assert!(
+                msg.contains("AckLevel::LocalDurable requires `request_durable_ack=local`"),
+                "got: {msg}"
+            );
+            free_err(&mut err);
+
+            line_sender_close(sender);
+        }
+        server.join().unwrap();
     }
 
     #[test]

@@ -744,12 +744,12 @@ impl Sender {
     /// After [`Self::flush_and_get_fsn`] returns `Some(fsn)`, that publication
     /// boundary has completed once this method returns a value greater than or
     /// equal to `fsn`. Use [`Self::wait`] when you need an explicit
-    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier, or
-    /// [`Self::completed_fsn`] to poll either level without blocking. This
-    /// method reports the watermark at the sender's configured level: with
-    /// `request_durable_ack=on` it equals `completed_fsn(AckLevel::Durable)`;
-    /// without it, it reports acceptance coverage whereas an explicit
-    /// `Durable` poll is rejected.
+    /// [`AckLevel::Ok`], [`AckLevel::LocalDurable`], or
+    /// [`AckLevel::Durable`] barrier, or [`Self::completed_fsn`] to poll a
+    /// level without blocking. This method reports the watermark at the
+    /// sender's configured trim level: local for `request_durable_ack=local`,
+    /// replicated for `on`, `replicated`, or `local,replicated`, and
+    /// acceptance for `off`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {
@@ -770,18 +770,22 @@ impl Sender {
     ///   (background progress mode; see below for manual mode). A covered
     ///   frame can therefore have been rejected: check
     ///   [`Self::poll_qwp_ws_error`] before treating coverage as delivery.
-    /// * [`AckLevel::Durable`] reports durable-ACK coverage. Like
+    /// * [`AckLevel::LocalDurable`] reports coverage on the server's own disk.
+    ///   It requires a server running `cairo.commit.mode=adaptive` and a
+    ///   sender opened with `request_durable_ack=local`.
+    /// * [`AckLevel::Durable`] reports replication coverage. Like
     ///   [`Self::wait`] it requires QuestDB Enterprise and a sender opened with
-    ///   `request_durable_ack=on`; otherwise the call is rejected up front,
-    ///   ahead of any terminal error the sender holds, so a caller polling
-    ///   for durability cannot silently read acceptance coverage instead.
-    ///   [`Self::acked_fsn`] reports the watermark at the sender's configured
-    ///   level instead and is equivalent only under that opt-in.
+    ///   `request_durable_ack=on`, `replicated`, or `local,replicated`.
+    ///
+    /// A durable level the sender was not opened for is rejected up front,
+    /// ahead of any terminal error the sender holds, so a caller polling for
+    /// durability cannot silently read a weaker watermark instead.
+    /// [`Self::acked_fsn`] reports the watermark at the sender's configured
+    /// level and is never rejected on that account.
     ///
     /// In background progress mode with durable ACKs `Ok` advances ahead of
-    /// `Durable`. Manual progress mode has no separate OK tracker, so there
-    /// both levels report the completed watermark even under
-    /// `request_durable_ack=on`.
+    /// the durable level. Manual progress mode has no separate OK tracker, so
+    /// there `Ok` and the durable level report the same completed watermark.
     ///
     /// An `Ok` read is never below a `Durable` read taken before it, but two
     /// calls are two snapshots: the background runner can advance `Durable`
@@ -822,10 +826,16 @@ impl Sender {
     ///
     /// * [`AckLevel::Ok`] waits for the server to accept every published
     ///   frame.
-    /// * [`AckLevel::Durable`] waits for durable-ACK coverage. It requires
-    ///   QuestDB Enterprise and a sender opened with
-    ///   `request_durable_ack=on`; otherwise the call is rejected before
-    ///   checking whether any frame has been published.
+    /// * [`AckLevel::LocalDurable`] waits until the server flushed the frames
+    ///   to its own disk. It requires a server running
+    ///   `cairo.commit.mode=adaptive` and a sender opened with
+    ///   `request_durable_ack=local`.
+    /// * [`AckLevel::Durable`] waits until the frames reached replication
+    ///   storage. It requires QuestDB Enterprise and a sender opened with
+    ///   `request_durable_ack=on`, `replicated`, or `local,replicated`.
+    ///
+    /// A durable level the sender was not opened for is rejected before
+    /// checking whether any frame has been published.
     ///
     /// `timeout` is a **no-progress** deadline: it fires only if the ack
     /// watermark fails to advance for that long, so a steadily-progressing
@@ -896,26 +906,16 @@ impl Sender {
         }
     }
 
-    /// Without `request_durable_ack=on` the durable watermark degrades to
-    /// acceptance coverage, so an explicit durable request is refused rather
-    /// than answered with a weaker guarantee.
+    /// A durable level is refused unless the sender was opened for it, so
+    /// the watermark read for it is never a weaker one.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn check_durable_ack_opt_in(&self, ack_level: AckLevel) -> Result<()> {
-        if ack_level != AckLevel::Durable {
-            return Ok(());
-        }
-        let request_durable_ack = match &self.handler {
+        let tiers = match &self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => state.request_durable_ack,
             SyncProtocolHandler::ManualQwpWs(state) => state.request_durable_ack,
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
-        if !request_durable_ack {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "AckLevel::Durable requires `request_durable_ack=on` in the connect string."
-            ));
-        }
-        Ok(())
+        tiers.check_ack_level(ack_level)
     }
 
     /// Completion watermark for `ack_level` across both QWP/WebSocket progress
@@ -926,11 +926,11 @@ impl Sender {
         match &self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => match ack_level {
                 AckLevel::Ok => qwp_ws_ok_fsn_background(state),
-                AckLevel::Durable => qwp_ws_acked_fsn_background(state),
+                AckLevel::Durable | AckLevel::LocalDurable => qwp_ws_acked_fsn_background(state),
             },
             SyncProtocolHandler::ManualQwpWs(state) => match ack_level {
                 AckLevel::Ok => qwp_ws_ok_fsn_manual(state),
-                AckLevel::Durable => qwp_ws_acked_fsn_manual(state),
+                AckLevel::Durable | AckLevel::LocalDurable => qwp_ws_acked_fsn_manual(state),
             },
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         }
@@ -1215,6 +1215,7 @@ fn qwp_ws_wait_timeout(
     let level = match ack_level {
         AckLevel::Ok => "ok",
         AckLevel::Durable => "durable",
+        AckLevel::LocalDurable => "local durable",
     };
     let progress = match completed {
         Some(fsn) => format!("reached FSN {fsn}"),

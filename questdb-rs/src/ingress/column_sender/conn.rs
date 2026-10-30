@@ -43,6 +43,7 @@ use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::ingress::RawQwpWsRoundStream;
+use crate::ingress::conf::DurableAckTiers;
 use crate::ingress::sender::qwp_ws::WsStream;
 use crate::ws::frame::{self, FrameError, FrameHeader, Opcode, encode_client_frame};
 use crate::ws::mask::{MaskKeySource, apply_mask};
@@ -63,6 +64,7 @@ pub(crate) const WS_HEADER_RESERVE: usize = 14;
 // into `crate::ingress::sender::qwp_ws_codec`.
 const QWP_STATUS_OK: u8 = 0x00;
 const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
+const QWP_STATUS_LOCAL_DURABLE_ACK: u8 = 0x0E;
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
 const QWP_STATUS_INTERNAL_ERROR: u8 = 0x06;
@@ -162,7 +164,11 @@ pub(crate) struct ColumnConn {
     endpoint_idx: usize,
     max_buf_size: usize,
     request_timeout: Duration,
-    durable_ack_opt_in: bool,
+    durable_ack_tiers: DurableAckTiers,
+    /// Interval between keepalive PINGs while a durable sync waits; zero
+    /// disables them. See [`Self::recv_durable_response`].
+    durable_ack_keepalive_interval: Duration,
+    last_durable_keepalive_ping: Option<Instant>,
 }
 
 impl ColumnConn {
@@ -191,7 +197,9 @@ impl ColumnConn {
             endpoint_idx: raw.endpoint_idx,
             max_buf_size: raw.max_buf_size,
             request_timeout: raw.request_timeout,
-            durable_ack_opt_in: raw.durable_ack_opt_in,
+            durable_ack_tiers: raw.durable_ack_tiers,
+            durable_ack_keepalive_interval: raw.durable_ack_keepalive_interval,
+            last_durable_keepalive_ping: None,
         })
     }
 
@@ -200,7 +208,7 @@ impl ColumnConn {
     /// logic, so tests can drive `process_response` / `push_pending`
     /// against a dummy connected pair.
     #[cfg(test)]
-    pub(crate) fn for_test(stream: WsStream, durable_ack_opt_in: bool) -> Self {
+    pub(crate) fn for_test(stream: WsStream, durable_ack_tiers: DurableAckTiers) -> Self {
         Self {
             stream,
             leftover: Vec::new(),
@@ -218,7 +226,9 @@ impl ColumnConn {
             endpoint_idx: 0,
             max_buf_size: 1 << 20,
             request_timeout: Duration::from_secs(30),
-            durable_ack_opt_in,
+            durable_ack_tiers,
+            durable_ack_keepalive_interval: Duration::from_millis(200),
+            last_durable_keepalive_ping: None,
         }
     }
 
@@ -394,13 +404,7 @@ impl ColumnConn {
     }
 
     pub(crate) fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
-        if ack_level == AckLevel::Durable && !self.durable_ack_opt_in {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "AckLevel::Durable requires `request_durable_ack=on` in the connect string."
-            ));
-        }
-        Ok(())
+        self.durable_ack_tiers.check_ack_level(ack_level)
     }
 
     /// Drain any QWP responses available without blocking, processing each
@@ -485,12 +489,13 @@ impl ColumnConn {
             }
         }
 
-        if ack_level == AckLevel::Durable {
+        if matches!(ack_level, AckLevel::Durable | AckLevel::LocalDurable) {
             let mut deadline_anchor = Instant::now();
             let mut last_mark = self.durable_progress_mark();
             while !self.durability_satisfied() {
-                let response = self.recv_qwp_response()?;
-                self.process_response(response)?;
+                if let Some(response) = self.recv_durable_response()? {
+                    self.process_response(response)?;
+                }
                 let mark = self.durable_progress_mark();
                 if mark != last_mark {
                     last_mark = mark;
@@ -570,7 +575,7 @@ impl ColumnConn {
                 // only; otherwise `Durable` is rejected up front and the targets
                 // map is never pruned, so accumulating would leak one entry per
                 // table for the connection's life.
-                if self.durable_ack_opt_in {
+                if self.durable_ack_tiers.is_enabled() {
                     for (t, seq_txn) in tables {
                         self.pending_durable_targets
                             .entry(t)
@@ -597,16 +602,11 @@ impl ColumnConn {
                 Ok(())
             }
             QwpResponse::DurableAck { tables } => {
-                for (t, seq_txn) in tables {
-                    self.durable_watermarks
-                        .entry(t)
-                        .and_modify(|w| {
-                            if seq_txn > *w {
-                                *w = seq_txn;
-                            }
-                        })
-                        .or_insert(seq_txn);
-                }
+                self.apply_durable_watermarks(tables, false);
+                Ok(())
+            }
+            QwpResponse::LocalDurableAck { tables } => {
+                self.apply_durable_watermarks(tables, true);
                 Ok(())
             }
             QwpResponse::Error {
@@ -623,6 +623,22 @@ impl ColumnConn {
                     ),
                 )))
             }
+        }
+    }
+
+    fn apply_durable_watermarks(&mut self, tables: Vec<(String, i64)>, is_local: bool) {
+        if is_local != self.durable_ack_tiers.trims_on_local() {
+            return;
+        }
+        for (table, seq_txn) in tables {
+            self.durable_watermarks
+                .entry(table)
+                .and_modify(|watermark| {
+                    if seq_txn > *watermark {
+                        *watermark = seq_txn;
+                    }
+                })
+                .or_insert(seq_txn);
         }
     }
 
@@ -894,32 +910,106 @@ impl ColumnConn {
         Ok(())
     }
 
+    /// Wait for the next QWP response during a durable sync.
+    ///
+    /// The server flushes durable ACKs only on inbound events, so a client
+    /// that just blocks on the socket waits out the no-progress deadline
+    /// even when its data is already durable. Like the row sender, send an
+    /// empty PING once per `durable_ack_keepalive_interval` and wait at most
+    /// that long for each read. Returns `None` when the wait ends without a
+    /// complete QWP frame so the caller can check its deadline. A zero
+    /// interval keeps the plain blocking read.
+    fn recv_durable_response(&mut self) -> Result<Option<QwpResponse>> {
+        let interval = self.durable_ack_keepalive_interval;
+        if interval.is_zero() {
+            return self.recv_qwp_response().map(Some);
+        }
+        if let Some(response) = self.try_recv_qwp_response()? {
+            return Ok(Some(response));
+        }
+        if self
+            .last_durable_keepalive_ping
+            .is_none_or(|sent_at| sent_at.elapsed() >= interval)
+        {
+            self.send_control_frame(Opcode::Ping, 0)?;
+            self.last_durable_keepalive_ping = Some(Instant::now());
+        }
+        let wait = if self.request_timeout.is_zero() {
+            interval
+        } else {
+            interval.min(self.request_timeout)
+        };
+        self.set_timeouts(Some(wait), Some(self.request_timeout))?;
+        let filled = self.fill_leftover_within_timeout();
+        self.set_timeouts(Some(self.request_timeout), Some(self.request_timeout))?;
+        if !filled? {
+            return Ok(None);
+        }
+        self.try_recv_qwp_response()
+    }
+
+    /// Like [`Self::fill_leftover`], but a read timeout returns `Ok(false)`
+    /// instead of latching the connection.
+    fn fill_leftover_within_timeout(&mut self) -> Result<bool> {
+        let mut chunk = [0u8; 1024];
+        match self.stream.read(&mut chunk) {
+            Ok(0) => Err(self.latch(error::fmt!(
+                SocketError,
+                "QWP/WebSocket socket closed unexpectedly while awaiting a durable ACK"
+            ))),
+            Ok(n) => {
+                self.leftover.extend_from_slice(&chunk[..n]);
+                Ok(true)
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(self.latch(error::fmt!(
+                SocketError,
+                "QWP/WebSocket socket read failed: {}",
+                e
+            ))),
+        }
+    }
+
     fn send_pong(&mut self, payload_len: usize) -> Result<()> {
         // The pong payload must echo the ping payload, which is in
         // read_buf[..payload_len].
+        self.send_control_frame(Opcode::Pong, payload_len)
+    }
+
+    /// Write a control frame whose payload is `read_buf[..payload_len]`.
+    fn send_control_frame(&mut self, opcode: Opcode, payload_len: usize) -> Result<()> {
         let mask_key = self.mask_keys.next_key().map_err(|e| {
             self.latch(error::fmt!(SocketError, "mask key entropy failed: {}", e.0))
         })?;
-        // Use a small scratch buffer to encode the pong; pongs are tiny
-        // (≤ 125 bytes by RFC) so this allocation is negligible.
-        let mut pong = Vec::with_capacity(WS_HEADER_RESERVE + payload_len);
+        // Use a small scratch buffer to encode the frame; control frames are
+        // tiny (≤ 125 bytes by RFC) so this allocation is negligible.
+        let mut control = Vec::with_capacity(WS_HEADER_RESERVE + payload_len);
         frame::encode_client_frame(
-            &mut pong,
-            Opcode::Pong,
+            &mut control,
+            opcode,
             mask_key,
             &self.read_buf[..payload_len],
         );
-        self.stream.write_all(&pong).map_err(|e| {
+        self.stream.write_all(&control).map_err(|e| {
             self.latch(error::fmt!(
                 SocketError,
-                "QWP/WebSocket pong write failed: {}",
+                "QWP/WebSocket {:?} write failed: {}",
+                opcode,
                 e
             ))
         })?;
         self.stream.flush().map_err(|e| {
             self.latch(error::fmt!(
                 SocketError,
-                "QWP/WebSocket pong flush failed: {}",
+                "QWP/WebSocket {:?} flush failed: {}",
+                opcode,
                 e
             ))
         })?;
@@ -978,6 +1068,9 @@ enum QwpResponse {
     DurableAck {
         tables: Vec<(String, i64)>,
     },
+    LocalDurableAck {
+        tables: Vec<(String, i64)>,
+    },
     Error {
         sequence: u64,
         status: u8,
@@ -1000,9 +1093,22 @@ fn parse_qwp_response(payload: &[u8]) -> Result<QwpResponse> {
             let tables = parse_table_entries(payload, 9, "QWP OK response")?;
             Ok(QwpResponse::Ok { sequence, tables })
         }
-        QWP_STATUS_DURABLE_ACK => {
-            let tables = parse_table_entries(payload, 1, "QWP durable ACK response")?;
-            Ok(QwpResponse::DurableAck { tables })
+        QWP_STATUS_DURABLE_ACK | QWP_STATUS_LOCAL_DURABLE_ACK => {
+            let is_local = status == QWP_STATUS_LOCAL_DURABLE_ACK;
+            let tables = parse_table_entries(
+                payload,
+                1,
+                if is_local {
+                    "QWP local durable ACK response"
+                } else {
+                    "QWP durable ACK response"
+                },
+            )?;
+            Ok(if is_local {
+                QwpResponse::LocalDurableAck { tables }
+            } else {
+                QwpResponse::DurableAck { tables }
+            })
         }
         _ => {
             let (sequence, message) = parse_error_body(payload)?;
@@ -1261,6 +1367,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_qwp_local_durable_ack_and_rejects_truncation() {
+        let mut payload = vec![QWP_STATUS_LOCAL_DURABLE_ACK];
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(b"tx");
+        payload.extend_from_slice(&9i64.to_le_bytes());
+        match parse_qwp_response(&payload).unwrap() {
+            QwpResponse::LocalDurableAck { tables } => {
+                assert_eq!(tables, vec![("tx".to_owned(), 9)]);
+            }
+            other => panic!("expected LocalDurableAck, got {other:?}"),
+        }
+        assert!(parse_qwp_response(&[QWP_STATUS_LOCAL_DURABLE_ACK]).is_err());
+    }
+
+    #[test]
     fn parse_qwp_error_truncated_rejected() {
         // status=PARSE_ERROR but only the status byte present
         let err = parse_qwp_response(&[QWP_STATUS_PARSE_ERROR]).unwrap_err();
@@ -1281,7 +1403,7 @@ mod tests {
 
     #[test]
     fn process_ok_pops_pending_and_tracks_durable_when_opted_in() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), true);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::LegacyReplicated);
         conn.push_pending(0);
         conn.process_response(QwpResponse::Ok {
             sequence: 0,
@@ -1294,8 +1416,46 @@ mod tests {
     }
 
     #[test]
+    fn direct_column_uses_only_configured_trim_tier() {
+        let mut local = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Local);
+        local.pending_durable_targets.insert("trades".to_owned(), 7);
+        local
+            .process_response(QwpResponse::DurableAck {
+                tables: vec![("trades".to_owned(), 7)],
+            })
+            .unwrap();
+        assert!(!local.durability_satisfied());
+        local
+            .process_response(QwpResponse::LocalDurableAck {
+                tables: vec![("trades".to_owned(), 7)],
+            })
+            .unwrap();
+        assert!(local.durability_satisfied());
+        assert!(local.validate_ack_level(AckLevel::LocalDurable).is_ok());
+        assert!(local.validate_ack_level(AckLevel::Durable).is_err());
+
+        let mut both = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::LocalAndReplicated);
+        both.pending_durable_targets.insert("trades".to_owned(), 7);
+        both.process_response(QwpResponse::LocalDurableAck {
+            tables: vec![("trades".to_owned(), 7)],
+        })
+        .unwrap();
+        assert!(
+            !both.durability_satisfied(),
+            "local progress must not satisfy a both-tier replicated barrier"
+        );
+        both.process_response(QwpResponse::DurableAck {
+            tables: vec![("trades".to_owned(), 7)],
+        })
+        .unwrap();
+        assert!(both.durability_satisfied());
+        assert!(both.validate_ack_level(AckLevel::Durable).is_ok());
+        assert!(both.validate_ack_level(AckLevel::LocalDurable).is_err());
+    }
+
+    #[test]
     fn process_ok_skips_durable_targets_without_opt_in() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Off);
         conn.push_pending(0);
         conn.process_response(QwpResponse::Ok {
             sequence: 0,
@@ -1312,7 +1472,7 @@ mod tests {
 
     #[test]
     fn process_unmatched_ok_is_tolerated_as_noop() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Off);
         // No pending frame: a cumulative OK that advances nothing is a
         // redundant progress ack, not a fatal error. It is a no-op and
         // leaves the connection reusable.
@@ -1326,7 +1486,7 @@ mod tests {
 
     #[test]
     fn process_stale_ok_below_pending_fsn_is_noop_and_keeps_pending() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Off);
         conn.push_pending(5);
         // An OK whose sequence precedes the oldest pending frame advances
         // nothing; it is tolerated as a no-op and the pending frame stays
@@ -1382,7 +1542,7 @@ mod tests {
 
         let mut conn = ColumnConn::for_test(
             WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
-            false,
+            DurableAckTiers::Off,
         );
         conn.request_timeout = Duration::from_millis(150);
         conn.push_pending(5);
@@ -1405,9 +1565,253 @@ mod tests {
         }
     }
 
+    /// Server-shaped peer for durable syncs: answers the published frame with
+    /// an OK at once but, like QuestDB, which flushes durable ACKs only on
+    /// inbound events, sends the `durable_status` ACK only after a client
+    /// PING, and only once `ack_after` has passed since the OK. Every PING
+    /// gets a PONG, `pong_delay` later. Returns the number of PINGs seen
+    /// before the client closed.
+    fn spawn_durable_ack_on_ping_peer(
+        server: std::net::TcpStream,
+        durable_status: u8,
+        ack_after: Duration,
+        pong_delay: Duration,
+    ) -> std::thread::JoinHandle<usize> {
+        std::thread::spawn(move || {
+            let mut server = server;
+            let with_entry = |mut payload: Vec<u8>| {
+                payload.extend_from_slice(&1u16.to_le_bytes());
+                payload.extend_from_slice(&1u16.to_le_bytes());
+                payload.push(b't');
+                payload.extend_from_slice(&1i64.to_le_bytes());
+                let mut ws_frame = vec![0x82u8, payload.len() as u8];
+                ws_frame.extend_from_slice(&payload);
+                ws_frame
+            };
+            let mut ok = vec![QWP_STATUS_OK];
+            ok.extend_from_slice(&0u64.to_le_bytes());
+            if server.write_all(&with_entry(ok)).is_err() {
+                return 0;
+            }
+            let ok_sent = Instant::now();
+            let mut pings = 0;
+            let mut header = [0u8; 2];
+            while server.read_exact(&mut header).is_ok() {
+                let mut mask_and_payload = vec![0u8; 4 + (header[1] & 0x7f) as usize];
+                if server.read_exact(&mut mask_and_payload).is_err() {
+                    break;
+                }
+                if header[0] & 0x0f == 0x9 {
+                    pings += 1;
+                    if ok_sent.elapsed() >= ack_after {
+                        let durable = with_entry(vec![durable_status]);
+                        if server.write_all(&durable).is_err() {
+                            break;
+                        }
+                    }
+                    if !pong_delay.is_zero() {
+                        std::thread::sleep(pong_delay);
+                    }
+                    if server.write_all(&[0x8A, 0]).is_err() {
+                        break;
+                    }
+                }
+            }
+            pings
+        })
+    }
+
+    #[test]
+    fn durable_sync_pings_a_server_that_flushes_durable_acks_on_inbound_events() {
+        use crate::ws::nosigpipe::NoSigpipeTcp;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::thread;
+
+        for (tiers, level, status) in [
+            (
+                DurableAckTiers::Local,
+                AckLevel::LocalDurable,
+                QWP_STATUS_LOCAL_DURABLE_ACK,
+            ),
+            (
+                DurableAckTiers::Replicated,
+                AckLevel::Durable,
+                QWP_STATUS_DURABLE_ACK,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+            let (server, _) = listener.accept().expect("accept");
+            let peer =
+                spawn_durable_ack_on_ping_peer(server, status, Duration::ZERO, Duration::ZERO);
+
+            let mut conn = ColumnConn::for_test(
+                WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
+                tiers,
+            );
+            conn.request_timeout = Duration::from_secs(3);
+            conn.durable_ack_keepalive_interval = Duration::from_millis(20);
+            conn.push_pending(0);
+
+            let (tx, rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let started = Instant::now();
+                let result = conn.sync_all_acks(level).map_err(|e| e.msg().to_string());
+                let _ = tx.send((result, started.elapsed()));
+            });
+            let (result, elapsed) = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("durable sync hung");
+            worker.join().expect("worker");
+            let pings = peer.join().expect("peer");
+
+            assert_eq!(result, Ok(()), "{level:?}");
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "{level:?} waited {elapsed:?}: a PING, not the no-progress deadline, \
+                 must prompt the durable ACK"
+            );
+            assert!(
+                pings >= 1,
+                "{level:?}: no keepalive PING reached the server"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_sync_with_keepalive_disabled_sends_no_ping() {
+        use crate::ws::nosigpipe::NoSigpipeTcp;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let peer = spawn_durable_ack_on_ping_peer(
+            server,
+            QWP_STATUS_LOCAL_DURABLE_ACK,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        let mut conn = ColumnConn::for_test(
+            WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
+            DurableAckTiers::Local,
+        );
+        conn.request_timeout = Duration::from_millis(150);
+        conn.durable_ack_keepalive_interval = Duration::ZERO;
+        conn.push_pending(0);
+
+        let err = conn
+            .sync_all_acks(AckLevel::LocalDurable)
+            .expect_err("nothing prompts the server, so the deadline must fire");
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        drop(conn);
+        assert_eq!(peer.join().expect("peer"), 0);
+    }
+
+    #[test]
+    fn durable_sync_with_keepalive_fails_when_the_needed_ack_never_comes() {
+        use crate::ws::nosigpipe::NoSigpipeTcp;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        // The peer answers every keepalive PING, but with the replicated ACK a
+        // `local` connection ignores: with the reads no longer failing on a
+        // timeout, only the no-progress deadline can end the wait.
+        let peer = spawn_durable_ack_on_ping_peer(
+            server,
+            QWP_STATUS_DURABLE_ACK,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        let mut conn = ColumnConn::for_test(
+            WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
+            DurableAckTiers::Local,
+        );
+        conn.request_timeout = Duration::from_millis(300);
+        conn.durable_ack_keepalive_interval = Duration::from_millis(20);
+        conn.push_pending(0);
+
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let started = Instant::now();
+            let result = conn
+                .sync_all_acks(AckLevel::LocalDurable)
+                .map_err(|e| (e.code(), e.msg().to_string()));
+            let _ = tx.send((result, started.elapsed()));
+        });
+        let (result, elapsed) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("durable sync hung: the no-progress deadline did not fire");
+        worker.join().expect("worker");
+        let pings = peer.join().expect("peer");
+
+        let (code, msg) = result.expect_err("the local durable ACK never came");
+        assert_eq!(code, crate::ErrorCode::SocketError);
+        assert!(msg.contains("durable sync stalled"), "got: {msg}");
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "failed after {elapsed:?}, before the no-progress deadline"
+        );
+        assert!(pings >= 2, "keepalive PINGs stopped early: {pings}");
+    }
+
+    #[test]
+    fn durable_sync_pings_at_most_once_per_keepalive_interval() {
+        use crate::ws::nosigpipe::NoSigpipeTcp;
+        use std::net::{TcpListener, TcpStream};
+
+        let interval = Duration::from_millis(100);
+        // An instant PONG, and one that takes half an interval: each PONG
+        // ends a read early, and with a slow one a throttle shorter than the
+        // interval would send the next PING as soon as the PONG is read.
+        for pong_delay in [Duration::ZERO, interval / 2] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+            let (server, _) = listener.accept().expect("accept");
+            // The peer holds the durable ACK back for 500 ms, so until then
+            // only the keepalive interval spaces the PINGs out.
+            let peer = spawn_durable_ack_on_ping_peer(
+                server,
+                QWP_STATUS_LOCAL_DURABLE_ACK,
+                Duration::from_millis(500),
+                pong_delay,
+            );
+
+            let mut conn = ColumnConn::for_test(
+                WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
+                DurableAckTiers::Local,
+            );
+            conn.request_timeout = Duration::from_secs(5);
+            conn.durable_ack_keepalive_interval = interval;
+            conn.push_pending(0);
+
+            let started = Instant::now();
+            conn.sync_all_acks(AckLevel::LocalDurable)
+                .expect("a PING after 500 ms draws the durable ACK");
+            let elapsed = started.elapsed();
+            drop(conn);
+            let pings = peer.join().expect("peer");
+
+            // One PING when the wait starts, then at most one per interval.
+            let max_pings = (elapsed.as_millis() / interval.as_millis()) as usize + 1;
+            assert!(
+                pings <= max_pings,
+                "PONG after {pong_delay:?}: {pings} PINGs in {elapsed:?}, \
+                 more than one per {interval:?}"
+            );
+        }
+    }
+
     #[test]
     fn redundant_ok_after_durable_prune_does_not_strand_sync() {
-        let mut conn = ColumnConn::for_test(dummy_ws_stream(), true);
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::LegacyReplicated);
         // Table `t` runs the full OK -> DurableAck -> satisfied cycle; its
         // satisfied pending target is pruned (the prune `sync_all_acks` runs).
         conn.push_pending(0);
@@ -1462,7 +1866,7 @@ mod tests {
             (QWP_STATUS_SECURITY_ERROR, crate::ErrorCode::AuthError),
             (QWP_STATUS_WRITE_ERROR, crate::ErrorCode::ServerFlushError),
         ] {
-            let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+            let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::Off);
             let err = conn
                 .process_response(QwpResponse::Error {
                     sequence: 0,

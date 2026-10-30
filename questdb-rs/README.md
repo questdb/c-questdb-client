@@ -129,9 +129,17 @@ ws::addr=localhost:9000;sf_dir=/var/lib/my-app/questdb-sf;sender_id=orders;sf_du
 The interval defaults to 5000 ms in periodic mode and is a target cadence:
 runner scheduling and storage-sync latency add to the actual recovery window.
 Publication can see ordinary backpressure at a segment boundary until the
-segment has been checkpointed. This local durability is independent of the
-QuestDB Enterprise server barrier selected by `request_durable_ack=on`; use
-both when end-to-end durability is required.
+segment has been checkpointed. This client-side durability is independent of
+`request_durable_ack`, which asks the server for durable acknowledgements:
+`local` (the commit is on the server's disk: survives a power loss, not the
+loss of that disk; needs a server running `cairo.commit.mode=adaptive`),
+`replicated` (the commit reached replication storage; needs QuestDB
+Enterprise), `local,replicated` (both: needs QuestDB Enterprise with
+`cairo.commit.mode=adaptive`, which a replicating primary runs only when the
+mode is set explicitly; trimming follows the replicated acknowledgement), `on`
+(the original name of `replicated`, the only one older servers understand) and
+`off` (the default). Wait for `AckLevel::LocalDurable` with `local` and for
+`AckLevel::Durable` with `on`, `replicated` or `local,replicated`.
 
 A standalone `Reader::from_conf("ws::addr=...")` gives the query side
 without a pool (`sync-reader-qwp-ws` feature), yielding results as native
