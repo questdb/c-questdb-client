@@ -26,7 +26,7 @@ trusted networks (batching is MTU-bounded).
 
 ## Compatibility
 
-The Rust and native clients require Rust 1.91.1 to build. The C and C++
+The Rust and native clients require Rust 1.91.0 to build. The C and C++
 surfaces target C11 and C++17, with CMake 3.15 or newer. See the
 [compatibility matrix](doc/COMPATIBILITY.md) for server, toolchain, platform,
 Arrow, and Polars support.

@@ -58,6 +58,8 @@ use std::borrow::Cow;
 ///
 /// #### Binary Format Notes
 /// - The unscaled value must be encoded in two's complement big-endian format
+///   (the chunk API `column_sender::Chunk::column_decimal256` instead accepts
+///   little-endian bytes).
 /// - Maximum scale is 76
 /// - Length byte indicates how many bytes follow for the unscaled value
 #[derive(Debug)]

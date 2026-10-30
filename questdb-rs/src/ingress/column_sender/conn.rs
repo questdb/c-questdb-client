@@ -400,6 +400,10 @@ impl ColumnConn {
         self.in_flight += 1;
     }
 
+    pub(crate) fn next_fsn(&self) -> u64 {
+        self.next_fsn
+    }
+
     /// Number of published-but-unacked frames.
     pub(crate) fn in_flight(&self) -> u32 {
         self.in_flight

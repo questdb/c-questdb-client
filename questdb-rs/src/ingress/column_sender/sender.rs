@@ -26,7 +26,6 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
@@ -34,12 +33,14 @@ use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 use crate::ingress::conf::DurableAckTiers;
+use crate::ingress::sender::effective_hard_frame_cap;
 use crate::ingress::sender::qwp_ws::{
     SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
     qwp_ws_begin_close_background, qwp_ws_check_error_background,
     qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
-    qwp_ws_published_fsn_background, qwp_ws_sender_errors_dropped_background,
+    qwp_ws_progress_generation_background, qwp_ws_published_fsn_background,
+    qwp_ws_sender_errors_dropped_background, qwp_ws_wait_for_progress_background,
     sfa_has_deferred_commit_slot,
 };
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
@@ -89,16 +90,16 @@ struct ArrowFrameSpec<'a> {
     overrides: &'a [ArrowColumnOverride<'a>],
 }
 
-/// Split point for an oversize `row_count`: the largest multiple of 8 not
-/// exceeding `row_count / 2` (at least 8). `None` once the block is at the
-/// 8-row floor, which cannot be split further because bit-packed `Bool`
-/// columns and validity bitmaps are only byte-addressable.
+/// Keep multi-row slices byte-aligned for Boolean and validity bitmaps.
+/// Above eight rows, halve at an aligned boundary. At eight or fewer, peel off the
+/// last row: the prefix retains its aligned start and only singletons can
+/// start unaligned. A single oversized row cannot be split further.
 fn split_mid(row_count: usize) -> Option<usize> {
-    if row_count <= 8 {
-        return None;
+    match row_count {
+        0 | 1 => None,
+        2..=8 => Some(row_count - 1),
+        _ => Some(((row_count / 2) & !7).max(8)),
     }
-    let mid = (row_count / 2) & !7;
-    Some(if mid == 0 { 8 } else { mid })
 }
 
 /// Per-frame payload caps for the store-and-forward publish path, derived once
@@ -119,15 +120,10 @@ struct SfaFrameCaps {
 }
 
 impl SfaFrameCaps {
-    /// Cap for one publish attempt: the split target while the range can
-    /// still split; the hard cap at the 8-row floor, where splitting is no
-    /// longer an option and only the binding limit matters.
+    /// Use the packing target above eight rows. Smaller ranges split only
+    /// when the hard cap requires it, avoiding unnecessary singleton frames.
     fn for_range(self, row_count: usize) -> usize {
-        if split_mid(row_count).is_some() {
-            self.soft
-        } else {
-            self.hard
-        }
+        if row_count > 8 { self.soft } else { self.hard }
     }
 }
 
@@ -564,14 +560,12 @@ impl PooledSenderCore {
     /// otherwise the call is rejected up front (`InvalidApiCall`) before
     /// `chunk` is touched.
     ///
-    /// Failure contract: the ACK level is validated, then the frame is
-    /// published, then the wait runs. If publication itself fails the `chunk`
-    /// is untouched and retryable. Once publication succeeds `chunk` is cleared
-    /// even if the later ACK wait fails — at which point delivery of the just
-    /// published frame is **unknown** (it may be committed, rejected, or in
-    /// flight) and the borrow should be dropped/reborrowed per the error class.
-    /// There is no internal failover retry; replay is the caller's
-    /// responsibility.
+    /// Publication failure retains `chunk`, but splitting may already have
+    /// published a prefix. Check [`crate::Error::in_doubt`] before retrying.
+    ///
+    /// Successful publication clears `chunk`, even if the ACK wait then fails.
+    /// On an ACK error, delivery may be unknown; drop and reborrow the sender
+    /// as required by the error class. There is no internal failover retry.
     pub fn flush_and_wait(&mut self, chunk: &mut Chunk<'_>, ack_level: AckLevel) -> Result<()> {
         self.backend
             .flush_chunk(chunk, WaitForAck::Yes(ack_level))
@@ -1165,11 +1159,7 @@ impl DirectColumnBackend {
                 let row_count = chunk.row_count();
                 match split_mid(row_count) {
                     Some(mid) => {
-                        // Splitting publishes deferred prefix frames as it goes.
-                        // If a later sub-range hits the floor, those frames sit
-                        // on the wire uncommitted; tear the connection down so
-                        // the drop-time best-effort commit discards them instead
-                        // of committing a partial chunk under a later boundary.
+                        let fsn_before_split = self.conn.next_fsn();
                         let mut committed = false;
                         let mut result = self.publish_split(chunk, 0, mid, true, &mut committed);
                         if result.is_ok() {
@@ -1182,7 +1172,11 @@ impl DirectColumnBackend {
                             );
                         }
                         if let Err(e) = result {
-                            self.conn.mark_must_close();
+                            // Discard this split's partial prefix, but preserve
+                            // earlier chunks if this split published nothing.
+                            if self.conn.next_fsn() != fsn_before_split {
+                                self.conn.mark_must_close();
+                            }
                             // A mid-split sync may already have committed a
                             // prefix. The deferred remainder is discarded on
                             // drop, but a committed prefix is real, so downgrade
@@ -1407,6 +1401,7 @@ impl DirectColumnBackend {
                 let row_count = batch.num_rows();
                 match split_mid(row_count) {
                     Some(mid) => {
+                        let fsn_before_split = self.conn.next_fsn();
                         let mut committed = false;
                         let mut result =
                             self.publish_arrow_split(&spec, 0, mid, true, &mut committed);
@@ -1420,7 +1415,9 @@ impl DirectColumnBackend {
                             );
                         }
                         if let Err(e) = result {
-                            self.conn.mark_must_close();
+                            if self.conn.next_fsn() != fsn_before_split {
+                                self.conn.mark_must_close();
+                            }
                             // See `flush_inner`: a mid-split sync may have
                             // committed a prefix, so a blind retry would
                             // duplicate it.
@@ -2224,6 +2221,9 @@ impl SfaBackend {
         let mut last_completed: Option<u64> = None;
 
         loop {
+            // Snapshot before checking progress so an ACK/error between the
+            // check and the condvar wait cannot be lost.
+            let generation = qwp_ws_progress_generation_background(&self.state);
             let completed = match ack_level {
                 AckLevel::Ok => qwp_ws_ok_fsn_background(&self.state)?,
                 AckLevel::Durable | AckLevel::LocalDurable => {
@@ -2249,7 +2249,15 @@ impl SfaBackend {
             if !timeout.is_zero() && deadline_anchor.elapsed() >= timeout {
                 return Err(sfa_sync_timeout(timeout, ack_level, boundary, completed));
             }
-            thread::sleep(Duration::from_millis(10));
+            let deadline = if timeout.is_zero() {
+                None
+            } else {
+                deadline_anchor.checked_add(timeout)
+            };
+            qwp_ws_wait_for_progress_background(&self.state, generation, deadline);
+            // Sending and maintenance also notify. Only watermark advancement
+            // above resets the no-progress deadline; always recheck after waking,
+            // including a timeout racing the final ACK or a terminal error.
         }
     }
 
@@ -2269,22 +2277,6 @@ impl SfaBackend {
             soft: hard.min(self.state.sfa_frame_split_target),
         }
     }
-}
-
-fn effective_hard_frame_cap(
-    max_buf_size: usize,
-    server_max_batch_size: usize,
-    sfa_frame_payload_cap: usize,
-) -> (usize, bool) {
-    let configured_cap = if server_max_batch_size == 0 {
-        max_buf_size
-    } else {
-        max_buf_size.min(server_max_batch_size)
-    };
-    (
-        configured_cap.min(sfa_frame_payload_cap),
-        server_max_batch_size != 0,
-    )
 }
 
 /// The store-and-forward `wait` poll loop made no progress toward `boundary`
@@ -2342,10 +2334,33 @@ mod tests {
     }
 
     #[test]
-    fn split_mid_floors_at_eight_rows() {
+    fn split_mid_stops_at_one_row() {
         assert_eq!(split_mid(0), None);
         assert_eq!(split_mid(1), None);
-        assert_eq!(split_mid(8), None);
+        for count in 2..=8 {
+            assert_eq!(split_mid(count), Some(count - 1));
+        }
+    }
+
+    #[test]
+    fn split_ranges_preserve_alignment_and_order_down_to_single_rows() {
+        for rows in 1..=4096 {
+            let mut pending = vec![(0usize, rows)];
+            let mut next_row = 0;
+            while let Some((offset, count)) = pending.pop() {
+                assert!(offset.is_multiple_of(8) || count == 1);
+                if let Some(mid) = split_mid(count) {
+                    assert!(mid > 0 && mid < count);
+                    pending.push((offset + mid, count - mid));
+                    pending.push((offset, mid));
+                } else {
+                    assert_eq!(count, 1);
+                    assert_eq!(offset, next_row);
+                    next_row += 1;
+                }
+            }
+            assert_eq!(next_row, rows);
+        }
     }
 
     #[test]
@@ -2366,18 +2381,18 @@ mod tests {
     }
 
     #[test]
-    fn sfa_frame_caps_use_split_target_only_while_range_can_split() {
+    fn sfa_frame_caps_keep_small_ranges_at_the_hard_cap() {
         use super::SfaFrameCaps;
 
         let caps = SfaFrameCaps {
             hard: 1000,
             soft: 400,
         };
-        // At or below the 8-row split floor there is no split left to aim
-        // for: only the binding (hard) cap matters.
-        assert_eq!(caps.for_range(1), 1000);
-        assert_eq!(caps.for_range(8), 1000);
-        // Splittable ranges aim for the two-frames-per-segment target.
+        // Small ranges may split, but only to satisfy the hard cap.
+        for rows in 0..=8 {
+            assert_eq!(caps.for_range(rows), 1000);
+        }
+        // Larger ranges aim for the two-frames-per-segment target.
         assert_eq!(caps.for_range(9), 400);
         assert_eq!(caps.for_range(10_000), 400);
     }

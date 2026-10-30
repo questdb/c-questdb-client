@@ -104,6 +104,7 @@ enum class error_code : int
     batch_too_large = ::line_sender_error_batch_too_large,
     store_resend_required = ::line_sender_error_store_resend_required,
     symbol_dict_full = ::line_sender_error_symbol_dict_full,
+    query_timeout = ::line_sender_error_query_timeout,
 };
 // clang-format on
 
@@ -349,6 +350,8 @@ public:
      * reports `failover_retry`, yet that code alone does not make the input
      * safe to resend. When `true`, only replay the same input if table-level
      * dedup/upsert keys make duplicate rows harmless.
+     *
+     * For a low-level flush, this does not track earlier independent flushes.
      */
     bool in_doubt() const noexcept
     {

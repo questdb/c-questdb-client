@@ -168,7 +168,11 @@ typedef enum line_sender_error_code
     /** HTTP-upgrade or WebSocket handshake failure. */
     line_sender_error_handshake_error = 20,
 
-    /** Server returned an unsupported QWP version, encoding, or capability. */
+    /** Server returned an unsupported QWP version, encoding, or capability.
+     *  Also raised client-side, before anything is written, when a query
+     *  carries a per-query timeout and the server does not advertise
+     *  `CAP_QUERY_TIMEOUT` (see `qwp_reader_query_set_timeout_ms`); the
+     *  connection is untouched by that refusal. */
     line_sender_error_unsupported_server = 21,
 
     /** Wire-format violation: bad magic, truncated frame, unknown
@@ -287,8 +291,27 @@ typedef enum line_sender_error_code
      *  (store-and-forward is at-least-once) when a later frame hits the cap.
      *  The error is then delivery-unknown rather than known-not-delivered -
      *  check `line_sender_error_in_doubt` before resending, or the rows the
-     *  queued prefix already carried are duplicated. */
+     *  queued prefix already carried are duplicated.
+     */
     line_sender_error_symbol_dict_full = 37,
+
+    /** The query ran past the timeout it carried: server-reported QWP
+     *  `QUERY_TIMEOUT` (status `0x0E`), produced only for a request that
+     *  supplied `timeout_ms` (see `qwp_reader_query_set_timeout_ms`). A
+     *  timeout requested against a server that does not advertise
+     *  `CAP_QUERY_TIMEOUT` is refused with
+     *  `line_sender_error_unsupported_server` instead, so retrying a timeout
+     *  with a larger budget cannot loop against a server that ignores it.
+     *
+     *  Per-query, not per-connection: the connection stays open and
+     *  authenticated, so the next query runs on it without reconnecting.
+     *
+     *  DO NOT RETRY A WRITE ON THIS ERROR. A statement that completes past
+     *  its timeout is reported as `EXEC_DONE` with its row count rather than
+     *  as a timeout, precisely so a retrying client cannot apply it twice;
+     *  and a DDL / INSERT / UPDATE that timed out waiting for the table
+     *  writer may still be applied by that writer afterwards. */
+    line_sender_error_query_timeout = 38,
 } line_sender_error_code;
 
 /**
@@ -351,6 +374,7 @@ typedef line_sender_error_code questdb_error_code;
 #define questdb_error_store_resend_required                                    \
     line_sender_error_store_resend_required
 #define questdb_error_symbol_dict_full line_sender_error_symbol_dict_full
+#define questdb_error_query_timeout line_sender_error_query_timeout
 
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol
@@ -448,9 +472,15 @@ questdb_error_code questdb_error_get_code(const questdb_error*);
 QUESTDB_CLIENT_API
 const char* questdb_error_msg(const questdb_error*, size_t* len_out);
 
-/** Whether the failed operation may already have delivered its input. A true
- *  result means replay can duplicate data unless the application has its own
- *  deduplication guarantee. NULL-safe: a NULL input returns false. */
+/**
+ * Whether the failed operation may already have delivered its input. A true
+ * result means replay can duplicate data unless the application has its own
+ * deduplication guarantee.
+ *
+ * For a low-level flush, this does not track earlier independent flushes.
+ *
+ * NULL-safe: a NULL input returns false.
+ */
 QUESTDB_CLIENT_API
 bool questdb_error_in_doubt(const questdb_error*);
 
@@ -475,6 +505,8 @@ const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
  * input's bytes may already have reached the server even though the call
  * returned an error (e.g. a socket write that failed mid-frame, or a
  * post-publish ACK wait that failed).
+ *
+ * For a low-level flush, this does not track earlier independent flushes.
  *
  * Independent of `line_sender_error_get_code`: a delivery-unknown failure
  * typically reports `line_sender_error_failover_retry`, yet that code alone
@@ -815,7 +847,8 @@ void line_sender_buffer_clear_marker(line_sender_buffer* buffer);
 
 /**
  * Remove all accumulated data and prepare the buffer for new lines.
- * This does not affect the buffer's capacity.
+ * This does not affect the buffer's capacity. Any stored rewind point
+ * (marker or bookmark) is discarded.
  */
 QUESTDB_CLIENT_API
 void line_sender_buffer_clear(line_sender_buffer* buffer);
@@ -823,9 +856,12 @@ void line_sender_buffer_clear(line_sender_buffer* buffer);
 /**
  * The current encoded size of the buffered data.
  *
- * For ILP buffers this is the exact pending byte length. For QWP buffers this
- * is a buffered size hint, not the exact size of an eventual UDP datagram or
- * WebSocket replay frame.
+ * For ILP buffers this is the exact pending byte length. For QWP/UDP buffers
+ * this is a buffered size hint, not the exact size of an eventual datagram.
+ * For QWP/WebSocket buffers it is at least the size of the frame that
+ * flushing the buffer encodes, unless store-and-forward has fallen back to
+ * sending full symbol dictionaries because its symbol side-file could not be
+ * opened or rolled back.
  */
 QUESTDB_CLIENT_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);
@@ -1039,6 +1075,10 @@ bool line_sender_buffer_column_dec_str(
 /**
  * Record a decimal value for the given column.
  *
+ * This row API accepts big-endian mantissas; the chunk APIs
+ * qwp_chunk_column_decimal128 and qwp_chunk_column_decimal256 require
+ * little-endian bytes.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] scale Number of digits after the decimal point
@@ -1191,7 +1231,13 @@ bool line_sender_buffer_column_binary(
 /**
  * Record a GEOHASH column value. QWP-only.
  *
- * `precision_bits` must be in `1..=60` and is pinned per column.
+ * `precision_bits` must be in `1..=60` and is pinned per column. `bits` is a
+ * raw pattern and is not checked to be less than `2^precision_bits`.
+ * Supplying the wrong precision or a pattern with bits set above it can
+ * succeed and store a different GEOHASH or NULL. Only the low
+ * `ceil(precision_bits / 8)` bytes are encoded; the exact result is
+ * unspecified. This is a semantic data-integrity risk, not a memory-safety
+ * risk for an otherwise valid call. The caller must validate `bits`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_column_geohash(
@@ -2177,6 +2223,22 @@ QUESTDB_CLIENT_API
 bool line_sender_qwpws_errors_dropped(
     const line_sender* sender,
     uint64_t* dropped_out,
+    line_sender_error** err_out);
+
+/**
+ * Return the current hard per-frame cap of a QWP/WebSocket sender: the
+ * smallest of `max_buf_size`, the server's advertised `X-QWP-Max-Batch-Size`
+ * and the store-and-forward segment payload capacity. A flush whose encoded
+ * frame exceeds it fails with `line_sender_error_batch_too_large` and
+ * publishes nothing. `*server_cap_known_out` is true when the current
+ * connection advertised `X-QWP-Max-Batch-Size`, whether or not that value is
+ * the binding limit. The value can change after reconnect.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_qwpws_effective_frame_cap(
+    const line_sender* sender,
+    size_t* cap_out,
+    bool* server_cap_known_out,
     line_sender_error** err_out);
 
 /**

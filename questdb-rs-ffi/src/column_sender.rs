@@ -41,7 +41,7 @@ use questdb::QuestDb;
 use questdb::ffi_support::{OwnedDirectColumnSender, OwnedSender};
 #[cfg(feature = "arrow")]
 use questdb::ingress::column_sender::{ArrowColumnOverride, FlushFailure, ImportedArrowColumn};
-use questdb::ingress::column_sender::{Chunk, NumpyDtype, Validity};
+use questdb::ingress::column_sender::{Chunk, MAX_CHUNK_ROWS, NumpyDtype, Validity};
 use questdb::ingress::{AckLevel, TimestampUnit};
 #[cfg(feature = "arrow")]
 use questdb::ingress::{ColumnName, TableName};
@@ -1842,6 +1842,173 @@ column_fn!(qwp_chunk_column_f64, f64, column_f64, "f64 column data");
 column_fn!(qwp_chunk_column_ipv4, u32, column_ipv4, "ipv4 column data");
 column_fn!(qwp_chunk_column_date, i64, column_date, "date column data");
 
+macro_rules! decimal_column_fn {
+    ($fn_name:ident, $c_ty:ty, $row_ty:ty, $append:path) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $fn_name(
+            chunk: *mut qwp_chunk,
+            name: *const c_char,
+            name_len: size_t,
+            data: *const $c_ty,
+            row_count: size_t,
+            scale: u8,
+            validity: *const qwp_validity,
+            err_out: *mut *mut line_sender_error,
+        ) -> bool {
+            if chunk.is_null() {
+                return reject_null_chunk(err_out);
+            }
+            let _guard = match unsafe {
+                InUseGuard::acquire(
+                    chunk,
+                    &raw const (*chunk).1,
+                    stringify!($fn_name),
+                    "qwp_chunk",
+                    err_out,
+                )
+            } {
+                Some(g) => g,
+                None => return false,
+            };
+            let name = match unsafe { name_str(name, name_len, err_out) } {
+                Some(s) => s,
+                None => return false,
+            };
+            // Bound the row count before constructing the borrowed slice.
+            // Wide decimals use byte arrays, so they need only byte alignment.
+            let data = match unsafe {
+                typed_slice(
+                    data.cast::<$row_ty>(),
+                    row_count,
+                    err_out,
+                    "decimal column data",
+                )
+            } {
+                Some(s) => s,
+                None => return false,
+            };
+            let validity = match unsafe { as_validity(validity, err_out) } {
+                Some(v) => v,
+                None => return false,
+            };
+            let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+            bubble_err_to_c!(
+                err_out,
+                $append(inner, name, data, scale, validity.as_ref())
+            );
+            true
+        }
+    };
+}
+
+decimal_column_fn!(
+    qwp_chunk_column_decimal64,
+    i64,
+    i64,
+    Chunk::column_decimal64
+);
+decimal_column_fn!(
+    qwp_chunk_column_decimal128,
+    u8,
+    [u8; 16],
+    questdb::ffi_support::chunk_column_decimal128
+);
+decimal_column_fn!(
+    qwp_chunk_column_decimal256,
+    u8,
+    [u8; 32],
+    Chunk::column_decimal256
+);
+
+/// Borrow a dense, fixed-shape DOUBLE array column. `data_len` counts f64
+/// elements across the entire batch; `shape` excludes the batch dimension.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_chunk_column_f64_array(
+    chunk: *mut qwp_chunk,
+    name: *const c_char,
+    name_len: size_t,
+    data: *const f64,
+    data_len: size_t,
+    row_count: size_t,
+    shape: *const u32,
+    ndim: size_t,
+    validity: *const qwp_validity,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "qwp_chunk_column_f64_array",
+            "qwp_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let name = match unsafe { name_str(name, name_len, err_out) } {
+        Some(s) => s,
+        None => return false,
+    };
+    if row_count > MAX_CHUNK_ROWS {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "array column row_count {row_count} exceeds MAX_CHUNK_ROWS ({MAX_CHUNK_ROWS})"
+                    ),
+                ),
+            );
+        }
+        return false;
+    }
+    let shape = match unsafe {
+        typed_slice_bounded(
+            shape,
+            ndim,
+            MAX_ARRAY_DIMS,
+            "MAX_ARRAY_DIMS",
+            err_out,
+            "array shape",
+        )
+    } {
+        Some(s) => s,
+        None => return false,
+    };
+    let max_elements = MAX_CHUNK_ROWS
+        .saturating_mul(MAX_NDARRAY_LEAF_ELEMS)
+        .min(isize::MAX as usize / std::mem::size_of::<f64>());
+    let data = match unsafe {
+        typed_slice_bounded(
+            data,
+            data_len,
+            max_elements,
+            "maximum array batch elements",
+            err_out,
+            "array data",
+        )
+    } {
+        Some(s) => s,
+        None => return false,
+    };
+    let validity = match unsafe { as_validity(validity, err_out) } {
+        Some(v) => v,
+        None => return false,
+    };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble_err_to_c!(
+        err_out,
+        inner.column_f64_array(name, data, row_count, shape, validity.as_ref())
+    );
+    true
+}
+
 /// `TIMESTAMP` / `TIMESTAMP_NANOS` column. `unit` selects the precision:
 /// `qwp_ts_unit_micros` (0) → `TIMESTAMP`,
 /// `qwp_ts_unit_nanos` (1) → `TIMESTAMP_NANOS`. `data` holds
@@ -2291,11 +2458,10 @@ symbol_fn!(qwp_chunk_symbol_i32, i32, symbol_i32, "symbol codes (i32)");
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL);
 /// the returned handle owns the underlying buffers and releases them on
-/// `qwp_arrow_import_free`. On failure, `array->release` may
-/// also have been consumed if the call reached the Arrow import step
-/// before failing — callers MUST check `array->release != NULL` before
-/// invoking it on the failure path. Early-fail paths (NULL pointer,
-/// depth-cap rejection) leave it intact. `schema` is borrowed in all
+/// `qwp_arrow_import_free`. A failure detected before the Arrow import
+/// step leaves `array->release` intact. Once import begins, a failure may
+/// also have consumed it — callers MUST check `array->release != NULL`
+/// before invoking it on the failure path. `schema` is borrowed in all
 /// cases.
 ///
 /// `auto`: Dictionary(*, Utf8/LargeUtf8) -> SYMBOL, plain Utf8 -> VARCHAR.
@@ -2472,12 +2638,11 @@ pub unsafe extern "C" fn qwp_chunk_append_arrow_import(
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL);
 /// the chunk holds the underlying buffers via an internal Arc until
-/// `qwp_sender_flush_chunk` returns. On failure, `array->release` may
-/// also have been consumed if the call reached the Arrow import step
-/// before failing — callers MUST check `array->release != NULL` before
-/// invoking it on the failure path. Early-fail paths (NULL pointer,
-/// depth-cap rejection) leave it intact. `schema` is borrowed in all
-/// cases.
+/// `qwp_sender_flush_chunk` returns. A failure detected before the Arrow
+/// import step leaves `array->release` intact. Once import begins, a
+/// failure may also have consumed it — callers MUST check
+/// `array->release != NULL` before invoking it on the failure path.
+/// `schema` is borrowed in all cases.
 ///
 /// `array->offset` is honored (the Arrow C Data Interface logical
 /// offset); `row_offset` further sub-slices within the call.
@@ -3971,8 +4136,10 @@ pub unsafe extern "C" fn qwp_sender_acked_fsn(
     }
 }
 
-/// Pipeline a deferred frame on a direct connection. Not committed until
-/// `qwp_direct_sender_commit` / `qwp_direct_sender_flush_and_wait`.
+/// Publish without waiting. The first successful flush on a fresh physical
+/// connection is non-deferred, including an empty flush; subsequent flushes
+/// are deferred until `qwp_direct_sender_commit` /
+/// `qwp_direct_sender_flush_and_wait`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_direct_sender_flush(
     sender: *mut qwp_direct_sender,
@@ -4035,18 +4202,10 @@ pub unsafe extern "C" fn qwp_direct_sender_flush_and_wait(
 /// batch — reaching for this entry point would discard that column's role
 /// as the designated timestamp and silently substitute server arrival time.
 ///
-/// Ownership: on success, `array->release` is consumed (set to NULL)
-/// and the function has invoked it internally. On a **transient,
-/// provably-not-delivered** (`line_sender_error_failover_retry` with
-/// `line_sender_error_in_doubt == false`) failure `array` is left intact
-/// (re-exported back into `*array` with a fresh `release`) so the caller
-/// can drop+re-borrow a live sender and retry with the same array. A
-/// delivery-unknown failure (a partial write that fails mid-frame: also
-/// `line_sender_error_failover_retry` but with `line_sender_error_in_doubt ==
-/// true`) is **not** re-exported, since replaying it could duplicate rows. On
-/// any failure `array->release` may have been consumed if the call reached the
-/// Arrow import step — callers MUST check `array->release != NULL` before
-/// invoking it on the failure path. `schema` is always borrowed.
+/// Ownership: success consumes `array->release`. On failure the batch is
+/// normally handed back (`release` non-NULL) unless the Arrow import failed
+/// after taking ownership or the error is `in_doubt`. Always check
+/// `array->release != NULL` before invoking it. `schema` is borrowed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 ///
@@ -4345,15 +4504,9 @@ pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_scalar_nanos(
 /// `request_durable_ack` tier) returns `line_sender_error_invalid_api_call`
 /// and leaves `array` untouched.
 ///
-/// Ownership differs from the publish-only flush on the failure path. On a
-/// failure that is provably **pre-publication** (validation, encode, size, or a
-/// transport error before any byte was written) the batch is re-exported back
-/// into `*array` with a fresh `release` so the caller can drop+re-borrow and
-/// retry. On any **post-publication** failure — including an ACK-wait or SFA
-/// no-progress timeout reported as `line_sender_error_failover_retry` — the
-/// batch is **not** re-exported (`array->release` stays NULL): delivery is
-/// unknown and a blind replay could duplicate rows. Callers MUST check
-/// `array->release != NULL` before invoking it on the failure path.
+/// Ownership: as the publish-only flush, except that after the import the
+/// batch is handed back only if it was provably not delivered; otherwise
+/// (including an ACK timeout) it stays consumed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 #[cfg(feature = "arrow")]

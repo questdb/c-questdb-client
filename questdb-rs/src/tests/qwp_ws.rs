@@ -1104,6 +1104,35 @@ fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
     predicate()
 }
 
+fn reopen_orphan_before_deadline(conf: &str, deadline: Instant) -> crate::ingress::Sender {
+    loop {
+        match SenderBuilder::from_conf(conf).unwrap().build() {
+            Ok(sender) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "orphan slot was not reusable within the shutdown deadline"
+                );
+                return sender;
+            }
+            Err(err)
+                if err.code() == ErrorCode::SocketError
+                    && err
+                        .msg()
+                        .starts_with("QWP/WebSocket store-and-forward slot is already in use ")
+                    && Instant::now() < deadline =>
+            {
+                // Bounded close may detach a cancelled worker while it finishes cleanup.
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
+            }
+            Err(err) => panic!("orphan slot was not reusable after close: {err}"),
+        }
+    }
+}
+
 fn spawn_upgrade_only_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1632,28 +1661,46 @@ fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8
 
         // Keep the orphan connection open until the test releases it. A
         // regression that waits for stalled orphan work would block close.
-        let _ = release_rx.recv_timeout(Duration::from_secs(6));
+        // The window matches the other stalled-orphan mocks: a shorter one
+        // lets a slow CI host time out before the test gets to release.
+        // Tests release best-effort for the same reason: an expired park has
+        // dropped the receiver, which is not a product failure.
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
     });
 
     (port, rx, release_tx)
 }
 
-fn spawn_stalled_background_orphan_connect_server() -> (u16, mpsc::Receiver<()>, mpsc::Sender<()>) {
+fn spawn_stalled_background_orphan_connect_server() -> (
+    u16,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    thread::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (accepted_tx, accepted_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
 
-    thread::spawn(move || {
+    let server = thread::spawn(move || {
         let (mut foreground, _) = listener.accept().unwrap();
         perform_server_upgrade(&mut foreground).unwrap();
 
-        let (_orphan, _) = listener.accept().unwrap();
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = read_request_until_blank(&mut orphan).unwrap();
+        assert!(request.ends_with(b"\r\n\r\n"));
         accepted_tx.send(()).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        assert_ne!(
+            release_rx.recv_timeout(Duration::from_secs(10)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "stalled-connect mock expired before explicit release"
+        );
     });
 
-    (port, accepted_rx, release_tx)
+    (port, accepted_rx, release_tx, server)
 }
 
 fn spawn_stalled_first_background_orphan_connect_server() -> (
@@ -1671,9 +1718,18 @@ fn spawn_stalled_first_background_orphan_connect_server() -> (
         let (mut foreground, _) = listener.accept().unwrap();
         perform_server_upgrade(&mut foreground).unwrap();
 
-        let (_orphan, _) = listener.accept().unwrap();
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = read_request_until_blank(&mut orphan).unwrap();
+        assert!(request.ends_with(b"\r\n\r\n"));
         accepted_tx.send(listener.try_clone().unwrap()).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        assert_ne!(
+            release_rx.recv_timeout(Duration::from_secs(10)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "stalled-connect mock expired before explicit release"
+        );
     });
 
     (port, accepted_rx, release_tx, server)
@@ -1714,7 +1770,13 @@ fn spawn_blocked_background_orphan_send_server() -> (
             thread::yield_now();
         }
         send_started_tx.send(()).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        // Expiry invalidates the blocked-send premise; the test joins this
+        // thread to surface it. Disconnection is allowed for panic cleanup.
+        assert_ne!(
+            release_rx.recv_timeout(Duration::from_secs(10)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "blocked-send mock expired before explicit release"
+        );
     });
 
     (port, send_started_rx, release_tx, server)
@@ -2068,14 +2130,14 @@ fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert_eq!(
             err.msg(),
             format!(
-                "Could not flush buffer: QWP/WebSocket encoded message size of {encoded_len} exceeds maximum configured allowed size of {max} bytes."
+                "Could not flush buffer: QWP/WebSocket encoded message size of {encoded_len} bytes exceeds the per-frame cap of {max} bytes. The cap is set by max_buf_size."
             ),
             "mode={}",
             progress.name()
@@ -3340,11 +3402,10 @@ fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str
 
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         if wait_for_client_hello {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-
             let mut record_header = [0u8; 5];
             stream.read_exact(&mut record_header).unwrap();
             assert_eq!(record_header[0], 0x16, "expected a TLS handshake record");
@@ -3353,12 +3414,19 @@ fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str
             let mut record = vec![0u8; record_len];
             stream.read_exact(&mut record).unwrap();
             assert_eq!(record.first(), Some(&0x01), "expected a TLS ClientHello");
-
-            // Give the client time to finish writing the ClientHello and block
-            // waiting for the ServerHello. This delay is outside the measured
-            // sender shutdown interval.
-            thread::sleep(Duration::from_millis(200));
+        } else {
+            let request = read_request_until_blank(&mut stream).unwrap();
+            assert!(
+                request.ends_with(b"\r\n\r\n"),
+                "expected a complete WebSocket upgrade request"
+            );
         }
+
+        // Give the client time to finish writing and block waiting for the
+        // reply, so the drop exercises the traffic gate waking a recv already
+        // in flight (CancelIoEx on Windows). This delay is outside the
+        // measured sender shutdown interval.
+        thread::sleep(Duration::from_millis(200));
         connect_stalled_tx.send(()).unwrap();
         let _ = release_rx.recv_timeout(Duration::from_secs(10));
     });
@@ -4776,7 +4844,7 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     );
     assert!(!orphan_slot.join(".failed").exists());
 
-    release_stalled_orphan.send(()).unwrap();
+    let _ = release_stalled_orphan.send(());
 
     // The recovered slot delta-encodes, so it re-registers its dictionary with a
     // catch-up frame before replaying the data frame; use a server that expects
@@ -4809,7 +4877,7 @@ fn qwp_ws_background_orphan_close_interrupts_stalled_connect() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
 
-    let (port, orphan_accepted, release_stalled_orphan) =
+    let (port, orphan_accepted, release_stalled_orphan, server) =
         spawn_stalled_background_orphan_connect_server();
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{port};\
@@ -4839,15 +4907,14 @@ fn qwp_ws_background_orphan_close_interrupts_stalled_connect() {
          sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
-    let mut recover_sender = SenderBuilder::from_conf(&recover_conf)
-        .unwrap()
-        .build()
-        .expect("stalled orphan worker retained the slot lock after close");
+    let mut recover_sender =
+        reopen_orphan_before_deadline(&recover_conf, started + Duration::from_secs(5));
     recover_sender.close_drain().unwrap();
     let recovered = recover_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(recovered.received_frames.len(), 1);
 
-    release_stalled_orphan.send(()).unwrap();
+    let _ = release_stalled_orphan.send(());
+    server.join().unwrap();
 }
 
 #[test]
@@ -4870,17 +4937,41 @@ fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
         .unwrap();
     let listener = listener_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
+    // The mock parks on the stalled orphan for 10s. Without a bound here, a
+    // close that waited for that park to expire would still find no second
+    // dial and pass.
+    let started = Instant::now();
     sender.close_drain().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "background orphan shutdown took {elapsed:?}"
+    );
+
+    // The close bound alone cannot tell an interrupted worker from one the
+    // pool detached. Allow cleanup only within the original close deadline.
+    // Which slot stalled depends on unsorted `read_dir` order, so reopen both.
+    for slot in ["orphan-a", "orphan-b"] {
+        let reopen_port = spawn_upgrade_only_server();
+        let reopen_conf = format!(
+            "ws::addr=127.0.0.1:{reopen_port};qwp_ws_progress=manual;\
+             sf_dir={};sender_id={slot};sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+            sf_dir.path().display()
+        );
+        let reopened =
+            reopen_orphan_before_deadline(&reopen_conf, started + Duration::from_secs(5));
+        drop(reopened);
+    }
+    assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-a")));
+    assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-b")));
 
     listener.set_nonblocking(true).unwrap();
     assert!(matches!(
         listener.accept(),
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
     ));
-    assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-a")));
-    assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-b")));
 
-    release_stalled_orphan.send(()).unwrap();
+    let _ = release_stalled_orphan.send(());
     server.join().unwrap();
 }
 
@@ -4917,14 +5008,11 @@ fn qwp_ws_background_orphan_close_interrupts_blocked_send() {
          sf_dir={};sender_id=orphan;sf_max_segment_bytes=16777216;",
         sf_dir.path().display()
     );
-    let reopened = SenderBuilder::from_conf(&reopen_conf)
-        .unwrap()
-        .build()
-        .expect("blocked orphan worker retained the slot lock after close");
+    let reopened = reopen_orphan_before_deadline(&reopen_conf, started + Duration::from_secs(5));
     drop(reopened);
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan")));
 
-    release_stalled_orphan.send(()).unwrap();
+    let _ = release_stalled_orphan.send(());
     server.join().unwrap();
 }
 
@@ -5012,6 +5100,123 @@ fn qwp_ws_subsequent_message_delta_encodes_dictionary_and_reemits_full_schema() 
     // (sym, qty) on every frame (at_now() carries no timestamp column).
     assert_eq!(first_table_column_count(&first), 2);
     assert_eq!(first_table_column_count(&second), 2);
+}
+
+/// A publication can fail with the buffer still held: `flush_and_keep` leaves
+/// the rows in place, and a failed flush rolls the connection dictionary back
+/// so the aborted frame's symbols are freed. The caller's recovery is to rewind
+/// to a bookmark taken before the doomed rows and republish.
+///
+/// The buffer tests compare encoded bytes for a buffer in isolation. What only
+/// shows on a live connection is the shared symbol dictionary: it spans frames,
+/// so a rewind that left the discarded rows' cells behind would re-intern their
+/// symbols on the next flush, and the republished frame's delta dictionary
+/// would carry symbols no surviving row references.
+#[test]
+fn qwp_ws_rewind_after_a_failed_publication_republishes_only_surviving_rows() {
+    fn write_row(buf: &mut Buffer, sym: &str, qty: i64) {
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", sym)
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + qty))
+            .unwrap();
+    }
+
+    // Two rows whose symbols each weigh most of the cap: together they run
+    // past it, alone either fits. A rewind that unwound only the last row
+    // would therefore leave a buffer that still publishes, and the
+    // dictionary assertions below get to see what it ships.
+    fn write_doomed_rows(buf: &mut Buffer) {
+        for i in 0..2 {
+            let symbol = format!("drop-{i}-{}", "a".repeat(700));
+            write_row(buf, symbol.as_str(), 100 + i);
+        }
+    }
+
+    // The cap sits at the configurable floor: the surviving rows encode well
+    // under it, the doomed ones well over, so that flush and only it is
+    // rejected.
+    let max = 1024;
+    let mut probe = Buffer::qwp_ws_with_max_name_len(127);
+    write_row(&mut probe, "keep-a", 1);
+    write_row(&mut probe, "keep-d", 2);
+    let kept_len = qwp_ws_replay_encoded_len(&probe);
+    assert!(kept_len < max, "kept_len={kept_len}, max={max}");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request_lines = perform_server_upgrade(&mut stream).unwrap();
+        let mut received_frames = Vec::new();
+        for seq in FIRST_WIRE_SEQUENCE..FIRST_WIRE_SEQUENCE + 2 {
+            let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+            received_frames.push(payload);
+            write_qwp_ok_response(&mut stream, seq).unwrap();
+        }
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .max_buf_size(max)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+
+    // Published, and kept: the buffer the bookmark is taken on is not empty.
+    write_row(&mut buf, "keep-a", 1);
+    sender.flush_and_keep(&buf).unwrap();
+
+    let bookmark = buf.bookmark().unwrap();
+    write_doomed_rows(&mut buf);
+    let err = sender.flush_and_keep(&buf).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{err}");
+    assert!(
+        err.msg().contains("exceeds the per-frame cap"),
+        "the doomed flush must fail on the size cap, not another guard: {err}"
+    );
+
+    buf.rewind_to_bookmark(bookmark).unwrap();
+    write_row(&mut buf, "keep-d", 2);
+    sender.flush(&mut buf).unwrap();
+
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(result.received_frames.len(), 2);
+    let republished = &result.received_frames[1];
+
+    // "keep-a" took id 0 on the first frame, and the doomed flush released the
+    // ids it had claimed. So the republished frame resumes at the watermark and
+    // ships exactly one new symbol: "keep-d".
+    let mut pos = 12;
+    assert_eq!(read_varint(republished, &mut pos), 1, "delta_start");
+    assert_eq!(read_varint(republished, &mut pos), 1, "delta_count");
+    let name_len = read_varint(republished, &mut pos) as usize;
+    assert_eq!(&republished[pos..pos + name_len], b"keep-d");
+    assert!(
+        !republished.windows(5).any(|window| window == b"drop-"),
+        "a discarded row's symbol reached the wire"
+    );
+    assert_eq!(
+        first_table_row_count(republished),
+        2,
+        "kept row + the new one"
+    );
 }
 
 #[test]
@@ -5186,11 +5391,9 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
     }
 }
 
-/// Skip past message header + delta dictionary section + first table header,
-/// returning the inline column count declared in the first table block. The
-/// column descriptors ride inline right after this count (no schema-mode byte,
-/// no schema id).
-fn first_table_column_count(frame: &[u8]) -> u64 {
+/// Skip past message header + delta dictionary section + first table name.
+/// What follows is the table's row count varint, then its column count.
+fn first_table_body_pos(frame: &[u8]) -> usize {
     let mut pos = 12; // header
     let _delta_start = read_varint(frame, &mut pos);
     let delta_count = read_varint(frame, &mut pos);
@@ -5198,10 +5401,22 @@ fn first_table_column_count(frame: &[u8]) -> u64 {
         let name_len = read_varint(frame, &mut pos) as usize;
         pos += name_len;
     }
-    // Table header: name (varint+bytes), row_count varint, column_count varint.
     let name_len = read_varint(frame, &mut pos) as usize;
-    pos += name_len;
+    pos + name_len
+}
+
+/// The inline column count declared in the first table block. The column
+/// descriptors ride inline right after this count (no schema-mode byte, no
+/// schema id).
+fn first_table_column_count(frame: &[u8]) -> u64 {
+    let mut pos = first_table_body_pos(frame);
     let _row_count = read_varint(frame, &mut pos);
+    read_varint(frame, &mut pos)
+}
+
+/// The row count declared in the first table block.
+fn first_table_row_count(frame: &[u8]) -> u64 {
+    let mut pos = first_table_body_pos(frame);
     read_varint(frame, &mut pos)
 }
 
@@ -7601,13 +7816,15 @@ fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert!(
-            err.msg()
-                .contains("exceeds maximum configured allowed size"),
+            err.msg().contains(
+                "exceeds the per-frame cap of 512 bytes. \
+                 The cap is set by the server's advertised X-QWP-Max-Batch-Size."
+            ),
             "mode={}: got: {}",
             progress.name(),
             err.msg()
@@ -7617,6 +7834,76 @@ fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes
             "mode={}: error should reference server cap {server_cap}, got: {}",
             progress.name(),
             err.msg()
+        );
+    }
+}
+
+#[test]
+fn segment_payload_capacity_clamps_flush_below_server_cap_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let server_cap: usize = 100 * 1024;
+        let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
+        let conf = format!(
+            "ws::addr=127.0.0.1:{port};qwp_ws_progress={};sf_max_segment_bytes=4096;",
+            progress.name()
+        );
+        let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+        let (cap, server_cap_known) = sender.effective_frame_cap().unwrap();
+        assert!(server_cap_known, "mode={}", progress.name());
+        assert!(
+            cap < 4096,
+            "mode={}: the segment payload capacity must bind, got {cap}",
+            progress.name()
+        );
+
+        let mut buf = build_buffer_with_payload_bytes(cap + 200);
+        let err = sender.flush(&mut buf).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::BatchTooLarge,
+            "mode={}",
+            progress.name()
+        );
+        assert!(
+            err.msg().contains(&format!(
+                "exceeds the per-frame cap of {cap} bytes. \
+                 The cap is set by the sf_max_segment_bytes segment payload capacity."
+            )),
+            "mode={}: got: {}",
+            progress.name(),
+            err.msg()
+        );
+        assert!(!buf.is_empty(), "mode={}", progress.name());
+    }
+}
+
+#[test]
+fn effective_frame_cap_reports_the_binding_limit_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let server_cap: usize = 512;
+        let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+            .max_buf_size(100 * 1024 * 1024)
+            .unwrap();
+        let sender = build_qwp_ws_sender_from_builder(progress, builder);
+        assert_eq!(
+            sender.effective_frame_cap().unwrap(),
+            (server_cap, true),
+            "mode={}",
+            progress.name()
+        );
+
+        let port = spawn_max_batch_size_upgrade_only_server(None);
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+            .max_buf_size(2048)
+            .unwrap();
+        let sender = build_qwp_ws_sender_from_builder(progress, builder);
+        assert_eq!(
+            sender.effective_frame_cap().unwrap(),
+            (2048, false),
+            "mode={}",
+            progress.name()
         );
     }
 }
@@ -7675,12 +7962,15 @@ fn absent_server_max_batch_size_falls_back_to_configured_max_in_all_progress_mod
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert!(
-            err.msg().contains(&configured_max.to_string()),
+            err.msg().contains(&format!(
+                "exceeds the per-frame cap of {configured_max} bytes. \
+                 The cap is set by max_buf_size."
+            )),
             "mode={}: error should reference configured max {configured_max}, got: {}",
             progress.name(),
             err.msg()
@@ -7715,12 +8005,15 @@ fn configured_max_wins_when_smaller_than_server_cap_in_all_progress_modes() {
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert!(
-            err.msg().contains(&configured_max.to_string()),
+            err.msg().contains(&format!(
+                "exceeds the per-frame cap of {configured_max} bytes. \
+                 The cap is set by max_buf_size."
+            )),
             "mode={}: error should reference configured max {configured_max}, got: {}",
             progress.name(),
             err.msg()
@@ -7762,8 +8055,8 @@ fn server_cap_prevents_message_too_big_by_rejecting_locally_in_all_progress_mode
         let err = sender.flush(&mut big_buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
-            "mode={}: must get local InvalidApiCall, not a server error",
+            crate::ErrorCode::BatchTooLarge,
+            "mode={}: must get local BatchTooLarge, not a server error",
             progress.name()
         );
     }
@@ -7825,12 +8118,15 @@ fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
         let err = sender.flush(&mut buf).unwrap_err();
         assert_eq!(
             err.code(),
-            crate::ErrorCode::InvalidApiCall,
+            crate::ErrorCode::BatchTooLarge,
             "mode={}",
             progress.name()
         );
         assert!(
-            err.msg().contains(&server_cap.to_string()),
+            err.msg().contains(&format!(
+                "exceeds the per-frame cap of {server_cap} bytes. \
+                 The cap is set by the server's advertised X-QWP-Max-Batch-Size."
+            )),
             "mode={}: error should reference server cap {server_cap}, got: {}",
             progress.name(),
             err.msg()

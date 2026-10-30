@@ -124,8 +124,9 @@ For 7.0.0, the approved compatibility decisions are:
 - HTTP Basic authentication and single-endpoint reconnect work with QuestDB
   Open Source and Enterprise, while bearer-token and OIDC authentication,
   multi-host failover, and durable acknowledgement require QuestDB Enterprise;
-- Rust 1.91.1 is the MSRV for default and advertised docs.rs features;
-- Arrow `>=58, <60` and Polars `>=0.52, <0.55` are the supported ranges;
+- Rust 1.91.0 is the MSRV for default and advertised docs.rs features;
+- Arrow `>=58, <60` and Polars `>=0.52, <0.55` are the published crate's
+  supported ranges; the FFI artifact pins Arrow `=59.0.0`;
 - C/C++ remains source-only; and
 - release tags remain lightweight.
 
@@ -205,7 +206,7 @@ git fetch origin --tags --prune
 git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
-git switch -c release/7.0.0
+git switch -c release/7.2.1
 ```
 
 Do not prepare a release from a dirty feature-branch checkout.
@@ -215,7 +216,7 @@ Do not prepare a release from a dirty feature-branch checkout.
 For a future version change, preview before modifying files:
 
 ```bash
-NEW_VERSION=7.0.0
+NEW_VERSION=7.2.1
 bump-my-version replace --new-version "$NEW_VERSION" --dry-run
 bump-my-version replace --new-version "$NEW_VERSION"
 ```
@@ -233,7 +234,8 @@ The 7.0.0 feature branch already declares 7.0.0. Verify at least:
 Search for stale release references:
 
 ```bash
-rg -n '6\.1\.0|7\.0\.0' \
+PREV_VERSION="$(git describe --tags --abbrev=0)"
+rg -nF "$PREV_VERSION" \
   .bumpversion.toml CMakeLists.txt include doc questdb-rs questdb-rs-ffi \
   system_test
 ```
@@ -325,7 +327,7 @@ git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-VERSION=7.0.0
+VERSION=7.2.1
 RELEASE_SHA="$(git rev-parse HEAD)"
 
 git show --no-patch --format=fuller "$RELEASE_SHA"
@@ -395,7 +397,7 @@ docs.rs. Do not use `--all-features` if it enables mutually exclusive crypto
 backends.
 
 ```bash
-MSRV=1.91.1
+MSRV=1.91.0
 cargo generate-lockfile --manifest-path questdb-rs/Cargo.toml
 
 cargo +"$MSRV" check --manifest-path questdb-rs/Cargo.toml --locked
@@ -416,7 +418,7 @@ Do not document an untested lower version.
 Use the same feature set configured under `[package.metadata.docs.rs]`:
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo +1.91.1 doc \
+RUSTDOCFLAGS="-D warnings" cargo +1.91.0 doc \
   --manifest-path questdb-rs/Cargo.toml --no-deps --locked \
   --features almost-all-features,arrow,polars
 ```
@@ -486,7 +488,7 @@ git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-VERSION=7.0.0
+VERSION=7.2.1
 RELEASE_SHA="$(git rev-parse HEAD)"
 
 git show --no-patch --format=fuller "$RELEASE_SHA"
@@ -571,7 +573,7 @@ can hide packaging mistakes:
 SMOKE_ROOT="$(mktemp -d)"
 cargo new "$SMOKE_ROOT/qdb-rs-release-smoke"
 cd "$SMOKE_ROOT/qdb-rs-release-smoke"
-cargo add questdb-rs@=7.0.0
+cargo add questdb-rs@=7.2.1
 cargo check
 ```
 
@@ -616,8 +618,8 @@ version and tag. Record the abandoned version so it is not accidentally reused.
 A crates.io version cannot be overwritten or deleted.
 
 1. Assess severity and customer impact.
-2. Prepare and publish a corrected version, normally 7.0.1 for a compatible
-   fix.
+2. Prepare and publish a corrected version, normally the next patch version
+   for a compatible fix.
 3. Add a prominent warning and mitigation to the affected GitHub Release.
 4. Correct the website documentation.
 5. Yank the affected crate only when leaving it selectable for new dependency
@@ -626,11 +628,11 @@ A crates.io version cannot be overwritten or deleted.
 To yank without deleting the already published package:
 
 ```bash
-cargo yank --version 7.0.0 questdb-rs
+cargo yank --version 7.2.1 questdb-rs
 ```
 
 Yanking does not break consumers whose lockfiles already select the version.
-Never reuse 7.0.0 after yanking it.
+Never reuse 7.2.1 after yanking it.
 
 ## Final release checklist
 

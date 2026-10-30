@@ -224,9 +224,12 @@ public:
     /**
      * The current encoded size of the buffered data.
      *
-     * For ILP buffers this is the exact pending byte length. For QWP buffers
-     * this is a buffered size hint, not the exact size of any eventual UDP
-     * datagram.
+     * For ILP buffers this is the exact pending byte length. For QWP/UDP
+     * buffers this is a buffered size hint, not the exact size of any
+     * eventual datagram. For QWP/WebSocket buffers it is at least the size of
+     * the frame that flushing the buffer encodes, unless store-and-forward
+     * has fallen back to sending full symbol dictionaries because its symbol
+     * side-file could not be opened or rolled back.
      */
     size_t size() const noexcept
     {
@@ -360,7 +363,8 @@ public:
 
     /**
      * Remove all accumulated data and prepare the buffer for new lines.
-     * This does not affect the buffer's capacity.
+     * This does not affect the buffer's capacity. Any stored rewind point
+     * (marker or bookmark) is discarded.
      */
     void clear() noexcept
     {
@@ -914,7 +918,13 @@ public:
     /**
      * Record a GEOHASH column value. QWP-only.
      *
-     * `precision_bits` must be in 1..=60 and is pinned per column.
+     * `precision_bits` must be in 1..=60 and is pinned per column. `bits` is
+     * a raw pattern and is not checked to be less than 2^precision_bits.
+     * Supplying the wrong precision or a pattern with bits set above it can
+     * succeed and store a different GEOHASH or NULL. Only the low
+     * ceil(precision_bits / 8) bytes are encoded; the exact result is
+     * unspecified. This is a semantic data-integrity risk, not a memory-safety
+     * risk for an otherwise valid call. The caller must validate `bits`.
      */
     line_sender_buffer& column_geohash(
         column_name_view name, uint64_t bits, uint8_t precision_bits)
@@ -1252,7 +1262,7 @@ private:
     static inline ::line_sender_utf8 name()
     {
         // Maintained by .bumpversion.cfg
-        static const char user_agent[] = "questdb/c++/7.0.0";
+        static const char user_agent[] = "questdb/c++/7.2.1";
         ::line_sender_utf8 utf8 =
             ::line_sender_utf8_assert(sizeof(user_agent) - 1, user_agent);
         return utf8;
