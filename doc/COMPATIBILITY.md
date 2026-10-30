@@ -28,6 +28,9 @@ durable acknowledgement (`request_durable_ack=local`) needs a server running
 `cairo.commit.mode=adaptive`, which QuestDB 10.1.0, QuestDB Enterprise 4.1.0
 and earlier releases do not have. Those releases also refuse the explicit
 names `replicated` and `local,replicated`; use `on` with them.
+`local,replicated` needs both: QuestDB Enterprise and
+`cairo.commit.mode=adaptive`. QuestDB Enterprise runs a replicating primary in
+nosync mode unless `cairo.commit.mode` is set, so set it explicitly.
 
 Before the server release is published, QWP/WebSocket release qualification
 must include a full system-test pass against the approved QuestDB 10.0

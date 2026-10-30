@@ -123,7 +123,9 @@ acknowledgements, and the sender trims its replay log only once they arrive:
 - `replicated`: the commit has reached replication storage, so it survives the
   loss of the server. It needs QuestDB Enterprise with replication.
 - `local,replicated`: both; the sender trims on the replicated
-  acknowledgement.
+  acknowledgement. It needs QuestDB Enterprise with
+  `cairo.commit.mode=adaptive`, which a replicating primary runs only when the
+  mode is set explicitly.
 - `on`: the original name of the replicated level. It sends the request every
   QuestDB Enterprise release understands; the explicit names above need a
   server that knows them, so keep `on` for older servers.

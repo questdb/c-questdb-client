@@ -121,7 +121,9 @@ pub enum AckLevel {
     Ok,
     /// Wait until the frames reached replication storage, so they survive the
     /// loss of the server. This level requires QuestDB Enterprise and
-    /// `request_durable_ack=on`, `replicated`, or `local,replicated`.
+    /// `request_durable_ack=on`, `replicated`, or `local,replicated`;
+    /// `local,replicated` also needs a server running
+    /// `cairo.commit.mode=adaptive`.
     Durable,
     /// Wait until the server flushed the frames to its own disk, so they
     /// survive a server power loss but not the loss of that disk. This level

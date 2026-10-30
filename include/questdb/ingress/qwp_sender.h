@@ -95,7 +95,9 @@ extern "C" {
  *  supported. Server durability is selected independently with
  *  `request_durable_ack`: `local` (a server running
  *  `cairo.commit.mode=adaptive`), `replicated` or its original name `on`
- *  (QuestDB Enterprise), or `local,replicated`.
+ *  (QuestDB Enterprise), or `local,replicated` (both: QuestDB Enterprise with
+ *  `cairo.commit.mode=adaptive`, which a replicating primary runs only when the
+ *  mode is set explicitly).
  *
  *  A chunk too large for one frame is split into several frames and may be
  *  committed in more than one server transaction: always once per frame with

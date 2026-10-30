@@ -131,7 +131,8 @@ report the completed watermark.
 [`AckLevel::LocalDurable`](crate::ingress::AckLevel::LocalDurable) needs a
 server running `cairo.commit.mode=adaptive` and `request_durable_ack=local`;
 [`AckLevel::Durable`](crate::ingress::AckLevel::Durable) needs QuestDB
-Enterprise and `request_durable_ack=on`, `replicated`, or `local,replicated`.
+Enterprise and `request_durable_ack=on`, `replicated`, or `local,replicated`
+(which also needs a server running `cairo.commit.mode=adaptive`).
 A durable poll or wait the sender was not opened for is rejected;
 `acked_fsn` reports the watermark at the sender's configured level and is
 never rejected on that account.
@@ -150,9 +151,11 @@ Periodic durability protects the local replay log. It is independent of the
 server-side barrier selected by `request_durable_ack`: `local` covers the
 server's own disk, `replicated` (or its original name `on`, the only value
 servers older than the durability tiers accept) covers replication storage,
-and `local,replicated` trims on the replicated acknowledgement. Configure
-client and server durability independently for the failure modes you need to
-survive.
+and `local,replicated` trims on the replicated acknowledgement. The server
+must grant the whole set, so `local,replicated` needs both QuestDB Enterprise
+and `cairo.commit.mode=adaptive`, which a replicating primary runs only when
+the mode is set explicitly. Configure client and server durability
+independently for the failure modes you need to survive.
 
 In `manual` progress mode no background thread observes the transport.
 Server-side state — including terminal diagnostics — only becomes visible when the user

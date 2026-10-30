@@ -2913,6 +2913,19 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
     ColumnConn::from_round_stream(raw)
 }
 
+/// The ack level a pool waits for when the caller names none: the level whose
+/// acknowledgement trims the store-and-forward copy for the pool's
+/// `request_durable_ack` setting.
+fn default_ack_level_for_tiers(tiers: crate::ingress::DurableAckTiers) -> AckLevel {
+    if tiers.has_replicated() {
+        AckLevel::Durable
+    } else if tiers.trims_on_local() {
+        AckLevel::LocalDurable
+    } else {
+        AckLevel::Ok
+    }
+}
+
 /// Best-effort commit of un-sync'd deferred frames on drop, so the natural
 /// `flush()`-loop-then-drop path doesn't silently lose data. Commits at the
 /// pool's default ack level so a tiered durable-ack pool still waits for its
@@ -2927,16 +2940,6 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
 /// symbols — is committed here rather than discarded. A symbol-less commit
 /// interns nothing, so the full dictionary does not block it. Only a hard latch
 /// (transport death, or a prior failed commit) skips the attempt.
-fn default_ack_level_for_tiers(tiers: crate::ingress::DurableAckTiers) -> AckLevel {
-    if tiers.has_replicated() {
-        AckLevel::Durable
-    } else if tiers.trims_on_local() {
-        AckLevel::LocalDurable
-    } else {
-        AckLevel::Ok
-    }
-}
-
 fn commit_in_flight_on_drop(ack: AckLevel, sender: &mut DirectSenderCore) {
     if sender.in_flight() == 0 {
         return;

@@ -2142,7 +2142,9 @@ typedef enum qwpws_ack_level
 
     /** Wait until the frames reached replication storage. This level requires
      * QuestDB Enterprise; APIs accepting it also require
-     * `request_durable_ack=on`, `replicated`, or `local,replicated`. */
+     * `request_durable_ack=on`, `replicated`, or `local,replicated`.
+     * `local,replicated` also needs a server running
+     * `cairo.commit.mode=adaptive`. */
     qwpws_ack_level_durable = 1,
 
     /** Wait until the server flushed the frames to its own disk. This level

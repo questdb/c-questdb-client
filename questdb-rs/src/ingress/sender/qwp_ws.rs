@@ -4129,8 +4129,9 @@ pub(crate) fn qwp_ws_acked_fsn_manual(
 }
 
 /// Manual-mode OK watermark. Manual progress keeps no separate OK tracker,
-/// so this is the completed watermark: under `request_durable_ack=on` it
-/// advances on the durable ACK, not on the server's ordinary OK.
+/// so this is the completed watermark: with durable ACKs requested (any
+/// `request_durable_ack` but `off`) it advances on the durable ACK the setting
+/// trims on, not on the server's ordinary OK.
 pub(crate) fn qwp_ws_ok_fsn_manual(state: &ManualQwpWsHandlerState) -> crate::Result<Option<u64>> {
     check_manual_driver_error(state)?;
     Ok(state.store.completed_fsn())

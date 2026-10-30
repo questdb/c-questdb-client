@@ -1162,7 +1162,9 @@ private:
  * supported. Server durability is selected independently with
  * `request_durable_ack`: `local` (a server running
  * `cairo.commit.mode=adaptive`), `replicated` or its original name `on`
- * (QuestDB Enterprise), or `local,replicated`.
+ * (QuestDB Enterprise), or `local,replicated` (both: QuestDB Enterprise with
+ * `cairo.commit.mode=adaptive`, which a replicating primary runs only when the
+ * mode is set explicitly).
  */
 class borrowed_sender
 {

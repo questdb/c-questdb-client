@@ -282,6 +282,10 @@ def check_compatibility(errors):
             ),
             ("require QuestDB Enterprise", "Enterprise feature boundary"),
             (local_durable_text, "local durable ACK server mode"),
+            (
+                "`local,replicated` needs both: QuestDB Enterprise and",
+                "combined durable ACK server requirements",
+            ),
             ("`windows-2022` and `windows-2025`", "Windows CI image coverage"),
         ),
         ROOT / "doc" / "CONSIDERATIONS.md": (
@@ -409,6 +413,10 @@ def check_compatibility(errors):
                 "durable ACK edition qualifier",
             ),
             (local_durable_text, "local durable ACK server mode"),
+            (
+                "`local,replicated` also needs a server running",
+                "combined durable ACK server mode",
+            ),
         ),
         ROOT / "include" / "questdb" / "ingress" / "line_sender.hpp": (
             (

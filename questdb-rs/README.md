@@ -134,10 +134,12 @@ segment has been checkpointed. This client-side durability is independent of
 `local` (the commit is on the server's disk: survives a power loss, not the
 loss of that disk; needs a server running `cairo.commit.mode=adaptive`),
 `replicated` (the commit reached replication storage; needs QuestDB
-Enterprise), `local,replicated` (both; trimming follows the replicated
-acknowledgement), `on` (the original name of `replicated`, the only one older
-servers understand) and `off` (the default). Wait for `AckLevel::LocalDurable`
-with `local` and for `AckLevel::Durable` otherwise.
+Enterprise), `local,replicated` (both: needs QuestDB Enterprise with
+`cairo.commit.mode=adaptive`, which a replicating primary runs only when the
+mode is set explicitly; trimming follows the replicated acknowledgement), `on`
+(the original name of `replicated`, the only one older servers understand) and
+`off` (the default). Wait for `AckLevel::LocalDurable` with `local` and for
+`AckLevel::Durable` with `on`, `replicated` or `local,replicated`.
 
 A standalone `Reader::from_conf("ws::addr=...")` gives the query side
 without a pool (`sync-reader-qwp-ws` feature), yielding results as native
