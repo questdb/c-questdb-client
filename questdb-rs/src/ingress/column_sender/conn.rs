@@ -1693,6 +1693,53 @@ mod tests {
     }
 
     #[test]
+    fn durable_sync_with_keepalive_fails_when_the_needed_ack_never_comes() {
+        use crate::ws::nosigpipe::NoSigpipeTcp;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        // The peer answers every keepalive PING, but with the replicated ACK a
+        // `local` connection ignores: with the reads no longer failing on a
+        // timeout, only the no-progress deadline can end the wait.
+        let peer = spawn_durable_ack_on_ping_peer(server, QWP_STATUS_DURABLE_ACK);
+
+        let mut conn = ColumnConn::for_test(
+            WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
+            DurableAckTiers::Local,
+        );
+        conn.request_timeout = Duration::from_millis(300);
+        conn.durable_ack_keepalive_interval = Duration::from_millis(20);
+        conn.push_pending(0);
+
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let started = Instant::now();
+            let result = conn
+                .sync_all_acks(AckLevel::LocalDurable)
+                .map_err(|e| (e.code(), e.msg().to_string()));
+            let _ = tx.send((result, started.elapsed()));
+        });
+        let (result, elapsed) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("durable sync hung: the no-progress deadline did not fire");
+        worker.join().expect("worker");
+        let pings = peer.join().expect("peer");
+
+        let (code, msg) = result.expect_err("the local durable ACK never came");
+        assert_eq!(code, crate::ErrorCode::SocketError);
+        assert!(msg.contains("durable sync stalled"), "got: {msg}");
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "failed after {elapsed:?}, before the no-progress deadline"
+        );
+        assert!(pings >= 2, "keepalive PINGs stopped early: {pings}");
+    }
+
+    #[test]
     fn redundant_ok_after_durable_prune_does_not_strand_sync() {
         let mut conn = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::LegacyReplicated);
         // Table `t` runs the full OK -> DurableAck -> satisfied cycle; its

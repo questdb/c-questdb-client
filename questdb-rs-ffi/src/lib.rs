@@ -7454,6 +7454,60 @@ mod tests {
     }
 
     #[test]
+    fn qwpws_wait_refuses_local_durable_level_without_local_opt_in() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            upgrade_mock_stream(&mut stream);
+            // Hold the connection until the client closes it.
+            let mut sink = [0u8; 256];
+            while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+        });
+
+        unsafe {
+            let mut err = ptr::null_mut();
+            let opts = line_sender_opts_new(
+                line_sender_protocol::line_sender_protocol_ws,
+                utf8(b"127.0.0.1"),
+                port,
+            );
+            assert!(!opts.is_null());
+            let sender = line_sender_build(opts, &mut err);
+            line_sender_opts_free(opts);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            // Level 2 must reach the local durable level, which a sender
+            // opened without `request_durable_ack=local` refuses; read as the
+            // OK level, the wait would succeed on acceptance alone.
+            assert!(!line_sender_qwpws_wait(
+                sender,
+                qwpws_ack_level_local_durable,
+                0,
+                &mut err
+            ));
+            assert!(!err.is_null());
+            assert_err_code(
+                line_sender_error_get_code(err),
+                line_sender_error_code::line_sender_error_invalid_api_call,
+            );
+            let msg = read_error_message(err);
+            assert!(
+                msg.contains("AckLevel::LocalDurable requires `request_durable_ack=local`"),
+                "got: {msg}"
+            );
+            free_err(&mut err);
+
+            line_sender_close(sender);
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
     fn qwpws_terminal_diagnostic_remains_visible_after_poll() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
