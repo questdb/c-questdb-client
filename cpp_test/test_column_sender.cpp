@@ -706,6 +706,28 @@ TEST_CASE("borrowed_sender::wait rejects durable ACK without opt-in")
     rs.drop_on_return();
 }
 
+TEST_CASE("borrowed_sender::wait rejects local durable ACK without opt-in")
+{
+    auto mock = spawn_mock(1);
+    questdb::pool db{conf_for(mock->addr())};
+    auto rs = db.borrow_sender();
+
+    try
+    {
+        rs.wait(qdb::qwpws_ack_level::local_durable);
+        FAIL("local durable without opt-in must throw");
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        CHECK(e.code() == qdb::line_sender_error_code::invalid_api_call);
+        CHECK(
+            std::string{e.what()}.find("request_durable_ack=local") !=
+            std::string::npos);
+    }
+
+    rs.drop_on_return();
+}
+
 TEST_CASE("flush rejects oversized table name")
 {
     auto mock = spawn_mock(1);

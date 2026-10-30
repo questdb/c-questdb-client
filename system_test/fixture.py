@@ -474,7 +474,8 @@ class QuestDbFixture(QuestDbFixtureBase):
             http=False,
             protocol_version=None,
             qwp_udp=False,
-            http_auth=False):
+            http_auth=False,
+            commit_mode=None):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         # Set once start() has refined `version` from the live server.
@@ -505,6 +506,8 @@ class QuestDbFixture(QuestDbFixtureBase):
         self.http = http
         self.protocol_version = protocol_version
         self.qwp_udp = qwp_udp
+        # `cairo.commit.mode`; None keeps the server's default.
+        self.commit_mode = commit_mode
 
     def print_log(self):
         # Read as bytes and replace undecodable sequences: a force-kill
@@ -534,6 +537,9 @@ class QuestDbFixture(QuestDbFixtureBase):
             if self.qwp_udp else '')
         qwp_udp_unicast = 'qwp.udp.unicast=true' if self.qwp_udp else ''
         qwp_udp_commit_rate = 'qwp.udp.commit.rate=1' if self.qwp_udp else ''
+        commit_mode_config = (
+            f'cairo.commit.mode={self.commit_mode}'
+            if self.commit_mode else '')
         with open(self._conf_path, 'w', encoding='utf-8') as conf_file:
             conf_file.write(textwrap.dedent(rf'''
                 http.bind.to=0.0.0.0:{self.http_server_port}
@@ -555,6 +561,7 @@ class QuestDbFixture(QuestDbFixtureBase):
                 {auth_config}
                 {http_auth_config}
                 {ilp_over_http_config}
+                {commit_mode_config}
                 ''').lstrip('\n'))
 
         java = _find_java()
@@ -579,7 +586,8 @@ class QuestDbFixture(QuestDbFixtureBase):
         sys.stderr.write(
             f'Starting QuestDB: {launch_args!r} '
             f'(auth: {self.auth}, http_auth: {self.http_auth}, '
-            f'http: {self.http}, qwp_udp: {self.qwp_udp})\n')
+            f'http: {self.http}, qwp_udp: {self.qwp_udp}, '
+            f'commit_mode: {self.commit_mode})\n')
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log = open(self._log_path, 'ab')
         # On Windows, Popen.terminate() maps to TerminateProcess(), which kills
