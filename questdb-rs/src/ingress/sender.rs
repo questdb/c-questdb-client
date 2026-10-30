@@ -770,18 +770,22 @@ impl Sender {
     ///   (background progress mode; see below for manual mode). A covered
     ///   frame can therefore have been rejected: check
     ///   [`Self::poll_qwp_ws_error`] before treating coverage as delivery.
-    /// * [`AckLevel::LocalDurable`] reports local-disk coverage and requires
-    ///   `request_durable_ack=local`.
-    /// * [`AckLevel::Durable`] reports replicated/object-store coverage and
-    ///   requires `request_durable_ack=on`, `replicated`, or
-    ///   `local,replicated`. Unsupported levels are rejected before any
-    ///   terminal error is read, so callers cannot silently receive a weaker
-    ///   guarantee.
+    /// * [`AckLevel::LocalDurable`] reports coverage on the server's own disk.
+    ///   It requires a server running `cairo.commit.mode=adaptive` and a
+    ///   sender opened with `request_durable_ack=local`.
+    /// * [`AckLevel::Durable`] reports replication coverage. Like
+    ///   [`Self::wait`] it requires QuestDB Enterprise and a sender opened with
+    ///   `request_durable_ack=on`, `replicated`, or `local,replicated`.
+    ///
+    /// A durable level the sender was not opened for is rejected up front,
+    /// ahead of any terminal error the sender holds, so a caller polling for
+    /// durability cannot silently read a weaker watermark instead.
+    /// [`Self::acked_fsn`] reports the watermark at the sender's configured
+    /// level and is never rejected on that account.
     ///
     /// In background progress mode with durable ACKs `Ok` advances ahead of
-    /// `Durable`. Manual progress mode has no separate OK tracker, so there
-    /// both levels report the completed watermark even under
-    /// `request_durable_ack=on`.
+    /// the durable level. Manual progress mode has no separate OK tracker, so
+    /// there `Ok` and the durable level report the same completed watermark.
     ///
     /// An `Ok` read is never below a `Durable` read taken before it, but two
     /// calls are two snapshots: the background runner can advance `Durable`
@@ -822,11 +826,16 @@ impl Sender {
     ///
     /// * [`AckLevel::Ok`] waits for the server to accept every published
     ///   frame.
-    /// * [`AckLevel::LocalDurable`] waits for local-disk durable coverage and
-    ///   requires `request_durable_ack=local`.
-    /// * [`AckLevel::Durable`] waits for replicated/object-store coverage and
-    ///   requires `request_durable_ack=on`, `replicated`, or
-    ///   `local,replicated`.
+    /// * [`AckLevel::LocalDurable`] waits until the server flushed the frames
+    ///   to its own disk. It requires a server running
+    ///   `cairo.commit.mode=adaptive` and a sender opened with
+    ///   `request_durable_ack=local`.
+    /// * [`AckLevel::Durable`] waits until the frames reached replication
+    ///   storage. It requires QuestDB Enterprise and a sender opened with
+    ///   `request_durable_ack=on`, `replicated`, or `local,replicated`.
+    ///
+    /// A durable level the sender was not opened for is rejected before
+    /// checking whether any frame has been published.
     ///
     /// `timeout` is a **no-progress** deadline: it fires only if the ack
     /// watermark fails to advance for that long, so a steadily-progressing

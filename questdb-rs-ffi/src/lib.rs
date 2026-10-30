@@ -3805,10 +3805,12 @@ pub const qwpws_ack_level_local_durable: u32 = 2;
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
-/// `qwpws_ack_level_durable` requires `request_durable_ack=on`, `replicated`,
-/// or `local,replicated`; `qwpws_ack_level_local_durable` requires
-/// `request_durable_ack=local`. Otherwise this returns
-/// `line_sender_error_invalid_api_call` even when nothing has been published.
+/// `qwpws_ack_level_durable` requires QuestDB Enterprise and the sender to be
+/// opened with `request_durable_ack=on`, `replicated`, or `local,replicated`;
+/// `qwpws_ack_level_local_durable` requires a server running
+/// `cairo.commit.mode=adaptive` and `request_durable_ack=local`. Otherwise
+/// this returns `line_sender_error_invalid_api_call` even when nothing has
+/// been published.
 ///
 /// Returns `true` once the boundary is acknowledged. Returns `false` and sets
 /// `err_out` on the no-progress timeout (`line_sender_error_failover_retry`), a

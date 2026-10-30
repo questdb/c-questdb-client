@@ -324,6 +324,17 @@ impl DurableAckTiers {
         }
     }
 
+    /// The `request_durable_ack` value that selects this set, for messages.
+    pub(crate) fn config_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::LegacyReplicated => "on",
+            Self::Local => "local",
+            Self::Replicated => "replicated",
+            Self::LocalAndReplicated => "local,replicated",
+        }
+    }
+
     pub(crate) fn confirmation_value(self) -> Option<&'static str> {
         match self {
             Self::Off => None,

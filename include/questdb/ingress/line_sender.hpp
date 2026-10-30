@@ -1752,9 +1752,14 @@ enum class qwpws_ack_level : uint32_t
     /** Wait for the server to accept every published frame. */
     ok = ::qwpws_ack_level_ok,
 
-    /** Wait for replicated/object-store durable-ACK coverage. */
+    /** Wait until the frames reached replication storage. This level requires
+     * QuestDB Enterprise; APIs accepting it also require
+     * `request_durable_ack=on`, `replicated`, or `local,replicated`. */
     durable = ::qwpws_ack_level_durable,
-    /** Wait for local-disk durable-ACK coverage. */
+
+    /** Wait until the server flushed the frames to its own disk. This level
+     * requires a server running `cairo.commit.mode=adaptive`; APIs accepting
+     * it also require `request_durable_ack=local`. */
     local_durable = ::qwpws_ack_level_local_durable,
 };
 
@@ -2118,9 +2123,10 @@ public:
      * store-and-forward wait. `timeout` is a no-progress deadline (it fires
      * only if the ack watermark fails to advance for that long); the default
      * of zero waits indefinitely. `qwpws_ack_level::durable` requires QuestDB
-     * `request_durable_ack=on`, `replicated`, or `local,replicated`; local
-     * durable waits require `request_durable_ack=local`; otherwise this throws
-     * `invalid_api_call` even when nothing has been published. Throws on the
+     * Enterprise and `request_durable_ack=on`, `replicated`, or
+     * `local,replicated`; `qwpws_ack_level::local_durable` requires
+     * `request_durable_ack=local`; otherwise this throws `invalid_api_call`
+     * even when nothing has been published. Throws on the
      * no-progress timeout, a server rejection, or a transport failure; returns
      * immediately when nothing has been published yet.
      */

@@ -226,12 +226,16 @@ def check_compatibility(errors):
     rust_text = f"Rust {EXPECTED_RUST_VERSION}"
     questdb_text = f"QuestDB {EXPECTED_QUESTDB_VERSION}"
     failover_edition_text = "Multi-endpoint failover requires QuestDB Enterprise"
-    durable_edition_text = "Durable acknowledgement requires QuestDB Enterprise"
+    durable_edition_text = (
+        "Replicated durable acknowledgement requires QuestDB Enterprise"
+    )
+    local_durable_text = "`cairo.commit.mode=adaptive`"
     requirements = {
         ROOT / "README.md": (
             (rust_text, "declared Rust MSRV"),
             (questdb_text, "QWP/WebSocket server floor"),
             (failover_edition_text, "failover edition qualifier"),
+            (local_durable_text, "local durable ACK server mode"),
             (
                 "https://questdb.com/docs/ingestion/overview/",
                 "client overview URL",
@@ -241,6 +245,7 @@ def check_compatibility(errors):
             (rust_text, "declared Rust MSRV"),
             (questdb_text, "QWP/WebSocket server floor"),
             (failover_edition_text, "failover edition qualifier"),
+            (local_durable_text, "local durable ACK server mode"),
         ),
         ROOT / "doc" / "BUILD.md": (
             (rust_text, "declared Rust MSRV"),
@@ -250,6 +255,7 @@ def check_compatibility(errors):
             (rust_text, "declared Rust MSRV"),
             (questdb_text, "QWP/WebSocket server floor"),
             (durable_edition_text, "durable ACK edition qualifier"),
+            (local_durable_text, "local durable ACK server mode"),
         ),
         ROOT / "doc" / "CPP.md": (
             (rust_text, "declared Rust MSRV"),
@@ -275,6 +281,7 @@ def check_compatibility(errors):
                 "Polars compatibility range",
             ),
             ("require QuestDB Enterprise", "Enterprise feature boundary"),
+            (local_durable_text, "local durable ACK server mode"),
             ("`windows-2022` and `windows-2025`", "Windows CI image coverage"),
         ),
         ROOT / "doc" / "CONSIDERATIONS.md": (
@@ -282,6 +289,7 @@ def check_compatibility(errors):
                 "`durable` requires QuestDB Enterprise",
                 "durable ACK edition qualifier",
             ),
+            (local_durable_text, "local durable ACK server mode"),
         ),
         ROOT / "doc" / "DEPENDENCY.md": (
             (questdb_text, "QWP/WebSocket server floor"),
@@ -353,7 +361,7 @@ def check_compatibility(errors):
         ),
         ROOT / "questdb-rs" / "src" / "db.rs": (
             (
-                "only the Enterprise durable level confirms",
+                "confirms server acceptance only",
                 "accurate OK-versus-durable acknowledgement contract",
             ),
             (
@@ -383,6 +391,7 @@ def check_compatibility(errors):
                 "`qwpws_ack_level_durable` requires QuestDB Enterprise",
                 "durable ACK edition qualifier",
             ),
+            (local_durable_text, "local durable ACK server mode"),
         ),
         ROOT / "questdb-rs-ffi" / "src" / "column_sender.rs": (
             (
@@ -399,6 +408,7 @@ def check_compatibility(errors):
                 "`qwpws_ack_level_durable` requires QuestDB Enterprise and",
                 "durable ACK edition qualifier",
             ),
+            (local_durable_text, "local durable ACK server mode"),
         ),
         ROOT / "include" / "questdb" / "ingress" / "line_sender.hpp": (
             (

@@ -1013,18 +1013,22 @@ impl QuestDb {
     /// is self-describing.
     ///
     /// `ack_level` chooses how far the call blocks before returning:
-    /// * `None` — wait for the connect string's default: local-durable for
-    ///   `request_durable_ack=local`, replicated-durable for `on`,
+    /// * `None` — wait for the connect string's default, i.e. the same level
+    ///   the store-and-forward senders use: [`AckLevel::LocalDurable`] for
+    ///   `request_durable_ack=local`, [`AckLevel::Durable`] for `on`,
     ///   `replicated`, or `local,replicated`, otherwise [`AckLevel::Ok`].
-    /// * `Some(level)` — wait for exactly `level`. The corresponding tier
-    ///   must be enabled by `request_durable_ack`; otherwise
-    ///   the call is rejected with [`ErrorCode::InvalidApiCall`].
+    /// * `Some(level)` — wait for exactly `level`. [`AckLevel::Durable`]
+    ///   requires QuestDB Enterprise and `request_durable_ack=on`,
+    ///   `replicated`, or `local,replicated`; [`AckLevel::LocalDurable`]
+    ///   requires `request_durable_ack=local`; otherwise the call is rejected
+    ///   with [`ErrorCode::InvalidApiCall`].
     ///
     /// The call publishes the batch as a commit boundary and blocks until the
     /// resolved acknowledgement level is reached. An `Ok` acknowledgement
-    /// confirms server acceptance; local-durable confirms the server's disk,
-    /// and replicated-durable confirms the configured replication/object-store
-    /// boundary. On a transient [`ErrorCode::FailoverRetry`] it
+    /// confirms server acceptance only; the durable levels confirm durability:
+    /// [`AckLevel::LocalDurable`] on the server's own disk, the Enterprise
+    /// [`AckLevel::Durable`] in replication storage. On a transient
+    /// [`ErrorCode::FailoverRetry`] it
     /// surfaces the error rather than replaying (the batch is fully owned by
     /// the caller, so retrying is a plain re-call); the DataFrame path
     /// ([`Self::flush_polars_dataframe`]) re-drives automatically instead.
@@ -1758,7 +1762,9 @@ impl<'a> BorrowedSender<'a> {
     /// mid-chunk: a chunk that takes longer than `request_timeout` to deliver
     /// times out here even though delivery is progressing.
     ///
-    /// Durable levels require the matching `request_durable_ack` tier;
+    /// `AckLevel::Durable` requires QuestDB Enterprise and a pool opened with
+    /// `request_durable_ack=on`, `replicated`, or `local,replicated`, and
+    /// `AckLevel::LocalDurable` a pool opened with `request_durable_ack=local`;
     /// otherwise the call is rejected up front (`InvalidApiCall`) before
     /// `chunk` is touched.
     ///
@@ -1811,10 +1817,12 @@ impl<'a> BorrowedSender<'a> {
     /// Return the highest frame sequence number completed by server ACK or
     /// server-side reject-and-continue, or `None` if no frame has completed.
     ///
-    /// With durable ACKs this watermark advances at the configured trim tier;
-    /// use [`Self::wait`] when you need an explicit [`AckLevel::Ok`],
-    /// [`AckLevel::LocalDurable`], or [`AckLevel::Durable`] barrier. Compare it
-    /// only with FSNs produced by this same sender stream.
+    /// With durable ACKs this watermark advances only once the durable level
+    /// the pool was opened for covers the frame: the local one for
+    /// `request_durable_ack=local`, the replicated one for any value that
+    /// includes `replicated`. Use [`Self::wait`] when you need an explicit
+    /// [`AckLevel::Ok`], [`AckLevel::LocalDurable`], or [`AckLevel::Durable`]
+    /// barrier. Compare it only with FSNs produced by this same sender stream.
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         self.0.inner_ref().acked_fsn()
     }
@@ -1826,8 +1834,10 @@ impl<'a> BorrowedSender<'a> {
     /// connection failure fails it. Server rejections are delivered to the
     /// pool's rejection handler (default: logged; see
     /// [`QuestDb::connect_with_handlers`]) rather than raised here;
-    /// retriable ones are replayed by the queue. Durable levels require the
-    /// matching `request_durable_ack` tier.
+    /// retriable ones are replayed by the queue. `AckLevel::Durable` requires
+    /// QuestDB Enterprise and a pool opened with `request_durable_ack=on`,
+    /// `replicated`, or `local,replicated`; `AckLevel::LocalDurable` requires
+    /// a pool opened with `request_durable_ack=local`.
     ///
     /// `timeout` is a no-progress deadline (it fires only if the ack watermark
     /// fails to advance for that long); `Duration::ZERO` waits indefinitely.

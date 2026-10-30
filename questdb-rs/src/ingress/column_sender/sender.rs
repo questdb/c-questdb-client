@@ -556,7 +556,9 @@ impl PooledSenderCore {
     /// flushes plus this one are acknowledged at `ack_level`. An empty `chunk`
     /// behaves exactly like [`Self::sync`] (it encodes a header-only frame).
     ///
-    /// Durable levels require the matching `request_durable_ack` tier;
+    /// `AckLevel::Durable` requires QuestDB Enterprise and a pool opened with
+    /// `request_durable_ack=on`, `replicated`, or `local,replicated`, and
+    /// `AckLevel::LocalDurable` a pool opened with `request_durable_ack=local`;
     /// otherwise the call is rejected up front (`InvalidApiCall`) before
     /// `chunk` is touched.
     ///

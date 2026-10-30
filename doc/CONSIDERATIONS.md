@@ -47,10 +47,13 @@ acknowledgement. Use `flush_and_wait` or `wait` when the caller needs a barrier:
 
 - `ok` waits until the server accepts every frame published through that
   sender up to the captured frame-sequence boundary;
-- `local_durable` waits for a local-disk watermark and requires
-  `request_durable_ack=local`; it survives server power loss, not disk loss;
-- `durable` waits for the replicated/object-store watermark and requires
-  `request_durable_ack=on`, `replicated`, or `local,replicated`; and
+- `local_durable` waits until the server has flushed the frames to its own
+  disk. It requires a server running `cairo.commit.mode=adaptive` and
+  `request_durable_ack=local`. It survives a server power loss, not the loss
+  of that disk or a failover to another node;
+- `durable` requires QuestDB Enterprise and `request_durable_ack=on`,
+  `replicated`, or `local,replicated`, and waits until the frames reached
+  replication storage, so they survive the loss of the server; and
 - neither ACK guarantees that a WAL table row is immediately query-visible.
   WAL application remains asynchronous, so read-after-write workflows should
   poll or otherwise wait for visibility.
@@ -76,10 +79,14 @@ In manual QWP progress mode, periodic checkpoints advance only when the
 application calls a progress-driving API such as `drive_once` or `wait`.
 
 A periodic checkpoint protects only the client's local replay log.
-`request_durable_ack` is orthogonal. It accepts `off` (default), legacy `on`
-(replicated), `local`, `replicated`, and `local,replicated`. The server must
-grant the complete requested set or the connection fails. Local-only trims on
-local ACK; any set containing replicated trims only on replicated ACK.
+`request_durable_ack` is orthogonal. It accepts `off` (default), `local`,
+`replicated`, `local,replicated`, and `on`. The server must grant the whole
+requested set or the connection fails. With `local` the sender trims its
+replay log on the local acknowledgement; with any set that contains
+`replicated` it trims only on the replicated one, and `local_durable` waits
+are refused. `on` is the original name of the replicated level: it sends the
+request every QuestDB Enterprise release understands, while servers that do
+not know the explicit names refuse them, so keep `on` for older servers.
 
 Returning a borrowed QWP sender does not discard already-published frames. For
 in-memory store-and-forward, pool shutdown drains best-effort within

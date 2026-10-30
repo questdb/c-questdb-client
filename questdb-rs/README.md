@@ -130,11 +130,14 @@ The interval defaults to 5000 ms in periodic mode and is a target cadence:
 runner scheduling and storage-sync latency add to the actual recovery window.
 Publication can see ordinary backpressure at a segment boundary until the
 segment has been checkpointed. This client-side durability is independent of
-`request_durable_ack`, whose values are `off` (default), legacy `on`
-(replicated), `local`, `replicated`, and `local,replicated`. Local ACKs survive
-server power loss but not disk loss; replicated ACKs cover the configured
-replication/object-store barrier. With both tiers, replicated ACKs control
-store-and-forward trimming.
+`request_durable_ack`, which asks the server for durable acknowledgements:
+`local` (the commit is on the server's disk: survives a power loss, not the
+loss of that disk; needs a server running `cairo.commit.mode=adaptive`),
+`replicated` (the commit reached replication storage; needs QuestDB
+Enterprise), `local,replicated` (both; trimming follows the replicated
+acknowledgement), `on` (the original name of `replicated`, the only one older
+servers understand) and `off` (the default). Wait for `AckLevel::LocalDurable`
+with `local` and for `AckLevel::Durable` otherwise.
 
 A standalone `Reader::from_conf("ws::addr=...")` gives the query side
 without a pool (`sync-reader-qwp-ws` feature), yielding results as native

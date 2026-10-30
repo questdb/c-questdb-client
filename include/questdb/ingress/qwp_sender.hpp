@@ -1160,8 +1160,9 @@ private:
  * `sf_sync_interval_millis` defaults to 5000; it is a target, not a maximum
  * loss window. `sf_durability=flush` and `sf_durability=append` are not yet
  * supported. Server durability is selected independently with
- * `request_durable_ack=local`, `replicated`, or `local,replicated`; legacy
- * `on` retains its replicated meaning.
+ * `request_durable_ack`: `local` (a server running
+ * `cairo.commit.mode=adaptive`), `replicated` or its original name `on`
+ * (QuestDB Enterprise), or `local,replicated`.
  */
 class borrowed_sender
 {

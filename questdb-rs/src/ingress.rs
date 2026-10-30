@@ -119,13 +119,15 @@ pub enum AckLevel {
     /// Wait for the server to accept every published frame.
     #[default]
     Ok,
-    /// Wait for replicated/object-store durable-ACK coverage. This level
-    /// requires `request_durable_ack=on`, `replicated`, or
-    /// `local,replicated`.
+    /// Wait until the frames reached replication storage, so they survive the
+    /// loss of the server. This level requires QuestDB Enterprise and
+    /// `request_durable_ack=on`, `replicated`, or `local,replicated`.
     Durable,
-    /// Wait for local-disk durable-ACK coverage. This level is available when
-    /// `request_durable_ack=local`. Local durability survives power loss, but
-    /// not loss of the server's disk.
+    /// Wait until the server flushed the frames to its own disk, so they
+    /// survive a server power loss but not the loss of that disk. This level
+    /// requires a server running `cairo.commit.mode=adaptive` and
+    /// `request_durable_ack=local`. With `local,replicated` the sender trims
+    /// on the replicated acknowledgement, so wait for [`Self::Durable`].
     LocalDurable,
 }
 

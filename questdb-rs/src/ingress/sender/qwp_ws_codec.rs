@@ -136,13 +136,15 @@ pub(super) fn validate_qwp_handshake_headers(
         ));
     }
     if let Some(expected) = request_durable_ack.confirmation_value() {
-        let granted = headers
-            .find_ci("x-qwp-durable-ack")
-            .is_some_and(|v| v.trim().eq_ignore_ascii_case(expected));
-        if !granted {
+        // The server grants the whole requested set or nothing: anything but
+        // the expected token is a denial, never a weaker grant to accept.
+        let echo = headers.find_ci("x-qwp-durable-ack");
+        if !echo.is_some_and(|v| v.eq_ignore_ascii_case(expected)) {
             return Err(error::fmt!(
                 ProtocolVersionError,
-                "WebSocket upgrade failed: server did not enable durable ACK: grant mismatch [requested={expected}]"
+                "WebSocket upgrade failed: server did not enable durable ACK [requested={}, echoed={}]",
+                request_durable_ack.config_value(),
+                echo.unwrap_or("<no X-QWP-Durable-Ack header>")
             ));
         }
     }
@@ -631,7 +633,11 @@ mod tests {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
         let err = validate_qwp_handshake_headers(&headers, 1, true).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
-        assert!(err.msg().contains("grant mismatch"), "got: {}", err.msg());
+        assert_eq!(
+            err.msg(),
+            "WebSocket upgrade failed: server did not enable durable ACK \
+             [requested=on, echoed=<no X-QWP-Durable-Ack header>]"
+        );
 
         let headers =
             Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", "enabled")]);
@@ -664,6 +670,17 @@ mod tests {
                 "partial/missing grant {value:?} must fail"
             );
         }
+
+        let partial =
+            Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", " local ")]);
+        let err = validate_qwp_handshake_headers(&partial, 1, DurableAckTiers::LocalAndReplicated)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
+        assert_eq!(
+            err.msg(),
+            "WebSocket upgrade failed: server did not enable durable ACK \
+             [requested=local,replicated, echoed=local]"
+        );
     }
 
     #[test]

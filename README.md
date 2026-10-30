@@ -113,12 +113,23 @@ may briefly apply normal publication backpressure while the current segment
 is checkpointed.
 
 Periodic durability covers the client's local store-and-forward files.
-`request_durable_ack` independently selects the server barrier: `local`
-protects against server power loss, `replicated` protects against server-disk
-loss through replication/object storage, and `local,replicated` requests both
-while trimming the replay log only at the replicated watermark. The legacy
-`on` value remains an alias for `replicated`; `off` remains the default.
-Unsupported or partially granted tier sets fail the connection.
+`request_durable_ack` independently asks the server for durable
+acknowledgements, and the sender trims its replay log only once they arrive:
+
+- `local`: the server has flushed the commit to its own disk. This survives a
+  server power loss, but not the loss of that disk or a failover to another
+  node. It needs a server running `cairo.commit.mode=adaptive`; see the
+  [compatibility matrix](doc/COMPATIBILITY.md) for versions.
+- `replicated`: the commit has reached replication storage, so it survives the
+  loss of the server. It needs QuestDB Enterprise with replication.
+- `local,replicated`: both; the sender trims on the replicated
+  acknowledgement.
+- `on`: the original name of the replicated level. It sends the request every
+  QuestDB Enterprise release understands; the explicit names above need a
+  server that knows them, so keep `on` for older servers.
+- `off` (the default): no durable acknowledgements.
+
+The server must grant the whole requested set, or the connection fails.
 
 ## Getting Started
 

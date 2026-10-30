@@ -4154,8 +4154,10 @@ pub unsafe extern "C" fn qwp_direct_sender_flush(
 /// `qwp_sender_wait` for the level meanings and the no-progress timeout).
 ///
 /// `ack_level` carries a `qwpws_ack_level_*` constant; an out-of-range value,
-/// or a durable level without its matching `request_durable_ack` tier, returns
-/// `line_sender_error_invalid_api_call` **before** `chunk` is touched.
+/// the Enterprise-only `qwpws_ack_level_durable` without
+/// `request_durable_ack=on`, `replicated`, or `local,replicated`, or
+/// `qwpws_ack_level_local_durable` without `request_durable_ack=local`,
+/// returns `line_sender_error_invalid_api_call` **before** `chunk` is touched.
 ///
 /// Boundary: a successful return acknowledges all prior no-wait flushes plus
 /// this one. An empty `chunk` behaves like `qwp_direct_sender_commit`.
@@ -4501,7 +4503,7 @@ pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_scalar_nanos(
 /// `ack_level` carries a `qwpws_ack_level_*` constant. It is validated
 /// **before** the Arrow C Data Interface import consumes `array->release`, so a
 /// rejected level (out-of-range, or a durable level without its matching
-/// `request_durable_ack` tier) returns `line_sender_error_invalid_api_call`
+/// `request_durable_ack` value) returns `line_sender_error_invalid_api_call`
 /// and leaves `array` untouched.
 ///
 /// Ownership: as the publish-only flush, except that after the import the
@@ -5031,8 +5033,9 @@ unsafe fn reexport_record_batch_into(
 /// committing frame's ack.
 ///
 /// `qwpws_ack_level_ok` waits for every in-flight frame's WAL-commit ack.
-/// `qwpws_ack_level_local_durable` waits for local-disk durability;
-/// `qwpws_ack_level_durable` waits for replicated/object-store durability.
+/// `qwpws_ack_level_local_durable` also waits until the server flushed them to
+/// its own disk; `qwpws_ack_level_durable` (QuestDB Enterprise) also waits
+/// until they reached replication storage.
 ///
 /// No-progress timeout: if the server stays connected but never advances the
 /// ack/durable watermark — a back-pressured WAL or stuck commit — the wait
