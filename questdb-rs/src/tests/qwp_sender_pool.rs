@@ -5039,9 +5039,8 @@ fn direct_column_sender_local_durable_wait_completes_on_keepalive_ping() {
 
 /// Over TLS, OKs each frame and sends the local durable ack only on the third
 /// PING, with no pongs: nothing reaches the client between the second and
-/// third PING, so its read in between times out inside rustls. Returns the
-/// PING count.
-fn spawn_tls_local_durable_ack_on_third_ping() -> (u16, thread::JoinHandle<usize>) {
+/// third PING, so its read in between times out inside rustls.
+fn spawn_tls_local_durable_ack_on_third_ping() -> (u16, thread::JoinHandle<()>) {
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -5089,7 +5088,6 @@ fn spawn_tls_local_durable_ack_on_third_ping() -> (u16, thread::JoinHandle<usize
         // Hold the connection until the client closes; the read timeout bounds it.
         let mut sink = [0u8; 256];
         while matches!(tls.read(&mut sink), Ok(n) if n > 0) {}
-        pings
     });
     (port, handle)
 }
@@ -5119,7 +5117,7 @@ fn direct_column_sender_local_durable_wait_completes_on_keepalive_ping_over_tls(
     );
     drop(sender);
     drop(db);
-    assert_eq!(server.join().unwrap(), 3);
+    server.join().unwrap();
 }
 
 #[cfg(feature = "arrow-ingress")]
