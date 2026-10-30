@@ -53,9 +53,10 @@ use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
 use crate::ingress::{AckLevel, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::qwp_ws::{
     MOCK_DURABLE_LOCAL, MOCK_DURABLE_ON, MockDurableTier, perform_server_upgrade,
-    perform_server_upgrade_with_durable_tier, read_frame, upgrade_mock_stream_with_max_batch_size,
-    write_qwp_durable_ack_response_with_status, write_qwp_error_response, write_qwp_ok_response,
-    write_qwp_ok_response_with_table_entries, write_server_frame,
+    perform_server_upgrade_with_durable_tier, read_frame, upgrade_mock_stream_with_durable_ack,
+    upgrade_mock_stream_with_max_batch_size, write_qwp_durable_ack_response_with_status,
+    write_qwp_error_response, write_qwp_ok_response, write_qwp_ok_response_with_table_entries,
+    write_server_frame,
 };
 use tempfile::TempDir;
 
@@ -5034,6 +5035,91 @@ fn direct_column_sender_local_durable_wait_completes_on_keepalive_ping() {
         .commit(AckLevel::Durable)
         .expect_err("Durable needs a replicated tier");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+}
+
+/// Over TLS, OKs each frame and sends the local durable ack only on the third
+/// PING, with no pongs: nothing reaches the client between the second and
+/// third PING, so its read in between times out inside rustls. Returns the
+/// PING count.
+fn spawn_tls_local_durable_ack_on_third_ping() -> (u16, thread::JoinHandle<usize>) {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    let certs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tls_certs");
+    let certs = CertificateDer::pem_file_iter(certs_dir.join("server.crt"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = PrivateKeyDer::from_pem_file(certs_dir.join("server.key")).unwrap();
+    let config = Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let conn = rustls::ServerConnection::new(config).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, tcp);
+        upgrade_mock_stream_with_durable_ack(&mut tls, Some(MOCK_DURABLE_LOCAL));
+        let mut wire_seq = 0u64;
+        let mut pings = 0usize;
+        while pings < 3 {
+            let (_fin, opcode, _payload) = read_frame(&mut tls).unwrap();
+            match opcode {
+                0x2 => {
+                    write_qwp_ok_response_with_table_entries(&mut tls, wire_seq, &[("trades", 1)])
+                        .unwrap();
+                    wire_seq += 1;
+                }
+                0x9 => pings += 1,
+                _ => {}
+            }
+        }
+        write_qwp_durable_ack_response_with_status(
+            &mut tls,
+            MOCK_DURABLE_LOCAL.ack_status,
+            &[("trades", 1)],
+        )
+        .unwrap();
+        // Hold the connection until the client closes; the read timeout bounds it.
+        let mut sink = [0u8; 256];
+        while matches!(tls.read(&mut sink), Ok(n) if n > 0) {}
+        pings
+    });
+    (port, handle)
+}
+
+#[test]
+fn direct_column_sender_local_durable_wait_completes_on_keepalive_ping_over_tls() {
+    let (port, server) = spawn_tls_local_durable_ack_on_third_ping();
+    let roots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tls_certs/server_rootCA.pem");
+    let db = QuestDb::connect(&format!(
+        "wss::addr=localhost:{port};tls_roots={};lazy_connect=true;auth_timeout=2000;\
+         reconnect_max_duration_millis=1000;pool_reap=manual;request_durable_ack=local;",
+        roots.display()
+    ))
+    .unwrap();
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
+    let val = [7_i64];
+    let ts = [1_i64];
+    let mut chunk = one_i64_row("trades", &val, &ts);
+    let started = Instant::now();
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::LocalDurable)
+        .expect("local durable wait must complete over TLS");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "durable wait took {elapsed:?}"
+    );
+    drop(sender);
+    drop(db);
+    assert_eq!(server.join().unwrap(), 3);
 }
 
 #[cfg(feature = "arrow-ingress")]

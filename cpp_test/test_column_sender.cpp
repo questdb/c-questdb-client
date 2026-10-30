@@ -728,6 +728,28 @@ TEST_CASE("borrowed_sender::wait rejects local durable ACK without opt-in")
     rs.drop_on_return();
 }
 
+TEST_CASE("borrowed_sender::wait completes on a local durable ACK")
+{
+    auto mock = std::make_unique<qm::MockServer>(
+        std::vector<qm::Script>{{qm::ActionServeLocalDurableAck{"trades"}}});
+    questdb::pool db{conf_for(mock->addr(), "request_durable_ack=local;")};
+    auto rs = db.borrow_sender();
+
+    qdb::column_chunk chunk{"trades"};
+    const int64_t qty[] = {10};
+    const int64_t ts[] = {1'700'000'000'000'000'000LL};
+    chunk.column_i64("qty", qty, 1).at_nanos(ts, 1);
+    const auto fsn = rs.flush_and_get_fsn(chunk);
+    REQUIRE(fsn.has_value());
+
+    rs.wait(qdb::qwpws_ack_level::local_durable, std::chrono::seconds{5});
+    const auto acked = rs.acked_fsn();
+    REQUIRE(acked.has_value());
+    CHECK(*acked >= *fsn);
+
+    rs.drop_on_return();
+}
+
 TEST_CASE("flush rejects oversized table name")
 {
     auto mock = spawn_mock(1);

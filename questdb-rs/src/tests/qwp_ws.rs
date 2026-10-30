@@ -146,7 +146,7 @@ pub(crate) fn parse_header(req: &str, name: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, Vec<u8>)> {
+pub(crate) fn read_frame<S: Read>(stream: &mut S) -> std::io::Result<(bool, u8, Vec<u8>)> {
     let mut hdr = [0u8; 2];
     stream.read_exact(&mut hdr)?;
     let fin = (hdr[0] & 0x80) != 0;
@@ -180,8 +180,8 @@ pub(crate) fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, V
     Ok((fin, opcode, payload))
 }
 
-pub(crate) fn write_server_binary_frame(
-    stream: &mut TcpStream,
+pub(crate) fn write_server_binary_frame<S: Write>(
+    stream: &mut S,
     payload: &[u8],
 ) -> std::io::Result<()> {
     // FIN | binary, no mask (server→client).
@@ -288,8 +288,8 @@ pub(crate) fn write_server_info_frame(stream: &mut TcpStream) -> std::io::Result
     write_server_frame(stream, 0x2, &frame, false)
 }
 
-pub(crate) fn write_server_frame(
-    stream: &mut TcpStream,
+pub(crate) fn write_server_frame<S: Write>(
+    stream: &mut S,
     opcode: u8,
     payload: &[u8],
     masked: bool,
@@ -369,8 +369,8 @@ pub(crate) fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> st
     write_server_binary_frame(stream, &ok)
 }
 
-pub(crate) fn write_qwp_ok_response_with_table_entries(
-    stream: &mut TcpStream,
+pub(crate) fn write_qwp_ok_response_with_table_entries<S: Write>(
+    stream: &mut S,
     wire_seq: u64,
     entries: &[(&str, i64)],
 ) -> std::io::Result<()> {
@@ -389,8 +389,8 @@ pub(crate) fn write_qwp_durable_ack_response(
 }
 
 /// Write a durable ack with status `status`: replicated (`0x02`) or local (`0x0E`).
-pub(crate) fn write_qwp_durable_ack_response_with_status(
-    stream: &mut TcpStream,
+pub(crate) fn write_qwp_durable_ack_response_with_status<S: Write>(
+    stream: &mut S,
     status: u8,
     entries: &[(&str, i64)],
 ) -> std::io::Result<()> {
@@ -456,8 +456,8 @@ pub(crate) const MOCK_DURABLE_LOCAL: MockDurableTier = MockDurableTier {
     ack_status: QWP_STATUS_LOCAL_DURABLE_ACK,
 };
 
-fn upgrade_mock_stream_with_durable_ack(
-    stream: &mut TcpStream,
+pub(crate) fn upgrade_mock_stream_with_durable_ack<S: Read + Write>(
+    stream: &mut S,
     durable_ack: Option<MockDurableTier>,
 ) -> Vec<String> {
     try_upgrade_mock_stream_with_durable_ack(stream, durable_ack)
@@ -477,8 +477,8 @@ fn try_upgrade_mock_stream(stream: &mut TcpStream) -> std::io::Result<Option<Vec
     try_upgrade_mock_stream_with_durable_ack(stream, None)
 }
 
-fn try_upgrade_mock_stream_with_durable_ack(
-    stream: &mut TcpStream,
+fn try_upgrade_mock_stream_with_durable_ack<S: Read + Write>(
+    stream: &mut S,
     durable_ack: Option<MockDurableTier>,
 ) -> std::io::Result<Option<Vec<String>>> {
     let req_bytes = read_request_until_blank(stream)?;
@@ -940,10 +940,11 @@ fn qwp_frame_has_tables(payload: &[u8]) -> bool {
 
 /// Ordinary-OKs every data frame without advancing the durable watermark.
 /// Once told how many frames filled the ring, drops the connection, verifies
-/// that every unresolved frame is replayed, and releases one cumulative
-/// durable ACK. It then accepts and durably ACKs one fresh publication so the
-/// test can prove that segment trimming restored producer capacity.
-fn spawn_durable_backlog_reconnect_server() -> DurableBacklogServer {
+/// that every unresolved frame is replayed, and releases `tier`'s durable ACKs
+/// in two steps, the first after an ACK of the other tier that must not trim.
+/// It then accepts and durably ACKs one fresh publication so the test can
+/// prove that segment trimming restored producer capacity.
+fn spawn_durable_backlog_reconnect_server(tier: MockDurableTier) -> DurableBacklogServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let initial_ok_count = Arc::new(AtomicUsize::new(0));
@@ -956,7 +957,7 @@ fn spawn_durable_backlog_reconnect_server() -> DurableBacklogServer {
 
     let handle = thread::spawn(move || {
         let (mut initial, _) = listener.accept().unwrap();
-        perform_server_upgrade_durable(&mut initial).unwrap();
+        perform_server_upgrade_with_durable_tier(&mut initial, tier).unwrap();
         initial
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
@@ -1010,7 +1011,7 @@ fn spawn_durable_backlog_reconnect_server() -> DurableBacklogServer {
         drop(initial);
 
         let (mut replay, _) = listener.accept().unwrap();
-        perform_server_upgrade_durable(&mut replay).unwrap();
+        perform_server_upgrade_with_durable_tier(&mut replay, tier).unwrap();
 
         let mut replayed = 0usize;
         let mut wire_seq = FIRST_WIRE_SEQUENCE;
@@ -1045,10 +1046,37 @@ fn spawn_durable_backlog_reconnect_server() -> DurableBacklogServer {
         }
         replayed_tx.send(replayed).unwrap();
 
+        // First release: the other tier's ack covers the whole backlog and
+        // must be ignored; this tier's ack covers all but the last frame.
         release_durable_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
-        write_qwp_durable_ack_response(&mut replay, &[("trades", replayed as i64)]).unwrap();
+        let other_tier_status = if tier.ack_status == QWP_STATUS_LOCAL_DURABLE_ACK {
+            QWP_STATUS_DURABLE_ACK
+        } else {
+            QWP_STATUS_LOCAL_DURABLE_ACK
+        };
+        write_qwp_durable_ack_response_with_status(
+            &mut replay,
+            other_tier_status,
+            &[("trades", replayed as i64)],
+        )
+        .unwrap();
+        write_qwp_durable_ack_response_with_status(
+            &mut replay,
+            tier.ack_status,
+            &[("trades", replayed as i64 - 1)],
+        )
+        .unwrap();
+        release_durable_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        write_qwp_durable_ack_response_with_status(
+            &mut replay,
+            tier.ack_status,
+            &[("trades", replayed as i64)],
+        )
+        .unwrap();
 
         loop {
             match read_frame(&mut replay) {
@@ -1065,8 +1093,12 @@ fn spawn_durable_backlog_reconnect_server() -> DurableBacklogServer {
                         &[("trades", resumed_txn)],
                     )
                     .unwrap();
-                    write_qwp_durable_ack_response(&mut replay, &[("trades", resumed_txn)])
-                        .unwrap();
+                    write_qwp_durable_ack_response_with_status(
+                        &mut replay,
+                        tier.ack_status,
+                        &[("trades", resumed_txn)],
+                    )
+                    .unwrap();
                     resumed_tx.send(()).unwrap();
                     break;
                 }
@@ -3333,6 +3365,27 @@ fn sender_completed_fsn_manual_mode_reports_one_watermark_under_durable_ack() {
 
 #[test]
 fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
+    check_deep_durable_backlog_replays_and_recovers(
+        "on",
+        MOCK_DURABLE_ON,
+        crate::ingress::AckLevel::Durable,
+    );
+}
+
+#[test]
+fn qwp_ws_deep_local_durable_backlog_fills_byte_ring_replays_and_recovers() {
+    check_deep_durable_backlog_replays_and_recovers(
+        "local",
+        MOCK_DURABLE_LOCAL,
+        crate::ingress::AckLevel::LocalDurable,
+    );
+}
+
+fn check_deep_durable_backlog_replays_and_recovers(
+    request_durable_ack: &str,
+    tier: MockDurableTier,
+    durable_level: crate::ingress::AckLevel,
+) {
     const MIN_DEEP_BACKLOG: usize = 64;
 
     let DurableBacklogServer {
@@ -3344,10 +3397,10 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         resumed_rx,
         done_tx,
         handle,
-    } = spawn_durable_backlog_reconnect_server();
+    } = spawn_durable_backlog_reconnect_server(tier);
     let conf = format!(
         "ws::addr=127.0.0.1:{port};\
-         request_durable_ack=on;\
+         request_durable_ack={request_durable_ack};\
          sf_max_segment_bytes=512;\
          sf_max_total_bytes=8192;\
          sf_append_deadline_millis=100;\
@@ -3360,6 +3413,7 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
 
     let mut published = 0usize;
     let mut last_fsn = None;
+    let mut before_last_fsn = None;
     let (mut blocked, backpressure) = loop {
         let mut next = sender.new_buffer();
         next.table("trades")
@@ -3371,7 +3425,7 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         match sender.flush_and_get_fsn(&mut next) {
             Ok(Some(fsn)) => {
                 published += 1;
-                last_fsn = Some(fsn);
+                before_last_fsn = last_fsn.replace(fsn);
             }
             Ok(None) => panic!("non-empty durable frame did not publish an FSN"),
             Err(err) => break (next, err),
@@ -3414,12 +3468,7 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         Some(last_fsn),
         "OK poll must cover every ordinary-OKed frame"
     );
-    assert_eq!(
-        sender
-            .completed_fsn(crate::ingress::AckLevel::Durable)
-            .unwrap(),
-        None
-    );
+    assert_eq!(sender.completed_fsn(durable_level).unwrap(), None);
 
     disconnect_tx.send(published).unwrap();
     let replayed = replayed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -3429,18 +3478,14 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         "ordinary OK watermark did not recover after replay"
     );
     assert!(!sender.sfa_fully_delivered(true));
+    assert_eq!(sender.acked_fsn().unwrap(), None);
     // Replay must leave the OK poll covering the backlog while the durable
     // level is still withheld.
     assert_eq!(
         sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
         Some(last_fsn)
     );
-    assert_eq!(
-        sender
-            .completed_fsn(crate::ingress::AckLevel::Durable)
-            .unwrap(),
-        None
-    );
+    assert_eq!(sender.completed_fsn(durable_level).unwrap(), None);
     assert!(
         wait_until(Duration::from_secs(5), || {
             let totals = sender.qwp_ws_totals().unwrap();
@@ -3453,16 +3498,22 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
     assert_eq!(totals.reconnects_succeeded, 1);
     assert_eq!(totals.frames_replayed, published as u64);
 
+    // The other tier's ack for the whole backlog arrives first; only this
+    // tier's ack, which stops one frame short, may trim.
     release_durable_tx.send(()).unwrap();
-    sender
-        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
-        .unwrap();
-    assert_eq!(
-        sender
-            .completed_fsn(crate::ingress::AckLevel::Durable)
-            .unwrap(),
-        Some(last_fsn)
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            sender.completed_fsn(durable_level).unwrap() == before_last_fsn
+        }),
+        "durable watermark {:?}, expected {before_last_fsn:?}",
+        sender.completed_fsn(durable_level).unwrap()
     );
+    assert_eq!(sender.acked_fsn().unwrap(), before_last_fsn);
+    assert!(!sender.sfa_fully_delivered(true));
+
+    release_durable_tx.send(()).unwrap();
+    sender.wait(durable_level, Duration::from_secs(5)).unwrap();
+    assert_eq!(sender.completed_fsn(durable_level).unwrap(), Some(last_fsn));
     assert_eq!(
         sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
         Some(last_fsn)
@@ -3475,15 +3526,11 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         .unwrap()
         .expect("the blocked frame must publish after durable segment trim");
     assert_eq!(resumed_fsn, last_fsn + 1);
-    sender
-        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
-        .unwrap();
+    sender.wait(durable_level, Duration::from_secs(5)).unwrap();
     resumed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(sender.acked_fsn().unwrap(), Some(resumed_fsn));
     assert_eq!(
-        sender
-            .completed_fsn(crate::ingress::AckLevel::Durable)
-            .unwrap(),
+        sender.completed_fsn(durable_level).unwrap(),
         Some(resumed_fsn)
     );
 
