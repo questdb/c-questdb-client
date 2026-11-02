@@ -1761,7 +1761,8 @@ enum class qwpws_ack_level : uint32_t
 
     /** Wait until the server flushed the frames to its own disk. This level
      * requires a server running `cairo.commit.mode=adaptive`; APIs accepting
-     * it also require `request_durable_ack=local`. */
+     * it also require `request_durable_ack=local`. It survives a server power
+     * loss, not the loss of that disk. */
     local_durable = ::qwpws_ack_level_local_durable,
 };
 
