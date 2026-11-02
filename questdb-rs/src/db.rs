@@ -3355,7 +3355,8 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{SlotReservations, managed_slot_recovery_scan_from};
+    use super::{SlotReservations, default_ack_level_for_tiers, managed_slot_recovery_scan_from};
+    use crate::ingress::{AckLevel, DurableAckTiers};
 
     fn dirty_slot(root: &std::path::Path, name: &str) {
         let slot = root.join(name);
@@ -3389,5 +3390,24 @@ mod tests {
 
         let mut in_memory = SlotReservations::default();
         assert!(!in_memory.reserve(0));
+    }
+
+    #[test]
+    fn default_ack_level_is_the_level_each_setting_trims_on() {
+        for (tiers, expected) in [
+            (DurableAckTiers::Off, AckLevel::Ok),
+            (DurableAckTiers::LegacyReplicated, AckLevel::Durable),
+            (DurableAckTiers::Local, AckLevel::LocalDurable),
+            (DurableAckTiers::Replicated, AckLevel::Durable),
+            (DurableAckTiers::LocalAndReplicated, AckLevel::Durable),
+        ] {
+            let level = default_ack_level_for_tiers(tiers);
+            assert_eq!(level, expected, "{tiers:?}");
+            // The drop-time commit waits at this level, so it must never be
+            // refused by the setting it comes from.
+            tiers
+                .check_ack_level(level)
+                .unwrap_or_else(|e| panic!("{tiers:?} refuses its own default: {}", e.msg()));
+        }
     }
 }

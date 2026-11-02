@@ -5037,6 +5037,71 @@ fn direct_column_sender_local_durable_wait_completes_on_keepalive_ping() {
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
 }
 
+/// Runs `publish_and_drop` against a mock that grants `request_durable_ack=local`
+/// and sends the local durable ack only in reply to a PING. Only a durable wait
+/// sends a PING, so one proves the drop-time commit of the deferred tail waited
+/// at the local durable level, not just for the OK.
+fn check_drop_commit_waits_for_local_durable(publish_and_drop: impl FnOnce(&str)) {
+    let (server, _frames, pings) =
+        MockServer::spawn_acking_durable_capturing(1, MOCK_DURABLE_LOCAL);
+    publish_and_drop(&conf_for(server.port(), "request_durable_ack=local;"));
+    assert!(
+        pings.load(Ordering::SeqCst) > 0,
+        "the drop-time commit did not wait for the local durable ack"
+    );
+}
+
+/// Flushes one row twice: the first flush on a fresh connection is committed
+/// inline, the second is deferred and left for the drop to commit.
+fn flush_committed_then_deferred(mut flush: impl FnMut(&mut Chunk<'_>) -> crate::Result<()>) {
+    let val = [7_i64];
+    let ts = [1_i64];
+    for _ in 0..2 {
+        flush(&mut one_i64_row("trades", &val, &ts)).unwrap();
+    }
+}
+
+#[test]
+fn direct_sender_drop_commits_at_local_durable_with_local_opt_in() {
+    check_drop_commit_waits_for_local_durable(|conf| {
+        let db = QuestDb::connect(&format!("{conf}pool_reap=manual;")).unwrap();
+        let mut sender = db.borrow_direct_column_sender().expect("borrow");
+        flush_committed_then_deferred(|chunk| sender.flush(chunk));
+        assert!(sender.in_flight() > 0, "deferred flush must be in-flight");
+        drop(sender);
+    });
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn owned_direct_sender_drop_commits_at_local_durable_with_local_opt_in() {
+    check_drop_commit_waits_for_local_durable(|conf| {
+        let db = QuestDb::connect(&format!("{conf}pool_reap=manual;")).unwrap();
+        let mut sender = db.borrow_direct_column_sender_owned().expect("borrow");
+        flush_committed_then_deferred(|chunk| sender.get_mut().flush(chunk));
+        assert!(
+            sender.get().in_flight() > 0,
+            "deferred flush must be in-flight"
+        );
+        drop(sender);
+    });
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn standalone_direct_sender_drop_commits_at_local_durable_with_local_opt_in() {
+    check_drop_commit_waits_for_local_durable(|conf| {
+        let mut sender =
+            crate::db::OwnedDirectColumnSender::from_conf(conf).expect("standalone connect");
+        flush_committed_then_deferred(|chunk| sender.get_mut().flush(chunk));
+        assert!(
+            sender.get().in_flight() > 0,
+            "deferred flush must be in-flight"
+        );
+        drop(sender);
+    });
+}
+
 /// Over TLS, OKs each frame and sends the local durable ack only on the third
 /// PING, with no pongs: nothing reaches the client between the second and
 /// third PING, so its read in between times out inside rustls.
