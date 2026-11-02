@@ -1686,10 +1686,22 @@ mod tests {
         conn.durable_ack_keepalive_interval = Duration::ZERO;
         conn.push_pending(0);
 
+        let started = Instant::now();
         let err = conn
             .sync_all_acks(AckLevel::LocalDurable)
-            .expect_err("nothing prompts the server, so the deadline must fire");
+            .expect_err("nothing prompts the server, so the blocking read must time out");
+        let elapsed = started.elapsed();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg().contains("socket read failed"),
+            "expected a read timeout, got: {}",
+            err.msg()
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "failed after {elapsed:?}, before the 150 ms read timeout: {}",
+            err.msg()
+        );
         drop(conn);
         assert_eq!(peer.join().expect("peer"), 0);
     }
