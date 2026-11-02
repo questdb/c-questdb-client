@@ -52,11 +52,11 @@ use crate::ingress::column_sender::Chunk;
 use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
 use crate::ingress::{AckLevel, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::qwp_ws::{
-    MOCK_DURABLE_LOCAL, MOCK_DURABLE_ON, MockDurableTier, perform_server_upgrade,
-    perform_server_upgrade_with_durable_tier, read_frame, upgrade_mock_stream_with_durable_ack,
-    upgrade_mock_stream_with_max_batch_size, write_qwp_durable_ack_response_with_status,
-    write_qwp_error_response, write_qwp_ok_response, write_qwp_ok_response_with_table_entries,
-    write_server_frame,
+    MOCK_DURABLE_LOCAL, MOCK_DURABLE_LOCAL_WITH_REPLICATED_ACKS, MOCK_DURABLE_ON, MockDurableTier,
+    perform_server_upgrade, perform_server_upgrade_with_durable_tier, read_frame,
+    upgrade_mock_stream_with_durable_ack, upgrade_mock_stream_with_max_batch_size,
+    write_qwp_durable_ack_response_with_status, write_qwp_error_response, write_qwp_ok_response,
+    write_qwp_ok_response_with_table_entries, write_server_frame,
 };
 use tempfile::TempDir;
 
@@ -2229,11 +2229,8 @@ fn orphan_drainer_trims_local_durable_slot_after_local_ack() {
 #[test]
 fn orphan_drainer_keeps_local_durable_slot_on_replicated_ack() {
     let dir = TempDir::new().unwrap();
-    let replicated_acks = MockDurableTier {
-        ack_status: MOCK_DURABLE_ON.ack_status,
-        ..MOCK_DURABLE_LOCAL
-    };
-    let (_server, _db, pings) = start_local_durable_orphan_drain(&dir, replicated_acks);
+    let (_server, _db, pings) =
+        start_local_durable_orphan_drain(&dir, MOCK_DURABLE_LOCAL_WITH_REPLICATED_ACKS);
     // A drainer that trimmed on the first replicated ack would stop pinging.
     assert!(wait_until(Duration::from_secs(5), || {
         pings.load(Ordering::SeqCst) >= 3
@@ -5092,11 +5089,8 @@ fn direct_column_sender_second_replicated_durable_commit_completes() {
 fn direct_column_sender_ok_commit_does_not_wait_for_local_durable_ack() {
     // The mock answers PINGs only with replicated acks, which a `local`
     // connection ignores: an Ok commit must return on the OK, without a PING.
-    let replicated_acks = MockDurableTier {
-        ack_status: MOCK_DURABLE_ON.ack_status,
-        ..MOCK_DURABLE_LOCAL
-    };
-    let (server, _frames, pings) = MockServer::spawn_acking_durable_capturing(1, replicated_acks);
+    let (server, _frames, pings) =
+        MockServer::spawn_acking_durable_capturing(1, MOCK_DURABLE_LOCAL_WITH_REPLICATED_ACKS);
     let db = QuestDb::connect(&conf_for(
         server.port(),
         "pool_reap=manual;request_durable_ack=local;",
@@ -8258,11 +8252,8 @@ const LOCAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
 /// Parks a `local` pool's only sender with a frame that is OK'd but never
 /// locally durable: the server answers pings only with replicated acks.
 fn park_local_sender_ok_but_not_locally_durable() -> (MockServer, QuestDb) {
-    let replicated_acks = MockDurableTier {
-        ack_status: MOCK_DURABLE_ON.ack_status,
-        ..MOCK_DURABLE_LOCAL
-    };
-    let (server, _frames, pings) = MockServer::spawn_acking_durable_capturing(1, replicated_acks);
+    let (server, _frames, pings) =
+        MockServer::spawn_acking_durable_capturing(1, MOCK_DURABLE_LOCAL_WITH_REPLICATED_ACKS);
     let db = QuestDb::connect(&conf_for(
         server.port(),
         &format!(

@@ -456,6 +456,13 @@ pub(crate) const MOCK_DURABLE_LOCAL: MockDurableTier = MockDurableTier {
     ack_status: QWP_STATUS_LOCAL_DURABLE_ACK,
 };
 
+/// Grants `local` but sends only replicated acks, which a `local` sender
+/// ignores: its frames are OK'd but never become locally durable.
+pub(crate) const MOCK_DURABLE_LOCAL_WITH_REPLICATED_ACKS: MockDurableTier = MockDurableTier {
+    ack_status: QWP_STATUS_DURABLE_ACK,
+    ..MOCK_DURABLE_LOCAL
+};
+
 pub(crate) fn upgrade_mock_stream_with_durable_ack<S: Read + Write>(
     stream: &mut S,
     durable_ack: Option<MockDurableTier>,
