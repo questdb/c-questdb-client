@@ -782,8 +782,10 @@ impl TokenProvider {
     /// # Known residual: the credential is not scrubbed past this point
     ///
     /// `oidc` zeroizes its own copies (`TokenSet`, `PersistedToken`, the store
-    /// buffers, the `Zeroizing<String>` the FFI hands out), but the token this
-    /// method receives from the provider closure, and the `Bearer …` value it
+    /// buffers, the `Zeroizing<String>` the FFI hands out), and in a build with
+    /// `oidc` a [`RefreshingTokenProvider`] wipes the token it caches when a
+    /// refresh replaces it or the provider closes. But the token this method
+    /// receives from the provider closure, and the `Bearer …` value it
     /// returns, are ordinary `String`s dropped unwiped -- once per flush, and
     /// again per 401 rotation. Accepted deliberately rather than overlooked:
     ///

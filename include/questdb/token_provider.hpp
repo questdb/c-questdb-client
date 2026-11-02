@@ -59,10 +59,11 @@ struct expiring_token
  * failure: whether retrying can succeed (network failures, timeouts, 429 and
  * 5xx are retryable; missing or wrong configuration is not), and a suggested
  * wait. A `questdb::error` that carries a classification, such as one thrown
- * by `token_provider::token()`, keeps it. Any other exception counts as
- * retryable, except the failures `bearer_token_provider::token()` lists as
- * stopping background reconnects (see there). Never put a token in the
- * message.
+ * by `token_provider::token()`, keeps it, and an `oidc::error` thrown by
+ * `oidc::device_auth::token()` is passed on unchanged. Any other exception
+ * counts as retryable, except the failures `bearer_token_provider::token()`
+ * lists as stopping background reconnects (see there). Never put a token in
+ * the message.
  */
 class token_unavailable : public std::runtime_error
 {
@@ -121,7 +122,13 @@ public:
      * that returns it: the failure of a closed `token_provider` (closing one
      * ends every client that uses it, through this provider too), and an
      * `oidc::error` of kind `cancelled` (a closed `oidc::device_auth`) or
-     * `config`. Any other such error keeps its classification
+     * `config`. Any other `oidc::error` that `oidc::device_auth::token()`
+     * threw is passed on unchanged, as a Rust provider passes on an
+     * `OidcError`: a connect the caller waits for ends at once on it unless
+     * the acquisition was busy, an ILP/HTTP flush resolves the token again
+     * after a transient failure within its `retry_timeout`, and the client's
+     * error keeps the OIDC detail (`line_sender_error::oidc_diagnostic()`).
+     * Any other QuestDB error keeps its classification
      * (`questdb::error::token_unavailable_diagnostic()`).
      */
     virtual std::string token() = 0;
@@ -238,6 +245,16 @@ inline void report_questdb_error(
         e.what());
 }
 
+/** Reads the C error an `oidc::error` was converted from. */
+struct oidc_error_access
+{
+    static const ::questdb_error* c_error(
+        const ::questdb::oidc::error& e) noexcept
+    {
+        return e._c_error.get();
+    }
+};
+
 /** Report the exception being handled through `sink`. */
 inline void report_current_exception(::questdb_token_sink* sink) noexcept
 {
@@ -257,12 +274,19 @@ inline void report_current_exception(::questdb_token_sink* sink) noexcept
     {
         // A closed `oidc::device_auth` (`cancelled`) and a misconfiguration
         // (`config`) fail every later request alike, as for a Rust provider.
-        report_questdb_error(
-            sink,
-            e,
+        const bool terminal =
             e.code() == ::questdb::error_code::invalid_api_call ||
-                e.kind() == ::questdb::oidc::error_kind::cancelled ||
-                e.kind() == ::questdb::oidc::error_kind::config);
+            e.kind() == ::questdb::oidc::error_kind::cancelled ||
+            e.kind() == ::questdb::oidc::error_kind::config;
+        // Pass any other failure the library raised on unchanged, as a Rust
+        // provider passes on an `OidcError`. It carries no classification to
+        // report: reported as retryable, a sign-in failure kept a connect the
+        // caller waits for retrying for its whole budget, and the client's
+        // error lost the OIDC detail.
+        const ::questdb_error* const raw = oidc_error_access::c_error(e);
+        if (!terminal && raw && ::questdb_token_sink_set_error_from(sink, raw))
+            return;
+        report_questdb_error(sink, e, terminal);
     }
     catch (const ::questdb::error& e)
     {

@@ -46,13 +46,14 @@ use crate::oidc::{read_versioned_input_field, versioned_output_capacity, write_v
 use crate::{line_sender_opts, questdb_error, set_err_out_from_error};
 
 /// Fetch a new token for a refreshing provider: call exactly one of
-/// `questdb_token_sink_set_token` or `questdb_token_sink_set_error`.
+/// `questdb_token_sink_set_token`, `questdb_token_sink_set_error` or
+/// `questdb_token_sink_set_error_from`.
 pub type questdb_token_source_fn =
     unsafe extern "C" fn(user_data: *mut c_void, sink: *mut questdb_token_sink);
 
 /// The current token of an application-implemented provider: call exactly one
-/// of `questdb_token_sink_set_token`, `questdb_token_sink_set_error` or
-/// `questdb_token_sink_set_terminal_error`.
+/// of `questdb_token_sink_set_token`, `questdb_token_sink_set_error`,
+/// `questdb_token_sink_set_error_from` or `questdb_token_sink_set_terminal_error`.
 pub type questdb_token_get_fn =
     unsafe extern "C" fn(user_data: *mut c_void, sink: *mut questdb_token_sink);
 
@@ -408,6 +409,38 @@ pub unsafe extern "C" fn questdb_token_sink_set_terminal_error(
     }
     let message = unsafe { sink_message(msg, msg_len) };
     sink.outcome = SinkOutcome::Error(Error::new(ErrorCode::InvalidApiCall, message));
+    true
+}
+
+/// Pass on, from a source or provider callback, the failure of another QuestDB
+/// token API -- `questdb_oidc_auth_token` or `questdb_token_provider_token` --
+/// unchanged: its code, its classification and its OIDC detail. The client
+/// then handles it exactly as it handles the same error returned by a Rust
+/// provider or source.
+///
+/// `questdb_token_sink_set_error` cannot: it records a classification, and an
+/// OIDC failure has none. Reported as retryable, a sign-in failure kept a
+/// connect the caller waits for retrying for its whole budget, where the auth
+/// attached directly ends it at once, and the client's error lost the OIDC
+/// detail.
+///
+/// `error` is copied and stays with the caller. Returns false, recording
+/// nothing, when `sink` or `error` is NULL or a result was already reported.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_token_sink_set_error_from(
+    sink: *mut questdb_token_sink,
+    error: *const questdb_error,
+) -> bool {
+    let Some(sink) = (unsafe { sink.as_mut() }) else {
+        return false;
+    };
+    let Some(error) = (unsafe { error.as_ref() }) else {
+        return false;
+    };
+    if !matches!(sink.outcome, SinkOutcome::Empty) {
+        return false;
+    }
+    sink.outcome = SinkOutcome::Error(error.error.clone());
     true
 }
 
@@ -1759,6 +1792,15 @@ mod tests {
     }
 
     fn application_provider(get_token: questdb_token_get_fn) -> *mut questdb_token_provider {
+        application_provider_with(get_token, ptr::null_mut())
+    }
+
+    /// An application provider whose `get_token` receives `user_data`, which
+    /// the caller keeps alive and frees: the provider has no `release`.
+    fn application_provider_with(
+        get_token: questdb_token_get_fn,
+        user_data: *mut c_void,
+    ) -> *mut questdb_token_provider {
         let vtable = questdb_token_provider_vtable {
             struct_size: size_of::<questdb_token_provider_vtable>(),
             get_token: Some(get_token),
@@ -1766,7 +1808,7 @@ mod tests {
             release: None,
         };
         let mut err: *mut questdb_error = ptr::null_mut();
-        let provider = unsafe { questdb_token_provider_new(&vtable, ptr::null_mut(), &mut err) };
+        let provider = unsafe { questdb_token_provider_new(&vtable, user_data, &mut err) };
         assert!(!provider.is_null() && err.is_null());
         provider
     }
@@ -1813,6 +1855,158 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::SocketError, "{err}");
         assert!(!err.as_token_unavailable().unwrap().retryable());
         unsafe { questdb_token_provider_free(unassigned) };
+    }
+
+    type OidcStringSetter = unsafe extern "C" fn(
+        *mut crate::oidc::questdb_oidc_builder,
+        *const c_char,
+        size_t,
+        *mut *mut questdb_error,
+    ) -> bool;
+
+    /// An OIDC auth nobody has signed in to: its token pull fails with
+    /// `InteractionRequired` without any network.
+    fn unsigned_oidc_auth() -> *mut crate::oidc::questdb_oidc_auth {
+        let builder = crate::oidc::questdb_oidc_builder_new();
+        let settings: [(OidcStringSetter, &str); 3] = [
+            (crate::oidc::questdb_oidc_builder_client_id, "questdb-c"),
+            (
+                crate::oidc::questdb_oidc_builder_token_endpoint,
+                "https://idp.example/token",
+            ),
+            (
+                crate::oidc::questdb_oidc_builder_device_authorization_endpoint,
+                "https://idp.example/device",
+            ),
+        ];
+        let mut err: *mut questdb_error = ptr::null_mut();
+        for (set, value) in settings {
+            assert!(unsafe { set(builder, value.as_ptr().cast(), value.len(), &mut err) });
+        }
+        let auth = unsafe { crate::oidc::questdb_oidc_builder_build(builder, &mut err) };
+        unsafe { crate::oidc::questdb_oidc_builder_free(builder) };
+        assert!(!auth.is_null() && err.is_null());
+        auth
+    }
+
+    /// The error the auth in `auth` reports for a token pull.
+    fn oidc_token_failure(auth: *const crate::oidc::questdb_oidc_auth) -> *mut questdb_error {
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let token = unsafe { crate::oidc::questdb_oidc_auth_token(auth, &mut err) };
+        assert!(token.is_null() && !err.is_null());
+        err
+    }
+
+    /// Passes on the failure of the OIDC auth in `user_data`, as a provider
+    /// that delegates to `questdb_oidc_auth_token` does.
+    unsafe extern "C" fn passing_on_get_token(
+        user_data: *mut c_void,
+        sink: *mut questdb_token_sink,
+    ) {
+        let err = oidc_token_failure(user_data.cast_const().cast());
+        assert!(unsafe { questdb_token_sink_set_error_from(sink, err) });
+        unsafe { crate::questdb_error_free(err) };
+    }
+
+    #[test]
+    fn passing_on_an_error_records_a_copy_once() {
+        let auth = unsigned_oidc_auth();
+        let err = oidc_token_failure(auth);
+        let mut sink = questdb_token_sink::for_provider();
+        assert!(!unsafe { questdb_token_sink_set_error_from(&mut sink, ptr::null()) });
+        assert!(!unsafe { questdb_token_sink_set_error_from(ptr::null_mut(), err) });
+        assert!(unsafe { questdb_token_sink_set_error_from(&mut sink, err) });
+        // A second report is refused.
+        assert!(!unsafe { questdb_token_sink_set_error_from(&mut sink, err) });
+        let msg = "reported too late";
+        assert!(!unsafe {
+            questdb_token_sink_set_error(&mut sink, true, -1, msg.as_ptr().cast(), msg.len())
+        });
+        // The caller still owns `error`: the sink holds a copy.
+        let expected = unsafe { &(*err).error }.clone();
+        unsafe { crate::questdb_error_free(err) };
+        let Err(recorded) = sink.take("token provider") else {
+            panic!("no failure was recorded");
+        };
+        assert_eq!(recorded.code(), expected.code());
+        assert_eq!(recorded.msg(), expected.msg());
+        assert_eq!(
+            recorded.oidc_error().map(questdb::oidc::OidcError::kind),
+            Some(questdb::oidc::OidcErrorKind::InteractionRequired)
+        );
+        // A token source's sink takes one too: a failed fetch.
+        let err = oidc_token_failure(auth);
+        let mut sink = questdb_token_sink::for_source();
+        assert!(unsafe { questdb_token_sink_set_error_from(&mut sink, err) });
+        assert!(sink.take("token source").is_err());
+        unsafe { crate::questdb_error_free(err) };
+        unsafe { crate::oidc::questdb_oidc_auth_free(auth) };
+    }
+
+    #[test]
+    fn a_passed_on_oidc_failure_is_classified_like_a_rust_providers() {
+        let auth = unsigned_oidc_auth();
+        // What a Rust provider that passes on the same failure gets.
+        let err = oidc_token_failure(auth);
+        let failure = unsafe { &(*err).error }.clone();
+        unsafe { crate::questdb_error_free(err) };
+        let rust = questdb::egress::ReaderConfig::from_conf("ws::addr=127.0.0.1:1;")
+            .unwrap()
+            .token_provider(move || Err::<String, _>(failure.clone()))
+            .unwrap()
+            .upgrade_headers()
+            .unwrap_err();
+
+        let provider = application_provider_with(passing_on_get_token, auth.cast());
+        let err = transport_failure(provider);
+        assert_eq!(err.code(), rust.code(), "{err}");
+        assert_eq!(err.msg(), rust.msg());
+        // Unclassified, as the OIDC failure itself: `set_error` would have
+        // recorded a classification it does not have.
+        assert_eq!(err.as_token_unavailable(), None, "{err}");
+        assert_eq!(
+            err.oidc_error().map(questdb::oidc::OidcError::kind),
+            Some(questdb::oidc::OidcErrorKind::InteractionRequired),
+            "{err}"
+        );
+        unsafe { questdb_token_provider_free(provider) };
+        unsafe { crate::oidc::questdb_oidc_auth_free(auth) };
+    }
+
+    #[test]
+    fn a_passed_on_sign_in_failure_ends_a_waited_for_connect_at_once() {
+        // Taken for retryable, the failure would be retried for the whole
+        // reconnect budget, as with nobody signed in it can never clear.
+        let conf = "ws::addr=127.0.0.1:1;initial_connect_retry=sync;\
+                    reconnect_max_duration_millis=10000;\
+                    reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;";
+        let auth = unsigned_oidc_auth();
+        let provider = application_provider_with(passing_on_get_token, auth.cast());
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let utf8 = unsafe { crate::line_sender_utf8_assert(conf.len(), conf.as_ptr().cast()) };
+        let opts = unsafe { crate::line_sender_opts_from_conf(utf8, &mut err) };
+        assert!(!opts.is_null());
+        assert!(unsafe { line_sender_opts_token_provider(opts, provider, &mut err) });
+        let started = std::time::Instant::now();
+        let sender = unsafe { crate::line_sender_build(opts, &mut err) };
+        let elapsed = started.elapsed();
+        unsafe { crate::line_sender_opts_free(opts) };
+        unsafe { questdb_token_provider_free(provider) };
+        assert!(sender.is_null() && !err.is_null());
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the connect retried for {elapsed:?}"
+        );
+        let mut view = unsafe { std::mem::zeroed::<crate::oidc::questdb_oidc_error_view>() };
+        view.struct_size = size_of_val(&view);
+        assert!(unsafe { crate::oidc::questdb_error_oidc_get_view(err, &mut view) });
+        assert_eq!(
+            view.kind,
+            crate::oidc::questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED
+        );
+        assert!(!view.acquisition_busy);
+        unsafe { crate::questdb_error_free(err) };
+        unsafe { crate::oidc::questdb_oidc_auth_free(auth) };
     }
 
     /// Publishes one row, returning the error a failed flush reported.

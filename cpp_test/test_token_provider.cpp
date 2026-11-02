@@ -595,6 +595,54 @@ TEST_CASE(
           }) == questdb::error_code::config_error);
 }
 
+TEST_CASE(
+    "A provider passing on an OIDC sign-in failure ends a waited-for "
+    "connect at once")
+{
+    // As with the auth attached directly, and as through a Rust closure that
+    // passes its `OidcError` on, a connect the caller waits for ends at once.
+    // Reported as retryable, the failure was retried for the whole reconnect
+    // budget and reached the caller without its OIDC detail.
+    auto builder = questdb::oidc::builder{};
+    builder.client_id("questdb-cpp")
+        .token_endpoint("https://idp.example/token")
+        .device_authorization_endpoint("https://idp.example/device");
+    auto auth = builder.build();
+    auto app = questdb::token_provider::from(
+        std::make_shared<oidc_delegating_provider>(auth));
+    auto opts = questdb::ingress::opts::from_conf(
+        "ws::addr=127.0.0.1:1;initial_connect_retry=sync;"
+        "reconnect_max_duration_millis=10000;"
+        "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;");
+    opts.token_provider(app);
+    const auto started = std::chrono::steady_clock::now();
+    try
+    {
+        questdb::ingress::line_sender sender{opts};
+        FAIL("connected without a token");
+    }
+    catch (const questdb::ingress::line_sender_error& e)
+    {
+        CHECK(std::chrono::steady_clock::now() - started < 5s);
+        const auto& oidc = e.oidc_diagnostic();
+        REQUIRE(oidc.has_value());
+        CHECK(oidc->kind() == questdb::oidc::error_kind::interaction_required);
+        CHECK_FALSE(oidc->acquisition_busy());
+        CHECK_FALSE(e.token_unavailable_diagnostic().has_value());
+    }
+
+    // A reader pulls the token before it dials, so no server is needed.
+    try
+    {
+        questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", app};
+        FAIL("connected without a token");
+    }
+    catch (const questdb::oidc::error& e)
+    {
+        CHECK(e.kind() == questdb::oidc::error_kind::interaction_required);
+    }
+}
+
 TEST_CASE("A source's invalid_api_call stays retryable")
 {
     // A token source cannot stop its provider's clients: its sink refuses a

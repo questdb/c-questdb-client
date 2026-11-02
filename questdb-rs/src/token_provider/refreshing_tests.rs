@@ -766,6 +766,26 @@ fn the_builder_rejects_an_invalid_configuration() {
     assert!(err.msg().contains("name"), "{err}");
 }
 
+/// The cache is wiped, not just dropped, when a refresh replaces the token or
+/// the provider closes.
+#[cfg(feature = "_oidc")]
+#[test]
+fn a_held_token_is_wiped_in_place() {
+    let mut held = Held {
+        token: "secret-bearer-token".to_string(),
+        expires_at_ms: T0,
+        refresh_at_ms: T0,
+        refresh_due: Duration::ZERO,
+    };
+    let buffer = held.token.as_ptr() as usize;
+    held.scrub();
+    assert!(held.token.is_empty());
+    // The allocation is kept, so its bytes can still be read: all zero.
+    assert_eq!(held.token.as_ptr() as usize, buffer);
+    let bytes = unsafe { std::slice::from_raw_parts(held.token.as_ptr(), held.token.capacity()) };
+    assert!(bytes.iter().all(|&b| b == 0), "{bytes:?}");
+}
+
 #[test]
 fn fmt_instant_renders_utc() {
     assert_eq!(fmt_instant(0), "1970-01-01T00:00:00.000Z");

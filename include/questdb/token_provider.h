@@ -69,6 +69,10 @@
  *   `get_token` callback that knows retrying can never succeed reports it with
  *   `questdb_token_sink_set_terminal_error`, which stops them; a refreshing
  *   provider is stopped with `questdb_token_provider_close`.
+ * - A callback that passes on the failure of another QuestDB token API, such
+ *   as `questdb_oidc_auth_token`, reports it with
+ *   `questdb_token_sink_set_error_from`, which keeps its classification and
+ *   OIDC detail.
  * - `release` runs once, on any thread, when the provider no longer needs
  *   `user_data`. It may run after the call that created the provider returns.
  *   A call that fails (returns NULL) leaves `user_data` with the caller and
@@ -139,7 +143,8 @@ bool questdb_token_sink_set_token(
  * A connect the caller waits for -- the synchronous initial connect, a pool
  * borrow with retry -- retries only a retryable failure. Background reconnects
  * retry either kind; to stop them, a `get_token` callback reports the failure
- * with `questdb_token_sink_set_terminal_error` instead.
+ * with `questdb_token_sink_set_terminal_error` instead. To pass on the failure
+ * of another QuestDB token API, use `questdb_token_sink_set_error_from`.
  *
  * Returns false when `sink` is NULL or a result was already reported.
  */
@@ -173,6 +178,29 @@ bool questdb_token_sink_set_error(
 QUESTDB_CLIENT_API
 bool questdb_token_sink_set_terminal_error(
     questdb_token_sink* sink, const char* msg, size_t msg_len);
+
+/**
+ * Pass on, from a source or `get_token` callback, the failure of another
+ * QuestDB token API -- `questdb_oidc_auth_token` or
+ * `questdb_token_provider_token` -- unchanged. The client handles it exactly
+ * as a Rust provider that returns the same error: it keeps its code, its
+ * classification (`questdb_error_token_unavailable_get_view`) and its OIDC
+ * detail (`questdb_error_oidc_get_view`).
+ *
+ * Use it rather than `questdb_token_sink_set_error`, which records a
+ * classification that an OIDC failure does not have. When the auth needs a new
+ * sign-in, a connect the caller waits for then ends at once, as it does with
+ * the auth attached directly (`line_sender_opts_oidc_auth`), rather than
+ * retrying for its whole budget. An ILP/HTTP flush still resolves the token
+ * again after a transient identity-provider failure, and background
+ * reconnects keep retrying.
+ *
+ * `error` is copied: free it as usual. Returns false, recording nothing, when
+ * `sink` or `error` is NULL or a result was already reported.
+ */
+QUESTDB_CLIENT_API
+bool questdb_token_sink_set_error_from(
+    questdb_token_sink* sink, const questdb_error* error);
 
 /** Fetch a new token: report it with exactly one sink call. */
 typedef void (*questdb_token_source_fn)(

@@ -540,6 +540,27 @@ struct Held {
     refresh_due: Duration,
 }
 
+#[cfg(feature = "_oidc")]
+impl Held {
+    /// Overwrite the token's buffer in place, keeping the allocation.
+    fn scrub(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.token);
+    }
+}
+
+/// The cached token is wiped when a refresh replaces it, on `close()` and when
+/// the provider is dropped, as the OIDC token cache is: dropping the `String`
+/// alone hands its buffer back to the allocator with the token still in it.
+/// `zeroize` comes with the `oidc` feature, which the C ABI library always
+/// enables. The copies handed out are the transient ones the known residual on
+/// `TokenProvider::bearer_header` describes.
+#[cfg(feature = "_oidc")]
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.scrub();
+    }
+}
+
 /// Why a cancellable wait for a token ended without one.
 pub(crate) enum TokenWait {
     /// The caller's cancellation predicate fired.
