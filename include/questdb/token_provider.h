@@ -411,6 +411,13 @@ typedef struct questdb_token_unavailable_view
     bool retryable;
     /** The suggested wait before retrying in milliseconds, -1 for none. */
     int64_t retry_after_ms;
+    /** The failure came from a closed refreshing provider, which fails every
+     *  later request alike: closing it ends every client that uses it. A
+     *  `get_token` callback that passes such a failure on should report it
+     *  with `questdb_token_sink_set_terminal_error`, so that its own clients
+     *  stop too. Appended after the first version: read it only when the
+     *  returned `struct_size` covers it. */
+    bool provider_closed;
 } questdb_token_unavailable_view;
 
 /**

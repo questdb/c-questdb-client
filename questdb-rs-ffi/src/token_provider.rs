@@ -160,11 +160,21 @@ pub struct questdb_token_unavailable_view {
     pub struct_size: size_t,
     pub retryable: bool,
     pub retry_after_ms: i64,
+    /// The failure came from a closed refreshing provider. Appended after v1.
+    pub provider_closed: bool,
 }
 
 const QUESTDB_TOKEN_UNAVAILABLE_VIEW_V1_SIZE: usize =
     std::mem::offset_of!(questdb_token_unavailable_view, retry_after_ms)
         + std::mem::size_of::<i64>();
+
+/// The prefix this library writes: through `provider_closed`, NOT
+/// `size_of::<questdb_token_unavailable_view>()`. That trailing `bool` leaves
+/// padding a field appended later could fit inside without changing `sizeof`,
+/// as for `QUESTDB_OIDC_ERROR_VIEW_SIZE`.
+const QUESTDB_TOKEN_UNAVAILABLE_VIEW_SIZE: usize =
+    std::mem::offset_of!(questdb_token_unavailable_view, provider_closed)
+        + std::mem::size_of::<bool>();
 
 /// The caller's function table, read entry by entry up to its `struct_size`:
 /// an entry appended after the caller's header was published reads as absent.
@@ -1034,13 +1044,14 @@ pub unsafe extern "C" fn questdb_error_token_unavailable_get_view(
     let Some(classification) = error.error.as_token_unavailable() else {
         return false;
     };
-    let value = questdb_token_unavailable_view {
-        struct_size: capacity.min(std::mem::size_of::<questdb_token_unavailable_view>()),
-        retryable: classification.retryable(),
-        retry_after_ms: classification
-            .retry_after()
-            .map_or(-1, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
-    };
+    // Zeroed so the padding copied out with the fields is not stack garbage.
+    let mut value = unsafe { std::mem::zeroed::<questdb_token_unavailable_view>() };
+    value.struct_size = capacity.min(QUESTDB_TOKEN_UNAVAILABLE_VIEW_SIZE);
+    value.retryable = classification.retryable();
+    value.retry_after_ms = classification
+        .retry_after()
+        .map_or(-1, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    value.provider_closed = classification.provider_closed();
     unsafe { write_versioned_output(out, capacity, &value) };
     true
 }
@@ -1139,6 +1150,7 @@ mod tests {
                 struct_size: _,
                 retryable: _,
                 retry_after_ms: _,
+                provider_closed: _,
             } = view;
         }
         assert_eq!(
@@ -1184,7 +1196,12 @@ mod tests {
         );
         assert_eq!(
             c_struct_fields(TOKEN_PROVIDER_H, "questdb_token_unavailable_view"),
-            ["struct_size", "retryable", "retry_after_ms"]
+            [
+                "struct_size",
+                "retryable",
+                "retry_after_ms",
+                "provider_closed"
+            ]
         );
     }
 
@@ -1656,8 +1673,11 @@ mod tests {
         let mut view = unsafe { std::mem::zeroed::<questdb_token_unavailable_view>() };
         view.struct_size = size_of_val(&view);
         assert!(unsafe { questdb_error_token_unavailable_get_view(err, &mut view) });
+        assert_eq!(view.struct_size, QUESTDB_TOKEN_UNAVAILABLE_VIEW_SIZE);
         assert!(!view.retryable);
         assert!(view.retry_after_ms > 0);
+        // A permanent failure is not a closed provider.
+        assert!(!view.provider_closed);
         unsafe { crate::questdb_error_free(err) };
 
         let mut buffer = [0u8; 8];
@@ -1672,6 +1692,17 @@ mod tests {
 
         unsafe { questdb_token_provider_close(provider) };
         assert!(!unsafe { questdb_token_provider_await_ready(provider, 100) });
+        // Once closed, the failure says so: a provider of the application's own
+        // that passes it on can then stop its clients, as closing promises.
+        err = ptr::null_mut();
+        let token = unsafe { questdb_token_provider_token(provider, &mut err) };
+        assert!(token.is_null() && !err.is_null());
+        let mut view = unsafe { std::mem::zeroed::<questdb_token_unavailable_view>() };
+        view.struct_size = size_of_val(&view);
+        assert!(unsafe { questdb_error_token_unavailable_get_view(err, &mut view) });
+        assert!(!view.retryable);
+        assert!(view.provider_closed);
+        unsafe { crate::questdb_error_free(err) };
         unsafe { questdb_token_provider_free(provider) };
     }
 

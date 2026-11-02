@@ -450,6 +450,151 @@ TEST_CASE("A provider's invalid_api_call stops its clients")
           }) == questdb::error_code::socket_error);
 }
 
+namespace
+{
+/** An application provider that passes on another provider's failures. It
+ *  owns its own handle: a client may call it from a worker thread. */
+class delegating_provider : public questdb::bearer_token_provider
+{
+public:
+    explicit delegating_provider(const questdb::token_provider& inner)
+        : _inner{inner.share()}
+    {
+    }
+
+    std::string token() override
+    {
+        return _inner.token();
+    }
+
+private:
+    questdb::token_provider _inner;
+};
+
+/** An application provider that passes on an OIDC auth's failures. */
+class oidc_delegating_provider : public questdb::bearer_token_provider
+{
+public:
+    explicit oidc_delegating_provider(const questdb::oidc::device_auth& auth)
+        : _auth{auth.share()}
+    {
+    }
+
+    std::string token() override
+    {
+        const auto token = _auth.token();
+        return std::string{token.view()};
+    }
+
+private:
+    questdb::oidc::device_auth _auth;
+};
+} // namespace
+
+TEST_CASE("A provider passing on a closed provider's failure stops its clients")
+{
+    // Closing a refreshing provider ends every client that uses it, also
+    // through an application provider that calls its token(), as through a
+    // Rust closure that does.
+    auto inner = questdb::token_provider::refreshing([] {
+        return questdb::expiring_token{
+            "T", std::chrono::system_clock::now() + 1h};
+    });
+    REQUIRE(inner.await_ready(10s));
+    auto app = questdb::token_provider::from(
+        std::make_shared<delegating_provider>(inner));
+    CHECK(app.token() == "T");
+    auto opts = questdb::ingress::opts::from_conf(
+        "ws::addr=127.0.0.1:1;initial_connect_retry=async;"
+        "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;");
+    opts.token_provider(app);
+    questdb::ingress::line_sender sender{opts};
+    inner.close();
+
+    try
+    {
+        (void)inner.token();
+        FAIL("a closed provider served a token");
+    }
+    catch (const questdb::error& e)
+    {
+        const auto& classification = e.token_unavailable_diagnostic();
+        REQUIRE(classification.has_value());
+        CHECK(classification->provider_closed);
+        CHECK_FALSE(classification->retryable);
+    }
+    // A direct pull reports the terminal failure unclassified, as for an
+    // application provider's own invalid_api_call.
+    try
+    {
+        (void)app.token();
+        FAIL("expected a failure");
+    }
+    catch (const questdb::error& e)
+    {
+        CHECK(e.code() == questdb::error_code::invalid_api_call);
+    }
+    // A reader pulls the token before it dials, so no server is needed.
+    CHECK(attach_error_code([&] {
+              questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", app};
+          }) == questdb::error_code::config_error);
+    // The sender's background connect stops instead of retrying for good.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (!sender.must_close() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(5ms);
+    CHECK(sender.must_close());
+}
+
+TEST_CASE("A provider passing on a classified failure keeps the classification")
+{
+    questdb::refreshing_token_provider_options options;
+    options.cold_wait = 50ms;
+    auto inner = questdb::token_provider::refreshing(
+        []() -> questdb::expiring_token {
+            throw questdb::token_unavailable{
+                "identity not assigned", false, 2500ms};
+        },
+        options);
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (!inner.status()->last_failure &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(1ms);
+    REQUIRE(inner.status()->last_failure.has_value());
+    auto app = questdb::token_provider::from(
+        std::make_shared<delegating_provider>(inner));
+    try
+    {
+        (void)app.token();
+        FAIL("expected a failure");
+    }
+    catch (const questdb::error& e)
+    {
+        // Not re-reported as retryable: a connect the caller waits for ends at
+        // once on it, as for the refreshing provider attached directly.
+        const auto& classification = e.token_unavailable_diagnostic();
+        REQUIRE(classification.has_value());
+        CHECK_FALSE(classification->retryable);
+        CHECK_FALSE(classification->provider_closed);
+        CHECK(classification->retry_after.has_value());
+    }
+}
+
+TEST_CASE(
+    "A provider passing on a closed OIDC auth's failure stops its clients")
+{
+    auto builder = questdb::oidc::builder{};
+    builder.client_id("questdb-cpp")
+        .token_endpoint("https://idp.example/token")
+        .device_authorization_endpoint("https://idp.example/device");
+    auto auth = builder.build();
+    auto app = questdb::token_provider::from(
+        std::make_shared<oidc_delegating_provider>(auth));
+    auth.close();
+    CHECK(attach_error_code([&] {
+              questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", app};
+          }) == questdb::error_code::config_error);
+}
+
 TEST_CASE("A source's invalid_api_call stays retryable")
 {
     // A token source cannot stop its provider's clients: its sink refuses a

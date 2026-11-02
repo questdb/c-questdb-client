@@ -146,6 +146,11 @@ struct token_unavailable_info
 
     /** How long the source suggested waiting before retrying, if it said. */
     std::optional<std::chrono::milliseconds> retry_after{};
+
+    /** Whether the failure came from a closed refreshing provider, which
+     *  fails every later request alike: closing it ends every client that
+     *  uses it. */
+    bool provider_closed{false};
 };
 
 /**
@@ -243,6 +248,11 @@ protected:
         info.retryable = view.retryable;
         if (view.retry_after_ms >= 0)
             info.retry_after = std::chrono::milliseconds{view.retry_after_ms};
+        // Appended after the first view: an older library does not write it.
+        if (view.struct_size >=
+            offsetof(::questdb_token_unavailable_view, provider_closed) +
+                sizeof view.provider_closed)
+            info.provider_closed = view.provider_closed;
         return info;
     }
 

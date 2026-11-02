@@ -58,10 +58,11 @@ struct expiring_token
  * Throw from a token source or a `bearer_token_provider` to classify a
  * failure: whether retrying can succeed (network failures, timeouts, 429 and
  * 5xx are retryable; missing or wrong configuration is not), and a suggested
- * wait. Any other exception counts as retryable, except a
- * `questdb::error` with `error_code::invalid_api_call` thrown from
- * `bearer_token_provider::token()`, which stops background reconnects (see
- * there). Never put a token in the message.
+ * wait. A `questdb::error` that carries a classification, such as one thrown
+ * by `token_provider::token()`, keeps it. Any other exception counts as
+ * retryable, except the failures `bearer_token_provider::token()` lists as
+ * stopping background reconnects (see there). Never put a token in the
+ * message.
  */
 class token_unavailable : public std::runtime_error
 {
@@ -114,6 +115,14 @@ public:
      * reader or pool then reports `config_error` and stops reconnecting, and
      * an ILP/HTTP flush fails with it at once. A token source cannot do this;
      * close a refreshing provider instead.
+     *
+     * Letting the error of another QuestDB token API escape stops them the
+     * same way when that error cannot clear either, as for a Rust provider
+     * that returns it: the failure of a closed `token_provider` (closing one
+     * ends every client that uses it, through this provider too), and an
+     * `oidc::error` of kind `cancelled` (a closed `oidc::device_auth`) or
+     * `config`. Any other such error keeps its classification
+     * (`questdb::error::token_unavailable_diagnostic()`).
      */
     virtual std::string token() = 0;
 
@@ -202,6 +211,33 @@ inline bool set_sink_terminal_error(
     return ::questdb_token_sink_set_terminal_error(sink, msg, std::strlen(msg));
 }
 
+/**
+ * Report a QuestDB error through `sink`, as a Rust provider that returns it
+ * is classified (`classify_provider_error`): a failure retrying can never
+ * clear (`terminal`) as terminal, anything else with the classification it
+ * carries, and as retryable when it carries none. A token source's sink
+ * refuses a terminal failure, which then counts as its classification says.
+ */
+inline void report_questdb_error(
+    ::questdb_token_sink* sink,
+    const ::questdb::error& e,
+    bool terminal) noexcept
+{
+    if (terminal && set_sink_terminal_error(sink, e.what()))
+        return;
+    const auto& classification = e.token_unavailable_diagnostic();
+    if (!classification)
+    {
+        set_sink_error(sink, true, -1, e.what());
+        return;
+    }
+    set_sink_error(
+        sink,
+        classification->retryable,
+        classification->retry_after ? classification->retry_after->count() : -1,
+        e.what());
+}
+
 /** Report the exception being handled through `sink`. */
 inline void report_current_exception(::questdb_token_sink* sink) noexcept
 {
@@ -217,14 +253,28 @@ inline void report_current_exception(::questdb_token_sink* sink) noexcept
             e.retry_after() ? e.retry_after()->count() : -1,
             e.what());
     }
+    catch (const ::questdb::oidc::error& e)
+    {
+        // A closed `oidc::device_auth` (`cancelled`) and a misconfiguration
+        // (`config`) fail every later request alike, as for a Rust provider.
+        report_questdb_error(
+            sink,
+            e,
+            e.code() == ::questdb::error_code::invalid_api_call ||
+                e.kind() == ::questdb::oidc::error_kind::cancelled ||
+                e.kind() == ::questdb::oidc::error_kind::config);
+    }
     catch (const ::questdb::error& e)
     {
         // `invalid_api_call` is a failure retrying can never clear, as for a
-        // Rust provider. A token source's sink refuses it, and it then counts
-        // as retryable like any other exception.
-        if (e.code() != ::questdb::error_code::invalid_api_call ||
-            !set_sink_terminal_error(sink, e.what()))
-            set_sink_error(sink, true, -1, e.what());
+        // Rust provider, and so is a closed provider's: closing one ends every
+        // client that uses it, through this application provider too.
+        const auto& classification = e.token_unavailable_diagnostic();
+        report_questdb_error(
+            sink,
+            e,
+            e.code() == ::questdb::error_code::invalid_api_call ||
+                (classification && classification->provider_closed));
     }
     catch (const std::exception& e)
     {

@@ -374,8 +374,9 @@ impl TokenUnavailable {
     }
 
     /// Whether the provider was closed. A closed provider never supplies a
-    /// token again, so every client using it stops reconnecting.
-    pub(crate) fn provider_closed(&self) -> bool {
+    /// token again, so every client using it stops reconnecting, including a
+    /// client whose own provider passes this failure on.
+    pub fn provider_closed(&self) -> bool {
         self.provider_closed
     }
 }
