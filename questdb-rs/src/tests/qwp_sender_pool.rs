@@ -5038,13 +5038,15 @@ fn direct_column_sender_local_durable_wait_completes_on_keepalive_ping() {
 }
 
 /// Two durable commits to one table on the same pooled direct connection: the
-/// second one completes only if the table's durable watermark keeps advancing.
+/// second one completes only if the table's durable watermark keeps advancing,
+/// and it must wait for its own durable ack, not return on the OK. The mock
+/// sends durable acks only in reply to a PING, so each commit must send one.
 fn check_second_durable_commit_on_one_connection(
     tier: MockDurableTier,
     request_durable_ack: &str,
     level: AckLevel,
 ) {
-    let (server, _frames, _pings) = MockServer::spawn_acking_durable_capturing(1, tier);
+    let (server, _frames, pings) = MockServer::spawn_acking_durable_capturing(1, tier);
     let db = QuestDb::connect(&conf_for(
         server.port(),
         &format!("pool_reap=manual;request_durable_ack={request_durable_ack};"),
@@ -5056,6 +5058,7 @@ fn check_second_durable_commit_on_one_connection(
         let ts = [1 + commit];
         let mut chunk = one_i64_row("trades", &val, &ts);
         let started = Instant::now();
+        let pings_before = pings.load(Ordering::SeqCst);
         sender
             .flush_and_wait(&mut chunk, level)
             .unwrap_or_else(|e| panic!("durable commit {commit} failed: {}", e.msg()));
@@ -5063,6 +5066,10 @@ fn check_second_durable_commit_on_one_connection(
             started.elapsed() < Duration::from_secs(10),
             "durable commit {commit} took {:?}",
             started.elapsed()
+        );
+        assert!(
+            pings.load(Ordering::SeqCst) > pings_before,
+            "durable commit {commit} returned without waiting for its durable ack"
         );
     }
 }
