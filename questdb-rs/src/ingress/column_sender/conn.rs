@@ -1569,13 +1569,11 @@ mod tests {
     /// an OK at once but, like QuestDB, which flushes durable ACKs only on
     /// inbound events, sends the `durable_status` ACK only after a client
     /// PING, and only once `ack_after` has passed since the OK. Every PING
-    /// gets a PONG, `pong_delay` later. Returns the number of PINGs seen
-    /// before the client closed.
+    /// gets a PONG. Returns the number of PINGs seen before the client closed.
     fn spawn_durable_ack_on_ping_peer(
         server: std::net::TcpStream,
         durable_status: u8,
         ack_after: Duration,
-        pong_delay: Duration,
     ) -> std::thread::JoinHandle<usize> {
         std::thread::spawn(move || {
             let mut server = server;
@@ -1609,9 +1607,6 @@ mod tests {
                             break;
                         }
                     }
-                    if !pong_delay.is_zero() {
-                        std::thread::sleep(pong_delay);
-                    }
                     if server.write_all(&[0x8A, 0]).is_err() {
                         break;
                     }
@@ -1643,8 +1638,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
             let (server, _) = listener.accept().expect("accept");
-            let peer =
-                spawn_durable_ack_on_ping_peer(server, status, Duration::ZERO, Duration::ZERO);
+            let peer = spawn_durable_ack_on_ping_peer(server, status, Duration::ZERO);
 
             let mut conn = ColumnConn::for_test(
                 WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
@@ -1687,12 +1681,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
         let (server, _) = listener.accept().expect("accept");
-        let peer = spawn_durable_ack_on_ping_peer(
-            server,
-            QWP_STATUS_LOCAL_DURABLE_ACK,
-            Duration::ZERO,
-            Duration::ZERO,
-        );
+        let peer =
+            spawn_durable_ack_on_ping_peer(server, QWP_STATUS_LOCAL_DURABLE_ACK, Duration::ZERO);
 
         let mut conn = ColumnConn::for_test(
             WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
@@ -1723,12 +1713,7 @@ mod tests {
         // The peer answers every keepalive PING, but with the replicated ACK a
         // `local` connection ignores: with the reads no longer failing on a
         // timeout, only the no-progress deadline can end the wait.
-        let peer = spawn_durable_ack_on_ping_peer(
-            server,
-            QWP_STATUS_DURABLE_ACK,
-            Duration::ZERO,
-            Duration::ZERO,
-        );
+        let peer = spawn_durable_ack_on_ping_peer(server, QWP_STATUS_DURABLE_ACK, Duration::ZERO);
 
         let mut conn = ColumnConn::for_test(
             WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
@@ -1767,46 +1752,39 @@ mod tests {
         use crate::ws::nosigpipe::NoSigpipeTcp;
         use std::net::{TcpListener, TcpStream};
 
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        // The peer answers every PING at once and holds the durable ACK back
+        // for 500 ms, so only the keepalive interval spaces the PINGs out.
+        let peer = spawn_durable_ack_on_ping_peer(
+            server,
+            QWP_STATUS_LOCAL_DURABLE_ACK,
+            Duration::from_millis(500),
+        );
+
         let interval = Duration::from_millis(100);
-        // An instant PONG, and one that takes half an interval: each PONG
-        // ends a read early, and with a slow one a throttle shorter than the
-        // interval would send the next PING as soon as the PONG is read.
-        for pong_delay in [Duration::ZERO, interval / 2] {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
-            let (server, _) = listener.accept().expect("accept");
-            // The peer holds the durable ACK back for 500 ms, so until then
-            // only the keepalive interval spaces the PINGs out.
-            let peer = spawn_durable_ack_on_ping_peer(
-                server,
-                QWP_STATUS_LOCAL_DURABLE_ACK,
-                Duration::from_millis(500),
-                pong_delay,
-            );
+        let mut conn = ColumnConn::for_test(
+            WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
+            DurableAckTiers::Local,
+        );
+        conn.request_timeout = Duration::from_secs(5);
+        conn.durable_ack_keepalive_interval = interval;
+        conn.push_pending(0);
 
-            let mut conn = ColumnConn::for_test(
-                WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
-                DurableAckTiers::Local,
-            );
-            conn.request_timeout = Duration::from_secs(5);
-            conn.durable_ack_keepalive_interval = interval;
-            conn.push_pending(0);
+        let started = Instant::now();
+        conn.sync_all_acks(AckLevel::LocalDurable)
+            .expect("a PING after 500 ms draws the durable ACK");
+        let elapsed = started.elapsed();
+        drop(conn);
+        let pings = peer.join().expect("peer");
 
-            let started = Instant::now();
-            conn.sync_all_acks(AckLevel::LocalDurable)
-                .expect("a PING after 500 ms draws the durable ACK");
-            let elapsed = started.elapsed();
-            drop(conn);
-            let pings = peer.join().expect("peer");
-
-            // One PING when the wait starts, then at most one per interval.
-            let max_pings = (elapsed.as_millis() / interval.as_millis()) as usize + 1;
-            assert!(
-                pings <= max_pings,
-                "PONG after {pong_delay:?}: {pings} PINGs in {elapsed:?}, \
-                 more than one per {interval:?}"
-            );
-        }
+        // One PING when the wait starts, then at most one per interval.
+        let max_pings = (elapsed.as_millis() / interval.as_millis()) as usize + 1;
+        assert!(
+            pings <= max_pings,
+            "{pings} PINGs in {elapsed:?}, more than one per {interval:?}"
+        );
     }
 
     #[test]

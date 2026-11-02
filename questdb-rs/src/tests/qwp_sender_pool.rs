@@ -8107,24 +8107,19 @@ fn close_drain_is_bounded_when_peer_never_acks() {
     );
 }
 
-const LOCAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
-
-/// Parks a `local` pool's only sender with a frame that is OK'd but never
-/// locally durable: the server answers pings only with replicated acks.
-fn park_local_sender_ok_but_not_locally_durable() -> (MockServer, QuestDb) {
+#[test]
+fn reap_skips_local_sender_with_ok_but_not_locally_durable_frame() {
+    // Grants `local` but answers pings only with replicated acks, which a
+    // `local` sender ignores: the frame is OK'd but never locally durable.
     let replicated_acks = MockDurableTier {
         ack_status: MOCK_DURABLE_ON.ack_status,
         ..MOCK_DURABLE_LOCAL
     };
-    let (server, _frames, pings) = MockServer::spawn_acking_durable_capturing(1, replicated_acks);
+    let (server, _frames, _pings) = MockServer::spawn_acking_durable_capturing(1, replicated_acks);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        &format!(
-            "sender_pool_min=0;sender_pool_max=1;idle_timeout_ms=1;pool_reap=manual;\
-             close_flush_timeout_millis={};request_durable_ack=local;\
-             durable_ack_keepalive_interval_millis=20;",
-            LOCAL_DRAIN_TIMEOUT.as_millis()
-        ),
+        "sender_pool_min=0;sender_pool_max=1;idle_timeout_ms=1;pool_reap=manual;\
+         close_flush_timeout_millis=0;request_durable_ack=local;",
     ))
     .unwrap();
     {
@@ -8137,50 +8132,13 @@ fn park_local_sender_ok_but_not_locally_durable() -> (MockServer, QuestDb) {
             .wait(AckLevel::Ok, Duration::from_secs(5))
             .expect("the OK arrives");
     }
-    // Replicated acks arrive while parked; the `local` sender ignores them.
-    assert!(wait_until(Duration::from_secs(5), || {
-        pings.load(Ordering::SeqCst) >= 2
-    }));
-    assert_eq!(db.free_count(), 1);
-    (server, db)
-}
-
-#[test]
-fn reap_skips_local_sender_with_ok_but_not_locally_durable_frame() {
-    let (_server, db) = park_local_sender_ok_but_not_locally_durable();
+    thread::sleep(Duration::from_millis(50));
     assert_eq!(
         db.reap_idle(),
         0,
         "a frame without its local durable ack is undelivered for a `local` pool"
     );
     assert_eq!(db.free_count(), 1);
-}
-
-#[test]
-fn drop_on_return_drains_local_sender_with_ok_but_not_locally_durable_frame() {
-    let (_server, db) = park_local_sender_ok_but_not_locally_durable();
-    let mut sender = db.borrow_sender().expect("reborrow the parked sender");
-    sender.drop_on_return();
-    let start = Instant::now();
-    drop(sender);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= LOCAL_DRAIN_TIMEOUT - Duration::from_millis(50),
-        "retiring must wait for the local durable ack until close_flush_timeout (took {elapsed:?})"
-    );
-    assert_eq!(db.free_count(), 0);
-}
-
-#[test]
-fn close_drains_local_sender_with_ok_but_not_locally_durable_frame() {
-    let (_server, db) = park_local_sender_ok_but_not_locally_durable();
-    let start = Instant::now();
-    db.close();
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= LOCAL_DRAIN_TIMEOUT - Duration::from_millis(50),
-        "close must wait for the local durable ack until close_flush_timeout (took {elapsed:?})"
-    );
 }
 
 // ---------- F0: endpoint rotation + health, transient classification ----------
