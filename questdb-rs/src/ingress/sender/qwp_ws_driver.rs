@@ -899,20 +899,15 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     self.complete_ack_through(store, wire_seq)
                 }
             }
-            TransportResponse::DurableAck { table_seq_txns } => {
+            TransportResponse::DurableAck {
+                table_seq_txns,
+                local,
+            } => {
                 store.counters.total_acks += 1;
                 let Some(tracker) = self.durable_ack.as_mut() else {
                     return Ok(DriveOutcome::Idle);
                 };
-                tracker.apply_ack(table_seq_txns, false);
-                self.complete_ready_durable(store)
-            }
-            TransportResponse::LocalDurableAck { table_seq_txns } => {
-                store.counters.total_acks += 1;
-                let Some(tracker) = self.durable_ack.as_mut() else {
-                    return Ok(DriveOutcome::Idle);
-                };
-                tracker.apply_ack(table_seq_txns, true);
+                tracker.apply_ack(table_seq_txns, local);
                 self.complete_ready_durable(store)
             }
             TransportResponse::Reject { wire_seq, error } => {
@@ -1709,12 +1704,12 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         progress: &SfaProgressView,
         table_seq_txns: Vec<TableSeqTxn>,
-        is_local: bool,
+        local: bool,
     ) -> Result<QwpWsHotResponseProgress, DriverError> {
         let Some(tracker) = self.durable_ack.as_mut() else {
             return Ok(QwpWsHotResponseProgress::idle());
         };
-        tracker.apply_ack(table_seq_txns, is_local);
+        tracker.apply_ack(table_seq_txns, local);
         self.complete_ready_durable_sfa(progress)
     }
 
@@ -3337,7 +3332,7 @@ fn decode_transport_response(
         Ok(PipelinedResponse::Ok { sequence }) => {
             Ok(Some(TransportResponse::Ack { wire_seq: sequence }))
         }
-        Ok(PipelinedResponse::DurableAck | PipelinedResponse::LocalDurableAck) => Ok(None),
+        Ok(PipelinedResponse::DurableAck { .. }) => Ok(None),
         Ok(PipelinedResponse::Error(error)) => {
             let wire_seq = error.sequence;
             let server_error = QwpServerError::from(error);
@@ -3366,12 +3361,10 @@ fn decode_durable_transport_response(
             wire_seq: sequence,
             table_seq_txns,
         })),
-        Ok(PipelinedResponse::DurableAck) => {
-            Ok(Some(TransportResponse::DurableAck { table_seq_txns }))
-        }
-        Ok(PipelinedResponse::LocalDurableAck) => {
-            Ok(Some(TransportResponse::LocalDurableAck { table_seq_txns }))
-        }
+        Ok(PipelinedResponse::DurableAck { local }) => Ok(Some(TransportResponse::DurableAck {
+            table_seq_txns,
+            local,
+        })),
         Ok(PipelinedResponse::Error(error)) => {
             let wire_seq = error.sequence;
             let server_error = QwpServerError::from(error);
@@ -3833,9 +3826,7 @@ pub(crate) enum TransportResponse {
     },
     DurableAck {
         table_seq_txns: Vec<TableSeqTxn>,
-    },
-    LocalDurableAck {
-        table_seq_txns: Vec<TableSeqTxn>,
+        local: bool,
     },
     Reject {
         wire_seq: u64,
@@ -3919,8 +3910,8 @@ impl DurableAckTracker {
         });
     }
 
-    fn apply_ack(&mut self, table_seq_txns: Vec<TableSeqTxn>, is_local: bool) {
-        if is_local != self.trim_on_local {
+    fn apply_ack(&mut self, table_seq_txns: Vec<TableSeqTxn>, local: bool) {
+        if local != self.trim_on_local {
             return;
         }
         for entry in table_seq_txns {
@@ -7002,7 +6993,8 @@ mod tests {
         assert_eq!(
             decode_durable_transport_response(&durable_ack_payload).unwrap(),
             Some(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("table_a", 42), ("table_b", 99)])
+                table_seq_txns: table_seq_txns(&[("table_a", 42), ("table_b", 99)]),
+                local: false,
             })
         );
 
@@ -7010,8 +7002,9 @@ mod tests {
         append_table_seq_txns(&mut local_ack_payload, &[("table_a", 43)]);
         assert_eq!(
             decode_durable_transport_response(&local_ack_payload).unwrap(),
-            Some(TransportResponse::LocalDurableAck {
-                table_seq_txns: table_seq_txns(&[("table_a", 43)])
+            Some(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("table_a", 43)]),
+                local: true,
             })
         );
     }
@@ -7184,6 +7177,7 @@ mod tests {
                 Ok(TransportPoll::Progress),
                 Ok(TransportPoll::Response(TransportResponse::DurableAck {
                     table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                    local: false,
                 })),
                 Ok(TransportPoll::Idle),
             ])
@@ -7270,6 +7264,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7313,6 +7308,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7391,6 +7387,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7474,6 +7471,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7522,6 +7520,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("b", 20)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(driver.acked_fsn(), None);
@@ -7531,6 +7530,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("a", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7578,6 +7578,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7614,6 +7615,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -7634,6 +7636,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 9)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -7649,6 +7652,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 12)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7675,6 +7679,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
 
@@ -7715,6 +7720,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -7745,6 +7751,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 12)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -7880,6 +7887,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         driver
             .send_core
@@ -7893,6 +7901,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+                local: false,
             });
 
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
@@ -7975,6 +7984,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         driver
             .send_core
@@ -8216,6 +8226,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         driver
             .send_core
@@ -8229,6 +8240,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -8316,6 +8328,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         driver
             .send_core
@@ -8329,6 +8342,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(

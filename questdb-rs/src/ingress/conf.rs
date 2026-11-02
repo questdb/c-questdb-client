@@ -272,30 +272,22 @@ impl DurableAckTiers {
     /// Parse a `request_durable_ack` value, with the error both the sender
     /// builder and the pool's connect-string check report.
     pub(crate) fn parse_conf(value: &str) -> Result<Self> {
-        Self::parse(value).ok_or_else(|| {
-            crate::error::fmt!(
+        let is = |name: &str| value.trim().eq_ignore_ascii_case(name);
+        if is("off") {
+            Ok(Self::Off)
+        } else if is("on") {
+            Ok(Self::LegacyReplicated)
+        } else if is("local") {
+            Ok(Self::Local)
+        } else if is("replicated") {
+            Ok(Self::Replicated)
+        } else if is("local,replicated") || is("replicated,local") {
+            Ok(Self::LocalAndReplicated)
+        } else {
+            Err(crate::error::fmt!(
                 ConfigError,
                 "invalid request_durable_ack [value={value}, allowed-values=[on, off, local, replicated, local,replicated]]"
-            )
-        })
-    }
-
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        let value = value.trim();
-        if value.eq_ignore_ascii_case("off") {
-            Some(Self::Off)
-        } else if value.eq_ignore_ascii_case("on") {
-            Some(Self::LegacyReplicated)
-        } else if value.eq_ignore_ascii_case("local") {
-            Some(Self::Local)
-        } else if value.eq_ignore_ascii_case("replicated") {
-            Some(Self::Replicated)
-        } else if value.eq_ignore_ascii_case("local,replicated")
-            || value.eq_ignore_ascii_case("replicated,local")
-        {
-            Some(Self::LocalAndReplicated)
-        } else {
-            None
+            ))
         }
     }
 
@@ -318,9 +310,7 @@ impl DurableAckTiers {
         match self {
             Self::Off => None,
             Self::LegacyReplicated => Some("true"),
-            Self::Local => Some("local"),
-            Self::Replicated => Some("replicated"),
-            Self::LocalAndReplicated => Some("local,replicated"),
+            _ => Some(self.config_value()),
         }
     }
 
@@ -367,9 +357,7 @@ impl DurableAckTiers {
         match self {
             Self::Off => None,
             Self::LegacyReplicated => Some("enabled"),
-            Self::Local => Some("local"),
-            Self::Replicated => Some("replicated"),
-            Self::LocalAndReplicated => Some("local,replicated"),
+            _ => Some(self.config_value()),
         }
     }
 }

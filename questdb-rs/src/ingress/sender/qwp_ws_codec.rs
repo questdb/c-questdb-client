@@ -297,8 +297,7 @@ pub(super) struct PipelinedError {
 
 pub(super) enum PipelinedResponse {
     Ok { sequence: u64 },
-    DurableAck,
-    LocalDurableAck,
+    DurableAck { local: bool },
     Error(PipelinedError),
 }
 
@@ -306,7 +305,6 @@ pub(super) enum PipelinedResponse {
 pub(super) enum PipelinedTableEntryKind {
     Ok,
     DurableAck,
-    LocalDurableAck,
 }
 
 pub(super) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<PipelinedResponse> {
@@ -340,27 +338,20 @@ pub(super) fn parse_pipelined_response_with_table_handler(
             Ok(PipelinedResponse::Ok { sequence: seq })
         }
         WS_STATUS_DURABLE_ACK | WS_STATUS_LOCAL_DURABLE_ACK => {
-            let is_local = status == WS_STATUS_LOCAL_DURABLE_ACK;
+            let local = status == WS_STATUS_LOCAL_DURABLE_ACK;
+            let context = if local {
+                "QWP local durable ACK response"
+            } else {
+                "QWP durable ACK response"
+            };
             handle_table_seq_txn_entries(
                 payload,
                 1,
-                if is_local {
-                    "QWP local durable ACK response"
-                } else {
-                    "QWP durable ACK response"
-                },
-                if is_local {
-                    PipelinedTableEntryKind::LocalDurableAck
-                } else {
-                    PipelinedTableEntryKind::DurableAck
-                },
+                context,
+                PipelinedTableEntryKind::DurableAck,
                 on_table_entry,
             )?;
-            Ok(if is_local {
-                PipelinedResponse::LocalDurableAck
-            } else {
-                PipelinedResponse::DurableAck
-            })
+            Ok(PipelinedResponse::DurableAck { local })
         }
         _ => {
             let (sequence, msg) = parse_error_body(payload)?;
@@ -904,7 +895,7 @@ mod tests {
             Ok(())
         };
         match parse_pipelined_response_with_table_handler(&payload, Some(&mut handler)).unwrap() {
-            PipelinedResponse::DurableAck => {
+            PipelinedResponse::DurableAck { local: false } => {
                 assert_eq!(
                     table_seq_txns,
                     vec![(
@@ -930,12 +921,12 @@ mod tests {
         };
         assert!(matches!(
             parse_pipelined_response_with_table_handler(&payload, Some(&mut handler)).unwrap(),
-            PipelinedResponse::LocalDurableAck
+            PipelinedResponse::DurableAck { local: true }
         ));
         assert_eq!(
             table_seq_txns,
             vec![(
-                PipelinedTableEntryKind::LocalDurableAck,
+                PipelinedTableEntryKind::DurableAck,
                 "wal_table".to_string(),
                 321
             )]

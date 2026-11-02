@@ -1465,21 +1465,14 @@ where
                     Err(err) => self.store_shared_driver_error(shared, err),
                 }
             }
-            TransportResponse::DurableAck { table_seq_txns } => {
+            TransportResponse::DurableAck {
+                table_seq_txns,
+                local,
+            } => {
                 match self.send_core.finish_durable_ack_response_sfa(
                     &self.progress,
                     table_seq_txns,
-                    false,
-                ) {
-                    Ok(progress) => self.finish_hot_response_progress(shared, progress),
-                    Err(err) => self.store_shared_driver_error(shared, err),
-                }
-            }
-            TransportResponse::LocalDurableAck { table_seq_txns } => {
-                match self.send_core.finish_durable_ack_response_sfa(
-                    &self.progress,
-                    table_seq_txns,
-                    true,
+                    local,
                 ) {
                     Ok(progress) => self.finish_hot_response_progress(shared, progress),
                     Err(err) => self.store_shared_driver_error(shared, err),
@@ -5714,6 +5707,7 @@ mod tests {
             if self.ack_ready.swap(false, Ordering::AcqRel) {
                 Ok(TransportPoll::Response(TransportResponse::DurableAck {
                     table_seq_txns: Self::table_seq_txns(),
+                    local: false,
                 }))
             } else {
                 Ok(TransportPoll::Idle)

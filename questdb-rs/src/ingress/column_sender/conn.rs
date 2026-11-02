@@ -489,7 +489,19 @@ impl ColumnConn {
             }
         }
 
-        if matches!(ack_level, AckLevel::Durable | AckLevel::LocalDurable) {
+        if matches!(ack_level, AckLevel::Durable | AckLevel::LocalDurable)
+            && !self.durability_satisfied()
+        {
+            // Cap each read at one keepalive interval; see
+            // `recv_durable_response`. Every error in the loop latches the
+            // connection, so only the success path restores `request_timeout`.
+            let keepalive = self.durable_ack_keepalive_interval;
+            if !keepalive.is_zero() {
+                self.set_timeouts(
+                    Some(keepalive.min(self.request_timeout)),
+                    Some(self.request_timeout),
+                )?;
+            }
             let mut deadline_anchor = Instant::now();
             let mut last_mark = self.durable_progress_mark();
             while !self.durability_satisfied() {
@@ -507,6 +519,9 @@ impl ColumnConn {
                         self.request_timeout
                     )));
                 }
+            }
+            if !keepalive.is_zero() {
+                self.set_timeouts(Some(self.request_timeout), Some(self.request_timeout))?;
             }
         }
 
@@ -601,12 +616,8 @@ impl ColumnConn {
                 })?;
                 Ok(())
             }
-            QwpResponse::DurableAck { tables } => {
-                self.apply_durable_watermarks(tables, false);
-                Ok(())
-            }
-            QwpResponse::LocalDurableAck { tables } => {
-                self.apply_durable_watermarks(tables, true);
+            QwpResponse::DurableAck { tables, local } => {
+                self.apply_durable_watermarks(tables, local);
                 Ok(())
             }
             QwpResponse::Error {
@@ -626,8 +637,8 @@ impl ColumnConn {
         }
     }
 
-    fn apply_durable_watermarks(&mut self, tables: Vec<(String, i64)>, is_local: bool) {
-        if is_local != self.durable_ack_tiers.trims_on_local() {
+    fn apply_durable_watermarks(&mut self, tables: Vec<(String, i64)>, local: bool) {
+        if local != self.durable_ack_tiers.trims_on_local() {
             return;
         }
         for (table, seq_txn) in tables {
@@ -892,14 +903,33 @@ impl ColumnConn {
 
     /// Read at least one more byte from the socket into `leftover`.
     fn fill_leftover(&mut self) -> Result<()> {
+        self.read_into_leftover(false).map(|_| ())
+    }
+
+    /// Read at least one more byte from the socket into `leftover`. With
+    /// `timeout_is_idle`, a read timeout returns `Ok(false)` instead of
+    /// latching the connection.
+    fn read_into_leftover(&mut self, timeout_is_idle: bool) -> Result<bool> {
         let mut chunk = [0u8; 1024];
-        let n = self.stream.read(&mut chunk).map_err(|e| {
-            self.latch(error::fmt!(
-                SocketError,
-                "QWP/WebSocket socket read failed: {}",
-                e
-            ))
-        })?;
+        let n = match self.stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e)
+                if timeout_is_idle
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                return Ok(false);
+            }
+            Err(e) => {
+                return Err(self.latch(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket socket read failed: {}",
+                    e
+                )));
+            }
+        };
         if n == 0 {
             return Err(self.latch(error::fmt!(
                 SocketError,
@@ -907,7 +937,7 @@ impl ColumnConn {
             )));
         }
         self.leftover.extend_from_slice(&chunk[..n]);
-        Ok(())
+        Ok(true)
     }
 
     /// Wait for the next QWP response during a durable sync.
@@ -915,10 +945,10 @@ impl ColumnConn {
     /// The server flushes durable ACKs only on inbound events, so a client
     /// that just blocks on the socket waits out the no-progress deadline
     /// even when its data is already durable. Like the row sender, send an
-    /// empty PING once per `durable_ack_keepalive_interval` and wait at most
-    /// that long for each read. Returns `None` when the wait ends without a
-    /// complete QWP frame so the caller can check its deadline. A zero
-    /// interval keeps the plain blocking read.
+    /// empty PING once per `durable_ack_keepalive_interval`; `sync_all_acks`
+    /// caps each read at that interval. Returns `None` when a read ends
+    /// without a complete QWP frame so the caller can check its deadline. A
+    /// zero interval keeps the plain blocking read.
     fn recv_durable_response(&mut self) -> Result<Option<QwpResponse>> {
         let interval = self.durable_ack_keepalive_interval;
         if interval.is_zero() {
@@ -934,47 +964,10 @@ impl ColumnConn {
             self.send_control_frame(Opcode::Ping, 0)?;
             self.last_durable_keepalive_ping = Some(Instant::now());
         }
-        let wait = if self.request_timeout.is_zero() {
-            interval
-        } else {
-            interval.min(self.request_timeout)
-        };
-        self.set_timeouts(Some(wait), Some(self.request_timeout))?;
-        let filled = self.fill_leftover_within_timeout();
-        self.set_timeouts(Some(self.request_timeout), Some(self.request_timeout))?;
-        if !filled? {
+        if !self.read_into_leftover(true)? {
             return Ok(None);
         }
         self.try_recv_qwp_response()
-    }
-
-    /// Like [`Self::fill_leftover`], but a read timeout returns `Ok(false)`
-    /// instead of latching the connection.
-    fn fill_leftover_within_timeout(&mut self) -> Result<bool> {
-        let mut chunk = [0u8; 1024];
-        match self.stream.read(&mut chunk) {
-            Ok(0) => Err(self.latch(error::fmt!(
-                SocketError,
-                "QWP/WebSocket socket closed unexpectedly while awaiting a durable ACK"
-            ))),
-            Ok(n) => {
-                self.leftover.extend_from_slice(&chunk[..n]);
-                Ok(true)
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(false)
-            }
-            Err(e) => Err(self.latch(error::fmt!(
-                SocketError,
-                "QWP/WebSocket socket read failed: {}",
-                e
-            ))),
-        }
     }
 
     fn send_pong(&mut self, payload_len: usize) -> Result<()> {
@@ -1067,9 +1060,7 @@ enum QwpResponse {
     },
     DurableAck {
         tables: Vec<(String, i64)>,
-    },
-    LocalDurableAck {
-        tables: Vec<(String, i64)>,
+        local: bool,
     },
     Error {
         sequence: u64,
@@ -1094,21 +1085,14 @@ fn parse_qwp_response(payload: &[u8]) -> Result<QwpResponse> {
             Ok(QwpResponse::Ok { sequence, tables })
         }
         QWP_STATUS_DURABLE_ACK | QWP_STATUS_LOCAL_DURABLE_ACK => {
-            let is_local = status == QWP_STATUS_LOCAL_DURABLE_ACK;
-            let tables = parse_table_entries(
-                payload,
-                1,
-                if is_local {
-                    "QWP local durable ACK response"
-                } else {
-                    "QWP durable ACK response"
-                },
-            )?;
-            Ok(if is_local {
-                QwpResponse::LocalDurableAck { tables }
+            let local = status == QWP_STATUS_LOCAL_DURABLE_ACK;
+            let context = if local {
+                "QWP local durable ACK response"
             } else {
-                QwpResponse::DurableAck { tables }
-            })
+                "QWP durable ACK response"
+            };
+            let tables = parse_table_entries(payload, 1, context)?;
+            Ok(QwpResponse::DurableAck { tables, local })
         }
         _ => {
             let (sequence, message) = parse_error_body(payload)?;
@@ -1359,7 +1343,10 @@ mod tests {
         payload.extend_from_slice(&0u16.to_le_bytes());
         let response = parse_qwp_response(&payload).unwrap();
         match response {
-            QwpResponse::DurableAck { tables } => {
+            QwpResponse::DurableAck {
+                tables,
+                local: false,
+            } => {
                 assert!(tables.is_empty());
             }
             other => panic!("expected DurableAck, got {other:?}"),
@@ -1374,10 +1361,13 @@ mod tests {
         payload.extend_from_slice(b"tx");
         payload.extend_from_slice(&9i64.to_le_bytes());
         match parse_qwp_response(&payload).unwrap() {
-            QwpResponse::LocalDurableAck { tables } => {
+            QwpResponse::DurableAck {
+                tables,
+                local: true,
+            } => {
                 assert_eq!(tables, vec![("tx".to_owned(), 9)]);
             }
-            other => panic!("expected LocalDurableAck, got {other:?}"),
+            other => panic!("expected local DurableAck, got {other:?}"),
         }
         assert!(parse_qwp_response(&[QWP_STATUS_LOCAL_DURABLE_ACK]).is_err());
     }
@@ -1422,12 +1412,14 @@ mod tests {
         local
             .process_response(QwpResponse::DurableAck {
                 tables: vec![("trades".to_owned(), 7)],
+                local: false,
             })
             .unwrap();
         assert!(!local.durability_satisfied());
         local
-            .process_response(QwpResponse::LocalDurableAck {
+            .process_response(QwpResponse::DurableAck {
                 tables: vec![("trades".to_owned(), 7)],
+                local: true,
             })
             .unwrap();
         assert!(local.durability_satisfied());
@@ -1436,8 +1428,9 @@ mod tests {
 
         let mut both = ColumnConn::for_test(dummy_ws_stream(), DurableAckTiers::LocalAndReplicated);
         both.pending_durable_targets.insert("trades".to_owned(), 7);
-        both.process_response(QwpResponse::LocalDurableAck {
+        both.process_response(QwpResponse::DurableAck {
             tables: vec![("trades".to_owned(), 7)],
+            local: true,
         })
         .unwrap();
         assert!(
@@ -1446,6 +1439,7 @@ mod tests {
         );
         both.process_response(QwpResponse::DurableAck {
             tables: vec![("trades".to_owned(), 7)],
+            local: false,
         })
         .unwrap();
         assert!(both.durability_satisfied());
@@ -1800,6 +1794,7 @@ mod tests {
         .expect("ok ack");
         conn.process_response(QwpResponse::DurableAck {
             tables: vec![("t".to_string(), 7)],
+            local: false,
         })
         .expect("durable ack");
         conn.drop_satisfied_durable_targets();
