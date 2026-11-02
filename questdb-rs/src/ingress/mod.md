@@ -225,9 +225,8 @@ let mut sender = Sender::from_conf(
 ### HTTP Bearer Token via a Provider (rotating / OIDC)
 
 For a token that rotates — such as one obtained by interactive OIDC sign-in —
-pass a **token provider** to the builder instead of a fixed `token=` string. The
-sender resolves a fresh token once per flush and reuses it for any retry requests
-within that flush, so a long-lived sender keeps working as the token rotates:
+pass a **token provider** to the builder instead of a fixed `token=` string, so a
+long-lived sender keeps working as the token rotates:
 
 ```ignore
 use std::sync::Arc;
@@ -243,6 +242,19 @@ let mut sender = SenderBuilder::new(Protocol::Https, "questdb.example.com", 9000
     .http_token_provider({ let auth = Arc::clone(&auth); move || auth.token() })?
     .build()?;
 ```
+
+A flush normally calls the provider once and reuses the token for its retry
+requests. It calls the provider again in two cases, so a provider can run more
+than once per flush:
+
+* After a provider failure that can clear on its own, such as a transient
+  identity-provider error, the flush calls the provider again with backoff
+  until it succeeds or `retry_timeout` expires.
+* After the server answers a request with HTTP 401 and its `WWW-Authenticate`
+  Bearer challenge names no error, or `invalid_token`, the flush tells the
+  provider which token was rejected and calls it again. If the token changed,
+  the flush replays the request once with it. This happens at most once per
+  flush.
 
 The provider is any `Fn() -> Result<String, E>`; see
 [`SenderBuilder::http_token_provider`](crate::ingress::SenderBuilder::http_token_provider)

@@ -56,9 +56,10 @@
 //! auth.sign_in()?; // prompts on first use, then caches (and refreshes silently
 //!                  // if the IdP issued a refresh token — see below)
 //!
-//! // Pass a token provider (not a fixed string): the sender resolves it once
-//! // per flush, reuses that value for ordinary retries, and resolves once more
-//! // only after a 401 when the credential may have rotated.
+//! // Pass a token provider (not a fixed string): the sender normally resolves
+//! // it once per flush and reuses that value for ordinary retries. It resolves
+//! // it again after a provider failure that can clear on its own, and after a
+//! // 401 when the credential may have rotated.
 //! let mut sender = SenderBuilder::new(Protocol::Https, "questdb.example.com", 9000)
 //!     .http_token_provider({
 //!         let auth = Arc::clone(&auth);
