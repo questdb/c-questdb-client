@@ -235,7 +235,10 @@ def check_compatibility(errors):
             (rust_text, "declared Rust MSRV"),
             (questdb_text, "QWP/WebSocket server floor"),
             (failover_edition_text, "failover edition qualifier"),
-            (local_durable_text, "local durable ACK server mode"),
+            (
+                "It needs a server running `cairo.commit.mode=adaptive`;",
+                "local durable ACK server mode",
+            ),
             (
                 "https://questdb.com/docs/ingestion/overview/",
                 "client overview URL",
@@ -245,7 +248,10 @@ def check_compatibility(errors):
             (rust_text, "declared Rust MSRV"),
             (questdb_text, "QWP/WebSocket server floor"),
             (failover_edition_text, "failover edition qualifier"),
-            (local_durable_text, "local durable ACK server mode"),
+            (
+                "needs a server running `cairo.commit.mode=adaptive`),",
+                "local durable ACK server mode",
+            ),
         ),
         ROOT / "doc" / "BUILD.md": (
             (rust_text, "declared Rust MSRV"),
@@ -281,7 +287,11 @@ def check_compatibility(errors):
                 "Polars compatibility range",
             ),
             ("require QuestDB Enterprise", "Enterprise feature boundary"),
-            (local_durable_text, "local durable ACK server mode"),
+            (
+                "(`request_durable_ack=local`) needs a server running\n"
+                "`cairo.commit.mode=adaptive`",
+                "local durable ACK server mode",
+            ),
             (
                 "`local,replicated` needs both: QuestDB Enterprise and",
                 "combined durable ACK server requirements",
@@ -293,7 +303,10 @@ def check_compatibility(errors):
                 "`durable` requires QuestDB Enterprise",
                 "durable ACK edition qualifier",
             ),
-            (local_durable_text, "local durable ACK server mode"),
+            (
+                "It requires a server running `cairo.commit.mode=adaptive` and",
+                "local durable ACK server mode",
+            ),
         ),
         ROOT / "doc" / "DEPENDENCY.md": (
             (questdb_text, "QWP/WebSocket server floor"),
@@ -412,7 +425,10 @@ def check_compatibility(errors):
                 "`qwpws_ack_level_durable` requires QuestDB Enterprise and",
                 "durable ACK edition qualifier",
             ),
-            (local_durable_text, "local durable ACK server mode"),
+            (
+                "requires a server running `cairo.commit.mode=adaptive`; APIs accepting",
+                "local durable ACK server mode",
+            ),
             (
                 "`local,replicated` also needs a server running",
                 "combined durable ACK server mode",
