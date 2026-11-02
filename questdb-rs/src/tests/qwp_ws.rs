@@ -4600,12 +4600,16 @@ fn qwp_ws_wait_names_a_failing_initial_connect() {
 fn qwp_ws_wait_names_a_failing_background_reconnect() {
     let err = wait_after_the_server_disappears_mid_stream(ProgressCase::Background);
     assert_wait_names_the_failing_reconnect(&err);
+    assert!(err.msg().contains("background runner"), "{err}");
 }
 
 #[test]
 fn qwp_ws_wait_names_a_failing_manual_reconnect() {
     let err = wait_after_the_server_disappears_mid_stream(ProgressCase::Manual);
     assert_wait_names_the_failing_reconnect(&err);
+    // No runner reconnects a manual-progress sender: its caller does.
+    assert!(!err.msg().contains("background runner"), "{err}");
+    assert!(err.msg().contains("only while it is driven"), "{err}");
 }
 
 #[test]

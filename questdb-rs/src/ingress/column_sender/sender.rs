@@ -2315,6 +2315,8 @@ fn sfa_sync_timeout(
         boundary,
         completed,
         reconnect_failure,
+        // The store-and-forward backend always runs a background runner.
+        crate::ingress::QwpWsProgress::Background,
     )
 }
 

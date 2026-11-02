@@ -57,7 +57,9 @@ use super::qwp_ws_auth_rejection::{
     AuthRejectionPolicy, OrphanAuthRideOut, is_upgrade_auth_rejection,
 };
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
-use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
+use super::qwp_ws_ownership::{
+    QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsProgress, QwpWsSenderError,
+};
 use super::qwp_ws_queue::{
     OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
 };
@@ -2874,9 +2876,11 @@ pub(crate) fn reconnect_backoff_step(
 }
 
 /// The `failover_retry` an ACK wait returns when `timeout` passes with no ack
-/// progress toward `boundary`. The frames stay queued and the background runner
-/// keeps delivering them, so the caller retries the wait; re-flushing the data
-/// would deliver it twice.
+/// progress toward `boundary`. The frames stay queued, so the caller retries the
+/// wait; re-flushing the data would deliver it twice. A sender in `mode`
+/// [`QwpWsProgress::Background`] has a runner that keeps delivering them and
+/// reconnecting. A [`QwpWsProgress::Manual`] one has none, and progresses only
+/// while its caller drives it, so its message says so instead.
 ///
 /// While the transport is down the stall is the reconnect's, not the
 /// server's. The message then names why the latest attempt failed, and the
@@ -2893,28 +2897,48 @@ pub(crate) fn ack_wait_timeout_error(
     boundary: u64,
     completed: Option<u64>,
     reconnect_failure: Option<&Error>,
+    mode: QwpWsProgress,
 ) -> Error {
     let progress = match completed {
         Some(fsn) => format!("reached FSN {fsn}"),
         None => "reached no frame".to_string(),
     };
-    let stall = match reconnect_failure {
-        None => "the connection is alive but the server is not advancing the watermark. \
-                 The published frames remain queued and the background runner keeps \
-                 delivering them: retry wait() to keep awaiting the ack"
-            .to_string(),
-        Some(cause) => format!(
+    let stall = match (reconnect_failure, mode) {
+        (None, QwpWsProgress::Background) => {
+            "the connection is alive but the server is not advancing the watermark. \
+             The published frames remain queued and the background runner keeps \
+             delivering them: retry wait() to keep awaiting the ack"
+                .to_string()
+        }
+        (None, QwpWsProgress::Manual) => {
+            "the connection is alive but the server is not advancing the watermark. \
+             The published frames remain queued, and a manual-progress sender delivers \
+             them only while it is driven: retry wait(), which drives it, to keep \
+             awaiting the ack"
+                .to_string()
+        }
+        (Some(cause), QwpWsProgress::Background) => format!(
             "the connection is down and reconnecting keeps failing: {}. The published \
              frames remain queued and the background runner keeps reconnecting: once \
              that is resolved, retry wait() to keep awaiting the ack",
             cause.msg()
         ),
+        (Some(cause), QwpWsProgress::Manual) => format!(
+            "the connection is down and reconnecting keeps failing: {}. The published \
+             frames remain queued, and a manual-progress sender reconnects only while \
+             it is driven (drive_once(), wait(), flush() or close_drain()): once that \
+             is resolved, retry wait(), which drives it, to keep awaiting the ack",
+            cause.msg()
+        ),
+    };
+    let drain = match mode {
+        QwpWsProgress::Background => "close the pool to drain",
+        QwpWsProgress::Manual => "call close_drain() to drain",
     };
     let msg = format!(
         "{operation} timed out after {timeout:?} with no ack progress (target FSN \
-         {boundary}, {progress}); {stall}, or close the pool to drain. Do not \
-         re-flush the same data, which is already accepted and would be delivered \
-         twice."
+         {boundary}, {progress}); {stall}, or {drain}. Do not re-flush the same \
+         data, which is already accepted and would be delivered twice."
     );
     match reconnect_failure {
         Some(cause) => cause
@@ -4465,8 +4489,14 @@ mod tests {
         )
         .with_provider_failure()
         .reclassified(ErrorCode::SocketError, "reconnect: identity not assigned");
-        let error =
-            ack_wait_timeout_error("wait", Duration::from_millis(50), 3, Some(1), Some(&cause));
+        let error = ack_wait_timeout_error(
+            "wait",
+            Duration::from_millis(50),
+            3,
+            Some(1),
+            Some(&cause),
+            QwpWsProgress::Background,
+        );
         assert_eq!(error.code(), ErrorCode::FailoverRetry);
         assert!(error.msg().contains("identity not assigned"));
         assert!(error.msg().contains("Do not re-flush"));
@@ -4477,7 +4507,14 @@ mod tests {
         assert!(!unavailable.provider_closed());
 
         let closed = Error::token_provider_closed("provider closed");
-        let error = ack_wait_timeout_error("wait", Duration::ZERO, 3, None, Some(&closed));
+        let error = ack_wait_timeout_error(
+            "wait",
+            Duration::ZERO,
+            3,
+            None,
+            Some(&closed),
+            QwpWsProgress::Background,
+        );
         assert!(error.as_token_unavailable().unwrap().provider_closed());
     }
 
@@ -4957,7 +4994,14 @@ mod tests {
     #[test]
     fn ack_wait_timeout_names_a_failing_reconnect() {
         // Connected: the server is not advancing the watermark.
-        let alive = ack_wait_timeout_error("wait", Duration::from_millis(50), 3, Some(1), None);
+        let alive = ack_wait_timeout_error(
+            "wait",
+            Duration::from_millis(50),
+            3,
+            Some(1),
+            None,
+            QwpWsProgress::Background,
+        );
         assert_eq!(alive.code(), ErrorCode::FailoverRetry);
         assert!(alive.msg().contains("the connection is alive"), "{alive}");
         assert!(alive.msg().contains("reached FSN 1"), "{alive}");
@@ -4965,7 +5009,14 @@ mod tests {
 
         // Disconnected: the stall is the reconnect's, and the error says why.
         let cause = Error::new(ErrorCode::SocketError, "could not connect: refused");
-        let down = ack_wait_timeout_error("wait", Duration::from_millis(50), 3, None, Some(&cause));
+        let down = ack_wait_timeout_error(
+            "wait",
+            Duration::from_millis(50),
+            3,
+            None,
+            Some(&cause),
+            QwpWsProgress::Background,
+        );
         assert_eq!(down.code(), ErrorCode::FailoverRetry);
         assert!(
             down.msg()
@@ -4979,6 +5030,42 @@ mod tests {
     }
 
     #[test]
+    fn a_manual_ack_wait_timeout_names_no_background_runner() {
+        // A manual-progress sender has no runner: it delivers and reconnects
+        // only while its caller drives it, which is what the hint must say.
+        let cause = Error::new(ErrorCode::SocketError, "could not connect: refused");
+        for reconnect_failure in [None, Some(&cause)] {
+            let manual = ack_wait_timeout_error(
+                "wait",
+                Duration::from_millis(50),
+                3,
+                None,
+                reconnect_failure,
+                QwpWsProgress::Manual,
+            );
+            assert_eq!(manual.code(), ErrorCode::FailoverRetry);
+            assert!(!manual.msg().contains("background runner"), "{manual}");
+            assert!(!manual.msg().contains("close the pool"), "{manual}");
+            assert!(manual.msg().contains("only while it is driven"), "{manual}");
+            assert!(manual.msg().contains("close_drain()"), "{manual}");
+            assert!(manual.msg().contains("Do not re-flush"), "{manual}");
+
+            let background = ack_wait_timeout_error(
+                "wait",
+                Duration::from_millis(50),
+                3,
+                None,
+                reconnect_failure,
+                QwpWsProgress::Background,
+            );
+            assert!(
+                background.msg().contains("background runner keeps"),
+                "{background}"
+            );
+        }
+    }
+
+    #[test]
     fn ack_wait_timeout_carries_no_server_rejection_diagnostic() {
         // The structured rejection marks the error that halted a sender
         // (`line_sender_error_qwpws_get_view`); an ACK-wait timeout is
@@ -4988,7 +5075,14 @@ mod tests {
             sender_error(0),
         );
         assert!(cause.qwp_ws_rejection().is_some());
-        let err = ack_wait_timeout_error("wait", Duration::from_millis(50), 0, None, Some(&cause));
+        let err = ack_wait_timeout_error(
+            "wait",
+            Duration::from_millis(50),
+            0,
+            None,
+            Some(&cause),
+            QwpWsProgress::Background,
+        );
         assert_eq!(err.code(), ErrorCode::FailoverRetry);
         assert!(err.msg().contains("write failed"), "{err}");
         assert!(err.qwp_ws_rejection().is_none());

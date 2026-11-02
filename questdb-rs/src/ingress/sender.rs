@@ -919,14 +919,16 @@ impl Sender {
                 deadline_anchor = Instant::now();
             }
             if !timeout.is_zero() && deadline_anchor.elapsed() >= timeout {
-                let reconnect_failure = match &self.handler {
-                    SyncProtocolHandler::SyncQwpWs(state) => {
-                        qwp_ws_reconnect_failure_background(state)
-                    }
-                    SyncProtocolHandler::ManualQwpWs(state) => {
-                        qwp_ws_reconnect_failure_manual(state)
-                    }
-                    _ => None,
+                let (reconnect_failure, mode) = match &self.handler {
+                    SyncProtocolHandler::SyncQwpWs(state) => (
+                        qwp_ws_reconnect_failure_background(state),
+                        QwpWsProgress::Background,
+                    ),
+                    SyncProtocolHandler::ManualQwpWs(state) => (
+                        qwp_ws_reconnect_failure_manual(state),
+                        QwpWsProgress::Manual,
+                    ),
+                    _ => (None, QwpWsProgress::Background),
                 };
                 return Err(qwp_ws_wait_timeout(
                     ack_level,
@@ -934,6 +936,7 @@ impl Sender {
                     boundary,
                     completed,
                     reconnect_failure.as_ref(),
+                    mode,
                 ));
             }
 
@@ -1257,11 +1260,12 @@ fn qwp_ws_sleep_until(deadline: Option<Instant>) {
 
 /// Error for a [`Sender::wait`] that made no ack progress within its
 /// no-progress `timeout`. Classified [`ErrorCode::FailoverRetry`]: the
-/// published frames are retained and the background runner keeps delivering
-/// them, so recover by retrying `wait()` until it returns `Ok` — not by
-/// re-flushing, which would duplicate the rows. While the sender is
-/// disconnected it names why reconnecting keeps failing, with that failure's
-/// OIDC detail. Mirrors the column-major store-and-forward wait.
+/// published frames are retained -- a background sender's runner keeps
+/// delivering them, a manual-progress one delivers them while it is driven --
+/// so recover by retrying `wait()` until it returns `Ok`, not by re-flushing,
+/// which would duplicate the rows. While the sender is disconnected it names
+/// why reconnecting keeps failing, with that failure's OIDC detail. Mirrors the
+/// column-major store-and-forward wait.
 #[cfg(feature = "sync-sender-qwp-ws")]
 fn qwp_ws_wait_timeout(
     ack_level: AckLevel,
@@ -1269,6 +1273,7 @@ fn qwp_ws_wait_timeout(
     boundary: u64,
     completed: Option<u64>,
     reconnect_failure: Option<&crate::Error>,
+    mode: QwpWsProgress,
 ) -> crate::Error {
     let level = match ack_level {
         AckLevel::Ok => "ok",
@@ -1280,5 +1285,6 @@ fn qwp_ws_wait_timeout(
         boundary,
         completed,
         reconnect_failure,
+        mode,
     )
 }
