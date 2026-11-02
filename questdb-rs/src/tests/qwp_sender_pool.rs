@@ -5037,6 +5037,80 @@ fn direct_column_sender_local_durable_wait_completes_on_keepalive_ping() {
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
 }
 
+/// Two durable commits to one table on the same pooled direct connection: the
+/// second one completes only if the table's durable watermark keeps advancing.
+fn check_second_durable_commit_on_one_connection(
+    tier: MockDurableTier,
+    request_durable_ack: &str,
+    level: AckLevel,
+) {
+    let (server, _frames, _pings) = MockServer::spawn_acking_durable_capturing(1, tier);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        &format!("pool_reap=manual;request_durable_ack={request_durable_ack};"),
+    ))
+    .unwrap();
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
+    for commit in 0..2_i64 {
+        let val = [commit];
+        let ts = [1 + commit];
+        let mut chunk = one_i64_row("trades", &val, &ts);
+        let started = Instant::now();
+        sender
+            .flush_and_wait(&mut chunk, level)
+            .unwrap_or_else(|e| panic!("durable commit {commit} failed: {}", e.msg()));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "durable commit {commit} took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[test]
+fn direct_column_sender_second_local_durable_commit_completes() {
+    check_second_durable_commit_on_one_connection(
+        MOCK_DURABLE_LOCAL,
+        "local",
+        AckLevel::LocalDurable,
+    );
+}
+
+#[test]
+fn direct_column_sender_second_replicated_durable_commit_completes() {
+    check_second_durable_commit_on_one_connection(MOCK_DURABLE_ON, "on", AckLevel::Durable);
+}
+
+#[test]
+fn direct_column_sender_ok_commit_does_not_wait_for_local_durable_ack() {
+    // The mock answers PINGs only with replicated acks, which a `local`
+    // connection ignores: an Ok commit must return on the OK, without a PING.
+    let replicated_acks = MockDurableTier {
+        ack_status: MOCK_DURABLE_ON.ack_status,
+        ..MOCK_DURABLE_LOCAL
+    };
+    let (server, _frames, pings) = MockServer::spawn_acking_durable_capturing(1, replicated_acks);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_reap=manual;request_durable_ack=local;",
+    ))
+    .unwrap();
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
+    let val = [7_i64];
+    let ts = [1_i64];
+    let mut chunk = one_i64_row("trades", &val, &ts);
+    let started = Instant::now();
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("an Ok commit needs only the OK");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "Ok commit took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(pings.load(Ordering::SeqCst), 0, "an Ok commit sent a PING");
+}
+
 /// Runs `publish_and_drop` against a mock that grants `request_durable_ack=local`
 /// and sends the local durable ack only in reply to a PING. Only a durable wait
 /// sends a PING, so one proves the drop-time commit of the deferred tail waited
