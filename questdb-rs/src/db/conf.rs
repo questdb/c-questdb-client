@@ -204,9 +204,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
             "lazy_connect" => {
                 // Java conf strings write true/false; accept on/off too,
                 // case-insensitively, matching initial_connect_retry's
-                // grammar. Deliberately NOT widened into parse_on_off:
-                // request_durable_ack has its own tier grammar and the pool
-                // must accept exactly what the builder accepts.
+                // grammar.
                 pool.lazy_connect = match value.to_ascii_lowercase().as_str() {
                     "on" | "true" => true,
                     "off" | "false" => false,

@@ -1028,10 +1028,10 @@ impl QuestDb {
     /// confirms server acceptance only; the durable levels confirm durability:
     /// [`AckLevel::LocalDurable`] on the server's own disk, the Enterprise
     /// [`AckLevel::Durable`] in replication storage. On a transient
-    /// [`ErrorCode::FailoverRetry`] it
-    /// surfaces the error rather than replaying (the batch is fully owned by
-    /// the caller, so retrying is a plain re-call); the DataFrame path
-    /// ([`Self::flush_polars_dataframe`]) re-drives automatically instead.
+    /// [`ErrorCode::FailoverRetry`] it surfaces the error rather than
+    /// replaying (the batch is fully owned by the caller, so retrying is a
+    /// plain re-call); the DataFrame path ([`Self::flush_polars_dataframe`])
+    /// re-drives automatically instead.
     ///
     /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
     /// [`ErrorCode::InvalidApiCall`]: crate::ErrorCode::InvalidApiCall
@@ -1061,9 +1061,7 @@ impl QuestDb {
     }
 
     /// The ack level these convenience flushes wait for when the caller does
-    /// not name one: local-durable for `request_durable_ack=local`,
-    /// replicated-durable for `on`, `replicated`, or `local,replicated`, and
-    /// [`AckLevel::Ok`] for `off`.
+    /// not name one; see [`default_ack_level_for_tiers`].
     #[cfg(feature = "arrow-ingress")]
     pub(crate) fn default_ack_level(&self) -> AckLevel {
         default_ack_level_for_tiers(self.inner.connector.request_durable_ack())
@@ -2928,8 +2926,8 @@ fn default_ack_level_for_tiers(tiers: crate::ingress::DurableAckTiers) -> AckLev
 
 /// Best-effort commit of un-sync'd deferred frames on drop, so the natural
 /// `flush()`-loop-then-drop path doesn't silently lose data. Commits at the
-/// pool's default ack level so a tiered durable-ack pool still waits for its
-/// selected durability ACK instead of silently downgrading to `Ok`. On failure the
+/// pool's default ack level so a durable-ack pool still waits for the durable
+/// ACK it trims on instead of silently downgrading to `Ok`. On failure the
 /// connection is latched `must_close` so the next borrower can't commit these
 /// frames under a foreign table.
 ///

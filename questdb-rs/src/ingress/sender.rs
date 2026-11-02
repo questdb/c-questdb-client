@@ -906,8 +906,7 @@ impl Sender {
         }
     }
 
-    /// A durable level is refused unless the sender was opened for it, so
-    /// the watermark read for it is never a weaker one.
+    /// Refuse a durable level the sender was not opened for.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn check_durable_ack_opt_in(&self, ack_level: AckLevel) -> Result<()> {
         let tiers = match &self.handler {
@@ -919,8 +918,9 @@ impl Sender {
     }
 
     /// Completion watermark for `ack_level` across both QWP/WebSocket progress
-    /// modes. `Ok` tracks completion at the OK level; `Durable` tracks
-    /// durable-ACK coverage. Terminal failures surface here as an `Err`.
+    /// modes. `Ok` tracks completion at the OK level; the durable levels track
+    /// the durable ACK the sender trims on. Terminal failures surface here as
+    /// an `Err`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn qwp_ws_completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
         match &self.handler {

@@ -342,7 +342,7 @@ impl DurableAckTiers {
         }
     }
 
-    /// The `request_durable_ack` value that selects this set, for messages.
+    /// The canonical `request_durable_ack` value that selects this set.
     pub(crate) fn config_value(self) -> &'static str {
         match self {
             Self::Off => "off",

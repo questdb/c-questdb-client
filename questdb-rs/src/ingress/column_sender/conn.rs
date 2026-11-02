@@ -445,9 +445,9 @@ impl ColumnConn {
         }
     }
 
-    /// Block until all in-flight frames are OK-acked. For
-    /// `AckLevel::Durable`, also wait for durable watermarks to reach
-    /// every pending frame's seq_txn.
+    /// Block until all in-flight frames are OK-acked. For a durable level,
+    /// also wait for durable watermarks to reach every pending frame's
+    /// seq_txn.
     pub(crate) fn sync_all_acks(&mut self, ack_level: AckLevel) -> Result<()> {
         if self.must_close {
             return Err(error::fmt!(
@@ -587,9 +587,9 @@ impl ColumnConn {
                 }
                 // Only a progress-advancing OK contributes durable targets — it
                 // is the wire event paired with a following DurableAck. Opt-in
-                // only; otherwise `Durable` is rejected up front and the targets
-                // map is never pruned, so accumulating would leak one entry per
-                // table for the connection's life.
+                // only; otherwise the durable levels are rejected up front and
+                // the targets map is never pruned, so accumulating would leak
+                // one entry per table for the connection's life.
                 if self.durable_ack_tiers.is_enabled() {
                     for (t, seq_txn) in tables {
                         self.pending_durable_targets

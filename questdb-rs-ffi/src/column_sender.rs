@@ -678,9 +678,9 @@ unsafe fn as_validity<'a>(
 //
 // The C header exposes named constants (`qwpws_ack_level_ok = 0`,
 // `qwpws_ack_level_durable = 1`, `qwpws_ack_level_local_durable = 2`),
-// but the FFI takes a `uint32_t`
-// (not a `#[repr(C)] enum`) so an out-of-range value is a recoverable
-// `InvalidApiCall` error instead of immediate Rust UB.
+// but the FFI takes a `uint32_t` (not a `#[repr(C)] enum`) so an
+// out-of-range value is a recoverable `InvalidApiCall` error instead of
+// immediate Rust UB.
 // ===========================================================================
 
 fn ack_level_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Option<AckLevel> {

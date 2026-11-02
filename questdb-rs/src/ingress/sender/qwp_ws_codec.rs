@@ -103,9 +103,8 @@ pub(crate) struct QwpWsHandshakeResult {
 /// negotiated protocol version (defaults to 1 when the server omits
 /// X-QWP-Version, matching the spec) and the server-advertised max batch
 /// size. Errors when the server returns an out-of-range version or, when the
-/// client requested durable ACKs, does not echo the confirmation token for the
-/// requested set in `X-QWP-Durable-Ack` (`enabled` for `on`, otherwise the
-/// requested value).
+/// client requested durable ACKs, does not echo the requested set's
+/// confirmation token in `X-QWP-Durable-Ack`.
 pub(super) fn validate_qwp_handshake_headers(
     headers: &crate::ws::handshake::Headers,
     max_version: u32,
