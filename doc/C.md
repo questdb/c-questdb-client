@@ -68,8 +68,12 @@ closing its reader. The two error names are aliases of the same C ABI type.
 An `OK` acknowledgement means the server accepted a QWP frame. On a WAL table,
 query visibility follows asynchronously; applications that must read their own
 writes should poll with a bounded deadline or use their own WAL-apply policy.
-Durable acknowledgement requires QuestDB Enterprise. Enable
-`request_durable_ack=on` and wait for the durable level. See
+For durability on the server's own disk, set `request_durable_ack=local` and
+wait for `qwpws_ack_level_local_durable`. Local durable acknowledgement needs
+a server running `cairo.commit.mode=adaptive`. For durability that survives
+the loss of the server, set `request_durable_ack=replicated` (or `on`, the
+only value older servers understand) and wait for `qwpws_ack_level_durable`.
+Replicated durable acknowledgement requires QuestDB Enterprise. See
 [threading and delivery considerations](CONSIDERATIONS.md).
 
 ## More examples

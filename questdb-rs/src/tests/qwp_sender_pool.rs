@@ -52,10 +52,11 @@ use crate::ingress::column_sender::Chunk;
 use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
 use crate::ingress::{AckLevel, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::qwp_ws::{
-    perform_server_upgrade, perform_server_upgrade_durable, read_frame,
-    upgrade_mock_stream_with_max_batch_size, write_qwp_durable_ack_response,
-    write_qwp_error_response, write_qwp_ok_response, write_qwp_ok_response_with_table_entries,
-    write_server_frame,
+    MOCK_DURABLE_LOCAL, MOCK_DURABLE_LOCAL_WITH_REPLICATED_ACKS, MOCK_DURABLE_ON, MockDurableTier,
+    perform_server_upgrade, perform_server_upgrade_with_durable_tier, read_frame,
+    upgrade_mock_stream_with_durable_ack, upgrade_mock_stream_with_max_batch_size,
+    write_qwp_durable_ack_response_with_status, write_qwp_error_response, write_qwp_ok_response,
+    write_qwp_ok_response_with_table_entries, write_server_frame,
 };
 use tempfile::TempDir;
 
@@ -103,10 +104,11 @@ enum MockMode {
     /// client's ACK-wait read hits EOF, a *post-publication* delivery-unknown
     /// failure.
     ReadThenClose(usize),
-    /// Durable-ACK mode: upgrade with `X-QWP-Durable-Ack: enabled`, OK each
-    /// data frame with a `trades` table seq_txn, and answer every keepalive
-    /// ping with a pong + a durable-ACK frame so a `Durable` boundary commits.
-    AckEachFrameDurable,
+    /// Durable-ACK mode: grant the tier in the upgrade, OK each data frame
+    /// with a `trades` table seq_txn, and answer every keepalive ping with a
+    /// pong + a durable-ACK frame of the tier so a durable boundary commits.
+    /// Counts the pings it answered.
+    AckEachFrameDurable(MockDurableTier, Arc<AtomicUsize>),
     /// The first accepted connection reads one data frame and closes without
     /// ACKing; later connections ACK normally. Drives deterministic replay and
     /// same-endpoint reconnect in the store-and-forward runner.
@@ -181,11 +183,17 @@ impl MockServer {
         (server, rx)
     }
 
-    fn spawn_acking_durable_capturing(max_accepts: usize) -> (Self, mpsc::Receiver<Vec<u8>>) {
+    /// Durable-ACK server granting `tier`; also returns the count of
+    /// keepalive pings it answered with a durable ack.
+    fn spawn_acking_durable_capturing(
+        max_accepts: usize,
+        tier: MockDurableTier,
+    ) -> (Self, mpsc::Receiver<Vec<u8>>, Arc<AtomicUsize>) {
         let (tx, rx) = mpsc::channel();
-        let server =
-            Self::spawn_with_mode_capture(max_accepts, MockMode::AckEachFrameDurable, Some(tx));
-        (server, rx)
+        let pings = Arc::new(AtomicUsize::new(0));
+        let mode = MockMode::AckEachFrameDurable(tier, Arc::clone(&pings));
+        let server = Self::spawn_with_mode_capture(max_accepts, mode, Some(tx));
+        (server, rx, pings)
     }
 
     fn spawn_reconnecting(max_accepts: usize) -> Self {
@@ -306,10 +314,10 @@ fn run_mock_server_accept_loop(
                         reject_upgrade_auth(&mut stream);
                         return;
                     }
-                    // Durable mode needs the `X-QWP-Durable-Ack: enabled` upgrade
-                    // header; every other mode uses the plain upgrade.
-                    let upgraded = if matches!(mode, MockMode::AckEachFrameDurable) {
-                        perform_server_upgrade_durable(&mut stream).is_ok()
+                    // Durable mode needs the `X-QWP-Durable-Ack` grant in the
+                    // upgrade; every other mode uses the plain upgrade.
+                    let upgraded = if let MockMode::AckEachFrameDurable(tier, _) = &mode {
+                        perform_server_upgrade_with_durable_tier(&mut stream, *tier).is_ok()
                     } else if let MockMode::ParkWithMaxBatchSize(max_batch_size) = &mode {
                         upgrade_mock_stream_with_max_batch_size(&mut stream, Some(*max_batch_size));
                         true
@@ -323,8 +331,8 @@ fn run_mock_server_accept_loop(
                                 park_connection(&mut stream, &stop)
                             }
                             MockMode::AckEachFrame => ack_each_frame(&mut stream, &stop, capture),
-                            MockMode::AckEachFrameDurable => {
-                                ack_each_frame_durable(&mut stream, &stop, capture)
+                            MockMode::AckEachFrameDurable(tier, pings) => {
+                                ack_each_frame_durable(&mut stream, &stop, capture, tier, &pings)
                             }
                             MockMode::ReconnectAfterFirstFrame if accept_index == 0 => {
                                 read_then_close(&mut stream, &stop, 1, capture)
@@ -412,6 +420,8 @@ fn ack_each_frame_durable(
     stream: &mut std::net::TcpStream,
     stop: &AtomicBool,
     capture: Option<mpsc::Sender<Vec<u8>>>,
+    tier: MockDurableTier,
+    pings: &AtomicUsize,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut next_wire_seq: u64 = 0;
@@ -426,7 +436,14 @@ fn ack_each_frame_durable(
                     if write_server_frame(stream, 0xA, &payload, false).is_err() {
                         break;
                     }
-                    if write_qwp_durable_ack_response(stream, &[("trades", seq_txn)]).is_err() {
+                    pings.fetch_add(1, Ordering::SeqCst);
+                    if write_qwp_durable_ack_response_with_status(
+                        stream,
+                        tier.ack_status,
+                        &[("trades", seq_txn)],
+                    )
+                    .is_err()
+                    {
                         break;
                     }
                 }
@@ -2170,6 +2187,55 @@ fn disk_store_and_forward_pool_drains_unsuffixed_slot_only_with_orphan_drain_ena
         sorted_slot_names(dir.path()),
         vec!["legacy", "legacy-ingest-0"]
     );
+}
+
+fn start_local_durable_orphan_drain(
+    dir: &TempDir,
+    tier: MockDurableTier,
+) -> (MockServer, QuestDb, Arc<AtomicUsize>) {
+    seed_async_qwp_ws_slot(dir.path(), "legacy", 33);
+    let (server, frames, pings) = MockServer::spawn_acking_durable_capturing(4, tier);
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=legacy;sender_pool_min=1;sender_pool_max=2;\
+             pool_reap=manual;max_background_drainers=1;drain_orphans=on;\
+             request_durable_ack=local;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    drop(
+        db.borrow_sender()
+            .expect("managed slot starts the orphan drainer"),
+    );
+    frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("orphan slot replayed");
+    (server, db, pings)
+}
+
+#[test]
+fn orphan_drainer_trims_local_durable_slot_after_local_ack() {
+    let dir = TempDir::new().unwrap();
+    let (_server, _db, pings) = start_local_durable_orphan_drain(&dir, MOCK_DURABLE_LOCAL);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !slot_has_sfa_file(&dir.path().join("legacy"))
+    }));
+    // The mock sends the local durable ack only in reply to a ping.
+    assert!(pings.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn orphan_drainer_keeps_local_durable_slot_on_replicated_ack() {
+    let dir = TempDir::new().unwrap();
+    let (_server, _db, pings) =
+        start_local_durable_orphan_drain(&dir, MOCK_DURABLE_LOCAL_WITH_REPLICATED_ACKS);
+    // A drainer that trimmed on the first replicated ack would stop pinging.
+    assert!(wait_until(Duration::from_secs(5), || {
+        pings.load(Ordering::SeqCst) >= 3
+    }));
+    assert!(slot_has_sfa_file(&dir.path().join("legacy")));
 }
 
 #[test]
@@ -4865,11 +4931,15 @@ fn check_store_and_forward_flush_and_wait_surfaces_server_rejection(extras: &str
     );
 }
 
-fn check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(extras: &str) {
-    // With `request_durable_ack=on` and a server that confirms durability, an
-    // `AckLevel::Durable` ACKing flush commits and clears the chunk (the
-    // success counterpart to the durable opt-in *guard* tests).
-    let (server, _frames) = MockServer::spawn_acking_durable_capturing(2);
+fn check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(
+    extras: &str,
+    tier: MockDurableTier,
+    ack_level: AckLevel,
+) {
+    // With `tier` requested and a server that confirms it, an ACKing flush
+    // waiting at `ack_level` commits and clears the chunk (the success
+    // counterpart to the durable opt-in *guard* tests).
+    let (server, _frames, pings) = MockServer::spawn_acking_durable_capturing(2, tier);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_sender().unwrap();
@@ -4884,8 +4954,10 @@ fn check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(extras: &
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
     sender
-        .wait(AckLevel::Durable, Duration::from_secs(5))
+        .wait(ack_level, Duration::from_secs(5))
         .expect("durable wait must commit once the durable ACK arrives");
+    // The mock sends durable acks only in reply to pings.
+    assert!(pings.load(Ordering::SeqCst) > 0);
     assert!(
         chunk.is_empty(),
         "a committed durable ACKing flush clears the chunk"
@@ -4895,16 +4967,321 @@ fn check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(extras: &
 #[test]
 fn store_and_forward_flush_and_wait_durable_succeeds_with_opt_in_disk() {
     let dir = TempDir::new().unwrap();
-    check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(&sf_disk_extras(
-        &dir,
-        "pool_reap=manual;request_durable_ack=on;durable_ack_keepalive_interval_millis=1;",
-    ));
+    check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(
+        &sf_disk_extras(
+            &dir,
+            "pool_reap=manual;request_durable_ack=on;durable_ack_keepalive_interval_millis=1;",
+        ),
+        MOCK_DURABLE_ON,
+        AckLevel::Durable,
+    );
 }
 #[test]
 fn store_and_forward_flush_and_wait_durable_succeeds_with_opt_in_memory() {
     check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(
         "pool_reap=manual;request_durable_ack=on;durable_ack_keepalive_interval_millis=1;",
+        MOCK_DURABLE_ON,
+        AckLevel::Durable,
     );
+}
+
+#[test]
+fn store_and_forward_flush_and_wait_local_durable_succeeds_with_opt_in_disk() {
+    let dir = TempDir::new().unwrap();
+    check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(
+        &sf_disk_extras(
+            &dir,
+            "pool_reap=manual;request_durable_ack=local;durable_ack_keepalive_interval_millis=1;",
+        ),
+        MOCK_DURABLE_LOCAL,
+        AckLevel::LocalDurable,
+    );
+}
+
+#[test]
+fn store_and_forward_flush_and_wait_local_durable_succeeds_with_opt_in_memory() {
+    check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(
+        "pool_reap=manual;request_durable_ack=local;durable_ack_keepalive_interval_millis=1;",
+        MOCK_DURABLE_LOCAL,
+        AckLevel::LocalDurable,
+    );
+}
+
+#[test]
+fn direct_column_sender_local_durable_wait_completes_on_keepalive_ping() {
+    // The mock sends the local durable ack only in reply to a ping; the
+    // default keepalive interval must get it well before the request timeout.
+    let (server, _frames, pings) =
+        MockServer::spawn_acking_durable_capturing(1, MOCK_DURABLE_LOCAL);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_reap=manual;request_durable_ack=local;",
+    ))
+    .unwrap();
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
+    let val = [7_i64];
+    let ts = [1_i64];
+    let mut chunk = one_i64_row("trades", &val, &ts);
+    let started = Instant::now();
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::LocalDurable)
+        .expect("local durable wait must complete");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(pings.load(Ordering::SeqCst) > 0);
+    let err = sender
+        .commit(AckLevel::Durable)
+        .expect_err("Durable needs a replicated tier");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+}
+
+/// Two durable commits to one table on the same pooled direct connection: the
+/// second one completes only if the table's durable watermark keeps advancing,
+/// and it must wait for its own durable ack, not return on the OK. The mock
+/// sends durable acks only in reply to a PING, so each commit must send one.
+fn check_second_durable_commit_on_one_connection(
+    tier: MockDurableTier,
+    request_durable_ack: &str,
+    level: AckLevel,
+) {
+    let (server, _frames, pings) = MockServer::spawn_acking_durable_capturing(1, tier);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        &format!("pool_reap=manual;request_durable_ack={request_durable_ack};"),
+    ))
+    .unwrap();
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
+    for commit in 0..2_i64 {
+        let val = [commit];
+        let ts = [1 + commit];
+        let mut chunk = one_i64_row("trades", &val, &ts);
+        let started = Instant::now();
+        let pings_before = pings.load(Ordering::SeqCst);
+        sender
+            .flush_and_wait(&mut chunk, level)
+            .unwrap_or_else(|e| panic!("durable commit {commit} failed: {}", e.msg()));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "durable commit {commit} took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            pings.load(Ordering::SeqCst) > pings_before,
+            "durable commit {commit} returned without waiting for its durable ack"
+        );
+    }
+}
+
+#[test]
+fn direct_column_sender_second_local_durable_commit_completes() {
+    check_second_durable_commit_on_one_connection(
+        MOCK_DURABLE_LOCAL,
+        "local",
+        AckLevel::LocalDurable,
+    );
+}
+
+#[test]
+fn direct_column_sender_second_replicated_durable_commit_completes() {
+    check_second_durable_commit_on_one_connection(MOCK_DURABLE_ON, "on", AckLevel::Durable);
+}
+
+#[test]
+fn direct_column_sender_ok_commit_does_not_wait_for_local_durable_ack() {
+    // The mock answers PINGs only with replicated acks, which a `local`
+    // connection ignores: an Ok commit must return on the OK, without a PING.
+    let (server, _frames, pings) =
+        MockServer::spawn_acking_durable_capturing(1, MOCK_DURABLE_LOCAL_WITH_REPLICATED_ACKS);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_reap=manual;request_durable_ack=local;",
+    ))
+    .unwrap();
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
+    let val = [7_i64];
+    let ts = [1_i64];
+    let mut chunk = one_i64_row("trades", &val, &ts);
+    let started = Instant::now();
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("an Ok commit needs only the OK");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "Ok commit took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(pings.load(Ordering::SeqCst), 0, "an Ok commit sent a PING");
+}
+
+/// Runs `publish_and_drop` against a mock that grants `request_durable_ack=local`
+/// and sends the local durable ack only in reply to a PING. Only a durable wait
+/// sends a PING, so one proves the drop-time commit of the deferred tail waited
+/// at the local durable level, not just for the OK.
+fn check_drop_commit_waits_for_local_durable(publish_and_drop: impl FnOnce(&str)) {
+    let (server, _frames, pings) =
+        MockServer::spawn_acking_durable_capturing(1, MOCK_DURABLE_LOCAL);
+    publish_and_drop(&conf_for(server.port(), "request_durable_ack=local;"));
+    assert!(
+        pings.load(Ordering::SeqCst) > 0,
+        "the drop-time commit did not wait for the local durable ack"
+    );
+}
+
+/// Flushes one row twice: the first flush on a fresh connection is committed
+/// inline, the second is deferred and left for the drop to commit.
+fn flush_committed_then_deferred(mut flush: impl FnMut(&mut Chunk<'_>) -> crate::Result<()>) {
+    let val = [7_i64];
+    let ts = [1_i64];
+    for _ in 0..2 {
+        flush(&mut one_i64_row("trades", &val, &ts)).unwrap();
+    }
+}
+
+#[test]
+fn direct_sender_drop_commits_at_local_durable_with_local_opt_in() {
+    check_drop_commit_waits_for_local_durable(|conf| {
+        let db = QuestDb::connect(&format!("{conf}pool_reap=manual;")).unwrap();
+        let mut sender = db.borrow_direct_column_sender().expect("borrow");
+        flush_committed_then_deferred(|chunk| sender.flush(chunk));
+        assert!(sender.in_flight() > 0, "deferred flush must be in-flight");
+        drop(sender);
+    });
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn owned_direct_sender_drop_commits_at_local_durable_with_local_opt_in() {
+    check_drop_commit_waits_for_local_durable(|conf| {
+        let db = QuestDb::connect(&format!("{conf}pool_reap=manual;")).unwrap();
+        let mut sender = db.borrow_direct_column_sender_owned().expect("borrow");
+        flush_committed_then_deferred(|chunk| sender.get_mut().flush(chunk));
+        assert!(
+            sender.get().in_flight() > 0,
+            "deferred flush must be in-flight"
+        );
+        drop(sender);
+    });
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn standalone_direct_sender_drop_commits_at_local_durable_with_local_opt_in() {
+    check_drop_commit_waits_for_local_durable(|conf| {
+        let mut sender =
+            crate::db::OwnedDirectColumnSender::from_conf(conf).expect("standalone connect");
+        flush_committed_then_deferred(|chunk| sender.get_mut().flush(chunk));
+        assert!(
+            sender.get().in_flight() > 0,
+            "deferred flush must be in-flight"
+        );
+        drop(sender);
+    });
+}
+
+/// Over TLS, OKs each frame and sends the local durable ack only on the third
+/// PING, with no pongs: nothing reaches the client between the second and
+/// third PING, so its read in between times out inside rustls.
+fn spawn_tls_local_durable_ack_on_third_ping() -> (u16, thread::JoinHandle<()>) {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    let certs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tls_certs");
+    let certs = CertificateDer::pem_file_iter(certs_dir.join("server.crt"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = PrivateKeyDer::from_pem_file(certs_dir.join("server.key")).unwrap();
+    let config = Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let conn = rustls::ServerConnection::new(config).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, tcp);
+        upgrade_mock_stream_with_durable_ack(&mut tls, Some(MOCK_DURABLE_LOCAL));
+        let mut wire_seq = 0u64;
+        let mut pings = 0usize;
+        while pings < 3 {
+            let (_fin, opcode, _payload) = read_frame(&mut tls).unwrap();
+            match opcode {
+                0x2 => {
+                    write_qwp_ok_response_with_table_entries(&mut tls, wire_seq, &[("trades", 1)])
+                        .unwrap();
+                    wire_seq += 1;
+                }
+                0x9 => pings += 1,
+                _ => {}
+            }
+        }
+        write_qwp_durable_ack_response_with_status(
+            &mut tls,
+            MOCK_DURABLE_LOCAL.ack_status,
+            &[("trades", 1)],
+        )
+        .unwrap();
+        // Hold the connection until the client closes; the read timeout bounds it.
+        let mut sink = [0u8; 256];
+        while matches!(tls.read(&mut sink), Ok(n) if n > 0) {}
+    });
+    (port, handle)
+}
+
+#[test]
+fn direct_column_sender_local_durable_wait_completes_on_keepalive_ping_over_tls() {
+    let (port, server) = spawn_tls_local_durable_ack_on_third_ping();
+    let roots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tls_certs/server_rootCA.pem");
+    let db = QuestDb::connect(&format!(
+        "wss::addr=localhost:{port};tls_roots={};lazy_connect=true;auth_timeout=2000;\
+         reconnect_max_duration_millis=1000;pool_reap=manual;request_durable_ack=local;",
+        roots.display()
+    ))
+    .unwrap();
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
+    let val = [7_i64];
+    let ts = [1_i64];
+    let mut chunk = one_i64_row("trades", &val, &ts);
+    let started = Instant::now();
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::LocalDurable)
+        .expect("local durable wait must complete over TLS");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "durable wait took {elapsed:?}"
+    );
+    drop(sender);
+    drop(db);
+    server.join().unwrap();
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn flush_arrow_batch_defaults_to_local_durable_with_local_opt_in() {
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let (server, _frames, pings) =
+        MockServer::spawn_acking_durable_capturing(1, MOCK_DURABLE_LOCAL);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_reap=manual;request_durable_ack=local;",
+    ))
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+    let arr = Arc::new(Int64Array::from(vec![1i64, 2]));
+    let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+    let started = Instant::now();
+    db.flush_arrow_batch("trades", &batch, None, &[], None)
+        .expect("default level must be the local durable one");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // Only a durable wait pings, so an `Ok` default would leave this at zero.
+    assert!(pings.load(Ordering::SeqCst) > 0);
 }
 
 #[test]
@@ -7870,6 +8247,79 @@ fn close_drain_is_bounded_when_peer_never_acks() {
     );
 }
 
+const LOCAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Parks a `local` pool's only sender with a frame that is OK'd but never
+/// locally durable: the server answers pings only with replicated acks.
+fn park_local_sender_ok_but_not_locally_durable() -> (MockServer, QuestDb) {
+    let (server, _frames, pings) =
+        MockServer::spawn_acking_durable_capturing(1, MOCK_DURABLE_LOCAL_WITH_REPLICATED_ACKS);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        &format!(
+            "sender_pool_min=0;sender_pool_max=1;idle_timeout_ms=1;pool_reap=manual;\
+             close_flush_timeout_millis={};request_durable_ack=local;\
+             durable_ack_keepalive_interval_millis=20;",
+            LOCAL_DRAIN_TIMEOUT.as_millis()
+        ),
+    ))
+    .unwrap();
+    {
+        let mut sender = db.borrow_sender().expect("borrow");
+        let v = [1_i64];
+        let t = [1_i64];
+        let mut chunk = one_i64_row("trades", &v, &t);
+        sender.flush(&mut chunk).expect("publish");
+        sender
+            .wait(AckLevel::Ok, Duration::from_secs(5))
+            .expect("the OK arrives");
+    }
+    // Replicated acks arrive while parked; the `local` sender ignores them.
+    assert!(wait_until(Duration::from_secs(5), || {
+        pings.load(Ordering::SeqCst) >= 2
+    }));
+    assert_eq!(db.free_count(), 1);
+    (server, db)
+}
+
+#[test]
+fn reap_skips_local_sender_with_ok_but_not_locally_durable_frame() {
+    let (_server, db) = park_local_sender_ok_but_not_locally_durable();
+    assert_eq!(
+        db.reap_idle(),
+        0,
+        "a frame without its local durable ack is undelivered for a `local` pool"
+    );
+    assert_eq!(db.free_count(), 1);
+}
+
+#[test]
+fn drop_on_return_drains_local_sender_with_ok_but_not_locally_durable_frame() {
+    let (_server, db) = park_local_sender_ok_but_not_locally_durable();
+    let mut sender = db.borrow_sender().expect("reborrow the parked sender");
+    sender.drop_on_return();
+    let start = Instant::now();
+    drop(sender);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= LOCAL_DRAIN_TIMEOUT - Duration::from_millis(50),
+        "retiring must wait for the local durable ack until close_flush_timeout (took {elapsed:?})"
+    );
+    assert_eq!(db.free_count(), 0);
+}
+
+#[test]
+fn close_drains_local_sender_with_ok_but_not_locally_durable_frame() {
+    let (_server, db) = park_local_sender_ok_but_not_locally_durable();
+    let start = Instant::now();
+    db.close();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= LOCAL_DRAIN_TIMEOUT - Duration::from_millis(50),
+        "close must wait for the local durable ack until close_flush_timeout (took {elapsed:?})"
+    );
+}
+
 // ---------- F0: endpoint rotation + health, transient classification ----------
 
 #[test]
@@ -9155,7 +9605,7 @@ fn flush_arrow_batch_durable_without_opt_in_is_rejected() {
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert_eq!(
         err.msg(),
-        "AckLevel::Durable requires `request_durable_ack=on` in the connect string."
+        "AckLevel::Durable requires `request_durable_ack=on`, `replicated`, or `local,replicated` in the connect string."
     );
 }
 

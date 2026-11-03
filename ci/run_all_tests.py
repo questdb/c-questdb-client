@@ -52,8 +52,10 @@ def run_cargo_tests():
     # arrow/polars run below still covers the cut without it.
     run_cmd('cargo', 'test', '--features=almost-all-features,ffi-support',
             '--', '--nocapture', cwd='questdb-rs')
+    # `ffi-support` also runs the tests of the owned pool and standalone
+    # handles the C API uses, which are compiled out without it.
     run_cmd('cargo', 'test', '--locked',
-            '--features=almost-all-features,arrow,polars',
+            '--features=almost-all-features,arrow,polars,ffi-support',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--locked', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',

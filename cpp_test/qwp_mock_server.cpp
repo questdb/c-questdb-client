@@ -385,6 +385,42 @@ std::vector<uint8_t> ingress_ok_frame(uint64_t wire_seq)
     return p;
 }
 
+namespace
+{
+void append_one_table_entry(
+    std::vector<uint8_t>& p, const std::string& table, int64_t seq_txn)
+{
+    p.push_back(0x01); // table count, u16 LE
+    p.push_back(0x00);
+    const uint16_t name_len = uint16_t(table.size());
+    p.push_back(uint8_t(name_len));
+    p.push_back(uint8_t(name_len >> 8));
+    p.insert(p.end(), table.begin(), table.end());
+    for (int i = 0; i < 8; ++i)
+        p.push_back(uint8_t(static_cast<uint64_t>(seq_txn) >> (i * 8)));
+}
+} // namespace
+
+std::vector<uint8_t> ingress_ok_frame_with_table(
+    uint64_t wire_seq, const std::string& table, int64_t seq_txn)
+{
+    std::vector<uint8_t> p;
+    p.push_back(0x00);
+    for (int i = 0; i < 8; ++i)
+        p.push_back(uint8_t((wire_seq >> (i * 8)) & 0xFF));
+    append_one_table_entry(p, table, seq_txn);
+    return p;
+}
+
+std::vector<uint8_t> ingress_local_durable_ack_frame(
+    const std::string& table, int64_t seq_txn)
+{
+    std::vector<uint8_t> p;
+    p.push_back(0x0E);
+    append_one_table_entry(p, table, seq_txn);
+    return p;
+}
+
 std::vector<uint8_t> result_batch_frame(
     int64_t request_id,
     uint64_t batch_seq,
@@ -701,8 +737,11 @@ bool recv_all(socket_t fd, uint8_t* data, size_t len)
 }
 
 // Read the HTTP request, find Sec-WebSocket-Key, write the upgrade
-// response with X-QWP-Version: 1. Returns true on success.
-bool ws_handshake(socket_t fd, bool reject_401)
+// response with X-QWP-Version: 1. A non-empty `grant_durable_ack` is echoed
+// as `X-QWP-Durable-Ack` when the request asks for exactly that tier.
+// Returns true on success.
+bool ws_handshake(
+    socket_t fd, bool reject_401, const std::string& grant_durable_ack)
 {
     std::string buf;
     buf.reserve(1024);
@@ -729,6 +768,7 @@ bool ws_handshake(socket_t fd, bool reject_401)
     }
 
     std::string key;
+    std::string requested_durable_ack;
     int client_max_version = 2;
     {
         size_t p = 0;
@@ -757,6 +797,10 @@ bool ws_handshake(socket_t fd, bool reject_401)
             {
                 key = value;
             }
+            else if (name == "x-qwp-request-durable-ack")
+            {
+                requested_durable_ack = value;
+            }
             else if (name == "x-qwp-max-version")
             {
                 try
@@ -783,7 +827,11 @@ bool ws_handshake(socket_t fd, bool reject_401)
         "Connection: Upgrade\r\n"
         "X-QWP-Version: 1\r\n"
         "Sec-WebSocket-Accept: " +
-        accept + "\r\n\r\n";
+        accept + "\r\n";
+    if (!grant_durable_ack.empty() &&
+        requested_durable_ack == grant_durable_ack)
+        resp += "X-QWP-Durable-Ack: " + grant_durable_ack + "\r\n";
+    resp += "\r\n";
     return send_all(
         fd, reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
 }
@@ -1045,16 +1093,56 @@ struct MockServer::Impl
         }
     }
 
+    // Runs `ActionServeLocalDurableAck` until the client closes.
+    void serve_local_durable_ack(socket_t fd, const std::string& table)
+    {
+        uint64_t next_wire_seq = 0;
+        while (true)
+        {
+            WsFrame f = ws_read(fd);
+            if (f.opcode < 0 || f.opcode == 0x8)
+                return;
+            if (f.opcode == 0x9)
+            {
+                std::vector<uint8_t> pong = {0x8A, uint8_t(f.payload.size())};
+                pong.insert(pong.end(), f.payload.begin(), f.payload.end());
+                if (!send_all(fd, pong.data(), pong.size()))
+                    return;
+                if (next_wire_seq > 0 &&
+                    !ws_write_binary(
+                        fd,
+                        ingress_local_durable_ack_frame(
+                            table, int64_t(next_wire_seq))))
+                    return;
+                continue;
+            }
+            if (f.opcode != 0x2 || f.payload.empty())
+                continue;
+            {
+                std::lock_guard<std::mutex> g(captured_mtx);
+                captured.push_back(f.payload);
+            }
+            if (!ws_write_binary(
+                    fd,
+                    ingress_ok_frame_with_table(
+                        next_wire_seq, table, int64_t(next_wire_seq + 1))))
+                return;
+            ++next_wire_seq;
+        }
+    }
+
     void run_worker(socket_t fd, Script script)
     {
         bool reject = false;
+        std::string grant_durable_ack;
         for (const auto& a : script)
+        {
             if (std::holds_alternative<ActionReject401>(a))
-            {
                 reject = true;
-                break;
-            }
-        if (!ws_handshake(fd, reject))
+            else if (std::holds_alternative<ActionServeLocalDurableAck>(a))
+                grant_durable_ack = "local";
+        }
+        if (!ws_handshake(fd, reject, grant_durable_ack))
         {
             close_socket(fd);
             return;
@@ -1159,6 +1247,10 @@ struct MockServer::Impl
             {
                 close_socket(fd);
                 return;
+            }
+            else if (auto* a = std::get_if<ActionServeLocalDurableAck>(&action))
+            {
+                serve_local_durable_ack(fd, a->table);
             }
         }
 #ifdef _MSC_VER

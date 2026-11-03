@@ -32,6 +32,7 @@ use crate::ErrorCode;
 use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+use crate::ingress::conf::DurableAckTiers;
 use crate::ingress::sender::ack_wait_timeout_error;
 use crate::ingress::sender::effective_hard_frame_cap;
 use crate::ingress::sender::qwp_ws::{
@@ -269,7 +270,7 @@ struct SfaBackend {
     /// `wait`, `flush`, or pool return can retry it.
     sfa_deferred_group_open: bool,
     max_buf_size: usize,
-    request_durable_ack: bool,
+    request_durable_ack: DurableAckTiers,
     /// No-progress deadline for the `sync` poll loop. Mirrors the direct
     /// backend's socket `request_timeout`: it bounds how long `sync` waits
     /// *without the ack/durable watermark advancing*, so a silent-but-alive
@@ -307,7 +308,7 @@ impl PooledSenderCore {
     pub(crate) fn new_store_and_forward(
         mut state: SyncQwpWsHandlerState,
         max_buf_size: usize,
-        request_durable_ack: bool,
+        request_durable_ack: DurableAckTiers,
         sync_timeout: Duration,
     ) -> Result<Self> {
         // The background driver enables its catch-up mirror on exactly the same
@@ -557,8 +558,10 @@ impl PooledSenderCore {
     /// behaves exactly like [`Self::sync`] (it encodes a header-only frame).
     ///
     /// `AckLevel::Durable` requires QuestDB Enterprise and a pool opened with
-    /// `request_durable_ack=on`; otherwise the call is rejected up front
-    /// (`InvalidApiCall`) before `chunk` is touched.
+    /// `request_durable_ack=on`, `replicated`, or `local,replicated`, and
+    /// `AckLevel::LocalDurable` a pool opened with `request_durable_ack=local`;
+    /// otherwise the call is rejected up front (`InvalidApiCall`) before
+    /// `chunk` is touched.
     ///
     /// Publication failure retains `chunk`, but splitting may already have
     /// published a prefix. Check [`crate::Error::in_doubt`] before retrying.
@@ -1557,13 +1560,7 @@ impl SfaBackend {
     /// durable-without-opt-in request *before* encode mutates the symbol dict
     /// or the Arrow import consumes the caller's array.
     fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
-        if ack_level == AckLevel::Durable && !self.request_durable_ack {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "AckLevel::Durable requires `request_durable_ack=on` in the connect string."
-            ));
-        }
-        Ok(())
+        self.request_durable_ack.check_ack_level(ack_level)
     }
 
     /// Marks the connection for retirement (`drop_on_return`) when `err` reports
@@ -2194,7 +2191,7 @@ impl SfaBackend {
     ) -> Result<()> {
         let last_boundary = match ack_level {
             AckLevel::Ok => self.last_ok_sync_boundary,
-            AckLevel::Durable => self.last_durable_sync_boundary,
+            AckLevel::Durable | AckLevel::LocalDurable => self.last_durable_sync_boundary,
         };
         if last_boundary.is_some_and(|last| last >= boundary) {
             return Ok(());
@@ -2214,12 +2211,16 @@ impl SfaBackend {
             let generation = qwp_ws_progress_generation_background(&self.state);
             let completed = match ack_level {
                 AckLevel::Ok => qwp_ws_ok_fsn_background(&self.state)?,
-                AckLevel::Durable => qwp_ws_acked_fsn_background(&self.state)?,
+                AckLevel::Durable | AckLevel::LocalDurable => {
+                    qwp_ws_acked_fsn_background(&self.state)?
+                }
             };
             if completed.is_some_and(|fsn| fsn >= boundary) {
                 match ack_level {
                     AckLevel::Ok => self.last_ok_sync_boundary = Some(boundary),
-                    AckLevel::Durable => self.last_durable_sync_boundary = Some(boundary),
+                    AckLevel::Durable | AckLevel::LocalDurable => {
+                        self.last_durable_sync_boundary = Some(boundary)
+                    }
                 }
                 return Ok(());
             }
@@ -2308,6 +2309,7 @@ fn sfa_sync_timeout(
     let level = match ack_level {
         AckLevel::Ok => "ok",
         AckLevel::Durable => "durable",
+        AckLevel::LocalDurable => "local durable",
     };
     ack_wait_timeout_error(
         &format!("QWP/WebSocket store-and-forward wait({level})"),

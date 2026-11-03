@@ -143,6 +143,8 @@ SUITE_QWP_WS_SMOKE = 'qwp_ws_smoke'
 SUITE_QWP_WS_PROTOCOL = 'qwp_ws_protocol'
 SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
 SUITE_QWP_WS_FUZZ = 'qwp_ws_fuzz'
+SUITE_QWP_WS_LOCAL_DURABLE = 'qwp_ws_local_durable'
+SUITE_QWP_WS_LOCAL_DURABLE_REFUSED = 'qwp_ws_local_durable_refused'
 QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
@@ -224,6 +226,10 @@ def _suite_kind(test):
         return SUITE_QWP_WS_PROTOCOL
     if class_name == 'TestQwpWsRestart':
         return SUITE_QWP_WS_RESTART
+    if class_name == 'TestQwpWsLocalDurableAck':
+        return SUITE_QWP_WS_LOCAL_DURABLE
+    if class_name == 'TestQwpWsLocalDurableAckRefused':
+        return SUITE_QWP_WS_LOCAL_DURABLE_REFUSED
     if class_name == 'TestQwpWsFuzz' or class_name.startswith('TestArrow'):
         return SUITE_QWP_WS_FUZZ
     return SUITE_MATRIX
@@ -2503,6 +2509,179 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
                     timeout_sec=60)
 
 
+def supports_local_durable_ack(fixture) -> bool:
+    """Whether `fixture`'s server grants `request_durable_ack=local`
+    (questdb/questdb#7411, on master after the 10.1.0 release).
+
+    Decided from what the fixture knows before it starts, because the
+    adaptive commit mode must not be configured on a server that does not
+    know it. A `--repo` build is QuestDB master, as for the other QWP/WebSocket
+    suites, so a refusal there fails instead of skipping. A released server
+    has it from the first release after 10.1.0."""
+    if fixture._root_dir.name == 'repo':
+        return True
+    return fixture.version > (10, 1, 0)
+
+
+class QwpWsLocalDurableAckSupport(QwpWsTestSupport):
+    # `qwpws_ack_level_local_durable` in `line_sender.h`.
+    ACK_LEVEL_LOCAL_DURABLE = 2
+    ROWS = 3
+
+    def setUp(self):
+        if not isinstance(QDB_FIXTURE, QuestDbFixture):
+            self.skipTest('local durable ACK tests configure the server commit mode')
+        if not supports_local_durable_ack(QDB_FIXTURE):
+            version = '.'.join(map(str, QDB_FIXTURE.version))
+            self.skipTest(f'QuestDB {version} predates the local durable ACK')
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(
+            f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {test_name}')
+
+    def tearDown(self):
+        if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
+            test_name = self.id()
+            QDB_FIXTURE.http_sql_query(
+                f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
+
+
+class TestQwpWsLocalDurableAck(QwpWsLocalDurableAckSupport, unittest.TestCase):
+    """Runs against a server with `cairo.commit.mode=adaptive`, the only mode
+    in which it grants `request_durable_ack=local`."""
+
+    # Well under the 30 s `request_timeout` default that bounds a durable
+    # wait which never sees the server's local durable ACK.
+    MAX_WAIT_SEC = 10
+
+    def test_row_sender_waits_for_local_durable_ack(self):
+        table_name = 'qwp_ws_local_durable_row_' + uuid.uuid4().hex[:8]
+        self._create_qwp_ws_table(table_name)
+        sender_id = 'local-durable-row-' + uuid.uuid4().hex[:8]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-local-durable-') as sf_dir:
+            sender = self._connect_sender(self._sender_conf(
+                sender_id,
+                sf_dir,
+                request_durable_ack='local'))
+            try:
+                self._write_rows(sender, table_name, 0, self.ROWS)
+                sender.flush()
+                started = time.monotonic()
+                sender.wait(
+                    self.ACK_LEVEL_LOCAL_DURABLE,
+                    self.MAX_WAIT_SEC * 1000)
+                waited = time.monotonic() - started
+            finally:
+                sender.close(False)
+
+        self.assertLess(waited, self.MAX_WAIT_SEC)
+        self._retry_assert_aggregates(
+            table_name,
+            expected_count=self.ROWS,
+            expected_distinct_id=self.ROWS,
+            expected_min_id=0,
+            expected_max_id=self.ROWS - 1)
+
+    def test_direct_column_sender_commits_at_local_durable_ack(self):
+        import ctypes as c
+
+        # Bind only the native ABI, as `test_native_chunk_decimals_and_arrays`
+        # does: this test must also run without Arrow.
+        def bind(name, result, *args):
+            return c.CFUNCTYPE(result, *args)((name, qls._DLL))
+
+        ptr, size, err = c.c_void_p, c.c_size_t, qls.c_line_sender_error_p_p
+        check = qls._error_wrapped_call
+        connect = bind('questdb_db_connect', ptr, c.c_char_p, size, err)
+        close = bind('questdb_db_close', None, ptr)
+        borrow = bind('questdb_db_borrow_direct_sender', ptr, ptr, err)
+        give_back = bind('questdb_db_return_direct_sender', None, ptr, ptr)
+        drop = bind('questdb_db_drop_direct_sender', None, ptr, ptr)
+        chunk_new = bind('qwp_chunk_new', ptr, c.c_char_p, size, err)
+        chunk_free = bind('qwp_chunk_free', None, ptr)
+        column_i64 = bind('qwp_chunk_column_i64', c.c_bool, ptr, c.c_char_p,
+                          size, c.POINTER(c.c_int64), size, ptr, err)
+        column_f64 = bind('qwp_chunk_column_f64', c.c_bool, ptr, c.c_char_p,
+                          size, c.POINTER(c.c_double), size, ptr, err)
+        at_micros = bind('qwp_chunk_at_micros', c.c_bool, ptr,
+                         c.POINTER(c.c_int64), size, err)
+        flush = bind('qwp_direct_sender_flush', c.c_bool, ptr, ptr, err)
+        commit = bind('qwp_direct_sender_commit', c.c_bool,
+                      ptr, c.c_uint32, err)
+
+        table_name = 'qwp_ws_local_durable_direct_' + uuid.uuid4().hex[:8]
+        self._create_qwp_ws_table(table_name)
+        table_bytes = table_name.encode()
+
+        def fill_chunk(chunk, first_id):
+            ids = (c.c_int64 * self.ROWS)(
+                *range(first_id, first_id + self.ROWS))
+            vals = (c.c_double * self.ROWS)(*(i * 0.5 for i in ids))
+            ts = (c.c_int64 * self.ROWS)(
+                *(self.BASE_TS_US + i * self.TS_STEP_US for i in ids))
+            check(column_i64, chunk, b'id', 2, ids, self.ROWS, None)
+            check(column_f64, chunk, b'val', 3, vals, self.ROWS, None)
+            check(at_micros, chunk, ts, self.ROWS)
+            # The chunk borrows the buffers until it is flushed.
+            return ids, vals, ts
+
+        conf = (
+            f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
+            'request_durable_ack=local;')
+        conf_bytes = conf.encode()
+        db = check(connect, conf_bytes, len(conf_bytes))
+        sender = chunk = None
+        committed = False
+        try:
+            sender = check(borrow, db)
+            chunk = check(chunk_new, table_bytes, len(table_bytes))
+            # Two flushes: the first one on a fresh connection is sent on its
+            # own, the second one is deferred to the commit below.
+            for first_id in (0, self.ROWS):
+                buffers = fill_chunk(chunk, first_id)
+                check(flush, sender, chunk)
+                del buffers
+            started = time.monotonic()
+            check(commit, sender, self.ACK_LEVEL_LOCAL_DURABLE)
+            waited = time.monotonic() - started
+            committed = True
+        finally:
+            chunk_free(chunk)
+            if sender:
+                (give_back if committed else drop)(db, sender)
+            close(db)
+
+        self.assertLess(waited, self.MAX_WAIT_SEC)
+        self._retry_assert_aggregates(
+            table_name,
+            expected_count=2 * self.ROWS,
+            expected_distinct_id=2 * self.ROWS,
+            expected_min_id=0,
+            expected_max_id=2 * self.ROWS - 1)
+
+
+class TestQwpWsLocalDurableAckRefused(QwpWsLocalDurableAckSupport, unittest.TestCase):
+    """Runs against a server with `cairo.commit.mode=nosync`, which does not
+    grant `request_durable_ack=local`."""
+
+    def test_connect_refused_without_adaptive_commit_mode(self):
+        sender_id = 'local-durable-refused-' + uuid.uuid4().hex[:8]
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-local-durable-') as sf_dir:
+            sender = qls.Sender.from_conf(self._sender_conf(
+                sender_id,
+                sf_dir,
+                request_durable_ack='local'))
+            try:
+                with self.assertRaises(qls.SenderError) as ctx:
+                    sender.connect()
+            finally:
+                sender.close(False)
+        self.assertIn(
+            'WebSocket upgrade failed: server did not enable durable ACK '
+            '[requested=local, echoed=<no X-QWP-Durable-Ack header>]',
+            str(ctx.exception))
+
+
 class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     """Schema-fuzz suite ported from
     `io.questdb.test.cutlass.qwp.e2e.QwpSenderFuzzTest`.
@@ -4569,6 +4748,12 @@ def run_with_fixtures(args):
     run_qwp_ws_protocol_suite = _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0
     run_qwp_ws_restart_suite = _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0
     run_qwp_ws_fuzz_suite = _select_tests(SUITE_QWP_WS_FUZZ).countTestCases() > 0
+    local_durable_suites = [
+        (suite_kind, commit_mode)
+        for suite_kind, commit_mode in (
+            (SUITE_QWP_WS_LOCAL_DURABLE, 'adaptive'),
+            (SUITE_QWP_WS_LOCAL_DURABLE_REFUSED, 'nosync'))
+        if _select_tests(suite_kind).countTestCases() > 0]
 
     for questdb_dir in iter_versions(args):
         if run_matrix_suite:
@@ -4699,6 +4884,29 @@ def run_with_fixtures(args):
                 QDB_FIXTURE.protocol_version = latest_protocol
                 QDB_FIXTURE.drop_all_tables()
                 if not _run_selected_tests(SUITE_QWP_WS_FUZZ):
+                    sys.exit(1)
+            finally:
+                _stop_and_maybe_wipe(QDB_FIXTURE)
+
+        for suite_kind, commit_mode in local_durable_suites:
+            QDB_FIXTURE = QuestDbFixture(
+                questdb_dir,
+                auth=False,
+                qwp_udp=False)
+            # An older server may not accept the commit mode; its tests skip.
+            if supports_local_durable_ack(QDB_FIXTURE):
+                QDB_FIXTURE.commit_mode = commit_mode
+            TLS_PROXY_FIXTURE = None
+            try:
+                sys.stderr.write(
+                    f'>>>> STARTING {questdb_dir} [{suite_kind} '
+                    f'commit_mode={QDB_FIXTURE.commit_mode}] <<<<\n')
+                QDB_FIXTURE.start()
+                BUILD_MODE = qls.BuildMode.CONF
+                QDB_FIXTURE.http = False
+                QDB_FIXTURE.protocol_version = latest_protocol
+                QDB_FIXTURE.drop_all_tables()
+                if not _run_selected_tests(suite_kind):
                     sys.exit(1)
             finally:
                 _stop_and_maybe_wipe(QDB_FIXTURE)

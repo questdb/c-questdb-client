@@ -39,7 +39,9 @@ use rand::RngCore;
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
 use crate::ingress::buffer::QwpWsColumnarBuffer;
-use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability};
+use crate::ingress::conf::{
+    DurableAckTiers, QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability,
+};
 use crate::ingress::tls::{TlsSettings, configure_tls};
 use crate::ws::frame::{
     OPCODE_BINARY, OPCODE_CLOSE, OPCODE_CONTINUATION, OPCODE_PING, OPCODE_PONG, OPCODE_TEXT, Opcode,
@@ -453,7 +455,7 @@ pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     runner: SyncQwpWsRunner,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
-    pub(crate) request_durable_ack: bool,
+    pub(crate) request_durable_ack: DurableAckTiers,
     /// Retained for a pending ACK wait's callback guard. Reconnects use the
     /// same provider through the runner; a warning handler may be waiting on
     /// this sender while that runner joins the handler's token worker.
@@ -518,7 +520,7 @@ pub(crate) struct ManualQwpWsHandlerState {
     store: QwpWsPublicationStore<SfaSlotQueue>,
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
-    pub(crate) request_durable_ack: bool,
+    pub(crate) request_durable_ack: DurableAckTiers,
     pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     /// Hard cap on a single queued frame's payload, as on
     /// [`SyncQwpWsHandlerState::sfa_frame_payload_cap`].
@@ -568,7 +570,7 @@ struct QwpWsPendingConnect {
     qwp_ws: QwpWsConfig,
     auth_header: Option<String>,
     reconnect_policy: ReconnectPolicy,
-    durable_ack: bool,
+    durable_ack: DurableAckTiers,
     server_max_batch_size: Arc<AtomicUsize>,
     traffic_gate: Arc<TrafficGate>,
     /// Whether the I/O thread enables its symbol-dict catch-up mirror once
@@ -1082,7 +1084,7 @@ impl QwpWsPendingConnect {
         tls_settings: Option<TlsSettings>,
         qwp_ws: &QwpWsConfig,
         auth_header: Option<String>,
-        durable_ack: bool,
+        durable_ack: DurableAckTiers,
         server_max_batch_size: Arc<AtomicUsize>,
         traffic_gate: Arc<TrafficGate>,
         delta_dict_enabled: bool,
@@ -1495,11 +1497,15 @@ where
                     Err(err) => self.store_shared_driver_error(shared, err),
                 }
             }
-            TransportResponse::DurableAck { table_seq_txns } => {
-                match self
-                    .send_core
-                    .finish_durable_ack_response_sfa(&self.progress, table_seq_txns)
-                {
+            TransportResponse::DurableAck {
+                table_seq_txns,
+                local,
+            } => {
+                match self.send_core.finish_durable_ack_response_sfa(
+                    &self.progress,
+                    table_seq_txns,
+                    local,
+                ) {
                     Ok(progress) => self.finish_hot_response_progress(shared, progress),
                     Err(err) => self.store_shared_driver_error(shared, err),
                 }
@@ -2828,7 +2834,7 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
     auth_header: Option<&str>,
     max_version: u32,
     client_id: Option<&str>,
-    request_durable_ack: bool,
+    request_durable_ack: DurableAckTiers,
 ) -> crate::Result<(u8, Vec<u8>)> {
     let extras = codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
     let handshake = crate::ws::handshake::upgrade(stream, host_header, codec::WS_PATH, &extras)
@@ -3647,7 +3653,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     {
         return Err(err);
     }
-    if *qwp_ws.request_durable_ack && role_reject_count == endpoints.len() {
+    if qwp_ws.request_durable_ack.is_enabled() && role_reject_count == endpoints.len() {
         let role_reject = last_role_mismatch
             .as_ref()
             .and_then(|err| err.qwp_ws_role_reject().cloned());
@@ -4366,8 +4372,8 @@ pub(crate) fn qwp_ws_acked_fsn_manual(
 }
 
 /// Manual-mode OK watermark. Manual progress keeps no separate OK tracker,
-/// so this is the completed watermark: under `request_durable_ack=on` it
-/// advances on the durable ACK, not on the server's ordinary OK.
+/// so this is the completed watermark: with durable ACKs requested it advances
+/// on the durable ACK the sender trims on, not on the server's ordinary OK.
 pub(crate) fn qwp_ws_ok_fsn_manual(state: &ManualQwpWsHandlerState) -> crate::Result<Option<u64>> {
     check_manual_driver_error(state)?;
     Ok(state.store.completed_fsn())
@@ -5169,7 +5175,7 @@ mod tests {
             None,
             &qwp_ws,
             None,
-            false,
+            DurableAckTiers::Off,
             Arc::new(AtomicUsize::new(0)),
             Arc::new(TrafficGate::default()),
             false,
@@ -5221,7 +5227,7 @@ mod tests {
 
     fn pooled_boundary_wait_sender<T: QwpWsCoreTransport + Send + 'static>(
         transport: T,
-        durable: bool,
+        durable: DurableAckTiers,
     ) -> (
         crate::ingress::column_sender::PooledSenderCore,
         Arc<BackpressureNotifier>,
@@ -5269,7 +5275,7 @@ mod tests {
     #[test]
     fn pooled_boundary_wait_unrelated_notifications_do_not_extend_timeout() {
         let (mut sender, notifier) =
-            pooled_boundary_wait_sender(FakeOrderedServer::no_response(), false);
+            pooled_boundary_wait_sender(FakeOrderedServer::no_response(), DurableAckTiers::Off);
         let (stop_tx, stop_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         std::thread::scope(|scope| {
@@ -5309,7 +5315,8 @@ mod tests {
                 terminal: terminal_rx,
                 sent_frames: Vec::new(),
             };
-            let (mut sender, notifier) = pooled_boundary_wait_sender(transport, false);
+            let (mut sender, notifier) =
+                pooled_boundary_wait_sender(transport, DurableAckTiers::Off);
             sent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let (waiting_tx, waiting_rx) = mpsc::channel();
             let (result_tx, result_rx) = mpsc::channel();
@@ -5351,7 +5358,8 @@ mod tests {
             ack_ready: Arc::clone(&ack_ready),
             sent_frames: Vec::new(),
         };
-        let (mut sender, _) = pooled_boundary_wait_sender(transport, true);
+        let (mut sender, _) =
+            pooled_boundary_wait_sender(transport, DurableAckTiers::LegacyReplicated);
         sender
             .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap();
@@ -5942,11 +5950,13 @@ mod tests {
         // consume them without losing the leading frame.
         let mut stream = UpgradeResponseWithFrame::new(b"\x02\x00");
 
-        let extras = codec::qwp_extra_headers(None, 1, None, false);
+        let extras = codec::qwp_extra_headers(None, 1, None, DurableAckTiers::Off);
         let handshake =
             crate::ws::handshake::upgrade(&mut stream, "localhost:9000", codec::WS_PATH, &extras)
                 .unwrap();
-        let result = codec::validate_qwp_handshake_headers(&handshake.headers, 1, false).unwrap();
+        let result =
+            codec::validate_qwp_handshake_headers(&handshake.headers, 1, DurableAckTiers::Off)
+                .unwrap();
         let leftover = handshake.leftover;
 
         assert_eq!(result.version, 1);
@@ -6254,6 +6264,7 @@ mod tests {
             if self.ack_ready.swap(false, Ordering::AcqRel) {
                 Ok(TransportPoll::Response(TransportResponse::DurableAck {
                     table_seq_txns: Self::table_seq_txns(),
+                    local: false,
                 }))
             } else {
                 Ok(TransportPoll::Idle)
@@ -6918,7 +6929,7 @@ mod tests {
             queue,
             transport,
             ReconnectPolicy::bounded(Duration::MAX, Duration::ZERO, Duration::ZERO),
-            true,
+            DurableAckTiers::LegacyReplicated,
         );
         let receipt = driver.try_submit(b"sfa-first").unwrap();
         assert_eq!(receipt.fsn, 0);
