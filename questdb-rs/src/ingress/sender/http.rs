@@ -63,15 +63,24 @@ pub(crate) struct SyncHttpHandlerState {
 /// A static value (Basic / a fixed Bearer token) is precomputed once; a provider
 /// is called per flush so a rotating token (e.g. OIDC) stays fresh for a
 /// long-lived sender.
+///
+/// The provider is boxed to keep this enum as small as a `String`: inline, a
+/// `TokenProvider` makes the ILP/HTTP variant of `SyncProtocolHandler` large
+/// enough to trip clippy's `large_enum_variant`.
 #[cfg(feature = "sync-sender-http")]
 pub(crate) enum HttpAuth {
     None,
     Static(String),
-    Provider(crate::token_provider::TokenProvider),
+    Provider(Box<crate::token_provider::TokenProvider>),
 }
 
 #[cfg(feature = "sync-sender-http")]
 impl HttpAuth {
+    /// A rotating credential from `provider`, resolved on every flush.
+    pub(crate) fn provider(provider: crate::token_provider::TokenProvider) -> Self {
+        HttpAuth::Provider(Box::new(provider))
+    }
+
     /// Resolve the `Authorization` header value for one flush, calling the token
     /// provider if present. A `Static` value is borrowed (no per-flush
     /// allocation on the hot path); only the `Provider` case allocates.
@@ -993,12 +1002,12 @@ mod tests {
     fn resolve_rejects_blank_provider_token() {
         // A blank / all-whitespace provider token is refused (matching safe_token),
         // never reaching the wire as "Bearer   ".
-        let blank = HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+        let blank = HttpAuth::provider(crate::token_provider::TokenProvider::new(|| {
             Ok::<_, crate::Error>("   ".to_string())
         }));
         assert!(blank.resolve().is_err());
         // A normal token resolves to a Bearer header.
-        let ok = HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+        let ok = HttpAuth::provider(crate::token_provider::TokenProvider::new(|| {
             Ok::<_, crate::Error>("tok".to_string())
         }));
         assert_eq!(ok.resolve().unwrap().as_deref(), Some("Bearer tok"));
@@ -1027,7 +1036,7 @@ mod tests {
         let state = SyncHttpHandlerState {
             agent: ureq::Agent::new_with_defaults(),
             url: "http://127.0.0.1/write".to_string(),
-            auth: HttpAuth::Provider(crate::token_provider::TokenProvider::new(move || {
+            auth: HttpAuth::provider(crate::token_provider::TokenProvider::new(move || {
                 seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(30));
                 Err::<String, crate::Error>(crate::error::fmt!(
@@ -1055,7 +1064,7 @@ mod tests {
         let state = SyncHttpHandlerState {
             agent: ureq::Agent::new_with_defaults(),
             url: "http://127.0.0.1/write".to_string(),
-            auth: HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+            auth: HttpAuth::provider(crate::token_provider::TokenProvider::new(|| {
                 Err::<String, crate::Error>(
                     crate::oidc::OidcError::network("refresh failed").into(),
                 )
@@ -1098,7 +1107,7 @@ mod tests {
         let state = SyncHttpHandlerState {
             agent: ureq::Agent::new_with_defaults(),
             url: "http://127.0.0.1/write".to_string(),
-            auth: HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+            auth: HttpAuth::provider(crate::token_provider::TokenProvider::new(|| {
                 Err::<String, crate::Error>(
                     crate::oidc::OidcError::network("refresh failed").into(),
                 )

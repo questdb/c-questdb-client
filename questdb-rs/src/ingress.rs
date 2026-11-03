@@ -3145,7 +3145,7 @@ impl SenderBuilder {
                         ));
                     }
                     None => match self.http_token_provider {
-                        Some(ref provider) => HttpAuth::Provider(provider.clone()),
+                        Some(ref provider) => HttpAuth::provider(provider.clone()),
                         None => HttpAuth::None,
                     },
                 };
