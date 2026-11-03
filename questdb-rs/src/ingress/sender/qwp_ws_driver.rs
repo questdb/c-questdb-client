@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 
 use crate::error;
+use crate::ingress::conf::DurableAckTiers;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint};
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -832,13 +833,13 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
 impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     pub(crate) fn new(transport: T, reconnect_policy: ReconnectPolicy) -> Self {
-        Self::new_with_durable_ack(transport, reconnect_policy, false)
+        Self::new_with_durable_ack(transport, reconnect_policy, DurableAckTiers::Off)
     }
 
     pub(crate) fn new_with_durable_ack(
         transport: T,
         reconnect_policy: ReconnectPolicy,
-        durable_ack: bool,
+        durable_ack: DurableAckTiers,
     ) -> Self {
         Self::new_with_durable_ack_and_rejection_limit(
             transport,
@@ -852,7 +853,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     pub(crate) fn new_with_durable_ack_and_rejection_limit(
         transport: T,
         reconnect_policy: ReconnectPolicy,
-        durable_ack: bool,
+        durable_ack: DurableAckTiers,
         max_frame_rejections: usize,
         poison_min_escalation_window: Duration,
     ) -> Self {
@@ -862,7 +863,9 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             dict_mirror: SentDictMirror::new(false),
             catch_up_pending: false,
             catch_up_retry_strikes: 0,
-            durable_ack: durable_ack.then(DurableAckTracker::new),
+            durable_ack: durable_ack
+                .is_enabled()
+                .then(|| DurableAckTracker::new(durable_ack.trims_on_local())),
             reconnect_policy,
             pending_reconnect: None,
             poison_tracker: PoisonFrameTracker::default(),
@@ -896,12 +899,15 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     self.complete_ack_through(store, wire_seq)
                 }
             }
-            TransportResponse::DurableAck { table_seq_txns } => {
+            TransportResponse::DurableAck {
+                table_seq_txns,
+                local,
+            } => {
                 store.counters.total_acks += 1;
                 let Some(tracker) = self.durable_ack.as_mut() else {
                     return Ok(DriveOutcome::Idle);
                 };
-                tracker.apply_ack(table_seq_txns);
+                tracker.apply_ack(table_seq_txns, local);
                 self.complete_ready_durable(store)
             }
             TransportResponse::Reject { wire_seq, error } => {
@@ -1698,11 +1704,12 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         progress: &SfaProgressView,
         table_seq_txns: Vec<TableSeqTxn>,
+        local: bool,
     ) -> Result<QwpWsHotResponseProgress, DriverError> {
         let Some(tracker) = self.durable_ack.as_mut() else {
             return Ok(QwpWsHotResponseProgress::idle());
         };
-        tracker.apply_ack(table_seq_txns);
+        tracker.apply_ack(table_seq_txns, local);
         self.complete_ready_durable_sfa(progress)
     }
 
@@ -2342,7 +2349,7 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
         queue: Q,
         transport: T,
         reconnect_policy: ReconnectPolicy,
-        durable_ack: bool,
+        durable_ack: DurableAckTiers,
     ) -> Self {
         Self {
             store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
@@ -2365,7 +2372,7 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
             send_core: QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
                 transport,
                 ReconnectPolicy::no_backoff(Duration::MAX),
-                false,
+                DurableAckTiers::Off,
                 max_frame_rejections,
                 poison_min_escalation_window,
             ),
@@ -2389,7 +2396,7 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
             send_core: QwpWsSendCore::new_with_durable_ack(
                 transport,
                 ReconnectPolicy::no_backoff(Duration::MAX),
-                true,
+                DurableAckTiers::LegacyReplicated,
             ),
         }
     }
@@ -3325,7 +3332,7 @@ fn decode_transport_response(
         Ok(PipelinedResponse::Ok { sequence }) => {
             Ok(Some(TransportResponse::Ack { wire_seq: sequence }))
         }
-        Ok(PipelinedResponse::DurableAck) => Ok(None),
+        Ok(PipelinedResponse::DurableAck { .. }) => Ok(None),
         Ok(PipelinedResponse::Error(error)) => {
             let wire_seq = error.sequence;
             let server_error = QwpServerError::from(error);
@@ -3354,9 +3361,10 @@ fn decode_durable_transport_response(
             wire_seq: sequence,
             table_seq_txns,
         })),
-        Ok(PipelinedResponse::DurableAck) => {
-            Ok(Some(TransportResponse::DurableAck { table_seq_txns }))
-        }
+        Ok(PipelinedResponse::DurableAck { local }) => Ok(Some(TransportResponse::DurableAck {
+            table_seq_txns,
+            local,
+        })),
         Ok(PipelinedResponse::Error(error)) => {
             let wire_seq = error.sequence;
             let server_error = QwpServerError::from(error);
@@ -3388,7 +3396,7 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
     }
 
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
-        if self.pending_wire_sequences.is_empty() && !*self.qwp_ws.request_durable_ack {
+        if self.pending_wire_sequences.is_empty() && !self.qwp_ws.request_durable_ack.is_enabled() {
             return Ok(TransportPoll::Idle);
         }
         let read = self
@@ -3430,7 +3438,7 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
             });
         }
 
-        let response = if *self.qwp_ws.request_durable_ack {
+        let response = if self.qwp_ws.request_durable_ack.is_enabled() {
             decode_durable_transport_response(self.reader.message())
         } else {
             decode_transport_response(self.reader.message())
@@ -3455,7 +3463,7 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
         &mut self,
         durable_ack_pending: bool,
     ) -> Result<bool, TransportFailure> {
-        if !durable_ack_pending || !*self.qwp_ws.request_durable_ack {
+        if !durable_ack_pending || !self.qwp_ws.request_durable_ack.is_enabled() {
             return Ok(false);
         }
         let interval = *self.qwp_ws.durable_ack_keepalive_interval;
@@ -3818,6 +3826,7 @@ pub(crate) enum TransportResponse {
     },
     DurableAck {
         table_seq_txns: Vec<TableSeqTxn>,
+        local: bool,
     },
     Reject {
         wire_seq: u64,
@@ -3857,6 +3866,7 @@ pub(crate) struct TableSeqTxn {
 struct DurableAckTracker {
     table_watermarks: HashMap<String, i64>,
     pending: VecDeque<PendingDurableFrame>,
+    trim_on_local: bool,
 }
 
 #[derive(Debug)]
@@ -3875,10 +3885,11 @@ struct DurableCompletion {
 }
 
 impl DurableAckTracker {
-    fn new() -> Self {
+    fn new(trim_on_local: bool) -> Self {
         Self {
             table_watermarks: HashMap::new(),
             pending: VecDeque::new(),
+            trim_on_local,
         }
     }
 
@@ -3899,7 +3910,10 @@ impl DurableAckTracker {
         });
     }
 
-    fn apply_ack(&mut self, table_seq_txns: Vec<TableSeqTxn>) {
+    fn apply_ack(&mut self, table_seq_txns: Vec<TableSeqTxn>, local: bool) {
+        if local != self.trim_on_local {
+            return;
+        }
         for entry in table_seq_txns {
             match self.table_watermarks.get_mut(&entry.table) {
                 Some(current) if entry.seq_txn > *current => {
@@ -6117,7 +6131,7 @@ mod tests {
 
     #[test]
     fn durable_pending_lookup_handles_contiguous_and_cumulative_gaps() {
-        let mut tracker = DurableAckTracker::new();
+        let mut tracker = DurableAckTracker::new(false);
         tracker.enqueue_ok(40, 100, Vec::new());
         tracker.enqueue_ok(41, 101, Vec::new());
         tracker.enqueue_ok(43, 103, Vec::new());
@@ -6128,6 +6142,34 @@ mod tests {
         assert_eq!(tracker.pending_wire_seq_for_fsn(103), Some(43));
         assert_eq!(tracker.pending_wire_seq_for_fsn(99), None);
         assert_eq!(tracker.pending_wire_seq_for_fsn(104), None);
+    }
+
+    #[test]
+    fn durable_tracker_trims_only_on_selected_tier() {
+        let targets = table_seq_txns(&[("trades", 7)]);
+
+        let mut local = DurableAckTracker::new(true);
+        local.enqueue_ok(1, 1, targets.clone());
+        local.apply_ack(targets.clone(), false);
+        assert_eq!(local.pop_ready(), None);
+        local.apply_ack(targets.clone(), true);
+        assert_eq!(local.pop_ready().map(|c| c.fsn), Some(1));
+        local.enqueue_ok(3, 3, targets.clone());
+        local.apply_ack(targets.clone(), true);
+        local.reset();
+        assert!(!local.has_pending());
+        assert!(local.table_watermarks.is_empty());
+        assert!(
+            local.trim_on_local,
+            "reconnect reset must preserve tier policy"
+        );
+
+        let mut replicated = DurableAckTracker::new(false);
+        replicated.enqueue_ok(2, 2, targets.clone());
+        replicated.apply_ack(targets.clone(), true);
+        assert_eq!(replicated.pop_ready(), None);
+        replicated.apply_ack(targets, false);
+        assert_eq!(replicated.pop_ready().map(|c| c.fsn), Some(2));
     }
 
     /// The wire cursor streams every buffered frame without an in-flight cap:
@@ -6194,7 +6236,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             ReconnectPolicy::no_backoff(Duration::from_secs(1)),
-            false,
+            DurableAckTiers::Off,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
 
@@ -6263,7 +6305,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6305,7 +6347,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6349,7 +6391,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             FakeOrderedServer::no_response(),
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -6446,7 +6488,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6514,7 +6556,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"first").unwrap();
 
@@ -6559,7 +6601,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6599,7 +6641,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             ReconnectPolicy::no_backoff(Duration::MAX),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6623,7 +6665,7 @@ mod tests {
             memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
-            false,
+            DurableAckTiers::Off,
         );
         driver.try_submit(b"payload").unwrap();
 
@@ -6951,7 +6993,18 @@ mod tests {
         assert_eq!(
             decode_durable_transport_response(&durable_ack_payload).unwrap(),
             Some(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("table_a", 42), ("table_b", 99)])
+                table_seq_txns: table_seq_txns(&[("table_a", 42), ("table_b", 99)]),
+                local: false,
+            })
+        );
+
+        let mut local_ack_payload = vec![codec::WS_STATUS_LOCAL_DURABLE_ACK];
+        append_table_seq_txns(&mut local_ack_payload, &[("table_a", 43)]);
+        assert_eq!(
+            decode_durable_transport_response(&local_ack_payload).unwrap(),
+            Some(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("table_a", 43)]),
+                local: true,
             })
         );
     }
@@ -6964,6 +7017,10 @@ mod tests {
         let failure =
             decode_durable_transport_response(&[codec::WS_STATUS_DURABLE_ACK]).unwrap_err();
         assert_retryable_transport_failure(failure, "QWP durable ACK response truncated");
+
+        let failure =
+            decode_durable_transport_response(&[codec::WS_STATUS_LOCAL_DURABLE_ACK]).unwrap_err();
+        assert_retryable_transport_failure(failure, "QWP local durable ACK response truncated");
     }
 
     fn assert_retryable_transport_failure(failure: TransportFailure, expected_message: &str) {
@@ -7120,6 +7177,7 @@ mod tests {
                 Ok(TransportPoll::Progress),
                 Ok(TransportPoll::Response(TransportResponse::DurableAck {
                     table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                    local: false,
                 })),
                 Ok(TransportPoll::Idle),
             ])
@@ -7206,6 +7264,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7249,6 +7308,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7327,6 +7387,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7410,6 +7471,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7458,6 +7520,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("b", 20)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(driver.acked_fsn(), None);
@@ -7467,6 +7530,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("a", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7514,6 +7578,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7550,6 +7615,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -7570,6 +7636,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 9)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -7585,6 +7652,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 12)]),
+                local: false,
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -7611,6 +7679,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
 
@@ -7651,6 +7720,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -7681,6 +7751,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 12)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -7816,6 +7887,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         driver
             .send_core
@@ -7829,6 +7901,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+                local: false,
             });
 
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
@@ -7911,6 +7984,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         driver
             .send_core
@@ -8152,6 +8226,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         driver
             .send_core
@@ -8165,6 +8240,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -8252,6 +8328,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                local: false,
             });
         driver
             .send_core
@@ -8265,6 +8342,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+                local: false,
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -8762,7 +8840,7 @@ mod tests {
                 Duration::from_millis(10),
                 Duration::from_millis(10),
             ),
-            false,
+            DurableAckTiers::Off,
         );
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();

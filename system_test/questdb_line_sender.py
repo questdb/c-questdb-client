@@ -1708,9 +1708,9 @@ class Sender:
 
     def wait(self, ack_level: int = 0, timeout_millis: int = 0) -> None:
         """Wait until every published QWP/WebSocket frame reaches ``ack_level``
-        (0 = ok, 1 = durable). ``timeout_millis`` is a no-progress deadline
-        (0 = wait indefinitely). Row-major counterpart to the column-major
-        store-and-forward wait."""
+        (0 = ok, 1 = durable, 2 = local durable). ``timeout_millis`` is a
+        no-progress deadline (0 = wait indefinitely). Row-major counterpart to
+        the column-major store-and-forward wait."""
         self._check_connected()
         _error_wrapped_call(
             _DLL.line_sender_qwpws_wait,
