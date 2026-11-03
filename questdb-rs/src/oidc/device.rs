@@ -2805,15 +2805,19 @@ impl OidcDeviceAuth {
         // response advertised. Cleared by every poll that does not raise it, so
         // a raise early in a long flow does not colour an expiry much later.
         let mut interval_raised = false;
-        // The last poll failure that never reached the token endpoint, and
-        // whether any poll ever did. A status-less transport error is retried
-        // until the code expires (see the arm below), which is right for a blip
-        // but wrong for a token endpoint that is misconfigured, unresolvable or
-        // firewalled: every poll fails the same way, none of it is recorded,
-        // and the expiry below then blames the user for not authorizing. Keep
-        // the cause so the expiry can name it instead.
-        let mut last_unsent_error: Option<String> = None;
-        let mut reached_token_endpoint = false;
+        // The last poll failure that got no HTTP response, and whether any poll
+        // ever completed. A status-less transport error is retried until the
+        // code expires (see the arm below), which is right for a blip but wrong
+        // for a token endpoint that is misconfigured, unresolvable, firewalled
+        // or not answering: every poll fails the same way, none of it is
+        // recorded, and the expiry below then blames the user for not
+        // authorizing. Keep the cause so the expiry can name it instead.
+        let mut last_unanswered_error: Option<String> = None;
+        let mut poll_completed = false;
+        // Whether any poll was sent, or got an HTTP response: the token
+        // endpoint was reachable even if it never answered a poll. The expiry
+        // then says it did not respond rather than that it was never reachable.
+        let mut token_endpoint_reached = false;
 
         loop {
             self.ensure_interactive_flow_active()?;
@@ -2823,23 +2827,17 @@ impl OidcDeviceAuth {
                 // fresh sign-in is the only recovery, so the `expired_token`
                 // tag callers key on is unchanged -- but say which of the two
                 // caused it.
-                // Nothing ever got through to the token endpoint, so the
-                // authorization was never checked even once. Keep the terminal
-                // class and the `expired_token` tag -- the code is still gone
-                // and a fresh sign-in is still the only recovery -- but report
-                // the transport failure that actually ended the flow rather
-                // than implying the user walked away.
-                match last_unsent_error.as_deref() {
-                    Some(cause) if !reached_token_endpoint => {
-                        self.renderer
-                            .on_failure("Sign-in failed: the token endpoint was never reachable.");
-                        return Err(OidcError::timeout(format!(
-                            "No poll of the token endpoint completed before the device \
-                             code expired, so the authorization was never checked. The \
-                             last failure was: {cause}. Verify the token endpoint and \
-                             its network reachability, then run the sign-in again."
-                        ))
-                        .with_idp_error(Some("expired_token"), None));
+                // No poll completed, so the authorization was never checked
+                // even once. Keep the terminal class and the `expired_token`
+                // tag -- the code is still gone and a fresh sign-in is still
+                // the only recovery -- but report the transport failure that
+                // actually ended the flow rather than implying the user walked
+                // away.
+                match last_unanswered_error.as_deref() {
+                    Some(cause) if !poll_completed => {
+                        let (line, error) = unanswered_polls_expiry(cause, token_endpoint_reached);
+                        self.renderer.on_failure(line);
+                        return Err(error);
                     }
                     _ => {}
                 }
@@ -2921,7 +2919,7 @@ impl OidcDeviceAuth {
             ) {
                 Ok(result) => {
                     self.ensure_interactive_flow_active()?;
-                    reached_token_endpoint = true;
+                    poll_completed = true;
                     result
                 }
                 Err(e) => {
@@ -2944,16 +2942,25 @@ impl OidcDeviceAuth {
                     // other transient poll failures: keep polling until the
                     // device code expires. This also lets a temporarily
                     // unreachable token endpoint recover during an active flow.
-                    // Retain the cause: if no poll ever reaches the endpoint,
-                    // the expiry branch reports this instead of "you did not
-                    // authorize in time".
+                    // Retain the cause: if no poll ever completes, the expiry
+                    // branch reports this instead of "you did not authorize in
+                    // time".
                     if e.status().is_none() {
-                        last_unsent_error = Some(e.to_string());
+                        // A request that started to go out had a connection
+                        // to the endpoint, which then dropped the poll or
+                        // never answered it.
+                        if e.kind() == crate::oidc::error::OidcErrorKind::Network
+                            && !e.request_unsent()
+                        {
+                            token_endpoint_reached = true;
+                        }
+                        last_unanswered_error = Some(e.to_string());
                     } else {
                         // This poll did receive an HTTP response. Do not let a
                         // stale, earlier transport failure make expiry claim
-                        // that the endpoint was never reachable.
-                        last_unsent_error = None;
+                        // that no poll was answered.
+                        token_endpoint_reached = true;
+                        last_unanswered_error = None;
                     }
                     if e.request_timed_out() {
                         let previous = interval;
@@ -3464,6 +3471,37 @@ fn store_error_is_permanent(error: &(dyn std::error::Error + Send + Sync + 'stat
         std::io::ErrorKind::PermissionDenied => cfg!(unix) && io.raw_os_error().is_some(),
         _ => false,
     }
+}
+
+/// The renderer line and the error for a device code that expired while no poll
+/// of the token endpoint completed, the last one failing with `cause` and no
+/// HTTP response.
+///
+/// `endpoint_reached` says whether any poll was sent or got an HTTP response.
+/// If none was, the endpoint was never reachable: misconfigured, unresolvable
+/// or firewalled. Otherwise it was reached and did not respond: down or
+/// stalled, or behind a proxy that is. Either way the code is gone and a fresh
+/// sign-in is the only recovery, so the class and the `expired_token` tag stay
+/// the same.
+fn unanswered_polls_expiry(cause: &str, endpoint_reached: bool) -> (&'static str, OidcError) {
+    let (line, advice) = if endpoint_reached {
+        (
+            "Sign-in failed: the token endpoint did not respond.",
+            "Verify that the token endpoint, and any proxy in front of it, is responding",
+        )
+    } else {
+        (
+            "Sign-in failed: the token endpoint was never reachable.",
+            "Verify the token endpoint and its network reachability",
+        )
+    };
+    let error = OidcError::timeout(format!(
+        "No poll of the token endpoint completed before the device code expired, \
+         so the authorization was never checked. The last failure was: {cause}. \
+         {advice}, then run the sign-in again."
+    ))
+    .with_idp_error(Some("expired_token"), None);
+    (line, error)
 }
 
 /// True when a failed [`refresh`](OidcDeviceAuth::refresh) should retain the

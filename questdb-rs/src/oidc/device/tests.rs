@@ -7790,44 +7790,41 @@ fn unsafe_refresh_token_is_rejected_at_ingestion() {
     }
 }
 
-/// A device flow whose polls never reach the token endpoint must say so, not
-/// report that the user failed to authorize in time.
-///
-/// A status-less transport error is retried until the code dies -- right for a
-/// blip, and matching Java -- but the loop kept no record of the cause, so a
-/// `token_endpoint` that is misconfigured, unresolvable or firewalled polled
-/// silently for up to the code's lifetime (`MAX_DEVICE_CODE_LIFETIME`, 1800s)
-/// and then blamed the user. The retry policy is unchanged; only the cause
-/// reported at expiry is.
-#[test]
-fn expiry_names_the_transport_failure_when_no_poll_ever_landed() {
-    let mock = MockServer::start(move |method, path, _body| match (method, path) {
-        ("POST", "/device") => (
-            200,
-            serde_json::json!({
-                "device_code": "DEV-CODE-123",
-                "user_code": "WXYZ-1234",
-                "verification_uri": "https://idp.example.com/activate",
-                "expires_in": 1,
-                "interval": 5
-            })
-            .to_string(),
-        ),
-        // 0 == drop the connection, so the poll fails with no HTTP status.
-        ("POST", "/token") => (0, String::new()),
-        _ => (404, "{}".to_string()),
-    });
+/// The `/device` response of the unanswered-poll expiry tests: a one-second
+/// code, so the flow expires after its first poll.
+fn one_poll_device_response() -> String {
+    serde_json::json!({
+        "device_code": "DEV-CODE-123",
+        "user_code": "WXYZ-1234",
+        "verification_uri": "https://idp.example.com/activate",
+        "expires_in": 1,
+        "interval": 5
+    })
+    .to_string()
+}
+
+/// Run a sign-in against `origin` (`http://host:port`) on a virtual clock,
+/// recording the renderer's failure lines into `failures`.
+fn sign_in_on_virtual_clock(origin: &str, failures: &Arc<Mutex<Vec<String>>>) -> OidcError {
+    struct RecordFailures(Arc<Mutex<Vec<String>>>);
+    impl Renderer for RecordFailures {
+        fn on_failure(&self, message: &str) {
+            self.0.lock().unwrap().push(message.to_string());
+        }
+    }
+
     let base = Instant::now();
     let virtual_ns = Arc::new(AtomicU64::new(0));
     let now_ns = Arc::clone(&virtual_ns);
     let sleep_ns = Arc::clone(&virtual_ns);
     let auth = OidcDeviceAuth::builder()
         .client_id("questdb")
-        .device_authorization_endpoint(mock.url("/device"))
-        .token_endpoint(mock.url("/token"))
+        .device_authorization_endpoint(format!("{origin}/device"))
+        .token_endpoint(format!("{origin}/token"))
         .scope("openid")
         .interactive(true)
         .open_browser(false)
+        .renderer(RecordFailures(Arc::clone(failures)))
         .now_hook(Arc::new(move || {
             base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
         }))
@@ -7836,8 +7833,14 @@ fn expiry_names_the_transport_failure_when_no_poll_ever_landed() {
         }))
         .build()
         .expect("build");
+    auth.sign_in().unwrap_err()
+}
 
-    let err = auth.sign_in().unwrap_err();
+/// The expiry error of a flow whose polls all failed without an HTTP response.
+/// It names the transport failure, not a user who failed to authorize in time,
+/// and keeps the terminal classification: the code is still gone and a fresh
+/// sign-in is still the only recovery, so anything keying on these is safe.
+fn assert_unanswered_polls_expiry(err: &OidcError) {
     assert!(
         err.message()
             .contains("No poll of the token endpoint completed"),
@@ -7850,10 +7853,93 @@ fn expiry_names_the_transport_failure_when_no_poll_ever_landed() {
         "must not blame the user for not authorizing: {}",
         err.message()
     );
-    // Unchanged terminal classification: the code is still gone and a fresh
-    // sign-in is still the only recovery, so anything keying on these is safe.
     assert_eq!(err.kind(), OidcErrorKind::Timeout);
     assert_eq!(err.idp_error(), Some("expired_token"));
+}
+
+/// A device flow whose polls reach the token endpoint, which never answers
+/// them, must say so, not report that the user failed to authorize in time.
+///
+/// A status-less transport error is retried until the code dies -- right for a
+/// blip, and matching Java -- but the loop kept no record of the cause, so a
+/// `token_endpoint` that dropped every poll polled silently for up to the
+/// code's lifetime (`MAX_DEVICE_CODE_LIFETIME`, 1800s) and then blamed the
+/// user. The retry policy is unchanged; only the cause reported at expiry is.
+/// The endpoint read each poll, so the expiry must not call it unreachable.
+#[test]
+fn expiry_names_the_transport_failure_when_no_poll_was_answered() {
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, one_poll_device_response()),
+        // 0 == read the poll, then drop the connection without a response.
+        ("POST", "/token") => (0, String::new()),
+        _ => (404, "{}".to_string()),
+    });
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let err = sign_in_on_virtual_clock(&mock.url(""), &failures);
+
+    assert_unanswered_polls_expiry(&err);
+    assert!(
+        err.message().contains("is responding"),
+        "expiry must say the endpoint did not respond: {}",
+        err.message()
+    );
+    assert_eq!(
+        *failures.lock().unwrap(),
+        ["Sign-in failed: the token endpoint did not respond."]
+    );
+}
+
+/// The counterpart: when no poll ever leaves the client, because every
+/// connection to the token endpoint is refused, the expiry says the endpoint
+/// was never reachable.
+#[test]
+fn expiry_names_an_unreachable_token_endpoint_when_no_poll_was_sent() {
+    // Accept the one device-authorization request, closing the listener before
+    // answering it: every later connection to the port, each token poll
+    // included, is refused before its request is sent.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break None,
+            }
+        };
+        drop(listener);
+        if let Some(stream) = stream {
+            handle_conn(
+                stream,
+                &|method: &str, path: &str, _body: &str| match (method, path) {
+                    ("POST", "/device") => (200, one_poll_device_response()),
+                    _ => (404, "{}".to_string()),
+                },
+                None,
+                None,
+            );
+        }
+    });
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let err = sign_in_on_virtual_clock(&format!("http://{addr}"), &failures);
+    server.join().unwrap();
+
+    assert_unanswered_polls_expiry(&err);
+    assert!(
+        err.message().contains("network reachability"),
+        "expiry must say the endpoint was unreachable: {}",
+        err.message()
+    );
+    assert_eq!(
+        *failures.lock().unwrap(),
+        ["Sign-in failed: the token endpoint was never reachable."]
+    );
 }
 
 /// A later HTTP response invalidates an earlier status-less failure. Otherwise
