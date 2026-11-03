@@ -203,9 +203,12 @@ bool questdb_token_sink_set_terminal_error(
  * provider holds no usable token, clients get the provider's own
  * token-unavailable error, which names that message but carries neither the
  * code nor the OIDC detail of `error`. A connect the caller waits for
- * therefore retries an OIDC sign-in failure until its budget runs out. To end
- * it at once, report the failure with `questdb_token_sink_set_error` as not
- * retryable, or attach the auth directly.
+ * therefore retries an OIDC sign-in failure until its budget runs out.
+ * Reported with `questdb_token_sink_set_error` as not retryable, the failure
+ * ends that connect when the provider's cold wait does: the provider retries
+ * a failed fetch whatever its classification, and the connect waits up to
+ * `cold_wait_ms` for a retry to succeed. To end it at once, attach the auth
+ * directly.
  *
  * `error` is copied: free it as usual. Returns false, recording nothing, when
  * `sink` or `error` is NULL or a result was already reported.

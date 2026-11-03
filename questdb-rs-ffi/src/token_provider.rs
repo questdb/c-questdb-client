@@ -2042,11 +2042,13 @@ mod tests {
     }
 
     /// Builds a sender with `initial_connect_retry=sync` and a reconnect budget
-    /// of `budget_ms`, whose refreshing provider wraps an [`OidcSource`].
+    /// of `budget_ms`, whose refreshing provider wraps an [`OidcSource`] and
+    /// retries it after a backoff of at most `backoff_ms`.
     /// Returns the build's error and how long the build took.
     fn sync_connect_through_oidc_source(
         pass_on: bool,
         budget_ms: u64,
+        backoff_ms: u64,
     ) -> (*mut questdb_error, Duration) {
         let source = Box::into_raw(Box::new(OidcSource {
             auth: unsigned_oidc_auth(),
@@ -2057,11 +2059,12 @@ mod tests {
         unsafe {
             questdb_refreshing_token_provider_options_init(&mut options, size_of_val(&options))
         };
-        // Back off past the cold wait: the source fails once, and every pull
-        // returns that failure at once.
-        options.cold_wait_ms = 5_000;
-        options.backoff_initial_ms = 60_000;
-        options.backoff_max_ms = 60_000;
+        // A backoff past the cold wait makes every pull after the first failed
+        // fetch return that failure at once. Within it, a pull waits out the
+        // cold wait while the provider retries the source.
+        options.cold_wait_ms = 1_000;
+        options.backoff_initial_ms = backoff_ms;
+        options.backoff_max_ms = backoff_ms;
         let mut err: *mut questdb_error = ptr::null_mut();
         let provider = unsafe {
             questdb_refreshing_token_provider_new(
@@ -2103,7 +2106,7 @@ mod tests {
         // counts as retryable, so a connect the caller waits for retries it
         // for its whole budget. The client's error names it, but carries no
         // OIDC detail.
-        let (err, elapsed) = sync_connect_through_oidc_source(true, 300);
+        let (err, elapsed) = sync_connect_through_oidc_source(true, 300, 60_000);
         assert!(
             elapsed >= Duration::from_millis(300),
             "the connect ended after {elapsed:?}"
@@ -2122,19 +2125,24 @@ mod tests {
         );
         unsafe { crate::questdb_error_free(err) };
 
-        // Reported as not retryable instead, it ends that connect at once.
-        let (err, elapsed) = sync_connect_through_oidc_source(false, 10_000);
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "the connect retried for {elapsed:?}"
-        );
-        let error = unsafe { &(*err).error };
-        assert!(error.msg().contains(&failure_msg), "{error}");
-        assert!(
-            error.as_token_unavailable().is_some_and(|t| !t.retryable()),
-            "{error}"
-        );
-        unsafe { crate::questdb_error_free(err) };
+        // Reported as not retryable instead, it ends that connect when the
+        // provider's cold wait does, not when the budget runs out. With a
+        // backoff within the cold wait, the default case, the provider retries
+        // the source throughout that wait first (spec §5.3, §5.4).
+        for backoff_ms in [60_000, 20] {
+            let (err, elapsed) = sync_connect_through_oidc_source(false, 10_000, backoff_ms);
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "the connect retried for {elapsed:?} [backoff_ms={backoff_ms}]"
+            );
+            let error = unsafe { &(*err).error };
+            assert!(error.msg().contains(&failure_msg), "{error}");
+            assert!(
+                error.as_token_unavailable().is_some_and(|t| !t.retryable()),
+                "{error}"
+            );
+            unsafe { crate::questdb_error_free(err) };
+        }
     }
 
     /// Publishes one row, returning the error a failed flush reported.

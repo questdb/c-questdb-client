@@ -318,6 +318,42 @@ fn c4_cold_failure_passes_a_permanent_classification_through() {
 }
 
 #[test]
+fn c4_a_permanent_failure_does_not_end_the_cold_wait() {
+    // Spec §5.3 ends a cold wait only with a usable token, when cold_wait
+    // elapses or on cancellation, and §5.4 retries a failed fetch whatever its
+    // classification: an operator can repair a "permanent" failure, such as an
+    // identity not yet assigned, without a restart. A caller therefore waits
+    // through one whose retry falls within cold_wait.
+    let clock = ManualClock::new();
+    let script = Arc::new(Script::default());
+    script.push(Err(Error::token_unavailable(
+        false,
+        None,
+        "identity not assigned",
+    )));
+    script.push(Ok(token("T1", T0 + HOUR)));
+    let provider = manual(&clock, &script)
+        .cold_wait(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    assert!(provider.run_due_fetch());
+    let caller = {
+        let provider = provider.clone();
+        thread::spawn(move || provider.token())
+    };
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !caller.is_finished(),
+        "the permanent failure ended the wait"
+    );
+    let backoff = provider.scheduled_in().unwrap();
+    assert!(backoff < Duration::from_secs(5), "{backoff:?}");
+    clock.advance_ms(backoff.as_millis() as i64);
+    assert!(provider.run_due_fetch());
+    assert_eq!(caller.join().unwrap().unwrap(), "T1");
+}
+
+#[test]
 fn c5_backoff_follows_the_spec() {
     let expect = |u: f64, delays: [i64; 9]| {
         for (n, expected) in delays.iter().enumerate() {
