@@ -163,6 +163,9 @@ const DIRECTORY_LOCK_FILE_NAME: &str = ".store.lock";
 const UNTRUSTED_SENTINEL_NAME: &str = ".untrusted";
 const DIRECTORY_LOCK_HEARTBEAT_THREAD: &str = "questdb-oidc-store-lock-heartbeat";
 const DIRECTORY_LOCK_HEARTBEAT: Duration = Duration::from_millis(500);
+/// The directory lock's short lease, used once no other user can write the
+/// directory. This host's clock ages it only for a holder on this host; see
+/// [`lock_snapshot_is_stale`].
 const DIRECTORY_LOCK_STALE: Duration = Duration::from_secs(2);
 const DIRECTORY_LOCK_EMPTY_GRACE: Duration = Duration::from_secs(2);
 const EMPTY_LOCK_GRACE: Duration = Duration::from_secs(5);
@@ -758,6 +761,13 @@ pub trait TokenStore: Send + Sync {
 /// deleting a peer's completed save. A group/other-writable directory is marked
 /// `.untrusted`, tightened, and swept before its contents can be trusted.
 ///
+/// In an owner-only directory that lock's lease is two seconds, and a holder
+/// renews it with its own clock. A holder on another host -- or a Java holder,
+/// whose stamp names no host -- may run a clock behind this one by more than
+/// the lease, and its live lock then looks abandoned by this host's clock. Such
+/// a lock is reclaimed only after this process has watched it go unrenewed for
+/// the lease, or once it is five minutes old.
+///
 /// Per-identity refresh locks use `O_CREAT|O_EXCL`, bounded owner stamps,
 /// handle-bound release markers, and the shared capture-then-verify stale-lock
 /// recovery protocol. If one cannot be acquired within the configured budget,
@@ -1179,6 +1189,9 @@ impl FileTokenStore {
         // small margin for losing the create race to a peer is ample.
         const MAX_BUDGET_FREE_STEAL_RETRIES: u32 = 8;
         let mut steal_retries: u32 = 0;
+        // What this contender has seen of the lock in its way, so that a holder
+        // that stopped renewing it is recognised whatever that holder's clock.
+        let mut watched = None;
         loop {
             if cancelled() {
                 return Err(cancelled_error());
@@ -1217,7 +1230,7 @@ impl FileTokenStore {
                     // already proven stale. Retry create_new once after the
                     // successful capture instead of reporting a timeout merely
                     // because the original collision consumed the budget.
-                    if steal_if_stale(lock, stale_after, empty_grace)
+                    if steal_if_stale(lock, stale_after, empty_grace, &mut watched)
                         && steal_retries < MAX_BUDGET_FREE_STEAL_RETRIES
                     {
                         steal_retries += 1;
@@ -2383,7 +2396,9 @@ fn has_live_lock_capture(
             LockStamp::Readable(Some(stamp)) => holder_is_dead_on_this_host(stamp),
             LockStamp::Unreadable => false,
         };
-        if reclaimable && lock_snapshot_is_stale(&snapshot, stale_after, empty_grace) {
+        if reclaimable
+            && lock_snapshot_is_stale(&snapshot, stale_after, empty_grace, Duration::ZERO)
+        {
             // Captures have unique names and are never reacquired in place.
             // Recheck because release can change the stamp/mtime concurrently.
             if lock_snapshot(&captured)?.as_ref() != Some(&snapshot) {
@@ -2397,30 +2412,69 @@ fn has_live_lock_capture(
     Ok(false)
 }
 
+/// Whether a lock is abandoned and may be reclaimed.
+///
+/// A holder renews its lock by writing its own wall-clock time into the mtime,
+/// and the age below is measured against this host's clock. That age is exact
+/// only for a holder on this host. A holder elsewhere -- or a Java holder,
+/// whose stamp names no host -- may run a clock behind this one, and its lock
+/// then looks older than it is by the difference. Under the directory lock's
+/// two-second lease, a holder renewing on schedule on a host whose clock lags
+/// by more than that would lose the lock in the middle of its critical section.
+/// Such a lock is stale only once this contender has watched it go unrenewed
+/// for the lease itself (`unrenewed_for`, on its own monotonic clock), or once
+/// its age also exceeds [`MIN_LOCK_STALE`], which no plausible clock difference
+/// reaches. A lease at least that long, such as the per-identity lock's, is
+/// unaffected: no contender waits long enough to watch one run out.
 fn lock_snapshot_is_stale(
     snapshot: &LockSnapshot,
     stale_after: Duration,
     empty_grace: Duration,
+    unrenewed_for: Duration,
 ) -> bool {
-    let threshold = match &snapshot.stamp {
-        LockStamp::Readable(None) => empty_grace,
-        LockStamp::Readable(Some(stamp)) if holder_is_dead_on_this_host(stamp) => {
-            stale_after.min(DEAD_HOLDER_GRACE)
-        }
-        _ => stale_after,
-    };
     let now_millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    snapshot.modified_millis <= now_millis
-        && now_millis - snapshot.modified_millis > threshold.as_millis()
+    // A future timestamp is not evidence of abandonment.
+    if snapshot.modified_millis > now_millis {
+        return false;
+    }
+    let age_millis = now_millis - snapshot.modified_millis;
+    let older_than = |threshold: Duration| age_millis > threshold.as_millis();
+    match &snapshot.stamp {
+        LockStamp::Readable(None) => older_than(empty_grace),
+        LockStamp::Readable(Some(stamp)) if holder_is_dead_on_this_host(stamp) => {
+            older_than(stale_after.min(DEAD_HOLDER_GRACE))
+        }
+        LockStamp::Readable(Some(stamp)) if holder_is_on_this_host(stamp) => {
+            older_than(stale_after)
+        }
+        _ => unrenewed_for > stale_after || older_than(stale_after.max(MIN_LOCK_STALE)),
+    }
+}
+
+/// The lock a contender keeps finding in its way, and since when, on the
+/// contender's own monotonic clock, it has found it unchanged.
+struct WatchedLock {
+    snapshot: LockSnapshot,
+    since: Instant,
 }
 
 /// Reclaim a stale Java, Python, or Rust lock with capture-then-verify. The stamp
 /// and mtime observed before the atomic capture must match afterwards; otherwise
 /// the captured peer replacement is restored rather than discarded.
-fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> bool {
+///
+/// `watched` carries what a polling contender saw on its earlier polls, which
+/// is how a lock whose holder stopped renewing it is recognised whatever that
+/// holder's clock says (see [`lock_snapshot_is_stale`]). A single check passes
+/// `&mut None`.
+fn steal_if_stale(
+    lock: &Path,
+    stale_after: Duration,
+    empty_grace: Duration,
+    watched: &mut Option<WatchedLock>,
+) -> bool {
     let meta = match fs::symlink_metadata(lock) {
         Ok(meta) => meta,
         Err(_) => return false,
@@ -2438,8 +2492,22 @@ fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> 
         Ok(Some(snapshot)) => snapshot,
         _ => return false,
     };
-    // A future timestamp is not evidence of abandonment.
-    if !lock_snapshot_is_stale(&before, stale_after, empty_grace) {
+    let now = Instant::now();
+    let unchanged_since = watched
+        .as_ref()
+        .filter(|seen| seen.snapshot == before)
+        .map(|seen| seen.since);
+    let unrenewed_for = match unchanged_since {
+        Some(since) => now.saturating_duration_since(since),
+        None => {
+            *watched = Some(WatchedLock {
+                snapshot: before.clone(),
+                since: now,
+            });
+            Duration::ZERO
+        }
+    };
+    if !lock_snapshot_is_stale(&before, stale_after, empty_grace, unrenewed_for) {
         return false;
     }
 
@@ -2452,6 +2520,8 @@ fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> 
         after.modified_millis == before.modified_millis && after.stamp == before.stamp
     }) {
         delete_capture(&captured);
+        // The lock it watched is gone.
+        *watched = None;
         true
     } else {
         restore_captured_lock(lock, &captured);
@@ -2603,23 +2673,10 @@ fn kernel_hostname() -> Option<String> {
 /// even a misjudged live holder is safe here: its heartbeat keeps the mtime far
 /// younger than [`DEAD_HOLDER_GRACE`].
 fn holder_is_dead_on_this_host(stamp: &[u8]) -> bool {
-    let Ok(stamp) = std::str::from_utf8(stamp) else {
+    let Some((nanos, pid, _)) = native_stamp_owner(stamp) else {
         return false;
     };
-    let mut parts = stamp.split(' ');
-    let (Some(nanos), Some(_nonce), Some(owner), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let Some((pid, host)) = owner.split_once('@') else {
-        return false;
-    };
-    let Ok(pid) = pid.parse::<u32>() else {
-        return false;
-    };
-    let local = hostname();
-    if host != local || local == "localhost" {
+    if !holder_is_on_this_host(stamp) {
         return false;
     }
     if pid == std::process::id() {
@@ -2628,6 +2685,32 @@ fn holder_is_dead_on_this_host(stamp: &[u8]) -> bool {
             .is_ok_and(|nanos| nanos < process_stamp_epoch_nanos());
     }
     process_is_gone(pid)
+}
+
+/// The nanos, pid and host of a native lock owner stamp
+/// (`"{nanos} {nonce} {pid}@{host}"`), or `None` for any other stamp: a Java
+/// one, which names no host, or a foreign or truncated one.
+fn native_stamp_owner(stamp: &[u8]) -> Option<(&str, u32, &str)> {
+    let stamp = std::str::from_utf8(stamp).ok()?;
+    let mut parts = stamp.split(' ');
+    let (Some(nanos), Some(_nonce), Some(owner), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let (pid, host) = owner.split_once('@')?;
+    let pid = pid.parse::<u32>().ok()?;
+    Some((nanos, pid, host))
+}
+
+/// Whether a lock owner stamp names this host, so that its holder renews the
+/// lock by the clock this process ages it with. The `localhost` fallback, used
+/// when a host name cannot be read, names no host in particular.
+fn holder_is_on_this_host(stamp: &[u8]) -> bool {
+    native_stamp_owner(stamp).is_some_and(|(_, _, host)| {
+        let local = hostname();
+        host == local && local != "localhost"
+    })
 }
 
 #[cfg(unix)]

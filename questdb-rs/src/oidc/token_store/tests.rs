@@ -65,7 +65,7 @@ fn assert_lock_released(lock: &Path, message: &str) {
         "{message}: released inode was not empty"
     );
     assert!(
-        steal_if_stale(lock, DEFAULT_LOCK_STALE, EMPTY_LOCK_GRACE),
+        steal_if_stale(lock, DEFAULT_LOCK_STALE, EMPTY_LOCK_GRACE, &mut None),
         "{message}: released inode was not immediately reclaimable"
     );
     assert!(!lock.exists(), "{message}: reclaim left the lock behind");
@@ -1035,6 +1035,135 @@ fn a_slightly_future_lock_is_still_treated_as_live() {
     assert!(lock.exists(), "a live peer's lock was stolen");
 }
 
+/// Plant a directory lock held by a process on another host, and return the
+/// lock's path and owner stamp.
+#[cfg(unix)]
+fn plant_directory_lock_from_another_host(store: &FileTokenStore) -> (PathBuf, String) {
+    // A first operation makes the directory owner-only and trusted, so the
+    // short lease applies. It also leaves its released lock file behind, which
+    // the other host's holder replaces.
+    assert!(store.load(&test_key()).unwrap().is_none());
+    let lock = store.directory_lock_file();
+    std::fs::remove_file(&lock).unwrap();
+    let stamp = format!("1 00ff 4242@not-{}", hostname());
+    create_lock_file(&lock, &stamp).unwrap();
+    (lock, stamp)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_lock_renewed_on_a_lagging_host_is_not_taken() {
+    // The mirror of the future-dated case: the holder's clock is BEHIND this
+    // one by more than the two-second lease, so every renewal it writes reads
+    // here as older than the lease. Its lock must still not be taken while it
+    // keeps renewing.
+    let dir = TempDir::new().unwrap();
+    // Long enough to watch the lock for a whole lease.
+    let store = test_file_store(dir.path()).with_lock_timings(
+        DIRECTORY_LOCK_STALE + Duration::from_millis(500),
+        DEFAULT_LOCK_STALE,
+    );
+    let (lock, stamp) = plant_directory_lock_from_another_host(&store);
+    let lag = Duration::from_secs(30);
+    set_mtime_offset_from_now(&lock, lag, false);
+    let stop = Arc::new(AtomicBool::new(false));
+    let holder = std::thread::spawn({
+        let (lock, stamp, stop) = (lock.clone(), stamp.clone(), Arc::clone(&stop));
+        move || {
+            // Renew as a heartbeat would, by the lagging clock, for as long as
+            // the lock is still ours.
+            while !stop.load(Ordering::Acquire) {
+                if std::fs::read(&lock).ok().as_deref() != Some(stamp.as_bytes()) {
+                    return false;
+                }
+                set_mtime_offset_from_now(&lock, lag, false);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            true
+        }
+    });
+
+    let error = store.load(&test_key()).unwrap_err();
+    stop.store(true, Ordering::Release);
+    let kept = holder.join().unwrap();
+
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock),
+        "{error}"
+    );
+    assert!(
+        kept,
+        "the contender took a lock its holder was still renewing"
+    );
+    assert_eq!(std::fs::read(&lock).unwrap(), stamp.as_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unrenewed_directory_lock_from_another_host_is_reclaimed_after_the_lease() {
+    // The other half: nobody renews this lock, as after its holder crashed, so
+    // it is reclaimed once a contender has watched it for the lease, whatever
+    // its timestamp. It does not block the store for the whole stale window.
+    let dir = TempDir::new().unwrap();
+    let store = test_file_store(dir.path());
+    let (lock, _) = plant_directory_lock_from_another_host(&store);
+
+    let started = Instant::now();
+    assert!(store.load(&test_key()).unwrap().is_none());
+    assert!(
+        started.elapsed() >= DIRECTORY_LOCK_STALE,
+        "reclaimed after {:?}, before the lease had passed",
+        started.elapsed()
+    );
+    assert_lock_released(
+        &lock,
+        "an unrenewed lock from another host was not reclaimed",
+    );
+}
+
+#[test]
+fn only_a_holder_on_this_host_is_aged_by_this_hosts_clock() {
+    let aged = |stamp: String, age: Duration| LockSnapshot {
+        stamp: LockStamp::Readable(Some(stamp.into_bytes())),
+        modified_millis: system_time_millis(SystemTime::now() - age).unwrap(),
+    };
+    let stale = |snapshot: &LockSnapshot, unrenewed_for: Duration| {
+        lock_snapshot_is_stale(
+            snapshot,
+            DIRECTORY_LOCK_STALE,
+            DIRECTORY_LOCK_EMPTY_GRACE,
+            unrenewed_for,
+        )
+    };
+    let thirty_seconds = Duration::from_secs(30);
+    for stamp in [
+        format!("1 00ff 4242@not-{}", hostname()),
+        // A Java stamp names no host.
+        "1725048000000 java-uuid".to_string(),
+    ] {
+        // Thirty seconds by this clock can be a renewal made a moment ago by a
+        // clock that lags.
+        let renewed = aged(stamp.clone(), thirty_seconds);
+        assert!(!stale(&renewed, Duration::ZERO), "{stamp}");
+        // Watched unrenewed for the lease, it is abandoned...
+        assert!(
+            stale(&renewed, DIRECTORY_LOCK_STALE + Duration::from_millis(1)),
+            "{stamp}"
+        );
+        // ...and so is one older than any clock difference explains.
+        let ancient = aged(stamp.clone(), MIN_LOCK_STALE + Duration::from_secs(1));
+        assert!(stale(&ancient, Duration::ZERO), "{stamp}");
+    }
+    // A live holder on this host renews by this clock, so its age is exact.
+    if hostname() != "localhost" {
+        let here = aged(holder_bytes().unwrap(), thirty_seconds);
+        assert!(stale(&here, Duration::ZERO));
+    }
+}
+
 #[test]
 fn oversized_hostnames_still_produce_readable_lock_stamps() {
     for raw in [&"h".repeat(5000), &"é".repeat(5000)] {
@@ -1474,7 +1603,12 @@ fn failed_stamp_initialization_retires_empty_and_partial_locks() {
         .unwrap_err();
         assert_eq!(error.to_string(), "stamp write failed");
         assert_eq!(std::fs::read(&lock).unwrap(), b"");
-        assert!(steal_if_stale(&lock, DEFAULT_LOCK_STALE, EMPTY_LOCK_GRACE));
+        assert!(steal_if_stale(
+            &lock,
+            DEFAULT_LOCK_STALE,
+            EMPTY_LOCK_GRACE,
+            &mut None
+        ));
         let successor = create_lock_file_handle(&lock, "successor").unwrap();
         assert_eq!(std::fs::read(&lock).unwrap(), b"successor");
         release_lock(&successor);
@@ -1542,7 +1676,7 @@ fn release_lock_marks_our_inode_immediately_reclaimable() {
         "release must empty the inode acquired by this holder"
     );
     assert!(
-        steal_if_stale(&lock, DEFAULT_LOCK_STALE, EMPTY_LOCK_GRACE),
+        steal_if_stale(&lock, DEFAULT_LOCK_STALE, EMPTY_LOCK_GRACE, &mut None),
         "the released inode must be reclaimable without waiting for the stale lease"
     );
     assert!(!lock.exists());

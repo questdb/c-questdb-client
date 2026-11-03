@@ -150,10 +150,13 @@
 //! A persisted file is treated as untrusted input on load (see [`FileTokenStore`]).
 //! A refresh is never attempted without owning the store's cross-process lock.
 //! Native holders renew their locks with heartbeats; eligible stale locks are
-//! recovered automatically using age-based capture-then-verify checks. Unresolved
-//! contention returns a retryable network-class error. Future-dated locks are not
-//! reclaimed while their timestamps remain ahead of the local clock; investigate
-//! the timestamp and verify that the holder is gone before removing one manually.
+//! recovered automatically using age-based capture-then-verify checks. A lock
+//! whose holder is not known to be on this host is also judged by whether its
+//! holder keeps renewing it, so a clock behind this host's does not make a live
+//! holder's lock look abandoned. Unresolved contention returns a retryable
+//! network-class error. Future-dated locks are not reclaimed while their
+//! timestamps remain ahead of the local clock; investigate the timestamp and
+//! verify that the holder is gone before removing one manually.
 //!
 //! # Using the token beyond ILP/HTTP
 //!
