@@ -494,8 +494,9 @@ private:
 TEST_CASE("A provider passing on a closed provider's failure stops its clients")
 {
     // Closing a refreshing provider ends every client that uses it, also
-    // through an application provider that calls its token(), as through a
-    // Rust closure that does.
+    // through an application provider that calls its token(). The failure is
+    // passed on unchanged, as through a Rust closure that returns it, so the
+    // clients report it as `auth_error` with `provider_closed` set.
     auto inner = questdb::token_provider::refreshing([] {
         return questdb::expiring_token{
             "T", std::chrono::system_clock::now() + 1h};
@@ -523,8 +524,14 @@ TEST_CASE("A provider passing on a closed provider's failure stops its clients")
         CHECK(classification->provider_closed);
         CHECK_FALSE(classification->retryable);
     }
-    // A direct pull reports the terminal failure unclassified, as for an
-    // application provider's own invalid_api_call.
+    const auto check_closed_provider_failure = [](const questdb::error& e) {
+        CHECK(e.code() == questdb::error_code::auth_error);
+        const auto& classification = e.token_unavailable_diagnostic();
+        REQUIRE(classification.has_value());
+        CHECK(classification->provider_closed);
+        CHECK_FALSE(classification->retryable);
+    };
+    // A direct pull reports the closed provider's failure unchanged.
     try
     {
         (void)app.token();
@@ -532,12 +539,18 @@ TEST_CASE("A provider passing on a closed provider's failure stops its clients")
     }
     catch (const questdb::error& e)
     {
-        CHECK(e.code() == questdb::error_code::invalid_api_call);
+        check_closed_provider_failure(e);
     }
     // A reader pulls the token before it dials, so no server is needed.
-    CHECK(attach_error_code([&] {
-              questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", app};
-          }) == questdb::error_code::config_error);
+    try
+    {
+        questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", app};
+        FAIL("connected without a token");
+    }
+    catch (const questdb::error& e)
+    {
+        check_closed_provider_failure(e);
+    }
     // The sender's background connect stops instead of retrying for good.
     const auto deadline = std::chrono::steady_clock::now() + 10s;
     while (!sender.must_close() && std::chrono::steady_clock::now() < deadline)

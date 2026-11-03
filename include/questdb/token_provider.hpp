@@ -122,19 +122,22 @@ public:
      * an ILP/HTTP flush fails with it at once. A token source cannot do this;
      * close a refreshing provider instead.
      *
-     * Letting the failure of a closed `token_provider` escape stops them the
-     * same way, as for a Rust provider that returns it: closing one ends
-     * every client that uses it, through this provider too. An `oidc::error`
-     * that `oidc::device_auth::token()` threw is passed on unchanged, as a
-     * Rust provider passes on an `OidcError`, and the client's error keeps
-     * its OIDC detail (`line_sender_error::oidc_diagnostic()`). One of kind
-     * `cancelled` (a closed `oidc::device_auth`, reported as `auth_error`)
-     * or `config` (`config_error`) stops the clients, as it cannot clear. On
-     * any other, a connect the caller waits for ends at once unless the
-     * acquisition was busy, and an ILP/HTTP flush resolves the token again
-     * after a transient failure within its `retry_timeout`. Any other
-     * QuestDB error keeps its classification
-     * (`questdb::error::token_unavailable_diagnostic()`).
+     * A QuestDB error that carries a classification
+     * (`questdb::error::token_unavailable_diagnostic()`), such as one
+     * `token_provider::token()` threw, is passed on unchanged, as a Rust
+     * provider passes on the error it returns, and the client's error keeps
+     * the classification. The failure of a closed `token_provider` stops them
+     * too, still reported as `auth_error` with `provider_closed` set: closing
+     * one ends every client that uses it, through this provider too.
+     *
+     * An `oidc::error` that `oidc::device_auth::token()` threw is passed on
+     * unchanged the same way, and the client's error keeps its OIDC detail
+     * (`line_sender_error::oidc_diagnostic()`). One of kind `cancelled` (a
+     * closed `oidc::device_auth`, reported as `auth_error`) or `config`
+     * (`config_error`) stops the clients, as it cannot clear. On any other,
+     * a connect the caller waits for ends at once unless the acquisition was
+     * busy, and an ILP/HTTP flush resolves the token again after a transient
+     * failure within its `retry_timeout`.
      */
     virtual std::string token() = 0;
 
@@ -250,11 +253,10 @@ inline void report_questdb_error(
         e.what());
 }
 
-/** Reads the C error an `oidc::error` was converted from. */
-struct oidc_error_access
+/** Reads the C error a `questdb::error` was converted from. */
+struct error_access
 {
-    static const ::questdb_error* c_error(
-        const ::questdb::oidc::error& e) noexcept
+    static const ::questdb_error* c_error(const ::questdb::error& e) noexcept
     {
         return e._c_error.get();
     }
@@ -286,7 +288,7 @@ inline void report_current_exception(::questdb_token_sink* sink) noexcept
         // the caller waits for retrying for its whole budget, and the
         // client's error lost the OIDC detail. From a token source it is a
         // failed fetch either way (see `questdb_token_sink_set_error_from`).
-        const ::questdb_error* const raw = oidc_error_access::c_error(e);
+        const ::questdb_error* const raw = error_access::c_error(e);
         if (raw && ::questdb_token_sink_set_error_from(sink, raw))
             return;
         // An `oidc::error` constructed in C++ has no C error to pass on. A
@@ -300,10 +302,21 @@ inline void report_current_exception(::questdb_token_sink* sink) noexcept
     }
     catch (const ::questdb::error& e)
     {
+        // Pass the failure of a QuestDB token API on unchanged, as a Rust
+        // provider passes on the error it returns: it carries a
+        // classification, which the client keeps. A closed provider's failure
+        // then stops the clients with its own code and `provider_closed`
+        // still set. Reported as terminal instead, it reached them as
+        // `config_error`, without the classification.
+        const auto& classification = e.token_unavailable_diagnostic();
+        const ::questdb_error* const raw = error_access::c_error(e);
+        if (classification && raw &&
+            ::questdb_token_sink_set_error_from(sink, raw))
+            return;
+        // A QuestDB error with no C error to pass on, or no classification.
         // `invalid_api_call` is a failure retrying can never clear, as for a
         // Rust provider, and so is a closed provider's: closing one ends every
         // client that uses it, through this application provider too.
-        const auto& classification = e.token_unavailable_diagnostic();
         report_questdb_error(
             sink,
             e,

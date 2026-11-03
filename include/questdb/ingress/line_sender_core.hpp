@@ -153,6 +153,13 @@ struct token_unavailable_info
     bool provider_closed{false};
 };
 
+namespace detail
+{
+/** Reads the C error a `questdb::error` was converted from: the token-provider
+ *  adapters (`questdb/token_provider.hpp`) pass it on unchanged. */
+struct error_access;
+} // namespace detail
+
 /**
  * Base class for every QuestDB client error, ingest or query.
  *
@@ -194,14 +201,16 @@ public:
     /** Convert and take ownership of a C client error. */
     static error from_c(::questdb_error* c_err)
     {
-        const std::unique_ptr<::questdb_error, decltype(&::questdb_error_free)>
-            owned_err{c_err, ::questdb_error_free};
+        // Shared: the error keeps it (see `_c_error`).
+        const std::shared_ptr<::questdb_error> owned_err{
+            c_err, ::questdb_error_free};
         const auto code = static_cast<error_code>(
             static_cast<int>(::questdb_error_get_code(owned_err.get())));
         size_t len{0};
         const char* msg{::questdb_error_msg(owned_err.get(), &len)};
         error err{code, std::string{msg, len}};
         err._token_unavailable = token_unavailable_from_c(owned_err.get());
+        err._c_error = owned_err;
         return err;
     }
 
@@ -265,16 +274,15 @@ protected:
 private:
     error_code _code;
     std::optional<token_unavailable_info> _token_unavailable;
+    /** The C error this was converted from, so that a token provider that
+     *  lets it escape passes it on unchanged; empty for an error constructed
+     *  in C++. Shared by every copy of the exception. */
+    std::shared_ptr<const ::questdb_error> _c_error;
+
+    friend struct detail::error_access;
 };
 
 } // namespace questdb
-
-namespace questdb::detail
-{
-/** Reads the C error an `oidc::error` was converted from: the token-provider
- *  adapters (`questdb/token_provider.hpp`) pass it on unchanged. */
-struct oidc_error_access;
-} // namespace questdb::detail
 
 namespace questdb::oidc
 {
@@ -380,13 +388,6 @@ private:
     std::optional<uint16_t> _status;
     std::optional<uint64_t> _retry_after_seconds;
     bool _acquisition_busy;
-    /** The C error this was converted from, so that a token provider that
-     *  lets it escape passes it on unchanged; empty for an error constructed
-     *  in C++. Shared by every copy of the exception. */
-    std::shared_ptr<const ::questdb_error> _c_error;
-
-    friend class ::questdb::error;
-    friend struct ::questdb::detail::oidc_error_access;
 };
 
 /**
@@ -434,7 +435,7 @@ inline bool error::has_oidc_detail(const ::questdb_error* c_err) noexcept
 
 [[noreturn]] inline void error::throw_from_c(::questdb_error* c_err)
 {
-    // Shared: an OIDC error keeps it (see `oidc::error::_c_error`).
+    // Shared: the thrown error keeps it (see `_c_error`).
     const std::shared_ptr<::questdb_error> owned_err{
         c_err, ::questdb_error_free};
     const auto code = static_cast<error_code>(
@@ -454,14 +455,15 @@ inline bool error::has_oidc_detail(const ::questdb_error* c_err) noexcept
     {
         error err{code, copy(message, message_len)};
         err.set_token_unavailable(std::move(token_unavailable));
+        err._c_error = owned_err;
         throw err;
     }
 
     auto err = ::questdb::oidc::error_from_view(
         code, copy(message, message_len), view);
-    static_cast<error&>(err).set_token_unavailable(
-        std::move(token_unavailable));
-    err._c_error = owned_err;
+    auto& base = static_cast<error&>(err);
+    base.set_token_unavailable(std::move(token_unavailable));
+    base._c_error = owned_err;
     throw err;
 }
 
