@@ -1423,12 +1423,15 @@ impl QuestDb {
     ///
     /// Egress companion to [`Self::borrow_sender`]: pulls a [`Reader`]
     /// from the pool's reader free list, lazily opening a fresh connection
-    /// (via `Reader::from_conf` on the original connect string) when the
-    /// free list is empty and the pool is below `query_pool_max`. The reader
-    /// pool is lazily grown and capped **independently** of the two ingestion
-    /// pools, so heavy ingest can't starve queries and vice versa (the
-    /// combined live-connection ceiling across all three pools is
-    /// `2 * sender_pool_max + query_pool_max`).
+    /// when the free list is empty and the pool is below `query_pool_max`.
+    /// A new connection uses the reader configuration parsed from the connect
+    /// string when the pool opened, together with any token provider attached
+    /// through [`Self::connect_with_token_provider`]. If the connect string's
+    /// query-side settings did not parse then, the borrow fails with that
+    /// configuration error instead. The reader pool is lazily grown and capped
+    /// **independently** of the two ingestion pools, so heavy ingest can't
+    /// starve queries and vice versa (the combined live-connection ceiling
+    /// across all three pools is `2 * sender_pool_max + query_pool_max`).
     ///
     /// Borrow at the cap waits up to `acquire_timeout_ms` for a return
     /// (`acquire_timeout_ms=0` fails fast), then returns
