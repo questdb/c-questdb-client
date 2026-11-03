@@ -59,11 +59,16 @@ struct expiring_token
  * failure: whether retrying can succeed (network failures, timeouts, 429 and
  * 5xx are retryable; missing or wrong configuration is not), and a suggested
  * wait. A `questdb::error` that carries a classification, such as one thrown
- * by `token_provider::token()`, keeps it, and an `oidc::error` thrown by
- * `oidc::device_auth::token()` is passed on unchanged. Any other exception
- * counts as retryable, except the failures `bearer_token_provider::token()`
- * lists as stopping background reconnects (see there). Never put a token in
- * the message.
+ * by `token_provider::token()`, keeps it. Any other exception counts as
+ * retryable, except the failures `bearer_token_provider::token()` lists as
+ * stopping background reconnects (see there). Never put a token in the
+ * message.
+ *
+ * An `oidc::error` thrown by `oidc::device_auth::token()` carries no
+ * classification. A `bearer_token_provider` passes it on as
+ * `bearer_token_provider::token()` describes. From a token source it is a
+ * failed fetch that counts as retryable, and its OIDC detail does not reach
+ * clients: see `questdb_token_sink_set_error_from`.
  */
 class token_unavailable : public std::runtime_error
 {
@@ -282,7 +287,8 @@ inline void report_current_exception(::questdb_token_sink* sink) noexcept
         // provider passes on an `OidcError`. It carries no classification to
         // report: reported as retryable, a sign-in failure kept a connect the
         // caller waits for retrying for its whole budget, and the client's
-        // error lost the OIDC detail.
+        // error lost the OIDC detail. From a token source it is a failed
+        // fetch either way (see `questdb_token_sink_set_error_from`).
         const ::questdb_error* const raw = oidc_error_access::c_error(e);
         if (!terminal && raw && ::questdb_token_sink_set_error_from(sink, raw))
             return;

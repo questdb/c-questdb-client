@@ -413,16 +413,20 @@ pub unsafe extern "C" fn questdb_token_sink_set_terminal_error(
 }
 
 /// Pass on, from a source or provider callback, the failure of another QuestDB
-/// token API -- `questdb_oidc_auth_token` or `questdb_token_provider_token` --
-/// unchanged: its code, its classification and its OIDC detail. The client
-/// then handles it exactly as it handles the same error returned by a Rust
-/// provider or source.
+/// token API -- `questdb_oidc_auth_token` or `questdb_token_provider_token`.
+/// The sink records an unchanged copy, which is then handled exactly as the
+/// same error returned by a Rust provider or source. From a provider
+/// (`get_token`), the client's error keeps its classification and OIDC detail.
+/// From a source it is a failed fetch: the refreshing provider keeps only its
+/// retryability (retryable when unclassified, as an OIDC failure is), its
+/// suggested wait and its message, and clients get the provider's own
+/// token-unavailable error.
 ///
-/// `questdb_token_sink_set_error` cannot: it records a classification, and an
-/// OIDC failure has none. Reported as retryable, a sign-in failure kept a
-/// connect the caller waits for retrying for its whole budget, where the auth
-/// attached directly ends it at once, and the client's error lost the OIDC
-/// detail.
+/// `questdb_token_sink_set_error` cannot do this for a provider: it records a
+/// classification, and an OIDC failure has none. Reported as retryable, a
+/// sign-in failure kept a connect the caller waits for retrying for its whole
+/// budget, where the auth attached directly ends it at once, and the client's
+/// error lost the OIDC detail.
 ///
 /// `error` is copied and stays with the caller. Returns false, recording
 /// nothing, when `sink` or `error` is NULL or a result was already reported.
@@ -2007,6 +2011,130 @@ mod tests {
         assert!(!view.acquisition_busy);
         unsafe { crate::questdb_error_free(err) };
         unsafe { crate::oidc::questdb_oidc_auth_free(auth) };
+    }
+
+    /// A refreshing provider's source that owns an OIDC auth nobody has signed
+    /// in to, and reports that auth's failure: passed on with
+    /// `questdb_token_sink_set_error_from`, or as a non-retryable
+    /// `questdb_token_sink_set_error`.
+    struct OidcSource {
+        auth: *mut crate::oidc::questdb_oidc_auth,
+        pass_on: bool,
+    }
+
+    unsafe extern "C" fn oidc_source(user_data: *mut c_void, sink: *mut questdb_token_sink) {
+        let source = unsafe { &*user_data.cast::<OidcSource>() };
+        let err = oidc_token_failure(source.auth);
+        if source.pass_on {
+            assert!(unsafe { questdb_token_sink_set_error_from(sink, err) });
+        } else {
+            let msg = unsafe { &(*err).error }.msg().to_string();
+            assert!(unsafe {
+                questdb_token_sink_set_error(sink, false, -1, msg.as_ptr().cast(), msg.len())
+            });
+        }
+        unsafe { crate::questdb_error_free(err) };
+    }
+
+    unsafe extern "C" fn release_oidc_source(user_data: *mut c_void) {
+        let source = unsafe { Box::from_raw(user_data.cast::<OidcSource>()) };
+        unsafe { crate::oidc::questdb_oidc_auth_free(source.auth) };
+    }
+
+    /// Builds a sender with `initial_connect_retry=sync` and a reconnect budget
+    /// of `budget_ms`, whose refreshing provider wraps an [`OidcSource`].
+    /// Returns the build's error and how long the build took.
+    fn sync_connect_through_oidc_source(
+        pass_on: bool,
+        budget_ms: u64,
+    ) -> (*mut questdb_error, Duration) {
+        let source = Box::into_raw(Box::new(OidcSource {
+            auth: unsigned_oidc_auth(),
+            pass_on,
+        }));
+        let mut options =
+            unsafe { std::mem::zeroed::<questdb_refreshing_token_provider_options>() };
+        unsafe {
+            questdb_refreshing_token_provider_options_init(&mut options, size_of_val(&options))
+        };
+        // Back off past the cold wait: the source fails once, and every pull
+        // returns that failure at once.
+        options.cold_wait_ms = 5_000;
+        options.backoff_initial_ms = 60_000;
+        options.backoff_max_ms = 60_000;
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let provider = unsafe {
+            questdb_refreshing_token_provider_new(
+                Some(oidc_source),
+                source.cast(),
+                Some(release_oidc_source),
+                &options,
+                &mut err,
+            )
+        };
+        assert!(!provider.is_null() && err.is_null());
+        let conf = format!(
+            "ws::addr=127.0.0.1:1;initial_connect_retry=sync;\
+             reconnect_max_duration_millis={budget_ms};\
+             reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;"
+        );
+        let utf8 = unsafe { crate::line_sender_utf8_assert(conf.len(), conf.as_ptr().cast()) };
+        let opts = unsafe { crate::line_sender_opts_from_conf(utf8, &mut err) };
+        assert!(!opts.is_null());
+        assert!(unsafe { line_sender_opts_token_provider(opts, provider, &mut err) });
+        let started = std::time::Instant::now();
+        let sender = unsafe { crate::line_sender_build(opts, &mut err) };
+        let elapsed = started.elapsed();
+        unsafe { crate::line_sender_opts_free(opts) };
+        unsafe { questdb_token_provider_free(provider) };
+        assert!(sender.is_null() && !err.is_null());
+        (err, elapsed)
+    }
+
+    #[test]
+    fn a_source_passing_on_an_oidc_failure_reports_a_failed_fetch() {
+        let auth = unsigned_oidc_auth();
+        let failure = oidc_token_failure(auth);
+        let failure_msg = unsafe { &(*failure).error }.msg().to_string();
+        unsafe { crate::questdb_error_free(failure) };
+        unsafe { crate::oidc::questdb_oidc_auth_free(auth) };
+
+        // As from a Rust source, the failure is a failed fetch. Unclassified, it
+        // counts as retryable, so a connect the caller waits for retries it
+        // for its whole budget. The client's error names it, but carries no
+        // OIDC detail.
+        let (err, elapsed) = sync_connect_through_oidc_source(true, 300);
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "the connect ended after {elapsed:?}"
+        );
+        let error = unsafe { &(*err).error };
+        assert!(error.msg().contains(&failure_msg), "{error}");
+        assert!(
+            error.as_token_unavailable().is_some_and(|t| t.retryable()),
+            "{error}"
+        );
+        let mut view = unsafe { std::mem::zeroed::<crate::oidc::questdb_oidc_error_view>() };
+        view.struct_size = size_of_val(&view);
+        assert!(
+            !unsafe { crate::oidc::questdb_error_oidc_get_view(err, &mut view) },
+            "{error}"
+        );
+        unsafe { crate::questdb_error_free(err) };
+
+        // Reported as not retryable instead, it ends that connect at once.
+        let (err, elapsed) = sync_connect_through_oidc_source(false, 10_000);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the connect retried for {elapsed:?}"
+        );
+        let error = unsafe { &(*err).error };
+        assert!(error.msg().contains(&failure_msg), "{error}");
+        assert!(
+            error.as_token_unavailable().is_some_and(|t| !t.retryable()),
+            "{error}"
+        );
+        unsafe { crate::questdb_error_free(err) };
     }
 
     /// Publishes one row, returning the error a failed flush reported.
