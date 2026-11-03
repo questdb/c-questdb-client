@@ -122,18 +122,18 @@ public:
      * an ILP/HTTP flush fails with it at once. A token source cannot do this;
      * close a refreshing provider instead.
      *
-     * Letting the error of another QuestDB token API escape stops them the
-     * same way when that error cannot clear either, as for a Rust provider
-     * that returns it: the failure of a closed `token_provider` (closing one
-     * ends every client that uses it, through this provider too), and an
-     * `oidc::error` of kind `cancelled` (a closed `oidc::device_auth`) or
-     * `config`. Any other `oidc::error` that `oidc::device_auth::token()`
-     * threw is passed on unchanged, as a Rust provider passes on an
-     * `OidcError`: a connect the caller waits for ends at once on it unless
-     * the acquisition was busy, an ILP/HTTP flush resolves the token again
-     * after a transient failure within its `retry_timeout`, and the client's
-     * error keeps the OIDC detail (`line_sender_error::oidc_diagnostic()`).
-     * Any other QuestDB error keeps its classification
+     * Letting the failure of a closed `token_provider` escape stops them the
+     * same way, as for a Rust provider that returns it: closing one ends
+     * every client that uses it, through this provider too. An `oidc::error`
+     * that `oidc::device_auth::token()` threw is passed on unchanged, as a
+     * Rust provider passes on an `OidcError`, and the client's error keeps
+     * its OIDC detail (`line_sender_error::oidc_diagnostic()`). One of kind
+     * `cancelled` (a closed `oidc::device_auth`, reported as `auth_error`)
+     * or `config` (`config_error`) stops the clients, as it cannot clear. On
+     * any other, a connect the caller waits for ends at once unless the
+     * acquisition was busy, and an ILP/HTTP flush resolves the token again
+     * after a transient failure within its `retry_timeout`. Any other
+     * QuestDB error keeps its classification
      * (`questdb::error::token_unavailable_diagnostic()`).
      */
     virtual std::string token() = 0;
@@ -277,21 +277,25 @@ inline void report_current_exception(::questdb_token_sink* sink) noexcept
     }
     catch (const ::questdb::oidc::error& e)
     {
-        // A closed `oidc::device_auth` (`cancelled`) and a misconfiguration
-        // (`config`) fail every later request alike, as for a Rust provider.
+        // Pass a failure the library raised on unchanged, as a Rust provider
+        // passes on an `OidcError`: the client classifies it as that
+        // provider's error and keeps its OIDC detail. A closed
+        // `oidc::device_auth` (`cancelled`) and a misconfiguration (`config`)
+        // then stop the clients, and any other kind carries no classification
+        // to report: reported as retryable, a sign-in failure kept a connect
+        // the caller waits for retrying for its whole budget, and the
+        // client's error lost the OIDC detail. From a token source it is a
+        // failed fetch either way (see `questdb_token_sink_set_error_from`).
+        const ::questdb_error* const raw = oidc_error_access::c_error(e);
+        if (raw && ::questdb_token_sink_set_error_from(sink, raw))
+            return;
+        // An `oidc::error` constructed in C++ has no C error to pass on. A
+        // closed auth and a misconfiguration fail every later request alike,
+        // as for a Rust provider.
         const bool terminal =
             e.code() == ::questdb::error_code::invalid_api_call ||
             e.kind() == ::questdb::oidc::error_kind::cancelled ||
             e.kind() == ::questdb::oidc::error_kind::config;
-        // Pass any other failure the library raised on unchanged, as a Rust
-        // provider passes on an `OidcError`. It carries no classification to
-        // report: reported as retryable, a sign-in failure kept a connect the
-        // caller waits for retrying for its whole budget, and the client's
-        // error lost the OIDC detail. From a token source it is a failed
-        // fetch either way (see `questdb_token_sink_set_error_from`).
-        const ::questdb_error* const raw = oidc_error_access::c_error(e);
-        if (!terminal && raw && ::questdb_token_sink_set_error_from(sink, raw))
-            return;
         report_questdb_error(sink, e, terminal);
     }
     catch (const ::questdb::error& e)

@@ -579,9 +579,32 @@ TEST_CASE("A provider passing on a classified failure keeps the classification")
     }
 }
 
+namespace
+{
+/** An application provider that throws an `oidc::error` it constructed
+ *  itself, which has no C error to pass on. */
+class constructed_oidc_error_provider : public questdb::bearer_token_provider
+{
+public:
+    std::string token() override
+    {
+        throw questdb::oidc::error{
+            questdb::error_code::auth_error,
+            "auth closed",
+            questdb::oidc::error_kind::cancelled,
+            {},
+            {},
+            std::nullopt,
+            std::nullopt};
+    }
+};
+} // namespace
+
 TEST_CASE(
     "A provider passing on a closed OIDC auth's failure stops its clients")
 {
+    // Passed on unchanged, as through a Rust closure that returns the
+    // `OidcError`: the clients stop, and the error keeps its OIDC detail.
     auto builder = questdb::oidc::builder{};
     builder.client_id("questdb-cpp")
         .token_endpoint("https://idp.example/token")
@@ -590,8 +613,35 @@ TEST_CASE(
     auto app = questdb::token_provider::from(
         std::make_shared<oidc_delegating_provider>(auth));
     auth.close();
+    // A reader pulls the token before it dials, so no server is needed.
+    try
+    {
+        questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", app};
+        FAIL("connected without a token");
+    }
+    catch (const questdb::oidc::error& e)
+    {
+        CHECK(e.code() == questdb::error_code::auth_error);
+        CHECK(e.kind() == questdb::oidc::error_kind::cancelled);
+    }
+    // The sender's background connect stops instead of retrying for good.
+    auto opts = questdb::ingress::opts::from_conf(
+        "ws::addr=127.0.0.1:1;initial_connect_retry=async;"
+        "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;");
+    opts.token_provider(app);
+    questdb::ingress::line_sender sender{opts};
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (!sender.must_close() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(5ms);
+    CHECK(sender.must_close());
+
+    // An `oidc::error` constructed in C++ has no C error to pass on: one of
+    // kind `cancelled` still stops the clients, with `config_error`.
+    auto constructed = questdb::token_provider::from(
+        std::make_shared<constructed_oidc_error_provider>());
     CHECK(attach_error_code([&] {
-              questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", app};
+              questdb::egress::reader reader{
+                  "ws::addr=127.0.0.1:1;", constructed};
           }) == questdb::error_code::config_error);
 }
 
