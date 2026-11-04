@@ -29,9 +29,10 @@
 //! redirects, bounding the response body, and holding every IdP call to `https`
 //! (or loopback `http`).
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::fmt::Debug;
 use std::io::{Read, Write};
+use std::marker::PhantomData;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -355,6 +356,8 @@ impl HttpClient {
     /// GET a URL and parse a JSON response, erroring on a non-2xx status.
     pub(crate) fn get_json(&self, url: &str, allow_insecure: bool) -> Result<serde_json::Value> {
         require_secure(url, allow_insecure)?;
+        let mut hook_state = DispatchHookState::new(None::<fn() -> Result<()>>);
+        let _dispatch = DispatchHookGuard::install(&mut hook_state);
         let response = self
             .agent
             .get(url)
@@ -457,11 +460,11 @@ impl HttpClient {
                 .build(),
             None => request,
         };
-        REQUEST_DISPATCHED.with(|dispatched| dispatched.set(false));
         let mut hook_state = DispatchHookState::new(before_dispatch);
-        let response = {
-            let _hook = DispatchHookGuard::install(&mut hook_state);
-            request.send_form(form.iter().copied())
+        let (response, dispatched) = {
+            let _dispatch = DispatchHookGuard::install(&mut hook_state);
+            let response = request.send_form(form.iter().copied());
+            (response, REQUEST_DISPATCHED.with(Cell::get))
         };
         let response = match response {
             Ok(response) => response,
@@ -476,7 +479,7 @@ impl HttpClient {
                 // refresh caller can safely keep a refresh token that the IdP
                 // cannot have seen (vs. an ambiguous mid-flight drop, where the
                 // parent may have been consumed and rotated).
-                let unsent = !REQUEST_DISPATCHED.with(Cell::get);
+                let unsent = !dispatched;
                 let timed_out = request_timed_out(&e);
                 return Err(OidcError::network(format!("Failed to reach {url}: {e}"))
                     .with_request_unsent(unsent)
@@ -684,8 +687,8 @@ fn form_url_encode(value: &str) -> Zeroizing<String> {
 
 thread_local! {
     /// Whether the request currently being sent on this thread has handed any
-    /// HTTP bytes to the transport. Set by [`DispatchTrackingTransport`], reset
-    /// by [`HttpClient::post_form_within`] before each request.
+    /// HTTP bytes to the transport. Set by [`DispatchTrackingTransport`], scoped
+    /// to each request by [`DispatchHookGuard`], including nested requests.
     ///
     /// A send failure with this still `false` proves the request never left the
     /// client — DNS resolution, TCP connect and the TLS handshake all run
@@ -707,12 +710,13 @@ thread_local! {
     ///
     /// ureq's connector and transport traits are `'static`, while the token
     /// store and key borrowed by a refresh are not. Keep only a type-erased
-    /// pointer for the strictly synchronous `send_form` call, with an RAII guard
-    /// that removes it before the borrowed callback leaves scope. ureq performs
-    /// every write on the calling thread, the same invariant used by
-    /// [`REQUEST_DISPATCHED`].
-    static BEFORE_REQUEST_DISPATCH: RefCell<Option<ErasedDispatchHook>> = const {
-        RefCell::new(None)
+    /// pointer for the strictly synchronous HTTP call, with an RAII guard that
+    /// restores the previous hook before the borrowed callback leaves scope.
+    /// Take the pointer out before invoking it, so a callback doing its own
+    /// HTTP work cannot invoke it recursively. ureq performs every write on the
+    /// calling thread, the same invariant used by [`REQUEST_DISPATCHED`].
+    static BEFORE_REQUEST_DISPATCH: Cell<Option<ErasedDispatchHook>> = const {
+        Cell::new(None)
     };
 }
 
@@ -737,9 +741,10 @@ fn invoke_dispatch_hook<F>(state: *mut ()) -> bool
 where
     F: FnOnce() -> Result<()>,
 {
-    // SAFETY: `DispatchHookGuard` installs a pointer to a live
-    // `DispatchHookState<F>` only for the synchronous `send_form` call on this
-    // thread, and clears it before that state can leave scope.
+    // SAFETY: `DispatchHookGuard` borrows this `DispatchHookState<F>` for the
+    // synchronous HTTP call on this thread and removes the pointer before the
+    // borrow ends. `run_before_request_dispatch` takes the pointer out before
+    // invoking it, so no nested request can alias this mutable reference.
     let state = unsafe { &mut *state.cast::<DispatchHookState<F>>() };
     let Some(hook) = state.hook.take() else {
         return true;
@@ -753,41 +758,53 @@ where
     }
 }
 
-struct DispatchHookGuard;
+/// Scope both the callback and send provenance to one request. A custom token
+/// store may synchronously authenticate through a different OIDC auth object;
+/// that nested request must neither inherit nor overwrite its caller's state.
+struct DispatchHookGuard<'a, F> {
+    previous_hook: Option<ErasedDispatchHook>,
+    previous_dispatched: bool,
+    // Keep the erased pointee borrowed until the guard has removed its pointer.
+    // The raw pointer in `previous_hook` also keeps the guard !Send / !Sync.
+    _state: PhantomData<&'a mut DispatchHookState<F>>,
+}
 
-impl DispatchHookGuard {
-    fn install<F>(state: &mut DispatchHookState<F>) -> Option<Self>
-    where
-        F: FnOnce() -> Result<()>,
-    {
-        state.hook.as_ref()?;
-        BEFORE_REQUEST_DISPATCH.with(|slot| {
-            let previous = slot.borrow_mut().replace(ErasedDispatchHook {
+impl<'a, F> DispatchHookGuard<'a, F>
+where
+    F: FnOnce() -> Result<()>,
+{
+    fn install(state: &'a mut DispatchHookState<F>) -> Self {
+        let hook = if state.hook.is_some() {
+            Some(ErasedDispatchHook {
                 state: std::ptr::from_mut(state).cast(),
                 invoke: invoke_dispatch_hook::<F>,
-            });
-            debug_assert!(previous.is_none(), "nested OIDC dispatch hook");
-        });
-        Some(Self)
+            })
+        } else {
+            None
+        };
+        // Even a request without a callback must hide the enclosing hook and
+        // have its own send marker. Restore both on return, error, or unwind.
+        Self {
+            previous_hook: BEFORE_REQUEST_DISPATCH.with(|slot| slot.replace(hook)),
+            previous_dispatched: REQUEST_DISPATCHED.with(|dispatched| dispatched.replace(false)),
+            _state: PhantomData,
+        }
     }
 }
 
-impl Drop for DispatchHookGuard {
+impl<F> Drop for DispatchHookGuard<'_, F> {
     fn drop(&mut self) {
-        BEFORE_REQUEST_DISPATCH.with(|slot| {
-            slot.borrow_mut().take();
-        });
+        BEFORE_REQUEST_DISPATCH.with(|slot| slot.set(self.previous_hook));
+        REQUEST_DISPATCHED.with(|dispatched| dispatched.set(self.previous_dispatched));
     }
 }
 
 fn run_before_request_dispatch() -> bool {
-    BEFORE_REQUEST_DISPATCH.with(|slot| {
-        let hook = *slot.borrow();
-        hook.is_none_or(|hook| {
-            // SAFETY: see `invoke_dispatch_hook`; the guard owns the scoped
-            // validity proof for this erased pointer.
-            unsafe { (hook.invoke)(hook.state) }
-        })
+    let hook = BEFORE_REQUEST_DISPATCH.with(Cell::take);
+    hook.is_none_or(|hook| {
+        // SAFETY: see `invoke_dispatch_hook`; the guard owns the scoped
+        // validity proof for this erased pointer, now detached from the slot.
+        unsafe { (hook.invoke)(hook.state) }
     })
 }
 
@@ -2071,6 +2088,103 @@ mod tests {
 
         fn is_open(&mut self) -> bool {
             true
+        }
+    }
+
+    #[test]
+    fn nested_dispatch_scopes_restore_hooks_and_send_provenance() {
+        for outer_dispatched in [false, true] {
+            for inner_dispatched in [false, true] {
+                for inner_has_hook in [false, true] {
+                    let outer_calls = Cell::new(0);
+                    let inner_calls = Cell::new(0);
+                    let mut outer_state = DispatchHookState::new(Some(|| {
+                        outer_calls.set(outer_calls.get() + 1);
+                        // The executing hook must no longer be reachable via
+                        // the thread-local pointer, even by hookless I/O.
+                        assert!(BEFORE_REQUEST_DISPATCH.with(Cell::get).is_none());
+                        assert!(run_before_request_dispatch());
+                        Ok(())
+                    }));
+                    let _outer = DispatchHookGuard::install(&mut outer_state);
+                    REQUEST_DISPATCHED.with(|sent| sent.set(outer_dispatched));
+                    {
+                        let mut inner_state =
+                            DispatchHookState::new(inner_has_hook.then_some(|| {
+                                inner_calls.set(inner_calls.get() + 1);
+                                assert!(BEFORE_REQUEST_DISPATCH.with(Cell::get).is_none());
+                                Ok(())
+                            }));
+                        let _inner = DispatchHookGuard::install(&mut inner_state);
+                        assert!(!REQUEST_DISPATCHED.with(Cell::get));
+                        assert!(run_before_request_dispatch());
+                        assert!(run_before_request_dispatch());
+                        assert_eq!(inner_calls.get(), usize::from(inner_has_hook));
+                        assert_eq!(outer_calls.get(), 0, "nested I/O inherited the outer hook");
+                        REQUEST_DISPATCHED.with(|sent| sent.set(inner_dispatched));
+                    }
+                    assert_eq!(REQUEST_DISPATCHED.with(Cell::get), outer_dispatched);
+                    assert!(run_before_request_dispatch());
+                    assert!(run_before_request_dispatch());
+                    assert_eq!(outer_calls.get(), 1, "the outer hook was lost or repeated");
+                }
+            }
+        }
+        assert!(BEFORE_REQUEST_DISPATCH.with(Cell::get).is_none());
+    }
+
+    #[test]
+    fn nested_dispatch_unwind_restores_the_enclosing_request() {
+        let outer_calls = Cell::new(0);
+        {
+            let mut outer_state = DispatchHookState::new(Some(|| {
+                outer_calls.set(outer_calls.get() + 1);
+                Ok(())
+            }));
+            let _outer = DispatchHookGuard::install(&mut outer_state);
+            REQUEST_DISPATCHED.with(|sent| sent.set(true));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut inner_state = DispatchHookState::new(Some(|| -> Result<()> {
+                    panic!("injected dispatch callback panic");
+                }));
+                let _inner = DispatchHookGuard::install(&mut inner_state);
+                assert!(!REQUEST_DISPATCHED.with(Cell::get));
+                run_before_request_dispatch();
+            }));
+            assert!(result.is_err());
+            assert!(REQUEST_DISPATCHED.with(Cell::get));
+            assert!(run_before_request_dispatch());
+            assert_eq!(outer_calls.get(), 1);
+        }
+        assert!(BEFORE_REQUEST_DISPATCH.with(Cell::get).is_none());
+    }
+
+    #[test]
+    fn nested_hookless_get_and_post_preserve_outer_dispatch_state() {
+        for get in [false, true] {
+            let server = TlsJsonServer::localhost();
+            let client = HttpClient::new(Some(&root_ca_path()), Duration::from_secs(5)).unwrap();
+            let outer_calls = Cell::new(0);
+            let mut outer_state = DispatchHookState::new(Some(|| {
+                outer_calls.set(outer_calls.get() + 1);
+                Ok(())
+            }));
+            let _outer = DispatchHookGuard::install(&mut outer_state);
+            if get {
+                client.get_json(&server.url("/config"), false).unwrap();
+            } else {
+                client
+                    .post_form(&server.url("/token"), &[("client_id", "questdb")], false)
+                    .unwrap();
+            }
+            assert!(
+                !REQUEST_DISPATCHED.with(Cell::get),
+                "nested I/O marked the outer request sent"
+            );
+            assert_eq!(outer_calls.get(), 0, "nested I/O invoked the outer hook");
+            assert!(run_before_request_dispatch());
+            assert_eq!(outer_calls.get(), 1);
+            assert_eq!(server.request_bodies().len(), 1);
         }
     }
 

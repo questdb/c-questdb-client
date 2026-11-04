@@ -6695,6 +6695,156 @@ fn refresh_dns_failure_keeps_persisted_parent() {
     );
 }
 
+#[test]
+fn custom_store_can_refresh_a_distinct_auth_at_dispatch() {
+    // A vault-backed store may need a separate OIDC credential before it can
+    // delete the persisted parent. Both auth objects can need refresh at once.
+    struct AuthenticatedStore {
+        inner: FailingSaveStore,
+        auth: Arc<OidcDeviceAuth>,
+    }
+
+    impl TokenStore for AuthenticatedStore {
+        fn load(&self, key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            self.inner.load(key)
+        }
+
+        fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+            self.inner.save(key, token)
+        }
+
+        fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+            assert_eq!(self.auth.token()?, "AT-vault");
+            self.inner.clear(key)
+        }
+
+        fn in_lock(
+            &self,
+            key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            self.inner.in_lock(key, action)
+        }
+    }
+
+    for fail_clear in [false, true] {
+        let vault_store = FailingSaveStore::default();
+        vault_store.seed(PersistedToken::new(
+            Some("AT-expired".to_string()),
+            None,
+            Some("RT-vault-parent".to_string()),
+            1.0,
+            300.0,
+        ));
+        let vault_posts = Arc::new(AtomicUsize::new(0));
+        let vault_mock = {
+            let store = vault_store.clone();
+            let posts = Arc::clone(&vault_posts);
+            MockServer::start(move |method, path, body| {
+                assert_eq!((method, path), ("POST", "/token"));
+                assert!(body.contains("refresh_token=RT-vault-parent"));
+                assert!(store.token().is_none(), "vault parent was not tombstoned");
+                posts.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-vault","refresh_token":"RT-vault-child","expires_in":300}"#
+                        .to_string(),
+                )
+            })
+        };
+        let vault_auth = Arc::new(auth_with_failing_store(
+            &vault_mock,
+            vault_store.clone(),
+            false,
+        ));
+
+        let database_store = FailingSaveStore::default();
+        database_store.seed(PersistedToken::new(
+            Some("AT-expired".to_string()),
+            None,
+            Some("RT-database-parent".to_string()),
+            1.0,
+            300.0,
+        ));
+        database_store
+            .fail_clear_after_delete
+            .store(fail_clear, Ordering::SeqCst);
+        let database_posts = Arc::new(AtomicUsize::new(0));
+        // Separate servers: the database connection is already open while its
+        // pre-dispatch callback synchronously refreshes the vault credential.
+        let database_mock = {
+            let store = database_store.clone();
+            let posts = Arc::clone(&database_posts);
+            MockServer::start(move |method, path, body| {
+                assert_eq!((method, path), ("POST", "/token"));
+                assert!(body.contains("refresh_token=RT-database-parent"));
+                assert!(
+                    store.token().is_none(),
+                    "database parent was not tombstoned"
+                );
+                posts.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-database","refresh_token":"RT-database-child","expires_in":300}"#
+                        .to_string(),
+                )
+            })
+        };
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(database_mock.url("/device"))
+            .token_endpoint(database_mock.url("/token"))
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .token_store(AuthenticatedStore {
+                inner: database_store.clone(),
+                auth: Arc::clone(&vault_auth),
+            })
+            .build()
+            .unwrap();
+
+        if fail_clear {
+            let error = auth.token().unwrap_err();
+            assert!(error.request_unsent(), "{error}");
+            assert!(error.message().contains("post-delete clear failure"));
+            assert_eq!(database_posts.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(auth.token().unwrap(), "AT-database");
+            assert_eq!(auth.token().unwrap(), "AT-database");
+            assert_eq!(database_posts.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(vault_auth.token().unwrap(), "AT-vault");
+        assert_eq!(vault_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            vault_store.token().unwrap().refresh_token(),
+            Some("RT-vault-child")
+        );
+        assert_eq!(
+            database_store.token().unwrap().refresh_token(),
+            Some(if fail_clear {
+                "RT-database-parent"
+            } else {
+                "RT-database-child"
+            })
+        );
+        for store in [&vault_store, &database_store] {
+            assert_eq!(
+                store
+                    .operations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|operation| **operation == "clear")
+                    .count(),
+                1,
+                "each dispatch callback must run exactly once"
+            );
+        }
+    }
+}
+
 /// Model a durable clear that pauses after removing the token. Keep the
 /// coordination lock separate from the stored value so close can publish while
 /// the refresh is inside clear().
