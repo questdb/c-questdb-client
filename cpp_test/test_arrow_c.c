@@ -143,6 +143,22 @@ TEST(test_query_timeout_is_a_distinct_appended_code)
         "neutral alias resolves to the same enumerator");
 }
 
+TEST(test_interrupted_is_a_distinct_appended_code)
+{
+    /* With `interrupt_on_eintr=on`, hosts tell a resumable signal
+     * interruption apart from a real failure by code: after it the cursor
+     * stays live. */
+    CHECK(
+        line_sender_error_interrupted > line_sender_error_query_timeout,
+        "interrupted appended (not renumbered)");
+    CHECK(
+        line_sender_error_interrupted == 39,
+        "interrupted discriminant pinned at 39 for cached ABI consumers");
+    CHECK(
+        questdb_error_interrupted == line_sender_error_interrupted,
+        "neutral alias resolves to the same enumerator");
+}
+
 TEST(test_query_set_timeout_ms_null_query_is_tolerated)
 {
     /* Proves the symbol links and argument-marshals under a plain C
@@ -1647,6 +1663,7 @@ int main(void)
     RUN(test_appended_sender_error_codes_exist);
     RUN(test_symbol_dict_full_is_a_distinct_appended_code);
     RUN(test_query_timeout_is_a_distinct_appended_code);
+    RUN(test_interrupted_is_a_distinct_appended_code);
     RUN(test_query_set_timeout_ms_null_query_is_tolerated);
     RUN(test_egress_null_cursor_returns_error_tristate);
     RUN(test_egress_null_out_array_returns_error_tristate);

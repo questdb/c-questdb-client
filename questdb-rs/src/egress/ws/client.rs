@@ -43,6 +43,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 
@@ -85,7 +86,7 @@ const READ_CHUNK: usize = 4 * 1024 * 1024;
 /// kill an FFI host process with `SIGPIPE` — see `nosigpipe.rs`.
 pub(crate) enum Stream {
     Plain(NoSigpipeTcp),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, NoSigpipeTcp>>),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TlsSock>>),
 }
 
 impl Stream {
@@ -94,7 +95,7 @@ impl Stream {
     pub(crate) fn tcp_mut(&mut self) -> &mut TcpStream {
         match self {
             Stream::Plain(s) => s.tcp_mut(),
-            Stream::Tls(s) => s.sock.tcp_mut(),
+            Stream::Tls(s) => s.sock.tcp.tcp_mut(),
         }
     }
 
@@ -131,6 +132,63 @@ impl Write for Stream {
     }
 }
 
+/// The TCP socket under a rustls session.
+///
+/// rustls' `complete_io` swallows `Interrupted` from the socket and
+/// retries the read itself, so an `EINTR` would never reach `fill_more`.
+/// With `raise_eintr` set (any mode but [`EintrMode::Surface`]), an
+/// `EINTR` is re-raised as [`EintrMarker`], which rustls propagates
+/// untouched; the bytes it already took off the socket stay buffered in
+/// the session, so the next read resumes where this one stopped.
+/// Otherwise `EINTR` passes through to rustls' retry.
+pub(crate) struct TlsSock {
+    tcp: NoSigpipeTcp,
+    raise_eintr: bool,
+}
+
+impl TlsSock {
+    pub(crate) fn new(tcp: NoSigpipeTcp) -> Self {
+        Self {
+            tcp,
+            raise_eintr: false,
+        }
+    }
+}
+
+impl Read for TlsSock {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.tcp.read(buf) {
+            Err(e) if self.raise_eintr && e.kind() == io::ErrorKind::Interrupted => {
+                Err(io::Error::other(EintrMarker))
+            }
+            r => r,
+        }
+    }
+}
+
+impl Write for TlsSock {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.tcp.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+/// Marker payload of the `io::Error` [`TlsSock`] raises for an `EINTR`
+/// when `raise_eintr` is set.
+#[derive(Debug)]
+struct EintrMarker;
+
+impl std::fmt::Display for EintrMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("egress read interrupted")
+    }
+}
+
+impl std::error::Error for EintrMarker {}
+
 /// Why a `read_binary_frame` call returned without yielding a Binary
 /// payload. Internal-only — the public API surfaces these as
 /// crate-wide [`Error`](crate::Error) variants in the transport layer.
@@ -146,6 +204,26 @@ pub(crate) enum WsReadError {
     /// Caller decides whether to surface as `SocketError` or treat as
     /// graceful.
     ServerClose { code: Option<u16> },
+    /// A signal interrupted the read in [`EintrMode::Interrupt`].
+    /// Nothing was lost: any partial frame stays in the recv buffer and
+    /// the next call resumes it.
+    Interrupted,
+}
+
+/// How a recv that fails with `EINTR` (a signal handler installed without
+/// `SA_RESTART`) is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EintrMode {
+    /// Default: plain TCP surfaces it as an `Io` error; rustls retries it
+    /// internally under TLS.
+    Surface,
+    /// Retry the read within its read timeout (see [`retry_eintr`]).
+    /// Used for connect-time reads when the reader opted into
+    /// `interrupt_on_eintr`: they cannot be resumed by a later call.
+    Retry,
+    /// Return [`WsReadError::Interrupted`], leaving any partial frame
+    /// buffered. Result-stream reads under `interrupt_on_eintr`.
+    Interrupt,
 }
 
 impl From<io::Error> for WsReadError {
@@ -171,6 +249,7 @@ pub(crate) struct WsClient {
     /// as a `Protocol` error rather than letting the buffer grow
     /// unboundedly under a corrupted-frame scenario.
     max_payload: usize,
+    eintr: EintrMode,
 }
 
 impl WsClient {
@@ -183,19 +262,30 @@ impl WsClient {
         leftover: Vec<u8>,
         mask_keys: MaskKeySource,
         max_payload: usize,
+        eintr: EintrMode,
     ) -> Self {
         let mut recv = BytesMut::with_capacity(INITIAL_RECV_CAPACITY.max(leftover.len()));
         recv.extend_from_slice(&leftover);
-        Self {
+        let mut client = Self {
             stream,
             recv,
             mask_keys,
             max_payload,
-        }
+            eintr: EintrMode::Surface,
+        };
+        client.set_eintr_mode(eintr);
+        client
     }
 
     pub(crate) fn stream_mut(&mut self) -> &mut Stream {
         &mut self.stream
+    }
+
+    pub(crate) fn set_eintr_mode(&mut self, mode: EintrMode) {
+        if let Stream::Tls(s) = &mut self.stream {
+            s.sock.raise_eintr = mode != EintrMode::Surface;
+        }
+        self.eintr = mode;
     }
 
     /// Read the next Binary frame from the peer, returning its payload
@@ -345,7 +435,17 @@ impl WsClient {
         // stabilises (rust-lang/rust#78485, #117693).
         let slice =
             unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
-        let n = self.stream.read(slice)?;
+        let read = match self.eintr {
+            EintrMode::Retry => retry_eintr(&mut self.stream, |s| s.read(slice)),
+            _ => self.stream.read(slice),
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(e) if self.eintr == EintrMode::Interrupt && is_eintr(&e) => {
+                return Err(WsReadError::Interrupted);
+            }
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             return Err(WsReadError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -357,6 +457,84 @@ impl WsClient {
         // is what `advance_mut` does.
         unsafe { self.recv.set_len(self.recv.len() + n) };
         Ok(())
+    }
+}
+
+fn is_eintr(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Interrupted || e.get_ref().is_some_and(|i| i.is::<EintrMarker>())
+}
+
+/// Runs `op` on `stream`, retrying `EINTR` until the socket's read
+/// timeout, as set when the call began, runs out. Each retried `recv`
+/// would otherwise restart `SO_RCVTIMEO`, so a steady stream of signals
+/// (Ruby re-signals a blocked thread periodically) would keep a peer
+/// that never answers from ever timing out. On expiry it fails as the
+/// timed-out `recv` would have. With no read timeout set, it just retries.
+pub(crate) fn retry_eintr<T>(
+    stream: &mut Stream,
+    mut op: impl FnMut(&mut Stream) -> io::Result<T>,
+) -> io::Result<T> {
+    let timeout = stream.tcp_mut().read_timeout().ok().flatten();
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut shortened = false;
+    let result = loop {
+        match op(stream) {
+            Err(e) if is_eintr(&e) => {
+                let Some(deadline) = deadline else { continue };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break Err(read_timed_out());
+                }
+                let _ = stream.tcp_mut().set_read_timeout(Some(remaining));
+                shortened = true;
+            }
+            r => break r,
+        }
+    };
+    if shortened {
+        let _ = stream.tcp_mut().set_read_timeout(timeout);
+    }
+    result
+}
+
+/// The error a `recv` that hit `SO_RCVTIMEO` returns.
+fn read_timed_out() -> io::Error {
+    #[cfg(unix)]
+    return io::Error::from_raw_os_error(libc::EAGAIN);
+    #[cfg(not(unix))]
+    return io::ErrorKind::WouldBlock.into();
+}
+
+/// A [`Stream`] whose reads and writes go through [`retry_eintr`]. Wraps
+/// the stream for the WS upgrade when the reader opted into
+/// `interrupt_on_eintr`: a half-read handshake cannot be resumed by a
+/// later call. Under TLS it also routes the rustls handshake's `EINTR`
+/// (which rustls would otherwise retry, restarting the timeout) through
+/// the same deadline.
+pub(crate) struct RetryEintr<'a>(&'a mut Stream);
+
+impl<'a> RetryEintr<'a> {
+    pub(crate) fn new(stream: &'a mut Stream) -> Self {
+        if let Stream::Tls(s) = stream {
+            s.sock.raise_eintr = true;
+        }
+        Self(stream)
+    }
+}
+
+impl Read for RetryEintr<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        retry_eintr(self.0, |s| s.read(buf))
+    }
+}
+
+impl Write for RetryEintr<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        retry_eintr(self.0, |s| s.write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        retry_eintr(self.0, |s| s.flush())
     }
 }
 

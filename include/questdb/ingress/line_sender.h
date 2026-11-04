@@ -312,6 +312,19 @@ typedef enum line_sender_error_code
      *  and a DDL / INSERT / UPDATE that timed out waiting for the table
      *  writer may still be applied by that writer afterwards. */
     line_sender_error_query_timeout = 38,
+
+    /** A signal interrupted a blocking query read (`EINTR`). Only produced
+     *  when the reader's connect string sets `interrupt_on_eintr=on`, which
+     *  is meant for language bindings that run their own signal handling:
+     *  the call returns so the host can run it. Not a failure of the query
+     *  or the connection: the cursor stays live, and the next
+     *  `qwp_reader_cursor_next_batch` / `_next_arrow_batch*` (or
+     *  `qwp_reader_cursor_cancel`) call resumes where this one stopped,
+     *  without reconnecting or replaying. A signal that arrives just before
+     *  the read blocks interrupts nothing, so the host must keep re-signalling
+     *  the blocked thread until the call returns. Never produced on Windows,
+     *  which has no `EINTR`. */
+    line_sender_error_interrupted = 39,
 } line_sender_error_code;
 
 /**
@@ -375,6 +388,7 @@ typedef line_sender_error_code questdb_error_code;
     line_sender_error_store_resend_required
 #define questdb_error_symbol_dict_full line_sender_error_symbol_dict_full
 #define questdb_error_query_timeout line_sender_error_query_timeout
+#define questdb_error_interrupted line_sender_error_interrupted
 
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol

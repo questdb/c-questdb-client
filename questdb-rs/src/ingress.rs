@@ -1126,6 +1126,7 @@ impl SenderBuilder {
             "failover_backoff_max_ms",
             "failover_max_attempts",
             "failover_max_duration_ms",
+            "interrupt_on_eintr",
             "max_batch_rows",
             "max_version",
             "on_internal_error",
