@@ -888,16 +888,32 @@ impl<T: Transport> Transport for DispatchTrackingTransport<T> {
     fn transmit_output(
         &mut self,
         amount: usize,
-        timeout: NextTimeout,
+        mut timeout: NextTimeout,
     ) -> std::result::Result<(), ureq::Error> {
         if amount > 0 {
             // Before marking the request dispatched: a request that times out
             // here has provably sent nothing.
             refuse_elapsed_deadline(timeout)?;
+            let deadline = match timeout.after {
+                TimeoutAfter::Exact(after) => Instant::now().checked_add(after),
+                TimeoutAfter::NotHappening => None,
+            };
             if !run_before_request_dispatch() {
                 return Err(ureq::Error::Io(std::io::Error::other(
                     "OIDC pre-dispatch callback failed",
                 )));
+            }
+            // The callback can block -- a token store's clear may wait for a
+            // peer's lock or run its own refresh -- so charge its time to this
+            // request. Writing the head after the deadline would mark the
+            // request dispatched and then have its body refused as late,
+            // discarding a refresh token the IdP never received.
+            if let Some(deadline) = deadline {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(ureq::Error::Timeout(timeout.reason));
+                }
+                timeout.after = TimeoutAfter::Exact(left);
             }
             // Set before the write: a write that fails part-way may already
             // have delivered the request.

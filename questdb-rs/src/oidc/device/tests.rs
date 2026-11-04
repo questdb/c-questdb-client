@@ -7074,6 +7074,111 @@ fn refresh_repersists_parent_when_dispatch_delete_reports_an_error() {
 }
 
 #[test]
+fn refresh_keeps_parent_when_a_slow_dispatch_clear_outlasts_the_timeout() {
+    // The dispatch callback's clear is slow only the first time, like a peer
+    // holding the store lock. It ends after the request deadline, so the
+    // request must fail unsent and keep the parent for the next refresh.
+    struct SlowFirstClearStore {
+        inner: FailingSaveStore,
+        first_clear_delay: Duration,
+        clears: AtomicUsize,
+    }
+
+    impl TokenStore for SlowFirstClearStore {
+        fn load(&self, key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            self.inner.load(key)
+        }
+
+        fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+            self.inner.save(key, token)
+        }
+
+        fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+            if self.clears.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::sleep(self.first_clear_delay);
+            }
+            self.inner.clear(key)
+        }
+
+        fn in_lock(
+            &self,
+            key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            self.inner.in_lock(key, action)
+        }
+    }
+
+    let refresh_posts = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_posts = Arc::clone(&refresh_posts);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_posts.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{"access_token":"AT-child","refresh_token":"RT-child","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let inner = FailingSaveStore::default();
+    inner.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-parent".to_string()),
+        1.0,
+        300.0,
+    ));
+    let timeout = Duration::from_millis(300);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .timeout(timeout)
+        .sleep_hook(no_sleep())
+        .token_store(SlowFirstClearStore {
+            inner: inner.clone(),
+            first_clear_delay: timeout * 2,
+            clears: AtomicUsize::new(0),
+        })
+        .build()
+        .expect("build auth with slow-clear store");
+
+    let error = auth.token().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Network, "{error:?}");
+    assert!(error.request_unsent(), "{error:?}");
+    assert_eq!(refresh_posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-parent")
+    );
+    assert_eq!(
+        inner
+            .token()
+            .and_then(|token| token.refresh_token().map(str::to_string)),
+        Some("RT-parent".to_string())
+    );
+    drop(auth);
+
+    // The parent never reached the IdP, so the next session still refreshes it.
+    let auth = auth_with_failing_store(&mock, inner.clone(), false);
+    assert_eq!(auth.token().unwrap(), "AT-child");
+    assert_eq!(refresh_posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        inner
+            .token()
+            .and_then(|token| token.refresh_token().map(str::to_string)),
+        Some("RT-child".to_string())
+    );
+}
+
+#[test]
 fn oversized_transient_refresh_preserves_memory_and_file_parents() {
     for status in [408, 429, 503] {
         for persisted in [false, true] {
