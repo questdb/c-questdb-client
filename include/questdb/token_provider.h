@@ -431,17 +431,22 @@ typedef struct questdb_token_provider_status
     size_t last_failure_msg_capacity;
     /** The message length in bytes before any truncation. */
     size_t last_failure_msg_len;
+    /** The number of bytes copied into `last_failure_msg`. Truncation stops
+     *  at a character boundary, so this can be less than
+     *  `min(last_failure_msg_len, last_failure_msg_capacity)`. */
+    size_t last_failure_msg_copied;
 } questdb_token_provider_status;
 
 /**
  * Read a refreshing provider's status. Set `out->struct_size` to
  * `sizeof *out`, and `last_failure_msg` / `last_failure_msg_capacity` to a
  * buffer for the message (1024 bytes always suffice), which is truncated at a
- * character boundary to fit. Returns false for NULL, an application provider,
- * or an undersized `out`, whose `struct_size` is then set to the size this
- * library requires. On success `struct_size` is replaced with the prefix the
- * library wrote; code that can load an older shared library must re-read it
- * before accessing a field appended later.
+ * character boundary to fit; read `last_failure_msg_copied` bytes of it.
+ * Returns false for NULL, an application provider, or an undersized `out`,
+ * whose `struct_size` is then set to the size this library requires. On
+ * success `struct_size` is replaced with the prefix the library wrote; code
+ * that can load an older shared library must re-read it before accessing a
+ * field appended later.
  */
 QUESTDB_CLIENT_API
 bool questdb_token_provider_get_status(

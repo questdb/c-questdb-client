@@ -147,6 +147,9 @@ pub struct questdb_token_provider_status {
     pub last_failure_msg: *mut c_char,
     pub last_failure_msg_capacity: size_t,
     pub last_failure_msg_len: size_t,
+    /// The number of bytes copied into `last_failure_msg`. Truncation stops at
+    /// a character boundary, so this can be less than `min(len, capacity)`.
+    pub last_failure_msg_copied: size_t,
 }
 
 // Pin the initial output layouts independently of future appended fields, as
@@ -994,9 +997,10 @@ pub unsafe extern "C" fn questdb_token_provider_on_rejected(
 /// `out->struct_size` to `sizeof *out`, and point `last_failure_msg` at a
 /// buffer of `last_failure_msg_capacity` bytes to receive the last failure's
 /// message (UTF-8, not NUL-terminated, truncated at a character boundary to
-/// fit; `last_failure_msg_len` reports its length before truncation). Returns
-/// false for NULL, an application-implemented provider, or an undersized
-/// `out`, whose `struct_size` is then set to the size this library requires.
+/// fit; `last_failure_msg_len` reports its length before truncation, and
+/// `last_failure_msg_copied` the bytes copied). Returns false for NULL, an
+/// application-implemented provider, or an undersized `out`, whose
+/// `struct_size` is then set to the size this library requires.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_token_provider_get_status(
     provider: *const questdb_token_provider,
@@ -1033,6 +1037,7 @@ pub unsafe extern "C" fn questdb_token_provider_get_status(
         last_failure_msg: msg_buf,
         last_failure_msg_capacity: msg_capacity,
         last_failure_msg_len: 0,
+        last_failure_msg_copied: 0,
     };
     if let Some(status) = status {
         value.closed = status.closed;
@@ -1054,6 +1059,7 @@ pub unsafe extern "C" fn questdb_token_provider_get_status(
                     cut -= 1;
                 }
                 unsafe { ptr::copy_nonoverlapping(message.as_ptr(), msg_buf.cast::<u8>(), cut) };
+                value.last_failure_msg_copied = cut;
             }
         }
     }
@@ -1182,6 +1188,7 @@ mod tests {
                 last_failure_msg: _,
                 last_failure_msg_capacity: _,
                 last_failure_msg_len: _,
+                last_failure_msg_copied: _,
             } = status;
             let questdb_token_unavailable_view {
                 struct_size: _,
@@ -1229,6 +1236,7 @@ mod tests {
                 "last_failure_msg",
                 "last_failure_msg_capacity",
                 "last_failure_msg_len",
+                "last_failure_msg_copied",
             ]
         );
         assert_eq!(
@@ -1725,6 +1733,7 @@ mod tests {
         assert!(unsafe { questdb_token_provider_get_status(provider, &mut status) });
         assert!(status.has_last_failure && !status.last_failure_retryable);
         assert_eq!(status.last_failure_msg_len, "identity not assigned".len());
+        assert_eq!(status.last_failure_msg_copied, buffer.len());
         assert_eq!(&buffer, b"identity");
 
         unsafe { questdb_token_provider_close(provider) };
@@ -1740,6 +1749,52 @@ mod tests {
         assert!(!view.retryable);
         assert!(view.provider_closed);
         unsafe { crate::questdb_error_free(err) };
+        unsafe { questdb_token_provider_free(provider) };
+    }
+
+    unsafe extern "C" fn multibyte_failure_source(
+        _user_data: *mut c_void,
+        sink: *mut questdb_token_sink,
+    ) {
+        let msg = "ééééé";
+        assert!(unsafe {
+            questdb_token_sink_set_error(sink, true, -1, msg.as_ptr().cast(), msg.len())
+        });
+    }
+
+    #[test]
+    fn a_truncated_status_message_reports_the_bytes_copied() {
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let provider = unsafe {
+            questdb_refreshing_token_provider_new(
+                Some(multibyte_failure_source),
+                ptr::null_mut(),
+                None,
+                ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!provider.is_null() && err.is_null());
+        // Five bytes end inside the third two-byte character.
+        let mut buffer = [0xFFu8; 5];
+        let mut status = unsafe { std::mem::zeroed::<questdb_token_provider_status>() };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            status.struct_size = size_of_val(&status);
+            status.last_failure_msg = buffer.as_mut_ptr().cast();
+            status.last_failure_msg_capacity = buffer.len();
+            assert!(unsafe { questdb_token_provider_get_status(provider, &mut status) });
+            if status.has_last_failure {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no fetch failed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(status.last_failure_msg_len, "ééééé".len());
+        assert_eq!(status.last_failure_msg_copied, "éé".len());
+        assert_eq!(&buffer[..status.last_failure_msg_copied], "éé".as_bytes());
+        assert_eq!(buffer[status.last_failure_msg_copied], 0xFF);
+        unsafe { questdb_token_provider_close(provider) };
         unsafe { questdb_token_provider_free(provider) };
     }
 
@@ -2453,8 +2508,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(status.last_failure_retryable);
-        let len = status.last_failure_msg_len.min(buffer.len());
-        let message = std::str::from_utf8(&buffer[..len]).unwrap();
+        let message = std::str::from_utf8(&buffer[..status.last_failure_msg_copied]).unwrap();
         assert!(
             message.contains("token source callback returned a token that is not valid UTF-8"),
             "{message}"
