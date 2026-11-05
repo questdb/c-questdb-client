@@ -597,11 +597,12 @@ public:
      */
     std::string token() const
     {
-        ::questdb_token* raw = ::questdb::error::wrapped_call(
-            ::questdb_token_provider_token, _raw);
-        std::string value{::questdb_token_data(raw), ::questdb_token_len(raw)};
-        ::questdb_token_free(raw);
-        return value;
+        std::unique_ptr<::questdb_token, decltype(&::questdb_token_free)> raw{
+            ::questdb::error::wrapped_call(
+                ::questdb_token_provider_token, _raw),
+            &::questdb_token_free};
+        return std::string{
+            ::questdb_token_data(raw.get()), ::questdb_token_len(raw.get())};
     }
 
     /** A server rejected `token` with `http_status`; see `on_rejected`. */

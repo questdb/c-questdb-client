@@ -96,6 +96,7 @@ def run_cpp_tests():
         'test_oidc',
         'test_oidc_examples',
         'test_token_provider',
+        'test_token_provider_copy',
     ]
     # Each C++ target may also have a `_cxx20` twin (QUESTDB_TEST_CXX20_VARIANTS);
     # run it too when present so the C++20 header paths are exercised.

@@ -447,6 +447,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_test(
         test_token_provider
         cpp_test/test_token_provider.cpp)
+    compile_test(
+        test_token_provider_copy
+        cpp_test/test_token_provider_copy.cpp)
 
     # Live-broker integration tests for the egress reader. Skips per-test
     # if no broker is reachable on QDB_LIVE_BROKER_HOST:QDB_LIVE_BROKER_HTTP_PORT
