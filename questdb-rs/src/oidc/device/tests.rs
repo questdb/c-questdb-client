@@ -3688,6 +3688,86 @@ fn deadline_expiry_returns_timeout() {
 }
 
 #[test]
+fn waiting_renderer_time_is_charged_to_the_device_code_deadline() {
+    struct AdvancingRenderer {
+        virtual_ns: Arc<AtomicU64>,
+        delay: Duration,
+        waits: Arc<Mutex<Vec<f64>>>,
+    }
+    impl Renderer for AdvancingRenderer {
+        fn on_waiting(&self, seconds_left: f64) {
+            self.waits.lock().unwrap().push(seconds_left);
+            self.virtual_ns
+                .fetch_add(self.delay.as_nanos() as u64, Ordering::SeqCst);
+        }
+    }
+
+    // Cover no callback delay, partial consumption, exact expiry and overrun.
+    for delay_ms in [0, 400, 1000, 1300] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let polls = Arc::clone(&polls);
+            MockServer::start(move |method, path, _body| match (method, path) {
+                ("POST", "/device") => (200, device_response_short()),
+                ("POST", "/token") => {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    (400, r#"{"error":"authorization_pending"}"#.to_string())
+                }
+                _ => (404, "{}".to_string()),
+            })
+        };
+        let base = Instant::now();
+        let virtual_ns = Arc::new(AtomicU64::new(0));
+        let now_ns = Arc::clone(&virtual_ns);
+        let sleep_ns = Arc::clone(&virtual_ns);
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let sleep_log = Arc::clone(&sleeps);
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let delay = Duration::from_millis(delay_ms);
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .interactive(true)
+            .open_browser(false)
+            .renderer(AdvancingRenderer {
+                virtual_ns: Arc::clone(&virtual_ns),
+                delay,
+                waits: Arc::clone(&waits),
+            })
+            .now_hook(Arc::new(move || {
+                base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+            }))
+            .sleep_hook(Arc::new(move |duration: Duration| {
+                sleep_log.lock().unwrap().push(duration);
+                sleep_ns.fetch_add(duration.as_nanos() as u64, Ordering::SeqCst);
+            }))
+            .build()
+            .expect("build");
+
+        let err = auth.sign_in().unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Timeout);
+        assert_eq!(err.idp_error(), Some("expired_token"));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(*waits.lock().unwrap(), vec![1.0]);
+        let expected_sleeps = if delay_ms < 1000 {
+            vec![Duration::from_millis(1000 - delay_ms)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            *sleeps.lock().unwrap(),
+            expected_sleeps,
+            "callback delay: {delay_ms}ms"
+        );
+        assert_eq!(
+            Duration::from_nanos(virtual_ns.load(Ordering::SeqCst)),
+            Duration::from_secs(1).max(delay)
+        );
+    }
+}
+
+#[test]
 fn transport_failures_continue_until_device_code_expiry() {
     // Every token-endpoint poll drops the connection without an HTTP status.
     // Match Java by retrying throughout the device-code lifetime instead of

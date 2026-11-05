@@ -2868,6 +2868,14 @@ impl OidcDeviceAuth {
             if !poll_now {
                 self.renderer.on_waiting(remaining.as_secs_f64());
                 self.ensure_interactive_flow_active()?;
+                // Renderer callbacks consume device-code lifetime too. Recheck
+                // before sleeping, and report expiry through the loop's common
+                // terminal path if the callback used up the remaining time.
+                let now = (self.now)();
+                if now >= deadline {
+                    continue;
+                }
+                let remaining = deadline - now;
                 let target = Duration::from_secs(interval);
                 let owed = target.saturating_sub(waited_in_interval);
                 if interval_raised && owed > remaining {
