@@ -51,6 +51,12 @@ fn test_file_store(directory: impl AsRef<Path>) -> FileTokenStore {
     FileTokenStore::at(directory.as_ref()).allow_unsafe_mutations_for_tests()
 }
 
+/// Added to a [`MockServer`] handler's status: send that status line and its
+/// headers, with the full `Content-Length`, then only half of the body before
+/// closing the connection. The client sees a status, then a body that never
+/// completes.
+const TRUNCATED_REPLY: u16 = 1000;
+
 /// A tiny single-request-per-connection HTTP mock. The handler receives
 /// `(method, path, body)` and returns `(status, json_body)`.
 struct MockServer {
@@ -189,6 +195,10 @@ fn handle_conn<H>(
     if status == 0 {
         return;
     }
+    let (status, truncated) = match status.checked_sub(TRUNCATED_REPLY) {
+        Some(status) => (status, true),
+        None => (status, false),
+    };
     let retry_after_header = match retry_after {
         Some(secs) => format!("Retry-After: {secs}\r\n"),
         None => String::new(),
@@ -199,12 +209,18 @@ fn handle_conn<H>(
         Some(loc) if (300..400).contains(&status) => format!("Location: {loc}\r\n"),
         _ => String::new(),
     };
-    let response = format!(
-        "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\n{retry_after_header}{location_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        json.len(),
-        json
-    );
-    stream.write_all(response.as_bytes()).ok();
+    let mut response = format!(
+        "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\n{retry_after_header}{location_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        json.len()
+    )
+    .into_bytes();
+    let sent = if truncated {
+        json.len() / 2
+    } else {
+        json.len()
+    };
+    response.extend_from_slice(&json.as_bytes()[..sent]);
+    stream.write_all(&response).ok();
     stream.flush().ok();
 }
 
@@ -4146,6 +4162,45 @@ fn poll_non_json_body_is_terminal_rejection() {
     let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     assert_eq!(err.status(), Some(403));
+}
+
+#[test]
+fn a_poll_reply_cut_off_after_its_status_keeps_polling() {
+    // The IdP's answer is in the body, so a reply whose body never completed
+    // answered nothing, whatever its status: keep polling, as after a poll that
+    // got no reply at all, rather than end the sign-in as a rejection.
+    for status in [400, 401, 200] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let polls = Arc::clone(&polls);
+            MockServer::start(move |method, path, _body| match (method, path) {
+                ("POST", "/device") => (200, device_response()),
+                ("POST", "/token") => {
+                    if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let body = if status == 200 {
+                            r#"{"access_token":"AT-lost","expires_in":300}"#
+                        } else {
+                            r#"{"error":"authorization_pending"}"#
+                        };
+                        (TRUNCATED_REPLY + status, body.to_string())
+                    } else {
+                        (
+                            200,
+                            r#"{"access_token":"AT-1","expires_in":300}"#.to_string(),
+                        )
+                    }
+                }
+                _ => (404, "{}".to_string()),
+            })
+        };
+        let auth = explicit_auth(&mock, false);
+        assert_eq!(
+            sign_in_and_token(&auth).expect("sign-in after a cut-off reply"),
+            "AT-1",
+            "status {status}"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 2, "status {status}");
+    }
 }
 
 // -- request_device_code error paths -----------------------------------------
@@ -8336,6 +8391,33 @@ fn expiry_names_the_transport_failure_when_no_poll_was_answered() {
     assert!(
         err.message().contains("is responding"),
         "expiry must say the endpoint did not respond: {}",
+        err.message()
+    );
+    assert_eq!(
+        *failures.lock().unwrap(),
+        ["Sign-in failed: the token endpoint did not respond."]
+    );
+}
+
+/// Polls whose replies are all cut off after the status line never complete
+/// either, so the expiry names that failure too.
+#[test]
+fn expiry_names_poll_replies_cut_off_after_their_status() {
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, one_poll_device_response()),
+        ("POST", "/token") => (
+            TRUNCATED_REPLY + 400,
+            r#"{"error":"authorization_pending"}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let err = sign_in_on_virtual_clock(&mock.url(""), &failures);
+
+    assert_unanswered_polls_expiry(&err);
+    assert!(
+        err.message().contains("Failed to read response body"),
+        "expiry must name the cut-off reply: {}",
         err.message()
     );
     assert_eq!(

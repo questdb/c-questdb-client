@@ -117,6 +117,13 @@ pub struct OidcError {
     /// device-flow polling loop uses this provenance to apply RFC 8628's
     /// mandatory five-second interval increase after connection timeouts.
     request_timed_out: bool,
+    /// True when a response's status line and headers arrived but its body
+    /// then failed in transit: the connection closed or reset early, or the
+    /// body stalled past the request deadline. `status` is set, but the body
+    /// that carries the server's answer never arrived. A body this client
+    /// refused to read -- past the size cap, or with malformed framing -- is
+    /// not counted.
+    response_incomplete: bool,
     /// True when an `InteractionRequired` was raised only because a peer holds
     /// this provider's acquisition lock (a `sign_in()` on another thread, or a
     /// renderer callback mid-paint), rather than because no credential exists.
@@ -146,6 +153,7 @@ impl OidcError {
             retry_after: None,
             request_unsent: false,
             request_timed_out: false,
+            response_incomplete: false,
             acquisition_busy: false,
         }
     }
@@ -307,6 +315,11 @@ impl OidcError {
         self
     }
 
+    pub(crate) fn with_response_incomplete(mut self, response_incomplete: bool) -> Self {
+        self.response_incomplete = response_incomplete;
+        self
+    }
+
     /// The category of this error.
     ///
     /// Match on the returned [`OidcErrorKind`] to branch on the failure — e.g.
@@ -365,6 +378,12 @@ impl OidcError {
     /// before or after the request was transmitted.
     pub(crate) fn request_timed_out(&self) -> bool {
         self.request_timed_out
+    }
+
+    /// True when the response's status and headers arrived but its body was
+    /// cut off in transit, so the server's answer is unknown. See the field.
+    pub(crate) fn response_incomplete(&self) -> bool {
+        self.response_incomplete
     }
 
     /// True when an [`InteractionRequired`](OidcErrorKind::InteractionRequired)

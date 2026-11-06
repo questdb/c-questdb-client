@@ -2932,11 +2932,19 @@ impl OidcDeviceAuth {
                 }
                 Err(e) => {
                     self.ensure_interactive_flow_active()?;
-                    // A non-JSON, non-transient status is a terminal rejection (a
-                    // WAF/proxy error page); a conformant poll reply is JSON, so
-                    // it can never be authorization_pending / slow_down.
-                    if e.status()
-                        .is_some_and(|status| !is_transient_http_status(status))
+                    // A reply cut off after its status line -- an early close or
+                    // reset, or a body that stalled past the deadline -- never
+                    // delivered the IdP's answer, which is in the body. Its
+                    // status says nothing about the authorization, so it is a
+                    // transport failure like a poll that got no reply at all.
+                    let incomplete = e.response_incomplete();
+                    // A complete non-JSON reply with a non-transient status is a
+                    // terminal rejection (a WAF/proxy error page); a conformant
+                    // poll reply is JSON, so it can never be
+                    // authorization_pending / slow_down.
+                    if !incomplete
+                        && e.status()
+                            .is_some_and(|status| !is_transient_http_status(status))
                     {
                         self.commit_interactive_flow()?;
                         self.renderer.on_failure(
@@ -2953,8 +2961,8 @@ impl OidcDeviceAuth {
                     // unreachable token endpoint recover during an active flow.
                     // Retain the cause: if no poll ever completes, the expiry
                     // branch reports this instead of "you did not authorize in
-                    // time".
-                    if e.status().is_none() {
+                    // time". A cut-off reply did not complete its poll either.
+                    if e.status().is_none() || incomplete {
                         // A request that started to go out had a connection
                         // to the endpoint, which then dropped the poll or
                         // never answered it.

@@ -974,15 +974,27 @@ fn read_body(url: &str, response: ureq::http::Response<ureq::Body>) -> Result<Ve
         .into_with_config()
         .limit(MAX_RESPONSE_BYTES + 1)
         .read_to_vec()
-        .map_err(|e| {
-            let timed_out = request_timed_out(&e);
-            OidcError::network(format!("Failed to read response body from {url}: {e}"))
-                .with_request_timed_out(timed_out)
-        })?;
+        .map_err(|e| body_read_error(url, &e))?;
     if body.len() as u64 > MAX_RESPONSE_BYTES {
         return Err(oversized_body_error(url));
     }
     Ok(body)
+}
+
+/// The error for a response body that could not be read once its status and
+/// headers had arrived.
+///
+/// It is marked [`response_incomplete`](OidcError::response_incomplete) only
+/// for a transport fault: a socket error, which includes an early close or
+/// reset, or a deadline. The server's answer is then unknown, which the
+/// device-flow poll must not mistake for a rejection. A body over
+/// [`MAX_RESPONSE_BYTES`] (`BodyExceedsLimit`) or with malformed framing
+/// (`Protocol`) is one this client refused, and is not marked.
+fn body_read_error(url: &str, e: &ureq::Error) -> OidcError {
+    let incomplete = matches!(e, ureq::Error::Io(_) | ureq::Error::Timeout(_));
+    OidcError::network(format!("Failed to read response body from {url}: {e}"))
+        .with_request_timed_out(request_timed_out(e))
+        .with_response_incomplete(incomplete)
 }
 
 fn oversized_body_error(url: &str) -> OidcError {
@@ -1009,12 +1021,7 @@ fn read_body_zeroizing(
     const INITIAL_CAPACITY: usize = 4096;
     const CHUNK: usize = 8192;
 
-    let read_error = |e: std::io::Error| {
-        let e = ureq::Error::from(e);
-        let timed_out = request_timed_out(&e);
-        OidcError::network(format!("Failed to read response body from {url}: {e}"))
-            .with_request_timed_out(timed_out)
-    };
+    let read_error = |e: std::io::Error| body_read_error(url, &ureq::Error::from(e));
     let initial = response
         .headers()
         .get(ureq::http::header::CONTENT_LENGTH)
@@ -2806,6 +2813,10 @@ mod tests {
                     let error = result.unwrap_err();
                     assert_eq!(error.kind(), crate::oidc::error::OidcErrorKind::Network);
                     assert!(error.message().contains("response body"));
+                    assert!(
+                        !error.response_incomplete(),
+                        "a body over the cap was refused, not cut off in transit"
+                    );
                 } else {
                     assert!(result.unwrap());
                 }
@@ -2857,9 +2868,74 @@ mod tests {
                 !error.request_unsent(),
                 "response headers prove the request reached the peer"
             );
+            assert!(
+                error.response_incomplete(),
+                "a body that stalled past the deadline never arrived"
+            );
             assert_eq!(error.status(), Some(status));
             assert_eq!(error.retry_after_secs(), Some(7));
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn a_response_body_cut_off_by_an_early_close_is_incomplete() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let headers_end = loop {
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                let amount = stream.read(&mut chunk).unwrap();
+                assert_ne!(amount, 0, "client closed before sending request headers");
+                request.extend_from_slice(&chunk[..amount]);
+            };
+            let content_length = std::str::from_utf8(&request[..headers_end])
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            // Drain the form before closing, so the close is a FIN, not a reset.
+            while request.len() - headers_end < content_length {
+                let amount = stream.read(&mut chunk).unwrap();
+                assert_ne!(amount, 0, "request body ended before Content-Length");
+                request.extend_from_slice(&chunk[..amount]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 MOCK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 64\r\nConnection: close\r\n\r\n{\"error\":",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let error = match client.post_form(
+            &format!("http://{addr}/token"),
+            &[("grant_type", "urn:ietf:params:oauth:grant-type:device_code")],
+            false,
+        ) {
+            Ok(_) => panic!("a body cut off by the peer must fail"),
+            Err(error) => error,
+        };
+        server.join().unwrap();
+
+        assert_eq!(error.kind(), crate::oidc::error::OidcErrorKind::Network);
+        assert!(error.response_incomplete(), "{error}");
+        assert!(!error.request_timed_out(), "{error}");
+        assert!(!error.request_unsent(), "{error}");
+        assert_eq!(error.status(), Some(400));
     }
 }
