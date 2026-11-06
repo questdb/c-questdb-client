@@ -174,8 +174,11 @@ pub(crate) fn compute_refresh_at_millis(
     let life = e.saturating_sub(f);
     let half = life / 2;
     let margin = refresh_margin_ms.min(half);
-    // the least time between a fetch and the refresh that follows it: p
-    let spacing = min_refresh_interval_ms.min(half);
+    // the least time between a fetch and the refresh that follows it: p.
+    // Positive after rounding, as the failure backoff must be (spec §5.4): a
+    // zero spacing let a refresh hint at or before receipt start the next
+    // fetch at once, again and again while the source kept returning one.
+    let spacing = min_refresh_interval_ms.min(half).max(1);
     let fraction = 0.45 + 0.10 * u.clamp(0.0, 1.0);
     let mut r = f.saturating_add((life as f64 * fraction) as i64);
     r = r.min(e.saturating_sub(margin));
@@ -434,9 +437,9 @@ pub struct TokenProviderStatus {
 ///   next fetch is scheduled at a jittered half-life, `f + (e - f) * U(0.45,
 ///   0.55)`, no later than `e - min(refresh_margin, (e - f) / 2)` or the
 ///   platform's refresh hint, and no sooner than `f + p`, where `p =
-///   min(min_refresh_interval, (e - f) / 2)`. It also starts at least `p`
-///   before the token leaves its hand-out window at `e - handout_floor`,
-///   unless that is sooner than `f + p`.
+///   min(min_refresh_interval, (e - f) / 2)`, at least 1 ms. It also starts
+///   at least `p` before the token leaves its hand-out window at `e -
+///   handout_floor`, unless that is sooner than `f + p`.
 /// - **Hand-out.** A token is usable only while `now < e - handout_floor`.
 ///   [`token`](Self::token) returns a usable token at once, with no I/O. With
 ///   none, it starts a fetch, unless one is running or the provider is
@@ -1348,7 +1351,9 @@ impl RefreshingTokenProviderBuilder {
     }
 
     /// Lower bound on the time between a fetch and the next scheduled
-    /// refresh. Default 30 s.
+    /// refresh. Default 30 s. Less than a millisecond counts as one, so a
+    /// refresh hint at or before receipt cannot make the provider fetch again
+    /// without pause.
     pub fn min_refresh_interval(mut self, value: Duration) -> Self {
         self.min_refresh_interval = value;
         self

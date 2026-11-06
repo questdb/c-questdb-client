@@ -184,6 +184,43 @@ fn c1_refresh_schedule_keeps_the_refresh_inside_the_handout_window() {
 }
 
 #[test]
+fn a_refresh_hint_cannot_make_the_next_fetch_immediate() {
+    // Below a millisecond, min_refresh_interval let a hint at or before
+    // receipt schedule the next fetch at receipt: while the source kept
+    // returning such a hint, the refresher fetched without pause.
+    for hint in [T0, T0 - HOUR] {
+        let r = compute_refresh_at_millis(T0, T0 + HOUR, Some(hint), 0.5, 5 * MIN, 0, 0);
+        assert_eq!(r - T0, 1, "hint={hint}");
+    }
+    for interval in [Duration::ZERO, Duration::from_micros(500)] {
+        let clock = ManualClock::new();
+        let script = Arc::new(Script::default());
+        for _ in 0..2 {
+            script.push(Ok(
+                token("T", T0 + HOUR).with_refresh_at(system_time(T0 - SEC))
+            ));
+        }
+        let provider = manual(&clock, &script)
+            .min_refresh_interval(interval)
+            .build()
+            .unwrap();
+        assert!(provider.run_due_fetch());
+        assert_eq!(
+            provider.scheduled_in(),
+            Some(Duration::from_millis(1)),
+            "{interval:?}"
+        );
+        assert!(
+            !provider.run_due_fetch(),
+            "{interval:?}: fetched again at once"
+        );
+        clock.advance_ms(1);
+        assert!(provider.run_due_fetch());
+        assert_eq!(script.calls(), 2);
+    }
+}
+
+#[test]
 fn c1_the_provider_schedules_the_computed_refresh() {
     let clock = ManualClock::new();
     let script = Arc::new(Script::default());

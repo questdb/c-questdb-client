@@ -260,7 +260,8 @@ typedef struct questdb_refreshing_token_provider_options
      *  Default 300000. */
     uint64_t refresh_margin_ms;
     /** Lower bound on the time between a fetch and the next scheduled
-     *  refresh. Default 30000. */
+     *  refresh. Default 30000. 0 counts as 1, so a refresh hint at or before
+     *  receipt cannot make the provider fetch again without pause. */
     uint64_t min_refresh_interval_ms;
     /** A token is usable only while now < expiry - handout_floor. A fetched
      *  token that is not usable on arrival is a failed fetch, so a source
