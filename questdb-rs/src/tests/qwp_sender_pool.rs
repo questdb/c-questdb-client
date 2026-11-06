@@ -3656,7 +3656,8 @@ fn direct_flush_split_floor_marks_must_close_to_discard_uncommitted_prefix() {
 #[test]
 fn standalone_direct_sender_free_commits_in_flight_on_drop() {
     const FLAG_DEFER_COMMIT: u8 = 0x01;
-    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
     let conf = conf_for(server.port(), "");
     let mut sender =
         crate::db::OwnedDirectColumnSender::from_conf(&conf).expect("standalone connect");
@@ -3677,18 +3678,20 @@ fn standalone_direct_sender_free_commits_in_flight_on_drop() {
         "deferred flush must leave an uncommitted in-flight frame"
     );
 
+    // Observe both data frames before dropping, so the initial committing
+    // frame cannot be mistaken for the drop-time commit of the deferred tail.
+    let first = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first[5] & FLAG_DEFER_COMMIT, 0);
+    let deferred = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(deferred[5] & FLAG_DEFER_COMMIT, 0);
+
     drop(sender); // free path: must_close stays unset -> best-effort commit of the tail
 
-    let mut captured = Vec::new();
-    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
-        captured.push(frame);
-    }
-    let last = captured.last().expect("server must have received frames");
-    assert_eq!(
-        last[5] & FLAG_DEFER_COMMIT,
-        0,
-        "free-drop must close the deferred tail with a commit boundary, not discard it"
-    );
+    let commit = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("free-drop must send a commit boundary for the deferred tail");
+    assert_eq!(commit[5] & FLAG_DEFER_COMMIT, 0);
+    assert_eq!(u16::from_le_bytes([commit[6], commit[7]]), 0);
 }
 
 /// Force-drop counterpart: `questdb_db_drop_direct_sender(NULL, sender)` on a
@@ -3702,7 +3705,8 @@ fn standalone_direct_sender_free_commits_in_flight_on_drop() {
 #[test]
 fn standalone_direct_sender_force_drop_discards_in_flight() {
     const FLAG_DEFER_COMMIT: u8 = 0x01;
-    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
     let conf = conf_for(server.port(), "");
     let mut sender =
         crate::db::OwnedDirectColumnSender::from_conf(&conf).expect("standalone connect");
@@ -3723,19 +3727,22 @@ fn standalone_direct_sender_force_drop_discards_in_flight() {
         "deferred flush must be in-flight"
     );
 
+    // Wait until the peer has read the deferred tail before closing. A socket
+    // write alone does not prove receipt: on Windows, closing first can make
+    // the mock's initial ACK write fail, leaving only the first (committing)
+    // frame captured. Do not ACK the deferred frame either, just like QuestDB.
+    let first = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first[5] & FLAG_DEFER_COMMIT, 0);
+    let deferred = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(deferred[5] & FLAG_DEFER_COMMIT, 0);
+
     // `questdb_db_drop_direct_sender` sets must_close before dropping the
     // box (via `on_deferred_close`); replicate that to drive the discard arm.
     sender.mark_must_close();
     drop(sender);
 
-    let mut captured = Vec::new();
-    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
-        captured.push(frame);
-    }
-    let last = captured.last().expect("server must have received frames");
-    assert_ne!(
-        last[5] & FLAG_DEFER_COMMIT,
-        0,
+    assert!(
+        frames.recv_timeout(Duration::from_millis(500)).is_err(),
         "force-drop must leave the deferred tail uncommitted (discarded), \
          not send a commit boundary"
     );
