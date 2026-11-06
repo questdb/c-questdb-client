@@ -269,8 +269,13 @@ fn c4_cold_failure_raises_a_retryable_error_within_cold_wait() {
         let provider = provider.clone();
         thread::spawn(move || provider.token())
     };
-    // Fetches keep failing retryably until the caller's cold_wait elapses.
-    for _ in 0..10 {
+    // Keep driving a late-starting caller's deadline, not a fixed number of ticks.
+    let watchdog = Instant::now() + Duration::from_secs(10);
+    while !caller.is_finished() {
+        if Instant::now() >= watchdog {
+            provider.close();
+            panic!("cold token caller did not reach its manual-clock deadline");
+        }
         let _ = provider.run_due_fetch();
         clock.advance_ms(SEC);
         thread::sleep(Duration::from_millis(10));
