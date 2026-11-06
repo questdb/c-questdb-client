@@ -33,7 +33,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -736,6 +736,126 @@ fn cancel_after_tokens_are_issued_is_a_no_op_and_success_is_reported() {
     assert_eq!(auth.token().unwrap(), "AT-refreshed");
     assert_eq!(successes.load(Ordering::SeqCst), 1);
     assert_eq!(failures.load(Ordering::SeqCst), 0);
+}
+
+#[rstest::rstest]
+#[case::access_denied(400, r#"{"error":"access_denied"}"#, OidcErrorKind::DeviceFlow)]
+#[case::expired_token(400, r#"{"error":"expired_token"}"#, OidcErrorKind::Timeout)]
+#[case::non_json_rejection(403, "Forbidden", OidcErrorKind::DeviceFlow)]
+#[case::redirect(302, "{}", OidcErrorKind::DeviceFlow)]
+#[case::deadline(400, r#"{"error":"authorization_pending"}"#, OidcErrorKind::Timeout)]
+#[case::unanswered_poll(0, "", OidcErrorKind::Timeout)]
+#[case::poll_pause(400, r#"{"error":"slow_down"}"#, OidcErrorKind::Timeout)]
+fn cancel_during_terminal_failure_is_a_no_op(
+    #[case] status: u16,
+    #[case] body: &'static str,
+    #[case] expected: OidcErrorKind,
+) {
+    struct CancellingRenderer {
+        auth: Arc<OnceLock<Weak<OidcDeviceAuth>>>,
+        entered: mpsc::SyncSender<bool>,
+        release: Mutex<mpsc::Receiver<()>>,
+        failures: Arc<AtomicUsize>,
+    }
+    impl Renderer for CancellingRenderer {
+        fn on_failure(&self, _message: &str) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+            let auth = self.auth.get().unwrap().upgrade().unwrap();
+            self.entered.send(auth.cancel_sign_in()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("failure callback was not released");
+        }
+    }
+
+    let succeed = Arc::new(AtomicBool::new(false));
+    let mock = {
+        let succeed = Arc::clone(&succeed);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response_short()),
+            ("POST", "/token") if succeed.load(Ordering::Acquire) => (
+                200,
+                r#"{"access_token":"AT-after-failure","expires_in":300}"#.to_string(),
+            ),
+            ("POST", "/token") => (status, body.to_string()),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let holder = Arc::new(OnceLock::new());
+    let failures = Arc::new(AtomicUsize::new(0));
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .interactive(true)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .now_hook(Arc::new(move || {
+                base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+            }))
+            .sleep_hook(Arc::new(move |duration: Duration| {
+                sleep_ns.fetch_add(duration.as_nanos() as u64, Ordering::SeqCst);
+            }))
+            .renderer(CancellingRenderer {
+                auth: Arc::clone(&holder),
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                failures: Arc::clone(&failures),
+            })
+            .build()
+            .expect("build auth"),
+    );
+    holder.set(Arc::downgrade(&auth)).unwrap();
+    let worker_auth = Arc::clone(&auth);
+    let worker = std::thread::spawn(move || worker_auth.sign_in());
+    let callback_cancel = entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sign-in did not report its terminal failure");
+    // The callback stays active while a second thread also tries to cancel.
+    let peer_cancel = auth.cancel_sign_in();
+    release_tx.send(()).unwrap();
+    let error = worker.join().expect("sign-in panicked").unwrap_err();
+
+    assert!(!callback_cancel, "failure callback accepted cancellation");
+    assert!(
+        !peer_cancel,
+        "peer accepted cancellation during failure callback"
+    );
+    assert_eq!(error.kind(), expected);
+    assert_eq!(failures.load(Ordering::SeqCst), 1);
+    assert!(!auth.is_closed());
+    assert_eq!(
+        auth.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+    succeed.store(true, Ordering::Release);
+    auth.sign_in().expect("the provider must remain reusable");
+    assert_eq!(auth.token().unwrap(), "AT-after-failure");
+    assert_eq!(failures.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cancellation_before_terminal_commit_wins() {
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = explicit_auth(&mock, false);
+    auth.begin_interactive_flow();
+    assert!(auth.cancel_sign_in());
+    assert_eq!(
+        auth.commit_interactive_flow().unwrap_err().kind(),
+        OidcErrorKind::Cancelled
+    );
+    assert!(!auth.sign_in_committed.load(Ordering::Acquire));
+    auth.finish_interactive_flow();
+    assert!(!auth.is_closed());
 }
 
 #[test]

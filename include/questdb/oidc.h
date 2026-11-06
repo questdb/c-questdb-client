@@ -655,7 +655,9 @@ void questdb_oidc_auth_free(questdb_oidc_auth* auth);
  *
  * Once the identity provider has issued tokens for the running flow, the
  * sign-in is committed and completes normally, delivering its SUCCESS or
- * FAILURE event; a cancel arriving after that point is a no-op too.
+ * FAILURE event; a cancel arriving after that point is a no-op too. A terminal
+ * failure is also committed before delivering its FAILURE event, so cancelling
+ * from that callback is a no-op and preserves the original failure.
  *
  * Safe to call from any thread, including this auth's own event callback and
  * while that callback is waiting behind a sibling built from the same reusable

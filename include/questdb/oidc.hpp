@@ -345,7 +345,9 @@ public:
      * same provider can succeed. A no-op when no device flow is running, and
      * once the identity provider has issued tokens for the running flow: that
      * sign-in is committed and completes normally, delivering its success or
-     * failure event.
+     * failure event. A terminal failure is also committed before its failure
+     * callback, so cancelling from that callback is a no-op and preserves the
+     * original failure.
      *
      * Safe from any thread, including this provider's event callback. Use
      * close() instead only when the provider and every attached transport must

@@ -712,7 +712,8 @@ pub struct OidcDeviceAuth {
     /// reset before and after every flow and never changes `closed`.
     sign_in_cancelled: AtomicBool,
     /// Set once the identity provider has answered the device-flow poll with
-    /// tokens. From then on the attempt runs to completion and
+    /// tokens, or before reporting a terminal failure to the renderer. From
+    /// then on the attempt runs to completion and
     /// [`cancel_sign_in`](OidcDeviceAuth::cancel_sign_in) reports that it found
     /// nothing to cancel. Reset before and after every flow, like
     /// `sign_in_cancelled`, and only changed under `close_wait`.
@@ -956,8 +957,10 @@ impl OidcDeviceAuth {
     ///
     /// Once the identity provider has issued tokens for the running flow, the
     /// sign-in is committed: it completes (reporting success or failure through
-    /// the renderer as usual) and this returns `false`. A `true` return
-    /// therefore always means the active `sign_in` will fail with
+    /// the renderer as usual) and this returns `false`. A terminal failure is
+    /// also committed before invoking [`Renderer::on_failure`]: cancelling from
+    /// that callback returns `false` and preserves the original failure. A
+    /// `true` return therefore always means the active `sign_in` will fail with
     /// `Cancelled`.
     ///
     /// Safe from any thread, including a [`Renderer`] callback. An HTTP request
@@ -1399,16 +1402,13 @@ impl OidcDeviceAuth {
         }
     }
 
-    /// Commit the running device flow once the identity provider has issued
-    /// its tokens: either report a cancellation that landed before this point,
-    /// or make every later [`cancel_sign_in`](Self::cancel_sign_in) a no-op.
+    /// Commit the running device flow once tokens are issued or before a
+    /// terminal failure callback. An earlier accepted cancellation wins;
+    /// every later [`cancel_sign_in`](Self::cancel_sign_in) is a no-op.
     ///
-    /// Checking the flag and committing under the lock `cancel_sign_in`
-    /// publishes under leaves no window in which a cancel is reported as
-    /// accepted (`true`) and then ignored. That window used to cover the
-    /// expired-token rescue refresh and the post-flow bookkeeping, so a cancel
-    /// landing there let `sign_in` succeed while a binding treated the attempt
-    /// as cancelled and dropped its success event.
+    /// Use the cancellation publication lock so a callback or another thread
+    /// cannot receive `true` while sign-in completes with a different result.
+    /// Release it before invoking the renderer, which may itself cancel.
     fn commit_interactive_flow(&self) -> Result<()> {
         let _guard = self
             .close_wait
@@ -2823,6 +2823,7 @@ impl OidcDeviceAuth {
             self.ensure_interactive_flow_active()?;
             let now = (self.now)();
             if now >= deadline {
+                self.commit_interactive_flow()?;
                 // Same terminal condition either way -- the code is gone and a
                 // fresh sign-in is the only recovery, so the `expired_token`
                 // tag callers key on is unchanged -- but say which of the two
@@ -2938,6 +2939,7 @@ impl OidcDeviceAuth {
                     if e.status()
                         .is_some_and(|status| !is_transient_http_status(status))
                     {
+                        self.commit_interactive_flow()?;
                         self.renderer.on_failure(
                             "Sign-in failed: the identity provider rejected the request.",
                         );
@@ -3069,6 +3071,7 @@ impl OidcDeviceAuth {
 
             // A 3xx these endpoints never legitimately return is terminal.
             if (300..400).contains(&status) {
+                self.commit_interactive_flow()?;
                 self.renderer
                     .on_failure("Sign-in failed: the identity provider rejected the request.");
                 return Err(OidcError::device_flow(format!(
@@ -3093,6 +3096,7 @@ impl OidcDeviceAuth {
                     continue;
                 }
                 Some("expired_token") => {
+                    self.commit_interactive_flow()?;
                     self.renderer
                         .on_failure("Code expired — run the sign-in again to retry.");
                     return Err(OidcError::timeout(
@@ -3115,6 +3119,7 @@ impl OidcDeviceAuth {
                     // Length-cap the untrusted field before interpolating: a
                     // hostile JSON error_description can be megabytes.
                     let description = strip_control_capped(description, MAX_IDP_FIELD_CHARS);
+                    self.commit_interactive_flow()?;
                     self.renderer
                         .on_failure(&format!("Sign-in failed: {description}"));
                     return Err(OidcError::device_flow(format!(
