@@ -1024,21 +1024,16 @@ pub unsafe extern "C" fn questdb_token_provider_get_status(
     };
     let msg_buf = unsafe { (*out).last_failure_msg };
     let msg_capacity = unsafe { (*out).last_failure_msg_capacity };
-    let mut value = questdb_token_provider_status {
-        struct_size: capacity.min(std::mem::size_of::<questdb_token_provider_status>()),
-        closed: true,
-        has_last_failure: false,
-        last_failure_retryable: false,
-        consecutive_failures: 0,
-        token_expires_at_ms: -1,
-        last_success_at_ms: -1,
-        last_failure_retry_after_ms: -1,
-        last_failure_at_ms: -1,
-        last_failure_msg: msg_buf,
-        last_failure_msg_capacity: msg_capacity,
-        last_failure_msg_len: 0,
-        last_failure_msg_copied: 0,
-    };
+    // Zeroed so the padding copied out with the fields is not stack garbage.
+    let mut value = unsafe { std::mem::zeroed::<questdb_token_provider_status>() };
+    value.struct_size = capacity.min(std::mem::size_of::<questdb_token_provider_status>());
+    value.closed = true;
+    value.token_expires_at_ms = -1;
+    value.last_success_at_ms = -1;
+    value.last_failure_retry_after_ms = -1;
+    value.last_failure_at_ms = -1;
+    value.last_failure_msg = msg_buf;
+    value.last_failure_msg_capacity = msg_capacity;
     if let Some(status) = status {
         value.closed = status.closed;
         value.consecutive_failures = status.consecutive_failures;
@@ -1794,6 +1789,84 @@ mod tests {
         assert_eq!(status.last_failure_msg_copied, "éé".len());
         assert_eq!(&buffer[..status.last_failure_msg_copied], "éé".as_bytes());
         assert_eq!(buffer[status.last_failure_msg_copied], 0xFF);
+        unsafe { questdb_token_provider_close(provider) };
+        unsafe { questdb_token_provider_free(provider) };
+    }
+
+    #[test]
+    fn the_status_padding_is_zeroed() {
+        use std::mem::{MaybeUninit, offset_of};
+        type S = questdb_token_provider_status;
+        let fields = [
+            (offset_of!(S, struct_size), size_of::<size_t>()),
+            (offset_of!(S, closed), size_of::<bool>()),
+            (offset_of!(S, has_last_failure), size_of::<bool>()),
+            (offset_of!(S, last_failure_retryable), size_of::<bool>()),
+            (offset_of!(S, consecutive_failures), size_of::<u32>()),
+            (offset_of!(S, token_expires_at_ms), size_of::<i64>()),
+            (offset_of!(S, last_success_at_ms), size_of::<i64>()),
+            (offset_of!(S, last_failure_retry_after_ms), size_of::<i64>()),
+            (offset_of!(S, last_failure_at_ms), size_of::<i64>()),
+            (offset_of!(S, last_failure_msg), size_of::<*mut c_char>()),
+            (
+                offset_of!(S, last_failure_msg_capacity),
+                size_of::<size_t>(),
+            ),
+            (offset_of!(S, last_failure_msg_len), size_of::<size_t>()),
+            (offset_of!(S, last_failure_msg_copied), size_of::<size_t>()),
+        ];
+        let mut padding = vec![true; size_of::<S>()];
+        for (offset, len) in fields {
+            padding[offset..offset + len].fill(false);
+        }
+        assert!(padding.contains(&true), "no padding to check");
+
+        let mut err: *mut questdb_error = ptr::null_mut();
+        let provider = unsafe {
+            questdb_refreshing_token_provider_new(
+                Some(multibyte_failure_source),
+                ptr::null_mut(),
+                None,
+                ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!provider.is_null() && err.is_null());
+        let mut buffer = [0u8; 64];
+        let mut status = MaybeUninit::<S>::uninit();
+        let out = status.as_mut_ptr();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // Fill the stack that the call's frame then reuses: padding left
+        // unwritten would carry this pattern out.
+        #[inline(never)]
+        fn dirty_stack() {
+            let mut junk = [0x5Au8; 64 * 1024];
+            std::hint::black_box(&mut junk);
+        }
+        // Before and after the first failure: the failure branch also frees a
+        // copy of the message, whose address the padding used to pick up.
+        loop {
+            unsafe {
+                ptr::write_bytes(out.cast::<u8>(), 0xAA, size_of::<S>());
+                (*out).struct_size = size_of::<S>();
+                (*out).last_failure_msg = buffer.as_mut_ptr().cast();
+                (*out).last_failure_msg_capacity = buffer.len();
+            }
+            dirty_stack();
+            assert!(unsafe { questdb_token_provider_get_status(provider, out) });
+            let bytes = unsafe { std::slice::from_raw_parts(out.cast::<u8>(), size_of::<S>()) };
+            for (offset, &byte) in bytes.iter().enumerate() {
+                assert!(
+                    !padding[offset] || byte == 0,
+                    "padding byte {offset}: {byte:#x}"
+                );
+            }
+            if unsafe { (*out).has_last_failure } {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no fetch failed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         unsafe { questdb_token_provider_close(provider) };
         unsafe { questdb_token_provider_free(provider) };
     }
