@@ -1291,10 +1291,9 @@ impl OidcDeviceAuth {
         }
     }
 
-    /// Whether `tokens` would serve the token a server last rejected. Every
-    /// source of a servable set goes through here -- the cache, the store and a
-    /// peer's refresh -- so the rejected token is never served again from any
-    /// of them, though its expiry says it could be.
+    /// Whether cached or peer-persisted tokens would serve the credential a
+    /// server last rejected. A successful IdP response can revalidate the same
+    /// bytes; cache and store reads alone cannot.
     fn is_rejected(&self, tokens: &TokenSet) -> bool {
         let Some(digest) = self.lock_rejected().digest else {
             return false;
@@ -1359,9 +1358,9 @@ impl OidcDeviceAuth {
         });
     }
 
-    /// Whether a newly obtained or peer-persisted token is fresh enough to
-    /// adopt as the result of acquisition. The skew keeps a refresh from
-    /// publishing a credential that is already too close to expiry.
+    /// Whether a peer-persisted token is fresh enough to adopt and is not the
+    /// credential the server rejected. The skew excludes tokens that are
+    /// already too close to expiry.
     fn is_usable(&self, tokens: &TokenSet) -> bool {
         tokens.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS)
             && self.has_required_token(tokens)
@@ -3005,28 +3004,21 @@ impl OidcDeviceAuth {
                     }
                 };
                 if self.has_required_token(&tokens) {
-                    // `is_usable`, not `has_required_token` alone -- the same
-                    // distinction the refresh arm in `obtain_tokens` makes, and
-                    // for the same reason. `tokenset_from_response` bounds
-                    // `expires_at` by the served token's own `exp`, so an IdP
-                    // that hands back a stale token on the device grant yields a
-                    // set that HAS the required kind and is already expired.
-                    // With no refresh token, accepting it reported a
-                    // successful sign-in through the renderer and persisted a
-                    // dead credential, and the caller's very next request said
-                    // no usable token was available and to call `sign_in()` --
-                    // which is what they had just done.
-                    // A refresh token can rescue an IdP's *one-off* stale JWT,
-                    // but a skewed host sees every newly issued JWT as expired.
-                    // Probe exactly once, before reporting SUCCESS or persisting
-                    // a credential that token() cannot serve. This also keeps
-                    // the old short-lived-token recovery path working.
-                    if self.is_usable(&tokens) {
+                    // Fresh IdP responses can revalidate byte-identical
+                    // credentials; rejection history only filters cache/store
+                    // reads. Still check expiry, including the served JWT's
+                    // own `exp`, before reporting success. A refresh can rescue
+                    // a one-off stale token, but only try once so persistent
+                    // clock skew cannot leave an unusable credential cached.
+                    if tokens.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS) {
                         return Ok(tokens);
                     }
                     if tokens.refresh_token.is_some() {
                         match self.refresh(&tokens) {
-                            Ok(refreshed) if self.is_usable(&refreshed) => {
+                            Ok(refreshed)
+                                if refreshed.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS)
+                                    && self.has_required_token(&refreshed) =>
+                            {
                                 return Ok(refreshed);
                             }
                             Err(error) => {

@@ -9030,6 +9030,72 @@ fn a_successful_same_token_refresh_clears_the_rejection_digest() {
     }
 }
 
+fn assert_same_token_sign_in_recovers(rescue_refresh: bool) {
+    for groups in [false, true] {
+        let grants = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::clone(&grants);
+        let mock = MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                let mut requests = requests.lock().unwrap();
+                let index = requests.len();
+                requests.push(body.contains("grant_type=refresh_token"));
+                let mut response = serde_json::json!({
+                    "access_token": "AT-same",
+                    "id_token": "ID-same",
+                    "expires_in": 300,
+                });
+                match index {
+                    0 => response["refresh_token"] = serde_json::json!("RT-initial"),
+                    1 => return (400, r#"{"error":"invalid_grant"}"#.to_string()),
+                    2 if rescue_refresh => {
+                        // Force a rescue without relying on time or JWT parsing.
+                        response["expires_in"] = serde_json::json!(0);
+                        response["refresh_token"] = serde_json::json!("RT-rescue");
+                    }
+                    2 => {}
+                    3 if rescue_refresh => {}
+                    _ => return (500, r#"{"error":"unexpected_request"}"#.to_string()),
+                }
+                (200, response.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        });
+        let auth = explicit_auth(&mock, groups);
+        let token = if groups { "ID-same" } else { "AT-same" };
+        assert_eq!(sign_in_and_token(&auth).unwrap(), token);
+
+        let error = token_after_401(&auth, token).unwrap_err();
+        assert_eq!(error.kind(), OidcErrorKind::InteractionRequired);
+        assert_eq!(error.status(), Some(400));
+        assert!(auth.lock_rejected().digest.is_some());
+        assert!(auth.cached_token().is_none());
+        assert_eq!(*grants.lock().unwrap(), [false, true]);
+
+        auth.sign_in().unwrap();
+        assert!(auth.lock_rejected().digest.is_none());
+        for _ in 0..3 {
+            assert_eq!(auth.token().unwrap(), token);
+        }
+        let expected = if rescue_refresh {
+            vec![false, true, false, true]
+        } else {
+            vec![false, true, false]
+        };
+        assert_eq!(*grants.lock().unwrap(), expected);
+    }
+}
+
+#[test]
+fn same_token_sign_in_recovers_after_refresh_rejection() {
+    assert_same_token_sign_in_recovers(false);
+}
+
+#[test]
+fn same_token_sign_in_rescue_refresh_recovers_after_refresh_rejection() {
+    assert_same_token_sign_in_recovers(true);
+}
+
 #[test]
 fn a_401_does_not_drop_a_valid_token_without_a_refresh_token() {
     // QuestDB can answer 401 when its own userinfo lookup is temporarily down.
