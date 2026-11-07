@@ -93,6 +93,7 @@ The committed headers are the authoritative native API reference:
 - [`qwp_sender.hpp`](../include/questdb/ingress/qwp_sender.hpp) — `pool::borrow_sender()`
 - [`qwp_reader.hpp`](../include/questdb/egress/qwp_reader.hpp) — `pool::borrow_reader()`
 - [`line_sender.hpp`](../include/questdb/ingress/line_sender.hpp)
+- [`token_provider.hpp`](../include/questdb/token_provider.hpp) — rotating bearer tokens
 
 For connection-string keys, QuestDB Enterprise multi-host failover,
 store-and-forward, and deployment guidance, use the public

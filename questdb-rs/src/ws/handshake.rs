@@ -85,6 +85,23 @@ impl Headers {
             .map(|h| h.value.trim())
     }
 
+    /// Every value whose name matches `name` case-insensitively, trimmed and
+    /// joined with `", "`, as a repeated field combines (RFC 9110 §5.3).
+    /// `None` when there is no such header.
+    pub(crate) fn join_all_ci(&self, name: &str) -> Option<String> {
+        let mut values = self
+            .0
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.trim());
+        let first = values.next()?;
+        Some(values.fold(first.to_string(), |mut joined, value| {
+            joined.push_str(", ");
+            joined.push_str(value);
+            joined
+        }))
+    }
+
     /// Construct from an explicit list of `(name, value)` pairs.
     /// Convenience for tests that need to forge a `Headers` for the
     /// content-encoding / role-rejection validators.

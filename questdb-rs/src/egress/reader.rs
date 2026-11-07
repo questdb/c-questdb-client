@@ -32,7 +32,9 @@
 //! on the Reader fail at the transport layer (open a fresh Reader to
 //! recover). Call `Cursor::cancel()` (or read until `next_batch()`
 //! returns `None`) before drop if you want to keep the existing
-//! connection alive.
+//! connection alive. A mid-query failover that gives up leaves the
+//! Reader disconnected too, but its next `execute()` reconnects
+//! (design/qwp-token-provider-spec.md §8.3, "Egress recovery").
 //!
 //! The `sync-reader-qwp-ws` feature gate is applied at the module
 //! declaration in `egress/mod.rs`; an inner `#![cfg(...)]` here would
@@ -117,13 +119,21 @@ pub struct Reader {
     /// Updated on mid-query failover so the cursor walks the list in the
     /// right order ("skip the failed one first") on the next failure.
     addr_idx: usize,
-    /// Live WS transport. `Option` only so that mid-query failover
-    /// can take the dead transport out via [`Option::take`] (releasing
-    /// its TCP FD) **before** sleeping on the backoff. Outside of the
-    /// brief reconnect window inside [`Reader::reconnect_with_failover`],
-    /// this is always `Some`. Use [`Reader::transport`] /
-    /// [`Reader::transport_mut`] to access — they assert this invariant.
+    /// Live WS transport. `None` once the connection was torn down: a
+    /// cursor abandoned mid-stream, a terminal stream error, or a mid-query
+    /// failover that gave up (see `reconnect_on_next_execute`). Briefly
+    /// `None` inside [`Reader::reconnect_with_failover`] too, which takes
+    /// the dead transport out via [`Option::take`] (releasing its TCP FD)
+    /// **before** sleeping on the backoff. Use [`Reader::transport_ref`] /
+    /// [`Reader::transport_mut`] to access it: they report a torn-down
+    /// connection as an error.
     transport: Option<WsTransport>,
+    /// Set while a mid-query failover that gave up has left the Reader
+    /// without a transport: the next `execute()` reconnects instead of
+    /// failing, so a failover that met, say, a token outage does not leave
+    /// the Reader unusable (design/qwp-token-provider-spec.md §8.3, "Egress
+    /// recovery"). A cursor abandoned mid-stream leaves it clear.
+    reconnect_on_next_execute: bool,
     dict: SymbolDict,
     /// Schema for the in-flight query. Populated from the first
     /// `RESULT_BATCH` (`batch_seq == 0`) and reused by continuation
@@ -287,6 +297,9 @@ impl Reader {
             cfg.zone.as_deref(),
             matches!(cfg.target, Target::Primary),
         );
+        if cfg.token_provider.is_some() && !cfg.tls {
+            crate::token_provider::warn_once_if_cleartext("ws");
+        }
         let walk = walk_via_tracker(
             &mut tracker,
             &cfg,
@@ -301,16 +314,14 @@ impl Reader {
             // every host floods server logs without recovery. Matches
             // the Java reference's `connect()` which rethrows on
             // `QwpAuthFailedException` immediately.
-            &[
-                ErrorCode::ConfigError,
-                ErrorCode::UnsupportedServer,
-                ErrorCode::AuthError,
-            ],
+            &WALK_TERMINAL_CODES,
+            None,
         )?;
         Ok(Reader {
             cfg,
             addr_idx: walk.session.idx,
             transport: Some(walk.session.transport),
+            reconnect_on_next_execute: false,
             dict: SymbolDict::new(),
             query_schema: None,
             next_request_id: 1,
@@ -332,22 +343,21 @@ impl Reader {
     /// error carrying the observed role + zone via `UpgradeReject` is
     /// surfaced so the tracker can classify identically to a `421`
     /// upgrade reject.
-    fn connect_endpoint(cfg: &ReaderConfig, idx: usize) -> Result<TransportSession> {
-        let mut transport = WsTransport::connect_to(cfg, idx).map_err(|e| {
+    fn connect_endpoint(
+        cfg: &ReaderConfig,
+        idx: usize,
+        upgrade_headers: &[(&'static str, String)],
+    ) -> Result<TransportSession> {
+        let mut transport = WsTransport::connect_to(cfg, idx, upgrade_headers).map_err(|e| {
             // Prepend the endpoint so a connect/handshake/auth failure
             // names the host it came from. Without this, aggregated
             // multi-endpoint diagnostics surface only the tungstenite
             // message ("HTTP error: 401") with no way to tell which
             // endpoint refused.
             let endpoint = &cfg.addrs[idx];
-            let mut annotated = Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
-            if let Some(r) = e.upgrade_reject() {
-                annotated = annotated.with_upgrade_reject(r.clone());
-            }
-            if let Some(info) = e.server_info() {
-                annotated = annotated.with_server_info(info.clone());
-            }
-            annotated
+            let code = e.code();
+            let msg = format!("endpoint {}: {}", endpoint, e.msg());
+            e.reclassified(code, msg)
         })?;
         let server_info = if transport.server_version() >= 1 {
             Some(read_server_info_frame(
@@ -467,6 +477,10 @@ impl Reader {
         if let Some(dead) = self.transport.take() {
             drop(dead);
         }
+        // Until a walk below succeeds, the Reader has no connection. If this
+        // failover gives up, the next `execute()` reconnects rather than
+        // leaving the Reader unusable (spec §8.3, "Egress recovery").
+        self.reconnect_on_next_execute = true;
         // Cumulative dial count across every outer attempt's walk.
         // `FailoverResetEvent.attempts` carries this back to the user so
         // long-running diagnostics see real dial pressure, not just the
@@ -510,11 +524,10 @@ impl Reader {
                 // (cluster-wide credentials problem; retrying every
                 // host floods server logs without recovery). Initial
                 // connect accumulates instead — see `from_config`.
-                &[
-                    ErrorCode::ConfigError,
-                    ErrorCode::UnsupportedServer,
-                    ErrorCode::AuthError,
-                ],
+                &WALK_TERMINAL_CODES,
+                // Bounds a token provider's credential resolution for this
+                // walk; a static credential keeps the admitted-walk semantics.
+                budget.deadline,
             ) {
                 Ok(walk) => {
                     total_dials = total_dials.saturating_add(walk.dials);
@@ -522,11 +535,7 @@ impl Reader {
                     // the counters callers query
                     // (`bytes_received`, `credit_granted_total`,
                     // `read_ns`, `decode_ns`, `next_request_id`).
-                    self.transport = Some(walk.session.transport);
-                    self.server_info = walk.session.server_info;
-                    self.dict = SymbolDict::new();
-                    self.query_schema = None;
-                    self.addr_idx = walk.session.idx;
+                    self.install_session(walk.session);
                     return Ok(total_dials);
                 }
                 Err(e) => match e.code() {
@@ -536,6 +545,11 @@ impl Reader {
                         // identically on every endpoint.
                         return Err(e);
                     }
+                    // A walk the deadline cut off while it resolved the token
+                    // provider's credential, before it dialled anything,
+                    // learned nothing about the cluster. Keep what the last
+                    // walk that did dial found.
+                    _ if is_walk_deadline_cutoff(&e) && last_err.is_some() => {}
                     _ => {
                         warn_on_protocol_error_failover(&e, "reconnect walk");
                         last_err = Some(e);
@@ -544,16 +558,10 @@ impl Reader {
             }
         }
         if deadline_exhausted {
-            let last_msg = last_err
-                .as_ref()
-                .map(|e| e.msg().to_string())
-                .unwrap_or_else(|| "<no error captured>".to_string());
-            return Err(fmt!(
-                SocketError,
-                "failover wall-clock budget exhausted (failover_max_duration_ms={}) after {} attempt(s); last error: {}",
+            return Err(failover_deadline_exhausted_error(
                 cfg.failover_max_duration_ms,
                 attempts_made,
-                last_msg
+                last_err,
             ));
         }
         Err(last_err.unwrap_or_else(|| {
@@ -576,40 +584,65 @@ impl Reader {
         &self.cfg.addrs[self.addr_idx]
     }
 
+    /// Bind a freshly walked endpoint session to this Reader, resetting
+    /// the connection-scoped state: the new connection has its own empty
+    /// symbol dictionary, and no query is in flight on it.
+    fn install_session(&mut self, session: TransportSession) {
+        self.transport = Some(session.transport);
+        self.server_info = session.server_info;
+        self.dict = SymbolDict::new();
+        self.query_schema = None;
+        self.addr_idx = session.idx;
+        self.reconnect_on_next_execute = false;
+    }
+
+    /// Reconnect before a new query when a mid-query failover gave up and
+    /// left this Reader without a connection (design/qwp-token-provider-spec.md
+    /// §8.3, "Egress recovery"): an outage that outlasted one query's
+    /// failover budget, such as a rejected or unavailable token, must not
+    /// leave the Reader unusable. One endpoint walk, like the initial
+    /// connect; a failure fails this call, and the next one tries again.
+    fn reconnect_if_failover_gave_up(&mut self) -> Result<()> {
+        if self.transport.is_some() || !self.reconnect_on_next_execute {
+            return Ok(());
+        }
+        let cfg = Arc::clone(&self.cfg);
+        // The fall-through reset gives endpoints the failed failover
+        // classified another chance, as a failover reconnect does.
+        match walk_via_tracker(&mut self.tracker, &cfg, true, &WALK_TERMINAL_CODES, None) {
+            Ok(walk) => {
+                self.install_session(walk.session);
+                Ok(())
+            }
+            Err(err) => {
+                let code = err.code();
+                let msg = format!(
+                    "could not reconnect the Reader after its last failover gave up: {}",
+                    err.msg()
+                );
+                Err(err.reclassified(code, msg))
+            }
+        }
+    }
+
     /// Mutable access to the live transport. Returns `SocketError`
     /// when the transport is `None`, which happens after the connection
-    /// was torn down: either a cursor was dropped before being fully
-    /// read (drop closes the WebSocket — see [`Cursor`]'s docs), or a
-    /// mid-query failover exhausted its retry budget. Either way the
-    /// Reader is "poisoned"; the fix is to drain cursors (`next_batch()`
-    /// until `None`) or `Cursor::cancel()` before dropping them, or to
-    /// open a fresh Reader. Inside `reconnect_with_failover` the transport
-    /// is only briefly absent (between dropping the dead one and splicing
-    /// in a new one); that path uses `self.transport` directly and never
-    /// goes through this accessor.
+    /// was torn down: a cursor was dropped before being fully read (drop
+    /// closes the WebSocket — see [`Cursor`]'s docs), a stream error
+    /// ended it, or a mid-query failover gave up. After a failover gives
+    /// up, the next `execute()` reconnects; otherwise the fix is to drain
+    /// cursors (`next_batch()` until `None`) or `Cursor::cancel()` before
+    /// dropping them, or to open a fresh Reader. Inside
+    /// `reconnect_with_failover` the transport is only briefly absent
+    /// (between dropping the dead one and splicing in a new one); that path
+    /// uses `self.transport` directly and never goes through this accessor.
     fn transport_mut(&mut self) -> Result<&mut WsTransport> {
-        self.transport.as_mut().ok_or_else(|| {
-            fmt!(
-                SocketError,
-                "Reader connection is closed and cannot be reused: a cursor was dropped before being \
-                 fully read, or a mid-query failover exhausted its retry budget. To keep the \
-                 connection reusable, drain each cursor (call next_batch() until it returns None) or \
-                 call cursor.cancel() before dropping it; otherwise open a fresh Reader."
-            )
-        })
+        self.transport.as_mut().ok_or_else(connection_closed_error)
     }
 
     /// Read access to the live transport. See [`Reader::transport_mut`].
     fn transport_ref(&self) -> Result<&WsTransport> {
-        self.transport.as_ref().ok_or_else(|| {
-            fmt!(
-                SocketError,
-                "Reader connection is closed and cannot be reused: a cursor was dropped before being \
-                 fully read, or a mid-query failover exhausted its retry budget. To keep the \
-                 connection reusable, drain each cursor (call next_batch() until it returns None) or \
-                 call cursor.cancel() before dropping it; otherwise open a fresh Reader."
-            )
-        })
+        self.transport.as_ref().ok_or_else(connection_closed_error)
     }
 
     /// Allocate the next `request_id`, skipping `0` and negatives on
@@ -1186,6 +1219,11 @@ impl<'r> ReaderQuery<'r> {
     }
 
     /// Send the QUERY_REQUEST and return a streaming `Cursor`.
+    ///
+    /// If the Reader's last mid-query failover gave up and left it without a
+    /// connection, this reconnects first, walking the configured endpoints
+    /// once. A failed reconnect fails this call, with the reconnect's error
+    /// code, and the next call tries again.
     pub fn execute(self) -> Result<Cursor<'r>> {
         if self.reader.cursor_active {
             return Err(fmt!(
@@ -1193,6 +1231,9 @@ impl<'r> ReaderQuery<'r> {
                 "another cursor is already in flight on this connection (only one cursor at a time per Reader)"
             ));
         }
+        // Before anything reads the connection's SERVER_INFO: a reconnect
+        // may land on another endpoint, with other capabilities.
+        self.reader.reconnect_if_failover_gave_up()?;
         let request_id = self.reader.alloc_request_id();
         // The schema rides the first RESULT_BATCH (batch_seq == 0) of each
         // query; clear any schema left from the prior query so a stray
@@ -2534,11 +2575,12 @@ impl<'r> Cursor<'r> {
                     // mismatched on every endpoint, config-level issue —
                     // tells the user *what to fix* and should win over
                     // the original cause-of-death.
-                    return Err(if prefer_over_trigger(e.code()) {
-                        e
-                    } else {
-                        trigger
-                    });
+                    //
+                    // So does an OIDC failure, or a token provider's failure
+                    // to supply a credential (see `prefer_over_trigger`),
+                    // including one carried by the wall-clock exhaustion
+                    // error, which keeps the last walk's payload.
+                    return Err(if prefer_over_trigger(&e) { e } else { trigger });
                 }
             };
             // Reset connection-scoped state. The new connection has its
@@ -2665,6 +2707,9 @@ impl<'r> Cursor<'r> {
                         if let Some(dead) = self.reader.transport.take() {
                             drop(dead);
                         }
+                        // The failover found an endpoint but could not
+                        // replay on it: the next `execute()` reconnects.
+                        self.reader.reconnect_on_next_execute = true;
                         self.reader.cursor_active = false;
                         self.done = true;
                         return Err(e);
@@ -3108,8 +3153,8 @@ fn warn_on_protocol_error_failover(err: &Error, context: &str) {
 /// failover loop surfaces one of these, the user should see *that*,
 /// not the original socket close — these tell the user *what to fix*
 /// (credentials, cluster topology, server version, config, TLS / WS
-/// handshake), whereas the trigger just says "the network broke at
-/// some point."
+/// handshake, or an attached OIDC recovery action), whereas the trigger
+/// just says "the network broke at some point."
 ///
 /// `HandshakeError` and `TlsError` are preferred for the same reason
 /// as `AuthError`: when every reachable endpoint rejects the WS
@@ -3117,9 +3162,20 @@ fn warn_on_protocol_error_failover(err: &Error, context: &str) {
 /// `SocketError` trigger ("connection dropped") is far less
 /// actionable than the handshake/cert message that actually names
 /// the problem.
-fn prefer_over_trigger(code: ErrorCode) -> bool {
+fn prefer_over_trigger(err: &Error) -> bool {
+    #[cfg(feature = "_oidc")]
+    if err.oidc_error().is_some() {
+        return true;
+    }
+    // The token provider could not supply a credential: the spec's
+    // credential-unavailable class, which the error for a failed failover
+    // must name (design/qwp-token-provider-spec.md §8.3).
+    if err.is_provider_failure() {
+        return true;
+    }
+
     matches!(
-        code,
+        err.code(),
         ErrorCode::AuthError
             | ErrorCode::RoleMismatch
             | ErrorCode::ConfigError
@@ -3127,6 +3183,28 @@ fn prefer_over_trigger(code: ErrorCode) -> bool {
             | ErrorCode::HandshakeError
             | ErrorCode::TlsError
     )
+}
+
+/// The error of a failover that ran out of `failover_max_duration_ms`: a
+/// `SocketError` naming the budget and the last reconnect error, which keeps
+/// that error's structured diagnostics. An OIDC or token-provider failure in
+/// them is what [`prefer_over_trigger`] surfaces instead of the transport
+/// error that started the failover.
+fn failover_deadline_exhausted_error(
+    max_duration_ms: u64,
+    attempts: u32,
+    last_error: Option<Error>,
+) -> Error {
+    let last_msg = last_error
+        .as_ref()
+        .map_or("<no error captured>", |err| err.msg());
+    let msg = format!(
+        "failover wall-clock budget exhausted (failover_max_duration_ms={max_duration_ms}) after {attempts} attempt(s); last error: {last_msg}"
+    );
+    match last_error {
+        Some(err) => err.reclassified(ErrorCode::SocketError, msg),
+        None => Error::new(ErrorCode::SocketError, msg),
+    }
 }
 
 /// Splitmix64 PRNG state for failover backoff jitter. Lives on the
@@ -3224,6 +3302,81 @@ struct WalkOutcome {
     dials: u32,
 }
 
+/// The `Authorization` header value from an upgrade header set, if present.
+/// Used to tell a rotated credential from an unchanged one after a 401.
+fn authorization_header<'a>(headers: &'a [(&'static str, String)]) -> Option<&'a str> {
+    headers
+        .iter()
+        .find_map(|(name, value)| (*name == "Authorization").then_some(value.as_str()))
+}
+
+/// Error codes that end an endpoint walk at once rather than move on to the
+/// next endpoint: credentials are cluster-wide, and so are configuration and
+/// a server too old for this client (spec §6 / §11.9.3). See
+/// [`walk_via_tracker`].
+const WALK_TERMINAL_CODES: [ErrorCode; 3] = [
+    ErrorCode::ConfigError,
+    ErrorCode::UnsupportedServer,
+    ErrorCode::AuthError,
+];
+
+/// The error for an operation on a Reader whose connection was torn down.
+fn connection_closed_error() -> Error {
+    fmt!(
+        SocketError,
+        "Reader connection is closed: a cursor was dropped before being fully read, a stream \
+         error ended the connection, or a mid-query failover gave up. After a failover gives \
+         up, the next execute() reconnects. Otherwise, to keep the connection reusable, drain \
+         each cursor (call next_batch() until it returns None) or call cursor.cancel() before \
+         dropping it; or open a fresh Reader."
+    )
+}
+
+const WALK_DEADLINE_CUTOFF_MSG: &str =
+    "failover deadline expired during endpoint or credential resolution";
+
+fn walk_deadline_passed(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
+
+fn ensure_walk_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
+    if walk_deadline_passed(deadline) {
+        return Err(Error::new(ErrorCode::SocketError, WALK_DEADLINE_CUTOFF_MSG));
+    }
+    Ok(())
+}
+
+/// Whether a walk failed only because the failover deadline stopped it before
+/// it dialled an endpoint (see [`ensure_walk_deadline`]).
+fn is_walk_deadline_cutoff(error: &Error) -> bool {
+    error.code() == ErrorCode::SocketError && error.msg() == WALK_DEADLINE_CUTOFF_MSG
+}
+
+/// Resolve the upgrade headers for one walk, bounded by the failover deadline.
+///
+/// When the deadline cancels the provider acquisition before it answered, the
+/// result is reported as the walk-deadline cutoff it is (see
+/// [`is_walk_deadline_cutoff`]), not as a transport "shutting down": the
+/// caller then keeps what an earlier walk found, such as a `RoleMismatch`.
+fn upgrade_headers_for_walk(
+    cfg: &ReaderConfig,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<(&'static str, String)>> {
+    let result = match deadline {
+        Some(deadline) => cfg.upgrade_headers_until(|| std::time::Instant::now() >= deadline),
+        None => cfg.upgrade_headers(),
+    };
+    match result {
+        Err(error)
+            if crate::token_provider::is_provider_shutdown_error(&error)
+                && walk_deadline_passed(deadline) =>
+        {
+            Err(Error::new(ErrorCode::SocketError, WALK_DEADLINE_CUTOFF_MSG))
+        }
+        result => result,
+    }
+}
+
 /// Walk the tracker until either an endpoint accepts or the round is
 /// exhausted. Shared between [`Reader::from_config`] (initial connect)
 /// and [`Reader::reconnect_with_failover`] (mid-query failover).
@@ -3247,12 +3400,29 @@ fn walk_via_tracker(
     cfg: &Arc<ReaderConfig>,
     allow_reset_pass: bool,
     terminal_codes: &[ErrorCode],
+    deadline: Option<std::time::Instant>,
 ) -> Result<WalkOutcome> {
     // Reset the within-round attempted bits. Topology classifications
     // accumulated by prior Executes are preserved (the within-outage
     // reset per failover.md §11.9.2). The fall-through pass below is
     // what re-evaluates stale classifications.
     tracker.begin_round(false);
+    // Resolve the fallible token provider once for this whole endpoint walk,
+    // before DNS or TCP work. A successful token is cluster-wide and can be
+    // reused across endpoints in the walk; a failed provider must not create
+    // and immediately discard one socket per endpoint (or twice per endpoint
+    // when the reconnect fall-through pass runs). The next outer reconnect
+    // round calls this function again and therefore polls the provider afresh.
+    let mut upgrade_headers = upgrade_headers_for_walk(cfg, deadline)?;
+    // Provider resolution during failover is isolated and cancellation-aware.
+    // Re-check immediately afterwards so a result racing the deadline is never
+    // followed by endpoint dials or a second credential resolution. A static
+    // credential performs no blocking provider work and keeps the historical
+    // admitted-walk deadline semantics.
+    if cfg.token_provider.is_some() {
+        ensure_walk_deadline(deadline)?;
+    }
+    let mut auth_rotation_retry_used = false;
     let mut last_role_mismatch: Option<Error> = None;
     let mut last_transport_err: Option<Error> = None;
     let mut retried_after_reset = false;
@@ -3274,7 +3444,61 @@ fn walk_via_tracker(
             }
         };
         dials = dials.saturating_add(1);
-        match Reader::connect_endpoint(cfg.as_ref(), idx) {
+        let mut connected = Reader::connect_endpoint(cfg.as_ref(), idx, &upgrade_headers);
+        // A valid credential can expire during endpoint setup. On one definite
+        // 401, ask only a rotating provider for a fresh header and replay this
+        // same endpoint once when the value changed. Endpoint failover still
+        // reuses one cluster-wide credential and all other auth failures remain
+        // terminal, including a 401 whose Bearer challenge names an error other
+        // than `invalid_token` (spec §8.2).
+        if matches!(&connected, Err(err) if err.upgrade_401_allows_token_refresh())
+            && !auth_rotation_retry_used
+            && cfg.token_provider.is_some()
+        {
+            auth_rotation_retry_used = true;
+            if let Err(deadline_err) = ensure_walk_deadline(deadline) {
+                // The endpoint has already answered 401. There is no time to
+                // fetch another credential, but replacing that definite auth
+                // rejection with a deadline error would make failover report
+                // the earlier socket failure instead.
+                if let Err(err) = connected {
+                    return Err(err);
+                }
+                return Err(deadline_err);
+            }
+            // Name the rejected token, so a cache-first provider such as
+            // `OidcDeviceAuth` refreshes it rather than handing it back.
+            let rotated_headers = match crate::token_provider::with_rejected_credential(
+                authorization_header(&upgrade_headers),
+                || upgrade_headers_for_walk(cfg, deadline),
+            ) {
+                Ok(headers) => headers,
+                Err(error) if is_walk_deadline_cutoff(&error) => {
+                    // A refresh cut off by the deadline cannot undo the 401
+                    // already returned by this endpoint. Otherwise an older
+                    // socket/role failure wins at the reconnect boundary.
+                    return match connected {
+                        Err(auth_error) => Err(auth_error),
+                        Ok(_) => Err(error),
+                    };
+                }
+                Err(error) => return Err(error),
+            };
+            if let Err(deadline_error) = ensure_walk_deadline(deadline) {
+                // A provider can finish just as the deadline passes. In that
+                // race we still have an observed 401, not a transport timeout.
+                return match connected {
+                    Err(auth_error) => Err(auth_error),
+                    Ok(_) => Err(deadline_error),
+                };
+            }
+            if authorization_header(&rotated_headers) != authorization_header(&upgrade_headers) {
+                upgrade_headers = rotated_headers;
+                dials = dials.saturating_add(1);
+                connected = Reader::connect_endpoint(cfg.as_ref(), idx, &upgrade_headers);
+            }
+        }
+        match connected {
             Ok(session) => {
                 // Update zone tier from `SERVER_INFO.zone_id` when the
                 // server advertised one (gated by `CAP_ZONE`). `record_zone`
@@ -3736,8 +3960,9 @@ mod tests {
             HandshakeError,
             TlsError,
         ] {
+            let err = Error::new(code, "test");
             assert!(
-                prefer_over_trigger(code),
+                prefer_over_trigger(&err),
                 "{:?} must be preferred over the trigger",
                 code
             );
@@ -3755,12 +3980,84 @@ mod tests {
             ServerInternalError,
             Cancelled,
         ] {
+            let err = Error::new(code, "test");
             assert!(
-                !prefer_over_trigger(code),
+                !prefer_over_trigger(&err),
                 "{:?} must NOT be preferred over the trigger",
                 code
             );
         }
+        // A provider contract violation never reaches the walk as
+        // `InvalidApiCall`: `classify_provider_error` re-codes it to a terminal
+        // `ConfigError`, which is preferred above.
+        let provider = crate::token_provider::TokenProvider::new(|| {
+            Err::<String, _>(Error::new(
+                InvalidApiCall,
+                "provider callback contract violated",
+            ))
+        });
+        let invalid_call = provider.bearer_header().unwrap_err();
+        assert_eq!(invalid_call.code(), ConfigError);
+        assert!(prefer_over_trigger(&invalid_call));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn structured_oidc_socket_error_is_preferred_over_trigger() {
+        let err = Error::from(crate::oidc::OidcError::interaction_required("sign in"))
+            .reclassified(ErrorCode::SocketError, "token provider failed");
+
+        assert!(prefer_over_trigger(&err));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn failover_deadline_context_preserves_oidc_detail() {
+        let original = Error::from(crate::oidc::OidcError::interaction_required("sign in"))
+            .reclassified(ErrorCode::SocketError, "token provider failed");
+
+        let err = failover_deadline_exhausted_error(25, 2, Some(original));
+
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(err.msg().contains("wall-clock budget exhausted"));
+        assert!(err.msg().contains("last error: token provider failed"));
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
+    }
+
+    #[test]
+    fn failover_deadline_abandons_a_blocked_token_provider() {
+        let cfg = ReaderConfig::from_conf("ws::addr=localhost:9000;")
+            .unwrap()
+            .token_provider(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok::<_, Error>("token".to_string())
+            })
+            .unwrap();
+        let start = std::time::Instant::now();
+        let error = upgrade_headers_for_walk(
+            &cfg,
+            Some(std::time::Instant::now() + Duration::from_millis(20)),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SocketError);
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "failover waited for the synchronous provider past its deadline"
+        );
+    }
+
+    #[test]
+    fn tracker_walk_rejects_work_after_the_execute_deadline() {
+        let expired = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = ensure_walk_deadline(Some(expired)).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SocketError);
+        assert!(error.msg().contains("failover deadline expired"));
+        assert!(ensure_walk_deadline(None).is_ok());
     }
 
     /// Pin the exponential base schedule without measuring wall-clock
