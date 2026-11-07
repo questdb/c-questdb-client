@@ -614,6 +614,57 @@ fn c8_forced_wait_is_bounded_and_cancellable() {
 }
 
 #[test]
+fn c8_a_rejection_inside_the_rate_limit_waits_for_the_running_forced_fetch() {
+    // Clients sharing a provider see the same 401 at about the same time. The
+    // first rejection starts the forced fetch; the others start none, but wait
+    // for it instead of getting the rejected token back.
+    let clock = ManualClock::new();
+    let script = Arc::new(Script::default());
+    script.push(Ok(token("T1", T0 + HOUR)));
+    script.push(Ok(token("T2", T0 + 2 * HOUR)));
+    let provider = manual(&clock, &script).build().unwrap();
+    assert!(provider.run_due_fetch());
+    let rejecter = || {
+        let provider = provider.clone();
+        thread::spawn(move || {
+            provider.on_rejected("T1", 401);
+            provider.token().unwrap()
+        })
+    };
+    let first = rejecter();
+    await_true("the forced fetch to be scheduled", || {
+        provider.scheduled_in() == Some(Duration::ZERO)
+    });
+    let direct = rejecter();
+    // A client's 401 replay re-pulls through `TokenProvider`.
+    let replay = {
+        let provider = crate::token_provider::TokenProvider::new(provider.clone());
+        thread::spawn(move || {
+            crate::token_provider::with_rejected_credential(Some("Bearer T1"), || {
+                provider.bearer_header()
+            })
+            .unwrap()
+        })
+    };
+    // The manual clock does not advance, so only the fetch can end the waits.
+    thread::sleep(Duration::from_millis(100));
+    assert!(!direct.is_finished(), "a direct rejection returned early");
+    assert!(!replay.is_finished(), "a client's replay returned early");
+    assert!(provider.run_due_fetch());
+    assert_eq!(first.join().unwrap(), "T2");
+    assert_eq!(direct.join().unwrap(), "T2");
+    assert_eq!(replay.join().unwrap(), "Bearer T2");
+    assert_eq!(script.calls(), 2, "the later rejections started a fetch");
+
+    // Once that fetch has completed, the rate limit applies as before: a
+    // rejection of the replacement starts nothing and returns at once.
+    let after_forced = provider.scheduled_in();
+    provider.on_rejected("T2", 401);
+    assert_eq!(provider.scheduled_in(), after_forced);
+    assert_eq!(script.calls(), 2);
+}
+
+#[test]
 fn c8_a_wrapped_provider_refreshes_a_token_rejected_with_401() {
     // Wrapped in a closure, the provider never hears `on_rejected`: the
     // rejection reaches `token` as the token the calling thread is replacing.

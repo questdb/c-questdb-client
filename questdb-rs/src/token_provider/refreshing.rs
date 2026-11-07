@@ -456,7 +456,8 @@ pub struct TokenProviderStatus {
 ///   and failures are logged at most once a minute per provider.
 /// - **Forced refresh.** [`on_rejected`](Self::on_rejected) with HTTP 401 for
 ///   the current token starts a fetch, at most once per `forced_min_interval`,
-///   and waits up to `forced_wait` for it. Clients call it when a server
+///   and waits up to `forced_wait` for it. Another rejection of the same token
+///   while that fetch runs waits for it too. Clients call it when a server
 ///   rejects the token with a 401 that a new token can fix: one whose
 ///   `WWW-Authenticate` Bearer challenge names no error, or `invalid_token`.
 /// - **Close.** [`close`](Self::close) stops the refresher and wakes every
@@ -532,6 +533,9 @@ struct State {
     last_success_ms: Option<i64>,
     last_failure_log: Option<Duration>,
     last_forced: Option<Duration>,
+    /// The `completed_fetches` count that ends the fetch the forced refresh at
+    /// `last_forced` started.
+    forced_target: Option<u64>,
     short_window_warned: bool,
 }
 
@@ -681,7 +685,10 @@ impl RefreshingTokenProvider {
     ///
     /// Ignored for any other status, for a token that has already rotated,
     /// and within `forced_min_interval` of the previous forced refresh. A
-    /// forced fetch that returns the same token counts as a normal success.
+    /// rejection of the same token while that refresh's fetch is still running
+    /// starts no fetch but waits for it, so every client that saw the same 401
+    /// can replay with the replacement. A forced fetch that returns the same
+    /// token counts as a normal success.
     pub fn on_rejected(&self, token: &str, http_status: u16) {
         self.shared().on_rejected(token, http_status, None);
     }
@@ -1048,29 +1055,42 @@ impl Shared {
             return; // stale: the token has already rotated
         }
         let now = self.clock.monotonic();
-        if st
+        let target = if st
             .last_forced
             .is_some_and(|last| now.saturating_sub(last) < self.config.forced_min_interval)
         {
-            return;
-        }
-        st.last_forced = Some(now);
-        let target = st.completed_fetches + 1;
-        self.request_fetch_now_locked(&mut st, now);
-        // Log with the state lock released, as `run_fetch` and `close` do. A
-        // `log` backend may hold its own output lock -- stderr's, say -- while
-        // it writes, and a thread formatting this provider with `{:?}` takes
-        // the state lock while holding that same lock (`eprintln!` formats
-        // under the stderr lock): logging under the state lock deadlocked the
-        // two threads, and with them every later user of the provider.
-        drop(st);
-        log::info!(
-            "questdb: token provider {}: the server rejected the current token with HTTP 401, \
-             refreshing early",
-            self.name
-        );
+            // The rate limit starts no second fetch. But the held token is
+            // still the rejected one, so if the forced fetch is still running,
+            // wait for it as the caller that started it does: several clients
+            // sharing this provider see the same 401 at about the same time,
+            // and handing the rejected token back failed every one of them
+            // but the first.
+            match st.forced_target {
+                Some(target) if st.completed_fetches < target => target,
+                _ => return,
+            }
+        } else {
+            st.last_forced = Some(now);
+            let target = st.completed_fetches + 1;
+            st.forced_target = Some(target);
+            self.request_fetch_now_locked(&mut st, now);
+            // Log with the state lock released, as `run_fetch` and `close` do.
+            // A `log` backend may hold its own output lock -- stderr's, say --
+            // while it writes, and a thread formatting this provider with
+            // `{:?}` takes the state lock while holding that same lock
+            // (`eprintln!` formats under the stderr lock): logging under the
+            // state lock deadlocked the two threads, and with them every later
+            // user of the provider.
+            drop(st);
+            log::info!(
+                "questdb: token provider {}: the server rejected the current token with HTTP \
+                 401, refreshing early",
+                self.name
+            );
+            st = self.lock();
+            target
+        };
         let deadline = now.saturating_add(self.config.forced_wait.min(MAX_DELAY));
-        let mut st = self.lock();
         while !st.closed && st.completed_fetches < target {
             let now = self.clock.monotonic();
             if now >= deadline || cancel.is_some_and(|cancel| cancel()) {

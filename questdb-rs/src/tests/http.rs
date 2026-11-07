@@ -1183,6 +1183,111 @@ fn test_refreshing_provider_refreshes_a_rejected_token_however_attached() -> Tes
 }
 
 #[test]
+fn test_senders_sharing_a_provider_all_replay_a_shared_401() -> TestResult {
+    // Two senders share one `RefreshingTokenProvider`, and the server rejects
+    // its token for both. The first 401 forces a fetch. The second, inside
+    // `forced_min_interval`, used to get the rejected token straight back while
+    // that fetch was still running, so its flush failed with the 401.
+    use crate::token_provider::{ExpiringToken, RefreshingTokenProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let (fetching_tx, fetching_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let fetching_tx = Mutex::new(fetching_tx);
+    let release_rx = Mutex::new(release_rx);
+    let provider = RefreshingTokenProvider::builder({
+        let fetches = Arc::clone(&fetches);
+        move || -> crate::Result<ExpiringToken> {
+            let token = if fetches.fetch_add(1, Ordering::SeqCst) == 0 {
+                "T1"
+            } else {
+                // The forced fetch, held in flight until the test releases it.
+                fetching_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                "T2"
+            };
+            Ok(ExpiringToken::expires_in(token, Duration::from_secs(3600)))
+        }
+    })
+    .build()?;
+    assert!(provider.await_ready(Duration::from_secs(5)));
+
+    // Each server rejects T1 once, then expects the replay with T2.
+    let (rejected_tx, rejected_rx) = mpsc::channel::<()>();
+    let mut flushes = Vec::new();
+    let mut servers = Vec::new();
+    for value in [1i64, 2] {
+        let mut server = MockServer::new()?;
+        let sender = server
+            .lsb_http()
+            .protocol_version(ProtocolVersion::V2)?
+            .http_token_provider(provider.clone())?
+            .retry_timeout(Duration::from_secs(10))?
+            .build()?;
+        let mut buffer = sender.new_buffer();
+        buffer
+            .table("test")?
+            .column_i64("v", value)?
+            .at(TimestampNanos::new(value))?;
+        let rejected_tx = rejected_tx.clone();
+        servers.push(std::thread::spawn(
+            move || -> io::Result<Vec<Option<String>>> {
+                server.accept()?;
+                let first = server.recv_http_q()?;
+                server.send_http_response_q(
+                    HttpResponse::empty()
+                        .with_status(401, "Unauthorized")
+                        .with_body_str("Unauthorized"),
+                )?;
+                let _ = rejected_tx.send(());
+                let replay = server.recv_http(15.0)?;
+                server.send_http_response_q(HttpResponse::empty())?;
+                Ok(vec![
+                    first.header("authorization").map(str::to_string),
+                    replay.header("authorization").map(str::to_string),
+                ])
+            },
+        ));
+        flushes.push((sender, buffer));
+    }
+
+    let (mut sender_b, buffer_b) = flushes.pop().unwrap();
+    let (mut sender_a, buffer_a) = flushes.pop().unwrap();
+    let flush_a = std::thread::spawn(move || sender_a.flush_and_keep(&buffer_a));
+    fetching_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the forced fetch never started");
+    rejected_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server A never answered 401");
+    let flush_b = std::thread::spawn(move || sender_b.flush_and_keep(&buffer_b));
+    rejected_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server B never answered 401");
+    // Let B handle its 401 while the forced fetch is still running.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !flush_b.is_finished(),
+        "the second sender gave up on the shared 401: {:?}",
+        flush_b.join().unwrap().map_err(|err| err.to_string())
+    );
+    release_tx.send(()).unwrap();
+
+    flush_a.join().unwrap()?;
+    flush_b.join().unwrap()?;
+    for server in servers {
+        assert_eq!(
+            server.join().unwrap()?,
+            vec![Some("Bearer T1".to_string()), Some("Bearer T2".to_string())]
+        );
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    provider.close();
+    Ok(())
+}
+
+#[test]
 fn test_credential_rotation_keeps_retry_backoff() -> TestResult {
     // Regression: `retry_http_send`'s credential-rotation branch used to make
     // the rotated retry immediate by setting `retry_interval_ms = 0`. That

@@ -402,7 +402,8 @@ void questdb_token_free(questdb_token* token);
  * Tell the provider that a server rejected `token` with `http_status`, for a
  * client of your own. A refreshing provider refreshes early on a 401 for its
  * current token -- at most once per `forced_min_interval_ms` -- and waits up
- * to `forced_wait_ms` for the result.
+ * to `forced_wait_ms` for the result. A 401 for the same token while that
+ * refresh is still fetching starts no fetch but waits for it too.
  */
 QUESTDB_CLIENT_API
 void questdb_token_provider_on_rejected(
