@@ -58,11 +58,11 @@ pub struct DeviceCodeChallenge {
     pub(crate) expires_in_seconds: u64,
     pub(crate) interval_seconds: u64,
     /// Whether the CONFIGURED device-authorization endpoint is itself a
-    /// loopback host. Gates the plaintext exemption in [`safe_target`]: a local
-    /// IdP names its own loopback port, and that must keep working without
-    /// TLS, but a remote HTTPS IdP has no business handing back a loopback URL
-    /// and must not be able to aim a browser, a clickable link or a QR code at
-    /// whatever else is listening on the machine.
+    /// loopback host. Gates loopback targets in [`safe_target`], over either
+    /// scheme: a local IdP names its own loopback port, and that must keep
+    /// working, without TLS too, but a remote IdP has no business handing back
+    /// a loopback URL and must not be able to aim a browser, a clickable link
+    /// or a QR code at whatever else is listening on the machine.
     pub(crate) idp_is_loopback: bool,
 }
 
@@ -612,21 +612,23 @@ pub(crate) fn safe_target(url: Option<&str>, idp_is_loopback: bool) -> Option<St
     {
         return None;
     }
+    // A loopback target is actionable only when the configured IdP is itself
+    // on loopback, whatever the scheme. The only origin check compares
+    // `verification_uri` against `verification_uri_complete`, both fields of
+    // the same response, so without this a REMOTE IdP could return
+    // `http://127.0.0.1:9000/exec?query=...` -- or the same over https, for a
+    // local service with a certificate the browser trusts -- and have it
+    // opened, linkified and QR-encoded. A local IdP names its own loopback port
+    // and still works. Names are not resolved: this covers loopback addresses
+    // and `localhost` names, not a public name that resolves to loopback.
+    let host_is_loopback = crate::oidc::http::is_loopback(host);
+    if host_is_loopback && !idp_is_loopback {
+        return None;
+    }
     // Device codes are credentials. Plaintext is actionable only on the local
     // machine; a remote HTTP URL must remain inert text and must never reach a
     // browser opener or QR code.
-    //
-    // `idp_is_loopback` narrows that exemption to the case it exists for. The
-    // test used to be "is this host loopback?" rather than "is this the IdP we
-    // are talking to?", with no tie back to the configured endpoint -- the only
-    // origin check compares `verification_uri` against
-    // `verification_uri_complete`, both fields of the same response. So a
-    // REMOTE https IdP could return `http://127.0.0.1:9000/exec?query=...` and
-    // have it opened, linkified and QR-encoded. A local IdP names its own
-    // loopback port and still works.
-    if uri.scheme_str() == Some("http")
-        && !(idp_is_loopback && crate::oidc::http::is_loopback(host))
-    {
+    if uri.scheme_str() == Some("http") && !host_is_loopback {
         return None;
     }
     Some(trimmed.to_string())
@@ -1091,7 +1093,11 @@ mod tests {
         // refused -- no link, no QR, no browser open -- on a host that cannot
         // be a homoglyph.
         assert_eq!(
-            safe_target(Some("https://[::1]:8443/device"), false),
+            safe_target(Some("https://[2001:db8::1]:8443/device"), false),
+            Some("https://[2001:db8::1]:8443/device".to_string())
+        );
+        assert_eq!(
+            safe_target(Some("https://[::1]:8443/device"), true),
             Some("https://[::1]:8443/device".to_string())
         );
         assert_eq!(safe_target(Some("http://[fe80::1]/device"), false), None);
@@ -1133,25 +1139,35 @@ mod tests {
     }
 
     #[test]
-    fn safe_target_refuses_loopback_plaintext_from_a_remote_idp() {
-        // A REMOTE https IdP has no business naming a loopback URL, and must
-        // not be able to aim a browser open, a clickable link or a QR code at
-        // whatever else is listening on the machine -- QuestDB's own REST API
-        // is on loopback:9000 and takes `?query=`. The gate used to ask only
-        // "is this host loopback?", with no tie back to the configured
-        // endpoint, so this was accepted.
+    fn safe_target_refuses_loopback_targets_from_a_remote_idp() {
+        // A REMOTE IdP has no business naming a loopback URL, and must not be
+        // able to aim a browser open, a clickable link or a QR code at whatever
+        // else is listening on the machine -- QuestDB's own REST API is on
+        // loopback:9000 and takes `?query=`. The gate used to ask only "is this
+        // host loopback?", with no tie back to the configured endpoint, and
+        // then only for plaintext, so a remote IdP could still name a local
+        // TLS service.
         for url in [
             "http://127.0.0.1:9000/exec?query=DROP+TABLE+x",
             "http://localhost:9000/exec?query=SELECT+1",
             "http://[::1]:9000/exec",
+            "https://127.0.0.1:9000/exec?query=DROP+TABLE+x",
+            "https://127.5.5.5:9000/exec",
+            "https://localhost:9000/exec?query=SELECT+1",
+            "https://localhost./exec",
+            "https://[::1]:9000/exec",
         ] {
             assert_eq!(safe_target(Some(url), false), None, "{url}");
+            // A local IdP names its own loopback port, over either scheme.
+            assert_eq!(safe_target(Some(url), true), Some(url.to_string()), "{url}");
         }
-        // https is unaffected either way.
-        assert_eq!(
-            safe_target(Some("https://idp.example.com/device"), false),
-            Some("https://idp.example.com/device".to_string())
-        );
+        // A remote target over https is unaffected either way.
+        for idp_is_loopback in [false, true] {
+            assert_eq!(
+                safe_target(Some("https://idp.example.com/device"), idp_is_loopback),
+                Some("https://idp.example.com/device".to_string())
+            );
+        }
     }
 
     #[test]
