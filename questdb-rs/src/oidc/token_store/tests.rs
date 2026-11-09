@@ -937,6 +937,50 @@ fn refuses_a_symlinked_store_directory() {
 
 #[cfg(unix)]
 #[test]
+fn refuses_a_symlinked_store_directory_however_it_is_spelled() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = TempDir::new().unwrap();
+    let real = base.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = base.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // A trailing separator makes lstat follow the link.
+    for spelling in ["link/", "link//", "link/.", "link/./"] {
+        let store = test_file_store(base.path().join(spelling));
+        let err = store.save(&test_key(), &test_token()).unwrap_err();
+        assert!(
+            err.to_string().contains("symbolic link"),
+            "{spelling}: {err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&real).unwrap().count(),
+            0,
+            "{spelling}: wrote into the link's target"
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "{spelling}: chmodded the link's target"
+        );
+    }
+}
+
+#[test]
+fn store_directory_drops_trailing_separators_and_dot_components() {
+    let base = TempDir::new().unwrap();
+    let store = test_file_store(base.path().join("tokens/./"));
+    store.save(&test_key(), &test_token()).unwrap();
+    assert!(
+        base.path()
+            .join("tokens")
+            .join(format!("{}.json", test_key().hash()))
+            .is_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn non_regular_token_file_is_ignored_not_hung() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;

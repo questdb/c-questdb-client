@@ -802,19 +802,20 @@ pub struct FileTokenStore {
 impl FileTokenStore {
     /// A store rooted at the given directory.
     ///
-    /// The path is used **verbatim** except that a leading `~` is rejected on
-    /// first use: a runtime does not expand it, and accepting it would create a
-    /// directory literally named `~` under the process working directory. A
-    /// relative path is resolved afresh at every use, so a `chdir` moves the
-    /// store and re-runs the device flow. Pass an already-expanded absolute
-    /// path, or use [`at_default_location`](Self::at_default_location).
+    /// The path is used **verbatim** except that trailing separators and `.`
+    /// components are dropped, and a leading `~` is rejected on first use: a
+    /// runtime does not expand it, and accepting it would create a directory
+    /// literally named `~` under the process working directory. A relative path
+    /// is resolved afresh at every use, so a `chdir` moves the store and re-runs
+    /// the device flow. Pass an already-expanded absolute path, or use
+    /// [`at_default_location`](Self::at_default_location).
     ///
     /// The C setter `questdb_oidc_builder_file_token_store` applies the same
     /// leading-`~` rejection. The Python binding expands and absolutises its
     /// path before it reaches this constructor.
     pub fn at(directory: impl Into<PathBuf>) -> Self {
         FileTokenStore {
-            directory: directory.into(),
+            directory: without_trailing_separators(directory.into()),
             lock_acquire_budget: DEFAULT_LOCK_ACQUIRE_BUDGET,
             lock_stale: DEFAULT_LOCK_STALE,
             #[cfg(test)]
@@ -2783,6 +2784,18 @@ fn symlink_leaf_error() -> std::io::Error {
 /// -- lands somewhere else entirely. This one setting is meant to be shared
 /// across clients, so an ambiguous value has to fail loudly rather than split
 /// the store in two.
+/// `directory` without trailing separators or `.` components.
+///
+/// Path resolution follows a final symlink when the path ends in `/` or `/.`,
+/// so `link/` passed the symlinked-leaf check in `create_directory` that `link`
+/// fails, and the store then chmodded and wrote the link's target. Dropping
+/// them once, at construction, makes every later lstat, chmod and join see the
+/// leaf itself however the caller spelled it -- and the documented default
+/// location is spelled with a trailing `/`.
+fn without_trailing_separators(directory: PathBuf) -> PathBuf {
+    directory.components().collect()
+}
+
 fn validate_override_dir(dir: PathBuf) -> std::io::Result<PathBuf> {
     if dir.is_absolute() {
         return Ok(dir);
