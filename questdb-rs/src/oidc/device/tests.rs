@@ -3132,6 +3132,45 @@ fn allow_insecure_does_not_relax_idp_endpoints() {
     );
 }
 
+#[test]
+fn an_idp_on_the_local_machine_keeps_its_verification_url_however_it_is_spelled() {
+    // Only a local IdP may name a local target, so the IdP's side of that rule
+    // must recognize every spelling of the local machine the target's side does.
+    let auth_on = |idp: &str| {
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(format!("{idp}/device"))
+            .token_endpoint(format!("{idp}/token"))
+            .build()
+            .expect("build auth")
+    };
+    for host in [
+        "localhost",
+        "127.0.0.1",
+        "[::1]",
+        "keycloak.localhost",
+        "0.0.0.0",
+        "[::]",
+        "[::ffff:127.0.0.1]",
+    ] {
+        let idp = format!("https://{host}:8443/realms/q");
+        let complete = format!("{idp}/device?user_code=WXYZ-1234");
+        let challenge = DeviceCodeChallenge {
+            user_code: "WXYZ-1234".to_string(),
+            verification_uri: format!("{idp}/device"),
+            verification_uri_complete: Some(complete.clone()),
+            expires_in_seconds: 600,
+            interval_seconds: 5,
+            idp_is_loopback: auth_on(&idp).device_endpoint_is_loopback(),
+        };
+        assert_eq!(challenge.browser_target(), Some(complete), "{host}");
+    }
+    for host in ["idp.example.com", "localhost.example.com", "10.0.0.1"] {
+        let auth = auth_on(&format!("https://{host}/realms/q"));
+        assert!(!auth.device_endpoint_is_loopback(), "{host} is not local");
+    }
+}
+
 // -- refresh branches --------------------------------------------------------
 
 #[test]

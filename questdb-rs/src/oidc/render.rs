@@ -57,12 +57,13 @@ pub struct DeviceCodeChallenge {
     pub(crate) verification_uri_complete: Option<String>,
     pub(crate) expires_in_seconds: u64,
     pub(crate) interval_seconds: u64,
-    /// Whether the CONFIGURED device-authorization endpoint is itself a
-    /// loopback host. Gates loopback targets in [`safe_target`], over either
-    /// scheme: a local IdP names its own loopback port, and that must keep
-    /// working, without TLS too, but a remote IdP has no business handing back
-    /// a loopback URL and must not be able to aim a browser, a clickable link
-    /// or a QR code at whatever else is listening on the machine.
+    /// Whether the CONFIGURED device-authorization endpoint is itself on the
+    /// local machine, by the test a target's host gets ([`is_local_machine`]).
+    /// Gates local targets in [`safe_target`], over either scheme: a local IdP
+    /// names its own port, and that must keep working, without TLS too, but a
+    /// remote IdP has no business handing back a local URL and must not be able
+    /// to aim a browser, a clickable link or a QR code at whatever else is
+    /// listening on the machine.
     pub(crate) idp_is_loopback: bool,
 }
 
@@ -621,17 +622,17 @@ pub(crate) fn safe_target(url: Option<&str>, idp_is_loopback: bool) -> Option<St
         return None;
     }
     // A target on the local machine is actionable only when the configured
-    // IdP is itself on loopback, whatever the scheme. The only origin check
+    // IdP is itself on it, whatever the scheme. The only origin check
     // compares `verification_uri` against `verification_uri_complete`, both
     // fields of the same response, so without this a REMOTE IdP could return
     // `http://127.0.0.1:9000/exec?query=...` -- or the same over https, for a
     // local service with a certificate the browser trusts -- and have it
-    // opened, linkified and QR-encoded. A local IdP names its own loopback port
-    // and still works. Names are not resolved: this covers the addresses and
+    // opened, linkified and QR-encoded. A local IdP names its own port and
+    // still works. Names are not resolved: this covers the addresses and
     // `localhost` names that reach the local machine by spelling alone, not a
     // public name that resolves to loopback.
     let host_is_loopback = crate::oidc::http::is_loopback(host);
-    if (host_is_loopback || reaches_local_machine(host)) && !idp_is_loopback {
+    if is_local_machine(host) && !idp_is_loopback {
         return None;
     }
     // Device codes are credentials. Plaintext is actionable only on the local
@@ -662,6 +663,19 @@ fn host_ends_in_a_number(host: &str) -> bool {
     chars.next() == Some('0')
         && matches!(chars.next(), Some('x' | 'X'))
         && chars.all(|c| c.is_ascii_hexdigit())
+}
+
+/// Whether `host` is the local machine by its spelling alone: a loopback
+/// address or `localhost` name (`is_loopback`), or one of the further spellings
+/// in [`reaches_local_machine`]. `host` is unbracketed.
+///
+/// The one test for both sides of the local-target rule in [`safe_target`]: the
+/// target's host, and the configured IdP's (`device_endpoint_is_loopback`).
+/// Judged by `is_loopback` alone, an IdP configured as `keycloak.localhost`,
+/// `0.0.0.0` or `[::ffff:127.0.0.1]` counted as remote, and its own
+/// verification URL was refused: no browser open, no link, no QR code.
+pub(crate) fn is_local_machine(host: &str) -> bool {
+    crate::oidc::http::is_loopback(host) || reaches_local_machine(host)
 }
 
 /// Whether `host` reaches the local machine by its spelling, beyond the
