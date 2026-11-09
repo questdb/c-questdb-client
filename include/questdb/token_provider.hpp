@@ -458,6 +458,12 @@ public:
      * A refreshing provider around `source`, any callable returning an
      * `expiring_token`. It runs only on the provider's refresher thread, never
      * concurrently with itself. Its first fetch starts at once.
+     *
+     * The provider keeps its own copy of `source`. Closing the provider, or
+     * destroying its last handle, does not wait for a fetch already running:
+     * that call finishes on the refresher thread, and only then is the copy
+     * destroyed. Capture by value, or keep whatever `source` refers to alive
+     * until then.
      */
     template <typename Source>
     static token_provider refreshing(
@@ -560,7 +566,8 @@ public:
         return *this;
     }
 
-    /** Release this handle; clients using the provider keep it. */
+    /** Release this handle; clients using the provider keep it. A fetch
+     *  already running finishes afterwards (see `refreshing()`). */
     ~token_provider()
     {
         ::questdb_token_provider_free(_raw);
@@ -627,7 +634,8 @@ public:
 
     /** Close a refreshing provider, ending every client that uses it,
      *  through this handle or any `share()` handle. Attaching it to a new
-     *  sender, pool or reader then fails. */
+     *  sender, pool or reader then fails. A fetch already running finishes
+     *  after this returns (see `refreshing()`). */
     void close() const
     {
         ::questdb_token_provider_close(_raw);

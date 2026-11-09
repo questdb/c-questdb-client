@@ -465,7 +465,9 @@ pub struct TokenProviderStatus {
 /// - **Close.** [`close`](Self::close) stops the refresher and wakes every
 ///   waiter; [`token`](Self::token) then fails as permanent. Clients never
 ///   close a provider: close it once every client using it is closed. When
-///   the last clone is dropped, the provider closes itself.
+///   the last clone is dropped, the provider closes itself. Neither waits for
+///   a fetch already running: it finishes on the refresher thread and its
+///   result is discarded, and only then is the source dropped.
 ///
 /// Its [`Debug`](fmt::Debug) rendering, log lines and errors show at most a
 /// token's length and an 8-hex-digit SHA-256 fingerprint.
@@ -729,6 +731,9 @@ impl RefreshingTokenProvider {
     /// [`token`](Self::token) fails as permanent, every client using the
     /// provider stops reconnecting, and attaching the provider to another
     /// sender, reader or pool fails at once with that same error. Idempotent.
+    ///
+    /// It does not wait for a fetch already running, which finishes on the
+    /// refresher thread after this returns; its result is discarded.
     ///
     /// Clients never close a provider: close it once every client using it is
     /// closed.

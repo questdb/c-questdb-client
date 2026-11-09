@@ -58,6 +58,14 @@
  * - A source runs only on the provider's refresher thread, never concurrently
  *   with itself. It may block, but should bound its own network calls (30 s
  *   per attempt is recommended).
+ * - Closing a refreshing provider, or freeing its last handle once no client
+ *   uses it, does not wait for a source call already running: that call
+ *   finishes on the refresher thread after `questdb_token_provider_close` or
+ *   `questdb_token_provider_free` returns, and its result is discarded.
+ *   `release` runs only once it has returned, so free `user_data`, and tear
+ *   down anything else the source uses, from `release` rather than after
+ *   close or free. Without `release`, nothing reports that the source has
+ *   finished.
  * - `get_token` and `on_rejected` run on a connect thread or an isolated
  *   worker for a QWP/WebSocket sender, reader or pool, and synchronously on
  *   the flushing thread, inside the flush call, for an ILP/HTTP sender.
@@ -352,7 +360,9 @@ questdb_token_provider* questdb_token_provider_clone(
 /**
  * Release this handle. Clients the provider is attached to keep using it, and
  * a refreshing provider keeps refreshing until it is closed or every handle
- * and client using it is gone. NULL-tolerant.
+ * and client using it is gone. A source call already running finishes after
+ * this returns; only `release`, which runs after it, reports that it has (see
+ * the callback contract above). NULL-tolerant.
  */
 QUESTDB_CLIENT_API
 void questdb_token_provider_free(questdb_token_provider* provider);
@@ -361,7 +371,10 @@ void questdb_token_provider_free(questdb_token_provider* provider);
  * Close a refreshing provider: stop its refresher and fail every later token
  * request as permanent, which ends every client that uses it. Attaching a
  * closed provider to a new sender, pool or reader then fails at once with
- * that same permanent error (`line_sender_error_auth_error`). Idempotent.
+ * that same permanent error (`line_sender_error_auth_error`). It does not
+ * wait for a source call already running, which finishes on the refresher
+ * thread after this returns; `release` runs only after that call has
+ * returned. Idempotent.
  * No-op for an application provider and for NULL.
  */
 QUESTDB_CLIENT_API
