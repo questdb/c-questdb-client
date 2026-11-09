@@ -455,19 +455,19 @@ fn format_mmss(seconds: f64) -> String {
 /// C0/C1 controls and DEL (including ANSI, tabs, and line breaks), bidi
 /// controls, zero-width characters, enclosing combining marks, private-use
 /// characters, and other invisible formatting are removed. Non-ASCII whitespace
-/// is folded to an ordinary space, and a run of stacking combining marks is
+/// is folded to an ordinary space, and a run of non-spacing combining marks is
 /// truncated to a bounded length. This is suitable for human-readable
 /// labels and messages; URLs and short authentication codes need the stricter
 /// display accessors on [`DeviceCodeChallenge`] so confusable non-ASCII
 /// characters are also made visible. This sanitizer never fails.
 ///
-/// The character classes are enumerated rather than taken from a general-
-/// category table, so this is a strong filter and not a proof: an unassigned
-/// codepoint (category `Cn`) that a future Unicode version gives invisible
-/// semantics to would pass until the ranges here are updated. It is the last
-/// line before a terminal or a notebook DOM, not the only one -- the fields it
-/// guards are separately length-capped, and the actionable URL is vetted by
-/// the crate's URL vetter rather than merely sanitized.
+/// The removed character classes are enumerated rather than taken from a
+/// general-category table, so this is a strong filter and not a proof: an
+/// unassigned codepoint (category `Cn`) that a future Unicode version gives
+/// invisible semantics to would pass until the ranges here are updated. It is
+/// the last line before a terminal or a notebook DOM, not the only one -- the
+/// fields it guards are separately length-capped, and the actionable URL is
+/// vetted by the crate's URL vetter rather than merely sanitized.
 pub fn sanitize_display_text(text: &str) -> String {
     crate::display_text::sanitize_display_text(text)
 }
@@ -722,6 +722,32 @@ mod tests {
         assert_eq!(strip_control("e\u{0301}a\u{0300}"), "e\u{0301}a\u{0300}");
         // Decomposed Vietnamese (base + horn + tone) is well inside the cap.
         assert_eq!(strip_control("o\u{031b}\u{0301}"), "o\u{031b}\u{0301}");
+    }
+
+    #[test]
+    fn strip_control_counts_every_nonspacing_mark_in_a_run() {
+        // Every non-spacing mark stacks, whichever block it comes from, so
+        // each one counts: a mark left out of the count would end the run like
+        // a base character, and interleaving it between counted marks -- the
+        // Devanagari stress sign udatta between combining acutes -- would keep
+        // the whole stack.
+        let marks = "\u{0951}\u{0301}".repeat(99);
+        let kept: String = marks.chars().take(MAX_STACKING_MARK_RUN).collect();
+        assert_eq!(strip_control(&format!("A{marks}B")), format!("A{kept}B"));
+        let unlisted = format!("A{}B", "\u{0951}".repeat(198));
+        assert_eq!(
+            strip_control(&unlisted),
+            format!("A{}B", "\u{0951}".repeat(MAX_STACKING_MARK_RUN))
+        );
+        // Scripts whose marks sit outside the Latin combining blocks keep
+        // them: Devanagari (virama), Thai (vowel + tone), Hebrew nikud.
+        for text in [
+            "\u{0939}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940}",
+            "\u{0E17}\u{0E35}\u{0E48}",
+            "\u{05E9}\u{05C1}\u{05B8}\u{05DC}\u{05D5}\u{05B9}\u{05DD}",
+        ] {
+            assert_eq!(strip_control(text), text);
+        }
     }
 
     #[test]
