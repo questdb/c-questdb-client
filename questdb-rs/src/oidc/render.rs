@@ -612,17 +612,26 @@ pub(crate) fn safe_target(url: Option<&str>, idp_is_loopback: bool) -> Option<St
     {
         return None;
     }
-    // A loopback target is actionable only when the configured IdP is itself
-    // on loopback, whatever the scheme. The only origin check compares
-    // `verification_uri` against `verification_uri_complete`, both fields of
-    // the same response, so without this a REMOTE IdP could return
+    // A browser parses a host that ends in a number as an IPv4 address, and
+    // accepts shorthand forms that Rust's parser does not: `127.1`,
+    // `2130706433`, `0x7f.0.0.1` and `0177.0.0.1` all open 127.0.0.1. Only the
+    // canonical dotted quad can be vetted below, and no identity provider
+    // needs any other spelling, so refuse the rest whatever the IdP.
+    if host_ends_in_a_number(host) && host.parse::<std::net::Ipv4Addr>().is_err() {
+        return None;
+    }
+    // A target on the local machine is actionable only when the configured
+    // IdP is itself on loopback, whatever the scheme. The only origin check
+    // compares `verification_uri` against `verification_uri_complete`, both
+    // fields of the same response, so without this a REMOTE IdP could return
     // `http://127.0.0.1:9000/exec?query=...` -- or the same over https, for a
     // local service with a certificate the browser trusts -- and have it
     // opened, linkified and QR-encoded. A local IdP names its own loopback port
-    // and still works. Names are not resolved: this covers loopback addresses
-    // and `localhost` names, not a public name that resolves to loopback.
+    // and still works. Names are not resolved: this covers the addresses and
+    // `localhost` names that reach the local machine by spelling alone, not a
+    // public name that resolves to loopback.
     let host_is_loopback = crate::oidc::http::is_loopback(host);
-    if host_is_loopback && !idp_is_loopback {
+    if (host_is_loopback || reaches_local_machine(host)) && !idp_is_loopback {
         return None;
     }
     // Device codes are credentials. Plaintext is actionable only on the local
@@ -632,6 +641,49 @@ pub(crate) fn safe_target(url: Option<&str>, idp_is_loopback: bool) -> Option<St
         return None;
     }
     Some(trimmed.to_string())
+}
+
+/// Whether a browser parses `host` as an IPv4 address rather than as a name:
+/// the URL Standard's "ends in a number" test, under which the last label is
+/// all digits, or `0x` followed by hex digits. `host` is unbracketed.
+fn host_ends_in_a_number(host: &str) -> bool {
+    if host.contains(':') {
+        return false;
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let last = name.rsplit('.').next().unwrap_or("");
+    if last.is_empty() {
+        return false;
+    }
+    if last.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let mut chars = last.chars();
+    chars.next() == Some('0')
+        && matches!(chars.next(), Some('x' | 'X'))
+        && chars.all(|c| c.is_ascii_hexdigit())
+}
+
+/// Whether `host` reaches the local machine by its spelling, beyond the
+/// loopback addresses and names `is_loopback` covers: an unspecified address,
+/// which browsers connect to locally, an IPv4-mapped IPv6 loopback or
+/// unspecified address, and a subdomain of `localhost`, which browsers resolve
+/// to loopback themselves (RFC 6761). `host` is unbracketed.
+fn reaches_local_machine(host: &str) -> bool {
+    if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+        return addr.is_unspecified();
+    }
+    if let Ok(addr) = host.parse::<std::net::Ipv6Addr>() {
+        return addr.is_unspecified()
+            || addr
+                .to_ipv4_mapped()
+                .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified());
+    }
+    const SUFFIX: &str = ".localhost";
+    let name = host.strip_suffix('.').unwrap_or(host);
+    name.len() > SUFFIX.len()
+        && name.is_char_boundary(name.len() - SUFFIX.len())
+        && name[name.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
 }
 
 #[cfg(test)]
@@ -1166,6 +1218,53 @@ mod tests {
             assert_eq!(
                 safe_target(Some("https://idp.example.com/device"), idp_is_loopback),
                 Some("https://idp.example.com/device".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn safe_target_refuses_every_spelling_of_the_local_machine_from_a_remote_idp() {
+        // A browser opens each of these at 127.0.0.1. No IdP needs a shorthand
+        // IPv4 spelling, so they are refused whatever the IdP.
+        for url in [
+            "https://127.1:9000/exec?query=DROP+TABLE+x",
+            "https://2130706433:9000/exec",
+            "https://0x7f.0.0.1:9000/exec",
+            "https://0X7F.0.0.1:9000/exec",
+            "https://0177.0.0.1:9000/exec",
+            "https://127.0.0.1.:9000/exec",
+            "http://127.1:9000/exec",
+        ] {
+            for idp_is_loopback in [false, true] {
+                assert_eq!(safe_target(Some(url), idp_is_loopback), None, "{url}");
+            }
+        }
+        // These reach the local machine too, and only a local IdP may name them.
+        for url in [
+            "https://[::ffff:127.0.0.1]:9000/exec",
+            "https://[::ffff:7f00:1]:9000/exec",
+            "https://[::ffff:0.0.0.0]:9000/exec",
+            "https://0.0.0.0:9000/exec",
+            "https://[::]:9000/exec",
+            "https://foo.localhost:9000/exec",
+            "https://a.b.LOCALHOST./exec",
+        ] {
+            assert_eq!(safe_target(Some(url), false), None, "{url}");
+            assert_eq!(safe_target(Some(url), true), Some(url.to_string()), "{url}");
+        }
+        // Names and addresses that only look similar are unaffected.
+        for url in [
+            "https://10.0.0.1/device",
+            "https://[2001:db8::1]/device",
+            "https://localhost.example.com/device",
+            "https://notlocalhost/device",
+            "https://idp0x7f.example/device",
+            "https://x1.example/device",
+        ] {
+            assert_eq!(
+                safe_target(Some(url), false),
+                Some(url.to_string()),
+                "{url}"
             );
         }
     }
