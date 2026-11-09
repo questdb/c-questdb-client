@@ -87,6 +87,7 @@ Replicated durable acknowledgement requires QuestDB Enterprise. See
 - [Custom certificate authority](../examples/line_sender_c_example_tls_ca.c)
 - [QWP/UDP](../examples/line_sender_c_example_udp.c)
 - [Rotating bearer tokens](../examples/token_provider_c_example.c)
+- [OIDC device-flow sign-in](../examples/oidc_c_example.c)
 
 QWP/UDP is best effort and provides no acknowledgement, authentication, or
 TLS. ILP/HTTP and ILP/TCP remain available for compatibility, but they do not
@@ -99,6 +100,7 @@ The committed headers are the authoritative native API reference:
 - [`qwp_reader.h`](../include/questdb/egress/qwp_reader.h) — `questdb_db_borrow_reader`
 - [`line_sender.h`](../include/questdb/ingress/line_sender.h)
 - [`token_provider.h`](../include/questdb/token_provider.h) — rotating bearer tokens
+- [`oidc.h`](../include/questdb/oidc.h) — OIDC device-flow sign-in
 
 For connection-string keys, Enterprise multi-host failover, store-and-forward,
 and deployment guidance, use the public

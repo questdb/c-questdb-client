@@ -86,6 +86,7 @@ connections.
 - [ILP authentication with TLS](../examples/line_sender_cpp_example_auth_tls.cpp)
 - [Custom certificate authority](../examples/line_sender_cpp_example_tls_ca.cpp)
 - [QWP/UDP](../examples/line_sender_cpp_example_udp.cpp)
+- [OIDC device-flow sign-in](../examples/oidc_cpp_example.cpp)
 
 The committed headers are the authoritative native API reference:
 
@@ -94,6 +95,7 @@ The committed headers are the authoritative native API reference:
 - [`qwp_reader.hpp`](../include/questdb/egress/qwp_reader.hpp) — `pool::borrow_reader()`
 - [`line_sender.hpp`](../include/questdb/ingress/line_sender.hpp)
 - [`token_provider.hpp`](../include/questdb/token_provider.hpp) — rotating bearer tokens
+- [`oidc.hpp`](../include/questdb/oidc.hpp) — OIDC device-flow sign-in
 
 For connection-string keys, QuestDB Enterprise multi-host failover,
 store-and-forward, and deployment guidance, use the public

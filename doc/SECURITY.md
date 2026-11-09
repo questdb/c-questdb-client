@@ -81,7 +81,11 @@ the Rust crate logs a warning, once per process, when one is used without TLS.
 See [`token_provider.h`](../include/questdb/token_provider.h),
 [`token_provider.hpp`](../include/questdb/token_provider.hpp), the Rust
 `questdb::token_provider` module, and
-[`token_provider_c_example.c`](../examples/token_provider_c_example.c). The
+[`token_provider_c_example.c`](../examples/token_provider_c_example.c); for
+the OIDC device flow, [`oidc.h`](../include/questdb/oidc.h),
+[`oidc.hpp`](../include/questdb/oidc.hpp),
+[`oidc_c_example.c`](../examples/oidc_c_example.c) and
+[`oidc_cpp_example.cpp`](../examples/oidc_cpp_example.cpp). The
 behaviour follows the cross-language dynamic-credential specification
 (`design/qwp-token-provider-spec.md` in the Java client).
 
