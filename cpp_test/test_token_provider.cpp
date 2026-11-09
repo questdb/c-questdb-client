@@ -489,6 +489,32 @@ public:
 private:
     questdb::oidc::device_auth _auth;
 };
+
+/** An application provider whose `token()` attaches `Inner` to sender options
+ *  and lets the `line_sender_error` thrown for a closed one escape. */
+template <typename Inner>
+class attaching_provider : public questdb::bearer_token_provider
+{
+public:
+    explicit attaching_provider(const Inner& inner)
+        : _inner{inner.share()}
+    {
+    }
+
+    std::string token() override
+    {
+        auto opts =
+            questdb::ingress::opts::from_conf("http::addr=127.0.0.1:1;");
+        if constexpr (std::is_same_v<Inner, questdb::oidc::device_auth>)
+            opts.oidc_auth(_inner);
+        else
+            opts.token_provider(_inner);
+        return "unreachable";
+    }
+
+private:
+    Inner _inner;
+};
 } // namespace
 
 TEST_CASE("A provider passing on a closed provider's failure stops its clients")
@@ -556,6 +582,73 @@ TEST_CASE("A provider passing on a closed provider's failure stops its clients")
     while (!sender.must_close() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(5ms);
     CHECK(sender.must_close());
+}
+
+TEST_CASE("A provider passing on a sender error keeps its classification")
+{
+    // `opts::token_provider()` refuses a closed provider with a
+    // `line_sender_error`. Passed on unchanged, like the provider's own
+    // failure, it stops the clients as `auth_error` with `provider_closed`
+    // set, rather than as `config_error` without the classification.
+    auto inner = questdb::token_provider::refreshing([] {
+        return questdb::expiring_token{
+            "T", std::chrono::system_clock::now() + 1h};
+    });
+    REQUIRE(inner.await_ready(10s));
+    auto app = questdb::token_provider::from(
+        std::make_shared<attaching_provider<questdb::token_provider>>(inner));
+    inner.close();
+    const auto check_closed_provider_failure = [](const questdb::error& e) {
+        CHECK(e.code() == questdb::error_code::auth_error);
+        const auto& classification = e.token_unavailable_diagnostic();
+        REQUIRE(classification.has_value());
+        CHECK(classification->provider_closed);
+        CHECK_FALSE(classification->retryable);
+    };
+    try
+    {
+        (void)app.token();
+        FAIL("expected a failure");
+    }
+    catch (const questdb::error& e)
+    {
+        check_closed_provider_failure(e);
+    }
+    // A reader pulls the token before it dials, so no server is needed.
+    try
+    {
+        questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", app};
+        FAIL("connected without a token");
+    }
+    catch (const questdb::error& e)
+    {
+        check_closed_provider_failure(e);
+    }
+}
+
+TEST_CASE("A provider passing on a sender error keeps its OIDC detail")
+{
+    // `opts::oidc_auth()` refuses a closed auth with a `line_sender_error`
+    // carrying OIDC detail. Passed on unchanged, it stops the clients as a
+    // closed auth does when attached directly.
+    auto builder = questdb::oidc::builder{};
+    builder.client_id("questdb-cpp")
+        .token_endpoint("https://idp.example/token")
+        .device_authorization_endpoint("https://idp.example/device");
+    auto auth = builder.build();
+    auto app = questdb::token_provider::from(
+        std::make_shared<attaching_provider<questdb::oidc::device_auth>>(auth));
+    auth.close();
+    try
+    {
+        questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", app};
+        FAIL("connected without a token");
+    }
+    catch (const questdb::oidc::error& e)
+    {
+        CHECK(e.code() == questdb::error_code::auth_error);
+        CHECK(e.kind() == questdb::oidc::error_kind::cancelled);
+    }
 }
 
 TEST_CASE("A provider passing on a classified failure keeps the classification")

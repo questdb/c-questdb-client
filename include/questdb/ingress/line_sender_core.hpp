@@ -271,12 +271,19 @@ protected:
         _token_unavailable = std::move(info);
     }
 
+    /** Keep the C error this was converted from (see `_c_error`). */
+    void set_c_error(std::shared_ptr<const ::questdb_error> c_err) noexcept
+    {
+        _c_error = std::move(c_err);
+    }
+
 private:
     error_code _code;
     std::optional<token_unavailable_info> _token_unavailable;
     /** The C error this was converted from, so that a token provider that
      *  lets it escape passes it on unchanged; empty for an error constructed
-     *  in C++. Shared by every copy of the exception. */
+     *  in C++. Shared by every copy of the exception. Every conversion from a
+     *  C error keeps it, `line_sender_error`'s included. */
     std::shared_ptr<const ::questdb_error> _c_error;
 
     friend struct detail::error_access;
@@ -681,9 +688,10 @@ public:
 private:
     inline static line_sender_error from_c(::line_sender_error* c_err)
     {
-        const std::
-            unique_ptr<::line_sender_error, decltype(&::line_sender_error_free)>
-                owned_err{c_err, ::line_sender_error_free};
+        // Shared: the error keeps it, so that a token provider that lets this
+        // error escape passes it on unchanged (see `questdb::error::_c_error`).
+        const std::shared_ptr<::line_sender_error> owned_err{
+            c_err, ::line_sender_error_free};
         line_sender_error_code code = static_cast<line_sender_error_code>(
             static_cast<int>(::line_sender_error_get_code(owned_err.get())));
         size_t c_len{0};
@@ -716,6 +724,7 @@ private:
         err.set_token_unavailable(token_unavailable_from_c(owned_err.get()));
         err._qwp_ws_role_reject =
             ::questdb_error_is_qwp_ws_role_reject(owned_err.get());
+        err.set_c_error(owned_err);
         return err;
     }
 

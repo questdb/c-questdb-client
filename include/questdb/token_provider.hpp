@@ -126,9 +126,11 @@ public:
      * (`questdb::error::token_unavailable_diagnostic()`), such as one
      * `token_provider::token()` threw, is passed on unchanged, as a Rust
      * provider passes on the error it returns, and the client's error keeps
-     * the classification. The failure of a closed `token_provider` stops them
-     * too, still reported as `auth_error` with `provider_closed` set: closing
-     * one ends every client that uses it, through this provider too.
+     * the classification. A `questdb::ingress::line_sender_error` that
+     * carries a classification or OIDC detail is passed on the same way. The
+     * failure of a closed `token_provider` stops them too, still reported as
+     * `auth_error` with `provider_closed` set: closing one ends every client
+     * that uses it, through this provider too.
      *
      * An `oidc::error` that `oidc::device_auth::token()` threw is passed on
      * unchanged the same way, and the client's error keeps its OIDC detail
@@ -307,10 +309,13 @@ inline void report_current_exception(::questdb_token_sink* sink) noexcept
         // classification, which the client keeps. A closed provider's failure
         // then stops the clients with its own code and `provider_closed`
         // still set. Reported as terminal instead, it reached them as
-        // `config_error`, without the classification.
+        // `config_error`, without the classification. The same holds for a
+        // `line_sender_error` -- the one attaching a closed provider to
+        // `ingress::opts` throws, say -- and for one carrying OIDC detail,
+        // which the client then keeps as it does an `oidc::error`'s.
         const auto& classification = e.token_unavailable_diagnostic();
         const ::questdb_error* const raw = error_access::c_error(e);
-        if (classification && raw &&
+        if (raw && (classification || ::questdb::error::has_oidc_detail(raw)) &&
             ::questdb_token_sink_set_error_from(sink, raw))
             return;
         // A QuestDB error with no C error to pass on, or no classification.
