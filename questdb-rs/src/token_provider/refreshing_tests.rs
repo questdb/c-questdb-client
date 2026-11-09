@@ -664,6 +664,90 @@ fn c8_a_rejection_inside_the_rate_limit_waits_for_the_running_forced_fetch() {
     assert_eq!(script.calls(), 2);
 }
 
+/// T1 held and usable, and its proactive refresh failed with `retry_after`,
+/// so failure backoff holds off every fetch for that long.
+fn held_token_backing_off(
+    clock: &Arc<ManualClock>,
+    script: &Arc<Script>,
+    retry_after: Duration,
+) -> RefreshingTokenProvider {
+    script.push(Ok(token("T1", T0 + HOUR)));
+    script.push(Err(Error::token_unavailable(
+        true,
+        Some(retry_after),
+        "throttled",
+    )));
+    let provider = manual(clock, script).build().unwrap();
+    assert!(provider.run_due_fetch());
+    clock.advance_ms(provider.scheduled_in().unwrap().as_millis() as i64);
+    assert!(provider.run_due_fetch());
+    assert_eq!(provider.status().consecutive_failures, 1);
+    assert_eq!(provider.scheduled_in(), Some(retry_after));
+    assert_eq!(provider.token().unwrap(), "T1");
+    provider
+}
+
+#[test]
+fn c8_a_rejection_returns_at_once_when_backoff_outlasts_the_forced_wait() {
+    // Backoff lets no fetch start before the forced wait would end, so no
+    // replacement can arrive in time: neither the rejection that requests the
+    // forced refresh nor a later one inside the rate limit may hold its caller
+    // -- an ILP/HTTP flush answered 401 -- for `forced_wait` only to get the
+    // rejected token back.
+    let clock = ManualClock::new();
+    let script = Arc::new(Script::default());
+    let provider = held_token_backing_off(&clock, &script, Duration::from_secs(30));
+    let start = clock.monotonic();
+    for round in 1..=2 {
+        let rejecter = {
+            let provider = provider.clone();
+            thread::spawn(move || provider.on_rejected("T1", 401))
+        };
+        // The manual clock does not move: only an early return ends the wait.
+        await_true(&format!("rejection {round} to return"), || {
+            rejecter.is_finished()
+        });
+        rejecter.join().unwrap();
+    }
+    let replay = {
+        let provider = crate::token_provider::TokenProvider::new(provider.clone());
+        thread::spawn(move || {
+            crate::token_provider::with_rejected_credential(Some("Bearer T1"), || {
+                provider.bearer_header()
+            })
+            .unwrap()
+        })
+    };
+    await_true("a client's 401 replay to return", || replay.is_finished());
+    assert_eq!(replay.join().unwrap(), "Bearer T1");
+    assert_eq!(clock.monotonic(), start);
+    assert_eq!(script.calls(), 2, "backoff must still hold off the fetch");
+    assert_eq!(provider.scheduled_in(), Some(Duration::from_secs(30)));
+}
+
+#[test]
+fn c8_a_rejection_still_waits_for_a_backoff_that_ends_within_the_forced_wait() {
+    let clock = ManualClock::new();
+    let script = Arc::new(Script::default());
+    let provider = held_token_backing_off(&clock, &script, Duration::from_secs(2));
+    script.push(Ok(token("T2", T0 + 2 * HOUR)));
+    let rejecter = {
+        let provider = provider.clone();
+        thread::spawn(move || {
+            provider.on_rejected("T1", 401);
+            provider.token().unwrap()
+        })
+    };
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !rejecter.is_finished(),
+        "gave up on a fetch that can still arrive"
+    );
+    clock.advance_ms(2 * SEC);
+    assert!(provider.run_due_fetch());
+    assert_eq!(rejecter.join().unwrap(), "T2");
+}
+
 #[test]
 fn c8_a_wrapped_provider_refreshes_a_token_rejected_with_401() {
     // Wrapped in a closure, the provider never hears `on_rejected`: the

@@ -457,7 +457,9 @@ pub struct TokenProviderStatus {
 /// - **Forced refresh.** [`on_rejected`](Self::on_rejected) with HTTP 401 for
 ///   the current token starts a fetch, at most once per `forced_min_interval`,
 ///   and waits up to `forced_wait` for it. Another rejection of the same token
-///   while that fetch runs waits for it too. Clients call it when a server
+///   while that fetch runs waits for it too. While failure backoff holds off
+///   every fetch until after that wait would end, it returns at once instead.
+///   Clients call it when a server
 ///   rejects the token with a 401 that a new token can fix: one whose
 ///   `WWW-Authenticate` Bearer challenge names no error, or `invalid_token`.
 /// - **Close.** [`close`](Self::close) stops the refresher and wakes every
@@ -681,7 +683,9 @@ impl RefreshingTokenProvider {
     /// Forced refresh (spec §5.5). When a server answered HTTP 401 to `token`
     /// and that token is still the current one, start a fetch now -- joining
     /// one already running, and respecting failure backoff -- and wait up to
-    /// `forced_wait` for it.
+    /// `forced_wait` for it. When backoff holds off every fetch until after
+    /// `forced_wait`, no new token can arrive in time, so it returns at once,
+    /// as [`token`](Self::token) does when it cannot fetch before `cold_wait`.
     ///
     /// Ignored for any other status, for a token that has already rotated,
     /// and within `forced_min_interval` of the previous forced refresh. A
@@ -1094,6 +1098,15 @@ impl Shared {
         while !st.closed && st.completed_fetches < target {
             let now = self.clock.monotonic();
             if now >= deadline || cancel.is_some_and(|cancel| cancel()) {
+                break;
+            }
+            // Backoff refused the fetch, and lets none start before the
+            // deadline: nothing can arrive in time. Waiting anyway held an
+            // ILP/HTTP flush for the whole `forced_wait` only to hand back the
+            // token the server had just rejected -- and every other 401 for
+            // it inside `forced_min_interval` for as long again. The cold path
+            // in `token_within` stops on the same condition.
+            if !st.fetch_running && st.backoff_until.is_some_and(|until| until > deadline) {
                 break;
             }
             st = self.wait(st, Some(deadline - now), cancel.is_some());

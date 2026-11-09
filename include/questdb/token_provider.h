@@ -403,7 +403,9 @@ void questdb_token_free(questdb_token* token);
  * client of your own. A refreshing provider refreshes early on a 401 for its
  * current token -- at most once per `forced_min_interval_ms` -- and waits up
  * to `forced_wait_ms` for the result. A 401 for the same token while that
- * refresh is still fetching starts no fetch but waits for it too.
+ * refresh is still fetching starts no fetch but waits for it too. While the
+ * provider backs off from failed fetches until after that wait would end, no
+ * new token can arrive in time, and the call returns at once.
  */
 QUESTDB_CLIENT_API
 void questdb_token_provider_on_rejected(
