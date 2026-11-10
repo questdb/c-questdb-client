@@ -98,6 +98,7 @@ stages:
           vmImage: $(imageName)
         timeoutInMinutes: 90
         steps:
+          - template: templates/macos_dns.yaml
           - checkout: self
             fetchDepth: 1
             lfs: false
@@ -122,6 +123,7 @@ stages:
           vmImage: $(imageName)
         timeoutInMinutes: 90
         steps:
+          - template: templates/macos_dns.yaml
           - checkout: self
             fetchDepth: 1
             lfs: false
@@ -418,6 +420,7 @@ stages:
           vmImage: $(imageName)
         timeoutInMinutes: 90
         steps:
+          - template: templates/macos_dns.yaml
           - checkout: self
             fetchDepth: 1
             lfs: false
