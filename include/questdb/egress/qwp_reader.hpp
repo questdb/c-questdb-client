@@ -2645,7 +2645,10 @@ public:
      *         `batch::symbol_dict`). Invalidated by the next `next_batch`,
      *         `cancel`, `add_credit`, cursor destruction, or mid-query
      *         failover; do not cache across batches.
-     * @throws questdb::error on transport / protocol failure.
+     * @throws questdb::error on transport / protocol failure. With
+     *         `interrupt_on_eintr=on`, a read interrupted by a signal
+     *         throws with code `error_code::interrupted`; the cursor stays
+     *         usable and calling this again resumes the stream.
      */
     std::optional<egress::batch> next_batch()
     {
@@ -2745,7 +2748,10 @@ public:
      *         documentation for release responsibilities.
      * @throws questdb::error on transport / protocol failure or any
      *         Arrow-specific error (`schema_drift`, `no_schema`,
-     *         `arrow_export`).
+     *         `arrow_export`). With `interrupt_on_eintr=on`, a read
+     *         interrupted by a signal throws with code
+     *         `error_code::interrupted`; the cursor (and its pinned schema)
+     *         stays usable and calling this again resumes the stream.
      *
      * Unlike `next_batch`, the returned `arrow_batch` is NOT invalidated
      * by subsequent cursor operations — it owns its release callbacks
@@ -2877,7 +2883,13 @@ public:
 
     /** Send a CANCEL frame and drain the stream until terminal.
      *  @throws questdb::error on transport failure or if this cursor
-     *          has been moved from. */
+     *          has been moved from. With `interrupt_on_eintr=on`, a drain
+     *          interrupted by a signal throws with code
+     *          `error_code::interrupted`; the cursor stays usable and
+     *          calling `cancel()` again resumes the drain without
+     *          re-sending CANCEL. Each resumed call re-arms the drain read
+     *          timeout, so under continuous signals the caller's retry
+     *          loop bounds the drain. */
     void cancel()
     {
         ensure_impl();
