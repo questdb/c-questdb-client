@@ -206,7 +206,7 @@ git fetch origin --tags --prune
 git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
-git switch -c release/7.2.1
+git switch -c release/7.3.0
 ```
 
 Do not prepare a release from a dirty feature-branch checkout.
@@ -216,7 +216,7 @@ Do not prepare a release from a dirty feature-branch checkout.
 For a future version change, preview before modifying files:
 
 ```bash
-NEW_VERSION=7.2.1
+NEW_VERSION=7.3.0
 bump-my-version replace --new-version "$NEW_VERSION" --dry-run
 bump-my-version replace --new-version "$NEW_VERSION"
 ```
@@ -327,7 +327,7 @@ git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-VERSION=7.2.1
+VERSION=7.3.0
 RELEASE_SHA="$(git rev-parse HEAD)"
 
 git show --no-patch --format=fuller "$RELEASE_SHA"
@@ -488,7 +488,7 @@ git switch main
 git pull --ff-only
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-VERSION=7.2.1
+VERSION=7.3.0
 RELEASE_SHA="$(git rev-parse HEAD)"
 
 git show --no-patch --format=fuller "$RELEASE_SHA"
@@ -573,7 +573,7 @@ can hide packaging mistakes:
 SMOKE_ROOT="$(mktemp -d)"
 cargo new "$SMOKE_ROOT/qdb-rs-release-smoke"
 cd "$SMOKE_ROOT/qdb-rs-release-smoke"
-cargo add questdb-rs@=7.2.1
+cargo add questdb-rs@=7.3.0
 cargo check
 ```
 
@@ -628,11 +628,11 @@ A crates.io version cannot be overwritten or deleted.
 To yank without deleting the already published package:
 
 ```bash
-cargo yank --version 7.2.1 questdb-rs
+cargo yank --version 7.3.0 questdb-rs
 ```
 
 Yanking does not break consumers whose lockfiles already select the version.
-Never reuse 7.2.1 after yanking it.
+Never reuse 7.3.0 after yanking it.
 
 ## Final release checklist
 
