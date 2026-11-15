@@ -40,11 +40,13 @@ verdict explicitly approves.
 - If the verdict is `request changes`, STOP and suggest `/skill:reject-pr`.
 - If the verdict is `needs discussion`, STOP and explain that an architecture,
   product, or compatibility decision is still required.
-- Preserve the report verbatim. Do not shorten, summarize, or rewrite it.
+- Preserve the report verbatim. Do not shorten, summarize, or rewrite it. The
+  one exception: leave out each Adjacent draft marked `Private: yes`, which
+  `review-pr` keeps out of public view, and tell the user you did.
 - Require the report's first line to match exactly:
   `Reviewing PR #<number> at level <N>, head <40-character headRefOid>, base <40-character baseRefOid>.`
-  Extract that PR number as `REVIEWED_PR` and the full head OID as
-  `REVIEWED_HEAD`. Reject missing, abbreviated, or malformed identities and tell
+  Extract that PR number as `REVIEWED_PR`, the full head OID as
+  `REVIEWED_HEAD`, and the full base OID as `REVIEWED_BASE`. Reject missing, abbreviated, or malformed identities and tell
   the user to rerun `review-pr`.
 
 ## Step 1: Detect and validate the PR
@@ -55,7 +57,9 @@ Normalize either form to the numeric PR number before constructing file paths.
 ```bash
 REVIEWED_PR='<numeric PR number from the review identity line>'
 REVIEWED_HEAD='<full head OID from the review identity line>'
-if ! [[ "$REVIEWED_PR" =~ ^[0-9]+$ && "$REVIEWED_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+REVIEWED_BASE='<full base OID from the review identity line>'
+if ! [[ "$REVIEWED_PR" =~ ^[0-9]+$ && "$REVIEWED_HEAD" =~ ^[0-9a-f]{40}$ &&
+        "$REVIEWED_BASE" =~ ^[0-9a-f]{40}$ ]]; then
   echo "The review report has no valid full PR/head identity. Run review-pr again."
   exit 1
 fi
@@ -86,6 +90,16 @@ if [ "$CURRENT_HEAD" != "$REVIEWED_HEAD" ]; then
   echo "PR #$PR moved from reviewed head $REVIEWED_HEAD to $CURRENT_HEAD. Run review-pr again."
   exit 1
 fi
+# The review covers the whole PR only when its base forks from the head at the
+# same commit as the PR's base. A review of a range that starts inside the PR,
+# such as at the last reviewed commit, covers only the newer commits.
+if ! PR_BASE=$(gh pr view "$PR" --json baseRefOid --jq .baseRefOid) ||
+   ! PR_FORK=$(gh api "repos/{owner}/{repo}/compare/$PR_BASE...$REVIEWED_HEAD" --jq .merge_base_commit.sha) ||
+   ! REVIEWED_FORK=$(gh api "repos/{owner}/{repo}/compare/$REVIEWED_BASE...$REVIEWED_HEAD" --jq .merge_base_commit.sha) ||
+   [ -z "$PR_FORK" ] || [ "$PR_FORK" != "$REVIEWED_FORK" ]; then
+  echo "The review's base $REVIEWED_BASE does not cover all of PR #$PR. Run review-pr on the whole PR."
+  exit 1
+fi
 gh pr view "$PR" --json number,title,author,headRefName,headRefOid,url,state,isDraft,labels
 ```
 
@@ -94,6 +108,8 @@ Before posting anything, verify all of the following:
 - the PR is open;
 - it is the same PR reviewed by the most recent `review-pr` report;
 - its current `headRefOid` exactly matches the report's full `REVIEWED_HEAD`;
+- the report's `REVIEWED_BASE` forks from that head where the PR's base does, so
+  the review covered the whole PR;
 - if it is a draft, STOP rather than marking it ready;
 - if it has `DO NOT MERGE`, STOP and ask the user to resolve that label — do
   not silently remove or override it.
@@ -103,7 +119,8 @@ State one line to the user: `Approving PR #<number> — <title>`, then proceed.
 
 ## Step 2: Write the review body to a file
 
-Write the complete, verbatim `review-pr` report to
+Write the complete, verbatim `review-pr` report, minus the drafts Step 0 leaves
+out, to
 `/tmp/approve-pr-$PR.md` using the `write` tool. Never interpolate the report
 into a shell command — reviews contain backticks, quotes, and `$` characters
 that break shell quoting.
