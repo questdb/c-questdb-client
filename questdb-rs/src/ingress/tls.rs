@@ -3,7 +3,8 @@ use crate::ingress::CertificateAuthority;
 #[cfg(any(
     feature = "_sender-tcp",
     feature = "_sender-http",
-    feature = "_sender-qwp-ws"
+    feature = "_sender-qwp-ws",
+    feature = "_oidc"
 ))]
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
@@ -13,7 +14,8 @@ use std::path::Path;
 #[cfg(any(
     feature = "_sender-tcp",
     feature = "_sender-http",
-    feature = "_sender-qwp-ws"
+    feature = "_sender-qwp-ws",
+    feature = "_oidc"
 ))]
 use std::sync::Arc;
 
@@ -77,7 +79,8 @@ mod danger {
     any(
         feature = "_sender-tcp",
         feature = "_sender-http",
-        feature = "_sender-qwp-ws"
+        feature = "_sender-qwp-ws",
+        feature = "_oidc"
     ),
 ))]
 fn add_webpki_roots(root_store: &mut RootCertStore) {
@@ -91,7 +94,8 @@ fn add_webpki_roots(root_store: &mut RootCertStore) {
     any(
         feature = "_sender-tcp",
         feature = "_sender-http",
-        feature = "_sender-qwp-ws"
+        feature = "_sender-qwp-ws",
+        feature = "_oidc"
     ),
 ))]
 fn unpack_os_native_certs(
@@ -117,7 +121,8 @@ fn unpack_os_native_certs(
     any(
         feature = "_sender-tcp",
         feature = "_sender-http",
-        feature = "_sender-qwp-ws"
+        feature = "_sender-qwp-ws",
+        feature = "_oidc"
     ),
 ))]
 fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
@@ -155,7 +160,8 @@ pub(crate) enum TlsSettings {
         not(any(
             feature = "_sender-tcp",
             feature = "_sender-http",
-            feature = "_sender-qwp-ws"
+            feature = "_sender-qwp-ws",
+            feature = "_oidc"
         )),
         allow(dead_code)
     )]
@@ -282,7 +288,7 @@ impl TlsSettings {
 /// (`[::1]`), which rustls parses as neither a DNS name nor an IP address, so
 /// every HTTPS request to an IPv6-literal host failed before the handshake.
 /// Strip them so the certificate is verified against the IP address.
-#[cfg(feature = "_sender-http")]
+#[cfg(any(feature = "_sender-http", feature = "_oidc"))]
 pub(crate) fn server_name_for_uri_host(
     host: &str,
 ) -> std::result::Result<rustls_pki_types::ServerName<'static>, rustls_pki_types::InvalidDnsNameError>
@@ -297,7 +303,8 @@ pub(crate) fn server_name_for_uri_host(
 #[cfg(any(
     feature = "_sender-tcp",
     feature = "_sender-http",
-    feature = "_sender-qwp-ws"
+    feature = "_sender-qwp-ws",
+    feature = "_oidc"
 ))]
 pub(crate) fn configure_tls(tls: TlsSettings) -> Result<Arc<rustls::ClientConfig>> {
     let mut root_store = RootCertStore::empty();
@@ -351,7 +358,7 @@ pub(crate) fn configure_tls(tls: TlsSettings) -> Result<Arc<rustls::ClientConfig
     Ok(Arc::new(config))
 }
 
-#[cfg(all(test, feature = "_sender-http"))]
+#[cfg(all(test, any(feature = "_sender-http", feature = "_oidc")))]
 mod tests {
     use super::server_name_for_uri_host;
     use rustls_pki_types::ServerName;

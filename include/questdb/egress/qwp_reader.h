@@ -188,6 +188,52 @@ qwp_reader* qwp_reader_from_conf(
     line_sender_utf8 config, questdb_error** err_out);
 
 /**
+ * Construct a reader whose WebSocket handshake uses `auth` as a rotating
+ * Bearer-token provider. The reader retains shared ownership of the auth state,
+ * so the caller may free its auth handle after this call returns. Provider
+ * calls may load or silently refresh a token but never start an interactive
+ * device flow; call questdb_oidc_auth_sign_in before opening the reader. After
+ * a handshake 401 for a token that had not expired, the one re-resolution a
+ * connect makes refreshes it rather than presenting it again (at most once
+ * every 30 seconds per auth). A connect re-resolves only when the 401's
+ * `WWW-Authenticate` challenge allows it (no Bearer error, or
+ * `invalid_token`).
+ * Mutually exclusive with static credentials: `config` must not also set
+ * `username`/`password` or `token`. Setting both fails with
+ * `questdb_error_config_error`. An `auth` already closed with
+ * `questdb_oidc_auth_close` is rejected with QUESTDB_OIDC_ERROR_CANCELLED.
+ * Use `wss::` (TLS): over plain `ws::` to a non-loopback host the Bearer token
+ * is sent in cleartext and can be captured in transit.
+ * The config string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
+ */
+QUESTDB_CLIENT_API
+qwp_reader* qwp_reader_from_conf_with_oidc(
+    line_sender_utf8 config,
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
+
+/**
+ * Construct a reader from a QuestDB config string and use `provider` (see
+ * `questdb/token_provider.h`) as its rotating Bearer-token provider. The
+ * reader keeps its own reference: `provider` may be freed afterwards. On a 401
+ * the reader calls the provider's `on_rejected`, pulls again, and replays the
+ * endpoint once if the token changed and the `WWW-Authenticate` challenge
+ * allows it.
+ *
+ * Mutually exclusive with static credentials in `config`. Use `wss::`. A
+ * refreshing provider already closed with `questdb_token_provider_close` is
+ * rejected with its permanent `questdb_error_auth_error`. The config string
+ * must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
+ *
+ * Returns NULL and sets `*err_out` on failure.
+ */
+QUESTDB_CLIENT_API
+qwp_reader* qwp_reader_from_conf_with_token_provider(
+    line_sender_utf8 config,
+    const questdb_token_provider* provider,
+    questdb_error** err_out);
+
+/**
  * Construct a reader from the configuration stored in the
  * `QDB_CLIENT_CONF` environment variable. The variable's value follows
  * the same format as `qwp_reader_from_conf`.
@@ -751,6 +797,9 @@ void qwp_reader_query_free(qwp_reader_query* query);
  * violation: the call sets `*err_out` to
  * `questdb_error_invalid_api_call` and returns NULL.
  *
+ * If the reader's last mid-query failover gave up and left it without a
+ * connection, this reconnects first; a failed reconnect fails this call.
+ *
  * On success, ownership transfers to the returned cursor; on failure,
  * `*err_out` is set and NULL is returned.
  */
@@ -987,6 +1036,35 @@ QUESTDB_CLIENT_API void qwp_reader_query_set_reset_symbol_dict(
     qwp_reader_query*, bool reset);
 
 /**
+ * Run this query under its own timeout, in milliseconds, instead of the
+ * server-wide `query.timeout`. Overrides the connect string's
+ * `query_timeout_ms` for this query; `0` clears it (no client timeout).
+ * Mirrors `ReaderQuery::timeout`.
+ *
+ * Requires a server advertising `CAP_QUERY_TIMEOUT` (`0x08` in
+ * `qwp_reader_server_info_capabilities`). Unlike
+ * `qwp_reader_query_set_reset_symbol_dict`, this does NOT silently degrade:
+ * against an older server `qwp_reader_query_execute` fails with
+ * `line_sender_error_unsupported_server`, before anything is written, instead
+ * of running the query under the server default while the caller believes
+ * its timeout applied. The connection is untouched by that refusal. Raise
+ * the server's `query.timeout` instead, or clear the timeout here.
+ *
+ * The server applies no ceiling, so a value above `query.timeout` is
+ * honoured — which is the point for a long transform.
+ *
+ * On expiry the cursor terminates with `line_sender_error_query_timeout` and
+ * the connection stays open and authenticated, so the next query runs on it
+ * without reconnecting. DO NOT RETRY A WRITE on that error: a statement that
+ * completes past its timeout is answered with `EXEC_DONE` and its row count
+ * rather than a timeout (so a retry cannot apply it twice), and a DDL /
+ * INSERT / UPDATE that timed out waiting for the table writer may still be
+ * applied by that writer afterwards.
+ */
+QUESTDB_CLIENT_API void qwp_reader_query_set_timeout_ms(
+    qwp_reader_query*, uint64_t timeout_ms);
+
+/**
  * Install a failover-reset callback on the query. Replaces any previously
  * installed callback. `user_data` is opaque to the library; pass NULL if
  * not needed. The callback fires on the thread driving
@@ -1098,12 +1176,20 @@ typedef struct qwp_reader_batch qwp_reader_batch;
  * started the failover. A reconnect error naming what to fix is one coded
  * `questdb_error_auth_error`, `questdb_error_role_mismatch`,
  * `questdb_error_config_error`, `questdb_error_unsupported_server`,
- * `questdb_error_handshake_error` or `questdb_error_tls_error`. This
- * includes a give-up caused by `failover_max_duration_ms` running out while
- * attempts remain: if the last round was rejected on role, at the WebSocket
- * upgrade or at TLS, that code is returned (message prefixed with "failover
- * wall-clock budget exhausted"), not the `questdb_error_socket_error` or
+ * `questdb_error_handshake_error` or `questdb_error_tls_error`, or one
+ * carrying an OIDC payload (`questdb_error_oidc_get_view`) or a token
+ * provider's failure to supply a credential
+ * (`questdb_error_token_unavailable_get_view`). This includes a give-up
+ * caused by `failover_max_duration_ms` running out while attempts remain:
+ * if the last round was rejected on role, at the WebSocket upgrade or at
+ * TLS, that code is returned (message prefixed with "failover wall-clock
+ * budget exhausted"), not the `questdb_error_socket_error` or
  * `questdb_error_protocol_error` that started the failover.
+ *
+ * A failover that gives up leaves the reader without a connection, but not
+ * unusable: its next `qwp_reader_execute` or `qwp_reader_query_execute`
+ * reconnects first. A failed reconnect fails that call, and the next call
+ * tries again.
  */
 QUESTDB_CLIENT_API
 const qwp_reader_batch* qwp_reader_cursor_next_batch(
@@ -1356,7 +1442,7 @@ qwp_reader_cursor_current_addr_port(const qwp_reader_cursor*);
  * while a cursor is live).
  *
  * Returns `false` and sets `*err_out` on failure: the cursor handle is
- * NULL, or the underlying connection is poisoned after a failed mid-query
+ * NULL, or the underlying connection was lost after a failed mid-query
  * failover. On success returns `true` and writes `*out_version`.
  */
 QUESTDB_CLIENT_API bool qwp_reader_cursor_server_version(
@@ -1397,13 +1483,31 @@ QUESTDB_CLIENT_API bool qwp_reader_cursor_terminal_end(
 /**
  * If the terminal is `EXEC_DONE`, fill the output parameters and return
  * true; otherwise zeroes both outputs and returns false.
+ *
+ * `*out_rows_affected` is the row count of an `INSERT` / `UPDATE`. For a
+ * statement the server executes at parse time (`TRUNCATE`, `RENAME TABLE`,
+ * `SET`, ...) it reports no count: it sends `-1`, which arrives as
+ * `QWP_READER_ROWS_AFFECTED_UNKNOWN` (`UINT64_MAX`). `*out_op_type` is the
+ * server's operation-type byte, carried through opaquely.
  */
 QUESTDB_CLIENT_API bool qwp_reader_cursor_terminal_exec_done(
     const qwp_reader_cursor* cursor,
     uint8_t* out_op_type,
     uint64_t* out_rows_affected);
 
-/** Whether freeing this cursor leaves its reader reusable; false for NULL. */
+/** `*out_rows_affected` of `qwp_reader_cursor_terminal_exec_done` for a
+ *  statement that reports no row count. */
+#define QWP_READER_ROWS_AFFECTED_UNKNOWN UINT64_MAX
+
+/**
+ * Whether freeing this cursor leaves its reader reusable; false for NULL.
+ *
+ * True only once the stream reached a terminal frame (or was cancelled to
+ * one) with no query still active and the transport up. A cursor that is
+ * terminal only because a client-side error ended it mid-stream still has
+ * frames in flight; freeing it sends `CANCEL` and closes the transport, so
+ * this reports false for it.
+ */
 QUESTDB_CLIENT_API bool qwp_reader_cursor_connection_reusable(
     const qwp_reader_cursor* cursor);
 

@@ -173,7 +173,7 @@ public:
         ::line_sender_error* c_err{nullptr};
         size_t r = ::qwp_chunk_row_count(_raw, &c_err);
         if (r == static_cast<size_t>(-1))
-            throw line_sender_error::from_c(c_err);
+            line_sender_error::throw_from_c(c_err);
         return r;
     }
 
@@ -1159,8 +1159,12 @@ private:
  * cache. Use `sf_durability=periodic` to checkpoint the local replay log.
  * `sf_sync_interval_millis` defaults to 5000; it is a target, not a maximum
  * loss window. `sf_durability=flush` and `sf_durability=append` are not yet
- * supported. End-to-end durability also requires
- * `request_durable_ack=on` and a durable ACK from QuestDB Enterprise.
+ * supported. Server durability is selected independently with
+ * `request_durable_ack`: `local` (a server running
+ * `cairo.commit.mode=adaptive`), `replicated` or its original name `on`
+ * (QuestDB Enterprise), or `local,replicated` (both: QuestDB Enterprise with
+ * `cairo.commit.mode=adaptive`, which a replicating primary runs only when the
+ * mode is set explicitly).
  */
 class borrowed_sender
 {
@@ -1210,7 +1214,7 @@ public:
         ::line_sender_error* c_err{nullptr};
         auto* raw = ::questdb_db_new_buffer(_db, &c_err);
         if (!raw)
-            throw line_sender_error::from_c(c_err);
+            line_sender_error::throw_from_c(c_err);
         try
         {
             line_sender_error::wrapped_call(

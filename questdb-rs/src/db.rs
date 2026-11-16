@@ -60,7 +60,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "_egress")]
-use crate::egress::Reader;
+use crate::egress::{Reader, ReaderConfig};
 use crate::ingress::conn_events;
 use crate::ingress::rejection_events;
 use crate::ingress::sender::is_candidate_orphan;
@@ -82,7 +82,7 @@ use crate::ingress::{
     )),
     allow(unused_imports)
 )]
-use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
+use crate::ingress::{reconnect_backoff_step, reconnect_error_is_foreground_terminal};
 use crate::{Result, error};
 
 /// Connect-string parsing for the [`QuestDb`] pool. Shared by every borrow
@@ -236,13 +236,36 @@ pub struct QuestDb {
     reaper: Option<JoinHandle<()>>,
 }
 
+/// Where a pooled reader's configuration comes from.
+///
+/// One connect string drives both the ingest and the query side, and the two
+/// parsers do not accept the same values: the sender treats the query-side keys
+/// as pass-through (see `QWP_WS_PORTABLE_CONFIG_KEYS`), while `ReaderConfig`
+/// range-checks them. Parsing the query side eagerly is what lets a rotating
+/// token provider be wired into every pooled reader, but making that parse
+/// fatal would refuse a connect string this pool accepted before the parse
+/// moved forward -- breaking an ingest-only deployment on upgrade, over a value
+/// its query side never used.
+#[cfg(feature = "_egress")]
+enum ReaderConfigSource {
+    /// Parsed at connect time, with any rotating token provider already wired
+    /// in and inherited by every pooled reader connection.
+    Ready(Box<ReaderConfig>),
+    /// The connect string carries a query-side value `ReaderConfig` rejects.
+    /// The pool still opens for ingest; the failure is reproduced from the
+    /// original string if and when a reader is actually asked for, which is the
+    /// same point, and the same error, a caller met before the parse was
+    /// hoisted to connect time. A token provider cannot be wired into a config
+    /// that does not parse, but nothing here can produce a reader anyway.
+    Deferred(String),
+}
+
 struct DbInner {
-    /// Original connect string. Kept verbatim so the reader pool
-    /// (`Reader::from_conf`) can spin up a new connection with the same
-    /// settings. The sender pools connect through pre-parsed builders so they
-    /// can override only the managed disk-SF slot id.
+    /// Reusable reader configuration. Kept as a resolved config rather than the
+    /// original connect string so programmatic state such as a rotating token
+    /// provider is inherited by every pooled reader connection.
     #[cfg(feature = "_egress")]
-    conf: String,
+    reader_config: ReaderConfigSource,
     /// Resolved, reusable QWP/WebSocket connect ingredients (endpoint list,
     /// TLS, auth, config). Every sender connection — first-borrow open,
     /// auto-grow, and failover re-borrow — opens through this connector so it rotates
@@ -314,9 +337,12 @@ struct DbInner {
     /// `2 * sender_pool_max + query_pool_max`.
     #[cfg(feature = "_egress")]
     reader_state: Mutex<ReaderPoolState>,
-    /// Wakes the reaper thread on `shutdown` and lets a disk-SF borrow wait
-    /// briefly for an in-flight slot close to release its flock.
+    /// Wakes at-cap store-and-forward borrows when a sender is returned or
+    /// an in-flight disk slot close releases its flock. Paired with `state`.
     cv: Condvar,
+    /// Wakes the reaper on shutdown, without triggering a sweep on every
+    /// store-and-forward sender return. Also paired with `state`.
+    reaper_cv: Condvar,
     /// Wakes at-cap direct-pool borrows when a direct sender is returned
     /// or a reservation is rolled back. Paired with `direct_state`.
     direct_cv: Condvar,
@@ -439,7 +465,8 @@ impl<S> PoolState<S> {
 struct PoolEntry<S> {
     sender: S,
     slot_index: Option<usize>,
-    last_idle_at: Instant,
+    // Fixed-size SF pools never reap idle entries.
+    last_idle_at: Option<Instant>,
 }
 
 struct PooledSender<S> {
@@ -641,7 +668,8 @@ fn preopen_recovery_sender(
                 state.free.push(PoolEntry {
                     sender,
                     slot_index,
-                    last_idle_at: Instant::now(),
+                    last_idle_at: (inner.sender_pool_min < inner.sender_pool_max)
+                        .then(Instant::now),
                 });
             }
             slot.commit();
@@ -797,6 +825,71 @@ impl QuestDb {
     /// producer-side abort logic belongs with the terminal error raised by
     /// the sender calls themselves.
     pub fn connect_with_handlers(conf: &str, handlers: ConnectHandlers) -> Result<Self> {
+        Self::connect_with_handlers_and_provider(conf, handlers, None)
+    }
+
+    /// [`Self::connect`] with one rotating Bearer-token provider shared by all
+    /// ingestion and query connections created by the pool. The callback is
+    /// pulled on every sender/reader connect and reconnect.
+    ///
+    /// Call an interactive provider once on the main thread before constructing
+    /// an eager pool. Otherwise initial sender/reader prewarming may invoke it
+    /// from connection setup, and lazy/background senders may invoke it from a
+    /// worker thread.
+    ///
+    /// A [`RefreshingTokenProvider`](crate::token_provider::RefreshingTokenProvider)
+    /// that was already closed is refused here, with the permanent error its
+    /// [`token`](crate::token_provider::RefreshingTokenProvider::token) returns.
+    pub fn connect_with_token_provider<P>(conf: &str, provider: P) -> Result<Self>
+    where
+        P: crate::token_provider::BearerTokenProvider + 'static,
+    {
+        Self::connect_with_handlers_and_token_provider(conf, ConnectHandlers::default(), provider)
+    }
+
+    /// [`Self::connect_with_handlers`] with one rotating Bearer-token provider
+    /// shared by the sender and reader pools.
+    pub fn connect_with_handlers_and_token_provider<P>(
+        conf: &str,
+        handlers: ConnectHandlers,
+        provider: P,
+    ) -> Result<Self>
+    where
+        P: crate::token_provider::BearerTokenProvider + 'static,
+    {
+        Self::connect_with_handlers_and_provider(
+            conf,
+            handlers,
+            Some(crate::token_provider::TokenProvider::new(provider)),
+        )
+    }
+
+    /// Binding-only form that shares one authentication object's isolated QWP
+    /// acquisition across every sender and reader attachment in this pool.
+    #[doc(hidden)]
+    pub fn connect_with_handlers_and_token_provider_with_isolation<P>(
+        conf: &str,
+        handlers: ConnectHandlers,
+        provider: P,
+        isolation: crate::TokenProviderIsolation,
+    ) -> Result<Self>
+    where
+        P: crate::token_provider::BearerTokenProvider + 'static,
+    {
+        Self::connect_with_handlers_and_provider(
+            conf,
+            handlers,
+            Some(crate::token_provider::TokenProvider::new_with_isolation(
+                provider, isolation,
+            )),
+        )
+    }
+
+    fn connect_with_handlers_and_provider(
+        conf: &str,
+        handlers: ConnectHandlers,
+        token_provider: Option<crate::token_provider::TokenProvider>,
+    ) -> Result<Self> {
         const MAX_CALLBACK_INBOX_CAPACITY: usize = 65_536;
         if handlers.connection_event_inbox_capacity > MAX_CALLBACK_INBOX_CAPACITY {
             return Err(error::fmt!(
@@ -824,13 +917,14 @@ impl QuestDb {
             ),
             None => rejection_events::RejectionEventSource::logging_default(),
         };
-        Self::connect_impl(conf, conn_events, rejections)
+        Self::connect_impl(conf, conn_events, rejections, token_provider)
     }
 
     fn connect_impl(
         conf: &str,
         conn_events: conn_events::ConnectionEventSource,
         rejections: rejection_events::RejectionEventSource,
+        token_provider: Option<crate::token_provider::TokenProvider>,
     ) -> Result<Self> {
         let parsed = conf::parse(conf)?;
         // The public ingestion pool is always store-and-forward: in-memory
@@ -839,6 +933,37 @@ impl QuestDb {
         let pool_cfg = parsed.pool;
 
         let mut builder = SenderBuilder::from_conf(conf)?;
+        // Tolerated, not fatal: see `ReaderConfigSource`. The sender parser has
+        // already accepted this string, so a query-side rejection here is a
+        // value the ingest path passes through and never reads.
+        #[cfg(feature = "_egress")]
+        let mut reader_config = match ReaderConfig::from_conf(conf) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                log::warn!(
+                    "Ignoring the query-side configuration for this connection: {e}. \
+                     Ingestion is unaffected, and this is reported again if a reader \
+                     or query is requested."
+                );
+                None
+            }
+        };
+        if let Some(provider) = token_provider {
+            // Preserve one isolated-acquisition identity while sharing this
+            // provider across the pool's sender and reader factories. Reboxing
+            // `provide()` in each factory used to create an independent cell
+            // per attachment and defeated the global worker bound.
+            builder = builder.qwp_ws_token_provider_object(provider.clone())?;
+            #[cfg(feature = "_egress")]
+            if let Some(cfg) = reader_config.take() {
+                reader_config = Some(cfg.token_provider_object(provider)?);
+            }
+        }
+        #[cfg(feature = "_egress")]
+        let reader_config = match reader_config {
+            Some(cfg) => ReaderConfigSource::Ready(Box::new(cfg)),
+            None => ReaderConfigSource::Deferred(conf.to_string()),
+        };
         if pool_cfg.lazy_connect {
             // Java's lazy_connect injects an async initial connect into the
             // ingest config once; every pooled sender then inherits it.
@@ -882,7 +1007,7 @@ impl QuestDb {
 
         let inner = Arc::new(DbInner {
             #[cfg(feature = "_egress")]
-            conf: conf.to_owned(),
+            reader_config,
             connector,
             buffer_max_name_len,
             health: Mutex::new(health),
@@ -910,6 +1035,7 @@ impl QuestDb {
             #[cfg(feature = "_egress")]
             reader_state: Mutex::new(ReaderPoolState::default()),
             cv: Condvar::new(),
+            reaper_cv: Condvar::new(),
             direct_cv: Condvar::new(),
             #[cfg(feature = "_egress")]
             reader_cv: Condvar::new(),
@@ -1021,20 +1147,24 @@ impl QuestDb {
     ///
     /// `ack_level` chooses how far the call blocks before returning:
     /// * `None` — wait for the connect string's default, i.e. the same level
-    ///   the store-and-forward senders use: [`AckLevel::Durable`] when the
-    ///   Enterprise-only durable mode is enabled with
-    ///   `request_durable_ack=on`, otherwise [`AckLevel::Ok`].
+    ///   the store-and-forward senders use: [`AckLevel::LocalDurable`] for
+    ///   `request_durable_ack=local`, [`AckLevel::Durable`] for `on`,
+    ///   `replicated`, or `local,replicated`, otherwise [`AckLevel::Ok`].
     /// * `Some(level)` — wait for exactly `level`. [`AckLevel::Durable`]
-    ///   requires QuestDB Enterprise and `request_durable_ack=on`; otherwise
-    ///   the call is rejected with [`ErrorCode::InvalidApiCall`].
+    ///   requires QuestDB Enterprise and `request_durable_ack=on`,
+    ///   `replicated`, or `local,replicated`; [`AckLevel::LocalDurable`]
+    ///   requires `request_durable_ack=local`; otherwise the call is rejected
+    ///   with [`ErrorCode::InvalidApiCall`].
     ///
     /// The call publishes the batch as a commit boundary and blocks until the
     /// resolved acknowledgement level is reached. An `Ok` acknowledgement
-    /// confirms server acceptance; only the Enterprise durable level confirms
-    /// durable coverage. On a transient [`ErrorCode::FailoverRetry`] it
-    /// surfaces the error rather than replaying (the batch is fully owned by
-    /// the caller, so retrying is a plain re-call); the DataFrame path
-    /// ([`Self::flush_polars_dataframe`]) re-drives automatically instead.
+    /// confirms server acceptance only; the durable levels confirm durability:
+    /// [`AckLevel::LocalDurable`] on the server's own disk, the Enterprise
+    /// [`AckLevel::Durable`] in replication storage. On a transient
+    /// [`ErrorCode::FailoverRetry`] it surfaces the error rather than
+    /// replaying (the batch is fully owned by the caller, so retrying is a
+    /// plain re-call); the DataFrame path ([`Self::flush_polars_dataframe`])
+    /// re-drives automatically instead.
     ///
     /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
     /// [`ErrorCode::InvalidApiCall`]: crate::ErrorCode::InvalidApiCall
@@ -1064,17 +1194,10 @@ impl QuestDb {
     }
 
     /// The ack level these convenience flushes wait for when the caller does
-    /// not name one: [`AckLevel::Durable`] when the connect string enabled the
-    /// Enterprise-only durable mode with `request_durable_ack=on`, otherwise
-    /// [`AckLevel::Ok`]. Mirrors the level the store-and-forward senders use
-    /// for the same pool.
+    /// not name one; see [`default_ack_level_for_tiers`].
     #[cfg(feature = "arrow-ingress")]
     pub(crate) fn default_ack_level(&self) -> AckLevel {
-        if self.inner.connector.request_durable_ack() {
-            AckLevel::Durable
-        } else {
-            AckLevel::Ok
-        }
+        default_ack_level_for_tiers(self.inner.connector.request_durable_ack())
     }
 
     /// FFI escape hatch: like [`Self::borrow_sender`] but the returned
@@ -1313,12 +1436,15 @@ impl QuestDb {
     ///
     /// Egress companion to [`Self::borrow_sender`]: pulls a [`Reader`]
     /// from the pool's reader free list, lazily opening a fresh connection
-    /// (via `Reader::from_conf` on the original connect string) when the
-    /// free list is empty and the pool is below `query_pool_max`. The reader
-    /// pool is lazily grown and capped **independently** of the two ingestion
-    /// pools, so heavy ingest can't starve queries and vice versa (the
-    /// combined live-connection ceiling across all three pools is
-    /// `2 * sender_pool_max + query_pool_max`).
+    /// when the free list is empty and the pool is below `query_pool_max`.
+    /// A new connection uses the reader configuration parsed from the connect
+    /// string when the pool opened, together with any token provider attached
+    /// through [`Self::connect_with_token_provider`]. If the connect string's
+    /// query-side settings did not parse then, the borrow fails with that
+    /// configuration error instead. The reader pool is lazily grown and capped
+    /// **independently** of the two ingestion pools, so heavy ingest can't
+    /// starve queries and vice versa (the combined live-connection ceiling
+    /// across all three pools is `2 * sender_pool_max + query_pool_max`).
     ///
     /// Borrow at the cap waits up to `acquire_timeout_ms` for a return
     /// (`acquire_timeout_ms=0` fails fast), then returns
@@ -1415,7 +1541,12 @@ impl QuestDb {
                 armed: true,
             }
         };
-        let reader = Reader::from_conf(&self.inner.conf)?;
+        let reader = match &self.inner.reader_config {
+            ReaderConfigSource::Ready(cfg) => Reader::from_config(cfg)?,
+            // Reproduce the parse failure the pool tolerated at connect time,
+            // at the point a caller actually needs the query side.
+            ReaderConfigSource::Deferred(conf) => Reader::from_conf(conf)?,
+        };
         slot.commit();
         Ok(reader)
     }
@@ -1459,6 +1590,7 @@ impl Drop for QuestDb {
         {
             let _g = lock_state(&self.inner.state);
             self.inner.cv.notify_all();
+            self.inner.reaper_cv.notify_all();
         }
         {
             let _g = lock_state(&self.inner.direct_state);
@@ -1595,9 +1727,12 @@ impl<'a> DirectSenderHandle<'a> {
 
     /// Retry [`reborrow_from_pool`] within `deadline` using the row API's
     /// reconnect backoff (centered-jittered, role-reject reset; `AuthError` /
-    /// `ProtocolVersionError` terminal). On terminal failure or budget
-    /// exhaustion the handle stays populated (per [`reborrow_from_pool`]), so a
-    /// later call reports a typed error rather than panicking.
+    /// `ProtocolVersionError` terminal, and so is a token-provider failure the
+    /// provider did not classify retryable: see
+    /// [`reconnect_error_is_foreground_terminal`]). On terminal failure or
+    /// budget exhaustion the handle stays populated (per
+    /// [`reborrow_from_pool`]), so a later call reports a typed error rather
+    /// than panicking.
     #[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
     pub(crate) fn reborrow_with_retry(&mut self, deadline: Option<Instant>) -> Result<()> {
         let policy = self.reconnect_policy();
@@ -1606,7 +1741,8 @@ impl<'a> DirectSenderHandle<'a> {
             match self.reborrow_from_pool() {
                 Ok(()) => return Ok(()),
                 Err(e)
-                    if reconnect_error_is_terminal(&e) || reconnect_deadline_expired(deadline) =>
+                    if reconnect_error_is_foreground_terminal(&e)
+                        || reconnect_deadline_expired(deadline) =>
                 {
                     return Err(e);
                 }
@@ -1770,8 +1906,10 @@ impl<'a> BorrowedSender<'a> {
     /// times out here even though delivery is progressing.
     ///
     /// `AckLevel::Durable` requires QuestDB Enterprise and a pool opened with
-    /// `request_durable_ack=on`; otherwise the call is rejected up front
-    /// (`InvalidApiCall`) before `chunk` is touched.
+    /// `request_durable_ack=on`, `replicated`, or `local,replicated`, and
+    /// `AckLevel::LocalDurable` a pool opened with `request_durable_ack=local`;
+    /// otherwise the call is rejected up front (`InvalidApiCall`) before
+    /// `chunk` is touched.
     ///
     /// Failure contract: if local publication fails, `chunk` is untouched and
     /// retryable. Once the frame is accepted into the queue `chunk` is cleared
@@ -1822,10 +1960,12 @@ impl<'a> BorrowedSender<'a> {
     /// Return the highest frame sequence number completed by server ACK or
     /// server-side reject-and-continue, or `None` if no frame has completed.
     ///
-    /// In Enterprise durable-ACK mode this watermark advances after durable
-    /// ACK coverage; use [`Self::wait`] when you need an explicit
-    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier. Compare it only with
-    /// FSNs produced by this same sender stream.
+    /// With durable ACKs this watermark advances only once the durable level
+    /// the pool was opened for covers the frame: the local one for
+    /// `request_durable_ack=local`, the replicated one for any value that
+    /// includes `replicated`. Use [`Self::wait`] when you need an explicit
+    /// [`AckLevel::Ok`], [`AckLevel::LocalDurable`], or [`AckLevel::Durable`]
+    /// barrier. Compare it only with FSNs produced by this same sender stream.
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         self.0.inner_ref().acked_fsn()
     }
@@ -1838,7 +1978,9 @@ impl<'a> BorrowedSender<'a> {
     /// pool's rejection handler (default: logged; see
     /// [`QuestDb::connect_with_handlers`]) rather than raised here;
     /// retriable ones are replayed by the queue. `AckLevel::Durable` requires
-    /// QuestDB Enterprise and a pool opened with `request_durable_ack=on`.
+    /// QuestDB Enterprise and a pool opened with `request_durable_ack=on`,
+    /// `replicated`, or `local,replicated`; `AckLevel::LocalDurable` requires
+    /// a pool opened with `request_durable_ack=local`.
     ///
     /// `timeout` is a no-progress deadline (it fires only if the ack watermark
     /// fails to advance for that long); `Duration::ZERO` waits indefinitely.
@@ -2211,7 +2353,10 @@ impl Drop for DirectSenderHandle<'_> {
         let Some(mut sender) = self.sender.take() else {
             return;
         };
-        commit_in_flight_on_drop(self.db.inner.connector.request_durable_ack(), &mut sender);
+        commit_in_flight_on_drop(
+            default_ack_level_for_tiers(self.db.inner.connector.request_durable_ack()),
+            &mut sender,
+        );
         return_direct_to_pool(&self.db.inner, sender);
     }
 }
@@ -2288,7 +2433,7 @@ impl Drop for OwnedSender {
 #[cfg(feature = "ffi-support")]
 enum DirectBacking {
     Pool(Arc<DbInner>),
-    Standalone { request_durable_ack: bool },
+    Standalone { default_ack_level: AckLevel },
 }
 
 /// Owned variant of the hidden direct sender used by the C FFI. Either
@@ -2332,7 +2477,7 @@ impl OwnedDirectColumnSender {
         );
         Ok(Self {
             backing: DirectBacking::Standalone {
-                request_durable_ack: connector.request_durable_ack(),
+                default_ack_level: default_ack_level_for_tiers(connector.request_durable_ack()),
             },
             sender: Some(sender),
         })
@@ -2374,13 +2519,14 @@ impl Drop for OwnedDirectColumnSender {
         };
         match &self.backing {
             DirectBacking::Pool(inner) => {
-                commit_in_flight_on_drop(inner.connector.request_durable_ack(), &mut sender);
+                commit_in_flight_on_drop(
+                    default_ack_level_for_tiers(inner.connector.request_durable_ack()),
+                    &mut sender,
+                );
                 return_direct_to_pool(inner, sender);
             }
-            DirectBacking::Standalone {
-                request_durable_ack,
-            } => {
-                commit_in_flight_on_drop(*request_durable_ack, &mut sender);
+            DirectBacking::Standalone { default_ack_level } => {
+                commit_in_flight_on_drop(*default_ack_level, &mut sender);
             }
         }
     }
@@ -2832,8 +2978,13 @@ fn connect_sfa_pool_with_recovery_candidates(
 /// Re-acquire a live connection within `deadline`, retrying with the pool's
 /// reconnect backoff: a failed pick (every endpoint role-rejecting while the
 /// cluster elects a primary, or a transient transport error) backs off and
-/// retries; `AuthError` / `ProtocolVersionError` and deadline exhaustion are
-/// terminal.
+/// retries. Errors [`reconnect_error_is_foreground_terminal`] treats as
+/// terminal -- `AuthError`, a `ProtocolVersionError` that carries no role
+/// rejection, a token-provider failure the provider did not classify
+/// retryable (every OIDC failure but a busy acquisition, a transient refresh
+/// failure included) -- and deadline exhaustion end it. A
+/// `ProtocolVersionError` from every endpoint rejecting by role (a durable-ack
+/// store-and-forward pool of replicas) is a role rejection, and is retried.
 #[cfg(feature = "ffi-support")]
 fn reconnect_pick<S>(
     inner: &Arc<DbInner>,
@@ -2845,7 +2996,10 @@ fn reconnect_pick<S>(
     loop {
         match pick(inner) {
             Ok(cs) => return Ok(cs),
-            Err(e) if reconnect_error_is_terminal(&e) || reconnect_deadline_expired(deadline) => {
+            Err(e)
+                if reconnect_error_is_foreground_terminal(&e)
+                    || reconnect_deadline_expired(deadline) =>
+            {
                 return Err(e);
             }
             Err(e) => {
@@ -2914,10 +3068,23 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
     ColumnConn::from_round_stream(raw)
 }
 
+/// The ack level a pool waits for when the caller names none: the level whose
+/// acknowledgement trims the store-and-forward copy for the pool's
+/// `request_durable_ack` setting.
+fn default_ack_level_for_tiers(tiers: crate::ingress::DurableAckTiers) -> AckLevel {
+    if tiers.has_replicated() {
+        AckLevel::Durable
+    } else if tiers.trims_on_local() {
+        AckLevel::LocalDurable
+    } else {
+        AckLevel::Ok
+    }
+}
+
 /// Best-effort commit of un-sync'd deferred frames on drop, so the natural
 /// `flush()`-loop-then-drop path doesn't silently lose data. Commits at the
-/// pool's default ack level so a `request_durable_ack=on` pool still waits for
-/// the durability ACK instead of silently downgrading to `Ok`. On failure the
+/// pool's default ack level so a durable-ack pool still waits for the durable
+/// ACK it trims on instead of silently downgrading to `Ok`. On failure the
 /// connection is latched `must_close` so the next borrower can't commit these
 /// frames under a foreign table.
 ///
@@ -2928,15 +3095,10 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
 /// symbols — is committed here rather than discarded. A symbol-less commit
 /// interns nothing, so the full dictionary does not block it. Only a hard latch
 /// (transport death, or a prior failed commit) skips the attempt.
-fn commit_in_flight_on_drop(request_durable_ack: bool, sender: &mut DirectSenderCore) {
+fn commit_in_flight_on_drop(ack: AckLevel, sender: &mut DirectSenderCore) {
     if sender.in_flight() == 0 {
         return;
     }
-    let ack = if request_durable_ack {
-        AckLevel::Durable
-    } else {
-        AckLevel::Ok
-    };
     let committed = sender.can_drain_in_flight() && sender.sync(ack).is_ok();
     if !committed {
         log::warn!(
@@ -2960,7 +3122,7 @@ fn drain_sfa_before_drop(inner: &DbInner, sender: &mut PooledSenderCore) {
     if timeout.is_zero() {
         return;
     }
-    let durable = inner.connector.request_durable_ack();
+    let durable = inner.connector.request_durable_ack().is_enabled();
     if sender.sfa_fully_delivered(durable) {
         return;
     }
@@ -2989,7 +3151,7 @@ fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [PooledSenderCore]) 
     if timeout.is_zero() || senders.is_empty() {
         return;
     }
-    let durable = inner.connector.request_durable_ack();
+    let durable = inner.connector.request_durable_ack().is_enabled();
     // Anchor the shared deadline before the orphan closes, which can block on
     // queue back-pressure: the "one close_flush_timeout" bound is on the whole
     // retirement, not just the drain.
@@ -3028,7 +3190,7 @@ fn return_sfa_to_pool(
             state.free.push(PoolEntry {
                 sender,
                 slot_index,
-                last_idle_at: Instant::now(),
+                last_idle_at: (inner.sender_pool_min < inner.sender_pool_max).then(Instant::now),
             });
             inner.cv.notify_all();
             return;
@@ -3062,7 +3224,7 @@ fn return_direct_to_pool(inner: &Arc<DbInner>, sender: DirectSenderCore) {
             state.free.push(PoolEntry {
                 sender,
                 slot_index: None,
-                last_idle_at: Instant::now(),
+                last_idle_at: Some(Instant::now()),
             });
         }
     }
@@ -3081,7 +3243,7 @@ fn finish_replaced_sender(inner: &Arc<DbInner>, sender: DirectSenderCore) {
             state.free.push(PoolEntry {
                 sender,
                 slot_index: None,
-                last_idle_at: Instant::now(),
+                last_idle_at: Some(Instant::now()),
             });
         }
     }
@@ -3129,7 +3291,7 @@ fn reaper_loop(inner: Arc<DbInner>, tick: Duration) {
             break;
         }
         let (state, _) = inner
-            .cv
+            .reaper_cv
             .wait_timeout(state, tick)
             .unwrap_or_else(|e| e.into_inner());
         if inner.shutdown.load(Ordering::SeqCst) {
@@ -3196,7 +3358,7 @@ fn drain_idle_readers(inner: &DbInner) -> usize {
 }
 
 fn reap_idle_senders(inner: &DbInner) -> usize {
-    let durable = inner.connector.request_durable_ack();
+    let durable = inner.connector.request_durable_ack().is_enabled();
     let mut dropped = 0;
     while let Some((sender, slot_index)) = take_reapable_column_sender(inner, durable) {
         let _release = slot_index.is_some().then_some(SenderSlotRelease {
@@ -3225,13 +3387,15 @@ fn take_reapable_column_sender(
         if state.total() <= inner.sender_pool_min {
             return None;
         }
-        let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
+        let expired = state.free[i]
+            .last_idle_at
+            .is_some_and(|idle_at| now.saturating_duration_since(idle_at) > inner.idle_timeout);
         // Never evict a connection whose store-and-forward queue still holds
         // undelivered frames: its background runner is still delivering, and
         // dropping it now would lose that data. It becomes reapable once the
         // runner drains it (or the transport goes terminal). `sfa_fully_delivered`
         // is a lock-free progress read in the healthy case.
-        if idle_for > inner.idle_timeout && state.free[i].sender.sfa_fully_delivered(durable) {
+        if expired && state.free[i].sender.sfa_fully_delivered(durable) {
             let entry = state.free.remove(i);
             if entry.slot_index.is_some() {
                 state.closing += 1;
@@ -3253,8 +3417,10 @@ fn reap_idle_direct_senders(inner: &DbInner) -> usize {
         let now = Instant::now();
         let mut i = 0;
         while i < state.free.len() {
-            let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
-            if idle_for > inner.idle_timeout {
+            let expired = state.free[i]
+                .last_idle_at
+                .is_some_and(|idle_at| now.saturating_duration_since(idle_at) > inner.idle_timeout);
+            if expired {
                 let entry = state.free.remove(i);
                 to_drop.push(entry.sender);
             } else {
@@ -3347,12 +3513,48 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{ConnectHandlers, QuestDb, SlotReservations, managed_slot_recovery_scan_from};
+    use super::{
+        ConnectHandlers, QuestDb, SlotReservations, default_ack_level_for_tiers,
+        managed_slot_recovery_scan_from,
+    };
+    use crate::ingress::{AckLevel, DurableAckTiers};
 
     fn dirty_slot(root: &std::path::Path, name: &str) {
         let slot = root.join(name);
         fs::create_dir(&slot).unwrap();
         fs::write(slot.join("sf-0.sfa"), b"queued").unwrap();
+    }
+
+    /// Regression: hoisting `ReaderConfig::from_conf` to connect time made the
+    /// query-side parser a gate on opening the pool at all. One connect string
+    /// drives both sides and the sender treats the query-side keys as
+    /// pass-through, so values like `compression=none` or `max_version=2` had
+    /// always been accepted here and simply never read by the ingest path.
+    /// Making them fatal broke ingest-only deployments on upgrade over a query
+    /// side they do not use.
+    #[cfg(all(feature = "_egress", feature = "sync-sender-qwp-ws"))]
+    #[test]
+    fn pool_opens_when_only_the_query_side_config_is_rejected() {
+        for bad in [
+            "compression=none",
+            "max_version=2",
+            "connect_timeout=99999999",
+            "auth_timeout_ms=99999999",
+        ] {
+            let conf = format!("ws::addr=127.0.0.1:19009;lazy_connect=on;{bad};");
+            // The query side rejects it on its own.
+            assert!(
+                crate::egress::ReaderConfig::from_conf(&conf).is_err(),
+                "{bad} is no longer a query-side rejection; pick another value"
+            );
+            // The pool still opens, exactly as it did before the parse moved.
+            let db = crate::QuestDb::connect(&conf)
+                .unwrap_or_else(|e| panic!("{bad} must not block the pool: {e}"));
+            // And the failure is still reported when the query side is asked for.
+            let err = db.borrow_reader().unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::ConfigError, "{bad}");
+            db.close();
+        }
     }
 
     #[test]
@@ -3413,5 +3615,24 @@ mod tests {
 
         let mut in_memory = SlotReservations::default();
         assert!(!in_memory.reserve(0));
+    }
+
+    #[test]
+    fn default_ack_level_is_the_level_each_setting_trims_on() {
+        for (tiers, expected) in [
+            (DurableAckTiers::Off, AckLevel::Ok),
+            (DurableAckTiers::LegacyReplicated, AckLevel::Durable),
+            (DurableAckTiers::Local, AckLevel::LocalDurable),
+            (DurableAckTiers::Replicated, AckLevel::Durable),
+            (DurableAckTiers::LocalAndReplicated, AckLevel::Durable),
+        ] {
+            let level = default_ack_level_for_tiers(tiers);
+            assert_eq!(level, expected, "{tiers:?}");
+            // The drop-time commit waits at this level, so it must never be
+            // refused by the setting it comes from.
+            tiers
+                .check_ack_level(level)
+                .unwrap_or_else(|e| panic!("{tiers:?} refuses its own default: {}", e.msg()));
+        }
     }
 }

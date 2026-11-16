@@ -35,6 +35,35 @@ mod gai;
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 mod ws;
 
+// Display-safe rendering of untrusted text, shared by the OIDC prompt and
+// token-provider error redaction.
+#[cfg(any(
+    feature = "_oidc",
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+mod display_text;
+
+// Rotating Bearer-token providers shared by the ILP/HTTP sender, the QWP/WS
+// ingress sender, and the egress reader: the `BearerTokenProvider` interface,
+// and the proactively refreshing `RefreshingTokenProvider` cache.
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+pub mod token_provider;
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+#[doc(hidden)]
+pub use token_provider::{
+    TokenProviderIsolation, token_pull_must_not_block, with_nonblocking_token_pull,
+};
+
 // JKS / PKCS#12 trust-store loader for `tls_roots_password`. Pulled
 // in only for the QWP transports — matches the Java reference's
 // `KeyStore.getInstance(...)` surface there. Other ILP transports
@@ -59,7 +88,130 @@ pub(crate) mod polars_ffi;
 #[cfg(feature = "_egress")]
 pub mod egress;
 
+#[cfg(feature = "_oidc")]
+pub mod oidc;
+
 pub use error::*;
+
+/// True if `s` is safe to send verbatim as a wire-bound Bearer credential:
+/// non-blank and printable-ASCII only. A control / non-ASCII byte (a decoded CR/LF
+/// is a header-injection vector) or a blank value must never reach an
+/// `Authorization: Bearer` header. Single gate shared by the OIDC token checks, the
+/// ILP/HTTP token-provider, and the QWP/WS + egress token-provider.
+#[cfg(any(
+    feature = "_oidc",
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+pub(crate) fn is_printable_ascii_token(s: &str) -> bool {
+    !s.trim().is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// Connect-string keys the dynamic-credential specification reserves for
+/// selecting a token provider (design/qwp-token-provider-spec.md §7.1).
+const RESERVED_TOKEN_PROVIDER_KEYS: &[&str] = &[
+    "token_provider",
+    "azure_resource",
+    "azure_client_id",
+    "azure_credential",
+];
+
+/// The sender method that attaches a token provider in this build, named by the
+/// reserved-key error: the protocol-neutral one needs both Bearer transports.
+#[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+const SENDER_TOKEN_PROVIDER_API: Option<&str> = Some("SenderBuilder::bearer_token_provider");
+#[cfg(all(feature = "_sender-http", not(feature = "_sender-qwp-ws")))]
+const SENDER_TOKEN_PROVIDER_API: Option<&str> = Some("SenderBuilder::http_token_provider");
+#[cfg(all(feature = "_sender-qwp-ws", not(feature = "_sender-http")))]
+const SENDER_TOKEN_PROVIDER_API: Option<&str> = Some("SenderBuilder::qwp_ws_token_provider");
+#[cfg(not(any(feature = "_sender-http", feature = "_sender-qwp-ws")))]
+const SENDER_TOKEN_PROVIDER_API: Option<&str> = None;
+
+/// The reader method that attaches a token provider, when this build has one.
+#[cfg(feature = "_egress")]
+const READER_TOKEN_PROVIDER_API: Option<&str> = Some("ReaderConfig::token_provider");
+#[cfg(not(feature = "_egress"))]
+const READER_TOKEN_PROVIDER_API: Option<&str> = None;
+
+/// Where a Rust caller of this build attaches a token provider, for the
+/// reserved-key error. It names only methods the enabled features compile in:
+/// pointing an ILP/HTTP-only build at `bearer_token_provider` sent the caller
+/// looking for a method that does not exist there.
+fn rust_token_provider_hint() -> String {
+    let apis: Vec<String> = [SENDER_TOKEN_PROVIDER_API, READER_TOKEN_PROVIDER_API]
+        .into_iter()
+        .flatten()
+        .map(|api| format!("`{api}`"))
+        .collect();
+    if apis.is_empty() {
+        return "Rust: this build has no ILP/HTTP, QWP/WebSocket or reader feature, so \
+                nothing in it accepts a token provider."
+            .to_string();
+    }
+    format!(
+        "Rust {}. A `RefreshingTokenProvider` can fetch tokens however you like, Azure \
+         Identity included.",
+        apis.join(" or ")
+    )
+}
+
+/// The error for a reserved token-provider key, or `None` for any other key.
+///
+/// This client selects no token provider from a connect string, so it rejects
+/// these keys on every schema with a pointer to the in-code API (§7.2): it must
+/// never connect without the credential the string asked for.
+pub(crate) fn reserved_token_provider_key_error(key: &str) -> Option<Error> {
+    RESERVED_TOKEN_PROVIDER_KEYS.contains(&key).then(|| {
+        error::fmt!(
+            ConfigError,
+            "\"{key}\" selects a connect-string token provider, which this client does not \
+             support (supported token_provider values: none). Attach a token provider in code \
+             instead: Python `bearer_token_provider=`; C/C++ `line_sender_opts_token_provider`, \
+             `questdb_db_connect_options.token_provider` or \
+             `qwp_reader_from_conf_with_token_provider`; {}",
+            rust_token_provider_hint()
+        )
+    })
+}
+
+#[cfg(test)]
+mod reserved_token_provider_key_tests {
+    use super::reserved_token_provider_key_error;
+
+    #[test]
+    fn the_error_names_only_apis_this_build_compiles_in() {
+        let err = reserved_token_provider_key_error("token_provider").unwrap();
+        let msg = err.msg();
+        for (api, compiled_in) in [
+            (
+                "SenderBuilder::bearer_token_provider",
+                cfg!(all(feature = "_sender-http", feature = "_sender-qwp-ws")),
+            ),
+            (
+                "SenderBuilder::http_token_provider",
+                cfg!(all(
+                    feature = "_sender-http",
+                    not(feature = "_sender-qwp-ws")
+                )),
+            ),
+            (
+                "SenderBuilder::qwp_ws_token_provider",
+                cfg!(all(
+                    feature = "_sender-qwp-ws",
+                    not(feature = "_sender-http")
+                )),
+            ),
+            ("ReaderConfig::token_provider", cfg!(feature = "_egress")),
+        ] {
+            assert_eq!(msg.contains(api), compiled_in, "{api}: {msg}");
+        }
+        assert!(
+            reserved_token_provider_key_error("token").is_none(),
+            "an ordinary key is not reserved"
+        );
+    }
+}
 
 // --- Primary entry point -------------------------------------------------
 //

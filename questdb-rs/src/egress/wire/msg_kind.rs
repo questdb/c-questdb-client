@@ -93,6 +93,12 @@ pub enum StatusCode {
     SecurityError = 0x08,
     Cancelled = 0x0A,
     LimitExceeded = 0x0B,
+    /// The query ran past the `timeout_ms` it carried. Per-query, not
+    /// per-connection: the connection stays open and authenticated, so a
+    /// pooled client runs its next query on it instead of reconnecting.
+    /// Only sent to clients that supplied a timeout; a request without one
+    /// gets [`Self::LimitExceeded`] for the same condition.
+    QueryTimeout = 0x0E,
 }
 
 impl StatusCode {
@@ -104,6 +110,7 @@ impl StatusCode {
             0x08 => StatusCode::SecurityError,
             0x0A => StatusCode::Cancelled,
             0x0B => StatusCode::LimitExceeded,
+            0x0E => StatusCode::QueryTimeout,
             other => {
                 return Err(fmt!(
                     ProtocolError,
@@ -157,8 +164,34 @@ mod tests {
             StatusCode::SecurityError,
             StatusCode::Cancelled,
             StatusCode::LimitExceeded,
+            StatusCode::QueryTimeout,
         ] {
             assert_eq!(StatusCode::from_u8(s.as_u8()).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn status_code_wire_values_pinned() {
+        // The server's QwpConstants owns these numbers; a drifted
+        // discriminant would mis-report one server error as another.
+        assert_eq!(StatusCode::SchemaMismatch.as_u8(), 0x03);
+        assert_eq!(StatusCode::ParseError.as_u8(), 0x05);
+        assert_eq!(StatusCode::InternalError.as_u8(), 0x06);
+        assert_eq!(StatusCode::SecurityError.as_u8(), 0x08);
+        assert_eq!(StatusCode::Cancelled.as_u8(), 0x0A);
+        assert_eq!(StatusCode::LimitExceeded.as_u8(), 0x0B);
+        assert_eq!(StatusCode::QueryTimeout.as_u8(), 0x0E);
+    }
+
+    #[test]
+    fn unknown_status_code_rejected() {
+        // 0x0C / 0x0D sit between LimitExceeded and QueryTimeout and are
+        // unassigned: they must not silently decode as a neighbour.
+        for byte in [0x00, 0x04, 0x0C, 0x0D, 0x0F, 0xFF] {
+            assert!(
+                StatusCode::from_u8(byte).is_err(),
+                "0x{byte:02X} must not decode"
+            );
         }
     }
 }

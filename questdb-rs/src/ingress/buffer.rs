@@ -549,9 +549,12 @@ impl Buffer {
     ///
     /// For ILP buffers this is the exact serialized byte count. For QWP/UDP
     /// buffers this is the size hint used for flush planning. For QWP/WebSocket
-    /// buffers this is only a local size hint; symbol-ID remapping and replay
-    /// dictionary state can change the eventual frame size. The sender
-    /// enforces `max_buf_size` against the encoded replay message.
+    /// buffers this is a size hint that is at least the size of the frame a
+    /// flush encodes: it charges each symbol value the widest connection-wide
+    /// id. It falls short only once store-and-forward sends full symbol
+    /// dictionaries, which it does when its symbol side-file cannot be opened
+    /// or rolled back. The sender enforces `max_buf_size` against the encoded
+    /// replay message.
     pub fn len(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.len(),

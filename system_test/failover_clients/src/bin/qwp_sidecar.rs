@@ -96,7 +96,7 @@ fn main() {
 struct State {
     sender: Option<Sender>,
     buf: Option<Buffer>,
-    request_durable_ack: bool,
+    ack_level: AckLevel,
     producer_published: bool,
 }
 
@@ -110,7 +110,7 @@ impl State {
             let _ = s.close_drain();
         }
         self.buf = None;
-        self.request_durable_ack = false;
+        self.ack_level = AckLevel::Ok;
         self.producer_published = false;
     }
 }
@@ -129,7 +129,7 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             state.close_quietly();
             let sender = Sender::from_conf(rest).map_err(|e| e.to_string())?;
             let buf = sender.new_buffer();
-            state.request_durable_ack = request_durable_ack_enabled(rest);
+            state.ack_level = ack_level_for_conf(rest);
             state.sender = Some(sender);
             state.buf = Some(buf);
             reply_ok(out, "")
@@ -204,12 +204,7 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             let timeout_ms: u64 = parts[1]
                 .parse()
                 .map_err(|_| "invalid timeout_ms".to_string())?;
-            let ack_level = if state.request_durable_ack {
-                AckLevel::Durable
-            } else {
-                AckLevel::Ok
-            };
-            match sender.wait(ack_level, Duration::from_millis(timeout_ms)) {
+            match sender.wait(state.ack_level, Duration::from_millis(timeout_ms)) {
                 Ok(()) => reply_ok(out, "true"),
                 Err(e)
                     if e.code() == questdb::ErrorCode::FailoverRetry
@@ -285,14 +280,23 @@ fn stats_payload(acked: i64, totals: Option<&QwpWsTotals>, producer_published: b
     }
 }
 
-fn request_durable_ack_enabled(conf: &str) -> bool {
-    conf.split(';').any(|part| {
-        let Some((key, value)) = part.split_once('=') else {
-            return false;
-        };
-        key.trim().eq_ignore_ascii_case("request_durable_ack")
-            && matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "true")
-    })
+/// The level AWAIT_ACKED waits for: the one the `request_durable_ack` tiers
+/// trim on (`local` trims on the local ack, any set with `replicated` on the
+/// replicated ack).
+fn ack_level_for_conf(conf: &str) -> AckLevel {
+    let tiers = conf.split(';').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case("request_durable_ack")
+            .then(|| value.trim().to_ascii_lowercase())
+    });
+    match tiers.as_deref() {
+        Some("on" | "true" | "replicated" | "local,replicated" | "replicated,local") => {
+            AckLevel::Durable
+        }
+        Some("local") => AckLevel::LocalDurable,
+        _ => AckLevel::Ok,
+    }
 }
 
 fn reply_ok(out: &mut impl Write, payload: &str) -> Result<(), String> {
@@ -337,5 +341,29 @@ mod tests {
             stats_payload(-1, None, false),
             "acked=-1 sent=0 replayed=0 startupSent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0"
         );
+    }
+
+    #[test]
+    fn ack_level_for_conf_follows_the_requested_tiers() {
+        let cases = [
+            ("ws::addr=h:9000;", AckLevel::Ok),
+            ("ws::addr=h:9000;request_durable_ack=off;", AckLevel::Ok),
+            ("ws::addr=h:9000;request_durable_ack=on;", AckLevel::Durable),
+            (
+                "ws::addr=h:9000;request_durable_ack=replicated;",
+                AckLevel::Durable,
+            ),
+            (
+                "ws::addr=h:9000;request_durable_ack=local,replicated;",
+                AckLevel::Durable,
+            ),
+            (
+                "ws::addr=h:9000;request_durable_ack=local;",
+                AckLevel::LocalDurable,
+            ),
+        ];
+        for (conf, level) in cases {
+            assert_eq!(ack_level_for_conf(conf), level, "{conf}");
+        }
     }
 }

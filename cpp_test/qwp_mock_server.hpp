@@ -67,8 +67,12 @@ inline constexpr uint8_t ROLE_PRIMARY = 0x01;
 inline constexpr uint8_t ROLE_REPLICA = 0x02;
 inline constexpr uint8_t ROLE_PRIMARY_CATCHUP = 0x03;
 
-// SERVER_INFO capability bits.
+// SERVER_INFO capability bits (mirror
+// questdb-rs/src/egress/wire/capabilities.rs).
 inline constexpr uint32_t CAP_ZONE = 0x00000001u;
+inline constexpr uint32_t CAP_QUERY_FLAGS = 0x00000002u;
+inline constexpr uint32_t CAP_COMPRESSION = 0x00000004u;
+inline constexpr uint32_t CAP_QUERY_TIMEOUT = 0x00000008u;
 
 // ColumnKind wire codes (mirror questdb-rs/src/egress/column_kind.rs).
 inline constexpr uint8_t COL_BOOLEAN = 0x01;
@@ -102,6 +106,11 @@ inline constexpr uint8_t STATUS_INTERNAL_ERROR = 0x06;
 inline constexpr uint8_t STATUS_SECURITY_ERROR = 0x08;
 inline constexpr uint8_t STATUS_CANCELLED = 0x0A;
 inline constexpr uint8_t STATUS_LIMIT_EXCEEDED = 0x0B;
+inline constexpr uint8_t STATUS_QUERY_TIMEOUT = 0x0E;
+
+// QUERY_REQUEST `query_flags` bits (mirror query_request.rs).
+inline constexpr uint8_t QUERY_FLAG_RESET_DICT = 0x01;
+inline constexpr uint8_t QUERY_FLAG_TIMEOUT = 0x02;
 
 // CACHE_RESET masks.
 inline constexpr uint8_t CACHE_RESET_SYMBOLS = 0x01;
@@ -141,6 +150,14 @@ std::vector<uint8_t> cache_reset_frame(uint8_t mask);
 // This is not wrapped in the QWP1 egress header: ingress ACKs are the raw
 // WebSocket binary payload `[status=0][wire_seq_le][table_count=0]`.
 std::vector<uint8_t> ingress_ok_frame(uint64_t wire_seq = 0);
+// Ingress OK response with one table entry:
+// `[status=0][wire_seq_le][count=1][u16 name_len][name][i64 seq_txn_le]`.
+std::vector<uint8_t> ingress_ok_frame_with_table(
+    uint64_t wire_seq, const std::string& table, int64_t seq_txn);
+// Ingress local durable ACK (status 0x0E) with one table entry:
+// `[status=0x0E][count=1][u16 name_len][name][i64 seq_txn_le]`.
+std::vector<uint8_t> ingress_local_durable_ack_frame(
+    const std::string& table, int64_t seq_txn);
 
 // Build a single-table RESULT_BATCH frame given:
 //  - request_id, batch_seq
@@ -291,6 +308,16 @@ struct ActionHardDrop
 struct ActionReject401
 {
 };
+// Grants `request_durable_ack=local`: the handshake echoes
+// `X-QWP-Durable-Ack: local` only when the request carries
+// `X-QWP-Request-Durable-Ack: local`. Then, until the client closes, OKs each
+// data frame N (0-based) with the entry `(table, N + 1)` and answers each PING
+// with a PONG plus a local durable ACK for the highest seqTxn OKed so far.
+// Must be the last action of its script.
+struct ActionServeLocalDurableAck
+{
+    std::string table;
+};
 
 using Action = std::variant<
     ActionSendServerInfo,
@@ -302,7 +329,8 @@ using Action = std::variant<
     ActionSendBuilt,
     ActionAwaitClientFrame,
     ActionHardDrop,
-    ActionReject401>;
+    ActionReject401,
+    ActionServeLocalDurableAck>;
 
 using Script = std::vector<Action>;
 

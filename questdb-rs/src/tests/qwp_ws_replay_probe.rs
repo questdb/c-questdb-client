@@ -222,7 +222,7 @@ fn send_one_replay_payload(
         config.auth_header.as_deref(),
         1,
         Some("rust-qwp-replay-probe"),
-        false,
+        crate::ingress::DurableAckTiers::Off,
     )?;
 
     let mut send_buf = Vec::new();

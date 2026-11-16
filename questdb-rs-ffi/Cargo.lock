@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "questdb-rs"
-version = "7.1.0"
+version = "7.3.0"
 dependencies = [
  "aligned-vec",
  "arrow",
@@ -1202,17 +1202,19 @@ dependencies = [
  "ureq",
  "webpki-roots",
  "windows-sys 0.60.2",
+ "zeroize",
  "zstd",
 ]
 
 [[package]]
 name = "questdb-rs-ffi"
-version = "7.1.0"
+version = "7.3.0"
 dependencies = [
  "arrow",
  "libc",
  "questdb-confstr-ffi",
  "questdb-rs",
+ "zeroize",
 ]
 
 [[package]]

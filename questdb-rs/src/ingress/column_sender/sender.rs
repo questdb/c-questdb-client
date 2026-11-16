@@ -26,21 +26,23 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+use crate::ingress::conf::DurableAckTiers;
 use crate::ingress::sender::ack_wait_timeout_error;
+use crate::ingress::sender::effective_hard_frame_cap;
 use crate::ingress::sender::qwp_ws::{
     SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
     qwp_ws_begin_close_background, qwp_ws_check_error_background,
     qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
-    qwp_ws_published_fsn_background, qwp_ws_reconnect_failure_background,
-    qwp_ws_sender_errors_dropped_background, sfa_has_deferred_commit_slot,
+    qwp_ws_progress_generation_background, qwp_ws_published_fsn_background,
+    qwp_ws_reconnect_failure_background, qwp_ws_sender_errors_dropped_background,
+    qwp_ws_wait_for_progress_background, sfa_has_deferred_commit_slot,
 };
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
 #[cfg(feature = "arrow-ingress")]
@@ -268,7 +270,7 @@ struct SfaBackend {
     /// `wait`, `flush`, or pool return can retry it.
     sfa_deferred_group_open: bool,
     max_buf_size: usize,
-    request_durable_ack: bool,
+    request_durable_ack: DurableAckTiers,
     /// No-progress deadline for the `sync` poll loop. Mirrors the direct
     /// backend's socket `request_timeout`: it bounds how long `sync` waits
     /// *without the ack/durable watermark advancing*, so a silent-but-alive
@@ -306,7 +308,7 @@ impl PooledSenderCore {
     pub(crate) fn new_store_and_forward(
         mut state: SyncQwpWsHandlerState,
         max_buf_size: usize,
-        request_durable_ack: bool,
+        request_durable_ack: DurableAckTiers,
         sync_timeout: Duration,
     ) -> Result<Self> {
         // The background driver enables its catch-up mirror on exactly the same
@@ -556,8 +558,10 @@ impl PooledSenderCore {
     /// behaves exactly like [`Self::sync`] (it encodes a header-only frame).
     ///
     /// `AckLevel::Durable` requires QuestDB Enterprise and a pool opened with
-    /// `request_durable_ack=on`; otherwise the call is rejected up front
-    /// (`InvalidApiCall`) before `chunk` is touched.
+    /// `request_durable_ack=on`, `replicated`, or `local,replicated`, and
+    /// `AckLevel::LocalDurable` a pool opened with `request_durable_ack=local`;
+    /// otherwise the call is rejected up front (`InvalidApiCall`) before
+    /// `chunk` is touched.
     ///
     /// Publication failure retains `chunk`, but splitting may already have
     /// published a prefix. Check [`crate::Error::in_doubt`] before retrying.
@@ -1556,13 +1560,7 @@ impl SfaBackend {
     /// durable-without-opt-in request *before* encode mutates the symbol dict
     /// or the Arrow import consumes the caller's array.
     fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
-        if ack_level == AckLevel::Durable && !self.request_durable_ack {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "AckLevel::Durable requires `request_durable_ack=on` in the connect string."
-            ));
-        }
-        Ok(())
+        self.request_durable_ack.check_ack_level(ack_level)
     }
 
     /// Marks the connection for retirement (`drop_on_return`) when `err` reports
@@ -2193,7 +2191,7 @@ impl SfaBackend {
     ) -> Result<()> {
         let last_boundary = match ack_level {
             AckLevel::Ok => self.last_ok_sync_boundary,
-            AckLevel::Durable => self.last_durable_sync_boundary,
+            AckLevel::Durable | AckLevel::LocalDurable => self.last_durable_sync_boundary,
         };
         if last_boundary.is_some_and(|last| last >= boundary) {
             return Ok(());
@@ -2208,16 +2206,35 @@ impl SfaBackend {
         let mut last_completed: Option<u64> = None;
 
         loop {
+            // Snapshot before checking progress so an ACK/error between the
+            // check and the condvar wait cannot be lost.
+            let generation = qwp_ws_progress_generation_background(&self.state);
             let completed = match ack_level {
                 AckLevel::Ok => qwp_ws_ok_fsn_background(&self.state)?,
-                AckLevel::Durable => qwp_ws_acked_fsn_background(&self.state)?,
+                AckLevel::Durable | AckLevel::LocalDurable => {
+                    qwp_ws_acked_fsn_background(&self.state)?
+                }
             };
             if completed.is_some_and(|fsn| fsn >= boundary) {
                 match ack_level {
                     AckLevel::Ok => self.last_ok_sync_boundary = Some(boundary),
-                    AckLevel::Durable => self.last_durable_sync_boundary = Some(boundary),
+                    AckLevel::Durable | AckLevel::LocalDurable => {
+                        self.last_durable_sync_boundary = Some(boundary)
+                    }
                 }
                 return Ok(());
+            }
+            // As in the row sender's wait: inside an auth callback whose
+            // return this sender's reconnect needs, the ACK cannot arrive.
+            // Each failed reconnect attempt notifies, so the wait below wakes
+            // to recheck this as soon as the runner's token pull is refused.
+            if let Some(err) = self
+                .state
+                .token_provider
+                .as_ref()
+                .and_then(|provider| provider.callback_wait_error())
+            {
+                return Err(err);
             }
             if completed != last_completed {
                 last_completed = completed;
@@ -2235,7 +2252,16 @@ impl SfaBackend {
                     qwp_ws_reconnect_failure_background(&self.state).as_ref(),
                 ));
             }
-            thread::sleep(Duration::from_millis(10));
+            let deadline = if timeout.is_zero() {
+                None
+            } else {
+                deadline_anchor.checked_add(timeout)
+            };
+            qwp_ws_wait_for_progress_background(&self.state, generation, deadline);
+            // Sending, maintenance and failed reconnect attempts also notify.
+            // Only watermark advancement above resets the no-progress deadline;
+            // always recheck after waking, including a timeout racing the final
+            // ACK or a terminal error.
         }
     }
 
@@ -2257,27 +2283,12 @@ impl SfaBackend {
     }
 }
 
-fn effective_hard_frame_cap(
-    max_buf_size: usize,
-    server_max_batch_size: usize,
-    sfa_frame_payload_cap: usize,
-) -> (usize, bool) {
-    let configured_cap = if server_max_batch_size == 0 {
-        max_buf_size
-    } else {
-        max_buf_size.min(server_max_batch_size)
-    };
-    (
-        configured_cap.min(sfa_frame_payload_cap),
-        server_max_batch_size != 0,
-    )
-}
-
 /// The store-and-forward `wait` poll loop made no progress toward `boundary`
 /// for `sync_timeout`. Either the connection is alive but the server is not
 /// advancing the ack/durable watermark (e.g. back-pressured WAL or a stuck
 /// commit), or the connection is down and reconnecting keeps failing -- then
-/// the error names that failure.
+/// the error names that failure and carries its OIDC detail, so a credential
+/// that needs a new sign-in reads as such.
 ///
 /// Classified `FailoverRetry`, but — unlike the direct backend's
 /// transport-timeout path, which drops the connection and discards its
@@ -2298,6 +2309,7 @@ fn sfa_sync_timeout(
     let level = match ack_level {
         AckLevel::Ok => "ok",
         AckLevel::Durable => "durable",
+        AckLevel::LocalDurable => "local durable",
     };
     ack_wait_timeout_error(
         &format!("QWP/WebSocket store-and-forward wait({level})"),
@@ -2305,6 +2317,8 @@ fn sfa_sync_timeout(
         boundary,
         completed,
         reconnect_failure,
+        // The store-and-forward backend always runs a background runner.
+        crate::ingress::QwpWsProgress::Background,
     )
 }
 

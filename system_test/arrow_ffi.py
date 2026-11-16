@@ -148,6 +148,7 @@ class ClientErrorCode:
     BATCH_TOO_LARGE = 35
     STORE_RESEND_REQUIRED = 36
     SYMBOL_DICT_FULL = 37
+    QUERY_TIMEOUT = 38
 
 
 def _setsig(name, restype, *argtypes):

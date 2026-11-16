@@ -1,0 +1,20 @@
+# Bypass DHCP DNS to address intermittent GitHub/PyPI lookup failures.
+# Electron found a caching proxy that failed TCP DNS on its macOS runners:
+# https://github.com/electron/electron/pull/54827
+steps:
+  - bash: |
+      set -euo pipefail
+      echo "DNS before change:"
+      networksetup -listallnetworkservices
+      scutil --dns
+
+      sudo networksetup -setdnsservers Ethernet 1.1.1.1 1.0.0.1
+      sudo dscacheutil -flushcache
+      sudo killall -HUP mDNSResponder
+
+      echo "DNS after change:"
+      networksetup -getdnsservers Ethernet
+      scutil --dns
+    displayName: "Use Cloudflare DNS on macOS"
+    condition: and(succeeded(), eq(variables['Agent.OS'], 'Darwin'))
+    workingDirectory: $(Agent.TempDirectory)

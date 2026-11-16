@@ -121,6 +121,8 @@ mod ndarr;
 use ndarr::StrideArrayView;
 
 mod egress;
+mod oidc;
+mod token_provider;
 
 pub mod column_sender;
 pub use column_sender::*;
@@ -359,6 +361,10 @@ pub enum line_sender_error_code {
     /// HTTP-upgrade or WebSocket handshake failure.
     line_sender_error_handshake_error = 20,
     /// Server returned an unsupported QWP version, encoding, or capability.
+    /// Also raised client-side, before anything is written, when a query
+    /// carries a per-query timeout and the server does not advertise
+    /// `CAP_QUERY_TIMEOUT` (see `qwp_reader_query_set_timeout_ms`); the
+    /// connection is untouched by that refusal.
     line_sender_error_unsupported_server = 21,
     /// Wire-format violation: bad magic, truncated frame, unknown
     /// discriminant, invalid varint, symbol-dict reference miss, etc.
@@ -464,6 +470,24 @@ pub enum line_sender_error_code {
     /// check `line_sender_error_in_doubt` before resending, or the rows the
     /// queued prefix already carried are duplicated.
     line_sender_error_symbol_dict_full = 37,
+
+    /// The query ran past the timeout it carried: server-reported QWP
+    /// `QUERY_TIMEOUT` (status `0x0E`), produced only for a request that
+    /// supplied `timeout_ms` (see `qwp_reader_query_set_timeout_ms`). A
+    /// timeout requested against a server that does not advertise
+    /// `CAP_QUERY_TIMEOUT` is refused with
+    /// `line_sender_error_unsupported_server` instead, so retrying a timeout
+    /// with a larger budget cannot loop against a server that ignores it.
+    ///
+    /// Per-query, not per-connection: the connection stays open and
+    /// authenticated, so the next query runs on it without reconnecting.
+    ///
+    /// Do not retry a write on this error. A statement that completes past its
+    /// timeout is reported as `EXEC_DONE` with its row count rather than as a
+    /// timeout, precisely so a retrying client cannot apply it twice; and a
+    /// DDL / INSERT / UPDATE that timed out waiting for the table writer may
+    /// still be applied by that writer afterwards.
+    line_sender_error_query_timeout = 38,
 }
 
 /// Neutral spelling of the client-wide error category. The released
@@ -555,6 +579,7 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_store_resend_required
             }
             ErrorCode::SymbolDictFull => line_sender_error_code::line_sender_error_symbol_dict_full,
+            ErrorCode::QueryTimeout => line_sender_error_code::line_sender_error_query_timeout,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -767,6 +792,18 @@ pub unsafe extern "C" fn questdb_error_in_doubt(error: *const questdb_error) -> 
         return false;
     }
     unsafe { (*error).error.in_doubt() }
+}
+
+/// Whether the error carries a QWP/WebSocket server-role rejection (including
+/// a 421 whose advertised role header cannot be parsed). Unlike a plain
+/// protocol-version error, the latter can be retried during role election.
+/// NULL-safe: passing `NULL` returns `false`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_error_is_qwp_ws_role_reject(error: *const questdb_error) -> bool {
+    if error.is_null() {
+        return false;
+    }
+    unsafe { (*error).error.is_qwp_ws_role_reject() }
 }
 
 /// Clean up the error.
@@ -1536,9 +1573,12 @@ pub unsafe extern "C" fn line_sender_buffer_clear(buffer: *mut line_sender_buffe
 
 /// The current encoded size of the buffered data.
 ///
-/// For ILP buffers this is the exact pending byte length. For QWP buffers this
-/// is a buffered size hint, not the exact size of an eventual UDP datagram or
-/// WebSocket replay frame.
+/// For ILP buffers this is the exact pending byte length. For QWP/UDP buffers
+/// this is a buffered size hint, not the exact size of an eventual datagram.
+/// For QWP/WebSocket buffers it is at least the size of the frame that
+/// flushing the buffer encodes, unless store-and-forward has fallen back to
+/// sending full symbol dictionaries because its symbol side-file could not be
+/// opened or rolled back.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_size(buffer: *const line_sender_buffer) -> size_t {
     unsafe {
@@ -3819,6 +3859,8 @@ pub unsafe extern "C" fn line_sender_qwpws_acked_fsn(
 pub const qwpws_ack_level_ok: u32 = 0;
 #[allow(non_upper_case_globals)]
 pub const qwpws_ack_level_durable: u32 = 1;
+#[allow(non_upper_case_globals)]
+pub const qwpws_ack_level_local_durable: u32 = 2;
 
 /// Wait until every QWP/WebSocket frame published so far on `sender` reaches
 /// `ack_level` (a `qwpws_ack_level_*` value). This is the
@@ -3827,8 +3869,11 @@ pub const qwpws_ack_level_durable: u32 = 1;
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
 /// `qwpws_ack_level_durable` requires QuestDB Enterprise and the sender to be
-/// opened with `request_durable_ack=on`; otherwise this returns
-/// `line_sender_error_invalid_api_call` even when nothing has been published.
+/// opened with `request_durable_ack=on`, `replicated`, or `local,replicated`;
+/// `qwpws_ack_level_local_durable` requires a server running
+/// `cairo.commit.mode=adaptive` and `request_durable_ack=local`. Otherwise
+/// this returns `line_sender_error_invalid_api_call` even when nothing has
+/// been published.
 ///
 /// Returns `true` once the boundary is acknowledged. Returns `false` and sets
 /// `err_out` on the no-progress timeout (`line_sender_error_failover_retry`), a
@@ -3845,11 +3890,16 @@ pub unsafe extern "C" fn line_sender_qwpws_wait(
         let ack_level = match ack_level {
             value if value == qwpws_ack_level_ok => questdb::ingress::AckLevel::Ok,
             value if value == qwpws_ack_level_durable => questdb::ingress::AckLevel::Durable,
+            value if value == qwpws_ack_level_local_durable => {
+                questdb::ingress::AckLevel::LocalDurable
+            }
             other => {
                 set_err_out(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    format!("line_sender_qwpws_wait: invalid ack_level {other} (expected 0 or 1)"),
+                    format!(
+                        "line_sender_qwpws_wait: invalid ack_level {other} (expected 0, 1, or 2)"
+                    ),
                 );
                 return false;
             }
@@ -3971,6 +4021,46 @@ pub unsafe extern "C" fn line_sender_qwpws_errors_dropped(
         match sender.qwp_ws_errors_dropped() {
             Ok(dropped) => {
                 *dropped_out = dropped;
+                true
+            }
+            Err(err) => {
+                set_err_out_from_sender_error(err_out, sender, err);
+                false
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_effective_frame_cap(
+    sender: *const line_sender,
+    cap_out: *mut usize,
+    server_cap_known_out: *mut bool,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        if cap_out.is_null() || server_cap_known_out.is_null() {
+            let output = if cap_out.is_null() {
+                "cap_out"
+            } else {
+                "server_cap_known_out"
+            };
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("line_sender_qwpws_effective_frame_cap requires non-NULL {output}"),
+            );
+            return false;
+        }
+        let Some(sender) =
+            qwpws_line_sender_ref(sender, err_out, "line_sender_qwpws_effective_frame_cap")
+        else {
+            return false;
+        };
+        match sender.effective_frame_cap() {
+            Ok((cap, server_cap_known)) => {
+                *cap_out = cap;
+                *server_cap_known_out = server_cap_known;
                 true
             }
             Err(err) => {
@@ -5804,6 +5894,19 @@ mod tests {
     }
 
     #[test]
+    fn role_reject_marker_is_null_safe_and_excludes_plain_protocol_errors() {
+        assert!(!unsafe { questdb_error_is_qwp_ws_role_reject(ptr::null()) });
+        let plain = Box::into_raw(Box::new(line_sender_error {
+            error: Error::new(ErrorCode::ProtocolVersionError, "unsupported version"),
+            qwp_ws_error: None,
+        }));
+        unsafe {
+            assert!(!questdb_error_is_qwp_ws_role_reject(plain));
+            line_sender_error_free(plain);
+        }
+    }
+
+    #[test]
     fn line_sender_error_in_doubt_round_trips_the_flag() {
         use questdb::ingress::column_sender::FlushFailure;
 
@@ -5922,6 +6025,7 @@ mod tests {
                 36,
             ),
             (E::SymbolDictFull, line_sender_error_symbol_dict_full, 37),
+            (E::QueryTimeout, line_sender_error_query_timeout, 38),
         ]
     }
 
@@ -6677,6 +6781,10 @@ mod tests {
                 questdb_connection_event_all_endpoints_unreachable,
             ),
             ("auth_failed", questdb_connection_event_auth_failed),
+            (
+                "credential_unavailable",
+                questdb_connection_event_credential_unavailable,
+            ),
         ]
     }
 
@@ -7568,6 +7676,60 @@ mod tests {
 
             line_sender_qwpws_error_free(raw);
         }
+    }
+
+    #[test]
+    fn qwpws_wait_refuses_local_durable_level_without_local_opt_in() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            upgrade_mock_stream(&mut stream);
+            // Hold the connection until the client closes it.
+            let mut sink = [0u8; 256];
+            while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+        });
+
+        unsafe {
+            let mut err = ptr::null_mut();
+            let opts = line_sender_opts_new(
+                line_sender_protocol::line_sender_protocol_ws,
+                utf8(b"127.0.0.1"),
+                port,
+            );
+            assert!(!opts.is_null());
+            let sender = line_sender_build(opts, &mut err);
+            line_sender_opts_free(opts);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            // Level 2 must reach the local durable level, which a sender
+            // opened without `request_durable_ack=local` refuses; read as the
+            // OK level, the wait would succeed on acceptance alone.
+            assert!(!line_sender_qwpws_wait(
+                sender,
+                qwpws_ack_level_local_durable,
+                0,
+                &mut err
+            ));
+            assert!(!err.is_null());
+            assert_err_code(
+                line_sender_error_get_code(err),
+                line_sender_error_code::line_sender_error_invalid_api_call,
+            );
+            let msg = read_error_message(err);
+            assert!(
+                msg.contains("AckLevel::LocalDurable requires `request_durable_ack=local`"),
+                "got: {msg}"
+            );
+            free_err(&mut err);
+
+            line_sender_close(sender);
+        }
+        server.join().unwrap();
     }
 
     #[test]

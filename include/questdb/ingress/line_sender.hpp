@@ -26,6 +26,8 @@
 
 #include "line_sender_array.hpp"
 #include "line_sender_decimal.hpp"
+#include "../oidc.hpp"
+#include "../token_provider.hpp"
 
 namespace questdb::ingress
 {
@@ -224,9 +226,12 @@ public:
     /**
      * The current encoded size of the buffered data.
      *
-     * For ILP buffers this is the exact pending byte length. For QWP buffers
-     * this is a buffered size hint, not the exact size of any eventual UDP
-     * datagram.
+     * For ILP buffers this is the exact pending byte length. For QWP/UDP
+     * buffers this is a buffered size hint, not the exact size of any
+     * eventual datagram. For QWP/WebSocket buffers it is at least the size of
+     * the frame that flushing the buffer encodes, unless store-and-forward
+     * has fallen back to sending full symbol dictionaries because its symbol
+     * side-file could not be opened or rolled back.
      */
     size_t size() const noexcept
     {
@@ -295,7 +300,7 @@ public:
         ::line_sender_error* c_err{nullptr};
         if (::line_sender_buffer_bookmark(_impl, &out, &c_err))
             return buffer_bookmark{out};
-        throw line_sender_error::from_c(c_err);
+        line_sender_error::throw_from_c(c_err);
     }
 
     /**
@@ -1259,7 +1264,7 @@ private:
     static inline ::line_sender_utf8 name()
     {
         // Maintained by .bumpversion.cfg
-        static const char user_agent[] = "questdb/c++/7.1.0";
+        static const char user_agent[] = "questdb/c++/7.3.0";
         ::line_sender_utf8 utf8 =
             ::line_sender_utf8_assert(sizeof(user_agent) - 1, user_agent);
         return utf8;
@@ -1496,6 +1501,67 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_token, _impl, token._impl);
+        return *this;
+    }
+
+    /**
+     * Use an OIDC device-flow auth state as a rotating Bearer-token provider.
+     * Supported by HTTP(S) and QWP/WebSocket senders. The Rust builder retains
+     * shared ownership, so `auth` does not need to outlive these options.
+     * Provider calls may silently refresh but never prompt from flush/connect;
+     * call auth.sign_in() explicitly before starting the sender.
+     * A QWP/WebSocket initial connect with `initial_connect_retry=sync`
+     * retries only a busy acquisition: any other OIDC failure, a transient
+     * refresh failure included, fails it at once. An HTTP flush retries a
+     * transient failure within its `retry_timeout`. See
+     * `line_sender_opts_oidc_auth`.
+     * Mutually exclusive with static credentials: these opts must not also
+     * carry `username`/`password` or `token`, from the config string or from
+     * `username()` and friends.
+     * Use `https::` or `wss::` (TLS): over plain `http::` or `ws::` to a
+     * non-loopback host the Bearer token is sent in cleartext on every flush
+     * or connect and can be captured in transit.
+     * @throws questdb::oidc::error if `auth` is empty or moved from.
+     * @throws line_sender_error if the sender configuration cannot use OIDC,
+     *         including when static credentials or another rotating provider
+     *         (`token_provider()`) are already set, or if `auth` was already
+     *         closed (OIDC kind `cancelled`).
+     * @note After attaching, a token-acquisition failure surfaces from
+     *       `flush()` (and other sender calls) as a `line_sender_error`, with
+     *       the structured OIDC detail on its `oidc_diagnostic()` member — not
+     *       as a `questdb::oidc::error`. Catch `const questdb::error&` to
+     *       handle both. See `questdb::oidc::error` for the cross-surface
+     *       model.
+     */
+    opts& oidc_auth(const ::questdb::oidc::device_auth& auth)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_oidc_auth, _impl, auth.raw());
+        return *this;
+    }
+
+    /**
+     * Attach a rotating Bearer-token provider (see `questdb::token_provider`)
+     * to an HTTP(S) or QWP/WebSocket sender. The options keep their own
+     * reference. A QWP/WebSocket sender pulls the token once per connect
+     * round; an HTTP(S) sender pulls it on every flush, on the flushing
+     * thread. On a 401 the sender tells the provider which token was
+     * rejected, pulls again, and retries once if the token changed and the
+     * `WWW-Authenticate` challenge allows it (no Bearer error, or
+     * `invalid_token`).
+     * Mutually exclusive with `username()`/`password()`, `token()` and
+     * `oidc_auth()`: one opts take one rotating provider. Use `https::` or
+     * `wss::`.
+     * @throws line_sender_error if the configuration cannot use a provider,
+     *         including when static credentials or another rotating provider
+     *         are already set (`config_error`), if `provider` is empty or
+     *         moved from (`invalid_api_call`), or if it is a refreshing
+     *         provider that was already closed (`auth_error`).
+     */
+    opts& token_provider(const ::questdb::token_provider& provider)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_token_provider, _impl, provider.raw());
         return *this;
     }
 
@@ -1749,9 +1815,18 @@ enum class qwpws_ack_level : uint32_t
     /** Wait for the server to accept every published frame. */
     ok = ::qwpws_ack_level_ok,
 
-    /** Wait for durable-ACK coverage. This level requires QuestDB Enterprise;
-     * APIs accepting it also require the `request_durable_ack=on` opt-in. */
+    /** Wait until the frames reached replication storage. This level requires
+     * QuestDB Enterprise; APIs accepting it also require
+     * `request_durable_ack=on`, `replicated`, or `local,replicated`.
+     * `local,replicated` also needs a server running
+     * `cairo.commit.mode=adaptive`. */
     durable = ::qwpws_ack_level_durable,
+
+    /** Wait until the server flushed the frames to its own disk. This level
+     * requires a server running `cairo.commit.mode=adaptive`; APIs accepting
+     * it also require `request_durable_ack=local`. It survives a server power
+     * loss, not the loss of that disk. */
+    local_durable = ::qwpws_ack_level_local_durable,
 };
 
 /**
@@ -2114,8 +2189,10 @@ public:
      * store-and-forward wait. `timeout` is a no-progress deadline (it fires
      * only if the ack watermark fails to advance for that long); the default
      * of zero waits indefinitely. `qwpws_ack_level::durable` requires QuestDB
-     * Enterprise and `request_durable_ack=on`; otherwise this throws
-     * `invalid_api_call` even when nothing has been published. Throws on the
+     * Enterprise and `request_durable_ack=on`, `replicated`, or
+     * `local,replicated`; `qwpws_ack_level::local_durable` requires
+     * `request_durable_ack=local`; otherwise this throws `invalid_api_call`
+     * even when nothing has been published. Throws on the
      * no-progress timeout, a server rejection, or a transport failure; returns
      * immediately when nothing has been published yet.
      */

@@ -41,8 +41,8 @@ use libc::{c_char, c_void, size_t};
 
 use questdb::egress::{
     BatchView, ColumnKind, ColumnView, Cursor, FailoverPhase, FailoverProgressEvent,
-    FailoverResetEvent, Reader, ReaderQuery, ReaderStats, ServerInfo, ServerRole, SimpleNullKind,
-    SymbolEntry, Terminal, Validity,
+    FailoverResetEvent, Reader, ReaderConfig, ReaderQuery, ReaderStats, ServerInfo, ServerRole,
+    SimpleNullKind, SymbolEntry, Terminal, Validity,
 };
 use questdb::{Error, ErrorCode};
 
@@ -129,6 +129,16 @@ fn wrap_pooled_reader(
             handle: pool,
             must_close: AtomicBool::new(false),
         },
+    }))
+}
+
+fn wrap_standalone_reader(reader: Reader) -> *mut qwp_reader {
+    let stats = Arc::clone(reader.stats());
+    Box::into_raw(Box::new(qwp_reader {
+        reader_cell: UnsafeCell::new(reader),
+        cursor_active: AtomicBool::new(false),
+        stats,
+        ownership: ReaderOwnership::Standalone,
     }))
 }
 
@@ -477,18 +487,75 @@ pub unsafe extern "C" fn qwp_reader_from_conf(
         };
         let reader_result = Reader::from_conf(conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
-        let stats = Arc::clone(reader.stats());
-        Box::into_raw(Box::new(qwp_reader {
-            reader_cell: UnsafeCell::new(reader),
-            cursor_active: AtomicBool::new(false),
-            stats,
-            ownership: ReaderOwnership::Standalone,
-        }))
+        wrap_standalone_reader(reader)
     }));
     match result {
         Ok(p) => p,
         Err(_) => std::process::abort(),
     }
+}
+
+/// Construct a reader from a QuestDB config string and use `auth` as its
+/// rotating, non-prompting Bearer-token provider. The auth handle may be freed
+/// after this call returns; the reader retains shared ownership of the OIDC
+/// state. Explicit sign-in must happen before a token that cannot be silently
+/// refreshed is needed. The config string must not exceed
+/// [`crate::MAX_CONFIG_BYTES`] bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_reader_from_conf_with_oidc(
+    config: line_sender_utf8,
+    auth: *const crate::oidc::questdb_oidc_auth,
+    err_out: *mut *mut questdb_error,
+) -> *mut qwp_reader {
+    panic_guard(|| unsafe {
+        let conf = match validated_config_str(&config) {
+            Ok(s) => s,
+            Err(err) => {
+                write_err_box(err_out, err);
+                return ptr::null_mut();
+            }
+        };
+        let Some(auth) = crate::oidc::clone_open_auth(auth, err_out) else {
+            return ptr::null_mut();
+        };
+        let config = reader_bubble!(err_out, ReaderConfig::from_conf(conf), ptr::null_mut());
+        let isolation = auth.token_provider_isolation();
+        let config = reader_bubble!(
+            err_out,
+            config.token_provider_with_isolation(move || auth.token(), isolation),
+            ptr::null_mut()
+        );
+        let reader = reader_bubble!(err_out, Reader::from_config(&config), ptr::null_mut());
+        wrap_standalone_reader(reader)
+    })
+}
+
+/// Construct a reader from a QuestDB config string and use `provider` as its
+/// rotating Bearer-token provider. The reader keeps its own reference:
+/// `provider` may be freed afterwards. The config string must not exceed
+/// [`crate::MAX_CONFIG_BYTES`] bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_reader_from_conf_with_token_provider(
+    config: line_sender_utf8,
+    provider: *const crate::token_provider::questdb_token_provider,
+    err_out: *mut *mut questdb_error,
+) -> *mut qwp_reader {
+    panic_guard(|| unsafe {
+        let conf = match validated_config_str(&config) {
+            Ok(s) => s,
+            Err(err) => {
+                write_err_box(err_out, err);
+                return ptr::null_mut();
+            }
+        };
+        let Some(provider) = crate::token_provider::provider_ref(provider, err_out) else {
+            return ptr::null_mut();
+        };
+        let config = reader_bubble!(err_out, ReaderConfig::from_conf(conf), ptr::null_mut());
+        let config = reader_bubble!(err_out, provider.attach_to_reader(config), ptr::null_mut());
+        let reader = reader_bubble!(err_out, Reader::from_config(&config), ptr::null_mut());
+        wrap_standalone_reader(reader)
+    })
 }
 
 /// Construct a reader from the configuration stored in the
@@ -526,13 +593,7 @@ pub unsafe extern "C" fn qwp_reader_from_env(err_out: *mut *mut questdb_error) -
         };
         let reader_result = Reader::from_conf(&conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
-        let stats = Arc::clone(reader.stats());
-        Box::into_raw(Box::new(qwp_reader {
-            reader_cell: UnsafeCell::new(reader),
-            cursor_active: AtomicBool::new(false),
-            stats,
-            ownership: ReaderOwnership::Standalone,
-        }))
+        wrap_standalone_reader(reader)
     }));
     match result {
         Ok(p) => p,
@@ -2730,7 +2791,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_current_addr_port(
 /// while a cursor is live.
 ///
 /// Returns `false` and sets `*err_out` on failure: the cursor handle is
-/// NULL, or the underlying connection is poisoned after a failed
+/// NULL, or the underlying connection was lost after a failed
 /// mid-query failover. On success returns `true` and writes the version
 /// to `*out_version`.
 #[unsafe(no_mangle)]
@@ -2878,6 +2939,10 @@ pub unsafe extern "C" fn qwp_reader_cursor_terminal_end(
 /// If the cursor's terminal is `EXEC_DONE`, set `*out_op_type` and
 /// `*out_rows_affected` and return true. Otherwise zeroes both outputs and
 /// returns false. NULL handle also zeroes the outputs and returns false.
+///
+/// A statement the server executes at parse time reports no row count: it
+/// sends `-1`, which arrives as `ROWS_AFFECTED_UNKNOWN` (`u64::MAX`, the
+/// header's `QWP_READER_ROWS_AFFECTED_UNKNOWN`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_cursor_terminal_exec_done(
     cursor: *const qwp_reader_cursor,
@@ -3019,6 +3084,33 @@ pub unsafe extern "C" fn qwp_reader_query_set_reset_symbol_dict(
     reset: bool,
 ) {
     unsafe { mutate_query(query, |q| q.reset_symbol_dict(reset)) }
+}
+
+/// Run this query under its own timeout, in milliseconds, instead of the
+/// server-wide `query.timeout`. Overrides the connect string's
+/// `query_timeout_ms`; `0` clears it. Mirrors `ReaderQuery::timeout`.
+///
+/// Unlike `qwp_reader_query_set_reset_symbol_dict`, this does NOT silently
+/// degrade: against a server that does not advertise `CAP_QUERY_TIMEOUT`,
+/// `qwp_reader_query_execute` fails with
+/// `line_sender_error_unsupported_server`, before anything is written,
+/// rather than letting the caller believe a timeout applied; the connection
+/// is untouched by that refusal. On expiry the query ends with
+/// `line_sender_error_query_timeout` and the connection stays usable — but
+/// do not retry a write on it, because a statement that outlives its
+/// timeout is reported as `EXEC_DONE` instead, and a DDL / INSERT / UPDATE
+/// that timed out waiting for the table writer may still be applied
+/// afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_reader_query_set_timeout_ms(
+    query: *mut qwp_reader_query,
+    timeout_ms: u64,
+) {
+    unsafe {
+        mutate_query(query, |q| {
+            q.timeout(std::time::Duration::from_millis(timeout_ms))
+        })
+    }
 }
 
 /// Report a NULL out-param contract violation through `err_out`.
@@ -4031,19 +4123,33 @@ mod tests {
             buf: std::ptr::NonNull::<c_char>::dangling().as_ptr(),
         };
 
+        let assert_size_error = |reader: *mut qwp_reader, err: *mut questdb_error| {
+            assert!(reader.is_null());
+            assert!(!err.is_null());
+            assert_eq!(
+                unsafe { questdb_error_get_code(err) } as u32,
+                questdb_error_code::line_sender_error_invalid_api_call as u32
+            );
+            let mut len = 0;
+            let message = unsafe { questdb_error_msg(err, &mut len) };
+            let message = unsafe { slice::from_raw_parts(message as *const u8, len) };
+            assert!(String::from_utf8_lossy(message).contains("maximum is 1048576 bytes"));
+            unsafe { questdb_error_free(err) };
+        };
+
         let mut err = ptr::null_mut();
         let reader = unsafe { qwp_reader_from_conf(config, &mut err) };
-        assert!(reader.is_null());
-        assert!(!err.is_null());
-        assert_eq!(
-            unsafe { questdb_error_get_code(err) } as u32,
-            questdb_error_code::line_sender_error_invalid_api_call as u32
-        );
-        let mut len = 0;
-        let message = unsafe { questdb_error_msg(err, &mut len) };
-        let message = unsafe { slice::from_raw_parts(message as *const u8, len) };
-        assert!(String::from_utf8_lossy(message).contains("maximum is 1048576 bytes"));
-        unsafe { questdb_error_free(err) };
+        assert_size_error(reader, err);
+
+        // The size gate also runs before the auth or provider is examined.
+        let mut err = ptr::null_mut();
+        let reader = unsafe { qwp_reader_from_conf_with_oidc(config, ptr::null(), &mut err) };
+        assert_size_error(reader, err);
+
+        let mut err = ptr::null_mut();
+        let reader =
+            unsafe { qwp_reader_from_conf_with_token_provider(config, ptr::null(), &mut err) };
+        assert_size_error(reader, err);
     }
 
     // -- Failover trampoline shape (no live cursor) --

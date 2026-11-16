@@ -2431,6 +2431,7 @@ struct QwpWsTableBuffer {
     in_progress_column_count: usize,
     column_access_cursor: usize,
     columns: Vec<QwpWsColumnBuffer>,
+    encoded_column_schema: Vec<u8>,
     column_lookup: std::collections::HashMap<Box<[u8]>, usize>,
     row_mark: Option<QwpWsRowRollbackMark>,
 }
@@ -2507,15 +2508,22 @@ struct QwpWsSizeHint {
 
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsSizeHint {
+    #[inline(always)]
     fn mark_dirty(&mut self, table_idx: usize) {
+        if self.tables.get(table_idx).is_some_and(|table| table.dirty) {
+            return;
+        }
+        self.mark_dirty_slow(table_idx);
+    }
+
+    #[inline(never)]
+    fn mark_dirty_slow(&mut self, table_idx: usize) {
         if self.tables.len() <= table_idx {
             self.tables
                 .resize(table_idx + 1, QwpWsTableSizeHint::default());
         }
-        if !self.tables[table_idx].dirty {
-            self.tables[table_idx].dirty = true;
-            self.dirty_tables.push(table_idx);
-        }
+        self.tables[table_idx].dirty = true;
+        self.dirty_tables.push(table_idx);
     }
 
     fn truncate(&mut self, table_count: usize) {
@@ -2559,9 +2567,8 @@ impl QwpWsSizeHint {
         }
 
         QWP_MESSAGE_HEADER_SIZE
-            + 2
             + self.encoded_tables_len
-            + qwp_varint_size(0)
+            + QWP_WS_SYMBOL_ID_MAX_LEN
             + qwp_varint_size(self.symbol_dict_count as u64)
             + self.symbol_dict_bytes
     }
@@ -2831,7 +2838,7 @@ impl QwpWsColumnarBuffer {
 
     #[cfg(test)]
     fn recompute_len_slow(&self) -> usize {
-        let mut total = QWP_MESSAGE_HEADER_SIZE + 2;
+        let mut total = QWP_MESSAGE_HEADER_SIZE;
         let mut symbol_dict_count = 0usize;
         let mut symbol_dict_bytes = 0usize;
         for table in self.tables.iter().filter(|table| table.row_count > 0) {
@@ -2854,7 +2861,10 @@ impl QwpWsColumnarBuffer {
                 }
             }
         }
-        total + qwp_varint_size(0) + qwp_varint_size(symbol_dict_count as u64) + symbol_dict_bytes
+        total
+            + QWP_WS_SYMBOL_ID_MAX_LEN
+            + qwp_varint_size(symbol_dict_count as u64)
+            + symbol_dict_bytes
     }
 
     #[cfg(test)]
@@ -2889,6 +2899,7 @@ impl QwpWsColumnarBuffer {
         for table in &self.tables {
             cap += table.table_name.capacity();
             cap += table.columns.capacity() * std::mem::size_of::<QwpWsColumnBuffer>();
+            cap += table.encoded_column_schema.capacity();
             for column in &table.columns {
                 cap += column.name.capacity() + column.lower_name.capacity() + column.capacity();
             }
@@ -3032,7 +3043,12 @@ impl QwpWsColumnarBuffer {
         let tables_len_before = self.tables.len();
         let current_table_idx_before = self.current_table_idx;
         let state_before = self.state;
-        let idx = match self.current_table_idx {
+        // clear() retains validated schema; a one-table buffer can reuse it
+        // without revalidating and hashing the same name after every flush.
+        let cached_table_idx = self
+            .current_table_idx
+            .or_else(|| (self.tables.len() == 1).then_some(0));
+        let idx = match cached_table_idx {
             Some(current_idx)
                 if names_equal_packed(
                     &self.tables[current_idx].table_name,
@@ -3882,18 +3898,9 @@ impl QwpWsColumnarBuffer {
             write_qwp_bytes(out, &table.table_name);
             write_qwp_varint(out, table.row_count as u64);
             write_qwp_varint(out, table.columns.len() as u64);
-
-            scratch.schema_signature.clear();
-            for column in &table.columns {
-                write_qwp_bytes(&mut scratch.schema_signature, &column.name);
-                scratch.schema_signature.push(wire_type_byte(
-                    column.kind,
-                    column.uses_null_bitmap(table.row_count as usize),
-                ));
-            }
             // Columns always travel inline: name + wire-type per column, right
             // after col_count. No schema-mode byte, no schema id.
-            out.extend_from_slice(&scratch.schema_signature);
+            out.extend_from_slice(&table.encoded_column_schema);
 
             for (col_idx, column) in table.columns.iter().enumerate() {
                 let globals = &scratch.per_segment_symbol_globals[table_idx][col_idx];
@@ -3931,6 +3938,7 @@ impl QwpWsTableBuffer {
             in_progress_column_count: 0,
             column_access_cursor: 0,
             columns: Vec::new(),
+            encoded_column_schema: Vec::new(),
             column_lookup: std::collections::HashMap::new(),
             row_mark: None,
         }
@@ -3973,7 +3981,7 @@ impl QwpWsTableBuffer {
         }
         if self.columns.len() > mark.columns_len {
             self.columns.truncate(mark.columns_len);
-            self.rebuild_column_lookup();
+            self.rebuild_column_metadata();
         }
         self.row_count = mark.row_count;
         self.in_progress = mark.in_progress;
@@ -4023,15 +4031,21 @@ impl QwpWsTableBuffer {
         let idx = self.columns.len();
         self.columns.push(QwpWsColumnBuffer::new(name, kind));
         self.column_lookup.insert(lookup_key, idx);
+        write_qwp_bytes(&mut self.encoded_column_schema, name);
+        self.encoded_column_schema.push(wire_type_byte(kind, false));
         Ok(idx)
     }
 
-    fn rebuild_column_lookup(&mut self) {
+    fn rebuild_column_metadata(&mut self) {
         self.column_lookup.clear();
+        self.encoded_column_schema.clear();
         for (idx, column) in self.columns.iter().enumerate() {
             if let Ok(key) = column_lookup_key(&column.name) {
                 self.column_lookup.insert(key, idx);
             }
+            write_qwp_bytes(&mut self.encoded_column_schema, &column.name);
+            self.encoded_column_schema
+                .push(wire_type_byte(column.kind, false));
         }
     }
 }
@@ -4127,7 +4141,7 @@ impl QwpWsColumnBuffer {
     fn rollback_rows_from(&mut self, from: u32) {
         if let QwpWsColumnValues::Symbol { cells, dict, .. } = &self.values {
             for cell in cells.iter().rev().take_while(|cell| cell.row_idx >= from) {
-                self.symbol_cells_encoded_len -= qwp_varint_size(cell.local_id as u64);
+                self.symbol_cells_encoded_len -= QWP_WS_SYMBOL_ID_MAX_LEN;
                 if cell.is_new {
                     let entry = &dict[cell.local_id as usize];
                     self.symbol_dict_encoded_len -= qwp_string_byte_len(entry.len as usize);
@@ -4299,8 +4313,22 @@ impl QwpWsColumnBuffer {
             return Err(type_mismatch_error_ws(&self.name));
         };
         let bytes = value.as_bytes();
-        let hash = qwp_ws_symbol_hash(bytes);
-        let (local_id, is_new) = if let Some(local_id) = lookup.get(hash, bytes, dict, data) {
+        // A one-symbol batch needs no hash table. Build the index only when a
+        // second distinct symbol arrives, retaining the same dictionary IDs.
+        let (existing, hash) = match dict.len() {
+            0 => (None, None),
+            1 => (
+                symbol_entry_bytes(dict, data, 0)
+                    .filter(|stored| *stored == bytes)
+                    .map(|_| 0),
+                None,
+            ),
+            _ => {
+                let hash = qwp_ws_symbol_hash(bytes);
+                (lookup.get(hash, bytes, dict, data), Some(hash))
+            }
+        };
+        let (local_id, is_new) = if let Some(local_id) = existing {
             (local_id, false)
         } else {
             let local_id = checked_qwp_push_index(dict.len(), "QWP/WS symbol dictionary length")?;
@@ -4308,7 +4336,13 @@ impl QwpWsColumnBuffer {
             let len = checked_qwp_u32(bytes.len(), "QWP/WS symbol length")?;
             data.extend_from_slice(bytes);
             dict.push(QwpWsSymbolEntry { offset, len });
-            lookup.insert(hash, local_id);
+            if local_id == 1 && lookup.buckets.is_empty() {
+                let first = symbol_entry_bytes(dict, data, 0).expect("first symbol exists");
+                lookup.insert(qwp_ws_symbol_hash(first), 0);
+            }
+            if local_id != 0 {
+                lookup.insert(hash.unwrap_or_else(|| qwp_ws_symbol_hash(bytes)), local_id);
+            }
             (local_id, true)
         };
         cells.push(QwpWsSymbolCell {
@@ -4317,7 +4351,7 @@ impl QwpWsColumnBuffer {
             is_new,
         });
         self.increment_non_null()?;
-        self.symbol_cells_encoded_len += qwp_varint_size(local_id as u64);
+        self.symbol_cells_encoded_len += QWP_WS_SYMBOL_ID_MAX_LEN;
         if is_new {
             self.symbol_dict_encoded_len += qwp_string_byte_len(bytes.len());
         }
@@ -4881,10 +4915,7 @@ impl QwpWsColumnValues {
                 cells.len().saturating_mul(8)
             }
             Self::String { cells, data } => (cells.len() + 1).saturating_mul(4) + data.len(),
-            Self::Symbol { cells, .. } => cells
-                .iter()
-                .map(|cell| qwp_varint_size(cell.local_id as u64))
-                .sum(),
+            Self::Symbol { cells, .. } => cells.len().saturating_mul(QWP_WS_SYMBOL_ID_MAX_LEN),
             Self::Decimal { cells, .. } => {
                 1 + cells
                     .iter()
@@ -5502,6 +5533,15 @@ impl Default for SymbolGlobalDict {
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 2_000_000;
 
+/// Bytes the QWP/WS size hint charges for each connection-wide symbol id a
+/// frame carries: every symbol cell, and the delta dictionary's start id.
+/// The buffer cannot see those ids until the flush interns its symbols, so
+/// it charges the widest varint an id can take. Ids stay below
+/// [`MAX_CONN_SYMBOL_DICT_SIZE`] and the start id reaches it at most, which
+/// keeps the hint at or above the encoded frame.
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_WS_SYMBOL_ID_MAX_LEN: usize = qwp_varint_size(MAX_CONN_SYMBOL_DICT_SIZE as u64);
+
 /// Per-connection cap on the cumulative UTF-8 heap (in bytes) the QWP/WS global
 /// symbol dictionary holds. Matches `MAX_CONN_DICT_HEAP_BYTES` in the egress
 /// reader (`egress/symbol_dict.rs`) and the Java reference client. The entry
@@ -5927,6 +5967,7 @@ pub(crate) struct QwpWsEncodeScratch {
     /// definitions: `(varint name_len, name, type_code)*`, spliced inline into
     /// the message right after `col_count` (avoiding a second pass over the
     /// columns).
+    #[cfg(test)]
     schema_signature: Vec<u8>,
 }
 
@@ -5937,6 +5978,7 @@ impl QwpWsEncodeScratch {
             #[cfg(test)]
             message: Vec::with_capacity(16 * 1024),
             per_segment_symbol_globals: Vec::new(),
+            #[cfg(test)]
             schema_signature: Vec::new(),
         }
     }
@@ -7421,7 +7463,7 @@ fn qwp_string_byte_len(byte_len: usize) -> usize {
     qwp_varint_size(byte_len as u64) + byte_len
 }
 
-fn qwp_varint_size(mut value: u64) -> usize {
+const fn qwp_varint_size(mut value: u64) -> usize {
     let mut size = 1usize;
     while value > 0x7F {
         value >>= 7;
@@ -10564,6 +10606,83 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn qwp_ws_size_hint_covers_encoded_frame_when_symbol_ids_widen() {
+        // A frame carries each symbol cell as its connection-wide id. The
+        // 500-value column comes first, so the other columns' ids start past
+        // its own, and the connection may have interned symbols before.
+        fn add_rows(buf: &mut QwpWsColumnarBuffer, rows: std::ops::Range<i64>) {
+            for i in rows {
+                let row = buf.table("trades").unwrap();
+                row.symbol("ticker", format!("T{:03}", (i * 7919) % 500).as_str())
+                    .unwrap();
+                row.symbol(
+                    "exchange",
+                    ["NYSE", "NASDAQ", "ARCA", "BATS"][(i % 4) as usize],
+                )
+                .unwrap();
+                row.symbol("side", ["buy", "sell"][((i / 3) % 2) as usize])
+                    .unwrap();
+                row.symbol("ccy", ["USD", "EUR", "GBP"][((i / 5) % 3) as usize])
+                    .unwrap();
+                if i % 3 != 0 {
+                    row.symbol("venue", format!("V{}", (i / 7) % 8).as_str())
+                        .unwrap();
+                }
+                row.column_f64("price", i as f64 * 0.5).unwrap();
+                row.at_now().unwrap();
+            }
+        }
+
+        fn assert_covers(
+            buf: &QwpWsColumnarBuffer,
+            global_dict: &mut SymbolGlobalDict,
+            warm: usize,
+            what: &str,
+        ) {
+            let mut scratch = QwpWsEncodeScratch::new();
+            let mut out = Vec::new();
+            buf.encode_ws_replay_message_with_defer(
+                &mut out,
+                &mut scratch,
+                global_dict,
+                QWP_VERSION_1,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(
+                out.len() <= buf.len(),
+                "{what} after {warm} interned symbols: encoded {} bytes, size hint {}",
+                out.len(),
+                buf.len()
+            );
+        }
+
+        for warm in [0usize, 127, 128, 16_383, 16_384] {
+            let mut global_dict = SymbolGlobalDict::new();
+            for i in 0..warm {
+                global_dict.intern(format!("w{i:05}").as_bytes()).unwrap();
+            }
+            let mut buf = QwpWsColumnarBuffer::new(127);
+
+            add_rows(&mut buf, 0..600);
+            assert_covers(&buf, &mut global_dict, warm, "new symbols");
+
+            buf.clear();
+            add_rows(&mut buf, 600..1200);
+            assert_covers(&buf, &mut global_dict, warm, "known symbols");
+
+            let before_marker = buf.len();
+            buf.set_marker().unwrap();
+            add_rows(&mut buf, 1200..1201);
+            buf.rewind_to_marker().unwrap();
+            assert_eq!(buf.len(), before_marker);
+            assert_covers(&buf, &mut global_dict, warm, "after a rewind");
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn qwp_ws_cached_size_hint_recomputes_only_dirty_tables() {
         let mut buf = QwpWsColumnarBuffer::new(127);
         for table in ["a", "b", "c"] {
@@ -10594,6 +10713,38 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn qwp_ws_size_hint_stays_current_between_fields() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for cycle in 0..2 {
+            for table in ["trades", "quotes"] {
+                buf.table(table)
+                    .unwrap()
+                    .symbol("sym", "alpha")
+                    .unwrap()
+                    .column_i64("value", 1)
+                    .unwrap()
+                    .at_now()
+                    .unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+
+                buf.table(table).unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+                buf.symbol("sym", "bravo").unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+                buf.column_i64("value", 2).unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+                buf.column_str("note", "new field").unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow());
+                buf.at_now().unwrap();
+                assert_eq!(buf.len(), buf.recompute_len_slow(), "cycle {cycle}");
+            }
+            buf.clear();
+            assert_eq!(buf.len(), buf.recompute_len_slow());
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn qwp_ws_cached_size_hint_retains_dirty_index_capacity() {
         let mut buf = QwpWsColumnarBuffer::new(127);
         buf.table("trades")
@@ -10617,6 +10768,74 @@ mod tests {
             assert_eq!(buf.len(), buf.recompute_len_slow());
             assert_eq!(buf.size_hint_dirty_capacity(), capacity);
         }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_clear_reuses_schema_without_keeping_row_state() {
+        for table in ["trades", "quotes"] {
+            let mut buf = QwpWsColumnarBuffer::new(6);
+            buf.table("trades")
+                .unwrap()
+                .column_i64("v", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            buf.clear();
+            assert!(buf.column_i64("v", 2).is_err());
+            assert!(buf.table("").is_err());
+            assert!(buf.table("too_long").is_err());
+            assert!(buf.is_empty());
+            buf.table(table)
+                .unwrap()
+                .column_i64("v", 2)
+                .unwrap()
+                .at_now()
+                .unwrap();
+
+            let mut expected = QwpWsColumnarBuffer::new(6);
+            expected
+                .table(table)
+                .unwrap()
+                .column_i64("v", 2)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut expected));
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_schema_replaces_rolled_back_column_type() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let mut expected = buf.clone();
+
+        buf.table("trades")
+            .unwrap()
+            .column_str("discarded", "value")
+            .unwrap();
+        assert!(buf.column_bool("qty", true).is_err());
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut expected));
+
+        for buffer in [&mut buf, &mut expected] {
+            buffer
+                .table("trades")
+                .unwrap()
+                .column_bool("discarded", false)
+                .unwrap()
+                .column_i64("qty", 2)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut expected));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -11547,6 +11766,8 @@ mod tests {
             .unwrap()
             .column_i64("qty", 3)
             .unwrap()
+            .column_bool("discarded", true)
+            .unwrap()
             .at_now()
             .unwrap();
 
@@ -11559,6 +11780,7 @@ mod tests {
 
         cloned.rewind_to_marker().unwrap();
         assert_eq!(cloned.row_count(), 1);
+        assert_eq!(ws_replay_bytes(&mut cloned), ws_replay_bytes(&mut original));
 
         original
             .table("trades")
@@ -11584,6 +11806,7 @@ mod tests {
             .unwrap();
         cloned.rewind_to_bookmark(clone_bookmark).unwrap();
         assert_eq!(cloned.row_count(), 1);
+        assert_eq!(ws_replay_bytes(&mut cloned), ws_replay_bytes(&mut original));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -11696,6 +11919,77 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn qwp_ws_single_symbol_promotes_index_and_survives_rollback_and_clear() {
+        fn values(column: &QwpWsColumnBuffer) -> Vec<Vec<u8>> {
+            let QwpWsColumnValues::Symbol {
+                cells, dict, data, ..
+            } = &column.values
+            else {
+                unreachable!()
+            };
+            cells
+                .iter()
+                .map(|cell| {
+                    symbol_entry_bytes(dict, data, cell.local_id)
+                        .unwrap()
+                        .to_vec()
+                })
+                .collect()
+        }
+        let mut column = QwpWsColumnBuffer::new(b"sym", ColumnKind::Symbol);
+        column.append_symbol(0, "alpha").unwrap();
+        column.append_symbol(1, "alpha").unwrap();
+        let mut cloned = column.clone();
+        column.append_symbol(2, "beta").unwrap();
+        column.append_symbol(3, "alpha").unwrap();
+        assert_eq!(
+            values(&column),
+            [
+                b"alpha".to_vec(),
+                b"alpha".to_vec(),
+                b"beta".to_vec(),
+                b"alpha".to_vec()
+            ]
+        );
+
+        column.rollback_rows_from(2);
+        column.append_symbol(2, "gamma").unwrap();
+        column.append_symbol(3, "beta").unwrap();
+        column.append_symbol(4, "beta").unwrap();
+        column.append_symbol(5, "alpha").unwrap();
+        column.append_symbol(6, "gamma").unwrap();
+        assert_eq!(
+            values(&column),
+            [
+                b"alpha".to_vec(),
+                b"alpha".to_vec(),
+                b"gamma".to_vec(),
+                b"beta".to_vec(),
+                b"beta".to_vec(),
+                b"alpha".to_vec(),
+                b"gamma".to_vec()
+            ]
+        );
+        cloned.append_symbol(2, "gamma").unwrap();
+        assert_eq!(
+            values(&cloned),
+            [b"alpha".to_vec(), b"alpha".to_vec(), b"gamma".to_vec()]
+        );
+
+        column.clear_rows();
+        column.append_symbol(0, "beta").unwrap();
+        column.rollback_rows_from(0);
+        column.append_symbol(0, "gamma").unwrap();
+        column.append_symbol(1, "alpha").unwrap();
+        column.append_symbol(2, "gamma").unwrap();
+        assert_eq!(
+            values(&column),
+            [b"gamma".to_vec(), b"alpha".to_vec(), b"gamma".to_vec()]
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn qwp_ws_columnar_rollback_removes_new_symbol_from_current_row() {
         let mut buf = QwpWsColumnarBuffer::new(127);
         let mut scratch = QwpWsEncodeScratch::new();
@@ -11709,13 +12003,9 @@ mod tests {
             .unwrap()
             .at_now()
             .unwrap();
-        // The committed symbol is the only value for its hash.
+        // A singleton dictionary does not need an index yet.
         let buckets = &symbol_lookup(&buf, "trades", "sym").buckets;
-        assert_eq!(buckets.len(), 1);
-        assert!(matches!(
-            buckets.values().next(),
-            Some(QwpWsLocalSymbolBucket::One(_))
-        ));
+        assert!(buckets.is_empty());
 
         // Each rejected symbol is new, so it occupies its own singleton
         // bucket. After the row is rejected only the committed symbol's

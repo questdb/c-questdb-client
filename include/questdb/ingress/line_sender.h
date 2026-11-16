@@ -168,7 +168,11 @@ typedef enum line_sender_error_code
     /** HTTP-upgrade or WebSocket handshake failure. */
     line_sender_error_handshake_error = 20,
 
-    /** Server returned an unsupported QWP version, encoding, or capability. */
+    /** Server returned an unsupported QWP version, encoding, or capability.
+     *  Also raised client-side, before anything is written, when a query
+     *  carries a per-query timeout and the server does not advertise
+     *  `CAP_QUERY_TIMEOUT` (see `qwp_reader_query_set_timeout_ms`); the
+     *  connection is untouched by that refusal. */
     line_sender_error_unsupported_server = 21,
 
     /** Wire-format violation: bad magic, truncated frame, unknown
@@ -290,6 +294,24 @@ typedef enum line_sender_error_code
      *  queued prefix already carried are duplicated.
      */
     line_sender_error_symbol_dict_full = 37,
+
+    /** The query ran past the timeout it carried: server-reported QWP
+     *  `QUERY_TIMEOUT` (status `0x0E`), produced only for a request that
+     *  supplied `timeout_ms` (see `qwp_reader_query_set_timeout_ms`). A
+     *  timeout requested against a server that does not advertise
+     *  `CAP_QUERY_TIMEOUT` is refused with
+     *  `line_sender_error_unsupported_server` instead, so retrying a timeout
+     *  with a larger budget cannot loop against a server that ignores it.
+     *
+     *  Per-query, not per-connection: the connection stays open and
+     *  authenticated, so the next query runs on it without reconnecting.
+     *
+     *  DO NOT RETRY A WRITE ON THIS ERROR. A statement that completes past
+     *  its timeout is reported as `EXEC_DONE` with its row count rather than
+     *  as a timeout, precisely so a retrying client cannot apply it twice;
+     *  and a DDL / INSERT / UPDATE that timed out waiting for the table
+     *  writer may still be applied by that writer afterwards. */
+    line_sender_error_query_timeout = 38,
 } line_sender_error_code;
 
 /**
@@ -352,6 +374,7 @@ typedef line_sender_error_code questdb_error_code;
 #define questdb_error_store_resend_required                                    \
     line_sender_error_store_resend_required
 #define questdb_error_symbol_dict_full line_sender_error_symbol_dict_full
+#define questdb_error_query_timeout line_sender_error_query_timeout
 
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol
@@ -460,6 +483,12 @@ const char* questdb_error_msg(const questdb_error*, size_t* len_out);
  */
 QUESTDB_CLIENT_API
 bool questdb_error_in_doubt(const questdb_error*);
+
+/** Whether the error carries a QWP/WebSocket server-role rejection (including
+ *  a 421 with an unrecognized role header). Unlike a plain protocol-version
+ *  error, this can be retried while server roles change. NULL-safe. */
+QUESTDB_CLIENT_API
+bool questdb_error_is_qwp_ws_role_reject(const questdb_error*);
 
 /** Clean up a client-wide error. Idempotent on NULL. */
 QUESTDB_CLIENT_API
@@ -837,9 +866,12 @@ void line_sender_buffer_clear(line_sender_buffer* buffer);
 /**
  * The current encoded size of the buffered data.
  *
- * For ILP buffers this is the exact pending byte length. For QWP buffers this
- * is a buffered size hint, not the exact size of an eventual UDP datagram or
- * WebSocket replay frame.
+ * For ILP buffers this is the exact pending byte length. For QWP/UDP buffers
+ * this is a buffered size hint, not the exact size of an eventual datagram.
+ * For QWP/WebSocket buffers it is at least the size of the frame that
+ * flushing the buffer encodes, unless store-and-forward has fallen back to
+ * sending full symbol dictionaries because its symbol side-file could not be
+ * opened or rolled back.
  */
 QUESTDB_CLIENT_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);
@@ -2120,9 +2152,18 @@ typedef enum qwpws_ack_level
     /** Wait for the server to accept every published frame. */
     qwpws_ack_level_ok = 0,
 
-    /** Wait for durable-ACK coverage. This level requires QuestDB Enterprise;
-     * APIs accepting it also require the `request_durable_ack=on` opt-in. */
+    /** Wait until the frames reached replication storage. This level requires
+     * QuestDB Enterprise; APIs accepting it also require
+     * `request_durable_ack=on`, `replicated`, or `local,replicated`.
+     * `local,replicated` also needs a server running
+     * `cairo.commit.mode=adaptive`. */
     qwpws_ack_level_durable = 1,
+
+    /** Wait until the server flushed the frames to its own disk. This level
+     * requires a server running `cairo.commit.mode=adaptive`; APIs accepting
+     * it also require `request_durable_ack=local`. It survives a server power
+     * loss, not the loss of that disk. */
+    qwpws_ack_level_local_durable = 2,
 } qwpws_ack_level;
 
 /**
@@ -2133,15 +2174,19 @@ typedef enum qwpws_ack_level
  * `timeout_millis` is a no-progress deadline (it fires only if the ack
  * watermark fails to advance for that long); `0` waits indefinitely.
  * `qwpws_ack_level_durable` requires QuestDB Enterprise and
- * `request_durable_ack=on`; otherwise this returns
- * `line_sender_error_invalid_api_call` even when nothing has been published.
+ * `request_durable_ack=on`, `replicated`, or `local,replicated`;
+ * `qwpws_ack_level_local_durable` requires `request_durable_ack=local`.
+ * Otherwise this returns `line_sender_error_invalid_api_call` even when
+ * nothing has been published.
  *
  * Returns `false` and sets `err_out` on the no-progress timeout
  * (`line_sender_error_failover_retry`), a server rejection, a transport
  * failure, or an invalid `ack_level`. With nothing published yet it succeeds
  * immediately. A timeout while the sender is disconnected and reconnecting
- * keeps failing names that failure. The published frames stay queued either
- * way.
+ * keeps failing names that failure, and carries its OIDC detail when an
+ * attached OIDC auth could not supply a token (`questdb_error_oidc_get_view`
+ * reports `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` when a new sign-in is
+ * needed). The published frames stay queued either way.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_wait(
@@ -2202,11 +2247,29 @@ bool line_sender_qwpws_errors_dropped(
     line_sender_error** err_out);
 
 /**
+ * Return the current hard per-frame cap of a QWP/WebSocket sender: the
+ * smallest of `max_buf_size`, the server's advertised `X-QWP-Max-Batch-Size`
+ * and the store-and-forward segment payload capacity. A flush whose encoded
+ * frame exceeds it fails with `line_sender_error_batch_too_large` and
+ * publishes nothing. `*server_cap_known_out` is true when the current
+ * connection advertised `X-QWP-Max-Batch-Size`, whether or not that value is
+ * the binding limit. The value can change after reconnect.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_qwpws_effective_frame_cap(
+    const line_sender* sender,
+    size_t* cap_out,
+    bool* server_cap_known_out,
+    line_sender_error** err_out);
+
+/**
  * Stop accepting new QWP/WebSocket publications and wait for already-published
  * frames to resolve. The timeout is configured with the QWP/WebSocket
  * `close_flush_timeout_millis` config key; the default is 5000 ms, and values
  * less than or equal to 0 configure a zero-timeout fast close. Timeout and
- * terminal failure are reported through `err_out`.
+ * terminal failure are reported through `err_out`. A timeout while the sender
+ * is disconnected and reconnecting keeps failing names that failure, in either
+ * progress mode, as `line_sender_qwpws_wait` does.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_close_drain(
@@ -2238,7 +2301,10 @@ bool line_sender_qwpws_close_drain(
  * With QWP-over-WebSocket, the function publishes the buffer into the local
  * sender queue and returns before the server necessarily ACKs the frame. Later
  * terminal diagnostics fail subsequent sender calls and are also observable
- * through the QWP/WebSocket diagnostic polling API.
+ * through the QWP/WebSocket diagnostic polling API. A flush that waits out
+ * `sf_append_deadline_millis` on a full queue while the sender is disconnected
+ * and reconnecting keeps failing names that failure, as
+ * `line_sender_qwpws_wait` does.
  *
  * HTTP should be the first choice, but use TCP if you need to continuously
  * send data to the server at a high rate.
@@ -2327,7 +2393,44 @@ int64_t line_sender_now_micros(void);
 #define questdb_connection_event_failed_over 3u
 #define questdb_connection_event_endpoint_attempt_failed 4u
 #define questdb_connection_event_all_endpoints_unreachable 5u
+/** The server rejected the credential the client presented: HTTP 401 or 403
+ *  on the WebSocket upgrade. `host` / `port` are set and `cause_code` is
+ *  `line_sender_error_auth_error`; one event per connect round. Before a
+ *  sender's first connection, and for a connect the caller waits for (a pool
+ *  borrow), it is terminal. Once connected, a store-and-forward sender keeps
+ *  reconnecting with capped backoff and keeps its unacknowledged data,
+ *  reporting each failed round: an identity-provider outage makes a server
+ *  reject a valid credential for a while. Close the sender to give up instead.
+ *  A 401 followed by a failed replacement-token acquisition is instead
+ *  `credential_unavailable` with the endpoint set. */
 #define questdb_connection_event_auth_failed 6u
+/** The token provider failed while acquiring a credential. Before dialling,
+ *  `host` / `port` are NULL. If this follows a server HTTP 401, they identify
+ *  the endpoint that rejected the previous token and `cause_msg` includes the
+ *  401; `cause_code` still classifies the provider failure. Read `cause_code`
+ *  to tell a retry from a stop:
+ *
+ *  - `line_sender_error_socket_error` -- the ordinary case, retryable.
+ *    The sender keeps reconnecting and store-and-forward keeps its queued
+ *    frames. Only a connect the caller waits for fails fast: an initial
+ *    connect other than `initial_connect_retry=async`, or a pool borrow.
+ *    With `initial_connect_retry=sync`, or a pool borrow with retry, that
+ *    connect still retries within its budget a failure the provider
+ *    classified retryable (`questdb_error_token_unavailable_get_view`). An
+ *    OIDC auth classifies none, so there only its busy acquisition is
+ *    retried: a transient refresh failure ends the connect.
+ *  - `line_sender_error_auth_error` / `line_sender_error_config_error` --
+ *    the provider cannot recover in this process (a permanently closed
+ *    provider, a scope that cannot yield the required token kind, or a
+ *    provider that reported `questdb_token_sink_set_terminal_error`), so
+ *    the reconnect is TERMINAL and the runner stops. Queued frames are
+ *    not deleted and a disk-backed slot stays drainable by a later
+ *    process, but this process will not send them.
+ *
+ *  A listener that pages on a permanent stop must qualify on `cause_code`,
+ *  not on the kind alone. `questdb_connection_event_auth_failed` is the
+ *  server-rejection signal. */
+#define questdb_connection_event_credential_unavailable 7u
 
 /** One connection-state transition. String fields are borrowed UTF-8
  * slices valid only for the duration of the callback; absent strings are

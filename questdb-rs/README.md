@@ -24,7 +24,7 @@ also supported for ingestion.
 * [Repository compatibility matrix](../doc/COMPATIBILITY.md)
 * [InfluxDB Line Protocol reference](https://questdb.com/docs/reference/api/ilp/overview/)
 
-Version 7.1.0 requires Rust 1.91.0. QWP over WebSocket requires QuestDB 10.0
+Version 7.3.0 requires Rust 1.91.0. QWP over WebSocket requires QuestDB 10.0
 or newer.
 
 ## Transports
@@ -129,9 +129,17 @@ ws::addr=localhost:9000;sf_dir=/var/lib/my-app/questdb-sf;sender_id=orders;sf_du
 The interval defaults to 5000 ms in periodic mode and is a target cadence:
 runner scheduling and storage-sync latency add to the actual recovery window.
 Publication can see ordinary backpressure at a segment boundary until the
-segment has been checkpointed. This local durability is independent of the
-QuestDB Enterprise server barrier selected by `request_durable_ack=on`; use
-both when end-to-end durability is required.
+segment has been checkpointed. This client-side durability is independent of
+`request_durable_ack`, which asks the server for durable acknowledgements:
+`local` (the commit is on the server's disk: survives a power loss, not the
+loss of that disk; needs a server running `cairo.commit.mode=adaptive`),
+`replicated` (the commit reached replication storage; needs QuestDB
+Enterprise), `local,replicated` (both: needs QuestDB Enterprise with
+`cairo.commit.mode=adaptive`, which a replicating primary runs only when the
+mode is set explicitly; trimming follows the replicated acknowledgement), `on`
+(the original name of `replicated`, the only one older servers understand) and
+`off` (the default). Wait for `AckLevel::LocalDurable` with `local` and for
+`AckLevel::Durable` with `on`, `replicated` or `local,replicated`.
 
 A standalone `Reader::from_conf("ws::addr=...")` gives the query side
 without a pool (`sync-reader-qwp-ws` feature), yielding results as native
@@ -178,21 +186,21 @@ then see the
 
 ## Examples
 
-A selection of usage examples is available in the [examples directory](https://github.com/questdb/c-questdb-client/tree/7.1.0/questdb-rs/examples):
+A selection of usage examples is available in the [examples directory](https://github.com/questdb/c-questdb-client/tree/7.3.0/questdb-rs/examples):
 
 | Example | Description |
 |---------|-------------|
-| [`basic.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/basic.rs) | Minimal TCP ingestion example; shows basic row and array ingestion. |
-| [`auth.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/auth.rs) | Adds authentication (user/password, token) to basic ingestion. |
-| [`auth_tls.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/auth_tls.rs) | Like `auth.rs`, but uses TLS for encrypted TCP connections. |
-| [`from_conf.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/from_conf.rs) | Configures client via connection string instead of builder pattern. |
-| [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/from_env.rs) | Reads config from `QDB_CLIENT_CONF` environment variable. |
-| [`http.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/http.rs) | Uses HTTP transport and demonstrates array ingestion with `ndarray`. |
-| [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/protocol_version.rs) | Shows protocol version selection and feature differences (e.g. arrays). |
-| [`qwp_ws_chunk_and_query.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/qwp_ws_chunk_and_query.rs) | Shares one `QuestDb` pool between concurrent columnar ingestion and query workers. |
-| [`qwp_ws_l1_quotes.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/qwp_ws_l1_quotes.rs) | Columnar ingestion over QWP/WebSocket via the `QuestDb` connection pool. |
-| [`qwp_egress_read.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/qwp_egress_read.rs) | Runs a SQL query and streams the result set over QWP/WebSocket. |
-| [`polars.rs`](https://github.com/questdb/c-questdb-client/blob/7.1.0/questdb-rs/examples/polars.rs) | Round trip: ingests a Polars `DataFrame` and queries it back as one. |
+| [`basic.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/basic.rs) | Minimal TCP ingestion example; shows basic row and array ingestion. |
+| [`auth.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/auth.rs) | Adds authentication (user/password, token) to basic ingestion. |
+| [`auth_tls.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/auth_tls.rs) | Like `auth.rs`, but uses TLS for encrypted TCP connections. |
+| [`from_conf.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/from_conf.rs) | Configures client via connection string instead of builder pattern. |
+| [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/from_env.rs) | Reads config from `QDB_CLIENT_CONF` environment variable. |
+| [`http.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/http.rs) | Uses HTTP transport and demonstrates array ingestion with `ndarray`. |
+| [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/protocol_version.rs) | Shows protocol version selection and feature differences (e.g. arrays). |
+| [`qwp_ws_chunk_and_query.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/qwp_ws_chunk_and_query.rs) | Shares one `QuestDb` pool between concurrent columnar ingestion and query workers. |
+| [`qwp_ws_l1_quotes.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/qwp_ws_l1_quotes.rs) | Columnar ingestion over QWP/WebSocket via the `QuestDb` connection pool. |
+| [`qwp_egress_read.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/qwp_egress_read.rs) | Runs a SQL query and streams the result set over QWP/WebSocket. |
+| [`polars.rs`](https://github.com/questdb/c-questdb-client/blob/7.3.0/questdb-rs/examples/polars.rs) | Round trip: ingests a Polars `DataFrame` and queries it back as one. |
 
 ## Crate features
 

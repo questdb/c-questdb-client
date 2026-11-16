@@ -29,12 +29,14 @@
 
 use crate::error;
 use crate::ingress::QwpWsRoleReject;
+use crate::ingress::conf::DurableAckTiers;
 use crate::ws::frame::{self, Opcode};
 
 pub(super) const WS_PATH: &str = "/api/v4/write";
 
 pub(super) const WS_STATUS_OK: u8 = 0x00;
 pub(super) const WS_STATUS_DURABLE_ACK: u8 = 0x02;
+pub(super) const WS_STATUS_LOCAL_DURABLE_ACK: u8 = 0x0E;
 pub(super) const WS_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 pub(super) const WS_STATUS_PARSE_ERROR: u8 = 0x05;
 pub(super) const WS_STATUS_INTERNAL_ERROR: u8 = 0x06;
@@ -67,15 +69,15 @@ pub(super) fn qwp_extra_headers(
     auth_header: Option<&str>,
     max_version: u32,
     client_id: Option<&str>,
-    request_durable_ack: bool,
+    request_durable_ack: DurableAckTiers,
 ) -> Vec<(&'static str, String)> {
     let mut extras = Vec::with_capacity(4);
     extras.push(("X-QWP-Max-Version", max_version.to_string()));
     if let Some(cid) = client_id {
         extras.push(("X-QWP-Client-Id", cid.to_owned()));
     }
-    if request_durable_ack {
-        extras.push(("X-QWP-Request-Durable-Ack", "true".to_owned()));
+    if let Some(value) = request_durable_ack.request_header_value() {
+        extras.push(("X-QWP-Request-Durable-Ack", value.to_owned()));
     }
     if let Some(auth) = auth_header {
         extras.push(("Authorization", auth.to_owned()));
@@ -100,12 +102,13 @@ pub(crate) struct QwpWsHandshakeResult {
 /// QWP-specific post-validation on a successful 101 response. Returns the
 /// negotiated protocol version (defaults to 1 when the server omits
 /// X-QWP-Version, matching the spec) and the server-advertised max batch
-/// size. Errors when the server returns an out-of-range version or fails
-/// to echo `X-QWP-Durable-Ack: enabled` after the client requested it.
+/// size. Errors when the server returns an out-of-range version or, when the
+/// client requested durable ACKs, does not echo the requested set's
+/// confirmation token in `X-QWP-Durable-Ack`.
 pub(super) fn validate_qwp_handshake_headers(
     headers: &crate::ws::handshake::Headers,
     max_version: u32,
-    request_durable_ack: bool,
+    request_durable_ack: DurableAckTiers,
 ) -> crate::Result<QwpWsHandshakeResult> {
     let version: u8 = match headers.find_ci("x-qwp-version") {
         Some(v) => v.parse().map_err(|_| {
@@ -131,14 +134,16 @@ pub(super) fn validate_qwp_handshake_headers(
             max_version
         ));
     }
-    if request_durable_ack {
-        let enabled = headers
-            .find_ci("x-qwp-durable-ack")
-            .is_some_and(|v| v.eq_ignore_ascii_case("enabled"));
-        if !enabled {
+    if let Some(expected) = request_durable_ack.confirmation_value() {
+        // The server grants the whole requested set or nothing: anything but
+        // the expected token is a denial, never a weaker grant to accept.
+        let echo = headers.find_ci("x-qwp-durable-ack");
+        if !echo.is_some_and(|v| v.eq_ignore_ascii_case(expected)) {
             return Err(error::fmt!(
                 ProtocolVersionError,
-                "WebSocket upgrade failed: server did not enable durable ACK"
+                "WebSocket upgrade failed: server did not enable durable ACK [requested={}, echoed={}]",
+                request_durable_ack.config_value(),
+                echo.unwrap_or("<no X-QWP-Durable-Ack header>")
             ));
         }
     }
@@ -171,11 +176,22 @@ pub(super) fn classify_qwp_handshake_reject(
     reject: crate::ws::handshake::HttpReject,
 ) -> crate::Error {
     if reject.status == 401 || reject.status == 403 {
+        // A Bearer challenge's `error` decides whether the 401 is worth a
+        // token refresh (RFC 6750 §3.1).
+        let bearer_error = crate::token_provider::bearer_challenge::sanitized_bearer_error(
+            reject.headers.join_all_ci("www-authenticate").as_deref(),
+        );
+        let detail = bearer_error
+            .as_deref()
+            .map_or_else(String::new, |error| format!(" [error={error}]"));
         return error::fmt!(
             AuthError,
-            "WebSocket upgrade authentication failed: HTTP status {}",
-            reject.status
-        );
+            "WebSocket upgrade authentication failed: HTTP status {}{}",
+            reject.status,
+            detail
+        )
+        .with_ws_http_status(reject.status)
+        .with_bearer_challenge_error(bearer_error);
     }
     if reject.status == 421
         && let Some(role) = reject
@@ -208,6 +224,7 @@ pub(super) fn classify_qwp_handshake_reject(
         "WebSocket upgrade failed: HTTP status {}",
         reject.status
     )
+    .with_ws_http_status(reject.status)
 }
 
 /// Map a [`crate::ws::handshake::HandshakeError`] from the shared handshake
@@ -291,7 +308,7 @@ pub(super) struct PipelinedError {
 
 pub(super) enum PipelinedResponse {
     Ok { sequence: u64 },
-    DurableAck,
+    DurableAck { local: bool },
     Error(PipelinedError),
 }
 
@@ -331,15 +348,21 @@ pub(super) fn parse_pipelined_response_with_table_handler(
             )?;
             Ok(PipelinedResponse::Ok { sequence: seq })
         }
-        WS_STATUS_DURABLE_ACK => {
+        WS_STATUS_DURABLE_ACK | WS_STATUS_LOCAL_DURABLE_ACK => {
+            let local = status == WS_STATUS_LOCAL_DURABLE_ACK;
+            let context = if local {
+                "QWP local durable ACK response"
+            } else {
+                "QWP durable ACK response"
+            };
             handle_table_seq_txn_entries(
                 payload,
                 1,
-                "QWP durable ACK response",
+                context,
                 PipelinedTableEntryKind::DurableAck,
                 on_table_entry,
             )?;
-            Ok(PipelinedResponse::DurableAck)
+            Ok(PipelinedResponse::DurableAck { local })
         }
         _ => {
             let (sequence, msg) = parse_error_body(payload)?;
@@ -501,7 +524,7 @@ mod tests {
 
     #[test]
     fn qwp_extra_headers_includes_durable_ack_when_requested() {
-        let extras = qwp_extra_headers(None, 1, None, true);
+        let extras = qwp_extra_headers(None, 1, None, DurableAckTiers::LegacyReplicated);
         assert!(
             extras
                 .iter()
@@ -512,8 +535,22 @@ mod tests {
     }
 
     #[test]
+    fn qwp_extra_headers_encode_explicit_tiers_canonically() {
+        for (tiers, expected) in [
+            (DurableAckTiers::Local, "local"),
+            (DurableAckTiers::Replicated, "replicated"),
+            (DurableAckTiers::LocalAndReplicated, "local,replicated"),
+        ] {
+            let extras = qwp_extra_headers(None, 1, None, tiers);
+            assert!(extras.iter().any(|(name, value)| {
+                *name == "X-QWP-Request-Durable-Ack" && value == expected
+            }));
+        }
+    }
+
+    #[test]
     fn qwp_extra_headers_omits_durable_ack_by_default() {
-        let extras = qwp_extra_headers(None, 1, None, false);
+        let extras = qwp_extra_headers(None, 1, None, DurableAckTiers::Off);
         assert!(
             !extras
                 .iter()
@@ -525,7 +562,7 @@ mod tests {
 
     #[test]
     fn qwp_extra_headers_includes_authorization_when_provided() {
-        let extras = qwp_extra_headers(Some("Basic dXNlcjpwYXNz"), 1, None, false);
+        let extras = qwp_extra_headers(Some("Basic dXNlcjpwYXNz"), 1, None, DurableAckTiers::Off);
         assert!(
             extras
                 .iter()
@@ -539,7 +576,7 @@ mod tests {
     fn validate_qwp_handshake_headers_negotiates_version() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, false)
+            validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off)
                 .unwrap()
                 .version,
             1
@@ -549,7 +586,7 @@ mod tests {
     #[test]
     fn validate_qwp_handshake_headers_rejects_version_above_max() {
         let headers = Headers::from_pairs([("X-QWP-Version", "2")]);
-        let err = validate_qwp_handshake_headers(&headers, 1, false).unwrap_err();
+        let err = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg().contains("unsupported X-QWP-Version"),
@@ -561,7 +598,7 @@ mod tests {
     #[test]
     fn validate_qwp_handshake_headers_rejects_zero_version() {
         let headers = Headers::from_pairs([("X-QWP-Version", "0")]);
-        let err = validate_qwp_handshake_headers(&headers, 1, false).unwrap_err();
+        let err = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg().contains("invalid X-QWP-Version"),
@@ -573,7 +610,7 @@ mod tests {
     #[test]
     fn validate_qwp_handshake_headers_rejects_invalid_version_string() {
         let headers = Headers::from_pairs([("X-QWP-Version", "not-a-version")]);
-        let err = validate_qwp_handshake_headers(&headers, 1, false).unwrap_err();
+        let err = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg().contains("invalid X-QWP-Version"),
@@ -586,7 +623,7 @@ mod tests {
     fn validate_qwp_handshake_headers_defaults_to_v1_when_missing() {
         let headers = Headers::default();
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, false)
+            validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off)
                 .unwrap()
                 .version,
             1
@@ -596,18 +633,19 @@ mod tests {
     #[test]
     fn validate_qwp_handshake_headers_requires_durable_ack_echo_when_requested() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
-        let err = validate_qwp_handshake_headers(&headers, 1, true).unwrap_err();
+        let err = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::LegacyReplicated)
+            .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
-        assert!(
-            err.msg().contains("server did not enable durable ACK"),
-            "got: {}",
-            err.msg()
+        assert_eq!(
+            err.msg(),
+            "WebSocket upgrade failed: server did not enable durable ACK \
+             [requested=on, echoed=<no X-QWP-Durable-Ack header>]"
         );
 
         let headers =
             Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", "enabled")]);
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, true)
+            validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::LegacyReplicated)
                 .unwrap()
                 .version,
             1
@@ -615,10 +653,44 @@ mod tests {
     }
 
     #[test]
+    fn validate_qwp_handshake_headers_requires_exact_tier_grant() {
+        let granted = Headers::from_pairs([
+            ("X-QWP-Version", "1"),
+            ("X-QWP-Durable-Ack", "local,replicated"),
+        ]);
+        validate_qwp_handshake_headers(&granted, 1, DurableAckTiers::LocalAndReplicated).unwrap();
+
+        for value in [None, Some("local"), Some("replicated"), Some("enabled")] {
+            let headers = match value {
+                Some(value) => {
+                    Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", value)])
+                }
+                None => Headers::from_pairs([("X-QWP-Version", "1")]),
+            };
+            assert!(
+                validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::LocalAndReplicated)
+                    .is_err(),
+                "partial/missing grant {value:?} must fail"
+            );
+        }
+
+        let partial =
+            Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", " local ")]);
+        let err = validate_qwp_handshake_headers(&partial, 1, DurableAckTiers::LocalAndReplicated)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
+        assert_eq!(
+            err.msg(),
+            "WebSocket upgrade failed: server did not enable durable ACK \
+             [requested=local,replicated, echoed=local]"
+        );
+    }
+
+    #[test]
     fn validate_qwp_handshake_headers_allows_missing_durable_ack_by_default() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, false)
+            validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off)
                 .unwrap()
                 .version,
             1
@@ -628,7 +700,7 @@ mod tests {
     #[test]
     fn extract_server_max_batch_size_absent_returns_zero() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 0);
     }
 
@@ -636,7 +708,7 @@ mod tests {
     fn extract_server_max_batch_size_parses_valid_value() {
         let headers =
             Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Max-Batch-Size", "16777202")]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 16_777_202);
     }
 
@@ -646,7 +718,7 @@ mod tests {
             ("X-QWP-Version", "1"),
             ("X-QWP-Max-Batch-Size", "not-a-number"),
         ]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 0);
     }
 
@@ -654,7 +726,7 @@ mod tests {
     fn extract_server_max_batch_size_negative_returns_zero() {
         let headers =
             Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Max-Batch-Size", "-100")]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 0);
     }
 
@@ -664,7 +736,7 @@ mod tests {
             ("X-QWP-Version", "1"),
             ("X-QWP-Max-Batch-Size", " 2097138 "),
         ]);
-        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        let result = validate_qwp_handshake_headers(&headers, 1, DurableAckTiers::Off).unwrap();
         assert_eq!(result.server_max_batch_size, 2_097_138);
     }
 
@@ -714,6 +786,7 @@ mod tests {
             };
             let err = classify_qwp_handshake_reject(reject);
             assert_eq!(err.code(), crate::ErrorCode::AuthError);
+            assert_eq!(err.ws_http_status(), Some(status));
             assert!(
                 err.msg().contains(&format!("HTTP status {status}")),
                 "got: {}",
@@ -734,6 +807,7 @@ mod tests {
             };
             let err = classify_qwp_handshake_reject(reject);
             assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert_eq!(err.ws_http_status(), Some(status));
             assert!(err.qwp_ws_role_reject().is_none());
             assert!(
                 err.msg().contains(&format!("HTTP status {status}")),
@@ -834,7 +908,7 @@ mod tests {
             Ok(())
         };
         match parse_pipelined_response_with_table_handler(&payload, Some(&mut handler)).unwrap() {
-            PipelinedResponse::DurableAck => {
+            PipelinedResponse::DurableAck { local: false } => {
                 assert_eq!(
                     table_seq_txns,
                     vec![(
@@ -846,6 +920,31 @@ mod tests {
             }
             _ => panic!("expected durable ACK response"),
         }
+    }
+
+    #[test]
+    fn local_durable_ack_response_uses_durable_payload_layout() {
+        let mut payload = vec![WS_STATUS_LOCAL_DURABLE_ACK];
+        append_table_entries(&mut payload, &[("wal_table", 321)]);
+
+        let mut table_seq_txns = Vec::new();
+        let mut handler = |kind, table: &str, seq_txn| {
+            table_seq_txns.push((kind, table.to_string(), seq_txn));
+            Ok(())
+        };
+        assert!(matches!(
+            parse_pipelined_response_with_table_handler(&payload, Some(&mut handler)).unwrap(),
+            PipelinedResponse::DurableAck { local: true }
+        ));
+        assert_eq!(
+            table_seq_txns,
+            vec![(
+                PipelinedTableEntryKind::DurableAck,
+                "wal_table".to_string(),
+                321
+            )]
+        );
+        assert!(parse_pipelined_response(&[WS_STATUS_LOCAL_DURABLE_ACK]).is_err());
     }
 
     #[test]
