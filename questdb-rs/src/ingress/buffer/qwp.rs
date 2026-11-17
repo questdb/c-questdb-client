@@ -42,6 +42,8 @@ use std::fmt::Debug;
 use std::hash::BuildHasherDefault;
 use std::hash::{BuildHasher, Hash, Hasher};
 #[cfg(feature = "_sender-qwp-ws")]
+use std::ops::Range;
+#[cfg(feature = "_sender-qwp-ws")]
 use std::sync::Mutex;
 
 use super::op_state::{Op, OpState};
@@ -2715,6 +2717,33 @@ struct QwpWsDecimalCell {
     value: Option<StoredQwpDecimal>,
 }
 
+/// Index range of the cells of rows `[rows.start, rows.end)`. Cells are
+/// stored in row order, and a row that wrote nothing has no cell.
+#[cfg(feature = "_sender-qwp-ws")]
+fn cells_in_rows<C>(cells: &[C], rows: &Range<u32>, row_idx: impl Fn(&C) -> u32) -> Range<usize> {
+    let start = cells.partition_point(|cell| row_idx(cell) < rows.start);
+    let end = start + cells[start..].partition_point(|cell| row_idx(cell) < rows.end);
+    start..end
+}
+
+/// The cells an encoder walks: every cell when the block is the whole table
+/// (`WHOLE`), else those in `cell_range`.
+///
+/// Takes the `Vec` because `Vec::len` tells the compiler how large a length
+/// can be, which a slice of unknown origin does not. Without it the string
+/// and binary encoders of a whole table gain overflow checks.
+#[cfg(feature = "_sender-qwp-ws")]
+#[allow(clippy::ptr_arg)]
+#[inline(always)]
+fn block_cells<'a, const WHOLE: bool, C>(cells: &'a Vec<C>, cell_range: &Range<usize>) -> &'a [C] {
+    let cell_range = if WHOLE {
+        0..cells.len()
+    } else {
+        cell_range.clone()
+    };
+    &cells[cell_range]
+}
+
 #[cfg(feature = "_sender-qwp-ws")]
 fn pop_value_cell_from<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, from: u32) -> Option<bool> {
     cells.pop_if(|cell| cell.row_idx >= from).map(|_| true)
@@ -3895,17 +3924,11 @@ impl QwpWsColumnarBuffer {
             if table.row_count == 0 {
                 continue;
             }
-            write_qwp_bytes(out, &table.table_name);
-            write_qwp_varint(out, table.row_count as u64);
-            write_qwp_varint(out, table.columns.len() as u64);
-            // Columns always travel inline: name + wire-type per column, right
-            // after col_count. No schema-mode byte, no schema id.
-            out.extend_from_slice(&table.encoded_column_schema);
-
-            for (col_idx, column) in table.columns.iter().enumerate() {
-                let globals = &scratch.per_segment_symbol_globals[table_idx][col_idx];
-                column.encode(table.row_count as usize, globals, out)?;
-            }
+            table.encode_rows(
+                0..table.row_count,
+                &scratch.per_segment_symbol_globals[table_idx],
+                out,
+            )?;
         }
 
         let header = QwpMessageHeader {
@@ -3953,6 +3976,34 @@ impl QwpWsTableBuffer {
         for column in &mut self.columns {
             column.clear_rows();
         }
+    }
+
+    /// Encodes rows `[rows.start, rows.end)` as one table block.
+    /// `symbol_globals` holds, per column, the connection id of each
+    /// column-local symbol id.
+    fn encode_rows(
+        &self,
+        rows: Range<u32>,
+        symbol_globals: &[Vec<u64>],
+        out: &mut Vec<u8>,
+    ) -> crate::Result<()> {
+        write_qwp_bytes(out, &self.table_name);
+        write_qwp_varint(out, u64::from(rows.end - rows.start));
+        write_qwp_varint(out, self.columns.len() as u64);
+        // Columns always travel inline: name + wire-type per column, right
+        // after col_count. No schema-mode byte, no schema id.
+        out.extend_from_slice(&self.encoded_column_schema);
+
+        let whole = rows.start == 0 && rows.end == self.row_count;
+        for (col_idx, column) in self.columns.iter().enumerate() {
+            let globals = &symbol_globals[col_idx];
+            if whole {
+                column.encode::<true>(rows.clone(), globals, out)?;
+            } else {
+                column.encode::<false>(rows.clone(), globals, out)?;
+            }
+        }
+        Ok(())
     }
 
     fn rollback_mark(&self) -> QwpWsTableRollbackMark {
@@ -4172,15 +4223,18 @@ impl QwpWsColumnBuffer {
     }
 
     fn uses_null_bitmap(&self, row_count: usize) -> bool {
-        uses_null_bitmap(
-            kind_supports_sparse_nulls(self.kind),
-            row_count,
-            self.non_null_count,
-        ) || matches!(
-            &self.values,
-            QwpWsColumnValues::Geohash { precision_bits, .. }
-                if geohash_precision_needs_bitmap(*precision_bits)
-        )
+        self.rows_use_null_bitmap(row_count, self.non_null_count as usize)
+    }
+
+    /// Whether a block of `row_count` rows that holds `non_null_count` values
+    /// of this column carries a null bitmap.
+    fn rows_use_null_bitmap(&self, row_count: usize, non_null_count: usize) -> bool {
+        (kind_supports_sparse_nulls(self.kind) && non_null_count < row_count)
+            || matches!(
+                &self.values,
+                QwpWsColumnValues::Geohash { precision_bits, .. }
+                    if geohash_precision_needs_bitmap(*precision_bits)
+            )
     }
 
     fn estimated_payload_len(&self, row_count: usize) -> usize {
@@ -4617,20 +4671,38 @@ impl QwpWsColumnBuffer {
         Ok(())
     }
 
-    fn encode(&self, row_count: usize, globals: &[u64], out: &mut Vec<u8>) -> crate::Result<()> {
-        let uses_null_bitmap = self.uses_null_bitmap(row_count);
+    /// Encodes rows `[rows.start, rows.end)` of this column.
+    ///
+    /// `WHOLE` says that `rows` is the whole table. It is a constant so that
+    /// the single-frame flush is compiled without the row-range arithmetic:
+    /// sharing one compiled encoder slowed it down by 10 to 40 percent.
+    fn encode<const WHOLE: bool>(
+        &self,
+        rows: Range<u32>,
+        globals: &[u64],
+        out: &mut Vec<u8>,
+    ) -> crate::Result<()> {
+        let (rows, cell_range, non_null_count) = if WHOLE {
+            (0..rows.end, 0..0, self.non_null_count as usize)
+        } else {
+            let cell_range = self.values.cell_range(&rows);
+            let non_null_count = self.values.non_null_count(&cell_range);
+            (rows, cell_range, non_null_count)
+        };
+        let row_count = rows.len();
+        let uses_null_bitmap = self.rows_use_null_bitmap(row_count, non_null_count);
         out.push(u8::from(uses_null_bitmap));
-        if uses_null_bitmap && self.non_null_count as usize == row_count {
+        if uses_null_bitmap && non_null_count == row_count {
             // Dense GEOHASH still needs a bitmap to distinguish maxima from null.
-            // All bits are zero; equality with the u32 count also proves the
-            // row-count bound otherwise checked by encode_null_bitmap.
+            // All bits are zero.
             let end =
                 checked_qwp_usize_add(out.len(), bitmap_bytes(row_count), "null bitmap size")?;
             out.resize(end, 0);
         } else if uses_null_bitmap {
-            self.values.encode_null_bitmap(row_count, out)?;
+            self.values
+                .encode_null_bitmap::<WHOLE>(rows.clone(), cell_range.start, out);
         }
-        self.values.encode(row_count, globals, out)
+        self.values.encode::<WHOLE>(rows, cell_range, globals, out)
     }
 }
 
@@ -4957,11 +5029,62 @@ impl QwpWsColumnValues {
         }
     }
 
-    fn encode_null_bitmap(&self, row_count: usize, out: &mut Vec<u8>) -> crate::Result<()> {
+    /// Index range of the cells of rows `[rows.start, rows.end)`.
+    fn cell_range(&self, rows: &Range<u32>) -> Range<usize> {
+        match self {
+            Self::Bool { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::I8 { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::I16 { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::I32 { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::I64 { cells }
+            | Self::TimestampMicros { cells }
+            | Self::TimestampNanos { cells }
+            | Self::Date { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::F32 { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::F64 { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::String { cells, .. }
+            | Self::DoubleArray { cells, .. }
+            | Self::Long256 { cells, .. }
+            | Self::Binary { cells, .. }
+            | Self::LongArray { cells, .. } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::Symbol { cells, .. } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::Decimal { cells, .. }
+            | Self::Decimal64 { cells, .. }
+            | Self::Decimal128 { cells, .. } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::Uuid { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::Ipv4 { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::Char { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+            Self::Geohash { cells, .. } => cells_in_rows(cells, rows, |cell| cell.row_idx),
+        }
+    }
+
+    /// Non-null values among the cells in `cell_range`. Only a decimal cell
+    /// can hold a null.
+    fn non_null_count(&self, cell_range: &Range<usize>) -> usize {
+        match self {
+            Self::Decimal { cells, .. }
+            | Self::Decimal64 { cells, .. }
+            | Self::Decimal128 { cells, .. } => cells[cell_range.clone()]
+                .iter()
+                .filter(|cell| cell.value.is_some())
+                .count(),
+            _ => cell_range.len(),
+        }
+    }
+
+    /// Writes the null bitmap of `rows`. `first_cell` is the first cell at or
+    /// past `rows.start`. `WHOLE` is not read: it gives the whole-table
+    /// encoder and the row-range encoder each a copy of this loop.
+    fn encode_null_bitmap<const WHOLE: bool>(
+        &self,
+        rows: Range<u32>,
+        first_cell: usize,
+        out: &mut Vec<u8>,
+    ) {
         let mut packed = 0u8;
         let mut bit_idx = 0u8;
-        let mut cursor = self.first_row_cursor();
-        for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+        let mut cursor = first_cell;
+        for row_idx in rows {
             let present = if let Some(cell_row) = self.row_at_cursor(cursor) {
                 if cell_row == row_idx {
                     let is_non_null = !self.value_at_cursor_is_null(cursor);
@@ -4986,16 +5109,24 @@ impl QwpWsColumnValues {
         if bit_idx != 0 {
             out.push(packed);
         }
-        Ok(())
     }
 
-    fn encode(&self, row_count: usize, globals: &[u64], out: &mut Vec<u8>) -> crate::Result<()> {
+    /// Encodes the values of `rows`. Their cells are `cell_range`, or every
+    /// cell when the block is the whole table (`WHOLE`).
+    fn encode<const WHOLE: bool>(
+        &self,
+        rows: Range<u32>,
+        cell_range: Range<usize>,
+        globals: &[u64],
+        out: &mut Vec<u8>,
+    ) -> crate::Result<()> {
         match self {
             Self::Bool { cells } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let mut cursor = 0usize;
                 let mut packed = 0u8;
                 let mut bit_idx = 0u8;
-                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                for row_idx in rows {
                     let value = cells.get(cursor).is_some_and(|cell| {
                         if cell.row_idx == row_idx {
                             cursor += 1;
@@ -5020,8 +5151,9 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::I8 { cells } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let mut cursor = 0usize;
-                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                for row_idx in rows {
                     let value = cells.get(cursor).map_or(0i8, |cell| {
                         if cell.row_idx == row_idx {
                             cursor += 1;
@@ -5035,8 +5167,9 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::I16 { cells } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let mut cursor = 0usize;
-                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                for row_idx in rows {
                     let value = cells.get(cursor).map_or(0i16, |cell| {
                         if cell.row_idx == row_idx {
                             cursor += 1;
@@ -5050,8 +5183,9 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::I32 { cells } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let mut cursor = 0usize;
-                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                for row_idx in rows {
                     let value = cells.get(cursor).map_or(i32::MIN, |cell| {
                         if cell.row_idx == row_idx {
                             cursor += 1;
@@ -5065,8 +5199,9 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::I64 { cells } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let mut cursor = 0usize;
-                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                for row_idx in rows {
                     let value = cells.get(cursor).map_or(i64::MIN, |cell| {
                         if cell.row_idx == row_idx {
                             cursor += 1;
@@ -5080,8 +5215,9 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::F32 { cells } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let mut cursor = 0usize;
-                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                for row_idx in rows {
                     let value = cells.get(cursor).map_or(f32::NAN, |cell| {
                         if cell.row_idx == row_idx {
                             cursor += 1;
@@ -5095,8 +5231,9 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::F64 { cells } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let mut cursor = 0usize;
-                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                for row_idx in rows {
                     let value = cells.get(cursor).map_or(f64::NAN, |cell| {
                         if cell.row_idx == row_idx {
                             cursor += 1;
@@ -5110,12 +5247,13 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::TimestampMicros { cells } | Self::TimestampNanos { cells } => {
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     out.extend_from_slice(&cell.value.to_le_bytes());
                 }
                 Ok(())
             }
             Self::String { cells, data } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let offsets_start = out.len();
                 let offset_count = checked_qwp_usize_add(cells.len(), 1, "string offset count")?;
                 let offset_table_len =
@@ -5140,7 +5278,7 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::Symbol { cells, .. } => {
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     let gid = globals.get(cell.local_id as usize).copied().ok_or_else(|| {
                         error::fmt!(
                             InvalidApiCall,
@@ -5162,7 +5300,7 @@ impl QwpWsColumnValues {
                     *decimal_scale
                 };
                 out.push(scale_byte);
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     if let Some(value) = cell.value {
                         out.extend_from_slice(&value.wire_bytes_with_scale(*decimal_scale)?);
                     }
@@ -5179,7 +5317,7 @@ impl QwpWsColumnValues {
                     *decimal_scale
                 };
                 out.push(scale_byte);
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     if let Some(value) = cell.value {
                         let bytes = value.wire_bytes_with_scale(*decimal_scale)?;
                         let low = narrow_decimal_le_fits(&bytes, 8)
@@ -5199,7 +5337,7 @@ impl QwpWsColumnValues {
                     *decimal_scale
                 };
                 out.push(scale_byte);
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     if let Some(value) = cell.value {
                         let bytes = value.wire_bytes_with_scale(*decimal_scale)?;
                         let low = narrow_decimal_le_fits(&bytes, 16)
@@ -5210,41 +5348,42 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::DoubleArray { cells, data } => {
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     let range = cell.offset as usize..(cell.offset + cell.len) as usize;
                     out.extend_from_slice(&data[range]);
                 }
                 Ok(())
             }
             Self::Uuid { cells } => {
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     out.extend_from_slice(&cell.value.0.to_le_bytes());
                     out.extend_from_slice(&cell.value.1.to_le_bytes());
                 }
                 Ok(())
             }
             Self::Long256 { cells, data } => {
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     let range = cell.offset as usize..(cell.offset + cell.len) as usize;
                     out.extend_from_slice(&data[range]);
                 }
                 Ok(())
             }
             Self::Ipv4 { cells } => {
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     out.extend_from_slice(&cell.value.to_le_bytes());
                 }
                 Ok(())
             }
             Self::Date { cells } => {
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     out.extend_from_slice(&cell.value.to_le_bytes());
                 }
                 Ok(())
             }
             Self::Char { cells } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let mut cursor = 0usize;
-                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                for row_idx in rows {
                     let value = cells.get(cursor).map_or(0u16, |cell| {
                         if cell.row_idx == row_idx {
                             cursor += 1;
@@ -5258,6 +5397,7 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::Binary { cells, data } => {
+                let cells = block_cells::<WHOLE, _>(cells, &cell_range);
                 let offsets_start = out.len();
                 let offset_count = checked_qwp_usize_add(cells.len(), 1, "binary offset count")?;
                 let offset_table_len =
@@ -5288,14 +5428,14 @@ impl QwpWsColumnValues {
             } => {
                 write_qwp_varint(out, *precision_bits as u64);
                 let bytes_per_value = geohash_bytes_per_value(*precision_bits);
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     let le = cell.value.to_le_bytes();
                     out.extend_from_slice(&le[..bytes_per_value]);
                 }
                 Ok(())
             }
             Self::LongArray { cells, data } => {
-                for cell in cells {
+                for cell in block_cells::<WHOLE, _>(cells, &cell_range) {
                     let range = cell.offset as usize..(cell.offset + cell.len) as usize;
                     out.extend_from_slice(&data[range]);
                 }
@@ -5304,10 +5444,9 @@ impl QwpWsColumnValues {
         }
     }
 
-    fn first_row_cursor(&self) -> usize {
-        0
-    }
-
+    // The null-bitmap loop calls this once per row and is compiled twice;
+    // with two callers the compiler no longer inlines it by itself.
+    #[inline(always)]
     fn row_at_cursor(&self, cursor: usize) -> Option<u32> {
         match self {
             Self::Bool { cells } => cells.get(cursor).map(|cell| cell.row_idx),
@@ -12300,6 +12439,262 @@ mod tests {
         assert_eq!(columnar_scratch.message, row_log_scratch.message);
     }
 
+    /// Writes row `$i` of a table that has every column kind. Each column is
+    /// left out of some rows, so columns hold nulls and gaps at different
+    /// rows. `late` first appears at row 12, and every fourth row has no
+    /// designated timestamp. A row's values depend on `$i` alone. A macro,
+    /// so that it also fills the row-log reference buffer.
+    #[cfg(feature = "_sender-qwp-ws")]
+    macro_rules! write_row_of_every_kind {
+        ($buf:expr, $i:expr, $decimals:expr) => {{
+            let i: i64 = $i;
+            let doubles = vec![0.5_f64, i as f64];
+            let longs = vec![i, -i, 7];
+            let row = $buf.table("every_kind").unwrap();
+            if i % 7 != 3 {
+                row.symbol("sym", format!("sym-{}", i % 5).as_str())
+                    .unwrap();
+            }
+            if i % 4 != 1 {
+                row.column_bool("flag", i % 3 == 0).unwrap();
+            }
+            if i % 5 != 2 {
+                row.column_i8("i8", (i - 9) as i8).unwrap();
+            }
+            if i % 6 != 4 {
+                row.column_i16("i16", (i * 301) as i16).unwrap();
+            }
+            row.column_i32("i32", (i * 70_001) as i32).unwrap();
+            if i % 2 == 0 {
+                row.column_i64("i64", i * 5_000_000_007).unwrap();
+            }
+            if i % 3 != 2 {
+                row.column_f32("f32", i as f32 + 0.25).unwrap();
+            }
+            row.column_f64("f64", i as f64 + 0.5).unwrap();
+            if i % 3 != 1 {
+                row.column_str("str", "x".repeat((i % 4) as usize).as_str())
+                    .unwrap();
+            }
+            if i % 4 != 3 {
+                row.column_binary("bin", &[i as u8; 2][..(i % 3) as usize])
+                    .unwrap();
+            }
+            if $decimals && i % 4 != 2 {
+                let dec = if i % 5 == 0 {
+                    "NaN".to_owned()
+                } else {
+                    format!("{i}.25")
+                };
+                row.column_dec("dec", dec.as_str()).unwrap();
+                row.column_dec64("dec64", format!("-{i}.5").as_str())
+                    .unwrap();
+            }
+            if $decimals {
+                let dec128 = if i % 6 == 5 {
+                    "NaN".to_owned()
+                } else {
+                    format!("{i}.125")
+                };
+                row.column_dec128("dec128", dec128.as_str()).unwrap();
+            }
+            if i % 5 != 4 {
+                row.column_uuid("uuid", i as u64, 7).unwrap();
+                row.column_long256("l256", &[i as u8; 32]).unwrap();
+            }
+            if i % 3 != 0 {
+                row.column_ipv4("ip", 0x0a00_0000 + i as u32).unwrap();
+                row.column_date("day", 86_400_000 * i).unwrap();
+                row.column_char("ch", u16::from(b'a') + i as u16).unwrap();
+            }
+            if i % 4 != 0 {
+                row.column_geohash("geo", i as u64, 20).unwrap();
+                row.column_arr("doubles", &doubles).unwrap();
+            }
+            row.column_geohash("geo16", 0xffff - i as u64, 16).unwrap();
+            if i % 5 != 1 {
+                row.column_arr("longs", &longs).unwrap();
+                row.column_ts("micros", TimestampMicros::new(i)).unwrap();
+            }
+            if i % 2 == 1 {
+                row.column_ts("nanos", TimestampNanos::new(i * 1_000))
+                    .unwrap();
+            }
+            if i >= 12 {
+                row.column_i64("late", -i).unwrap();
+            }
+            if i % 4 == 3 {
+                row.at_now().unwrap();
+            } else {
+                row.at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
+                    .unwrap();
+            }
+        }};
+    }
+
+    /// The whole-table encoder keeps today's bytes for every column kind:
+    /// the same rows through the row-log reference encoder give the same
+    /// message.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_replay_matches_row_log_for_every_column_kind() {
+        let mut row_log = QwpBuffer::new(127);
+        let mut columnar = QwpWsColumnarBuffer::new(127);
+        for i in 0..24 {
+            write_row_of_every_kind!(row_log, i, true);
+            write_row_of_every_kind!(columnar, i, true);
+        }
+
+        let mut row_log_scratch = QwpWsEncodeScratch::new();
+        let mut row_log_dict = SymbolGlobalDict::new();
+        row_log
+            .encode_ws_replay_message(&mut row_log_scratch, &mut row_log_dict, QWP_VERSION_1)
+            .unwrap();
+
+        let mut columnar_scratch = QwpWsEncodeScratch::new();
+        let mut columnar_dict = SymbolGlobalDict::new();
+        columnar
+            .encode_ws_replay_message(&mut columnar_scratch, &mut columnar_dict, QWP_VERSION_1)
+            .unwrap();
+
+        assert_eq!(columnar_scratch.message, row_log_scratch.message);
+    }
+
+    /// A block of rows `[lo, hi)` must be the bytes a table holding only those
+    /// rows encodes to, for every column kind and every `lo < hi`.
+    ///
+    /// The reference buffer is filled with every row and cleared, which keeps
+    /// the columns, and then gets rows `lo..hi` alone. Both sides resolve
+    /// symbols through one connection dictionary. Decimals are in
+    /// `qwp_ws_columnar_decimal_row_ranges_decode_to_the_same_rows`: a block
+    /// without a decimal value carries the column's scale, a fresh table 0.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_row_range_encodes_like_a_table_of_only_those_rows() {
+        const ROWS: u32 = 24;
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..ROWS {
+            write_row_of_every_kind!(buf, i64::from(i), false);
+        }
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        // No frame below adds a symbol: header, dictionary start, zero count.
+        let block_start =
+            QWP_MESSAGE_HEADER_SIZE + qwp_varint_size(global_dict.next_id()) + qwp_varint_size(0);
+
+        let mut reference = QwpWsColumnarBuffer::new(127);
+        for i in 0..ROWS {
+            write_row_of_every_kind!(reference, i64::from(i), false);
+        }
+        reference.clear();
+        let mut reference_scratch = QwpWsEncodeScratch::new();
+        let mut expected = Vec::new();
+        let mut block = Vec::new();
+        for lo in 0..ROWS {
+            for hi in lo + 1..=ROWS {
+                for i in lo..hi {
+                    write_row_of_every_kind!(reference, i64::from(i), false);
+                }
+                reference
+                    .encode_ws_replay_message_with_defer(
+                        &mut expected,
+                        &mut reference_scratch,
+                        &mut global_dict,
+                        QWP_VERSION_1,
+                        false,
+                        true,
+                    )
+                    .unwrap();
+                reference.clear();
+
+                block.clear();
+                buf.tables[0]
+                    .encode_rows(lo..hi, &scratch.per_segment_symbol_globals[0], &mut block)
+                    .unwrap();
+                assert_eq!(block, expected[block_start..], "rows {lo}..{hi}");
+            }
+        }
+    }
+
+    /// Wraps one table block in a datagram header for the test decoder. The
+    /// block must hold no symbol column: a datagram carries a dictionary per
+    /// column, a WebSocket frame connection ids.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn decode_ws_table_block(block: &[u8]) -> crate::tests::qwp_decode::DecodedTable {
+        let mut datagram = Vec::with_capacity(QWP_MESSAGE_HEADER_SIZE + block.len());
+        datagram.extend_from_slice(b"QWP1");
+        datagram.push(QWP_VERSION_1);
+        datagram.push(0);
+        datagram.extend_from_slice(&1u16.to_le_bytes());
+        datagram.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        datagram.extend_from_slice(block);
+        decode_datagram(&datagram).unwrap().table
+    }
+
+    /// Decimal columns, with values, explicit nulls and rows that left the
+    /// column out: every block of rows `[lo, hi)` decodes to rows `lo..hi` of
+    /// the whole table.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_decimal_row_ranges_decode_to_the_same_rows() {
+        const ROWS: u32 = 24;
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..i64::from(ROWS) {
+            let row = buf.table("decimals").unwrap();
+            row.column_i64("qty", i).unwrap();
+            if i % 3 != 1 {
+                let dec = if i % 5 == 0 {
+                    "NaN".to_owned()
+                } else {
+                    format!("{i}.25")
+                };
+                row.column_dec("dec", dec.as_str()).unwrap();
+            }
+            if i % 4 != 2 {
+                let dec64 = if i % 7 == 3 {
+                    "NaN".to_owned()
+                } else {
+                    format!("-{i}.5")
+                };
+                row.column_dec64("dec64", dec64.as_str()).unwrap();
+            }
+            let dec128 = if i % 6 == 5 {
+                "NaN".to_owned()
+            } else {
+                format!("{i}.125")
+            };
+            row.column_dec128("dec128", dec128.as_str()).unwrap();
+            row.column_dec128("dense128", format!("{i}.5").as_str())
+                .unwrap();
+            row.at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
+                .unwrap();
+        }
+        let table = &buf.tables[0];
+        let no_symbols = vec![Vec::new(); table.columns.len()];
+
+        let mut block = Vec::new();
+        table.encode_rows(0..ROWS, &no_symbols, &mut block).unwrap();
+        let whole = decode_ws_table_block(&block);
+        assert_eq!(whole.rows.len(), ROWS as usize);
+
+        for lo in 0..ROWS {
+            for hi in lo + 1..=ROWS {
+                block.clear();
+                table.encode_rows(lo..hi, &no_symbols, &mut block).unwrap();
+                let part = decode_ws_table_block(&block);
+                assert_eq!(part.name, whole.name, "rows {lo}..{hi}");
+                assert_eq!(part.columns.len(), whole.columns.len(), "rows {lo}..{hi}");
+                assert_eq!(
+                    part.rows,
+                    whole.rows[lo as usize..hi as usize],
+                    "rows {lo}..{hi}"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "_sender-qwp-ws")]
     const QWP_WS_COLUMNAR_BENCH_BATCH_SIZE: usize = 1000;
 
@@ -12404,6 +12799,119 @@ mod tests {
             elapsed.as_millis(),
             measured_rows as f64 / elapsed.as_secs_f64()
         );
+    }
+
+    /// One table of `rows` by `cols`. The columns cycle through dense and
+    /// sparse kinds, or all have kind `only_kind`. Every fifth column is left
+    /// out of odd rows, so the null bitmap and the gap fill are timed too.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn fill_qwp_ws_encode_shape(
+        buf: &mut QwpWsColumnarBuffer,
+        names: &[String],
+        rows: usize,
+        only_kind: Option<usize>,
+    ) {
+        let symbols = ["SYM000", "SYM001", "SYM002", "SYM003"];
+        for row_idx in 0..rows {
+            let seq = row_idx as i64;
+            buf.table("shapes").unwrap();
+            for (col_idx, name) in names.iter().enumerate() {
+                if col_idx % 5 == 4 && row_idx % 2 == 1 {
+                    continue;
+                }
+                let name = name.as_str();
+                match only_kind.unwrap_or(col_idx % 7) {
+                    0 => buf.column_i64(name, seq),
+                    1 => buf.column_f64(name, 100.0 + (seq & 1023) as f64),
+                    2 => buf.column_bool(name, row_idx % 3 == 0),
+                    3 => buf.column_str(name, symbols[row_idx & 3]),
+                    4 => buf.column_ts(name, TimestampMicros::new(seq)),
+                    5 => buf.symbol(name, symbols[row_idx & 3]),
+                    _ => buf.column_i32(name, row_idx as i32),
+                }
+                .unwrap();
+            }
+            buf.at(TimestampNanos::new(seq)).unwrap();
+        }
+    }
+
+    /// Times one encode of a single-frame buffer, for shapes that grow by
+    /// rows and by columns. Run with:
+    /// `cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_columnar_encode_shapes_benchmark --lib -- --ignored --nocapture --test-threads=1`
+    /// QWP_WS_ENCODE_SHAPES_SAMPLES defaults to 9. QWP_WS_ENCODE_SHAPES_KIND
+    /// (0 to 6: long, double, boolean, string, timestamp, symbol, int) gives
+    /// every column that kind instead of the mix. Each shape of two rows or
+    /// more is also timed as two blocks of half the rows (`halves_ns`), which
+    /// go through the row-range encoder.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn qwp_ws_columnar_encode_shapes_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        let setting = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+        };
+        let samples = setting("QWP_WS_ENCODE_SHAPES_SAMPLES")
+            .filter(|samples| *samples > 0)
+            .unwrap_or(9);
+        let only_kind = setting("QWP_WS_ENCODE_SHAPES_KIND").filter(|kind| *kind < 7);
+        for (rows, cols) in [
+            (1, 10),
+            (1, 100),
+            (1, 1000),
+            (100, 6),
+            (1000, 6),
+            (10_000, 6),
+            (100, 100),
+        ] {
+            let names: Vec<String> = (0..cols).map(|col_idx| format!("c{col_idx}")).collect();
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            fill_qwp_ws_encode_shape(&mut buf, &names, rows, only_kind);
+            let mut scratch = QwpWsEncodeScratch::new();
+            let mut global_dict = SymbolGlobalDict::new();
+            buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+                .unwrap();
+            let bytes = scratch.message.len();
+            let iterations = (20_000_000 / (rows * (cols + 1))).max(1);
+            for sample in 0..samples {
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+                        .unwrap();
+                    black_box(scratch.message.len());
+                }
+                let ns = started.elapsed().as_nanos() / iterations as u128;
+                assert_eq!(scratch.message.len(), bytes);
+                eprintln!(
+                    "encode_shapes_bench rows={rows} cols={cols} sample={sample} iterations={iterations} ns_per_encode={ns} bytes={bytes}"
+                );
+            }
+            if rows < 2 {
+                continue;
+            }
+            let table = &buf.tables[0];
+            let globals = &scratch.per_segment_symbol_globals[0];
+            let half = (rows / 2) as u32;
+            let mut blocks = Vec::with_capacity(bytes);
+            for sample in 0..samples {
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    blocks.clear();
+                    table.encode_rows(0..half, globals, &mut blocks).unwrap();
+                    table
+                        .encode_rows(half..rows as u32, globals, &mut blocks)
+                        .unwrap();
+                    black_box(blocks.len());
+                }
+                let ns = started.elapsed().as_nanos() / iterations as u128;
+                eprintln!(
+                    "encode_shapes_bench rows={rows} cols={cols} sample={sample} iterations={iterations} halves_ns={ns}"
+                );
+            }
+        }
     }
 
     /// Actual batch size (default one million), not accumulated small batches.
@@ -14910,7 +15418,8 @@ mod tests {
         assert_eq!(table.row_count as usize, values.len());
         assert_eq!(col.non_null_count as usize, values.iter().flatten().count());
         reset_geohash_output(out);
-        col.encode(values.len(), &[], out).unwrap();
+        col.encode::<true>(0..values.len() as u32, &[], out)
+            .unwrap();
         assert_eq!(col.estimated_payload_len(values.len()), out.len() - 7);
         assert_geohash_payload(out, bits, values);
     }
