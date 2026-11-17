@@ -4006,6 +4006,21 @@ impl QwpWsTableBuffer {
         Ok(())
     }
 
+    /// An upper bound of the size of the block `encode_rows` writes for
+    /// `rows`, without encoding it. It is the exact size for every column
+    /// kind sized so far. `None` when the table has a column of another kind.
+    #[allow(dead_code)] // No caller until a flush is cut into frames.
+    fn encoded_rows_bound(&self, rows: Range<u32>) -> Option<usize> {
+        let mut bound = qwp_string_byte_len(self.table_name.len())
+            + qwp_varint_size(rows.len() as u64)
+            + qwp_varint_size(self.columns.len() as u64)
+            + self.encoded_column_schema.len();
+        for column in &self.columns {
+            bound += column.encoded_rows_bound(&rows)?;
+        }
+        Some(bound)
+    }
+
     fn rollback_mark(&self) -> QwpWsTableRollbackMark {
         QwpWsTableRollbackMark {
             row_count: self.row_count,
@@ -4704,6 +4719,21 @@ impl QwpWsColumnBuffer {
         }
         self.values.encode::<WHOLE>(rows, cell_range, globals, out)
     }
+
+    /// An upper bound of what `encode` writes for `rows`: the flag byte, the
+    /// null bitmap and the values. `None` for a kind not sized yet.
+    fn encoded_rows_bound(&self, rows: &Range<u32>) -> Option<usize> {
+        let row_count = rows.len();
+        let cell_range = self.values.cell_range(rows);
+        let data_bound = self.values.rows_data_bound(row_count, &cell_range)?;
+        let non_null_count = self.values.non_null_count(&cell_range);
+        let bitmap = if self.rows_use_null_bitmap(row_count, non_null_count) {
+            bitmap_bytes(row_count)
+        } else {
+            0
+        };
+        Some(1 + bitmap + data_bound)
+    }
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -5030,6 +5060,9 @@ impl QwpWsColumnValues {
     }
 
     /// Index range of the cells of rows `[rows.start, rows.end)`.
+    // The row-range encoder and the size bound both call this; with two
+    // callers the compiler no longer inlines it into the encoder by itself.
+    #[inline(always)]
     fn cell_range(&self, rows: &Range<u32>) -> Range<usize> {
         match self {
             Self::Bool { cells } => cells_in_rows(cells, rows, |cell| cell.row_idx),
@@ -5070,6 +5103,44 @@ impl QwpWsColumnValues {
                 .count(),
             _ => cell_range.len(),
         }
+    }
+
+    /// An upper bound of the size of the values `encode` writes for
+    /// `row_count` rows whose cells are `cell_range`, with the arithmetic of
+    /// `estimated_data_len`. `None` for a kind not sized yet.
+    fn rows_data_bound(&self, row_count: usize, cell_range: &Range<usize>) -> Option<usize> {
+        let cell_count = cell_range.len();
+        let bound = match self {
+            Self::Bool { .. } => packed_bytes(row_count),
+            Self::I8 { .. } => row_count,
+            Self::I16 { .. } | Self::Char { .. } => row_count.saturating_mul(2),
+            Self::I32 { .. } | Self::F32 { .. } => row_count.saturating_mul(4),
+            Self::I64 { .. } | Self::F64 { .. } => row_count.saturating_mul(8),
+            Self::TimestampMicros { .. } | Self::TimestampNanos { .. } | Self::Date { .. } => {
+                cell_count.saturating_mul(8)
+            }
+            Self::Ipv4 { .. } => cell_count.saturating_mul(4),
+            Self::Uuid { .. } => cell_count.saturating_mul(16),
+            Self::String { cells, .. } | Self::Binary { cells, .. } => {
+                // A cell's bytes start where the previous cell's end, so the
+                // cells of a row range cover one span of the column's data.
+                let cells = &cells[cell_range.clone()];
+                let data_len = match (cells.first(), cells.last()) {
+                    (Some(first), Some(last)) => last.offset + last.len - first.offset,
+                    _ => 0,
+                };
+                (cell_count + 1).saturating_mul(4) + data_len as usize
+            }
+            Self::Symbol { .. }
+            | Self::Decimal { .. }
+            | Self::Decimal64 { .. }
+            | Self::Decimal128 { .. }
+            | Self::DoubleArray { .. }
+            | Self::Long256 { .. }
+            | Self::Geohash { .. }
+            | Self::LongArray { .. } => return None,
+        };
+        Some(bound)
     }
 
     /// Writes the null bitmap of `rows`. `first_cell` is the first cell at or
@@ -12692,6 +12763,175 @@ mod tests {
                     "rows {lo}..{hi}"
                 );
             }
+        }
+    }
+
+    /// Writes row `i` of a table whose column kinds all have a size bound:
+    /// the fixed-width kinds, strings and binary. Each column is left out of
+    /// some rows, `late` first appears at row 12, and every fourth row has no
+    /// designated timestamp. A row's values depend on `i` alone.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn write_row_of_sized_kinds(buf: &mut QwpWsColumnarBuffer, table: &str, i: i64) {
+        let row = buf.table(table).unwrap();
+        if i % 4 != 1 {
+            row.column_bool("flag", i % 3 == 0).unwrap();
+        }
+        if i % 5 != 2 {
+            row.column_i8("i8", (i - 9) as i8).unwrap();
+        }
+        if i % 6 != 4 {
+            row.column_i16("i16", (i * 301) as i16).unwrap();
+        }
+        row.column_i32("i32", (i * 70_001) as i32).unwrap();
+        if i % 2 == 0 {
+            row.column_i64("i64", i * 5_000_000_007).unwrap();
+        }
+        if i % 3 != 2 {
+            row.column_f32("f32", i as f32 + 0.25).unwrap();
+        }
+        row.column_f64("f64", i as f64 + 0.5).unwrap();
+        if i % 3 != 1 {
+            row.column_str("str", "x".repeat((i % 4) as usize).as_str())
+                .unwrap();
+        }
+        if i % 4 != 3 {
+            row.column_binary("bin", &[i as u8; 2][..(i % 3) as usize])
+                .unwrap();
+        }
+        if i % 5 != 4 {
+            row.column_uuid("uuid", i as u64, 7).unwrap();
+        }
+        if i % 3 != 0 {
+            row.column_ipv4("ip", 0x0a00_0000 + i as u32).unwrap();
+            row.column_date("day", 86_400_000 * i).unwrap();
+            row.column_char("ch", u16::from(b'a') + i as u16).unwrap();
+        }
+        if i % 5 != 1 {
+            row.column_ts("micros", TimestampMicros::new(i)).unwrap();
+        }
+        if i % 2 == 1 {
+            row.column_ts("nanos", TimestampNanos::new(i * 1_000))
+                .unwrap();
+        }
+        if i >= 12 {
+            row.column_i64("late", -i).unwrap();
+        }
+        if i % 4 == 3 {
+            row.at_now().unwrap();
+        } else {
+            row.at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
+                .unwrap();
+        }
+    }
+
+    /// Checks the bound of every row range of `table`, the empty ones
+    /// included, against the length of the encoded block. The table must
+    /// hold no symbol column.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn assert_rows_bound_is_the_encoded_length(table: &QwpWsTableBuffer) {
+        let no_symbols = vec![Vec::new(); table.columns.len()];
+        let mut block = Vec::new();
+        for lo in 0..=table.row_count {
+            for hi in lo..=table.row_count {
+                block.clear();
+                table.encode_rows(lo..hi, &no_symbols, &mut block).unwrap();
+                assert_eq!(
+                    table.encoded_rows_bound(lo..hi),
+                    Some(block.len()),
+                    "rows {lo}..{hi}"
+                );
+            }
+        }
+    }
+
+    /// The size of a block is known without encoding it: for every row range
+    /// of a table of the kinds sized so far, the bound is the length of the
+    /// encoded block. The table has 130 rows, so that the row count of a
+    /// block takes one byte in some ranges and two in others.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_is_the_encoded_length_of_every_row_range() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..130 {
+            write_row_of_sized_kinds(&mut buf, "sized", i);
+        }
+        assert_rows_bound_is_the_encoded_length(&buf.tables[0]);
+    }
+
+    /// The bounds of whole tables add up to `len()`, the number callers size
+    /// a flush from: `len()` is the frame overhead plus every table.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bounds_of_whole_tables_add_up_to_len() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..130 {
+            write_row_of_sized_kinds(&mut buf, "first", i);
+        }
+        for i in 0..7 {
+            write_row_of_sized_kinds(&mut buf, "second", i);
+        }
+        // No symbols: the header, the dictionary start, a zero symbol count.
+        let frame_overhead =
+            QWP_MESSAGE_HEADER_SIZE + QWP_WS_SYMBOL_ID_MAX_LEN + qwp_varint_size(0);
+        let tables: usize = buf
+            .tables
+            .iter()
+            .map(|table| table.encoded_rows_bound(0..table.row_count).unwrap())
+            .sum();
+        assert_eq!(buf.len(), frame_overhead + tables);
+    }
+
+    /// A string or binary column counts the bytes of a row range as one span
+    /// of the column's data, from the first cell's bytes to the end of the
+    /// last cell's. Rows taken back by a rewind must leave no bytes in it.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_is_the_encoded_length_after_a_rewind() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..8 {
+            write_row_of_sized_kinds(&mut buf, "sized", i);
+        }
+        buf.set_marker().unwrap();
+        for i in 50..60 {
+            write_row_of_sized_kinds(&mut buf, "sized", i);
+        }
+        buf.rewind_to_marker().unwrap();
+        for i in 8..20 {
+            write_row_of_sized_kinds(&mut buf, "sized", i);
+        }
+        assert_eq!(buf.tables[0].row_count, 20);
+        assert_rows_bound_is_the_encoded_length(&buf.tables[0]);
+    }
+
+    /// A table with a column of a kind that is not sized yet has no bound.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_is_unknown_for_kinds_not_sized_yet() {
+        let doubles = vec![0.5_f64, 1.5];
+        let longs = vec![1_i64, 2];
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let row = buf.table("symbol").unwrap();
+        row.symbol("v", "a").unwrap().at_now().unwrap();
+        let row = buf.table("decimal").unwrap();
+        row.column_dec("v", "1.25").unwrap().at_now().unwrap();
+        let row = buf.table("decimal64").unwrap();
+        row.column_dec64("v", "1.5").unwrap().at_now().unwrap();
+        let row = buf.table("decimal128").unwrap();
+        row.column_dec128("v", "1.125").unwrap().at_now().unwrap();
+        let row = buf.table("double_array").unwrap();
+        row.column_arr("v", &doubles).unwrap().at_now().unwrap();
+        let row = buf.table("long_array").unwrap();
+        row.column_arr("v", &longs).unwrap().at_now().unwrap();
+        let row = buf.table("long256").unwrap();
+        row.column_long256("v", &[7; 32]).unwrap().at_now().unwrap();
+        let row = buf.table("geohash").unwrap();
+        row.column_geohash("v", 5, 20).unwrap().at_now().unwrap();
+
+        assert_eq!(buf.tables.len(), 8);
+        for table in &buf.tables {
+            let name = String::from_utf8_lossy(&table.table_name);
+            assert_eq!(table.columns.len(), 1, "{name}");
+            assert_eq!(table.encoded_rows_bound(0..1), None, "{name}");
         }
     }
 
