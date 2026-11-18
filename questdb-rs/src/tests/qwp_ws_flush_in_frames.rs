@@ -42,7 +42,7 @@
 use std::time::Duration;
 
 use crate::ErrorCode;
-use crate::ingress::{AckLevel, Buffer, Sender, SenderBuilder, TimestampNanos};
+use crate::ingress::{AckLevel, Buffer, Sender, SenderBuilder, TimestampMicros, TimestampNanos};
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
 use crate::tests::qwp_ws_server_model::{
     QwpWsModelServer, add_rows, buffer_of, frames_of_a_flush, rows_of,
@@ -112,6 +112,108 @@ fn buffer_of_three_tables(first_id: i64) -> Buffer {
     let mut buffer = buffer_of(FIRST, first_id..first_id + 700);
     add_rows(&mut buffer, SECOND, first_id + 700..first_id + 705);
     add_rows(&mut buffer, THIRD, first_id + 705..first_id + 1705);
+    buffer
+}
+
+/// Adds row `id` of a table that has a column of every kind but a symbol.
+/// Each column but `id` is left out of some rows, some decimal values are
+/// explicit nulls, and every seventh row has no designated timestamp.
+fn add_row_of_every_kind(buffer: &mut Buffer, table: &str, id: i64) {
+    let decimal_or_null = |value: String| {
+        if id % 5 == 0 { "NaN".to_owned() } else { value }
+    };
+    buffer.table(table).unwrap().column_i64("id", id).unwrap();
+    if id % 4 != 1 {
+        buffer.column_bool("flag", id % 3 == 0).unwrap();
+        buffer.column_i8("i8", id as i8).unwrap();
+        buffer.column_i16("i16", (id * 301) as i16).unwrap();
+    }
+    if id % 5 != 2 {
+        buffer.column_i32("i32", (id * 70_001) as i32).unwrap();
+        buffer.column_f32("f32", id as f32 + 0.25).unwrap();
+        buffer.column_f64("f64", id as f64 + 0.5).unwrap();
+    }
+    if id % 3 != 1 {
+        buffer.column_str("str", format!("row {id}")).unwrap();
+        buffer
+            .column_binary("bin", &[id as u8; 3][..(id % 4) as usize])
+            .unwrap();
+    }
+    if id % 4 != 2 {
+        buffer
+            .column_dec("dec", decimal_or_null(format!("{id}.25")).as_str())
+            .unwrap();
+        buffer
+            .column_dec64("dec64", decimal_or_null(format!("-{id}.5")).as_str())
+            .unwrap();
+    }
+    buffer
+        .column_dec128("dec128", format!("{id}.125").as_str())
+        .unwrap();
+    if id % 5 != 4 {
+        buffer.column_uuid("uuid", id as u64, 7).unwrap();
+        buffer.column_long256("l256", &[id as u8; 32]).unwrap();
+    }
+    if id % 3 != 0 {
+        let ip = std::net::Ipv4Addr::from(0x0a00_0000 + id as u32);
+        buffer.column_ipv4("ip", ip).unwrap();
+        buffer.column_date("day", 86_400_000 * id).unwrap();
+        buffer
+            .column_char("ch", b'a' as u16 + (id % 26) as u16)
+            .unwrap();
+    }
+    if id % 4 != 0 {
+        buffer.column_geohash("geo", id as u64, 20).unwrap();
+        buffer
+            .column_arr("doubles", &vec![0.5_f64, id as f64])
+            .unwrap();
+    }
+    buffer
+        .column_geohash("geo16", 0xffff - id as u64, 16)
+        .unwrap();
+    if id % 5 != 1 {
+        buffer
+            .column_arr("longs", &vec![id; (id % 3) as usize + 1])
+            .unwrap();
+        buffer
+            .column_ts("micros", TimestampMicros::new(id))
+            .unwrap();
+    }
+    if id % 2 == 1 {
+        buffer
+            .column_ts("nanos", TimestampNanos::new(id * 1_000))
+            .unwrap();
+    }
+    if id % 7 == 3 {
+        buffer.at_now().unwrap();
+    } else {
+        buffer
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + id))
+            .unwrap();
+    }
+}
+
+/// Rows `ids` of a table with one DECIMAL64 column, whose first value has
+/// one digit after the point. So has every other value but that of row
+/// `two_digits`, which has two: a value the encoder refuses.
+fn buffer_of_decimals(ids: std::ops::Range<i64>, two_digits: Option<i64>) -> Buffer {
+    let mut buffer = Buffer::new_qwp_ws();
+    for id in ids {
+        let price = if Some(id) == two_digits {
+            format!("{id}.25")
+        } else {
+            format!("{id}.5")
+        };
+        buffer
+            .table(TABLE)
+            .unwrap()
+            .column_i64("id", id)
+            .unwrap()
+            .column_dec64("price", price.as_str())
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + id))
+            .unwrap();
+    }
     buffer
 }
 
@@ -363,6 +465,102 @@ fn a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_wh
     assert_table_holds(&server, SECOND, 1, &[&large]);
     assert_table_holds(&server, THIRD, 1, &[&large]);
     assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_flush_with_a_column_of_every_kind_above_the_frame_cap_is_one_commit() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, "");
+    let row_of_every_kind = |ids: std::ops::Range<i64>| {
+        let mut buffer = Buffer::new_qwp_ws();
+        for id in ids {
+            add_row_of_every_kind(&mut buffer, TABLE, id);
+        }
+        buffer
+    };
+    let before = row_of_every_kind(0..3);
+    let large = row_of_every_kind(3..303);
+    let after = row_of_every_kind(303..306);
+    assert!(before.len() < FRAME_LIMIT && after.len() < FRAME_LIMIT);
+    let frames = frames_of_a_flush(&large, FRAME_LIMIT);
+    let frame_count = frames.len() as u64;
+    assert!(frame_count > 40, "{frame_count} frames");
+    // The decimal columns hold nulls, so the frames are cut by a size that
+    // is above what they take: none is above the frame limit.
+    assert!(frames.iter().all(|frame| frame.len() <= FRAME_LIMIT));
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+
+    let mut flushed = large.clone();
+    assert_eq!(
+        sender.flush_and_get_fsn(&mut flushed).unwrap(),
+        Some(frame_count)
+    );
+    assert!(flushed.is_empty());
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(
+        sender.completed_fsn(AckLevel::Ok).unwrap(),
+        Some(frame_count)
+    );
+    let table = server.model.table(TABLE).unwrap();
+    assert_eq!(table.blocks.len() as u64, 1 + frame_count);
+    assert_table_holds(&server, TABLE, 2, &[&before, &large]);
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&after).unwrap(),
+        Some(frame_count + 1)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 3, &[&before, &large, &after]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_buffer_with_a_decimal_that_cannot_be_written_is_refused_before_its_first_frame() {
+    const TWO_DIGITS: &str = "cannot rescale decimal from scale 2 to 1 without precision loss";
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, "");
+    let before = buffer_of(FIRST, 0..3);
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    // The value is far behind the first frame of the flush, and in a buffer
+    // of one frame: both are refused in the same way, and nothing is sent.
+    let good = buffer_of_decimals(0..2000, None);
+    let frame_count = frames_of_a_flush(&good, FRAME_LIMIT).len() as u64;
+    assert!(frame_count > 40, "{frame_count} frames");
+    for mut refused in [
+        buffer_of_decimals(0..2000, Some(1500)),
+        buffer_of_decimals(0..20, Some(15)),
+    ] {
+        let (rows, len) = (refused.row_count(), refused.len());
+        assert_eq!(len > FRAME_LIMIT, rows == 2000);
+        let err = sender.flush(&mut refused).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{}", err.msg());
+        assert_eq!(err.msg(), TWO_DIGITS);
+        assert_eq!(sender.published_fsn().unwrap(), Some(0));
+        assert_eq!((refused.row_count(), refused.len()), (rows, len));
+        assert!(!sender.must_close());
+    }
+
+    // The sender goes on: the same rows without that value are one commit.
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&good).unwrap(),
+        Some(frame_count)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&good]);
+    assert_eq!(
+        server.model.table(TABLE).unwrap().blocks.len() as u64,
+        frame_count
+    );
+    assert_table_holds(&server, FIRST, 1, &[&before]);
     drop(sender);
     server.finish();
 }

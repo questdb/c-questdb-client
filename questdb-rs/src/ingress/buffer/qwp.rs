@@ -2717,6 +2717,16 @@ struct QwpWsDecimalCell {
     value: Option<StoredQwpDecimal>,
 }
 
+/// The bytes of the column's data that the cells of a row range cover. A
+/// cell's bytes start where the previous cell's end, so they are one span.
+#[cfg(feature = "_sender-qwp-ws")]
+fn slice_cells_data_len(cells: &[QwpWsSliceCell]) -> usize {
+    match (cells.first(), cells.last()) {
+        (Some(first), Some(last)) => (last.offset + last.len - first.offset) as usize,
+        _ => 0,
+    }
+}
+
 /// Index range of the cells of rows `[rows.start, rows.end)`. Cells are
 /// stored in row order, and a row that wrote nothing has no cell.
 #[cfg(feature = "_sender-qwp-ws")]
@@ -4005,8 +4015,9 @@ impl QwpWsColumnarBuffer {
     /// blocks, so an encoded frame is never larger.
     ///
     /// `None` when the buffer cannot be cut: a table with rows has a column
-    /// kind without a size bound, the frame of a row would exceed `cap`, or
-    /// the buffer holds no rows at all.
+    /// kind without a size bound or a decimal value that the encoder
+    /// refuses, the frame of a row would exceed `cap`, or the buffer holds
+    /// no rows at all.
     pub(crate) fn plan_frames(&self, target: usize, cap: usize) -> Option<QwpWsFramePlan> {
         debug_assert!(target <= cap);
         // A frame without new symbols: the header, the dictionary start and
@@ -4020,6 +4031,11 @@ impl QwpWsColumnarBuffer {
         let mut frame_start = 0;
         let mut frame_size = frame_overhead;
         for (table_idx, table) in self.tables.iter().enumerate() {
+            // The frames of a plan are published one by one. A value that
+            // the encoder refuses must be found before the first of them.
+            if !table.decimals_can_be_encoded() {
+                return None;
+            }
             let mut lo = 0;
             let mut like_rows = None;
             while lo < table.row_count {
@@ -4230,8 +4246,9 @@ impl QwpWsTableBuffer {
     }
 
     /// An upper bound of the size of the block `encode_rows` writes for
-    /// `rows`, without encoding it. It is the exact size for every column
-    /// kind sized so far. `None` when the table has a column of another kind.
+    /// `rows`, without encoding it. It is the exact size, but for a decimal
+    /// column that holds a null: see [`QwpWsColumnBuffer::encoded_rows_bound`].
+    /// `None` when the table has a symbol column, which is not sized yet.
     fn encoded_rows_bound(&self, rows: Range<u32>) -> Option<usize> {
         let mut bound = qwp_string_byte_len(self.table_name.len())
             + qwp_varint_size(rows.len() as u64)
@@ -4241,6 +4258,13 @@ impl QwpWsTableBuffer {
             bound += column.encoded_rows_bound(&rows)?;
         }
         Some(bound)
+    }
+
+    /// Whether the encoder takes every decimal value of the table.
+    fn decimals_can_be_encoded(&self) -> bool {
+        self.columns
+            .iter()
+            .all(|column| column.values.decimals_can_be_encoded())
     }
 
     /// The largest `hi` for which the size bound of rows `[lo, hi)` is at
@@ -4981,8 +5005,27 @@ impl QwpWsColumnBuffer {
         self.values.encode::<WHOLE>(rows, cell_range, globals, out)
     }
 
+    /// Whether a cell of the column holds a null, which only a decimal cell
+    /// can.
+    fn holds_null_cell(&self) -> bool {
+        match &self.values {
+            QwpWsColumnValues::Decimal { cells, .. }
+            | QwpWsColumnValues::Decimal64 { cells, .. }
+            | QwpWsColumnValues::Decimal128 { cells, .. } => {
+                cells.len() > self.non_null_count as usize
+            }
+            _ => false,
+        }
+    }
+
     /// An upper bound of what `encode` writes for `rows`: the flag byte, the
-    /// null bitmap and the values. `None` for a kind not sized yet.
+    /// null bitmap and the values. `None` for a symbol column, which is not
+    /// sized yet.
+    ///
+    /// It is the exact size, but for a decimal column that holds a null.
+    /// Telling how many cells of a range are nulls would walk them, so such
+    /// a column counts each cell of the range as a value, and the bitmap
+    /// that a null brings for every range.
     fn encoded_rows_bound(&self, rows: &Range<u32>) -> Option<usize> {
         let row_count = rows.len();
         // A kind without a null bitmap writes every row, with a zero where
@@ -4994,12 +5037,12 @@ impl QwpWsColumnBuffer {
             0..0
         };
         let data_bound = self.values.rows_data_bound(row_count, &cell_range)?;
-        let non_null_count = self.values.non_null_count(&cell_range);
-        let bitmap = if self.rows_use_null_bitmap(row_count, non_null_count) {
-            bitmap_bytes(row_count)
-        } else {
-            0
-        };
+        let bitmap =
+            if self.holds_null_cell() || self.rows_use_null_bitmap(row_count, cell_range.len()) {
+                bitmap_bytes(row_count)
+            } else {
+                0
+            };
         Some(1 + bitmap + data_bound)
     }
 }
@@ -5359,6 +5402,50 @@ impl QwpWsColumnValues {
         }
     }
 
+    /// Whether `encode` takes every value of the column. Of all kinds only a
+    /// decimal can be refused: one that cannot be brought to the scale of
+    /// its column, which the first value sets, without losing digits, or
+    /// that is too large for the width of the column at that scale. A value
+    /// is not checked for that when it is added.
+    fn decimals_can_be_encoded(&self) -> bool {
+        let (cells, scale, width) = match self {
+            Self::Decimal {
+                cells,
+                decimal_scale,
+            } => (cells, *decimal_scale, QWP_DECIMAL_MAG_BYTES),
+            Self::Decimal64 {
+                cells,
+                decimal_scale,
+            } => (cells, *decimal_scale, 8),
+            Self::Decimal128 {
+                cells,
+                decimal_scale,
+            } => (cells, *decimal_scale, 16),
+            _ => return true,
+        };
+        cells
+            .iter()
+            .filter_map(|cell| cell.value.as_ref())
+            .all(|value| {
+                if value.scale == scale {
+                    // A value of the column's scale is not rescaled. A
+                    // narrow one was checked for its width when it was
+                    // added, which leaves the range of the widest.
+                    return width != QWP_DECIMAL_MAG_BYTES
+                        || ensure_signed_decimal256_fits(
+                            value.negative && !mag_is_zero(&value.magnitude),
+                            &value.magnitude,
+                            "QWP decimal value exceeds signed DECIMAL256 range",
+                        )
+                        .is_ok();
+                }
+                value.wire_bytes_with_scale(scale).is_ok_and(|bytes| {
+                    width == QWP_DECIMAL_MAG_BYTES
+                        || narrow_decimal_le_fits(&bytes, width).is_some()
+                })
+            })
+    }
+
     /// Non-null values among the cells in `cell_range`. Only a decimal cell
     /// can hold a null.
     fn non_null_count(&self, cell_range: &Range<usize>) -> usize {
@@ -5376,7 +5463,8 @@ impl QwpWsColumnValues {
     /// An upper bound of the size of the values `encode` writes for
     /// `row_count` rows whose cells are `cell_range`, with the arithmetic of
     /// `estimated_data_len`. A kind that writes every row does not read
-    /// `cell_range`. `None` for a kind not sized yet.
+    /// `cell_range`. A decimal column counts each cell as a value, also one
+    /// that holds a null. `None` for a symbol column, which is not sized yet.
     fn rows_data_bound(&self, row_count: usize, cell_range: &Range<usize>) -> Option<usize> {
         let cell_count = cell_range.len();
         let bound = match self {
@@ -5391,23 +5479,19 @@ impl QwpWsColumnValues {
             Self::Ipv4 { .. } => cell_count.saturating_mul(4),
             Self::Uuid { .. } => cell_count.saturating_mul(16),
             Self::String { cells, .. } | Self::Binary { cells, .. } => {
-                // A cell's bytes start where the previous cell's end, so the
-                // cells of a row range cover one span of the column's data.
-                let cells = &cells[cell_range.clone()];
-                let data_len = match (cells.first(), cells.last()) {
-                    (Some(first), Some(last)) => last.offset + last.len - first.offset,
-                    _ => 0,
-                };
-                (cell_count + 1).saturating_mul(4) + data_len as usize
+                (cell_count + 1).saturating_mul(4)
+                    + slice_cells_data_len(&cells[cell_range.clone()])
             }
-            Self::Symbol { .. }
-            | Self::Decimal { .. }
-            | Self::Decimal64 { .. }
-            | Self::Decimal128 { .. }
-            | Self::DoubleArray { .. }
-            | Self::Long256 { .. }
-            | Self::Geohash { .. }
-            | Self::LongArray { .. } => return None,
+            Self::DoubleArray { cells, .. }
+            | Self::Long256 { cells, .. }
+            | Self::LongArray { cells, .. } => slice_cells_data_len(&cells[cell_range.clone()]),
+            Self::Decimal { .. } => 1 + cell_count.saturating_mul(QWP_DECIMAL_MAG_BYTES),
+            Self::Decimal64 { .. } => 1 + cell_count.saturating_mul(8),
+            Self::Decimal128 { .. } => 1 + cell_count.saturating_mul(16),
+            Self::Geohash { precision_bits, .. } => {
+                1 + cell_count.saturating_mul(geohash_bytes_per_value(*precision_bits))
+            }
+            Self::Symbol { .. } => return None,
         };
         Some(bound)
     }
@@ -13080,6 +13164,84 @@ mod tests {
         }
     }
 
+    /// Says of a row, by its number, whether a rule holds for it.
+    #[cfg(feature = "_sender-qwp-ws")]
+    type RowRule = fn(i64) -> bool;
+
+    /// The decimal columns of [`write_row_of_decimals_arrays_and_hashes`]
+    /// that can hold an explicit null: the bytes of a value, the rows that
+    /// write the column, and those of them that write a null.
+    #[cfg(feature = "_sender-qwp-ws")]
+    const NULLABLE_DECIMALS: [(&str, usize, RowRule, RowRule); 3] = [
+        ("dec", 32, |i| i % 3 != 1, |i| i % 5 == 0),
+        ("dec64", 8, |i| i % 4 != 2, |i| i % 7 == 3),
+        ("dec128", 16, |i| i % 7 != 6, |i| i % 6 == 5),
+    ];
+
+    /// Writes row `i` of a table of the kinds that
+    /// [`write_row_of_sized_kinds`] leaves out, but for symbols: decimals of
+    /// the three widths, arrays of doubles and of longs, LONG256 and
+    /// geohashes. Each column is left out of some rows, but for `dense128`
+    /// and `geo16`. `late` first appears at row 12, and every
+    /// fourth row has no designated timestamp. A geohash of 16 or 8 bits has
+    /// a null bitmap in every block, one of 20 bits only where a row left it
+    /// out. With `decimal_nulls`, some values of [`NULLABLE_DECIMALS`] are
+    /// explicit nulls, which a cell holds; without, every decimal cell holds
+    /// a value. A row's values depend on `i` alone.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn write_row_of_decimals_arrays_and_hashes(
+        buf: &mut QwpWsColumnarBuffer,
+        table: &str,
+        i: i64,
+        decimal_nulls: bool,
+    ) {
+        let row = buf.table(table).unwrap();
+        for (column, (name, _, writes, is_null)) in NULLABLE_DECIMALS.into_iter().enumerate() {
+            if !writes(i) {
+                continue;
+            }
+            let value = match column {
+                _ if decimal_nulls && is_null(i) => "NaN".to_owned(),
+                0 => format!("{i}.25"),
+                1 => format!("-{i}.5"),
+                _ => format!("{i}.125"),
+            };
+            match column {
+                0 => row.column_dec(name, value.as_str()),
+                1 => row.column_dec64(name, value.as_str()),
+                _ => row.column_dec128(name, value.as_str()),
+            }
+            .unwrap();
+        }
+        row.column_dec128("dense128", format!("{i}.5").as_str())
+            .unwrap();
+        if i % 4 != 0 {
+            row.column_arr("doubles", &vec![0.5_f64, i as f64]).unwrap();
+            row.column_geohash("geo", i as u64, 20).unwrap();
+        }
+        if i % 5 != 1 {
+            // One to three longs: the arrays of a column differ in size.
+            row.column_arr("longs", &vec![i; (i % 3) as usize + 1])
+                .unwrap();
+        }
+        if i % 5 != 4 {
+            row.column_long256("l256", &[i as u8; 32]).unwrap();
+        }
+        row.column_geohash("geo16", 0xffff - i as u64, 16).unwrap();
+        if i % 3 != 2 {
+            row.column_geohash("geo8", i as u64 & 0xff, 8).unwrap();
+        }
+        if i >= 12 {
+            row.column_dec64("late", format!("{i}.5").as_str()).unwrap();
+        }
+        if i % 4 == 3 {
+            row.at_now().unwrap();
+        } else {
+            row.at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
+                .unwrap();
+        }
+    }
+
     /// Checks the bound of every row range of `table`, the empty ones
     /// included, against the length of the encoded block. The table must
     /// hold no symbol column.
@@ -13114,6 +13276,68 @@ mod tests {
         assert_rows_bound_is_the_encoded_length(&buf.tables[0]);
     }
 
+    /// The same for the kinds that `write_row_of_sized_kinds` leaves out, but
+    /// for symbols: decimals whose cells all hold a value, arrays, LONG256
+    /// and geohashes.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_is_the_encoded_length_for_decimals_arrays_and_hashes() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..130 {
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "others", i, false);
+        }
+        assert_rows_bound_is_the_encoded_length(&buf.tables[0]);
+    }
+
+    /// A decimal cell can hold a null, and the bound does not tell the nulls
+    /// of a range from its values. A column that holds a null counts each
+    /// of its cells as a value, and a null bitmap for every range. So the
+    /// bound is never below the encoded block. It is above it by the bytes
+    /// that the nulls of the range would take as values, and by the bitmap
+    /// where the range has a value in every row.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_counts_a_decimal_null_as_a_value() {
+        const ROWS: u32 = 130;
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..i64::from(ROWS) {
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "nulls", i, true);
+        }
+        let table = &buf.tables[0];
+        let no_symbols = vec![Vec::new(); table.columns.len()];
+        let mut block = Vec::new();
+        let (mut with_nulls, mut with_a_bitmap_not_written) = (0, 0);
+        for lo in 0..=ROWS {
+            for hi in lo..=ROWS {
+                let rows = || i64::from(lo)..i64::from(hi);
+                let mut above = 0;
+                for (_, value_len, writes, is_null) in NULLABLE_DECIMALS {
+                    let nulls = rows().filter(|i| writes(*i) && is_null(*i)).count();
+                    let values = rows().filter(|i| writes(*i) && !is_null(*i)).count();
+                    above += nulls * value_len;
+                    with_nulls += usize::from(nulls > 0);
+                    if values == rows().count() {
+                        above += bitmap_bytes(values);
+                        with_a_bitmap_not_written += usize::from(values > 0);
+                    }
+                }
+                block.clear();
+                table.encode_rows(lo..hi, &no_symbols, &mut block).unwrap();
+                assert_eq!(
+                    table.encoded_rows_bound(lo..hi),
+                    Some(block.len() + above),
+                    "rows {lo}..{hi}"
+                );
+            }
+        }
+        // The ranges did reach both cases.
+        assert!(with_nulls > 1000, "{with_nulls}");
+        assert!(
+            with_a_bitmap_not_written > 100,
+            "{with_a_bitmap_not_written}"
+        );
+    }
+
     /// The bounds of whole tables add up to `len()`, the number callers size
     /// a flush from: `len()` is the frame overhead plus every table.
     #[cfg(feature = "_sender-qwp-ws")]
@@ -13125,6 +13349,10 @@ mod tests {
         }
         for i in 0..7 {
             write_row_of_sized_kinds(&mut buf, "second", i);
+        }
+        // Decimal cells that all hold a value: `len()` counts the values.
+        for i in 0..40 {
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "third", i, false);
         }
         // No symbols: the header, the dictionary start, a zero symbol count.
         let frame_overhead =
@@ -13159,10 +13387,42 @@ mod tests {
         assert_rows_bound_is_the_encoded_length(&buf.tables[0]);
     }
 
-    /// A table with a column of a kind that is not sized yet has no bound.
+    /// A rewind must leave nothing of the rows it takes back in the bound of
+    /// these kinds either: no bytes of an array or a LONG256 in the span of
+    /// their column, and no null in a decimal column. The rows taken back
+    /// hold the only decimal nulls of the table, so that the bound is the
+    /// encoded length again.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
-    fn qwp_ws_columnar_rows_bound_is_unknown_for_kinds_not_sized_yet() {
+    fn qwp_ws_columnar_rows_bound_of_decimals_arrays_and_hashes_after_a_rewind() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..8 {
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "others", i, false);
+        }
+        buf.set_marker().unwrap();
+        for i in 50..60 {
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "others", i, true);
+        }
+        // With the nulls of these rows the bound is above the encoded length.
+        let table = &buf.tables[0];
+        let no_symbols = vec![Vec::new(); table.columns.len()];
+        let mut block = Vec::new();
+        table.encode_rows(0..18, &no_symbols, &mut block).unwrap();
+        assert!(table.encoded_rows_bound(0..18).unwrap() > block.len());
+
+        buf.rewind_to_marker().unwrap();
+        for i in 8..20 {
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "others", i, false);
+        }
+        assert_eq!(buf.tables[0].row_count, 20);
+        assert_rows_bound_is_the_encoded_length(&buf.tables[0]);
+    }
+
+    /// Every column kind has a bound but a symbol column: a table that
+    /// holds one has none.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_is_unknown_for_a_symbol_column_alone() {
         let doubles = vec![0.5_f64, 1.5];
         let longs = vec![1_i64, 2];
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -13187,7 +13447,14 @@ mod tests {
         for table in &buf.tables {
             let name = String::from_utf8_lossy(&table.table_name);
             assert_eq!(table.columns.len(), 1, "{name}");
-            assert_eq!(table.encoded_rows_bound(0..1), None, "{name}");
+            let bound = table.encoded_rows_bound(0..1);
+            if name == "symbol" {
+                assert_eq!(bound, None);
+            } else {
+                let mut block = Vec::new();
+                table.encode_rows(0..1, &[Vec::new()], &mut block).unwrap();
+                assert_eq!(bound, Some(block.len()), "{name}");
+            }
         }
     }
 
@@ -13200,14 +13467,19 @@ mod tests {
         let mut buf = QwpWsColumnarBuffer::new(127);
         for i in 0..i64::from(ROWS) {
             write_row_of_sized_kinds(&mut buf, "sized", i);
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "others", i, false);
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "nulls", i, true);
         }
-        let table = &buf.tables[0];
-        for lo in 0..ROWS {
-            let mut shorter = table.encoded_rows_bound(lo..lo).unwrap();
-            for hi in lo + 1..=ROWS {
-                let bound = table.encoded_rows_bound(lo..hi).unwrap();
-                assert!(bound >= shorter, "rows {lo}..{hi}");
-                shorter = bound;
+        assert_eq!(buf.tables.len(), 3);
+        for table in &buf.tables {
+            let name = String::from_utf8_lossy(&table.table_name);
+            for lo in 0..ROWS {
+                let mut shorter = table.encoded_rows_bound(lo..lo).unwrap();
+                for hi in lo + 1..=ROWS {
+                    let bound = table.encoded_rows_bound(lo..hi).unwrap();
+                    assert!(bound >= shorter, "{name} rows {lo}..{hi}");
+                    shorter = bound;
+                }
             }
         }
     }
@@ -13335,6 +13607,135 @@ mod tests {
             assert!(frame_counts.contains(&1) && frame_counts.contains(&2));
             assert!(frame_counts.last().is_some_and(|most| *most > 50));
         }
+    }
+
+    /// Plans `buf`, which holds one table, for each target, encodes the
+    /// blocks of every plan and reads them back: they must give the rows of
+    /// the table, as a block of the whole table gives them. Returns the rows
+    /// at which a frame began in some plan.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn assert_frames_give_the_rows_back(
+        buf: &QwpWsColumnarBuffer,
+        targets: impl IntoIterator<Item = usize>,
+    ) -> std::collections::BTreeSet<u32> {
+        let table = &buf.tables[0];
+        let no_symbols = vec![Vec::new(); table.columns.len()];
+        let mut block = Vec::new();
+        table
+            .encode_rows(0..table.row_count, &no_symbols, &mut block)
+            .unwrap();
+        let whole = decode_ws_table_block(&block);
+        assert_eq!(whole.rows.len(), table.row_count as usize);
+
+        let mut frame_starts = std::collections::BTreeSet::new();
+        for target in targets {
+            let plan = buf.plan_frames(target, target).unwrap();
+            let mut rows = Vec::new();
+            for frame in plan.frames() {
+                for frame_block in frame {
+                    frame_starts.insert(frame_block.rows.start);
+                    block.clear();
+                    table
+                        .encode_rows(frame_block.rows.clone(), &no_symbols, &mut block)
+                        .unwrap();
+                    rows.extend(decode_ws_table_block(&block).rows);
+                }
+            }
+            assert_eq!(rows, whole.rows, "target {target}");
+        }
+        frame_starts
+    }
+
+    /// A table of decimals, arrays, LONG256 and geohashes is cut like any
+    /// other: into frames that hold its rows in order, stay within the
+    /// target and are full. Its decimal cells all hold a value, so its bound
+    /// is its encoded size. The frames of every plan give the rows back, and
+    /// over the plans a frame begins at every row.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_cuts_decimals_arrays_and_hashes_into_full_frames() {
+        const ROWS: u32 = 130;
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..i64::from(ROWS) {
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "others", i, false);
+        }
+        let table = &buf.tables[0];
+        let largest_row = (0..ROWS)
+            .map(|row| encoded_frame_len(table, row..row + 1))
+            .max()
+            .unwrap();
+        let whole = encoded_frame_len(table, 0..ROWS);
+        let targets = || {
+            (largest_row..largest_row + 600)
+                .chain(whole / 2 - 2..=whole / 2 + 2)
+                .chain(whole - 2..=whole + 2)
+        };
+
+        let (exact_frames, frame_counts) = assert_frame_plans_are_full(&buf, targets());
+        // The targets did reach the cases they are there for.
+        assert!(exact_frames > 100, "{exact_frames}");
+        assert!(frame_counts.contains(&1) && frame_counts.contains(&2));
+        assert!(
+            frame_counts
+                .last()
+                .is_some_and(|most| *most > ROWS as usize / 2)
+        );
+
+        let frame_starts = assert_frames_give_the_rows_back(&buf, targets());
+        assert_eq!(frame_starts.len(), ROWS as usize, "{frame_starts:?}");
+    }
+
+    /// A decimal column that holds explicit nulls makes the bound of its
+    /// table larger than the encoded block, so the frames of the table are
+    /// full by the bound: the next row would not fit by it. No frame is
+    /// larger than the plan says, the plan says no more than the target, and
+    /// the frames give the rows back.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_cuts_decimals_with_nulls_by_their_bound() {
+        const ROWS: u32 = 130;
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..i64::from(ROWS) {
+            write_row_of_decimals_arrays_and_hashes(&mut buf, "nulls", i, true);
+        }
+        let table = &buf.tables[0];
+        // The frame of a block by its bound: 16 bytes around the block.
+        let frame_bound = |rows: Range<u32>| 12 + 3 + 1 + table.encoded_rows_bound(rows).unwrap();
+        let largest_row = (0..ROWS)
+            .map(|row| frame_bound(row..row + 1))
+            .max()
+            .unwrap();
+        let whole = frame_bound(0..ROWS);
+        let targets = || {
+            (largest_row..largest_row + 600)
+                .chain(whole / 2 - 2..=whole / 2 + 2)
+                .chain(whole - 2..=whole + 2)
+        };
+
+        let mut smaller_than_planned = 0;
+        for target in targets() {
+            let plan = buf.plan_frames(target, target).unwrap();
+            let mut next_row = 0;
+            for (frame, planned_len) in plan.frames().zip(plan.frame_sizes()) {
+                assert_eq!(frame.len(), 1, "target {target}");
+                let rows = frame[0].rows.clone();
+                let case = format!("target {target} rows {rows:?}");
+                assert_eq!(rows.start, next_row, "{case}");
+                assert!(rows.end > rows.start, "{case}");
+                assert_eq!(*planned_len, frame_bound(rows.clone()), "{case}");
+                assert!(*planned_len <= target, "{case}");
+                if rows.end < ROWS {
+                    assert!(frame_bound(rows.start..rows.end + 1) > target, "{case}");
+                }
+                let encoded_len = encoded_frame_len(table, rows.clone());
+                assert!(encoded_len <= *planned_len, "{case}");
+                smaller_than_planned += usize::from(encoded_len < *planned_len);
+                next_row = rows.end;
+            }
+            assert_eq!(next_row, ROWS, "target {target}");
+        }
+        assert!(smaller_than_planned > 1000, "{smaller_than_planned}");
+        assert_frames_give_the_rows_back(&buf, targets());
     }
 
     /// The search for the last row of a frame, on its own. For every range
@@ -13790,6 +14191,184 @@ mod tests {
         }
     }
 
+    /// The largest DECIMAL256 and the smallest, and the numbers next to
+    /// them, which are no DECIMAL256.
+    #[cfg(feature = "_sender-qwp-ws")]
+    const DECIMAL256_MAX: &str =
+        "57896044618658097711785492504343953926634992332820282019728792003956564819967";
+    #[cfg(feature = "_sender-qwp-ws")]
+    const DECIMAL256_MIN: &str =
+        "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
+    #[cfg(feature = "_sender-qwp-ws")]
+    const ABOVE_DECIMAL256_MAX: &str =
+        "57896044618658097711785492504343953926634992332820282019728792003956564819968";
+    #[cfg(feature = "_sender-qwp-ws")]
+    const BELOW_DECIMAL256_MIN: &str =
+        "-57896044618658097711785492504343953926634992332820282019728792003956564819969";
+
+    /// Adds a row whose one column `d` is a decimal of the width that `kind`
+    /// names. An error is that of the column: the row is not added.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn add_decimal_row(
+        buf: &mut QwpWsColumnarBuffer,
+        table: &str,
+        kind: &str,
+        value: &str,
+    ) -> crate::Result<()> {
+        let row = buf.table(table)?;
+        match kind {
+            "dec" => row.column_dec("d", value),
+            "dec64" => row.column_dec64("d", value),
+            _ => row.column_dec128("d", value),
+        }?;
+        buf.at_now()
+    }
+
+    /// The buffer takes a decimal value that the encoder later refuses: a
+    /// value is brought to the scale of its column, which the first value
+    /// set, only when it is encoded. A buffer that holds such a value is not
+    /// cut, in whichever of its tables the value is, so that no frame of a
+    /// flush is published before the frame that fails. A flush of one frame
+    /// reports the value. Without the row of that value the buffer is cut.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_is_none_for_a_decimal_the_encoder_refuses() {
+        const LOSES_DIGITS: &str =
+            "cannot rescale decimal from scale 2 to 1 without precision loss";
+        let target = 1024 * 1024;
+        for (kind, first, refused, error) in [
+            // More digits after the point than the scale of the column has.
+            ("dec", "1.5", "1.25", LOSES_DIGITS),
+            ("dec64", "1.5", "1.25", LOSES_DIGITS),
+            ("dec128", "1.5", "1.25", LOSES_DIGITS),
+            // Within the width at its own scale, too large at the column's.
+            (
+                "dec64",
+                "1.000001",
+                "9000000000000000000",
+                "decimal value does not fit DECIMAL64 wire width",
+            ),
+            (
+                "dec128",
+                "1.000001",
+                "170141183460469231731687303715884105727",
+                "decimal value does not fit DECIMAL128 wire width",
+            ),
+            (
+                "dec",
+                "1.5",
+                DECIMAL256_MAX,
+                "QWP decimal rescale exceeds DECIMAL256 range",
+            ),
+            (
+                "dec",
+                "0.1",
+                "5789604461865809771178549250434395392663499233282028201972879200395656481997",
+                "QWP decimal rescale exceeds signed DECIMAL256 range",
+            ),
+            // Of the column's scale, and no DECIMAL256.
+            (
+                "dec",
+                "1",
+                ABOVE_DECIMAL256_MAX,
+                "QWP decimal value exceeds signed DECIMAL256 range",
+            ),
+            (
+                "dec",
+                "1",
+                BELOW_DECIMAL256_MIN,
+                "QWP decimal value exceeds signed DECIMAL256 range",
+            ),
+        ] {
+            let case = format!("{kind}: {first}, then {refused}");
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            write_row_of_sized_kinds(&mut buf, "first", 0);
+            add_decimal_row(&mut buf, "decimals", kind, first).unwrap();
+            assert!(buf.plan_frames(target, target).is_some(), "{case}");
+
+            buf.set_marker().unwrap();
+            add_decimal_row(&mut buf, "decimals", kind, refused).unwrap();
+            write_row_of_sized_kinds(&mut buf, "last", 0);
+            assert!(buf.plan_frames(target, target).is_none(), "{case}");
+            let err = buf
+                .encode_ws_replay_message(
+                    &mut QwpWsEncodeScratch::new(),
+                    &mut SymbolGlobalDict::new(),
+                    QWP_VERSION_1,
+                )
+                .unwrap_err();
+            assert_eq!(err.msg(), error, "{case}");
+
+            buf.rewind_to_marker().unwrap();
+            write_row_of_sized_kinds(&mut buf, "last", 0);
+            let plan = buf.plan_frames(target, target).unwrap();
+            assert_eq!(plan.frames().map(<[_]>::len).collect::<Vec<_>>(), [3]);
+        }
+    }
+
+    /// The planner refuses the decimal values that the encoder refuses, and
+    /// no others: for each width, every pair of the values below, the first
+    /// of which sets the scale of the column.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_takes_the_decimals_the_encoder_takes() {
+        let values = [
+            "1.5",
+            "1.25",
+            "-1.25",
+            "0",
+            "0.000",
+            "NaN",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "9223372036854775808",
+            "922337203685477580.7",
+            "92233720368547758.08",
+            "170141183460469231731687303715884105727",
+            "-170141183460469231731687303715884105728",
+            "17014118346046923173168730371588410572.7",
+            DECIMAL256_MAX,
+            DECIMAL256_MIN,
+            ABOVE_DECIMAL256_MAX,
+            BELOW_DECIMAL256_MIN,
+            "1e70",
+            "1e-70",
+        ];
+        let mut scratch = QwpWsEncodeScratch::new();
+        for kind in ["dec", "dec64", "dec128"] {
+            let (mut taken, mut refused) = (0, 0);
+            for first in values {
+                for second in values {
+                    let mut buf = QwpWsColumnarBuffer::new(127);
+                    // A value too large for the width at its own scale is
+                    // refused when it is added.
+                    let added = [first, second]
+                        .into_iter()
+                        .filter(|value| add_decimal_row(&mut buf, "t", kind, value).is_ok())
+                        .count();
+                    if added == 0 {
+                        continue;
+                    }
+                    let encoded = buf
+                        .encode_ws_replay_message(
+                            &mut scratch,
+                            &mut SymbolGlobalDict::new(),
+                            QWP_VERSION_1,
+                        )
+                        .is_ok();
+                    assert_eq!(
+                        buf.plan_frames(usize::MAX, usize::MAX).is_some(),
+                        encoded,
+                        "{kind}: {first}, then {second}"
+                    );
+                    taken += usize::from(encoded);
+                    refused += usize::from(!encoded);
+                }
+            }
+            assert!(taken > 100 && refused > 30, "{kind}: {taken} {refused}");
+        }
+    }
+
     /// A connection dictionary that earlier flushes left with `symbols`
     /// symbols. The dictionary start of a frame then takes one byte (up to
     /// 127 symbols), two (up to 16,383) or three.
@@ -14038,7 +14617,12 @@ mod tests {
     /// of the rows and a hundred times longer in the other half, so that the
     /// average row says little about where a frame ends. Then come buffers
     /// of 10 and 100 MiB whose rows are spread evenly over 1 to 100,000
-    /// tables of six columns (`kind=tables`).
+    /// tables of six columns (`kind=tables`). Before those come tables of
+    /// the kinds 7 to 12 of `fill_qwp_ws_encode_shape`: decimals, arrays,
+    /// LONG256 and geohashes. `check_us_min` is the time of looking at every
+    /// decimal value for one that the encoder refuses, which the planner
+    /// does and `plan_us` holds. `encoded_bytes` is what the frames of the
+    /// plan take: next to `frames` it tells how full they are.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     #[ignore = "performance benchmark"]
@@ -14056,6 +14640,18 @@ mod tests {
                 black_box(plan.frame_ends.len());
             }
             plan_us.sort_by(f64::total_cmp);
+
+            let mut check_us = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                let can = buf
+                    .tables
+                    .iter()
+                    .all(|table| table.decimals_can_be_encoded());
+                check_us.push(started.elapsed().as_secs_f64() * 1e6);
+                assert!(black_box(can));
+            }
+            check_us.sort_by(f64::total_cmp);
 
             let plan = buf.plan_frames(TARGET, TARGET).unwrap();
             let most_columns = buf.tables.iter().map(|table| table.columns.len()).max();
@@ -14081,8 +14677,10 @@ mod tests {
             let mut scratch = QwpWsEncodeScratch::new();
             let dict = SymbolGlobalDict::new();
             let mut frame_us = Vec::with_capacity(SAMPLES);
+            let mut encoded_bytes = 0;
             for _ in 0..SAMPLES {
                 let started = Instant::now();
+                encoded_bytes = 0;
                 for (frame_idx, blocks) in plan.frames().enumerate() {
                     buf.encode_ws_frame(
                         blocks,
@@ -14093,14 +14691,14 @@ mod tests {
                         frame_idx + 1 < frame_count,
                     )
                     .unwrap();
-                    black_box(block.len());
+                    encoded_bytes += black_box(block.len());
                 }
                 frame_us.push(started.elapsed().as_secs_f64() * 1e6);
             }
             frame_us.sort_by(f64::total_cmp);
 
             eprintln!(
-                "frame_plan_bench kind={shape} cols={cols} mib={mib} tables={} rows={} bytes={} frames={frame_count} plan_us_min={:.0} plan_us_median={:.0} encode_us_min={:.0} encode_us_median={:.0} frame_us_min={:.0} frame_us_median={:.0}",
+                "frame_plan_bench kind={shape} cols={cols} mib={mib} tables={} rows={} bytes={} frames={frame_count} plan_us_min={:.0} plan_us_median={:.0} encode_us_min={:.0} encode_us_median={:.0} frame_us_min={:.0} frame_us_median={:.0} check_us_min={:.0} encoded_bytes={}",
                 buf.tables.len(),
                 buf.tables.iter().map(|table| table.row_count).sum::<u32>(),
                 buf.len(),
@@ -14110,6 +14708,8 @@ mod tests {
                 encode_us[SAMPLES / 2],
                 frame_us[0],
                 frame_us[SAMPLES / 2],
+                check_us[0],
+                encoded_bytes,
             );
         };
         let names = |cols: usize| -> Vec<String> {
@@ -14129,6 +14729,19 @@ mod tests {
             let mut probe = QwpWsColumnarBuffer::new(127);
             fill_qwp_ws_encode_shape(&mut probe, &names, 100, Some(kind));
             for mib in [1, 10, 100] {
+                let rows = mib * 1024 * 1024 * 100 / probe.len();
+                let mut buf = QwpWsColumnarBuffer::new(127);
+                fill_qwp_ws_encode_shape(&mut buf, &names, rows, Some(kind));
+                time_plan(&kind.to_string(), cols, mib, &buf);
+            }
+        }
+
+        // The kinds that hold decimals, arrays, LONG256 and geohashes.
+        for (kind, cols) in [(7, 6), (8, 6), (9, 6), (10, 6), (11, 6), (12, 6), (7, 100)] {
+            let names = names(cols);
+            let mut probe = QwpWsColumnarBuffer::new(127);
+            fill_qwp_ws_encode_shape(&mut probe, &names, 100, Some(kind));
+            for mib in [10, 100] {
                 let rows = mib * 1024 * 1024 * 100 / probe.len();
                 let mut buf = QwpWsColumnarBuffer::new(127);
                 fill_qwp_ws_encode_shape(&mut buf, &names, rows, Some(kind));
@@ -14303,6 +14916,9 @@ mod tests {
     /// One table of `rows` by `cols`. The columns cycle through dense and
     /// sparse kinds, or all have kind `only_kind`. Every fifth column is left
     /// out of odd rows, so the null bitmap and the gap fill are timed too.
+    /// The mix takes kinds 0 to 6. A caller can also ask for 7 to 12:
+    /// DECIMAL64, DECIMAL256, DECIMAL64 with an explicit null in one value
+    /// of eight, an array of four doubles, LONG256 and a geohash of 20 bits.
     #[cfg(feature = "_sender-qwp-ws")]
     fn fill_qwp_ws_encode_shape(
         buf: &mut QwpWsColumnarBuffer,
@@ -14311,6 +14927,8 @@ mod tests {
         only_kind: Option<usize>,
     ) {
         let symbols = ["SYM000", "SYM001", "SYM002", "SYM003"];
+        let decimals = ["1234.25", "-99.50", "100000.75", "0.01"];
+        let doubles = vec![0.5_f64, 1.5, 2.5, 3.5];
         for row_idx in 0..rows {
             let seq = row_idx as i64;
             buf.table("shapes").unwrap();
@@ -14326,6 +14944,14 @@ mod tests {
                     3 => buf.column_str(name, symbols[row_idx & 3]),
                     4 => buf.column_ts(name, TimestampMicros::new(seq)),
                     5 => buf.symbol(name, symbols[row_idx & 3]),
+                    7 => buf.column_dec64(name, decimals[row_idx & 3]),
+                    8 => buf.column_dec(name, decimals[row_idx & 3]),
+                    // One value in eight is an explicit null.
+                    9 if row_idx % 8 == 3 => buf.column_dec64(name, "NaN"),
+                    9 => buf.column_dec64(name, decimals[row_idx & 3]),
+                    10 => buf.column_arr(name, &doubles),
+                    11 => buf.column_long256(name, &[row_idx as u8; 32]),
+                    12 => buf.column_geohash(name, seq as u64 & 0xf_ffff, 20),
                     _ => buf.column_i32(name, row_idx as i32),
                 }
                 .unwrap();
