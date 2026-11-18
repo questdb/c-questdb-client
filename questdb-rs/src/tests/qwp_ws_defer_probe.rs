@@ -268,15 +268,15 @@ fn a_frame_of_the_advertised_limit_is_taken(server: &Server<'_>) -> ProbeResult<
 }
 
 /// The rows of one flush: a buffer, and what its rows are.
-struct Group {
-    buffer: Buffer,
+pub(super) struct Group {
+    pub(super) buffer: Buffer,
     /// Per row its id and the length of its text.
     rows: Vec<(i64, usize)>,
 }
 
 impl Group {
     /// Rows from `first_id` on, until the buffer holds `bytes`.
-    fn of_bytes(table: &str, first_id: i64, bytes: usize) -> ProbeResult<Self> {
+    pub(super) fn of_bytes(table: &str, first_id: i64, bytes: usize) -> ProbeResult<Self> {
         let mut group = Self {
             buffer: Buffer::new_qwp_ws(),
             rows: Vec::new(),
@@ -325,7 +325,7 @@ impl Group {
     }
 
     /// What a table holds when it holds exactly these rows.
-    fn digest(&self) -> Digest {
+    pub(super) fn digest(&self) -> Digest {
         Digest {
             rows: self.rows.len() as i64,
             ids: self.rows.len() as i64,
@@ -346,7 +346,7 @@ fn mix_of(id: i64) -> i64 {
 /// What a table holds, in numbers that change when a row is missing, there
 /// twice, or altered.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Digest {
+pub(super) struct Digest {
     rows: i64,
     /// Distinct ids.
     ids: i64,
@@ -358,7 +358,7 @@ struct Digest {
     timestamps: i64,
 }
 
-enum Server<'a> {
+pub(super) enum Server<'a> {
     Live(&'a ProbeConfig),
     Model(&'a QwpWsModelServer),
 }
@@ -377,7 +377,7 @@ impl Server<'_> {
 
     /// A table name of its own, and for a real server the drop of the table
     /// when the script is done with it.
-    fn new_table(&self, prefix: &str) -> (String, Option<TableCleanup>) {
+    pub(super) fn new_table(&self, prefix: &str) -> (String, Option<TableCleanup>) {
         let table = unique_table_name(prefix);
         let cleanup = match self {
             Self::Live(config) => Some(TableCleanup::new((*config).clone(), table.clone())),
@@ -387,7 +387,7 @@ impl Server<'_> {
     }
 
     /// What the table holds. `None` when there is no such table.
-    fn digest(&self, table: &str) -> ProbeResult<Option<Digest>> {
+    pub(super) fn digest(&self, table: &str) -> ProbeResult<Option<Digest>> {
         match self {
             Self::Live(config) => {
                 let sql = format!(
@@ -458,7 +458,7 @@ impl Server<'_> {
 
     /// How many transactions the table has. `None` when there is no such
     /// table.
-    fn transactions(&self, table: &str) -> ProbeResult<Option<i64>> {
+    pub(super) fn transactions(&self, table: &str) -> ProbeResult<Option<i64>> {
         match self {
             Self::Live(config) => {
                 let sql = format!("select count() from wal_transactions('{table}')");
@@ -486,7 +486,7 @@ impl Server<'_> {
 
     /// A real server applies committed rows to the table a moment after it
     /// answered. The model has them at once.
-    fn wait_for_rows(&self, table: &str, rows: usize) -> ProbeResult<()> {
+    pub(super) fn wait_for_rows(&self, table: &str, rows: usize) -> ProbeResult<()> {
         let deadline = Instant::now() + Duration::from_secs(60);
         while matches!(self, Self::Live(_))
             && self.row_count(table)? < rows as i64
