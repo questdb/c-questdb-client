@@ -38,22 +38,40 @@
 //!   which names each table it committed with the number of that table's
 //!   commit, and no other table. Sequences count the frames of a connection
 //!   from zero, commits those of a table from one.
-//! - A connection that goes away loses the rows it holds, of every table.
+//! - A frame brings the symbols that are new to its connection. The
+//!   connection keeps them, committed or not, and numbers them as they
+//!   come. A symbol in a row is such a number: of a symbol that this frame
+//!   brought or an earlier one, for this table or another.
+//! - A frame without a table block and without the flag only brings
+//!   symbols. Its answer is an OK that names no table. A sender begins a
+//!   new connection with such frames, to bring every symbol it has sent,
+//!   and then sends again the frames that were not answered. So a frame
+//!   may bring symbols the connection holds, under the same numbers.
+//! - A connection that goes away loses the rows it holds, of every table,
+//!   and its symbols.
 //! - A table exists from the first frame that names it, committed or not.
 //!
 //! What the model cannot do it refuses with a panic, so that no test passes
 //! on behaviour the model made up: a frame that is not a QWP message, a flag
-//! it does not know, symbols, a frame without a table block, two blocks of
-//! one table in a frame (which no flush sends), a frame above the frame
-//! limit, and the commit a server forces on a table that holds 1,000,000
-//! uncommitted rows (`qwp.max.uncommitted.rows`).
+//! it does not know, two blocks of one table in a frame (which no flush
+//! sends), a frame above the frame limit, and the commit a server forces on
+//! a table that holds 1,000,000 uncommitted rows
+//! (`qwp.max.uncommitted.rows`). Of symbols it refuses: a frame whose
+//! symbols leave a gap after those the connection holds (a server rejects
+//! it), a held symbol that gets another text (a server takes the new text),
+//! a symbol in a row that the connection does not hold, and a frame without
+//! a table block that has the defer flag or comes while the connection
+//! holds rows (a server takes both, the second as the commit of those rows;
+//! the driver sends neither).
 //!
-//! Three things a server does are neither modelled nor refused. A server
+//! Four things a server does are neither modelled nor refused. A server
 //! rejects a frame whose column types disagree with the table; the model
 //! takes any columns. A server may commit frames without the flag together,
 //! as one transaction, when they arrive in one read; the model commits each
 //! on its own. So a test may count on one commit for a group, never on one
-//! commit per frame without the flag. And a server names the tables of an
+//! commit per frame without the flag. A server may likewise answer several
+//! frames without the flag with one OK, which counts for the frames before
+//! it too; the model answers each. And a server names the tables of an
 //! OK in the order the connection first named them, the model in the order
 //! of their names; the script does not look at the order, and the client
 //! reads each entry by itself.
@@ -116,9 +134,29 @@ pub(crate) fn frames_of_a_flush(buffer: &Buffer, target: usize) -> Vec<Vec<u8>> 
 }
 
 /// One frame that holds every table of `buffer` whole, a block each, as a
-/// flush of a buffer within the frame cap sends it. The connection has no
+/// flush of a buffer within the frame cap sends it. The buffer has no
 /// symbols.
 pub(crate) fn frame_of_a_whole_buffer(buffer: &Buffer, defer_commit: bool) -> Vec<u8> {
+    let mut no_symbols = SymbolGlobalDict::new();
+    let frame = frame_of_a_sender(buffer, defer_commit, &mut no_symbols);
+    assert_eq!(
+        no_symbols.next_id(),
+        0,
+        "a buffer with symbols needs the dictionary of its sender"
+    );
+    frame
+}
+
+/// As [`frame_of_a_whole_buffer`], from a sender whose symbol dictionary is
+/// `symbols`: the frame brings the symbols of `buffer` that the dictionary
+/// does not hold yet, and the dictionary holds them afterwards. So the
+/// frames of one sender, made in the order they are sent, bring each symbol
+/// once.
+pub(crate) fn frame_of_a_sender(
+    buffer: &Buffer,
+    defer_commit: bool,
+    symbols: &mut SymbolGlobalDict,
+) -> Vec<u8> {
     let mut frame = Vec::new();
     buffer
         .as_qwp_ws()
@@ -126,7 +164,7 @@ pub(crate) fn frame_of_a_whole_buffer(buffer: &Buffer, defer_commit: bool) -> Ve
         .encode_ws_replay_message_with_defer(
             &mut frame,
             &mut QwpWsEncodeScratch::new(),
-            &mut SymbolGlobalDict::new(),
+            symbols,
             QWP_VERSION,
             defer_commit,
             true,
@@ -203,11 +241,13 @@ impl QwpWsServerModel {
         Self::default()
     }
 
-    /// A new connection. It holds no rows, and its first frame has sequence 0.
+    /// A new connection. It holds no rows and no symbols, and its first
+    /// frame has sequence 0.
     pub(crate) fn connect(&self) -> QwpWsModelConnection {
         QwpWsModelConnection {
             server: self.clone(),
             next_sequence: 0,
+            symbols: Vec::new(),
             held: BTreeMap::new(),
         }
     }
@@ -219,10 +259,13 @@ impl QwpWsServerModel {
 }
 
 /// One connection to the server. Dropping it is a disconnect: the rows it
-/// holds are gone.
+/// holds are gone, and its symbols.
 pub(crate) struct QwpWsModelConnection {
     server: QwpWsServerModel,
     next_sequence: u64,
+    /// The symbols the frames of the connection brought. A symbol's id is
+    /// its place here.
+    symbols: Vec<String>,
     /// Per table, the blocks that wait for a frame without the defer flag.
     held: BTreeMap<String, Vec<DecodedTable>>,
 }
@@ -252,19 +295,15 @@ impl QwpWsModelConnection {
         );
         let block_count = usize::from(u16::from_le_bytes([message[6], message[7]]));
         assert!(
-            block_count > 0,
-            "frame {sequence}: the server model reads frames that hold a table block"
+            block_count > 0 || (!defer_commit && self.held.is_empty()),
+            "frame {sequence}: the server model reads a frame without a table block only as a \
+             sender brings its symbols again: without the defer flag, on a connection that \
+             holds no rows"
         );
-        let (dict_start, pos) = decode_qwp_varint(message, QWP_HEADER_SIZE).unwrap();
-        let (dict_count, pos) = decode_qwp_varint(message, pos).unwrap();
-        assert_eq!(
-            (dict_start, dict_count),
-            (0, 0),
-            "frame {sequence}: the server model holds no symbols"
-        );
+        let pos = self.take_symbols(sequence, message);
 
         let mut names = BTreeSet::new();
-        for block in decode_ws_table_blocks(&message[pos..], block_count) {
+        for block in decode_ws_table_blocks(&message[pos..], block_count, &self.symbols) {
             assert!(
                 names.insert(block.name.clone()),
                 "frame {sequence}: two blocks of table {}, which no flush sends: the server \
@@ -303,6 +342,36 @@ impl QwpWsModelConnection {
             ok.extend_from_slice(&(table.commits as i64).to_le_bytes());
         }
         Some(ok)
+    }
+
+    /// Takes the symbols a frame brings: behind the header, the id of the
+    /// first, their count, and each as its length and its text. Returns
+    /// where the table blocks of the frame begin.
+    fn take_symbols(&mut self, sequence: u64, message: &[u8]) -> usize {
+        let (first_id, pos) = decode_qwp_varint(message, QWP_HEADER_SIZE).unwrap();
+        let (count, mut pos) = decode_qwp_varint(message, pos).unwrap();
+        let first_id = first_id as usize;
+        assert!(
+            first_id <= self.symbols.len(),
+            "frame {sequence}: its symbols start at id {first_id} and the connection holds \
+             {}: a server rejects the frame, which the server model does not do",
+            self.symbols.len()
+        );
+        for id in first_id..first_id + count as usize {
+            let (len, start) = decode_qwp_varint(message, pos).unwrap();
+            pos = start + len as usize;
+            let symbol = std::str::from_utf8(&message[start..pos]).unwrap();
+            match self.symbols.get(id) {
+                // A frame that is sent again brings its symbols again.
+                Some(held) => assert_eq!(
+                    held, symbol,
+                    "frame {sequence}: symbol {id} gets another text, which no sender does \
+                     on its own connection"
+                ),
+                None => self.symbols.push(symbol.to_owned()),
+            }
+        }
+        pos
     }
 }
 
@@ -493,6 +562,8 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use crate::ingress::SentDictMirror;
+    use crate::tests::qwp_decode::DecodedValue;
 
     const TABLE: &str = "model_rows";
 
@@ -769,15 +840,36 @@ mod tests {
         QwpWsServerModel::new().connect().receive(&frame);
     }
 
+    /// The frame without a table block that brings the symbols of
+    /// `frame` again.
+    fn frame_without_a_table(frame: &[u8]) -> Vec<u8> {
+        let mut sent = SentDictMirror::new(true);
+        assert!(sent.accumulate(frame));
+        let mut frames = sent.build_catch_up_frames(0, QWP_VERSION).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0][QWP_FLAGS_OFFSET..8],
+            [QWP_FLAG_DELTA_SYMBOL_DICT, 0, 0]
+        );
+        frames.remove(0)
+    }
+
     #[test]
-    #[should_panic(expected = "frames that hold a table block")]
-    fn server_model_refuses_a_frame_without_a_table_block() {
-        // The header and an empty dictionary section.
-        let mut frame = one_frame();
-        frame.truncate(QWP_HEADER_SIZE + 2);
-        frame[6] = 0;
-        frame[8..12].copy_from_slice(&2u32.to_le_bytes());
+    #[should_panic(expected = "only as a sender brings its symbols again")]
+    fn server_model_refuses_a_frame_without_a_table_block_that_has_the_defer_flag() {
+        let mut frame = frame_without_a_table(&symbol_frames(&mut SymbolGlobalDict::new())[0]);
+        frame[QWP_FLAGS_OFFSET] |= QWP_FLAG_DEFER_COMMIT;
         QwpWsServerModel::new().connect().receive(&frame);
+    }
+
+    #[test]
+    #[should_panic(expected = "only as a sender brings its symbols again")]
+    fn server_model_refuses_a_frame_without_a_table_block_while_it_holds_rows() {
+        let frames = symbol_frames(&mut SymbolGlobalDict::new());
+        let server = QwpWsServerModel::new();
+        let mut connection = server.connect();
+        assert_eq!(connection.receive(&frames[0]), None);
+        connection.receive(&frame_without_a_table(&frames[0]));
     }
 
     #[test]
@@ -813,21 +905,228 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "holds no symbols")]
-    fn server_model_refuses_a_frame_that_brings_symbols() {
+    #[should_panic(expected = "its symbols start at id 1 and the connection holds 0")]
+    fn server_model_refuses_a_frame_whose_dictionary_starts_past_its_own() {
         let mut frame = one_frame();
-        // The dictionary section: the start, then the count.
+        // The dictionary section: the id of the first symbol, then the count.
         assert_eq!(frame[QWP_HEADER_SIZE..QWP_HEADER_SIZE + 2], [0, 0]);
-        frame[QWP_HEADER_SIZE + 1] = 1;
+        frame[QWP_HEADER_SIZE] = 1;
         QwpWsServerModel::new().connect().receive(&frame);
     }
 
+    /// Adds rows with two symbol columns to a buffer: per row its id, its
+    /// `sym`, and its `other`, which a row may lack.
+    fn add_symbol_rows(buffer: &mut Buffer, table: &str, rows: &[(i64, &str, Option<&str>)]) {
+        for (id, sym, other) in rows {
+            buffer
+                .table(table)
+                .unwrap()
+                .symbol("sym", sym)
+                .unwrap()
+                .symbol_opt("other", *other)
+                .unwrap()
+                .column_i64("id", *id)
+                .unwrap()
+                .at(TimestampNanos::new(1_700_000_000_000_000_000 + id))
+                .unwrap();
+        }
+    }
+
+    fn symbol_rows(table: &str, rows: &[(i64, &str, Option<&str>)]) -> Buffer {
+        let mut buffer = Buffer::new_qwp_ws();
+        add_symbol_rows(&mut buffer, table, rows);
+        buffer
+    }
+
+    /// The three frames of a flush over two tables, from a sender whose
+    /// dictionary is `symbols`. With a new dictionary the first brings `a`,
+    /// `b` and `x`, the second `y` and `z`, the third `w`. The second and
+    /// the third also name symbols that an earlier frame brought, for the
+    /// other column or the other table.
+    fn symbol_frames(symbols: &mut SymbolGlobalDict) -> [Vec<u8>; 3] {
+        let first = symbol_rows(
+            "model_one",
+            &[(0, "a", Some("x")), (1, "b", None), (2, "a", Some("a"))],
+        );
+        let mut second = symbol_rows("model_one", &[(3, "b", Some("y"))]);
+        add_symbol_rows(&mut second, "model_two", &[(10, "a", Some("z"))]);
+        let third = symbol_rows("model_two", &[(11, "w", Some("b"))]);
+        [
+            frame_of_a_sender(&first, true, symbols),
+            frame_of_a_sender(&second, true, symbols),
+            frame_of_a_sender(&third, false, symbols),
+        ]
+    }
+
+    /// Per frame, the symbols it brings: the id of the first, and how many.
+    fn brought(frames: &[Vec<u8>]) -> Vec<[u8; 2]> {
+        frames
+            .iter()
+            .map(|frame| [frame[QWP_HEADER_SIZE], frame[QWP_HEADER_SIZE + 1]])
+            .collect()
+    }
+
+    /// Per committed row of a table, the symbol it has in `column`; `-` for
+    /// a row without one.
+    fn symbols_in(server: &QwpWsServerModel, table: &str, column: &str) -> Vec<String> {
+        let mut symbols = Vec::new();
+        for block in &server.table(table).unwrap().blocks {
+            let column = block
+                .columns
+                .iter()
+                .position(|candidate| candidate.name == column)
+                .unwrap();
+            for row in &block.rows {
+                symbols.push(match &row[column] {
+                    DecodedValue::Symbol(symbol) => symbol.clone(),
+                    DecodedValue::Null => "-".to_owned(),
+                    other => panic!("not a symbol: {other:?}"),
+                });
+            }
+        }
+        symbols
+    }
+
     #[test]
-    #[should_panic(expected = "holds no symbols")]
-    fn server_model_refuses_a_frame_whose_dictionary_starts_past_its_own() {
-        let mut frame = one_frame();
-        frame[QWP_HEADER_SIZE] = 1;
-        QwpWsServerModel::new().connect().receive(&frame);
+    fn server_model_reads_a_symbol_by_the_id_its_connection_gave_it() {
+        let mut symbols = SymbolGlobalDict::new();
+        let frames = symbol_frames(&mut symbols);
+        assert_eq!(brought(&frames), [[0, 3], [3, 2], [5, 1]]);
+
+        let server = QwpWsServerModel::new();
+        let mut connection = server.connect();
+        assert_eq!(connection.receive(&frames[0]), None);
+        assert_eq!(connection.receive(&frames[1]), None);
+        assert_eq!(
+            connection.receive(&frames[2]),
+            ok(2, &[("model_one", 1), ("model_two", 1)])
+        );
+        assert_eq!(
+            symbols_in(&server, "model_one", "sym"),
+            ["a", "b", "a", "b"]
+        );
+        assert_eq!(
+            symbols_in(&server, "model_one", "other"),
+            ["x", "-", "a", "y"]
+        );
+        assert_eq!(symbols_in(&server, "model_two", "sym"), ["a", "w"]);
+        assert_eq!(symbols_in(&server, "model_two", "other"), ["z", "b"]);
+
+        // The connection keeps its symbols after a commit: the next frame
+        // brings one, and names one of the first frame.
+        let frame = frame_of_a_sender(
+            &symbol_rows("model_two", &[(12, "c", Some("x"))]),
+            false,
+            &mut symbols,
+        );
+        assert_eq!(brought(std::slice::from_ref(&frame)), [[6, 1]]);
+        assert_eq!(connection.receive(&frame), ok(3, &[("model_two", 2)]));
+        assert_eq!(symbols_in(&server, "model_two", "sym"), ["a", "w", "c"]);
+        assert_eq!(symbols_in(&server, "model_two", "other"), ["z", "b", "x"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "its symbols start at id 3 and the connection holds 0")]
+    fn server_model_gives_each_connection_symbols_of_its_own() {
+        let frames = symbol_frames(&mut SymbolGlobalDict::new());
+        let server = QwpWsServerModel::new();
+        let mut first = server.connect();
+        assert_eq!(first.receive(&frames[0]), None);
+        assert_eq!(first.receive(&frames[1]), None);
+        // A second connection has not got the symbols of the first frame.
+        server.connect().receive(&frames[1]);
+    }
+
+    #[test]
+    fn server_model_takes_the_symbols_again_on_a_new_connection() {
+        // What a sender keeps: its dictionary, and the symbols it has sent.
+        let mut symbols = SymbolGlobalDict::new();
+        let mut sent = SentDictMirror::new(true);
+        let server = QwpWsServerModel::new();
+
+        // A flush that is answered, then two frames of a flush of three.
+        let early = frame_of_a_sender(
+            &symbol_rows("model_one", &[(20, "early", Some("a"))]),
+            false,
+            &mut symbols,
+        );
+        let frames = symbol_frames(&mut symbols);
+        assert_eq!(brought(&frames), [[2, 2], [4, 2], [6, 1]]);
+        let mut connection = server.connect();
+        assert_eq!(connection.receive(&early), ok(0, &[("model_one", 1)]));
+        assert_eq!(connection.receive(&frames[0]), None);
+        assert_eq!(connection.receive(&frames[1]), None);
+        for frame in [&early, &frames[0], &frames[1]] {
+            assert!(sent.accumulate(frame));
+        }
+        drop(connection);
+
+        // The new connection: first the six symbols, in two frames without
+        // a table. Each is answered, and nothing is committed.
+        let again = sent.build_catch_up_frames(36, QWP_VERSION).unwrap();
+        assert_eq!(brought(&again), [[0, 2], [2, 4]]);
+        let mut connection = server.connect();
+        assert_eq!(connection.receive(&again[0]), ok(0, &[]));
+        assert_eq!(connection.receive(&again[1]), ok(1, &[]));
+        let table = server.table("model_one").unwrap();
+        assert_eq!((table.commits, table.row_count()), (1, 1));
+        let table = server.table("model_two").unwrap();
+        assert_eq!((table.commits, table.row_count()), (0, 0));
+
+        // Then the frames that were not answered, as they are: they bring
+        // their symbols once more. The last one was never sent.
+        assert_eq!(connection.receive(&frames[0]), None);
+        assert_eq!(connection.receive(&frames[1]), None);
+        assert_eq!(
+            connection.receive(&frames[2]),
+            ok(4, &[("model_one", 2), ("model_two", 1)])
+        );
+        assert_eq!(
+            symbols_in(&server, "model_one", "sym"),
+            ["early", "a", "b", "a", "b"]
+        );
+        assert_eq!(
+            symbols_in(&server, "model_one", "other"),
+            ["a", "x", "-", "a", "y"]
+        );
+        assert_eq!(symbols_in(&server, "model_two", "sym"), ["a", "w"]);
+        assert_eq!(symbols_in(&server, "model_two", "other"), ["z", "b"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "symbol 0 gets another text")]
+    fn server_model_refuses_another_text_for_a_symbol_it_holds() {
+        let frames = symbol_frames(&mut SymbolGlobalDict::new());
+        let server = QwpWsServerModel::new();
+        let mut connection = server.connect();
+        assert_eq!(connection.receive(&frames[0]), None);
+        // The first frame of another sender: its symbols begin at 0 too.
+        let other = frame_of_a_sender(
+            &symbol_rows("model_one", &[(5, "q", None)]),
+            false,
+            &mut SymbolGlobalDict::new(),
+        );
+        connection.receive(&other);
+    }
+
+    #[test]
+    #[should_panic(expected = "symbol index 5 out of bounds for dictionary size 4")]
+    fn server_model_refuses_a_symbol_its_connection_does_not_hold() {
+        let mut frames = symbol_frames(&mut SymbolGlobalDict::new());
+        let server = QwpWsServerModel::new();
+        let mut connection = server.connect();
+        assert_eq!(connection.receive(&frames[0]), None);
+        // No sender makes this frame: it brings its symbol as the fourth of
+        // the connection, and its row names the sixth.
+        assert_eq!(brought(&frames[2..]), [[5, 1]]);
+        frames[2][QWP_HEADER_SIZE] = 3;
+        connection.receive(&frames[2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a buffer with symbols needs the dictionary of its sender")]
+    fn a_frame_of_a_buffer_with_symbols_needs_the_dictionary_of_its_sender() {
+        frame_of_a_whole_buffer(&symbol_rows(TABLE, &[(0, "a", None)]), false);
     }
 
     /// One row short of the server's row limit is held; the row that reaches

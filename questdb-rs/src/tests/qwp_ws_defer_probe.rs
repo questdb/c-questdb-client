@@ -25,10 +25,12 @@
 //! What a server does with the frames of one flush that is larger than a
 //! frame: every frame but the last carries the defer flag. One script sends
 //! such frames over a raw WebSocket and checks the answers and what the
-//! tables hold afterwards, for a flush of one table and for a flush over
-//! two. It runs against a real QuestDB server in an ignored test, and
-//! against the server model of the tests (`qwp_ws_server_model`) in a test
-//! that always runs, so the model is held to what a real server showed.
+//! tables hold afterwards: for a flush of one table, for a flush over
+//! two, and for a flush of rows with symbols, whose frames bring the
+//! symbols as they go, also after the connection was lost. It runs against
+//! a real QuestDB server in an ignored test, and against the server model
+//! of the tests (`qwp_ws_server_model`) in a test that always runs, so the
+//! model is held to what a real server showed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error as IoError, ErrorKind};
@@ -36,13 +38,12 @@ use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
 use crate::ingress::{
-    Buffer, DurableAckTiers, TimestampNanos, perform_upgrade, write_binary_frame, write_ping_frame,
+    Buffer, DurableAckTiers, SentDictMirror, SymbolGlobalDict, TimestampNanos, decode_qwp_varint,
+    perform_upgrade, write_binary_frame, write_ping_frame,
 };
 use crate::tests::qwp_decode::DecodedValue;
 use crate::tests::qwp_ws::read_frame;
-use crate::tests::qwp_ws_server_model::{
-    QwpWsModelServer, frame_of_a_whole_buffer, frames_of_a_flush,
-};
+use crate::tests::qwp_ws_server_model::{QwpWsModelServer, frame_of_a_sender, frames_of_a_flush};
 
 use super::TestResult;
 use super::qwp_ws_protocol_probe::{
@@ -52,6 +53,8 @@ use super::qwp_ws_protocol_probe::{
 const WS_OPCODE_BINARY: u8 = 0x2;
 const WS_OPCODE_PONG: u8 = 0xA;
 const QWP_STATUS_OK: u8 = 0x00;
+const QWP_VERSION: u8 = 1;
+const QWP_HEADER_SIZE: usize = 12;
 const QWP_FLAGS_OFFSET: usize = 5;
 const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 const BASE_TS_NANOS: i64 = 1_700_200_000_000_000_000;
@@ -122,6 +125,8 @@ fn run_defer_rules_script(server: &Server<'_>, settings: &ScriptSettings) -> Pro
     a_frame_of_the_advertised_limit_is_taken(server)?;
     a_group_over_two_tables_is_one_transaction_of_each(server, settings)?;
     a_dropped_group_over_two_tables_leaves_no_rows(server, settings)?;
+    a_group_brings_its_symbols_frame_by_frame(server, settings)?;
+    a_new_connection_gets_the_symbols_again_before_the_frames(server, settings)?;
     Ok(())
 }
 
@@ -293,7 +298,7 @@ fn a_group_over_two_tables_is_one_transaction_of_each(
     let limit = connection.frame_limit;
     let of_first = rows_from(0, settings.group_bytes * 2 / 5 / ROW_BYTES);
     let of_second = rows_from(5_000_000, settings.group_bytes * 3 / 5 / ROW_BYTES);
-    let frames = frames_over_tables(&[(&first, &of_first), (&second, &of_second)], limit)?;
+    let frames = frames_over_tables(&[(&first, &of_first), (&second, &of_second)], limit, None)?;
     let last = frames.len() - 1;
     // One frame holds a block of each table, every other frame one block.
     let blocks = block_counts(&frames);
@@ -345,7 +350,7 @@ fn a_group_over_two_tables_is_one_transaction_of_each(
 
     // The next frame of the connection: a few rows of the second table.
     let more = rows_from(6_000_000, 10);
-    let frames = frames_over_tables(&[(&second, &more)], limit)?;
+    let frames = frames_over_tables(&[(&second, &more)], limit, None)?;
     assert_eq!(frames.len(), 1);
     connection.send(&frames[0])?;
     assert_eq!(connection.expect_ok()?, OkAnswer::of(last + 1, &second, 2));
@@ -378,6 +383,7 @@ fn a_dropped_group_over_two_tables_leaves_no_rows(
             (&second, &rows_from(5_000_000, rows)),
         ],
         limit,
+        None,
     )?;
     // The frames that are sent hold rows of both tables.
     let sent = &frames[..frames.len() - 1];
@@ -402,7 +408,7 @@ fn a_dropped_group_over_two_tables_leaves_no_rows(
     let mut connection = server.connect()?;
     let of_second = rows_from(6_000_000, 2 * rows);
     let of_first = rows_from(1_000_000, 10);
-    let frames = frames_over_tables(&[(&second, &of_second), (&first, &of_first)], limit)?;
+    let frames = frames_over_tables(&[(&second, &of_second), (&first, &of_first)], limit, None)?;
     let last = frames.len() - 1;
     let mut expected = vec![1; frames.len()];
     expected[last] = 2;
@@ -433,6 +439,239 @@ fn a_dropped_group_over_two_tables_leaves_no_rows(
     Ok(())
 }
 
+/// A flush of rows with symbols over two tables, as a sender sends it:
+/// each frame brings the symbols that are new to the connection, and its
+/// rows name every symbol by the id it got when it was brought, by this
+/// frame or by an earlier one, for this table or for the other. No answer
+/// before the last frame; then each table holds exactly its rows, each
+/// with its symbols, in one transaction. The next frame of the connection
+/// brings only the symbols the connection does not hold yet.
+fn a_group_brings_its_symbols_frame_by_frame(
+    server: &Server<'_>,
+    settings: &ScriptSettings,
+) -> ProbeResult<()> {
+    let (first, _cleanup_first) = server.new_table("qwp_defer_symbols_one");
+    let (second, _cleanup_second) = server.new_table("qwp_defer_symbols_two");
+    let mut connection = server.connect()?;
+    let limit = connection.frame_limit;
+    let mut symbols = SymbolGlobalDict::new();
+    let of_first = rows_from(0, settings.group_bytes * 2 / 5 / ROW_BYTES);
+    let of_second = rows_from(5_000_000, settings.group_bytes * 3 / 5 / ROW_BYTES);
+    let frames = frames_over_tables(
+        &[(&first, &of_first), (&second, &of_second)],
+        limit,
+        Some(&mut symbols),
+    )?;
+    let last = frames.len() - 1;
+    assert!(last >= 8, "{} frames", frames.len());
+    assert!(block_counts(&frames).contains(&2));
+    // The symbols of a frame begin where those of the frame before ended,
+    // and every full frame brings some. Only the first brings the venues,
+    // which the rows of every frame have.
+    let brought = symbols_brought(&frames);
+    let mut next_id = 0;
+    for (frame, (first_id, count)) in brought.iter().enumerate() {
+        assert_eq!(*first_id, next_id, "frame {frame} of {brought:?}");
+        assert!(*count > 0 || frame == last, "frame {frame} of {brought:?}");
+        next_id += count;
+    }
+
+    let started = Instant::now();
+    for frame in &frames[..last] {
+        connection.send(frame)?;
+    }
+    connection.expect_no_answer_yet()?;
+    let deferred_taken = started.elapsed();
+    connection.expect_silence(settings.quiet)?;
+    for table in [&first, &second] {
+        assert_eq!(server.row_count(table)?, 0, "rows before the commit frame");
+    }
+
+    let commit_sent = Instant::now();
+    connection.send(&frames[last])?;
+    assert_eq!(
+        connection.expect_ok()?,
+        OkAnswer::of_tables(last, &[(&first, 1), (&second, 1)])
+    );
+    let committed = commit_sent.elapsed();
+    server.wait_for_rows(&first, of_first.len())?;
+    server.wait_for_rows(&second, of_second.len())?;
+    connection.expect_no_answer(settings.quiet)?;
+
+    server.expect_rows_with_symbols(&first, &of_first)?;
+    server.expect_rows_with_symbols(&second, &of_second)?;
+    assert_eq!(server.transactions(&first)?, Some(1));
+    assert_eq!(server.transactions(&second)?, Some(1));
+    eprintln!(
+        "symbols: {} and {} rows with {next_id} symbols, brought by {} frames of at most \
+         {limit} bytes (largest {}), {} to {} a frame; the server took the deferred frames in \
+         {deferred_taken:?} and answered the commit frame after {committed:?}",
+        of_first.len(),
+        of_second.len(),
+        frames.len(),
+        frames.iter().map(Vec::len).max().unwrap(),
+        brought.iter().map(|(_, count)| *count).min().unwrap(),
+        brought.iter().map(|(_, count)| *count).max().unwrap(),
+    );
+
+    // The next frame of the connection: rows whose venues the connection
+    // holds, and whose three tags are new.
+    let more = rows_from(6_000_000, 25);
+    let frames = frames_over_tables(&[(&second, &more)], limit, Some(&mut symbols))?;
+    assert_eq!(symbols_brought(&frames), [(next_id, 3)]);
+    connection.send(&frames[0])?;
+    assert_eq!(connection.expect_ok()?, OkAnswer::of(last + 1, &second, 2));
+    server.wait_for_rows(&second, of_second.len() + more.len())?;
+    server.expect_rows_with_symbols(&first, &of_first)?;
+    server.expect_rows_with_symbols(&second, &[of_second, more].concat())?;
+    assert_eq!(server.transactions(&first)?, Some(1));
+    assert_eq!(server.transactions(&second)?, Some(2));
+    Ok(())
+}
+
+/// What a sender does when it loses its connection in the middle of a
+/// flush with symbols. On the new connection it first brings every symbol
+/// it has sent, in frames without a table and without the defer flag, and
+/// then sends again, as they are, the frames that were not answered: here
+/// the frames of the flush, whose rows also name symbols that an earlier,
+/// answered frame brought. A server answers the frames without a table and
+/// commits nothing by them, takes the symbols that the frames of the flush
+/// bring once more, and commits the flush once, with its last frame.
+fn a_new_connection_gets_the_symbols_again_before_the_frames(
+    server: &Server<'_>,
+    settings: &ScriptSettings,
+) -> ProbeResult<()> {
+    let (first, _cleanup_first) = server.new_table("qwp_defer_resent_one");
+    let (second, _cleanup_second) = server.new_table("qwp_defer_resent_two");
+    let mut connection = server.connect()?;
+    let limit = connection.frame_limit;
+    // What a sender keeps: its dictionary, and the symbols it has sent.
+    let mut symbols = SymbolGlobalDict::new();
+    let mut sent_symbols = SentDictMirror::new(true);
+
+    // A flush of one frame, which is answered. The sender does not send it
+    // again; its symbols it does.
+    let early = rows_from(0, 30);
+    let frames = frames_over_tables(&[(&first, &early)], limit, Some(&mut symbols))?;
+    assert_eq!(frames.len(), 1);
+    connection.send(&frames[0])?;
+    assert!(sent_symbols.accumulate(&frames[0]));
+    assert_eq!(connection.expect_ok()?, OkAnswer::of(0, &first, 1));
+    server.wait_for_rows(&first, early.len())?;
+
+    // A flush in frames. The connection goes away before the last one.
+    let rows = settings.group_bytes / 8 / ROW_BYTES;
+    let of_first = rows_from(1_000, rows);
+    let of_second = rows_from(5_000_000, rows);
+    let frames = frames_over_tables(
+        &[(&first, &of_first), (&second, &of_second)],
+        limit,
+        Some(&mut symbols),
+    )?;
+    let last = frames.len() - 1;
+    assert!(last >= 2, "{} frames", frames.len());
+    for frame in &frames[..last] {
+        connection.send(frame)?;
+        assert!(sent_symbols.accumulate(frame));
+    }
+    connection.expect_no_answer(settings.quiet)?;
+    connection.drop_without_close();
+    server.wait_for_the_drop(settings.settle);
+    server.expect_rows_with_symbols(&first, &early)?;
+    assert_eq!(server.row_count(&second)?, 0, "rows of a dropped group");
+
+    // The frames without a table, made by the driver's own code. The driver
+    // cuts them at the frame limit of the server; here they are cut
+    // smaller, so that there are several.
+    let symbol_bytes: usize = symbols
+        .entries_from(0)
+        .unwrap()
+        .map(|symbol| 1 + symbol.len())
+        .sum();
+    let symbol_frames = sent_symbols
+        .build_catch_up_frames((symbol_bytes / 3).max(64), QWP_VERSION)
+        .expect("frames for the symbols");
+    assert!(symbol_frames.len() >= 2, "{} frames", symbol_frames.len());
+    assert!(
+        symbol_frames
+            .iter()
+            .all(|frame| frame.len() <= limit
+                && frame[QWP_FLAGS_OFFSET] & QWP_FLAG_DEFER_COMMIT == 0)
+    );
+    assert!(block_counts(&symbol_frames).iter().all(|count| *count == 0));
+    // They bring every symbol the lost connection got, in order: up to
+    // where the symbols of the frame that was never sent begin.
+    let mut next_id = 0;
+    for (first_id, count) in symbols_brought(&symbol_frames) {
+        assert_eq!(first_id, next_id);
+        next_id += count;
+    }
+    assert_eq!(next_id, symbols_brought(&frames)[last].0);
+    // And the frames of the flush name symbols that only they bring now:
+    // the flush itself begins behind the symbols of the early frame.
+    assert!(symbols_brought(&frames)[0].0 > 0);
+
+    let mut connection = server.connect()?;
+    let started = Instant::now();
+    for frame in symbol_frames.iter().chain(&frames[..last]) {
+        connection.send(frame)?;
+    }
+    // A server may answer several frames without a table with one OK. The
+    // frames of the flush it does not answer.
+    let answers = connection.answers_so_far()?;
+    let taken = started.elapsed();
+    let answered: Vec<u64> = answers.iter().map(|ok| ok.sequence).collect();
+    assert!(answers.iter().all(|ok| ok.tables.is_empty()), "{answers:?}");
+    assert!(
+        answered.windows(2).all(|pair| pair[0] < pair[1]),
+        "{answered:?}"
+    );
+    assert_eq!(
+        answered.last().copied(),
+        Some(symbol_frames.len() as u64 - 1),
+        "{answered:?}"
+    );
+    connection.expect_silence(settings.quiet)?;
+    server.expect_rows_with_symbols(&first, &early)?;
+    assert_eq!(
+        server.row_count(&second)?,
+        0,
+        "rows before the commit frame"
+    );
+    assert_eq!(server.transactions(&first)?, Some(1));
+
+    // The frames without a table took sequences of the connection.
+    let commit_sent = Instant::now();
+    connection.send(&frames[last])?;
+    assert_eq!(
+        connection.expect_ok()?,
+        OkAnswer::of_tables(symbol_frames.len() + last, &[(&first, 2), (&second, 1)])
+    );
+    let committed = commit_sent.elapsed();
+    let of_first = [early, of_first].concat();
+    server.wait_for_rows(&first, of_first.len())?;
+    server.wait_for_rows(&second, of_second.len())?;
+    // Now, and again after a while: no row of the lost connection comes
+    // later.
+    for settle in [Duration::ZERO, settings.settle] {
+        std::thread::sleep(settle);
+        server.expect_rows_with_symbols(&first, &of_first)?;
+        server.expect_rows_with_symbols(&second, &of_second)?;
+        assert_eq!(server.transactions(&first)?, Some(2));
+        assert_eq!(server.transactions(&second)?, Some(1));
+    }
+    eprintln!(
+        "symbols again: {next_id} symbols in {} frames without a table, answered with OKs for \
+         the sequences {answered:?}; then {} frames of {} and {} rows; the server took all \
+         but the last in {taken:?} and answered the commit frame after {committed:?}",
+        symbol_frames.len(),
+        frames.len(),
+        of_first.len() - 30,
+        of_second.len(),
+    );
+    Ok(())
+}
+
 /// `count` rows of the script from `first_id` on: per row its id and the
 /// length of its text.
 fn rows_from(first_id: i64, count: usize) -> Vec<(i64, usize)> {
@@ -451,24 +690,35 @@ fn text_len_of(id: i64) -> usize {
 /// rows of the next. Every frame but the last has the defer flag. Each
 /// frame is what a flush makes of a buffer that holds the rows of that
 /// frame alone.
+///
+/// With `symbols`, the dictionary of the sender, the rows have their
+/// symbols ([`venue_of`], [`tag_of`]), and a frame brings those the
+/// dictionary does not hold yet. Without, the rows have none.
 fn frames_over_tables(
     tables: &[(&str, &[(i64, usize)])],
     limit: usize,
+    symbols: Option<&mut SymbolGlobalDict>,
 ) -> ProbeResult<Vec<Vec<u8>>> {
-    // More than a row takes together with the header of its table block.
+    // More than a row takes together with the header of its table block
+    // and two new symbols.
     const ROOM_FOR_A_ROW: usize = 512;
+    let mut no_symbols = SymbolGlobalDict::new();
+    let (with_symbols, symbols) = match symbols {
+        Some(symbols) => (true, symbols),
+        None => (false, &mut no_symbols),
+    };
     let mut frames = Vec::new();
     let mut buffer = Buffer::new_qwp_ws();
     for (table, rows) in tables {
         for (id, text_len) in *rows {
             if buffer.len() + ROOM_FOR_A_ROW > limit {
-                frames.push(frame_of_a_whole_buffer(&buffer, true));
+                frames.push(frame_of_a_sender(&buffer, true, symbols));
                 buffer = Buffer::new_qwp_ws();
             }
-            push_row(&mut buffer, table, *id, *text_len)?;
+            push_row(&mut buffer, table, *id, *text_len, with_symbols)?;
         }
     }
-    frames.push(frame_of_a_whole_buffer(&buffer, false));
+    frames.push(frame_of_a_sender(&buffer, false, symbols));
     assert!(frames.iter().all(|frame| frame.len() <= limit));
     Ok(frames)
 }
@@ -481,13 +731,80 @@ fn block_counts(frames: &[Vec<u8>]) -> Vec<usize> {
         .collect()
 }
 
-/// One row: two numbers, a text, and its own timestamp. No symbols.
-fn push_row(buffer: &mut Buffer, table: &str, id: i64, text_len: usize) -> ProbeResult<()> {
+/// Per frame, the symbols it brings: the id of the first, and how many.
+fn symbols_brought(frames: &[Vec<u8>]) -> Vec<(u64, u64)> {
+    frames
+        .iter()
+        .map(|frame| {
+            let (first_id, pos) = decode_qwp_varint(frame, QWP_HEADER_SIZE).unwrap();
+            let (count, _) = decode_qwp_varint(frame, pos).unwrap();
+            (first_id, count)
+        })
+        .collect()
+}
+
+/// The symbol columns of a row that has symbols.
+const SYMBOL_COLUMNS: [&str; 2] = ["venue", "tag"];
+
+/// The first symbol of a row: one of seven, so the first frame of a
+/// connection brings them all, and every later frame, of any table, names
+/// them by the ids they got there.
+fn venue_of(id: i64) -> String {
+    format!("venue-{}", id % 7)
+}
+
+/// The second symbol of a row. One row in eleven has none. One in thirteen
+/// has the venue of the row behind it: a text of both symbol columns. The
+/// others share a text among ten rows, so new texts keep coming as the ids
+/// rise, and most frames begin with rows whose text the frame before
+/// brought.
+fn tag_of(id: i64) -> Option<String> {
+    if id % 11 == 0 {
+        None
+    } else if id % 13 == 0 {
+        Some(venue_of(id + 1))
+    } else {
+        Some(format!("tag-{}", id / 10))
+    }
+}
+
+/// Per symbol column and text, how many rows have it and the sum of their
+/// ids. `None` stands for the rows without a value.
+type RowsPerSymbol = BTreeMap<(&'static str, Option<String>), (i64, i64)>;
+
+/// What a table has per symbol when it holds exactly `rows`, each with its
+/// symbols.
+fn rows_per_symbol_of(rows: &[(i64, usize)]) -> RowsPerSymbol {
+    let mut per_symbol = RowsPerSymbol::new();
+    for (id, _) in rows {
+        for (column, symbol) in [("venue", Some(venue_of(*id))), ("tag", tag_of(*id))] {
+            let (count, id_sum) = per_symbol.entry((column, symbol)).or_default();
+            *count += 1;
+            *id_sum += id;
+        }
+    }
+    per_symbol
+}
+
+/// One row: two numbers, a text, and its own timestamp; with `symbols`,
+/// its two symbols before them.
+fn push_row(
+    buffer: &mut Buffer,
+    table: &str,
+    id: i64,
+    text_len: usize,
+    symbols: bool,
+) -> ProbeResult<()> {
     let text = char::from(b'a' + (id % 26) as u8)
         .to_string()
         .repeat(text_len);
+    buffer.table(table)?;
+    if symbols {
+        buffer
+            .symbol("venue", venue_of(id))?
+            .symbol_opt("tag", tag_of(id))?;
+    }
     buffer
-        .table(table)?
         .column_i64("id", id)?
         .column_i64("mix", mix_of(id))?
         .column_str("txt", text)?
@@ -531,7 +848,7 @@ impl Group {
     }
 
     fn push(&mut self, table: &str, id: i64, text_len: usize) -> ProbeResult<()> {
-        push_row(&mut self.buffer, table, id, text_len)?;
+        push_row(&mut self.buffer, table, id, text_len, false)?;
         self.rows.push((id, text_len));
         Ok(())
     }
@@ -677,6 +994,83 @@ impl Server<'_> {
                 Ok(Some(digest))
             }
         }
+    }
+
+    /// Per symbol of the table, how many rows have it and the sum of their
+    /// ids.
+    fn rows_per_symbol(&self, table: &str) -> ProbeResult<RowsPerSymbol> {
+        let mut per_symbol = RowsPerSymbol::new();
+        match self {
+            Self::Live(config) => {
+                for column in SYMBOL_COLUMNS {
+                    let sql = format!("select {column}, count(), sum(id) from '{table}'");
+                    let value = query_json(config, &sql)?;
+                    let rows = value
+                        .get("dataset")
+                        .and_then(|dataset| dataset.as_array())
+                        .ok_or_else(|| invalid(format!("no rows in the answer to {sql:?}")))?;
+                    for row in rows {
+                        let symbol = row[0].as_str().map(str::to_owned);
+                        let numbers = (row[1].as_i64(), row[2].as_i64());
+                        let (Some(count), Some(id_sum)) = numbers else {
+                            return Err(invalid(format!("{row} in the answer to {sql:?}")).into());
+                        };
+                        per_symbol.insert((column, symbol), (count, id_sum));
+                    }
+                }
+            }
+            Self::Model(server) => {
+                let blocks = server.model.table(table).map(|table| table.blocks);
+                for block in blocks.iter().flatten() {
+                    let column =
+                        |name: &str| block.columns.iter().position(|column| column.name == name);
+                    let id = column("id").unwrap();
+                    for name in SYMBOL_COLUMNS {
+                        // A block has no such column when none of its rows
+                        // has the symbol.
+                        let symbol = column(name);
+                        for row in &block.rows {
+                            let symbol = match (symbol.map(|symbol| &row[symbol]), &row[id]) {
+                                (Some(DecodedValue::Symbol(symbol)), _) => Some(symbol.clone()),
+                                (Some(DecodedValue::Null) | None, _) => None,
+                                other => panic!("not a row with symbols: {other:?}"),
+                            };
+                            let DecodedValue::I64(id) = row[id] else {
+                                panic!("not a row of the script: {row:?}");
+                            };
+                            let (count, id_sum) = per_symbol.entry((name, symbol)).or_default();
+                            *count += 1;
+                            *id_sum += id;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(per_symbol)
+    }
+
+    /// The table holds exactly `rows`, each with its symbols.
+    fn expect_rows_with_symbols(&self, table: &str, rows: &[(i64, usize)]) -> ProbeResult<()> {
+        assert_eq!(self.digest(table)?, Some(Digest::of(rows)));
+        let (held, expected) = (self.rows_per_symbol(table)?, rows_per_symbol_of(rows));
+        // Not the maps whole: a table has thousands of symbols.
+        let differs = held
+            .iter()
+            .find(|(symbol, rows)| expected.get(*symbol) != Some(*rows))
+            .or_else(|| {
+                expected
+                    .iter()
+                    .find(|(symbol, _)| !held.contains_key(*symbol))
+            })
+            .map(|(symbol, _)| (symbol, held.get(symbol), expected.get(symbol)));
+        assert!(
+            differs.is_none(),
+            "rows per symbol of {table}: {} symbols held, {} expected; the first that differs, \
+             with what is held and what is expected: {differs:?}",
+            held.len(),
+            expected.len()
+        );
+        Ok(())
     }
 
     fn row_count(&self, table: &str) -> ProbeResult<i64> {
@@ -825,22 +1219,30 @@ impl Connection {
     }
 
     /// The server has taken every frame sent so far, and has not answered
-    /// one: it answers in the order it takes frames, so an answer to an
-    /// earlier frame would come before the pong of a ping sent now.
+    /// one.
     fn expect_no_answer_yet(&mut self) -> ProbeResult<()> {
+        let answers = self.answers_so_far()?;
+        if !answers.is_empty() {
+            return Err(invalid(format!("expected no answer yet, got {answers:?}")).into());
+        }
+        Ok(())
+    }
+
+    /// The OKs the server has for the frames sent so far, when it has
+    /// taken them all: it answers in the order it takes frames, so an
+    /// answer to an earlier frame comes before the pong of a ping sent now.
+    fn answers_so_far(&mut self) -> ProbeResult<Vec<OkAnswer>> {
         let ping = [b'p', self.pings];
         self.pings += 1;
         write_ping_frame(&mut self.stream, &mut self.send_buf, &ping)?;
-        let (_fin, opcode, payload) = read_frame(&mut self.stream)?;
-        if opcode != WS_OPCODE_PONG || payload != ping {
-            return Err(invalid(format!(
-                "expected the pong of {ping:?}, got opcode {opcode:#x} with {} bytes: {:?}",
-                payload.len(),
-                &payload[..payload.len().min(64)]
-            ))
-            .into());
+        let mut answers = Vec::new();
+        loop {
+            let (_fin, opcode, payload) = read_frame(&mut self.stream)?;
+            if opcode == WS_OPCODE_PONG && payload == ping {
+                return Ok(answers);
+            }
+            answers.push(ok_answer(opcode, &payload)?);
         }
-        Ok(())
     }
 
     /// Nothing arrives for `quiet`: an answer the server still held back
@@ -862,36 +1264,41 @@ impl Connection {
     /// The next thing the server sends is an OK.
     fn expect_ok(&mut self) -> ProbeResult<OkAnswer> {
         let (_fin, opcode, payload) = read_frame(&mut self.stream)?;
-        if opcode != WS_OPCODE_BINARY || payload.len() < 11 || payload[0] != QWP_STATUS_OK {
-            return Err(invalid(format!(
-                "expected an OK, got opcode {opcode:#x} with {} bytes: {:?} ({:?})",
-                payload.len(),
-                &payload[..payload.len().min(64)],
-                String::from_utf8_lossy(&payload[payload.len().min(11)..])
-            ))
-            .into());
-        }
-        let sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-        let table_count = u16::from_le_bytes([payload[9], payload[10]]);
-        let mut tables = BTreeMap::new();
-        let mut pos = 11;
-        for _ in 0..table_count {
-            let name_len = usize::from(u16::from_le_bytes([payload[pos], payload[pos + 1]]));
-            let name = String::from_utf8(payload[pos + 2..pos + 2 + name_len].to_vec())?;
-            pos += 2 + name_len;
-            let transaction = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            assert!(
-                tables.insert(name, transaction).is_none(),
-                "the OK names a table twice"
-            );
-        }
-        assert_eq!(pos, payload.len(), "bytes after the OK");
-        Ok(OkAnswer { sequence, tables })
+        ok_answer(opcode, &payload)
     }
 
     /// Goes away as a process that died would: no close frame.
     fn drop_without_close(self) {
         let _ = self.stream.shutdown(Shutdown::Both);
     }
+}
+
+/// Reads a message of the server, which must be an OK.
+fn ok_answer(opcode: u8, payload: &[u8]) -> ProbeResult<OkAnswer> {
+    if opcode != WS_OPCODE_BINARY || payload.len() < 11 || payload[0] != QWP_STATUS_OK {
+        return Err(invalid(format!(
+            "expected an OK, got opcode {opcode:#x} with {} bytes: {:?} ({:?})",
+            payload.len(),
+            &payload[..payload.len().min(64)],
+            String::from_utf8_lossy(&payload[payload.len().min(11)..])
+        ))
+        .into());
+    }
+    let sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+    let table_count = u16::from_le_bytes([payload[9], payload[10]]);
+    let mut tables = BTreeMap::new();
+    let mut pos = 11;
+    for _ in 0..table_count {
+        let name_len = usize::from(u16::from_le_bytes([payload[pos], payload[pos + 1]]));
+        let name = String::from_utf8(payload[pos + 2..pos + 2 + name_len].to_vec())?;
+        pos += 2 + name_len;
+        let transaction = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        assert!(
+            tables.insert(name, transaction).is_none(),
+            "the OK names a table twice"
+        );
+    }
+    assert_eq!(pos, payload.len(), "bytes after the OK");
+    Ok(OkAnswer { sequence, tables })
 }

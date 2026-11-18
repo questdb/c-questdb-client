@@ -255,7 +255,7 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
     }
 
     let mut decoder = Decoder::new(payload);
-    let table = decode_table_block(&mut decoder)?;
+    let table = decode_table_block(&mut decoder, None)?;
     if decoder.pos != payload.len() {
         return Err(format!(
             "unexpected trailing payload bytes: {}",
@@ -274,7 +274,14 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
 
 /// Decodes the table block that starts where `decoder` stands, and leaves
 /// `decoder` behind the block.
-fn decode_table_block(decoder: &mut Decoder<'_>) -> Result<DecodedTable, String> {
+///
+/// A symbol column of a datagram brings its own dictionary, and its cells
+/// are indexes into it. In a QWP/WebSocket frame the cells are ids of the
+/// connection's dictionary, given as `connection_symbols`.
+fn decode_table_block(
+    decoder: &mut Decoder<'_>,
+    connection_symbols: Option<&[String]>,
+) -> Result<DecodedTable, String> {
     let table_name = decoder.read_string()?;
     let row_count = decoder.read_varint()?;
     let column_count = decoder.read_varint()? as usize;
@@ -336,11 +343,19 @@ fn decode_table_block(decoder: &mut Decoder<'_>) -> Result<DecodedTable, String>
                 values
             }
             TYPE_SYMBOL => {
-                let dict_size = decoder.read_varint()? as usize;
-                let mut dict = Vec::with_capacity(dict_size);
-                for _ in 0..dict_size {
-                    dict.push(decoder.read_string()?);
-                }
+                let own_dict;
+                let dict = match connection_symbols {
+                    Some(symbols) => symbols,
+                    None => {
+                        let dict_size = decoder.read_varint()? as usize;
+                        let mut dict = Vec::with_capacity(dict_size);
+                        for _ in 0..dict_size {
+                            dict.push(decoder.read_string()?);
+                        }
+                        own_dict = dict;
+                        &own_dict
+                    }
+                };
                 let non_null_count = has_value.iter().filter(|&&present| present).count();
                 let mut indexes = Vec::with_capacity(non_null_count);
                 for _ in 0..non_null_count {
@@ -825,14 +840,19 @@ pub(crate) fn decode_ws_table_block(block: &[u8]) -> DecodedTable {
 }
 
 /// Decodes the table blocks of a QWP/WebSocket frame: `count` blocks back to
-/// back, and nothing behind them. As for [`decode_ws_table_block`], no block
-/// may hold a symbol column.
+/// back, and nothing behind them. `symbols` is the dictionary of the
+/// connection, the symbols of this frame included: a symbol cell is an id
+/// into it.
 #[cfg(feature = "sync-sender-qwp-ws")]
-pub(crate) fn decode_ws_table_blocks(blocks: &[u8], count: usize) -> Vec<DecodedTable> {
+pub(crate) fn decode_ws_table_blocks(
+    blocks: &[u8],
+    count: usize,
+    symbols: &[String],
+) -> Vec<DecodedTable> {
     let mut decoder = Decoder::new(blocks);
     let tables = (0..count)
         .map(|block| {
-            decode_table_block(&mut decoder)
+            decode_table_block(&mut decoder, Some(symbols))
                 .unwrap_or_else(|err| panic!("table block {block} of {count}: {err}"))
         })
         .collect();

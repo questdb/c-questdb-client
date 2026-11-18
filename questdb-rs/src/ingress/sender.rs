@@ -110,7 +110,7 @@ pub(crate) mod qwp_ws_sfa_symbol_dict;
 mod qwp_ws_sfa_catchup;
 
 #[cfg(all(test, feature = "_sender-qwp-ws"))]
-pub(crate) use qwp_ws_sfa_catchup::fail_next_catch_up_allocation_for_test;
+pub(crate) use qwp_ws_sfa_catchup::{SentDictMirror, fail_next_catch_up_allocation_for_test};
 
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
