@@ -27,7 +27,8 @@
 use super::qwp_ws_sfa_symbol_dict::{PersistedSymbolDict, PersistedSymbolDictMark};
 use crate::error;
 use crate::ingress::buffer::{
-    QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict, SymbolGlobalDictMark,
+    QwpWsColumnarBuffer, QwpWsEncodeScratch, QwpWsFrameBlock, SymbolGlobalDict,
+    SymbolGlobalDictMark,
 };
 
 pub(crate) struct QwpWsReplayEncoder {
@@ -268,6 +269,37 @@ impl QwpWsReplayEncoder {
             }
         }
     }
+
+    /// Encodes one frame of a plan into the scratch message and refuses it
+    /// when it is larger than `frame_cap`.
+    ///
+    /// The frame brings no new symbols: the connection dictionary and its
+    /// side-file stay as they are, so a frame that is not published needs no
+    /// rollback. Only for a sender in delta mode, whose frames start their
+    /// dictionary section at the connection dictionary's size.
+    #[allow(dead_code)] // No caller until a flush sends more than one frame.
+    pub(crate) fn encode_frame(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        blocks: &[QwpWsFrameBlock],
+        defer_commit: bool,
+        frame_cap: usize,
+    ) -> crate::Result<&[u8]> {
+        debug_assert!(self.delta_dict_enabled);
+        buffer.encode_ws_frame(
+            blocks,
+            &mut self.payload,
+            &mut self.scratch,
+            &self.global_dict,
+            self.version,
+            defer_commit,
+        )?;
+        let encoded_len = self.payload.len();
+        if encoded_len > frame_cap {
+            return Err(qwp_ws_encoded_message_size_error(encoded_len, frame_cap));
+        }
+        Ok(&self.payload)
+    }
 }
 
 pub(crate) fn qwp_ws_encoded_message_size_error(
@@ -477,6 +509,94 @@ mod tests {
             encoder.global_dict.len(),
             0,
             "the dormant encoder's seeded dictionary must be freed"
+        );
+    }
+
+    /// Rows without symbols, enough of them for several small frames.
+    fn rows_without_symbols() -> QwpWsColumnarBuffer {
+        let mut buffer = QwpWsColumnarBuffer::new(127);
+        for id in 0..40 {
+            buffer
+                .table("readings")
+                .unwrap()
+                .column_i64("id", id)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        buffer
+    }
+
+    #[test]
+    fn encode_frame_writes_a_frame_of_the_plan_for_its_connection() {
+        // A connection of version 3 that has registered one symbol.
+        let mut encoder = QwpWsReplayEncoder::new(3);
+        encoder.set_delta_dict_enabled(true);
+        encoder.encode(&one_symbol_buffer("a")).unwrap();
+
+        let buffer = rows_without_symbols();
+        let plan = buffer.plan_frames(128, 128).unwrap();
+        assert!(plan.frames().count() > 2);
+        let mut expected = Vec::new();
+        let mut scratch = QwpWsEncodeScratch::new();
+        for defer_commit in [true, false] {
+            for blocks in plan.frames() {
+                // The same frame for a connection of version 1 without symbols.
+                buffer
+                    .encode_ws_frame(
+                        blocks,
+                        &mut expected,
+                        &mut scratch,
+                        &SymbolGlobalDict::new(),
+                        1,
+                        defer_commit,
+                    )
+                    .unwrap();
+                let frame = encoder
+                    .encode_frame(&buffer, blocks, defer_commit, usize::MAX)
+                    .unwrap();
+                assert_eq!(frame[..4], expected[..4]);
+                assert_eq!((frame[4], expected[4]), (3, 1), "the version");
+                assert_eq!(
+                    frame[5..12],
+                    expected[5..12],
+                    "the flags, the table count and the payload length"
+                );
+                assert_eq!(
+                    (&frame[12..14], &expected[12..14]),
+                    (&[1, 0][..], &[0, 0][..]),
+                    "the dictionary section: where it starts, and no new symbol"
+                );
+                assert_eq!(frame[14..], expected[14..], "the table blocks");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_frame_refuses_a_frame_above_the_cap() {
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        let buffer = rows_without_symbols();
+        let plan = buffer.plan_frames(128, 128).unwrap();
+        let blocks = plan.frames().next().unwrap();
+        let len = encoder
+            .encode_frame(&buffer, blocks, true, usize::MAX)
+            .unwrap()
+            .len();
+
+        let at_the_cap = encoder.encode_frame(&buffer, blocks, true, len).unwrap();
+        assert_eq!(at_the_cap.len(), len);
+        let err = encoder
+            .encode_frame(&buffer, blocks, true, len - 1)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+        assert_eq!(
+            err.msg(),
+            format!(
+                "Could not flush buffer: QWP/WebSocket encoded message size of {len} bytes \
+                 exceeds the per-frame cap of {} bytes.",
+                len - 1
+            )
         );
     }
 }

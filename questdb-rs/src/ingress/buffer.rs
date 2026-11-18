@@ -45,8 +45,9 @@ pub(crate) use self::qwp::QwpBuffer;
 pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use self::qwp::{
-    MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
-    SymbolGlobalDictMark, decode_qwp_varint, geohash_precision_needs_bitmap,
+    MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer, QwpWsEncodeScratch, QwpWsFrameBlock,
+    QwpWsFramePlan, SymbolGlobalDict, SymbolGlobalDictMark, decode_qwp_varint,
+    geohash_precision_needs_bitmap,
 };
 // Test-only: lets the sender-level suites drive the connection dictionary's
 // cap-rejection path through a real `Sender` (see `TestDictCapGuard`).

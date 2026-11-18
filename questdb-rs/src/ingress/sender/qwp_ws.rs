@@ -38,7 +38,7 @@ use rand::RngCore;
 
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
-use crate::ingress::buffer::QwpWsColumnarBuffer;
+use crate::ingress::buffer::{QwpWsColumnarBuffer, QwpWsFramePlan};
 use crate::ingress::conf::{
     DurableAckTiers, QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability,
 };
@@ -4276,6 +4276,70 @@ fn publish_qwp_ws_buffer(
         .map(Some)
 }
 
+/// Publishes the frames of `plan` back to back, as one flush that the server
+/// commits once: every frame but the last asks the server to hold its rows,
+/// and the last one commits them all. Returns the number of the last frame.
+///
+/// When the first frame cannot be published, nothing of the flush is queued
+/// and the sender stays usable. When a later one cannot, the sender is
+/// stopped: see [`stop_after_unfinished_flush`].
+#[allow(dead_code)] // No caller until a flush sends more than one frame.
+fn publish_qwp_ws_frames<Q>(
+    encoder: &mut QwpWsReplayEncoder,
+    runner: &mut SyncQwpWsRunner<Q>,
+    buffer: &QwpWsColumnarBuffer,
+    plan: &QwpWsFramePlan,
+    frame_cap: usize,
+) -> crate::Result<Option<u64>>
+where
+    Q: PublicationLog + Send + 'static,
+{
+    let mut frames = plan.frames().peekable();
+    let mut last_fsn = None;
+    while let Some(blocks) = frames.next() {
+        let defer_commit = frames.peek().is_some();
+        let published = encoder
+            .encode_frame(buffer, blocks, defer_commit, frame_cap)
+            .and_then(|payload| runner.publish_replay_payload(payload));
+        match published {
+            Ok(fsn) => last_fsn = Some(fsn),
+            Err(err) if last_fsn.is_none() => return Err(err),
+            Err(err) => return Err(stop_after_unfinished_flush(runner, err)),
+        }
+    }
+    Ok(last_fsn)
+}
+
+/// Stops a sender whose flush queued some of its frames and could not queue
+/// the rest, and returns the error that every later call reports.
+///
+/// The queued frames hold rows that only a later frame could commit, so
+/// nothing may be published after them: the sender turns terminal. Its
+/// network thread then ends and drops the connection, and the server drops
+/// the rows it held for it.
+///
+/// Provisional: everything else in the queue is lost with the sender too,
+/// earlier flushes that the server has not confirmed included.
+fn stop_after_unfinished_flush<Q>(runner: &SyncQwpWsRunner<Q>, cause: crate::Error) -> crate::Error
+where
+    Q: PublicationLog + Send + 'static,
+{
+    let mut store = match runner.lock_shared() {
+        Ok(store) => store,
+        Err(poisoned) => return poisoned,
+    };
+    let msg = format!(
+        "Could not flush buffer: the flush stopped part way: {}. Nothing of this flush is \
+         committed and the buffer still holds its rows. This sender cannot be used any more: \
+         close it, create a new sender and flush the buffer again.",
+        cause.msg().trim_end_matches('.')
+    );
+    let err = cause.reclassified(crate::ErrorCode::SocketError, msg);
+    store.mark_terminal(Some(err.clone()));
+    // An error that stopped the sender before this one stays the one it reports.
+    store.terminal_error().cloned().unwrap_or(err)
+}
+
 pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::Result<bool> {
     let outcome = state.send_core.drive_once(&mut state.store);
     let foreground_progress = match outcome {
@@ -4758,6 +4822,10 @@ mod tests {
         SfaFrameQueue, SfaMemoryQueueOptions, SfaQueueOptions, SfaStorageStep,
     };
     use super::*;
+    use crate::ingress::Buffer;
+    use crate::tests::qwp_ws_server_model::{
+        QwpWsModelConnection, QwpWsServerModel, buffer_of, rows_of,
+    };
     use std::sync::{Arc, mpsc};
     use tempfile::TempDir;
 
@@ -7538,5 +7606,511 @@ mod tests {
         assert_eq!(replayed(), 1);
         assert_eq!(*sent_fsns.lock().unwrap(), [0, 0]);
         drop(runner);
+    }
+
+    // ---------- a flush of several frames ----------
+
+    const FLUSH_TABLE: &str = "flush_rows";
+    /// A segment this small holds two frames of the flushes below.
+    const SMALL_SEGMENT: u64 = 1024;
+
+    /// What the connection of a [`ServerModelTransport`] saw.
+    #[derive(Default)]
+    struct ModelWire {
+        /// Each frame sent, and whether it has the defer flag.
+        sent: Mutex<Vec<(SentFrame, bool)>>,
+        /// The transport is gone, as a connection is once its runner thread
+        /// has ended.
+        closed: AtomicBool,
+    }
+
+    /// The connection of a runner to a [`QwpWsServerModel`]: the model takes
+    /// every frame the runner sends, and its answer is the next response the
+    /// runner reads.
+    struct ServerModelTransport {
+        connection: QwpWsModelConnection,
+        answers: VecDeque<Vec<u8>>,
+        wire: Arc<ModelWire>,
+        /// The frame at which the connection fails for good.
+        fails_at_fsn: Option<u64>,
+    }
+
+    impl QwpWsCoreTransport for ServerModelTransport {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            let Some(answer) = self.answers.pop_front() else {
+                return Ok(TransportPoll::Idle);
+            };
+            match codec::parse_pipelined_response(&answer) {
+                Ok(codec::PipelinedResponse::Ok { sequence }) => {
+                    Ok(TransportPoll::Response(TransportResponse::Ack {
+                        wire_seq: sequence,
+                    }))
+                }
+                _ => panic!("the server model answers with an OK"),
+            }
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            const QWP_FLAGS_OFFSET: usize = 5;
+            const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
+            if self.fails_at_fsn == Some(frame.fsn) {
+                return Err(TransportFailure::Terminal(crate::Error::new(
+                    crate::ErrorCode::SocketError,
+                    "synthetic terminal failure",
+                )));
+            }
+            let defer_commit = frame.payload[QWP_FLAGS_OFFSET] & QWP_FLAG_DEFER_COMMIT != 0;
+            self.wire
+                .sent
+                .lock()
+                .unwrap()
+                .push((frame.sent_frame(), defer_commit));
+            // The model panics at a frame it does not take: that stops the
+            // sender, so the test fails at its next call instead of waiting.
+            let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.connection.receive(frame.payload)
+            }))
+            .map_err(|_| {
+                TransportFailure::Terminal(crate::Error::new(
+                    crate::ErrorCode::SocketError,
+                    format!("the server model refused frame {}", frame.fsn),
+                ))
+            })?;
+            self.answers.extend(answer);
+            Ok(TransportSendResult::NoResponse)
+        }
+    }
+
+    impl Drop for ServerModelTransport {
+        fn drop(&mut self) {
+            self.wire.closed.store(true, Ordering::Release);
+        }
+    }
+
+    /// A runner on a memory queue with its connection to `server`, and the
+    /// encoder of its sender.
+    fn runner_on_model(
+        server: &QwpWsServerModel,
+        queue: SfaMemoryQueueOptions,
+        append_deadline: Duration,
+        fails_at_fsn: Option<u64>,
+    ) -> (
+        SyncQwpWsRunner<SfaFrameQueue>,
+        QwpWsReplayEncoder,
+        Arc<ModelWire>,
+    ) {
+        let wire = Arc::new(ModelWire::default());
+        let transport = ServerModelTransport {
+            connection: server.connect(),
+            answers: VecDeque::new(),
+            wire: Arc::clone(&wire),
+            fails_at_fsn,
+        };
+        let driver =
+            QwpWsCoreTestHarness::from_queue(SfaFrameQueue::open_memory(queue).unwrap(), transport);
+        let runner = SyncQwpWsRunner::start_driver_with_append_deadline(driver, append_deadline);
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        (runner, encoder, wire)
+    }
+
+    fn small_segments(segment_count: u64) -> SfaMemoryQueueOptions {
+        SfaMemoryQueueOptions {
+            segment_size_bytes: SMALL_SEGMENT,
+            max_bytes: (segment_count * SMALL_SEGMENT) as usize,
+        }
+    }
+
+    /// The largest frame a sender with segments of [`SMALL_SEGMENT`] sends.
+    fn small_frame_cap() -> usize {
+        segment_payload_capacity(SMALL_SEGMENT)
+    }
+
+    /// The frames such a sender cuts `buffer` into.
+    fn small_frames_plan(buffer: &Buffer) -> QwpWsFramePlan {
+        buffer
+            .as_qwp_ws()
+            .unwrap()
+            .plan_frames(
+                two_frame_segment_payload_capacity(SMALL_SEGMENT),
+                small_frame_cap(),
+            )
+            .unwrap()
+    }
+
+    /// Flushes `buffer` as the frames of `plan`.
+    fn publish_frames(
+        encoder: &mut QwpWsReplayEncoder,
+        runner: &mut SyncQwpWsRunner<SfaFrameQueue>,
+        buffer: &Buffer,
+        plan: &QwpWsFramePlan,
+    ) -> crate::Result<Option<u64>> {
+        let rows = buffer.as_qwp_ws().unwrap();
+        publish_qwp_ws_frames(encoder, runner, rows, plan, small_frame_cap())
+    }
+
+    /// Flushes `buffer` as one frame, the way every flush goes today.
+    fn publish_as_one_frame(
+        encoder: &mut QwpWsReplayEncoder,
+        runner: &mut SyncQwpWsRunner<SfaFrameQueue>,
+        buffer: &Buffer,
+    ) -> u64 {
+        publish_as_one_frame_within(encoder, runner, buffer, small_frame_cap())
+    }
+
+    fn publish_as_one_frame_within(
+        encoder: &mut QwpWsReplayEncoder,
+        runner: &mut SyncQwpWsRunner<SfaFrameQueue>,
+        buffer: &Buffer,
+        frame_cap: usize,
+    ) -> u64 {
+        let rows = buffer.as_qwp_ws().unwrap();
+        publish_qwp_ws_buffer(encoder, rows, frame_cap, |payload| {
+            runner.publish_replay_payload(payload)
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Waits until the server has confirmed every frame up to `fsn`.
+    fn wait_for_ack(runner: &SyncQwpWsRunner<SfaFrameQueue>, fsn: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner.acked_fsn().unwrap() != Some(fsn) {
+            assert!(Instant::now() < deadline, "frame {fsn} was not confirmed");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// One flush of many frames, between two flushes of one frame each. The
+    /// server must hold the rows of the three, in three commits. Returns the
+    /// bytes that the frames of the three flushes take in the queue.
+    fn assert_a_flush_of_many_frames_is_one_commit(queue: SfaMemoryQueueOptions) -> u64 {
+        let server = QwpWsServerModel::new();
+        let (mut runner, mut encoder, wire) =
+            runner_on_model(&server, queue, Duration::from_secs(5), None);
+        let before = buffer_of(FLUSH_TABLE, 0..3);
+        let buffer = buffer_of(FLUSH_TABLE, 3..403);
+        let after = buffer_of(FLUSH_TABLE, 403..406);
+        let plan = small_frames_plan(&buffer);
+        let frame_count = plan.frames().count() as u64;
+        assert!(frame_count > 8, "{frame_count} frames");
+
+        assert_eq!(publish_as_one_frame(&mut encoder, &mut runner, &before), 0);
+        // Frame 0 is the flush before, so this flush is frames 1 to
+        // `frame_count`.
+        let fsn = publish_frames(&mut encoder, &mut runner, &buffer, &plan).unwrap();
+        assert_eq!(fsn, Some(frame_count));
+        assert_eq!(runner.published_fsn().unwrap(), fsn);
+        assert_eq!(
+            publish_as_one_frame(&mut encoder, &mut runner, &after),
+            frame_count + 1
+        );
+        wait_for_ack(&runner, frame_count + 1);
+
+        let sent = wire.sent.lock().unwrap().clone();
+        assert_eq!(sent.len() as u64, frame_count + 2);
+        for (idx, (frame, defer_commit)) in sent.iter().enumerate() {
+            let idx = idx as u64;
+            assert_eq!((frame.fsn, frame.wire_seq), (idx, idx));
+            assert_eq!(
+                *defer_commit,
+                (1..frame_count).contains(&idx),
+                "frame {idx}: of the flush in frames, every frame but the last has the flag"
+            );
+        }
+        let table = server.table(FLUSH_TABLE).unwrap();
+        assert_eq!(table.commits, 3, "one commit for each flush");
+        let rows: Vec<String> = [&before, &buffer, &after]
+            .into_iter()
+            .flat_map(|flushed| rows_of(FLUSH_TABLE, flushed))
+            .collect();
+        assert_eq!(table.rows_as_text(), rows);
+        // In a segment a frame takes its payload and a header of 8 bytes.
+        sent.iter()
+            .map(|(frame, _)| frame.payload_len as u64 + 8)
+            .sum()
+    }
+
+    #[test]
+    fn a_flush_of_many_frames_is_one_commit() {
+        let segment_size_bytes = 64 * SMALL_SEGMENT;
+        let queued = assert_a_flush_of_many_frames_is_one_commit(SfaMemoryQueueOptions {
+            segment_size_bytes,
+            max_bytes: 2 * segment_size_bytes as usize,
+        });
+        // A segment starts with a header of 24 bytes.
+        assert!(
+            queued + 24 <= segment_size_bytes,
+            "{queued} bytes of frames must fit the first segment"
+        );
+    }
+
+    #[test]
+    fn a_flush_of_many_frames_is_one_commit_when_it_fills_several_segments() {
+        let queued = assert_a_flush_of_many_frames_is_one_commit(small_segments(64));
+        assert!(queued > 4 * SMALL_SEGMENT, "{queued} bytes of frames");
+    }
+
+    #[test]
+    fn a_flush_whose_first_frame_is_refused_leaves_the_sender_usable() {
+        let server = QwpWsServerModel::new();
+        let (mut runner, mut encoder, wire) =
+            runner_on_model(&server, small_segments(64), Duration::from_secs(5), None);
+        let buffer = buffer_of(FLUSH_TABLE, 0..400);
+        let plan = small_frames_plan(&buffer);
+        let rows = buffer.as_qwp_ws().unwrap();
+
+        // No frame of the flush is as small as 64 bytes.
+        let err = publish_qwp_ws_frames(&mut encoder, &mut runner, rows, &plan, 64).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::BatchTooLarge);
+        assert!(
+            err.msg().contains("exceeds the per-frame cap of 64 bytes"),
+            "got: {}",
+            err.msg()
+        );
+        assert!(!runner.lifecycle_is_terminal());
+        assert_eq!(runner.published_fsn().unwrap(), None);
+        assert!(wire.sent.lock().unwrap().is_empty());
+
+        let fsn = publish_frames(&mut encoder, &mut runner, &buffer, &plan)
+            .unwrap()
+            .unwrap();
+        wait_for_ack(&runner, fsn);
+        let table = server.table(FLUSH_TABLE).unwrap();
+        assert_eq!(table.commits, 1);
+        assert_eq!(table.rows_as_text(), rows_of(FLUSH_TABLE, &buffer));
+    }
+
+    #[test]
+    fn a_flush_that_cannot_queue_a_later_frame_stops_the_sender() {
+        let server = QwpWsServerModel::new();
+        // Two segments hold four frames of the flush. The server confirms
+        // none of them before the last frame of the flush, so their segments
+        // are never freed and the fifth frame finds no room.
+        let (mut runner, mut encoder, wire) =
+            runner_on_model(&server, small_segments(2), Duration::from_millis(50), None);
+        let buffer = buffer_of(FLUSH_TABLE, 0..400);
+        let plan = small_frames_plan(&buffer);
+        assert!(plan.frames().count() > 8);
+
+        let err = publish_frames(&mut encoder, &mut runner, &buffer, &plan).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        for part in [
+            "Could not flush buffer: the flush stopped part way: ",
+            "timed out waiting for ACK-driven segment trim",
+            "Nothing of this flush is committed and the buffer still holds its rows.",
+            "This sender cannot be used any more: close it, create a new sender and flush the \
+             buffer again.",
+        ] {
+            assert!(err.msg().contains(part), "no {part:?} in: {}", err.msg());
+        }
+        assert!(!err.in_doubt());
+        assert!(runner.lifecycle_is_terminal());
+        assert_eq!(runner.lock_shared().unwrap().published_fsn(), Some(3));
+
+        // Every later publication is refused with the same error.
+        let refused = publish_frames(&mut encoder, &mut runner, &buffer, &plan).unwrap_err();
+        assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+        let refused = runner.publish_replay_payload(b"more").unwrap_err();
+        assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+
+        // The runner thread ends and drops the connection, and with it the
+        // rows the server held for it: nothing of the flush is committed.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !wire.closed.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the connection stayed open");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(wire.sent.lock().unwrap().iter().all(|(_, defer)| *defer));
+        let committed = server
+            .table(FLUSH_TABLE)
+            .map_or((0, 0), |table| (table.commits, table.row_count()));
+        assert_eq!(committed, (0, 0));
+
+        // What the error tells the user to do: a new sender, the same buffer.
+        drop(runner);
+        let (mut runner, mut encoder, _wire) =
+            runner_on_model(&server, small_segments(64), Duration::from_secs(5), None);
+        let fsn = publish_frames(&mut encoder, &mut runner, &buffer, &plan)
+            .unwrap()
+            .unwrap();
+        wait_for_ack(&runner, fsn);
+        let table = server.table(FLUSH_TABLE).unwrap();
+        assert_eq!(table.commits, 1);
+        assert_eq!(table.rows_as_text(), rows_of(FLUSH_TABLE, &buffer));
+    }
+
+    #[test]
+    fn a_sender_that_turns_terminal_during_a_flush_reports_its_own_error() {
+        let server = QwpWsServerModel::new();
+        // The flush cannot queue its fifth frame, as above, and waits for
+        // room. The connection fails for good at the second frame.
+        let (mut runner, mut encoder, _wire) =
+            runner_on_model(&server, small_segments(2), Duration::from_secs(5), Some(1));
+        let buffer = buffer_of(FLUSH_TABLE, 0..400);
+        let plan = small_frames_plan(&buffer);
+
+        let err = publish_frames(&mut encoder, &mut runner, &buffer, &plan).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(err.msg(), "synthetic terminal failure");
+        assert!(runner.lifecycle_is_terminal());
+        let refused = runner.publish_replay_payload(b"more").unwrap_err();
+        assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+    }
+
+    #[test]
+    fn the_error_of_an_unfinished_flush_keeps_what_its_cause_says() {
+        let server = QwpWsServerModel::new();
+        let (runner, _encoder, _wire) =
+            runner_on_model(&server, small_segments(2), Duration::from_secs(5), None);
+        let cause = crate::Error::new(
+            crate::ErrorCode::AuthError,
+            "WebSocket upgrade authentication failed: HTTP status 401.",
+        )
+        .with_ws_http_status(401);
+
+        let err = stop_after_unfinished_flush(&runner, cause);
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            err.msg(),
+            "Could not flush buffer: the flush stopped part way: WebSocket upgrade \
+             authentication failed: HTTP status 401. Nothing of this flush is committed and \
+             the buffer still holds its rows. This sender cannot be used any more: close it, \
+             create a new sender and flush the buffer again."
+        );
+        assert_eq!(err.ws_http_status(), Some(401));
+        assert!(!err.in_doubt());
+        assert!(runner.lifecycle_is_terminal());
+    }
+
+    /// A server that reads no rows, so that a flush is timed without it. It
+    /// confirms each frame without the defer flag, or none at all.
+    struct SinkTransport {
+        confirms: bool,
+        confirmed: VecDeque<u64>,
+    }
+
+    impl QwpWsCoreTransport for SinkTransport {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(match self.confirmed.pop_front() {
+                Some(wire_seq) => TransportPoll::Response(TransportResponse::Ack { wire_seq }),
+                None => TransportPoll::Idle,
+            })
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            if self.confirms && frame.payload[5] & 0x01 == 0 {
+                self.confirmed.push_back(frame.wire_seq);
+            }
+            Ok(TransportSendResult::NoResponse)
+        }
+    }
+
+    /// Times the `flush` of a large buffer in frames (plan, encode and copy
+    /// into the queue) next to the same rows flushed as buffers of one frame
+    /// each, into a memory queue of the default size. Run with:
+    /// `cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_flush_in_frames_benchmark --lib -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn qwp_ws_flush_in_frames_benchmark() {
+        const SEGMENT: u64 = 4 * 1024 * 1024;
+        const QUEUE: usize = 128 * 1024 * 1024;
+        // The frame limit a server advertises by default.
+        const SERVER_FRAME_LIMIT: usize = 2_097_138;
+        let frame_cap = SERVER_FRAME_LIMIT.min(segment_payload_capacity(SEGMENT));
+        let target = frame_cap.min(two_frame_segment_payload_capacity(SEGMENT));
+        let runner_and_encoder = |confirms: bool| {
+            let queue = SfaFrameQueue::open_memory(SfaMemoryQueueOptions {
+                segment_size_bytes: SEGMENT,
+                max_bytes: QUEUE,
+            })
+            .unwrap();
+            let transport = SinkTransport {
+                confirms,
+                confirmed: VecDeque::new(),
+            };
+            let runner = SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(queue, transport));
+            let mut encoder = QwpWsReplayEncoder::new(1);
+            encoder.set_delta_dict_enabled(true);
+            (runner, encoder)
+        };
+        let ms = |elapsed: Duration| elapsed.as_secs_f64() * 1e3;
+
+        println!(
+            "MiB,frames,single_frames,plan_ms,in_frames_ms,single_frames_ms,single_frames_unconfirmed_ms"
+        );
+        for mib in [10usize, 50, 100] {
+            // The same rows twice: in one buffer, and in buffers of one frame.
+            let mut large = Buffer::new_qwp_ws();
+            let mut small = vec![Buffer::new_qwp_ws()];
+            let mut id = 0i64;
+            while large.len() < mib << 20 {
+                for buffer in [&mut large, small.last_mut().unwrap()] {
+                    buffer.table("flush_bench").unwrap();
+                    for column in ["a", "b", "c", "d", "e", "f"] {
+                        buffer.column_i64(column, id).unwrap();
+                    }
+                    buffer
+                        .at(crate::ingress::TimestampNanos::new(
+                            1_700_000_000_000_000_000 + id,
+                        ))
+                        .unwrap();
+                }
+                id += 1;
+                if small.last().unwrap().len() + 256 > target {
+                    small.push(Buffer::new_qwp_ws());
+                }
+            }
+            small.retain(|buffer| !buffer.is_empty());
+            let rows = large.as_qwp_ws().unwrap();
+
+            for _ in 0..7 {
+                let (mut runner, mut encoder) = runner_and_encoder(true);
+                let started = Instant::now();
+                let plan = rows.plan_frames(target, frame_cap).unwrap();
+                let planned = started.elapsed();
+                let fsn = publish_qwp_ws_frames(&mut encoder, &mut runner, rows, &plan, frame_cap)
+                    .unwrap()
+                    .unwrap();
+                let in_frames = started.elapsed();
+                wait_for_ack(&runner, fsn);
+                drop(runner);
+
+                let mut single_frames = [Duration::ZERO; 2];
+                for (confirms, elapsed) in [true, false].into_iter().zip(&mut single_frames) {
+                    let (mut runner, mut encoder) = runner_and_encoder(confirms);
+                    let started = Instant::now();
+                    let mut fsn = 0;
+                    for buffer in &small {
+                        fsn = publish_as_one_frame_within(
+                            &mut encoder,
+                            &mut runner,
+                            buffer,
+                            frame_cap,
+                        );
+                    }
+                    *elapsed = started.elapsed();
+                    if confirms {
+                        wait_for_ack(&runner, fsn);
+                    }
+                    drop(runner);
+                }
+                println!(
+                    "{mib},{},{},{:.2},{:.1},{:.1},{:.1}",
+                    plan.frames().count(),
+                    small.len(),
+                    ms(planned),
+                    ms(in_frames),
+                    ms(single_frames[0]),
+                    ms(single_frames[1]),
+                );
+            }
+        }
     }
 }

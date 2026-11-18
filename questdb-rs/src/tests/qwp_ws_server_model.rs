@@ -62,7 +62,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::ingress::{Buffer, QwpWsEncodeScratch, SymbolGlobalDict, decode_qwp_varint};
+use crate::ingress::{
+    Buffer, QwpWsEncodeScratch, SymbolGlobalDict, TimestampNanos, decode_qwp_varint,
+};
 use crate::tests::qwp_decode::{DecodedTable, decode_ws_table_block};
 use crate::tests::qwp_ws::{
     read_frame, upgrade_mock_stream_with_max_batch_size, write_server_binary_frame,
@@ -109,6 +111,32 @@ pub(crate) fn frames_of_a_flush(buffer: &Buffer, target: usize) -> Vec<Vec<u8>> 
             frame
         })
         .collect()
+}
+
+/// Rows `ids` of a table without symbols, a few dozen bytes each.
+pub(crate) fn buffer_of(table: &str, ids: std::ops::Range<i64>) -> Buffer {
+    let mut buffer = Buffer::new_qwp_ws();
+    for id in ids {
+        buffer
+            .table(table)
+            .unwrap()
+            .column_i64("id", id)
+            .unwrap()
+            .column_str("txt", format!("row {id}"))
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + id))
+            .unwrap();
+    }
+    buffer
+}
+
+/// The rows a server holds when `buffer` reaches it as a single frame.
+pub(crate) fn rows_of(table: &str, buffer: &Buffer) -> Vec<String> {
+    let server = QwpWsServerModel::new();
+    let frames = frames_of_a_flush(buffer, usize::MAX);
+    assert_eq!(frames.len(), 1);
+    assert!(server.connect().receive(&frames[0]).is_some());
+    server.table(table).unwrap().rows_as_text()
 }
 
 /// What the server holds of one table.
@@ -408,35 +436,8 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::ingress::TimestampNanos;
 
     const TABLE: &str = "model_rows";
-
-    /// Rows `ids` of a table without symbols, a few dozen bytes each.
-    fn buffer_of(table: &str, ids: std::ops::Range<i64>) -> Buffer {
-        let mut buffer = Buffer::new_qwp_ws();
-        for id in ids {
-            buffer
-                .table(table)
-                .unwrap()
-                .column_i64("id", id)
-                .unwrap()
-                .column_str("txt", format!("row {id}"))
-                .unwrap()
-                .at(TimestampNanos::new(1_700_000_000_000_000_000 + id))
-                .unwrap();
-        }
-        buffer
-    }
-
-    /// The rows a server holds when `buffer` reaches it as a single frame.
-    fn rows_of(table: &str, buffer: &Buffer) -> Vec<String> {
-        let server = QwpWsServerModel::new();
-        let frames = frames_of_a_flush(buffer, usize::MAX);
-        assert_eq!(frames.len(), 1);
-        assert!(server.connect().receive(&frames[0]).is_some());
-        server.table(table).unwrap().rows_as_text()
-    }
 
     /// The OK of frame `sequence`, which committed `tables`: each with the
     /// number of its commit.
