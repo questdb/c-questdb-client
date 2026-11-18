@@ -25,12 +25,12 @@
 //! What a server does with the frames of one flush that is larger than a
 //! frame: every frame but the last carries the defer flag. One script sends
 //! such frames over a raw WebSocket and checks the answers and what the
-//! tables hold afterwards. It runs against a real QuestDB server in an
-//! ignored test, and against the server model of the tests
-//! (`qwp_ws_server_model`) in a test that always runs, so the model is held
-//! to what a real server showed.
+//! tables hold afterwards, for a flush of one table and for a flush over
+//! two. It runs against a real QuestDB server in an ignored test, and
+//! against the server model of the tests (`qwp_ws_server_model`) in a test
+//! that always runs, so the model is held to what a real server showed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error as IoError, ErrorKind};
 use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
@@ -40,7 +40,9 @@ use crate::ingress::{
 };
 use crate::tests::qwp_decode::DecodedValue;
 use crate::tests::qwp_ws::read_frame;
-use crate::tests::qwp_ws_server_model::{QwpWsModelServer, frames_of_a_flush};
+use crate::tests::qwp_ws_server_model::{
+    QwpWsModelServer, frame_of_a_whole_buffer, frames_of_a_flush,
+};
 
 use super::TestResult;
 use super::qwp_ws_protocol_probe::{
@@ -58,6 +60,10 @@ const BASE_TS_NANOS: i64 = 1_700_200_000_000_000_000;
 const SERVER_MAX_UNCOMMITTED_ROWS: usize = 1_000_000;
 /// The frame limit the model server advertises: small, for a quick test.
 const MODEL_FRAME_LIMIT: usize = 16 * 1024;
+/// What a row of the script takes in a frame, on average: two numbers and a
+/// timestamp of 8 bytes each, and a text of 150 to 199 bytes behind its
+/// 4-byte offset.
+const ROW_BYTES: usize = 203;
 
 #[test]
 #[ignore = "requires a real QuestDB server and QDB_QWP_WS_DEFER_PROBE=1"]
@@ -100,7 +106,8 @@ fn qwp_ws_server_model_follows_the_defer_rules_of_a_real_server() -> TestResult 
 }
 
 struct ScriptSettings {
-    /// The least size of the buffer that is sent as the large group.
+    /// The least size of the buffer that is sent as the large group. A
+    /// group over two tables holds about as many bytes of rows.
     group_bytes: usize,
     /// How long nothing may arrive for the server to count as silent.
     quiet: Duration,
@@ -113,6 +120,8 @@ fn run_defer_rules_script(server: &Server<'_>, settings: &ScriptSettings) -> Pro
     the_same_frames_without_the_flag_are_a_transaction_each(server, settings)?;
     a_dropped_group_leaves_no_rows(server, settings)?;
     a_frame_of_the_advertised_limit_is_taken(server)?;
+    a_group_over_two_tables_is_one_transaction_of_each(server, settings)?;
+    a_dropped_group_over_two_tables_leaves_no_rows(server, settings)?;
     Ok(())
 }
 
@@ -267,6 +276,225 @@ fn a_frame_of_the_advertised_limit_is_taken(server: &Server<'_>) -> ProbeResult<
     Ok(())
 }
 
+/// A flush over two tables: frames of the first table, one frame that holds
+/// the last rows of the first and the first rows of the second, frames of
+/// the second. No answer before the last frame, which holds rows of the
+/// second table only and commits both: one OK that names each with its
+/// first transaction. Each table then holds exactly its rows, in one
+/// transaction. The next frame of the connection brings rows of one table,
+/// and commits and names that table alone.
+fn a_group_over_two_tables_is_one_transaction_of_each(
+    server: &Server<'_>,
+    settings: &ScriptSettings,
+) -> ProbeResult<()> {
+    let (first, _cleanup_first) = server.new_table("qwp_defer_pair_one");
+    let (second, _cleanup_second) = server.new_table("qwp_defer_pair_two");
+    let mut connection = server.connect()?;
+    let limit = connection.frame_limit;
+    let of_first = rows_from(0, settings.group_bytes * 2 / 5 / ROW_BYTES);
+    let of_second = rows_from(5_000_000, settings.group_bytes * 3 / 5 / ROW_BYTES);
+    let frames = frames_over_tables(&[(&first, &of_first), (&second, &of_second)], limit)?;
+    let last = frames.len() - 1;
+    // One frame holds a block of each table, every other frame one block.
+    let blocks = block_counts(&frames);
+    let shared = blocks.iter().position(|count| *count == 2).unwrap_or(0);
+    let mut expected = vec![1; frames.len()];
+    expected[shared] = 2;
+    assert_eq!(blocks, expected);
+    // The first table has frames of its own, and the second goes on in
+    // frames that hold no block of the first: the last one is such a frame.
+    assert!(shared >= 2 && shared + 2 <= last, "{blocks:?}");
+
+    let started = Instant::now();
+    for frame in &frames[..last] {
+        connection.send(frame)?;
+    }
+    connection.expect_no_answer_yet()?;
+    let deferred_taken = started.elapsed();
+    connection.expect_silence(settings.quiet)?;
+    for table in [&first, &second] {
+        assert_eq!(server.row_count(table)?, 0, "rows before the commit frame");
+    }
+
+    let commit_sent = Instant::now();
+    connection.send(&frames[last])?;
+    assert_eq!(
+        connection.expect_ok()?,
+        OkAnswer::of_tables(last, &[(&first, 1), (&second, 1)])
+    );
+    let committed = commit_sent.elapsed();
+    server.wait_for_rows(&first, of_first.len())?;
+    server.wait_for_rows(&second, of_second.len())?;
+    let visible = commit_sent.elapsed();
+    connection.expect_no_answer(settings.quiet)?;
+
+    assert_eq!(server.digest(&first)?, Some(Digest::of(&of_first)));
+    assert_eq!(server.digest(&second)?, Some(Digest::of(&of_second)));
+    assert_eq!(server.transactions(&first)?, Some(1));
+    assert_eq!(server.transactions(&second)?, Some(1));
+    eprintln!(
+        "two tables: {} and {} rows, {} frames of at most {limit} bytes (largest {}), frame \
+         {shared} with a block of each; the server took the deferred frames in \
+         {deferred_taken:?}, answered the commit frame after {committed:?}, and showed the \
+         rows after {visible:?}",
+        of_first.len(),
+        of_second.len(),
+        frames.len(),
+        frames.iter().map(Vec::len).max().unwrap(),
+    );
+
+    // The next frame of the connection: a few rows of the second table.
+    let more = rows_from(6_000_000, 10);
+    let frames = frames_over_tables(&[(&second, &more)], limit)?;
+    assert_eq!(frames.len(), 1);
+    connection.send(&frames[0])?;
+    assert_eq!(connection.expect_ok()?, OkAnswer::of(last + 1, &second, 2));
+    server.wait_for_rows(&second, of_second.len() + more.len())?;
+    assert_eq!(server.digest(&first)?, Some(Digest::of(&of_first)));
+    assert_eq!(
+        server.digest(&second)?,
+        Some(Digest::of(&[of_second, more].concat()))
+    );
+    assert_eq!(server.transactions(&first)?, Some(1));
+    assert_eq!(server.transactions(&second)?, Some(2));
+    Ok(())
+}
+
+/// A connection that goes away before the commit frame of a group over two
+/// tables leaves no row in either. A group on a new connection commits only
+/// itself; its last frame holds a block of each table.
+fn a_dropped_group_over_two_tables_leaves_no_rows(
+    server: &Server<'_>,
+    settings: &ScriptSettings,
+) -> ProbeResult<()> {
+    let (first, _cleanup_first) = server.new_table("qwp_defer_pair_dropped_one");
+    let (second, _cleanup_second) = server.new_table("qwp_defer_pair_dropped_two");
+    let mut connection = server.connect()?;
+    let limit = connection.frame_limit;
+    let rows = settings.group_bytes / 8 / ROW_BYTES;
+    let frames = frames_over_tables(
+        &[
+            (&first, &rows_from(0, rows)),
+            (&second, &rows_from(5_000_000, rows)),
+        ],
+        limit,
+    )?;
+    // The frames that are sent hold rows of both tables.
+    let sent = &frames[..frames.len() - 1];
+    assert!(block_counts(sent).contains(&2), "{:?}", block_counts(sent));
+    for frame in sent {
+        connection.send(frame)?;
+    }
+    connection.expect_no_answer(settings.quiet)?;
+    connection.drop_without_close();
+    server.wait_for_the_drop(settings.settle);
+    for table in [&first, &second] {
+        assert_eq!(server.row_count(table)?, 0, "rows of a dropped group");
+    }
+    eprintln!(
+        "after a dropped group over two tables: transactions {:?} and {:?}",
+        server.transactions(&first)?,
+        server.transactions(&second)?,
+    );
+
+    // Other rows, so that a row of the dropped group would show. The second
+    // table comes first now, and the few rows of the first end the group.
+    let mut connection = server.connect()?;
+    let of_second = rows_from(6_000_000, 2 * rows);
+    let of_first = rows_from(1_000_000, 10);
+    let frames = frames_over_tables(&[(&second, &of_second), (&first, &of_first)], limit)?;
+    let last = frames.len() - 1;
+    let mut expected = vec![1; frames.len()];
+    expected[last] = 2;
+    assert_eq!(block_counts(&frames), expected);
+    assert!(last >= 2, "{} frames", frames.len());
+    for frame in &frames[..last] {
+        connection.send(frame)?;
+    }
+    connection.expect_no_answer(settings.quiet)?;
+    connection.send(&frames[last])?;
+    // The dropped group took no transaction of either table.
+    assert_eq!(
+        connection.expect_ok()?,
+        OkAnswer::of_tables(last, &[(&first, 1), (&second, 1)])
+    );
+
+    server.wait_for_rows(&first, of_first.len())?;
+    server.wait_for_rows(&second, of_second.len())?;
+    // Now, and again after a while: the rows of the dropped group do not
+    // come later.
+    for settle in [Duration::ZERO, settings.settle] {
+        std::thread::sleep(settle);
+        assert_eq!(server.digest(&first)?, Some(Digest::of(&of_first)));
+        assert_eq!(server.digest(&second)?, Some(Digest::of(&of_second)));
+        assert_eq!(server.transactions(&first)?, Some(1));
+        assert_eq!(server.transactions(&second)?, Some(1));
+    }
+    Ok(())
+}
+
+/// `count` rows of the script from `first_id` on: per row its id and the
+/// length of its text.
+fn rows_from(first_id: i64, count: usize) -> Vec<(i64, usize)> {
+    (first_id..first_id + count as i64)
+        .map(|id| (id, text_len_of(id)))
+        .collect()
+}
+
+fn text_len_of(id: i64) -> usize {
+    150 + (id % 50) as usize
+}
+
+/// The frames of one flush of `tables`: the tables one after the other, a
+/// frame filled before the next begins. So a table goes on in the next
+/// frame, and a frame can hold the last rows of one table and the first
+/// rows of the next. Every frame but the last has the defer flag. Each
+/// frame is what a flush makes of a buffer that holds the rows of that
+/// frame alone.
+fn frames_over_tables(
+    tables: &[(&str, &[(i64, usize)])],
+    limit: usize,
+) -> ProbeResult<Vec<Vec<u8>>> {
+    // More than a row takes together with the header of its table block.
+    const ROOM_FOR_A_ROW: usize = 512;
+    let mut frames = Vec::new();
+    let mut buffer = Buffer::new_qwp_ws();
+    for (table, rows) in tables {
+        for (id, text_len) in *rows {
+            if buffer.len() + ROOM_FOR_A_ROW > limit {
+                frames.push(frame_of_a_whole_buffer(&buffer, true));
+                buffer = Buffer::new_qwp_ws();
+            }
+            push_row(&mut buffer, table, *id, *text_len)?;
+        }
+    }
+    frames.push(frame_of_a_whole_buffer(&buffer, false));
+    assert!(frames.iter().all(|frame| frame.len() <= limit));
+    Ok(frames)
+}
+
+/// Per frame, how many table blocks its header counts.
+fn block_counts(frames: &[Vec<u8>]) -> Vec<usize> {
+    frames
+        .iter()
+        .map(|frame| usize::from(u16::from_le_bytes([frame[6], frame[7]])))
+        .collect()
+}
+
+/// One row: two numbers, a text, and its own timestamp. No symbols.
+fn push_row(buffer: &mut Buffer, table: &str, id: i64, text_len: usize) -> ProbeResult<()> {
+    let text = char::from(b'a' + (id % 26) as u8)
+        .to_string()
+        .repeat(text_len);
+    buffer
+        .table(table)?
+        .column_i64("id", id)?
+        .column_i64("mix", mix_of(id))?
+        .column_str("txt", text)?
+        .at(TimestampNanos::new(BASE_TS_NANOS + id * 1_000))?;
+    Ok(())
+}
+
 /// The rows of one flush: a buffer, and what its rows are.
 pub(super) struct Group {
     pub(super) buffer: Buffer,
@@ -283,7 +511,7 @@ impl Group {
         };
         let mut id = first_id;
         while group.buffer.len() < bytes {
-            group.push(table, id, 150 + (id % 50) as usize)?;
+            group.push(table, id, text_len_of(id))?;
             id += 1;
         }
         assert!(
@@ -302,17 +530,8 @@ impl Group {
         Ok(group)
     }
 
-    /// One row: two numbers, a text, and its own timestamp. No symbols.
     fn push(&mut self, table: &str, id: i64, text_len: usize) -> ProbeResult<()> {
-        let text = char::from(b'a' + (id % 26) as u8)
-            .to_string()
-            .repeat(text_len);
-        self.buffer
-            .table(table)?
-            .column_i64("id", id)?
-            .column_i64("mix", mix_of(id))?
-            .column_str("txt", text)?
-            .at(TimestampNanos::new(BASE_TS_NANOS + id * 1_000))?;
+        push_row(&mut self.buffer, table, id, text_len)?;
         self.rows.push((id, text_len));
         Ok(())
     }
@@ -326,15 +545,7 @@ impl Group {
 
     /// What a table holds when it holds exactly these rows.
     pub(super) fn digest(&self) -> Digest {
-        Digest {
-            rows: self.rows.len() as i64,
-            ids: self.rows.len() as i64,
-            min_id: self.rows.first().unwrap().0,
-            max_id: self.rows.last().unwrap().0,
-            mix_sum: self.rows.iter().map(|(id, _)| mix_of(*id)).sum(),
-            text_bytes: self.rows.iter().map(|(_, len)| *len as i64).sum(),
-            timestamps: self.rows.len() as i64,
-        }
+        Digest::of(&self.rows)
     }
 }
 
@@ -356,6 +567,22 @@ pub(super) struct Digest {
     text_bytes: i64,
     /// Distinct timestamps.
     timestamps: i64,
+}
+
+impl Digest {
+    /// What a table holds when it holds exactly `rows`: per row its id and
+    /// the length of its text, the ids rising.
+    fn of(rows: &[(i64, usize)]) -> Self {
+        Self {
+            rows: rows.len() as i64,
+            ids: rows.len() as i64,
+            min_id: rows.first().unwrap().0,
+            max_id: rows.last().unwrap().0,
+            mix_sum: rows.iter().map(|(id, _)| mix_of(*id)).sum(),
+            text_bytes: rows.iter().map(|(_, len)| *len as i64).sum(),
+            timestamps: rows.len() as i64,
+        }
+    }
 }
 
 pub(super) enum Server<'a> {
@@ -535,17 +762,28 @@ struct Connection {
 #[derive(Debug, PartialEq, Eq)]
 struct OkAnswer {
     sequence: u64,
-    /// The tables the answer names, each with its transaction number.
-    tables: Vec<(String, i64)>,
+    /// The tables the answer names, each with its transaction number. The
+    /// order of the names in the answer is not kept: the client reads each
+    /// entry by itself.
+    tables: BTreeMap<String, i64>,
 }
 
 impl OkAnswer {
     /// The OK of frame `sequence`, which committed `table` as its
     /// transaction `transaction`.
     fn of(sequence: usize, table: &str, transaction: i64) -> Self {
+        Self::of_tables(sequence, &[(table, transaction)])
+    }
+
+    /// The OK of frame `sequence`, which committed each of `tables` as the
+    /// transaction given with it.
+    fn of_tables(sequence: usize, tables: &[(&str, i64)]) -> Self {
         Self {
             sequence: sequence as u64,
-            tables: vec![(table.to_string(), transaction)],
+            tables: tables
+                .iter()
+                .map(|(table, transaction)| (table.to_string(), *transaction))
+                .collect(),
         }
     }
 }
@@ -635,17 +873,18 @@ impl Connection {
         }
         let sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
         let table_count = u16::from_le_bytes([payload[9], payload[10]]);
-        let mut tables = Vec::new();
+        let mut tables = BTreeMap::new();
         let mut pos = 11;
         for _ in 0..table_count {
             let name_len = usize::from(u16::from_le_bytes([payload[pos], payload[pos + 1]]));
             let name = String::from_utf8(payload[pos + 2..pos + 2 + name_len].to_vec())?;
             pos += 2 + name_len;
-            tables.push((
-                name,
-                i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap()),
-            ));
+            let transaction = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
             pos += 8;
+            assert!(
+                tables.insert(name, transaction).is_none(),
+                "the OK names a table twice"
+            );
         }
         assert_eq!(pos, payload.len(), "bytes after the OK");
         Ok(OkAnswer { sequence, tables })

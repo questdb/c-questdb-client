@@ -255,6 +255,26 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
     }
 
     let mut decoder = Decoder::new(payload);
+    let table = decode_table_block(&mut decoder)?;
+    if decoder.pos != payload.len() {
+        return Err(format!(
+            "unexpected trailing payload bytes: {}",
+            payload.len() - decoder.pos
+        ));
+    }
+
+    Ok(DecodedDatagram {
+        version,
+        flags,
+        table_count,
+        payload_len,
+        table,
+    })
+}
+
+/// Decodes the table block that starts where `decoder` stands, and leaves
+/// `decoder` behind the block.
+fn decode_table_block(decoder: &mut Decoder<'_>) -> Result<DecodedTable, String> {
     let table_name = decoder.read_string()?;
     let row_count = decoder.read_varint()?;
     let column_count = decoder.read_varint()? as usize;
@@ -781,24 +801,11 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
         }
     }
 
-    if decoder.pos != payload.len() {
-        return Err(format!(
-            "unexpected trailing payload bytes: {}",
-            payload.len() - decoder.pos
-        ));
-    }
-
-    Ok(DecodedDatagram {
-        version,
-        flags,
-        table_count,
-        payload_len,
-        table: DecodedTable {
-            name: table_name,
-            row_count,
-            columns,
-            rows,
-        },
+    Ok(DecodedTable {
+        name: table_name,
+        row_count,
+        columns,
+        rows,
     })
 }
 
@@ -815,4 +822,24 @@ pub(crate) fn decode_ws_table_block(block: &[u8]) -> DecodedTable {
     datagram.extend_from_slice(&(block.len() as u32).to_le_bytes());
     datagram.extend_from_slice(block);
     decode_datagram(&datagram).unwrap().table
+}
+
+/// Decodes the table blocks of a QWP/WebSocket frame: `count` blocks back to
+/// back, and nothing behind them. As for [`decode_ws_table_block`], no block
+/// may hold a symbol column.
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) fn decode_ws_table_blocks(blocks: &[u8], count: usize) -> Vec<DecodedTable> {
+    let mut decoder = Decoder::new(blocks);
+    let tables = (0..count)
+        .map(|block| {
+            decode_table_block(&mut decoder)
+                .unwrap_or_else(|err| panic!("table block {block} of {count}: {err}"))
+        })
+        .collect();
+    assert_eq!(
+        decoder.pos,
+        blocks.len(),
+        "bytes behind the last of {count} table blocks"
+    );
+    tables
 }

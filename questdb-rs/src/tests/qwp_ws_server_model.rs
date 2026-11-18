@@ -31,32 +31,34 @@
 //!
 //! - A frame with the defer flag gets no answer. Its rows are held for the
 //!   connection, uncommitted.
+//! - A frame holds one table block, or several, each of another table.
 //! - A frame without the flag commits what the connection holds, the frame's
-//!   own rows included, as one commit per table. Its answer is one OK with
-//!   the frame's sequence, which names each table it committed with the
-//!   number of that table's commit. Sequences count the frames of a
-//!   connection from zero, commits those of a table from one.
-//! - A connection that goes away loses the rows it holds.
+//!   own rows included, as one commit per table. It commits a table it
+//!   brings no rows for too. Its answer is one OK with the frame's sequence,
+//!   which names each table it committed with the number of that table's
+//!   commit, and no other table. Sequences count the frames of a connection
+//!   from zero, commits those of a table from one.
+//! - A connection that goes away loses the rows it holds, of every table.
 //! - A table exists from the first frame that names it, committed or not.
-//!
-//! The script sends one table per connection. That a frame without the flag
-//! commits every table the connection holds rows for is read from the
-//! server's code, not yet seen on a real server.
 //!
 //! What the model cannot do it refuses with a panic, so that no test passes
 //! on behaviour the model made up: a frame that is not a QWP message, a flag
-//! it does not know, symbols, several table blocks in one frame, a frame
-//! above the frame limit, and the commit a server forces on a table that
-//! holds 1,000,000 uncommitted rows (`qwp.max.uncommitted.rows`).
+//! it does not know, symbols, a frame without a table block, two blocks of
+//! one table in a frame (which no flush sends), a frame above the frame
+//! limit, and the commit a server forces on a table that holds 1,000,000
+//! uncommitted rows (`qwp.max.uncommitted.rows`).
 //!
-//! Two things a server does are neither modelled nor refused. A server
+//! Three things a server does are neither modelled nor refused. A server
 //! rejects a frame whose column types disagree with the table; the model
-//! takes any columns. And a server may commit frames without the flag
-//! together, as one transaction, when they arrive in one read; the model
-//! commits each on its own. So a test may count on one commit for a group,
-//! never on one commit per frame without the flag.
+//! takes any columns. A server may commit frames without the flag together,
+//! as one transaction, when they arrive in one read; the model commits each
+//! on its own. So a test may count on one commit for a group, never on one
+//! commit per frame without the flag. And a server names the tables of an
+//! OK in the order the connection first named them, the model in the order
+//! of their names; the script does not look at the order, and the client
+//! reads each entry by itself.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -65,7 +67,7 @@ use std::thread;
 use crate::ingress::{
     Buffer, QwpWsEncodeScratch, SymbolGlobalDict, TimestampNanos, decode_qwp_varint,
 };
-use crate::tests::qwp_decode::{DecodedTable, decode_ws_table_block};
+use crate::tests::qwp_decode::{DecodedTable, decode_ws_table_blocks};
 use crate::tests::qwp_ws::{
     read_frame, upgrade_mock_stream_with_max_batch_size, write_server_binary_frame,
     write_server_frame,
@@ -113,9 +115,35 @@ pub(crate) fn frames_of_a_flush(buffer: &Buffer, target: usize) -> Vec<Vec<u8>> 
         .collect()
 }
 
+/// One frame that holds every table of `buffer` whole, a block each, as a
+/// flush of a buffer within the frame cap sends it. The connection has no
+/// symbols.
+pub(crate) fn frame_of_a_whole_buffer(buffer: &Buffer, defer_commit: bool) -> Vec<u8> {
+    let mut frame = Vec::new();
+    buffer
+        .as_qwp_ws()
+        .expect("a QWP/WebSocket buffer")
+        .encode_ws_replay_message_with_defer(
+            &mut frame,
+            &mut QwpWsEncodeScratch::new(),
+            &mut SymbolGlobalDict::new(),
+            QWP_VERSION,
+            defer_commit,
+            true,
+        )
+        .unwrap();
+    frame
+}
+
 /// Rows `ids` of a table without symbols, a few dozen bytes each.
 pub(crate) fn buffer_of(table: &str, ids: std::ops::Range<i64>) -> Buffer {
     let mut buffer = Buffer::new_qwp_ws();
+    add_rows(&mut buffer, table, ids);
+    buffer
+}
+
+/// Adds the rows [`buffer_of`] makes to a buffer, which may hold other tables.
+pub(crate) fn add_rows(buffer: &mut Buffer, table: &str, ids: std::ops::Range<i64>) {
     for id in ids {
         buffer
             .table(table)
@@ -127,7 +155,6 @@ pub(crate) fn buffer_of(table: &str, ids: std::ops::Range<i64>) -> Buffer {
             .at(TimestampNanos::new(1_700_000_000_000_000_000 + id))
             .unwrap();
     }
-    buffer
 }
 
 /// The rows a server holds when `buffer` reaches it as a single frame.
@@ -223,10 +250,10 @@ impl QwpWsModelConnection {
             "frame {sequence}: the server model reads frames with the delta dictionary flag, \
              with or without the defer flag"
         );
-        assert_eq!(
-            u16::from_le_bytes([message[6], message[7]]),
-            1,
-            "frame {sequence}: the server model reads frames of one table block"
+        let block_count = usize::from(u16::from_le_bytes([message[6], message[7]]));
+        assert!(
+            block_count > 0,
+            "frame {sequence}: the server model reads frames that hold a table block"
         );
         let (dict_start, pos) = decode_qwp_varint(message, QWP_HEADER_SIZE).unwrap();
         let (dict_count, pos) = decode_qwp_varint(message, pos).unwrap();
@@ -236,19 +263,28 @@ impl QwpWsModelConnection {
             "frame {sequence}: the server model holds no symbols"
         );
 
-        let block = decode_ws_table_block(&message[pos..]);
-        let name = block.name.clone();
-        let held = self.held.entry(name.clone()).or_default();
-        held.push(block);
-        let held_rows: usize = held.iter().map(|block| block.rows.len()).sum();
-        assert!(
-            held_rows < MAX_UNCOMMITTED_ROWS,
-            "frame {sequence}: a server commits a table by itself once it holds \
-             {MAX_UNCOMMITTED_ROWS} uncommitted rows, which the server model does not do"
-        );
+        let mut names = BTreeSet::new();
+        for block in decode_ws_table_blocks(&message[pos..], block_count) {
+            assert!(
+                names.insert(block.name.clone()),
+                "frame {sequence}: two blocks of table {}, which no flush sends: the server \
+                 model reads one block of a table in a frame",
+                block.name
+            );
+            let held = self.held.entry(block.name.clone()).or_default();
+            held.push(block);
+            let held_rows: usize = held.iter().map(|block| block.rows.len()).sum();
+            assert!(
+                held_rows < MAX_UNCOMMITTED_ROWS,
+                "frame {sequence}: a server commits a table by itself once it holds \
+                 {MAX_UNCOMMITTED_ROWS} uncommitted rows, which the server model does not do"
+            );
+        }
 
         let mut tables = self.server.tables.lock().unwrap();
-        tables.entry(name).or_default();
+        for name in names {
+            tables.entry(name).or_default();
+        }
         if defer_commit {
             return None;
         }
@@ -610,6 +646,79 @@ mod tests {
         assert_eq!(table.rows_as_text(), rows_of("model_two", &two));
     }
 
+    /// A buffer with the rows [`buffer_of`] makes for each of `tables`, in
+    /// the order given.
+    fn buffer_of_tables(tables: &[(&str, std::ops::Range<i64>)]) -> Buffer {
+        let mut buffer = Buffer::new_qwp_ws();
+        for (table, ids) in tables {
+            add_rows(&mut buffer, table, ids.clone());
+        }
+        buffer
+    }
+
+    #[test]
+    fn server_model_takes_each_block_of_a_frame_for_its_own_table() {
+        // The frames of a flush over two tables: rows of one table, the
+        // rest of them with the first rows of the other, the rest of the
+        // other.
+        let frames = [
+            frame_of_a_whole_buffer(&buffer_of("model_one", 0..5), true),
+            frame_of_a_whole_buffer(
+                &buffer_of_tables(&[("model_one", 5..9), ("model_two", 100..103)]),
+                true,
+            ),
+            frame_of_a_whole_buffer(&buffer_of("model_two", 103..110), false),
+        ];
+        assert_eq!([frames[0][6], frames[1][6], frames[2][6]], [1, 2, 1]);
+
+        let server = QwpWsServerModel::new();
+        let mut connection = server.connect();
+        assert_eq!(connection.receive(&frames[0]), None);
+        assert!(server.table("model_two").is_none());
+        assert_eq!(connection.receive(&frames[1]), None);
+        for name in ["model_one", "model_two"] {
+            let table = server.table(name).unwrap();
+            assert_eq!((table.commits, table.row_count()), (0, 0));
+        }
+        // The last frame holds no block of the first table, and commits it.
+        assert_eq!(
+            connection.receive(&frames[2]),
+            ok(2, &[("model_one", 1), ("model_two", 1)])
+        );
+        let rows_of_ids = |table: &str, ids| rows_of(table, &buffer_of(table, ids));
+        let one = server.table("model_one").unwrap();
+        assert_eq!(one.commits, 1);
+        assert_eq!(one.rows_as_text(), rows_of_ids("model_one", 0..9));
+        let two = server.table("model_two").unwrap();
+        assert_eq!(two.commits, 1);
+        assert_eq!(two.rows_as_text(), rows_of_ids("model_two", 100..110));
+
+        // The next frame commits, and names, only the table it brings rows
+        // for.
+        let frame = frame_of_a_whole_buffer(&buffer_of("model_two", 110..112), false);
+        assert_eq!(connection.receive(&frame), ok(3, &[("model_two", 2)]));
+        assert_eq!(server.table("model_one").unwrap().commits, 1);
+        assert_eq!(server.table("model_two").unwrap().commits, 2);
+
+        // A frame may list its tables in any order.
+        let frame = frame_of_a_whole_buffer(
+            &buffer_of_tables(&[("model_two", 112..113), ("model_one", 9..12)]),
+            false,
+        );
+        assert_eq!(
+            connection.receive(&frame),
+            ok(4, &[("model_one", 2), ("model_two", 3)])
+        );
+        assert_eq!(
+            server.table("model_one").unwrap().rows_as_text(),
+            rows_of_ids("model_one", 0..12)
+        );
+        assert_eq!(
+            server.table("model_two").unwrap().rows_as_text(),
+            rows_of_ids("model_two", 100..113)
+        );
+    }
+
     fn one_frame() -> Vec<u8> {
         frames_of_a_flush(&buffer_of(TABLE, 0..3), usize::MAX).remove(0)
     }
@@ -661,10 +770,45 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "frames of one table block")]
-    fn server_model_refuses_a_frame_of_two_table_blocks() {
+    #[should_panic(expected = "frames that hold a table block")]
+    fn server_model_refuses_a_frame_without_a_table_block() {
+        // The header and an empty dictionary section.
+        let mut frame = one_frame();
+        frame.truncate(QWP_HEADER_SIZE + 2);
+        frame[6] = 0;
+        frame[8..12].copy_from_slice(&2u32.to_le_bytes());
+        QwpWsServerModel::new().connect().receive(&frame);
+    }
+
+    #[test]
+    #[should_panic(expected = "table block 1 of 2: unexpected end")]
+    fn server_model_refuses_a_frame_that_states_a_block_more_than_it_holds() {
         let mut frame = one_frame();
         frame[6] = 2;
+        QwpWsServerModel::new().connect().receive(&frame);
+    }
+
+    #[test]
+    #[should_panic(expected = "bytes behind the last of 1 table blocks")]
+    fn server_model_refuses_a_frame_that_holds_a_block_more_than_it_states() {
+        let two_tables = buffer_of_tables(&[(TABLE, 0..3), ("model_other", 0..3)]);
+        let mut frame = frame_of_a_whole_buffer(&two_tables, false);
+        assert_eq!(frame[6], 2);
+        frame[6] = 1;
+        QwpWsServerModel::new().connect().receive(&frame);
+    }
+
+    #[test]
+    #[should_panic(expected = "two blocks of table model_rows")]
+    fn server_model_refuses_two_blocks_of_one_table_in_a_frame() {
+        // No flush makes such a frame: the block of a second frame is put
+        // behind the block of the first.
+        let mut frame = one_frame();
+        let second = frames_of_a_flush(&buffer_of(TABLE, 3..5), usize::MAX).remove(0);
+        frame.extend_from_slice(&second[QWP_HEADER_SIZE + 2..]);
+        frame[6] = 2;
+        let payload_len = (frame.len() - QWP_HEADER_SIZE) as u32;
+        frame[8..12].copy_from_slice(&payload_len.to_le_bytes());
         QwpWsServerModel::new().connect().receive(&frame);
     }
 
@@ -687,7 +831,8 @@ mod tests {
     }
 
     /// One row short of the server's row limit is held; the row that reaches
-    /// it is refused, because a server would commit there.
+    /// it is refused, because a server would commit there. The limit holds
+    /// for each table by itself, wherever in a frame its block is.
     #[test]
     fn server_model_refuses_to_hold_as_many_rows_as_a_server_commits_by_itself() {
         let mut buffer = Buffer::new_qwp_ws();
@@ -702,12 +847,16 @@ mod tests {
         }
         let mut most = frames_of_a_flush(&buffer, usize::MAX).remove(0);
         most[QWP_FLAGS_OFFSET] |= QWP_FLAG_DEFER_COMMIT;
-        let mut one_more = frames_of_a_flush(&buffer_of(TABLE, 0..1), usize::MAX).remove(0);
-        one_more[QWP_FLAGS_OFFSET] |= QWP_FLAG_DEFER_COMMIT;
+        let other = frame_of_a_whole_buffer(&buffer_of("model_other", 0..1), true);
+        let one_more = frame_of_a_whole_buffer(
+            &buffer_of_tables(&[("model_other", 1..2), (TABLE, 0..1)]),
+            true,
+        );
 
         let server = QwpWsServerModel::new();
         let mut connection = server.connect();
         assert_eq!(connection.receive(&most), None);
+        assert_eq!(connection.receive(&other), None);
         let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             connection.receive(&one_more)
         }))
