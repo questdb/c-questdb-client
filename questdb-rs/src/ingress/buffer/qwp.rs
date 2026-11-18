@@ -2450,6 +2450,10 @@ struct QwpWsColumnBuffer {
     non_null_count: u32,
     symbol_cells_encoded_len: usize,
     symbol_dict_encoded_len: usize,
+    /// The widest length prefix of a symbol that the column has held since
+    /// it was last cleared, in bytes: 1 while every symbol was shorter than
+    /// 128 bytes. A rollback does not narrow it.
+    symbol_len_prefix_max: u8,
     values: QwpWsColumnValues,
 }
 
@@ -2688,7 +2692,18 @@ struct QwpWsSliceCell {
 struct QwpWsSymbolCell {
     row_idx: u32,
     local_id: u32,
-    is_new: bool,
+    /// How many symbols the column's dictionary held before this cell: its
+    /// `local_id` when the cell brought its symbol, and more when the
+    /// symbol was there.
+    symbols_before: u32,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsSymbolCell {
+    /// Whether the cell brought its symbol into the column's dictionary.
+    fn is_new(&self) -> bool {
+        self.local_id == self.symbols_before
+    }
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2723,6 +2738,37 @@ struct QwpWsDecimalCell {
 fn slice_cells_data_len(cells: &[QwpWsSliceCell]) -> usize {
     match (cells.first(), cells.last()) {
         (Some(first), Some(last)) => (last.offset + last.len - first.offset) as usize,
+        _ => 0,
+    }
+}
+
+/// An upper bound of what the symbols that the cells `cell_range` of a symbol
+/// column bring take in the dictionary section of their frame. Each is
+/// counted as new to the connection, and its length prefix as `len_prefix`
+/// bytes, the widest of the column. So the bound is exact when the connection
+/// knows none of them and the column has held no symbol of 128 bytes or more
+/// since it was cleared.
+///
+/// A cell knows how many symbols the column held before it, so the symbols of
+/// the cells are one run of the dictionary, and their bytes one span of its
+/// data.
+#[cfg(feature = "_sender-qwp-ws")]
+fn symbols_brought_bound(
+    cells: &[QwpWsSymbolCell],
+    dict: &[QwpWsSymbolEntry],
+    cell_range: &Range<usize>,
+    len_prefix: usize,
+) -> usize {
+    let symbols_before = |cell: usize| {
+        cells
+            .get(cell)
+            .map_or(dict.len(), |cell| cell.symbols_before as usize)
+    };
+    let brought = &dict[symbols_before(cell_range.start)..symbols_before(cell_range.end)];
+    match (brought.first(), brought.last()) {
+        (Some(first), Some(last)) => {
+            brought.len() * len_prefix + (last.offset + last.len - first.offset) as usize
+        }
         _ => 0,
     }
 }
@@ -4014,10 +4060,10 @@ impl QwpWsColumnarBuffer {
     /// `cap` bytes. Frame sizes are taken from the size bound of their
     /// blocks, so an encoded frame is never larger.
     ///
-    /// `None` when the buffer cannot be cut: a table with rows has a column
-    /// kind without a size bound or a decimal value that the encoder
-    /// refuses, the frame of a row would exceed `cap`, or the buffer holds
-    /// no rows at all.
+    /// `None` when the buffer cannot be cut: a table with rows has a symbol
+    /// column, which a frame of a plan does not bring yet, or a decimal
+    /// value that the encoder refuses, the frame of a row would exceed
+    /// `cap`, or the buffer holds no rows at all.
     pub(crate) fn plan_frames(&self, target: usize, cap: usize) -> Option<QwpWsFramePlan> {
         debug_assert!(target <= cap);
         // A frame without new symbols: the header, the dictionary start and
@@ -4034,6 +4080,10 @@ impl QwpWsColumnarBuffer {
             // The frames of a plan are published one by one. A value that
             // the encoder refuses must be found before the first of them.
             if !table.decimals_can_be_encoded() {
+                return None;
+            }
+            // A frame of a plan brings no symbols yet.
+            if table.row_count > 0 && table.has_symbol_column() {
                 return None;
             }
             let mut lo = 0;
@@ -4245,10 +4295,12 @@ impl QwpWsTableBuffer {
         Ok(())
     }
 
-    /// An upper bound of the size of the block `encode_rows` writes for
-    /// `rows`, without encoding it. It is the exact size, but for a decimal
-    /// column that holds a null: see [`QwpWsColumnBuffer::encoded_rows_bound`].
-    /// `None` when the table has a symbol column, which is not sized yet.
+    /// An upper bound of what `rows` add to a frame, without encoding them:
+    /// the block `encode_rows` writes and, outside the block, the symbols
+    /// that the rows bring. It is the exact size of the block, but for a
+    /// symbol column and for a decimal column that holds a null: see
+    /// [`QwpWsColumnBuffer::encoded_rows_bound`]. Every column kind has a
+    /// bound, so this is never `None`.
     fn encoded_rows_bound(&self, rows: Range<u32>) -> Option<usize> {
         let mut bound = qwp_string_byte_len(self.table_name.len())
             + qwp_varint_size(rows.len() as u64)
@@ -4260,6 +4312,13 @@ impl QwpWsTableBuffer {
         Some(bound)
     }
 
+    /// Whether the table has a symbol column.
+    fn has_symbol_column(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|column| matches!(column.values, QwpWsColumnValues::Symbol { .. }))
+    }
+
     /// Whether the encoder takes every decimal value of the table.
     fn decimals_can_be_encoded(&self) -> bool {
         self.columns
@@ -4269,7 +4328,7 @@ impl QwpWsTableBuffer {
 
     /// The largest `hi` for which the size bound of rows `[lo, hi)` is at
     /// most `max_len`, with that bound, or `lo` when not even one row fits.
-    /// `None` when the table has a column kind without a size bound.
+    /// `None` when [`Self::encoded_rows_bound`] is.
     ///
     /// `like_rows` is the row count of a block of similar rows, when the
     /// caller has one: the search starts from a block of that many rows.
@@ -4419,6 +4478,7 @@ impl QwpWsColumnBuffer {
             non_null_count: 0,
             symbol_cells_encoded_len: 0,
             symbol_dict_encoded_len: 0,
+            symbol_len_prefix_max: 0,
             values: QwpWsColumnValues::new(kind),
         }
     }
@@ -4482,6 +4542,7 @@ impl QwpWsColumnBuffer {
         self.non_null_count = 0;
         self.symbol_cells_encoded_len = 0;
         self.symbol_dict_encoded_len = 0;
+        self.symbol_len_prefix_max = 0;
         self.values.clear_rows();
     }
 
@@ -4493,7 +4554,7 @@ impl QwpWsColumnBuffer {
         if let QwpWsColumnValues::Symbol { cells, dict, .. } = &self.values {
             for cell in cells.iter().rev().take_while(|cell| cell.row_idx >= from) {
                 self.symbol_cells_encoded_len -= QWP_WS_SYMBOL_ID_MAX_LEN;
-                if cell.is_new {
+                if cell.is_new() {
                     let entry = &dict[cell.local_id as usize];
                     self.symbol_dict_encoded_len -= qwp_string_byte_len(entry.len as usize);
                 }
@@ -4702,12 +4763,16 @@ impl QwpWsColumnBuffer {
         cells.push(QwpWsSymbolCell {
             row_idx,
             local_id,
-            is_new,
+            // The id of a new symbol is the number of symbols before it. An
+            // id fits `u32`, so the length of the dictionary does.
+            symbols_before: if is_new { local_id } else { dict.len() as u32 },
         });
         self.increment_non_null()?;
         self.symbol_cells_encoded_len += QWP_WS_SYMBOL_ID_MAX_LEN;
         if is_new {
-            self.symbol_dict_encoded_len += qwp_string_byte_len(bytes.len());
+            let len_prefix = qwp_varint_size(bytes.len() as u64);
+            self.symbol_dict_encoded_len += len_prefix + bytes.len();
+            self.symbol_len_prefix_max = self.symbol_len_prefix_max.max(len_prefix as u8);
         }
         Ok(())
     }
@@ -5018,14 +5083,15 @@ impl QwpWsColumnBuffer {
         }
     }
 
-    /// An upper bound of what `encode` writes for `rows`: the flag byte, the
-    /// null bitmap and the values. `None` for a symbol column, which is not
-    /// sized yet.
+    /// An upper bound of what `rows` of the column add to a frame: what
+    /// `encode` writes for them, which is the flag byte, the null bitmap and
+    /// the values, and for a symbol column also the symbols that the rows
+    /// bring ([`symbols_brought_bound`]).
     ///
-    /// It is the exact size, but for a decimal column that holds a null.
-    /// Telling how many cells of a range are nulls would walk them, so such
-    /// a column counts each cell of the range as a value, and the bitmap
-    /// that a null brings for every range.
+    /// It is the exact size, but for a symbol column and for a decimal
+    /// column that holds a null. Telling how many cells of a range are
+    /// nulls would walk them, so such a column counts each cell of the
+    /// range as a value, and the bitmap that a null brings for every range.
     fn encoded_rows_bound(&self, rows: &Range<u32>) -> Option<usize> {
         let row_count = rows.len();
         // A kind without a null bitmap writes every row, with a zero where
@@ -5036,7 +5102,11 @@ impl QwpWsColumnBuffer {
         } else {
             0..0
         };
-        let data_bound = self.values.rows_data_bound(row_count, &cell_range)?;
+        let data_bound = self.values.rows_data_bound(
+            row_count,
+            &cell_range,
+            usize::from(self.symbol_len_prefix_max),
+        )?;
         let bitmap =
             if self.holds_null_cell() || self.rows_use_null_bitmap(row_count, cell_range.len()) {
                 bitmap_bytes(row_count)
@@ -5297,7 +5367,7 @@ impl QwpWsColumnValues {
                 data,
             } => {
                 let cell = cells.pop_if(|cell| cell.row_idx >= from)?;
-                if cell.is_new
+                if cell.is_new()
                     && let Some(entry) = dict.pop()
                 {
                     debug_assert_eq!(cell.local_id as usize, dict.len());
@@ -5464,8 +5534,17 @@ impl QwpWsColumnValues {
     /// `row_count` rows whose cells are `cell_range`, with the arithmetic of
     /// `estimated_data_len`. A kind that writes every row does not read
     /// `cell_range`. A decimal column counts each cell as a value, also one
-    /// that holds a null. `None` for a symbol column, which is not sized yet.
-    fn rows_data_bound(&self, row_count: usize, cell_range: &Range<usize>) -> Option<usize> {
+    /// that holds a null. A symbol column counts each cell as the widest id
+    /// of a connection, and the symbols that the cells bring, which travel
+    /// outside the block ([`symbols_brought_bound`]): `symbol_len_prefix` is
+    /// the widest length prefix of its symbols, which no other kind reads.
+    /// Every kind has a bound, so this is never `None`.
+    fn rows_data_bound(
+        &self,
+        row_count: usize,
+        cell_range: &Range<usize>,
+        symbol_len_prefix: usize,
+    ) -> Option<usize> {
         let cell_count = cell_range.len();
         let bound = match self {
             Self::Bool { .. } => packed_bytes(row_count),
@@ -5491,7 +5570,10 @@ impl QwpWsColumnValues {
             Self::Geohash { precision_bits, .. } => {
                 1 + cell_count.saturating_mul(geohash_bytes_per_value(*precision_bits))
             }
-            Self::Symbol { .. } => return None,
+            Self::Symbol { cells, dict, .. } => {
+                cell_count.saturating_mul(QWP_WS_SYMBOL_ID_MAX_LEN)
+                    + symbols_brought_bound(cells, dict, cell_range, symbol_len_prefix)
+            }
         };
         Some(bound)
     }
@@ -13418,11 +13500,395 @@ mod tests {
         assert_rows_bound_is_the_encoded_length(&buf.tables[0]);
     }
 
-    /// Every column kind has a bound but a symbol column: a table that
-    /// holds one has none.
+    /// Writes row `i` of a table of symbol columns and a long. Each column
+    /// is left out of some rows, `late` first appears at row 12, and every
+    /// fourth row has no designated timestamp. `few` has four symbols, every
+    /// cell of `fresh` brings a new one, and `mixed` brings some and finds
+    /// others, in no order. No two columns share a symbol. With
+    /// `long_symbols` some symbols of `mixed` are 130 bytes long, so that
+    /// their length takes two bytes; without, every symbol is shorter than
+    /// 128 bytes. A row's values depend on `i` alone.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn write_row_of_symbols(
+        buf: &mut QwpWsColumnarBuffer,
+        table: &str,
+        i: i64,
+        long_symbols: bool,
+    ) {
+        let row = buf.table(table).unwrap();
+        if i % 5 != 3 {
+            row.symbol("few", format!("f{}", i % 4).as_str()).unwrap();
+        }
+        if i % 3 != 1 {
+            row.symbol("fresh", format!("n{i}").as_str()).unwrap();
+        }
+        if i % 4 != 2 {
+            let pick = i * i % 37;
+            let tail = if long_symbols && pick % 5 == 0 {
+                128
+            } else {
+                0
+            };
+            row.symbol("mixed", format!("m{pick}{}", "-".repeat(tail)).as_str())
+                .unwrap();
+        }
+        if i % 2 == 1 {
+            row.column_i64("qty", i).unwrap();
+        }
+        if i >= 12 {
+            row.symbol("late", format!("l{}", i % 9).as_str()).unwrap();
+        }
+        if i % 4 == 3 {
+            row.at_now().unwrap();
+        } else {
+            row.at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
+                .unwrap();
+        }
+    }
+
+    /// A connection that knows `others` symbols, none of which a test table
+    /// uses. With 16,384 of them every later id takes three bytes.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn connection_with_symbols(others: usize) -> SymbolGlobalDict {
+        let mut conn = SymbolGlobalDict::new();
+        for i in 0..others {
+            conn.intern(format!("c{i}").as_bytes()).unwrap();
+        }
+        conn
+    }
+
+    /// How many symbols of a column the rows before `row` use. The ids of a
+    /// column are given in the order of first use, so these symbols are the
+    /// ids below this number.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn symbols_used_before(cells: &[QwpWsSymbolCell], row: u32) -> usize {
+        cells
+            .iter()
+            .filter(|cell| cell.row_idx < row)
+            .map(|cell| cell.local_id as usize + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// What the bound of a row range counts above the frame of the range.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[derive(Debug, Default, PartialEq)]
+    struct SymbolSlack {
+        /// The three bytes of a cell's id, above what the id takes.
+        ids: usize,
+        /// The dictionary entries of the symbols that the connection knew.
+        known: usize,
+        /// The widest length prefix of the column, above the symbol's own.
+        prefixes: usize,
+    }
+
+    /// Makes the frame that brings rows `rows` of `table` to `conn`, as a
+    /// flush in frames would: the frames before it brought the symbols of
+    /// the rows before `rows`, and this one brings the symbols that `rows`
+    /// use first and the connection does not know. Returns the length of
+    /// the frame's table block and dictionary entries, and what the bound
+    /// counts above them. `conn` is left as it was.
+    ///
+    /// The symbols that rows use first are taken from the ids in the cells,
+    /// not from what a cell says of the symbols before it.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn frame_of_symbol_rows(
+        table: &QwpWsTableBuffer,
+        rows: Range<u32>,
+        conn: &mut SymbolGlobalDict,
+    ) -> (usize, SymbolSlack) {
+        let mark = conn.mark();
+        let mut globals: Vec<Vec<u64>> = vec![Vec::new(); table.columns.len()];
+        let symbol_columns = || {
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, column)| match &column.values {
+                    QwpWsColumnValues::Symbol {
+                        cells, dict, data, ..
+                    } => Some((idx, cells, dict, data)),
+                    _ => None,
+                })
+        };
+        for (idx, cells, dict, data) in symbol_columns() {
+            for id in 0..symbols_used_before(cells, rows.start) {
+                let text = symbol_entry_bytes(dict, data, id as u32).unwrap();
+                globals[idx].push(conn.intern(text).unwrap().0);
+            }
+        }
+        let frame_start = conn.next_id();
+        let mut slack = SymbolSlack::default();
+        for (idx, cells, dict, data) in symbol_columns() {
+            let widest_prefix = dict
+                .iter()
+                .map(|entry| qwp_varint_size(u64::from(entry.len)))
+                .max()
+                .unwrap_or(0);
+            for id in symbols_used_before(cells, rows.start)..symbols_used_before(cells, rows.end) {
+                let text = symbol_entry_bytes(dict, data, id as u32).unwrap();
+                let (global_id, is_new) = conn.intern(text).unwrap();
+                globals[idx].push(global_id);
+                if is_new {
+                    slack.prefixes += widest_prefix - qwp_varint_size(text.len() as u64);
+                } else {
+                    slack.known += widest_prefix + text.len();
+                }
+            }
+            for cell in cells.iter().filter(|cell| rows.contains(&cell.row_idx)) {
+                let global_id = globals[idx][cell.local_id as usize];
+                slack.ids += QWP_WS_SYMBOL_ID_MAX_LEN - qwp_varint_size(global_id);
+            }
+        }
+        let mut len: usize = (frame_start..conn.next_id())
+            .map(|id| qwp_string_byte_len(conn.entry(id).unwrap().len()))
+            .sum();
+        let mut block = Vec::new();
+        table.encode_rows(rows, &globals, &mut block).unwrap();
+        len += block.len();
+        conn.rollback(mark);
+        (len, slack)
+    }
+
+    /// Checks the bound of every row range of `table`, the empty ones
+    /// included, against the frame of the range on `conn`: the bound is the
+    /// length of the frame's block and dictionary entries, and the slack of
+    /// the range. Checks also that every symbol cell counts the symbols
+    /// before it. Returns the slack of all ranges together.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn assert_rows_bound_is_the_frame_and_its_slack(
+        table: &QwpWsTableBuffer,
+        conn: &mut SymbolGlobalDict,
+    ) -> SymbolSlack {
+        for column in &table.columns {
+            if let QwpWsColumnValues::Symbol { cells, .. } = &column.values {
+                for cell in cells {
+                    assert_eq!(
+                        cell.symbols_before as usize,
+                        symbols_used_before(cells, cell.row_idx),
+                        "row {}",
+                        cell.row_idx
+                    );
+                }
+            }
+        }
+        let mut total = SymbolSlack::default();
+        for lo in 0..=table.row_count {
+            for hi in lo..=table.row_count {
+                let (len, slack) = frame_of_symbol_rows(table, lo..hi, conn);
+                assert_eq!(
+                    table.encoded_rows_bound(lo..hi),
+                    Some(len + slack.ids + slack.known + slack.prefixes),
+                    "rows {lo}..{hi}: {slack:?}"
+                );
+                total.ids += slack.ids;
+                total.known += slack.known;
+                total.prefixes += slack.prefixes;
+            }
+        }
+        total
+    }
+
+    /// The symbols that rows bring are sized without encoding the rows. For
+    /// every row range of a table of symbol columns the bound is what the
+    /// frame of the range takes, its block and its dictionary entries, when
+    /// the connection knows none of the symbols, its ids take three bytes
+    /// and every symbol is shorter than 128 bytes.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
-    fn qwp_ws_columnar_rows_bound_is_unknown_for_a_symbol_column_alone() {
+    fn qwp_ws_columnar_rows_bound_of_symbols_is_the_frame_when_all_are_new() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..100 {
+            write_row_of_symbols(&mut buf, "symbols", i, false);
+        }
+        let mut conn = connection_with_symbols(16_384);
+        assert_eq!(
+            assert_rows_bound_is_the_frame_and_its_slack(&buf.tables[0], &mut conn),
+            SymbolSlack::default()
+        );
+    }
+
+    /// The id of a symbol cell is counted as three bytes, the most an id of
+    /// a connection takes. On a connection of few symbols an id takes one
+    /// byte or two, and the bound is above the frame by the rest.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_of_symbols_counts_an_id_at_its_widest() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..100 {
+            write_row_of_symbols(&mut buf, "symbols", i, false);
+        }
+        for others in [0, 100] {
+            let mut conn = connection_with_symbols(others);
+            let slack = assert_rows_bound_is_the_frame_and_its_slack(&buf.tables[0], &mut conn);
+            assert!(slack.ids > 0, "{others}");
+            assert_eq!((slack.known, slack.prefixes), (0, 0), "{others}");
+        }
+    }
+
+    /// A symbol that rows use first is counted as new to the connection. A
+    /// frame does not bring one that the connection knows, so the bound is
+    /// above the frame by its dictionary entry. The connection knows a
+    /// symbol from an earlier flush, and also from another column of the
+    /// frame that holds the same symbol.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_of_symbols_counts_one_the_connection_knows() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..100 {
+            write_row_of_symbols(&mut buf, "symbols", i, false);
+        }
+        let mut conn = connection_with_symbols(16_384);
+        for i in 0..4 {
+            conn.intern(format!("f{i}").as_bytes()).unwrap();
+        }
+        for i in (0..100).step_by(2) {
+            conn.intern(format!("n{i}").as_bytes()).unwrap();
+        }
+        let slack = assert_rows_bound_is_the_frame_and_its_slack(&buf.tables[0], &mut conn);
+        assert!(slack.known > 0);
+        assert_eq!((slack.ids, slack.prefixes), (0, 0));
+
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..40 {
+            let row = buf.table("shared").unwrap();
+            row.symbol("a", format!("s{}", i % 7).as_str()).unwrap();
+            if i % 3 != 0 {
+                row.symbol("b", format!("s{}", (i + 3) % 7).as_str())
+                    .unwrap();
+            }
+            row.at_now().unwrap();
+        }
+        let mut conn = connection_with_symbols(16_384);
+        let slack = assert_rows_bound_is_the_frame_and_its_slack(&buf.tables[0], &mut conn);
+        assert!(slack.known > 0);
+        assert_eq!((slack.ids, slack.prefixes), (0, 0));
+    }
+
+    /// The length prefix of a symbol is counted at the widest of its
+    /// column. In a column whose longest symbol has 128 bytes or more, the
+    /// bound is above the frame by a byte for each shorter symbol that the
+    /// rows bring. `len()` is not: it adds up the lengths as they are.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_of_symbols_counts_a_length_at_the_widest_of_its_column() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..100 {
+            write_row_of_symbols(&mut buf, "symbols", i, true);
+        }
+        let mut conn = connection_with_symbols(16_384);
+        let slack = assert_rows_bound_is_the_frame_and_its_slack(&buf.tables[0], &mut conn);
+        assert!(slack.prefixes > 0);
+        assert_eq!((slack.ids, slack.known), (0, 0));
+        // `len()` counts the length of each symbol as it is.
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+    }
+
+    /// Rows that are taken back take their symbols with them: after a
+    /// rewind, and after a row that failed half way, the cells that stay
+    /// count the symbols before them as if those rows had never been, and
+    /// the bound is the frame again.
+    ///
+    /// The widest length prefix of a column is not narrowed when its
+    /// longest symbol is taken back: until the buffer is cleared, the bound
+    /// counts a byte more for each symbol that the column brings.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_of_symbols_after_rows_are_taken_back() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut conn = connection_with_symbols(16_384);
+        for i in 0..8 {
+            write_row_of_symbols(&mut buf, "symbols", i, false);
+        }
+        buf.set_marker().unwrap();
+        for i in 50..60 {
+            write_row_of_symbols(&mut buf, "symbols", i, false);
+        }
+        buf.rewind_to_marker().unwrap();
+        // `qty` holds longs: the row is taken back, with its new symbol.
+        let row = buf.table("symbols").unwrap();
+        row.symbol("fresh", "taken-back").unwrap();
+        row.column_bool("qty", true).unwrap_err();
+        for i in 8..20 {
+            write_row_of_symbols(&mut buf, "symbols", i, false);
+        }
+        assert_eq!(buf.tables[0].row_count, 20);
+        assert_eq!(
+            assert_rows_bound_is_the_frame_and_its_slack(&buf.tables[0], &mut conn),
+            SymbolSlack::default()
+        );
+
+        buf.set_marker().unwrap();
+        let row = buf.table("symbols").unwrap();
+        row.symbol("mixed", "m".repeat(130).as_str()).unwrap();
+        row.at_now().unwrap();
+        buf.rewind_to_marker().unwrap();
+        let table = &buf.tables[0];
+        let mixed = table
+            .columns
+            .iter()
+            .find(|column| column.name == b"mixed")
+            .unwrap();
+        let QwpWsColumnValues::Symbol { dict, .. } = &mixed.values else {
+            panic!("not a symbol column");
+        };
+        assert!(!dict.is_empty());
+        let (len, slack) = frame_of_symbol_rows(table, 0..20, &mut conn);
+        assert_eq!(slack, SymbolSlack::default());
+        assert_eq!(table.encoded_rows_bound(0..20), Some(len + dict.len()));
+
+        buf.clear();
+        for i in 0..20 {
+            write_row_of_symbols(&mut buf, "symbols", i, false);
+        }
+        assert_eq!(
+            assert_rows_bound_is_the_frame_and_its_slack(&buf.tables[0], &mut conn),
+            SymbolSlack::default()
+        );
+    }
+
+    /// With symbols too, the bounds of whole tables add up to `len()`: the
+    /// frame overhead then holds the number of symbols, which here takes
+    /// two bytes.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bounds_of_whole_tables_with_symbols_add_up_to_len() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..100 {
+            write_row_of_symbols(&mut buf, "symbols", i, false);
+        }
+        for i in 0..7 {
+            write_row_of_sized_kinds(&mut buf, "sized", i);
+        }
+        for i in 0..30 {
+            write_row_of_symbols(&mut buf, "more", i, false);
+        }
+        let symbols: usize = buf
+            .tables
+            .iter()
+            .flat_map(|table| &table.columns)
+            .map(|column| match &column.values {
+                QwpWsColumnValues::Symbol { dict, .. } => dict.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(symbols > 127);
+        let frame_overhead =
+            QWP_MESSAGE_HEADER_SIZE + QWP_WS_SYMBOL_ID_MAX_LEN + qwp_varint_size(symbols as u64);
+        let tables: usize = buf
+            .tables
+            .iter()
+            .map(|table| table.encoded_rows_bound(0..table.row_count).unwrap())
+            .sum();
+        assert_eq!(buf.len(), frame_overhead + tables);
+    }
+
+    /// Every column kind has a bound, each in a table of its own. For a
+    /// symbol column it is the block and the symbol the row brings, here on
+    /// a connection whose ids take three bytes.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rows_bound_is_known_for_every_kind_alone() {
         let doubles = vec![0.5_f64, 1.5];
         let longs = vec![1_i64, 2];
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -13448,10 +13914,15 @@ mod tests {
             let name = String::from_utf8_lossy(&table.table_name);
             assert_eq!(table.columns.len(), 1, "{name}");
             let bound = table.encoded_rows_bound(0..1);
+            let mut block = Vec::new();
             if name == "symbol" {
-                assert_eq!(bound, None);
+                table
+                    .encode_rows(0..1, &[vec![16_384]], &mut block)
+                    .unwrap();
+                // The symbol `a` in the dictionary of the frame: its length
+                // and its byte.
+                assert_eq!(bound, Some(block.len() + 2));
             } else {
-                let mut block = Vec::new();
                 table.encode_rows(0..1, &[Vec::new()], &mut block).unwrap();
                 assert_eq!(bound, Some(block.len()), "{name}");
             }
@@ -13469,8 +13940,9 @@ mod tests {
             write_row_of_sized_kinds(&mut buf, "sized", i);
             write_row_of_decimals_arrays_and_hashes(&mut buf, "others", i, false);
             write_row_of_decimals_arrays_and_hashes(&mut buf, "nulls", i, true);
+            write_row_of_symbols(&mut buf, "symbols", i, true);
         }
-        assert_eq!(buf.tables.len(), 3);
+        assert_eq!(buf.tables.len(), 4);
         for table in &buf.tables {
             let name = String::from_utf8_lossy(&table.table_name);
             for lo in 0..ROWS {
@@ -14139,9 +14611,10 @@ mod tests {
     }
 
     /// What the planner does not cut: a buffer without rows, and a buffer in
-    /// which a table with rows has a column of a kind without a size bound,
-    /// whichever of its tables that is. A table that holds no rows, which
-    /// `clear` leaves behind, is not in the way, whatever its columns.
+    /// which a table with rows has a symbol column, which a frame of a plan
+    /// does not bring yet, whichever of its tables that is. A table that
+    /// holds no rows, which `clear` leaves behind, is not in the way,
+    /// whatever its columns.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_frame_plan_is_none_for_what_it_cannot_cut() {
@@ -14166,28 +14639,34 @@ mod tests {
         let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
         assert_eq!(frames, [&[block(1, 0..2)]]);
 
-        for (unsized_idx, unsized_table) in TABLES.into_iter().enumerate() {
+        // One row with a symbol is enough.
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let row = buf.table("first").unwrap();
+        row.symbol("sym", "a").unwrap().at_now().unwrap();
+        assert!(buf.plan_frames(target, target).is_none());
+
+        for (symbol_idx, symbol_table) in TABLES.into_iter().enumerate() {
             let mut buf = QwpWsColumnarBuffer::new(127);
             for table in TABLES {
                 write_row_of_sized_kinds(&mut buf, table, 0);
             }
             assert!(buf.plan_frames(target, target).is_some());
-            let row = buf.table(unsized_table).unwrap();
+            let row = buf.table(symbol_table).unwrap();
             row.symbol("sym", "a").unwrap().at_now().unwrap();
-            assert!(buf.plan_frames(target, target).is_none(), "{unsized_table}");
+            assert!(buf.plan_frames(target, target).is_none(), "{symbol_table}");
 
             // The table keeps its symbol column, and holds no rows.
             buf.clear();
             let mut sized_blocks = Vec::new();
             for (table_idx, table) in TABLES.into_iter().enumerate() {
-                if table_idx != unsized_idx {
+                if table_idx != symbol_idx {
                     write_row_of_sized_kinds(&mut buf, table, 0);
                     sized_blocks.push(block(table_idx, 0..1));
                 }
             }
             let plan = buf.plan_frames(target, target).unwrap();
             let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
-            assert_eq!(frames, [sized_blocks.as_slice()], "{unsized_table}");
+            assert_eq!(frames, [sized_blocks.as_slice()], "{symbol_table}");
         }
     }
 
