@@ -2794,7 +2794,7 @@ fn restore_displaced_geohash_precision(
 /// `table_idx`.
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, PartialEq, Eq)]
-struct QwpWsFrameBlock {
+pub(crate) struct QwpWsFrameBlock {
     table_idx: usize,
     rows: Range<u32>,
 }
@@ -2803,7 +2803,7 @@ struct QwpWsFrameBlock {
 /// the frames together hold every row of the buffer once, in buffer order.
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Default)]
-struct QwpWsFramePlan {
+pub(crate) struct QwpWsFramePlan {
     /// The blocks of all frames, in sending order.
     blocks: Vec<QwpWsFrameBlock>,
     /// Per frame, the index in `blocks` one past its last block.
@@ -2814,7 +2814,7 @@ struct QwpWsFramePlan {
 impl QwpWsFramePlan {
     /// The blocks of each frame, in sending order.
     #[allow(dead_code)] // No caller until a flush sends more than one frame.
-    fn frames(&self) -> impl Iterator<Item = &[QwpWsFrameBlock]> {
+    pub(crate) fn frames(&self) -> impl Iterator<Item = &[QwpWsFrameBlock]> {
         let mut start = 0;
         self.frame_ends.iter().map(move |&end| {
             let frame = &self.blocks[start..end];
@@ -3993,7 +3993,7 @@ impl QwpWsColumnarBuffer {
     /// tables, a column kind without a size bound, a row whose frame would
     /// exceed `cap`, or no rows at all.
     #[allow(dead_code)] // No caller until a flush sends more than one frame.
-    fn plan_frames(&self, target: usize, cap: usize) -> Option<QwpWsFramePlan> {
+    pub(crate) fn plan_frames(&self, target: usize, cap: usize) -> Option<QwpWsFramePlan> {
         debug_assert!(target <= cap);
         let mut tables = self
             .tables
@@ -4045,7 +4045,7 @@ impl QwpWsColumnarBuffer {
     /// The tables of `blocks` must hold no symbol column, which is all the
     /// planner cuts so far.
     #[allow(dead_code)] // No caller until a flush sends more than one frame.
-    fn encode_ws_frame(
+    pub(crate) fn encode_ws_frame(
         &self,
         blocks: &[QwpWsFrameBlock],
         out: &mut Vec<u8>,
@@ -8588,6 +8588,8 @@ fn to_designated_ts(timestamp: Timestamp) -> DesignatedTs {
 mod tests {
     use super::*;
     use crate::ingress::{TimestampMicros, TimestampNanos};
+    #[cfg(feature = "_sender-qwp-ws")]
+    use crate::tests::qwp_decode::decode_ws_table_block;
     use crate::tests::qwp_decode::{DecodedDatagram, DecodedValue, decode_datagram};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
@@ -12904,21 +12906,6 @@ mod tests {
                 assert_eq!(block, expected[block_start..], "rows {lo}..{hi}");
             }
         }
-    }
-
-    /// Wraps one table block in a datagram header for the test decoder. The
-    /// block must hold no symbol column: a datagram carries a dictionary per
-    /// column, a WebSocket frame connection ids.
-    #[cfg(feature = "_sender-qwp-ws")]
-    fn decode_ws_table_block(block: &[u8]) -> crate::tests::qwp_decode::DecodedTable {
-        let mut datagram = Vec::with_capacity(QWP_MESSAGE_HEADER_SIZE + block.len());
-        datagram.extend_from_slice(b"QWP1");
-        datagram.push(QWP_VERSION_1);
-        datagram.push(0);
-        datagram.extend_from_slice(&1u16.to_le_bytes());
-        datagram.extend_from_slice(&(block.len() as u32).to_le_bytes());
-        datagram.extend_from_slice(block);
-        decode_datagram(&datagram).unwrap().table
     }
 
     /// Decimal columns, with values, explicit nulls and rows that left the

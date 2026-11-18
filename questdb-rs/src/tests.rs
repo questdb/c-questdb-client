@@ -49,6 +49,12 @@ mod qwp_ws_replay_probe;
 mod qwp_ws_protocol_probe;
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
+mod qwp_ws_defer_probe;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) mod qwp_ws_server_model;
+
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
 mod qwp_ws_publication_probe;
 
 #[cfg(feature = "sync-sender-qwp-ws")]

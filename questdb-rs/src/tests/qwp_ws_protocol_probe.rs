@@ -45,14 +45,14 @@ const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
 const BASE_TS_NANOS: i64 = 1_700_100_000_000_000_000;
 
-type ProbeResult<T> = std::result::Result<T, TestError>;
+pub(super) type ProbeResult<T> = std::result::Result<T, TestError>;
 
 #[derive(Clone, Debug)]
-struct ProbeConfig {
-    host: String,
-    qwp_ws_port: u16,
+pub(super) struct ProbeConfig {
+    pub(super) host: String,
+    pub(super) qwp_ws_port: u16,
     http_port: u16,
-    auth_header: Option<String>,
+    pub(super) auth_header: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -567,14 +567,14 @@ fn qwp_error_body(response: &[u8]) -> ProbeResult<(u64, String)> {
     Ok((sequence, message))
 }
 
-struct TableCleanup {
+pub(super) struct TableCleanup {
     config: ProbeConfig,
     table: String,
     keep: bool,
 }
 
 impl TableCleanup {
-    fn new(config: ProbeConfig, table: String) -> Self {
+    pub(super) fn new(config: ProbeConfig, table: String) -> Self {
         Self {
             config,
             table,
@@ -600,7 +600,7 @@ impl Drop for TableCleanup {
 }
 
 impl ProbeConfig {
-    fn from_env() -> ProbeResult<Self> {
+    pub(super) fn from_env() -> ProbeResult<Self> {
         let host = std::env::var("QDB_QWP_WS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let qwp_ws_port = parse_port("QDB_QWP_WS_PORT", 9000)?;
         let http_port = parse_port("QDB_QWP_WS_HTTP_PORT", qwp_ws_port)?;
@@ -622,7 +622,7 @@ fn parse_port(name: &str, default: u16) -> ProbeResult<u16> {
     }
 }
 
-fn unique_table_name(prefix: &str) -> String {
+pub(super) fn unique_table_name(prefix: &str) -> String {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -630,7 +630,7 @@ fn unique_table_name(prefix: &str) -> String {
     format!("{prefix}_{}_{}", std::process::id(), since_epoch)
 }
 
-fn query_build(config: &ProbeConfig) -> ProbeResult<String> {
+pub(super) fn query_build(config: &ProbeConfig) -> ProbeResult<String> {
     let value = query_json(config, "select build")?;
     let build = value
         .get("dataset")
@@ -698,7 +698,7 @@ fn has_qty(config: &ProbeConfig, table: &str, qty: i64) -> ProbeResult<bool> {
     }))
 }
 
-fn query_json(config: &ProbeConfig, sql: &str) -> ProbeResult<serde_json::Value> {
+pub(super) fn query_json(config: &ProbeConfig, sql: &str) -> ProbeResult<serde_json::Value> {
     let url = format!(
         "http://{}:{}/exec?query={}",
         config.host,

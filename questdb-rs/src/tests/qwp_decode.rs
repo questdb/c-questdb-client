@@ -801,3 +801,18 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
         },
     })
 }
+
+/// Decodes one table block of a QWP/WebSocket frame, by wrapping it in a
+/// datagram header. The block must hold no symbol column: a datagram carries
+/// a dictionary per column, a WebSocket frame connection ids.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) fn decode_ws_table_block(block: &[u8]) -> DecodedTable {
+    let mut datagram = Vec::with_capacity(HEADER_SIZE + block.len());
+    datagram.extend_from_slice(b"QWP1");
+    datagram.push(1); // the version
+    datagram.push(0);
+    datagram.extend_from_slice(&1u16.to_le_bytes());
+    datagram.extend_from_slice(&(block.len() as u32).to_le_bytes());
+    datagram.extend_from_slice(block);
+    decode_datagram(&datagram).unwrap().table
+}

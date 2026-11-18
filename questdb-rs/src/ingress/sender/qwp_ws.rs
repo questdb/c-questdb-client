@@ -2821,11 +2821,10 @@ fn read_exact_io<R: Read>(stream: &mut R, buf: &mut [u8], what: &str) -> crate::
 // `codec::{qwp_extra_headers, validate_qwp_handshake_headers,
 // handshake_error_to_ingress}`.
 
-/// Test-only convenience wrapper used by the QWP replay / protocol probes
-/// in `crate::tests::qwp_ws_*`. Mirrors the inline upgrade sequence the
-/// connect paths use below, but in a single call so the probes don't need
-/// to thread the extras-builder + validate-headers + error-mapper boilerplate
-/// through every test harness.
+/// Test-only convenience wrapper used by the probes in `crate::tests::qwp_ws_*`:
+/// the inline upgrade sequence the connect paths use below, in a single call,
+/// without the extras-builder + validate-headers + error-mapper boilerplate. Returns
+/// the version, the bytes read past the response, and the server's frame limit (0: none).
 #[cfg(all(test, feature = "_sender-http"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_upgrade<S: Read + Write>(
@@ -2835,7 +2834,7 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
     max_version: u32,
     client_id: Option<&str>,
     request_durable_ack: DurableAckTiers,
-) -> crate::Result<(u8, Vec<u8>)> {
+) -> crate::Result<(u8, Vec<u8>, usize)> {
     let extras = codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
     let handshake = crate::ws::handshake::upgrade(stream, host_header, codec::WS_PATH, &extras)
         .map_err(codec::handshake_error_to_ingress)?;
@@ -2844,7 +2843,8 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
         max_version,
         request_durable_ack,
     )?;
-    Ok((result.version, handshake.leftover))
+    let frame_limit = result.server_max_batch_size;
+    Ok((result.version, handshake.leftover, frame_limit))
 }
 
 // ---------- connect ----------
