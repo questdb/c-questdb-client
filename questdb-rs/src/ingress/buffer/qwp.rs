@@ -4035,6 +4035,61 @@ impl QwpWsColumnarBuffer {
         }
         Some(plan)
     }
+
+    /// Encodes one frame of a plan: the message
+    /// [`Self::encode_ws_replay_message_with_defer`] writes in delta mode,
+    /// with `blocks` in place of every table whole. The frame brings no new
+    /// symbols: its dictionary section is the connection dictionary's next
+    /// id and a zero count.
+    ///
+    /// The tables of `blocks` must hold no symbol column, which is all the
+    /// planner cuts so far.
+    #[allow(dead_code)] // No caller until a flush sends more than one frame.
+    fn encode_ws_frame(
+        &self,
+        blocks: &[QwpWsFrameBlock],
+        out: &mut Vec<u8>,
+        scratch: &mut QwpWsEncodeScratch,
+        global_dict: &SymbolGlobalDict,
+        version: u8,
+        defer_commit: bool,
+    ) -> crate::Result<()> {
+        out.clear();
+        out.extend_from_slice(&[0u8; QWP_MESSAGE_HEADER_SIZE]);
+        write_qwp_varint(out, global_dict.next_id());
+        write_qwp_varint(out, 0);
+
+        let table_count = checked_qwp_u16(blocks.len(), "WS message table count")?;
+        for block in blocks {
+            let table = &self.tables[block.table_idx];
+            // The block encoder takes a symbol id map per column, used or not.
+            while scratch.per_segment_symbol_globals.len() <= block.table_idx {
+                scratch.per_segment_symbol_globals.push(Vec::new());
+            }
+            let symbol_globals = &mut scratch.per_segment_symbol_globals[block.table_idx];
+            while symbol_globals.len() < table.columns.len() {
+                symbol_globals.push(Vec::new());
+            }
+            table.encode_rows(block.rows.clone(), symbol_globals, out)?;
+        }
+
+        let header = QwpMessageHeader {
+            magic: *b"QWP1",
+            version,
+            flags: if defer_commit {
+                QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_DEFER_COMMIT
+            } else {
+                QWP_FLAG_DELTA_SYMBOL_DICT
+            },
+            table_count,
+            payload_len: checked_qwp_u32(
+                out.len() - QWP_MESSAGE_HEADER_SIZE,
+                "WS replay message payload length",
+            )?,
+        };
+        header.write_to(&mut out[..QWP_MESSAGE_HEADER_SIZE]);
+        Ok(())
+    }
 }
 
 /// The largest `end` in `lo + 1..over` that fits, or `lo` when none does.
@@ -13354,8 +13409,246 @@ mod tests {
         assert!(buf.plan_frames(target, target).is_none());
     }
 
+    /// A connection dictionary that earlier flushes left with `symbols`
+    /// symbols. The dictionary start of a frame then takes one byte (up to
+    /// 127 symbols), two (up to 16,383) or three.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn connection_dict_of(symbols: u32) -> SymbolGlobalDict {
+        let mut dict = SymbolGlobalDict::new();
+        for id in 0..symbols {
+            dict.intern(format!("s{id}").as_bytes()).unwrap();
+        }
+        assert_eq!(dict.next_id(), u64::from(symbols));
+        dict
+    }
+
+    /// A frame that holds a whole table is the message a flush sends today,
+    /// byte for byte: as a commit frame and as a deferred one, whatever the
+    /// connection dictionary holds.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_of_a_whole_table_is_the_replay_message() {
+        // Not the protocol's version, so that a frame must take it as given.
+        const VERSION: u8 = QWP_VERSION_1 + 1;
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..130 {
+            write_row_of_sized_kinds(&mut buf, "sized", i);
+        }
+        let plan = buf.plan_frames(usize::MAX, usize::MAX).unwrap();
+        let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
+        assert_eq!(frames.len(), 1);
+
+        for symbols in [0, 200, 20_000] {
+            for defer_commit in [false, true] {
+                let mut dict = connection_dict_of(symbols);
+                let mut message = Vec::new();
+                buf.encode_ws_replay_message_with_defer(
+                    &mut message,
+                    &mut QwpWsEncodeScratch::new(),
+                    &mut dict,
+                    VERSION,
+                    defer_commit,
+                    true,
+                )
+                .unwrap();
+
+                // What an earlier frame left in the output must not stay.
+                let mut frame = vec![0xAA; 3];
+                buf.encode_ws_frame(
+                    frames[0],
+                    &mut frame,
+                    &mut QwpWsEncodeScratch::new(),
+                    &dict,
+                    VERSION,
+                    defer_commit,
+                )
+                .unwrap();
+                assert_eq!(frame, message, "symbols {symbols} defer {defer_commit}");
+            }
+        }
+    }
+
+    /// The frames of a plan are messages that carry the table in order. Each
+    /// has the header of a message with one table, the defer flag as asked,
+    /// an empty dictionary section and a block that decodes to the rows of
+    /// its range. A frame is never longer than the planner counted, so it is
+    /// within the target, and exactly as long when the dictionary start
+    /// takes its three bytes.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frames_of_a_plan_carry_the_table_in_order() {
+        const ROWS: u32 = 130;
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..i64::from(ROWS) {
+            write_row_of_sized_kinds(&mut buf, "sized", i);
+        }
+        let table = &buf.tables[0];
+        let no_symbols = vec![Vec::new(); table.columns.len()];
+        let mut block = Vec::new();
+        table.encode_rows(0..ROWS, &no_symbols, &mut block).unwrap();
+        let whole = decode_ws_table_block(&block);
+        assert_eq!(whole.rows.len(), ROWS as usize);
+        // Rows are compared as text: a float column left out of a row decodes
+        // to NaN, which is not equal to itself.
+        let as_text = |rows: &[Vec<DecodedValue>]| -> Vec<String> {
+            rows.iter().map(|row| format!("{row:?}")).collect()
+        };
+        let whole_rows = as_text(&whole.rows);
+
+        let largest_row = (0..ROWS)
+            .map(|row| encoded_frame_len(table, row..row + 1))
+            .max()
+            .unwrap();
+        let whole_len = encoded_frame_len(table, 0..ROWS);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut frame = Vec::new();
+        for (symbols, start_len) in [(0, 1), (200, 2), (20_000, 3)] {
+            let dict = connection_dict_of(symbols);
+            let mut dict_start = Vec::new();
+            write_qwp_varint(&mut dict_start, u64::from(symbols));
+            assert_eq!(dict_start.len(), start_len);
+            let block_start = QWP_MESSAGE_HEADER_SIZE + start_len + 1;
+
+            let mut frame_counts = std::collections::BTreeSet::new();
+            let targets = (largest_row..largest_row + 600)
+                .step_by(7)
+                .chain([whole_len * 2 / 3, whole_len]);
+            for target in targets {
+                let plan = buf.plan_frames(target, target).unwrap();
+                let frame_count = plan.frames().count();
+                let mut rows_seen = Vec::new();
+                for (frame_idx, blocks) in plan.frames().enumerate() {
+                    let defer_commit = frame_idx + 1 < frame_count;
+                    buf.encode_ws_frame(
+                        blocks,
+                        &mut frame,
+                        &mut scratch,
+                        &dict,
+                        QWP_VERSION_1,
+                        defer_commit,
+                    )
+                    .unwrap();
+                    let rows = blocks[0].rows.clone();
+                    let case = format!("symbols {symbols} target {target} rows {rows:?}");
+
+                    assert_eq!(&frame[..4], b"QWP1", "{case}");
+                    assert_eq!(frame[4], QWP_VERSION_1, "{case}");
+                    let flags = if defer_commit {
+                        QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_DEFER_COMMIT
+                    } else {
+                        QWP_FLAG_DELTA_SYMBOL_DICT
+                    };
+                    assert_eq!(frame[5], flags, "{case}");
+                    assert_eq!(u16::from_le_bytes([frame[6], frame[7]]), 1, "{case}");
+                    assert_eq!(
+                        u32::from_le_bytes(frame[8..12].try_into().unwrap()) as usize,
+                        frame.len() - QWP_MESSAGE_HEADER_SIZE,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        frame[QWP_MESSAGE_HEADER_SIZE..block_start - 1],
+                        dict_start,
+                        "{case}"
+                    );
+                    assert_eq!(frame[block_start - 1], 0, "{case}");
+
+                    let block = &frame[block_start..];
+                    assert_eq!(
+                        Some(block.len()),
+                        table.encoded_rows_bound(rows.clone()),
+                        "{case}"
+                    );
+                    assert!(frame.len() <= target, "{case}");
+                    assert_eq!(
+                        frame.len() == encoded_frame_len(table, rows.clone()),
+                        start_len == 3,
+                        "{case}"
+                    );
+
+                    let part = decode_ws_table_block(block);
+                    assert_eq!(part.name, whole.name, "{case}");
+                    assert_eq!(part.columns.len(), whole.columns.len(), "{case}");
+                    let part_rows = as_text(&part.rows);
+                    assert_eq!(
+                        part_rows,
+                        whole_rows[rows.start as usize..rows.end as usize],
+                        "{case}"
+                    );
+                    rows_seen.extend(part_rows);
+                }
+                assert_eq!(rows_seen, whole_rows, "symbols {symbols} target {target}");
+                frame_counts.insert(frame_count);
+            }
+            // The targets did give a single frame, two, and many small ones.
+            assert!(frame_counts.contains(&1) && frame_counts.contains(&2));
+            assert!(frame_counts.last().is_some_and(|most| *most > 60));
+        }
+    }
+
+    /// A frame takes its blocks in the order they are listed, each from its
+    /// own table and row range: after the dictionary section come the blocks
+    /// back to back, and the header counts them. The planner makes no such
+    /// frame yet, so the blocks are written by hand.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_holds_its_blocks_back_to_back() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..6 {
+            buf.table("narrow")
+                .unwrap()
+                .column_i64("v", i)
+                .unwrap()
+                .at(TimestampNanos::new(i))
+                .unwrap();
+        }
+        for i in 0..14 {
+            write_row_of_sized_kinds(&mut buf, "wide", i);
+        }
+        assert!(buf.tables[1].columns.len() > buf.tables[0].columns.len());
+        let blocks = [
+            QwpWsFrameBlock {
+                table_idx: 1,
+                rows: 2..14,
+            },
+            QwpWsFrameBlock {
+                table_idx: 0,
+                rows: 1..4,
+            },
+        ];
+        let mut expected = Vec::new();
+        for block in &blocks {
+            let table = &buf.tables[block.table_idx];
+            let no_symbols = vec![Vec::new(); table.columns.len()];
+            table
+                .encode_rows(block.rows.clone(), &no_symbols, &mut expected)
+                .unwrap();
+        }
+
+        let mut frame = Vec::new();
+        buf.encode_ws_frame(
+            &blocks,
+            &mut frame,
+            &mut QwpWsEncodeScratch::new(),
+            &SymbolGlobalDict::new(),
+            QWP_VERSION_1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(u16::from_le_bytes([frame[6], frame[7]]), 2);
+        assert_eq!(
+            u32::from_le_bytes(frame[8..12].try_into().unwrap()) as usize,
+            frame.len() - QWP_MESSAGE_HEADER_SIZE
+        );
+        // An empty dictionary section: start 0, no symbols.
+        assert_eq!(
+            frame[QWP_MESSAGE_HEADER_SIZE..QWP_MESSAGE_HEADER_SIZE + 2],
+            [0, 0]
+        );
+        assert_eq!(frame[QWP_MESSAGE_HEADER_SIZE + 2..], expected);
+    }
+
     /// Times cutting one table of 1, 10 and 100 MiB into 2 MiB frames, next
-    /// to encoding the blocks of the plan. Run with:
+    /// to encoding the blocks of the plan, alone and as frames. Run with:
     /// `cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_columnar_frame_plan_benchmark --lib -- --ignored --nocapture --test-threads=1`
     /// Every column of a table has one kind (0, 3 or 4 of
     /// `fill_qwp_ws_encode_shape`: long, string, timestamp), because the
@@ -13399,15 +13692,38 @@ mod tests {
             }
             encode_us.sort_by(f64::total_cmp);
 
+            let frame_count = plan.frames().count();
+            let mut scratch = QwpWsEncodeScratch::new();
+            let dict = SymbolGlobalDict::new();
+            let mut frame_us = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                for (frame_idx, blocks) in plan.frames().enumerate() {
+                    buf.encode_ws_frame(
+                        blocks,
+                        &mut block,
+                        &mut scratch,
+                        &dict,
+                        QWP_VERSION_1,
+                        frame_idx + 1 < frame_count,
+                    )
+                    .unwrap();
+                    black_box(block.len());
+                }
+                frame_us.push(started.elapsed().as_secs_f64() * 1e6);
+            }
+            frame_us.sort_by(f64::total_cmp);
+
             eprintln!(
-                "frame_plan_bench kind={shape} cols={cols} mib={mib} rows={} bytes={} frames={} plan_us_min={:.0} plan_us_median={:.0} encode_us_min={:.0} encode_us_median={:.0}",
+                "frame_plan_bench kind={shape} cols={cols} mib={mib} rows={} bytes={} frames={frame_count} plan_us_min={:.0} plan_us_median={:.0} encode_us_min={:.0} encode_us_median={:.0} frame_us_min={:.0} frame_us_median={:.0}",
                 table.row_count,
                 buf.len(),
-                plan.frames().count(),
                 plan_us[0],
                 plan_us[SAMPLES / 2],
                 encode_us[0],
                 encode_us[SAMPLES / 2],
+                frame_us[0],
+                frame_us[SAMPLES / 2],
             );
         };
         let names = |cols: usize| -> Vec<String> {
