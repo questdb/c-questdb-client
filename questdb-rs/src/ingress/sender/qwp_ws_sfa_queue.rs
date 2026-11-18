@@ -3526,6 +3526,59 @@ pub(crate) fn two_frame_segment_payload_capacity(segment_size_bytes: u64) -> usi
     segment_payload_capacity(segment_size_bytes).saturating_sub(FRAME_HEADER_SIZE) / 2
 }
 
+/// How many new segments frames with payloads of `payload_lens` bytes take
+/// when they are appended one after another to a segment that is filled up to
+/// `append_offset`: a frame that does not fit the segment starts a new one.
+/// `None` when a frame fits no segment.
+#[allow(dead_code)] // No caller until a flush sends more than one frame.
+fn new_segments_for_frames(
+    segment_size_bytes: u64,
+    mut append_offset: u64,
+    payload_lens: &[usize],
+) -> Option<u64> {
+    let payload_capacity = segment_payload_capacity(segment_size_bytes);
+    let mut new_segments = 0;
+    for &payload_len in payload_lens {
+        if payload_len > payload_capacity {
+            return None;
+        }
+        let frame_len = (FRAME_HEADER_SIZE + payload_len) as u64;
+        if append_offset + frame_len > segment_size_bytes {
+            new_segments += 1;
+            append_offset = HEADER_SIZE as u64;
+        }
+        append_offset += frame_len;
+    }
+    Some(new_segments)
+}
+
+impl SfaProducer {
+    /// Whether frames with payloads of `payload_lens` bytes can all be
+    /// appended now, one after another, without a wait for queue room.
+    ///
+    /// Every new segment they take must be the prepared spare or come out of
+    /// the free byte budget. A yes holds until the frames are appended: only
+    /// the appends of this producer take either away, because the runner
+    /// installs a spare out of the free budget and the next rotation uses it.
+    /// A no does not count the segments of confirmed frames that the runner
+    /// has yet to free.
+    #[allow(dead_code)] // No caller until a flush sends more than one frame.
+    pub(crate) fn has_room_for(&self, payload_lens: &[usize]) -> bool {
+        let segment_size_bytes = self.engine.segment_size_bytes;
+        let Some(new_segments) =
+            new_segments_for_frames(segment_size_bytes, self.active_append_offset, payload_lens)
+        else {
+            return false;
+        };
+        self.engine.with_state(|state| {
+            let spare = u64::from(state.hot_spare.is_some());
+            let free_bytes =
+                (self.engine.max_bytes as u64).saturating_sub(state.allocated_segment_bytes);
+            new_segments <= spare + free_bytes / segment_size_bytes
+        })
+    }
+}
+
 fn first_unresolved_fsn_from_segments(
     sealed_segments: &VecDeque<Arc<SfaSharedSegment>>,
     active: &Arc<SfaSharedSegment>,
@@ -7049,5 +7102,218 @@ mod tests {
             }
         }
         assert_eq!(sent_fsns, vec![42, 43]);
+    }
+
+    /// Numbers for the tests of queue room, the same on every run.
+    struct RoomTestNumbers(u64);
+
+    impl RoomTestNumbers {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// A number from `lo` to `hi`, both included.
+        fn between(&mut self, lo: u64, hi: u64) -> u64 {
+            lo + self.next() % (hi - lo + 1)
+        }
+
+        /// Payload sizes of frames that fit a segment: many small ones, some
+        /// that fill a segment or nearly.
+        fn payload_lens(&mut self, count: u64, segment_size_bytes: u64) -> Vec<usize> {
+            let capacity = segment_payload_capacity(segment_size_bytes) as u64;
+            (0..count)
+                .map(|_| match self.between(0, 9) {
+                    0 => capacity,
+                    1 => self.between(capacity / 2, capacity),
+                    _ => self.between(1, capacity / 3),
+                } as usize)
+                .collect()
+        }
+    }
+
+    const ROOM_TEST_SEGMENT_SIZES: [u64; 4] = [64, 100, 257, 1024];
+
+    #[test]
+    fn new_segments_for_frames_counts_the_rotations_of_real_appends() {
+        let payload = [0x5a_u8; 1024];
+        let mut numbers = RoomTestNumbers(0x9e37_79b9_7f4a_7c15);
+        let mut counts = std::collections::BTreeSet::new();
+        for case in 0..1500 {
+            let segment_size_bytes = ROOM_TEST_SEGMENT_SIZES[case % 4];
+            let mut queue = SfaFrameQueue::open_memory(memory_options(
+                segment_size_bytes,
+                64 * segment_size_bytes as usize,
+            ))
+            .unwrap();
+            let mut producer = queue.take_producer().unwrap();
+            // The frames start anywhere in a segment.
+            let before = numbers.between(0, 3);
+            for len in numbers.payload_lens(before, segment_size_bytes) {
+                producer.try_submit(&payload[..len]).unwrap();
+            }
+            let frames = numbers.between(1, 24);
+            let lens = numbers.payload_lens(frames, segment_size_bytes);
+
+            let counted =
+                new_segments_for_frames(segment_size_bytes, producer.active_append_offset, &lens);
+            let sealed_before = queue.sealed_segment_count();
+            for len in &lens {
+                producer.try_submit(&payload[..*len]).unwrap();
+            }
+            let rotations = (queue.sealed_segment_count() - sealed_before) as u64;
+            assert_eq!(counted, Some(rotations), "case {case}: {lens:?}");
+            counts.insert(rotations);
+        }
+        assert!(counts.contains(&0) && counts.len() > 12, "{counts:?}");
+    }
+
+    #[test]
+    fn new_segments_for_frames_follows_the_fit_rule_of_a_segment_to_the_byte() {
+        // A segment of 100 bytes: a header of 24, then frames of their
+        // payload and 8 bytes each.
+        assert_eq!(new_segments_for_frames(100, 24, &[68]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 24, &[69]), None);
+        assert_eq!(new_segments_for_frames(100, 24, &[30, 30]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 24, &[30, 31]), Some(1));
+        assert_eq!(new_segments_for_frames(100, 62, &[30]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 63, &[30]), Some(1));
+        // In the new segment the frame starts after the header again.
+        assert_eq!(new_segments_for_frames(100, 63, &[30, 30]), Some(1));
+        assert_eq!(new_segments_for_frames(100, 63, &[30, 31]), Some(2));
+        assert_eq!(new_segments_for_frames(100, 100, &[68, 68, 68]), Some(3));
+        assert_eq!(new_segments_for_frames(100, 24, &[]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 24, &[1, 69, 1]), None);
+    }
+
+    /// The room for a flush is counted right when the count says whether
+    /// the frames can then be appended without a wait.
+    ///
+    /// Each case is a queue in some state: earlier frames, a part of them
+    /// confirmed and their segments freed, the spare segment installed or
+    /// used up. Then come the frames of one flush. The server confirms none
+    /// of them before the last. The runner's storage maintenance runs before
+    /// every one of them, before some, around every one, or not at all.
+    ///
+    /// "Room" must mean that every frame is appended, whatever the runner
+    /// does. "No room" must mean that a frame is refused, with one exception:
+    /// when the queue still holds confirmed frames, the runner may free their
+    /// segment while the flush runs, and the flush may then fit after all.
+    #[test]
+    fn has_room_for_says_whether_the_frames_can_be_appended_without_a_wait() {
+        let payload = [0x5a_u8; 1024];
+        let mut numbers = RoomTestNumbers(0x2545_f491_4f6c_dd1d);
+        // [no room, room] by [no spare, spare] at the time of the count.
+        let mut seen = [[0u32; 2]; 2];
+        let mut fitted_after_all = 0;
+        for case in 0..6000 {
+            let segment_size_bytes = ROOM_TEST_SEGMENT_SIZES[case % 4];
+            let max_segments = numbers.between(2, 7);
+            let mut queue = SfaFrameQueue::open_memory(memory_options(
+                segment_size_bytes,
+                (max_segments * segment_size_bytes) as usize,
+            ))
+            .unwrap();
+            let mut producer = queue.take_producer().unwrap();
+
+            // Earlier flushes of one frame each, as far as the queue takes
+            // them.
+            let mut published = 0u64;
+            let earlier = numbers.between(0, 12);
+            for len in numbers.payload_lens(earlier, segment_size_bytes) {
+                if numbers.between(0, 2) == 0 {
+                    queue.maintain_storage().unwrap();
+                }
+                if producer.try_submit(&payload[..len]).is_err() {
+                    break;
+                }
+                published += 1;
+            }
+            // The server confirms some of them, and the runner frees their
+            // segments, or has not got to it yet.
+            let confirmed = numbers.between(0, published);
+            if confirmed > 0 {
+                queue.complete_through_fsn(confirmed - 1).unwrap();
+            }
+            if numbers.between(0, 3) > 0 {
+                while queue.maintain_storage().unwrap() {}
+            }
+            // More frames may use up the spare.
+            let more = numbers.between(0, 2);
+            for len in numbers.payload_lens(more, segment_size_bytes) {
+                if producer.try_submit(&payload[..len]).is_err() {
+                    break;
+                }
+            }
+
+            let frames = numbers.between(1, 14);
+            let lens = numbers.payload_lens(frames, segment_size_bytes);
+            let has_room = producer.has_room_for(&lens);
+            seen[usize::from(has_room)][usize::from(queue.hot_spare_installed())] += 1;
+            let segments = queue.engine.segments_snapshot();
+            let oldest_held = segments
+                .sealed_segments
+                .first()
+                .or(segments.active.as_ref())
+                .unwrap()
+                .base_seq();
+            let holds_confirmed_frames = oldest_held < confirmed;
+            drop(segments);
+
+            let maintenance = numbers.between(0, 3);
+            let mut appended = 0;
+            for len in &lens {
+                let frame = &payload[..*len];
+                let submitted = if maintenance == 3 {
+                    // A step of the runner begins before the append and ends
+                    // after it, as it can on the runner's own thread.
+                    match queue.take_storage_maintenance_step(true).unwrap() {
+                        Some(step) => {
+                            let result = step.perform().unwrap();
+                            let submitted = producer.try_submit(frame);
+                            let finish = queue.finish_storage_maintenance(result, true).unwrap();
+                            if let Some(cleanup) = finish.into_cleanup() {
+                                assert!(cleanup.perform().is_none());
+                            }
+                            queue.complete_storage_maintenance().unwrap();
+                            submitted
+                        }
+                        None => producer.try_submit(frame),
+                    }
+                } else {
+                    if maintenance == 2 || (maintenance == 1 && numbers.between(0, 1) == 0) {
+                        queue.maintain_storage().unwrap();
+                    }
+                    producer.try_submit(frame)
+                };
+                match submitted {
+                    Ok(_) => appended += 1,
+                    Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull { .. })) => break,
+                    Err(err) => panic!("case {case}: {err:?}"),
+                }
+            }
+            let appended_all = appended == lens.len();
+            let case = format!(
+                "case {case}: segments of {segment_size_bytes} bytes, at most {max_segments}; \
+                 {appended} of the frames {lens:?} were appended"
+            );
+            if has_room || maintenance == 0 || !holds_confirmed_frames {
+                assert_eq!(has_room, appended_all, "{case}");
+            } else {
+                fitted_after_all += u32::from(appended_all);
+            }
+        }
+        assert!(seen.iter().flatten().all(|cases| *cases > 300), "{seen:?}");
+        assert!(fitted_after_all > 20, "{fitted_after_all}");
+    }
+
+    #[test]
+    fn has_room_for_refuses_a_frame_that_fits_no_segment() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(100, 800)).unwrap();
+        let producer = queue.take_producer().unwrap();
+        assert!(producer.has_room_for(&[68, 68, 68]));
+        assert!(!producer.has_room_for(&[68, 69, 68]));
     }
 }

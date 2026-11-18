@@ -2808,6 +2808,8 @@ pub(crate) struct QwpWsFramePlan {
     blocks: Vec<QwpWsFrameBlock>,
     /// Per frame, the index in `blocks` one past its last block.
     frame_ends: Vec<usize>,
+    /// Per frame, the size the planner counted for it.
+    frame_sizes: Vec<usize>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2821,6 +2823,14 @@ impl QwpWsFramePlan {
             start = end;
             frame
         })
+    }
+
+    /// Per frame, in sending order, an upper bound of its encoded size. The
+    /// encoded frame is up to two bytes shorter: the bound counts three bytes
+    /// for where the dictionary section starts, and a small id takes one.
+    #[allow(dead_code)] // No caller until a flush sends more than one frame.
+    pub(crate) fn frame_sizes(&self) -> &[usize] {
+        &self.frame_sizes
     }
 }
 
@@ -4015,11 +4025,12 @@ impl QwpWsColumnarBuffer {
         let mut lo = 0;
         let mut like_rows = None;
         while lo < table.row_count {
-            let mut hi = table.fitting_rows_end(lo, block_target, like_rows)?;
+            let (mut hi, mut block_size) = table.fitting_rows_end(lo, block_target, like_rows)?;
             if hi == lo {
                 // Not even one row fits the target: the row travels alone.
                 hi = lo + 1;
-                if table.encoded_rows_bound(lo..hi)? > block_cap {
+                block_size = table.encoded_rows_bound(lo..hi)?;
+                if block_size > block_cap {
                     return None;
                 }
             }
@@ -4028,6 +4039,7 @@ impl QwpWsColumnarBuffer {
                 rows: lo..hi,
             });
             plan.frame_ends.push(plan.blocks.len());
+            plan.frame_sizes.push(frame_overhead + block_size);
             // Rows next to each other are the most alike: the search for
             // the next frame starts from the size of this one.
             like_rows = Some(hi - lo);
@@ -4204,15 +4216,20 @@ impl QwpWsTableBuffer {
     }
 
     /// The largest `hi` for which the size bound of rows `[lo, hi)` is at
-    /// most `max_len`, or `lo` when not even one row fits. `None` when the
-    /// table has a column kind without a size bound.
+    /// most `max_len`, with that bound, or `lo` when not even one row fits.
+    /// `None` when the table has a column kind without a size bound.
     ///
     /// `like_rows` is the row count of a block of similar rows, when the
     /// caller has one: the search starts from a block of that many rows.
-    fn fitting_rows_end(&self, lo: u32, max_len: usize, like_rows: Option<u32>) -> Option<u32> {
+    fn fitting_rows_end(
+        &self,
+        lo: u32,
+        max_len: usize,
+        like_rows: Option<u32>,
+    ) -> Option<(u32, usize)> {
         let rest = self.encoded_rows_bound(lo..self.row_count)?;
         if rest <= max_len {
-            return Some(self.row_count);
+            return Some((self.row_count, rest));
         }
         let guess = match like_rows {
             Some(rows) => lo.saturating_add(rows),
@@ -4225,9 +4242,16 @@ impl QwpWsTableBuffer {
         };
         // The bound never shrinks when a row is added, so the ends that fit
         // come before those that do not.
-        largest_fitting_end(lo, self.row_count, guess, |end| {
-            Some(self.encoded_rows_bound(lo..end)? <= max_len)
-        })
+        // The search returns the last end it saw fit, so this is its bound.
+        let mut fitting_bound = 0;
+        let hi = largest_fitting_end(lo, self.row_count, guess, |end| {
+            let bound = self.encoded_rows_bound(lo..end)?;
+            if bound <= max_len {
+                fitting_bound = bound;
+            }
+            Some(bound <= max_len)
+        })?;
+        Some((hi, fitting_bound))
     }
 
     fn rollback_mark(&self) -> QwpWsTableRollbackMark {
@@ -13190,6 +13214,7 @@ mod tests {
         for target in targets {
             let plan = buf.plan_frames(target, target).unwrap();
             let mut next_row = 0;
+            let mut frame_lens = Vec::new();
             for frame in plan.frames() {
                 assert_eq!(frame.len(), 1, "target {target}");
                 let QwpWsFrameBlock { table_idx, rows } = &frame[0];
@@ -13204,8 +13229,10 @@ mod tests {
                 }
                 exact_frames += usize::from(len == target);
                 next_row = rows.end;
+                frame_lens.push(len);
             }
             assert_eq!(next_row, table.row_count, "target {target}");
+            assert_eq!(plan.frame_sizes(), frame_lens, "target {target}");
             frame_counts.insert(plan.frames().count());
         }
         (exact_frames, frame_counts)
@@ -13359,6 +13386,10 @@ mod tests {
                 &[block(6..7)]
             ]
         );
+
+        let frame_lens = [0..2, 2..3, 3..6, 6..7].map(|rows| encoded_frame_len(table, rows));
+        assert_eq!(plan.frame_sizes(), frame_lens);
+        assert_eq!(frame_lens[1], long_row);
 
         assert!(buf.plan_frames(target, long_row - 1).is_none());
     }
