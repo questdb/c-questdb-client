@@ -27,8 +27,9 @@
 //! Such a buffer goes out in several frames that the server commits together
 //! when all of this holds: the sender makes its progress in the background
 //! and keeps its queue in memory, the server has told its frame limit, the
-//! buffer is within `max_buf_size` and holds rows of one table without a
-//! column the planner cannot size, and the queue has room for all the frames.
+//! buffer is within `max_buf_size` and holds no column the planner cannot
+//! size, and the queue has room for all the frames. The buffer may hold rows
+//! of several tables: the server commits each of them once.
 //! Any other flush goes out as one frame, as before: a buffer that is too
 //! large for one frame is refused, nothing of it is published and it keeps
 //! its rows.
@@ -43,9 +44,15 @@ use std::time::Duration;
 use crate::ErrorCode;
 use crate::ingress::{AckLevel, Buffer, Sender, SenderBuilder, TimestampNanos};
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
-use crate::tests::qwp_ws_server_model::{QwpWsModelServer, buffer_of, frames_of_a_flush, rows_of};
+use crate::tests::qwp_ws_server_model::{
+    QwpWsModelServer, add_rows, buffer_of, frames_of_a_flush, rows_of,
+};
 
 const TABLE: &str = "flush_rows";
+/// The tables of a flush over several tables, in the order of its buffer.
+const FIRST: &str = "first_rows";
+const SECOND: &str = "second_rows";
+const THIRD: &str = "third_rows";
 /// The frame limit the server tells, where a test names no other.
 const FRAME_LIMIT: usize = 1024;
 const WAIT: Duration = Duration::from_secs(10);
@@ -95,6 +102,37 @@ fn rows_of_all(buffers: &[&Buffer]) -> Vec<String> {
         .iter()
         .flat_map(|buffer| rows_of(TABLE, buffer))
         .collect()
+}
+
+/// Rows of three tables: 700 of the first, 5 of the second and 1,000 of the
+/// third, each with an id of its own from `first_id` on. Cut for frames of
+/// [`FRAME_LIMIT`] bytes, the second table lies whole in one frame, between
+/// the last rows of the first table and the first rows of the third.
+fn buffer_of_three_tables(first_id: i64) -> Buffer {
+    let mut buffer = buffer_of(FIRST, first_id..first_id + 700);
+    add_rows(&mut buffer, SECOND, first_id + 700..first_id + 705);
+    add_rows(&mut buffer, THIRD, first_id + 705..first_id + 1705);
+    buffer
+}
+
+/// How many table blocks each frame of `frames` holds.
+fn blocks_per_frame(frames: &[Vec<u8>]) -> Vec<u16> {
+    frames
+        .iter()
+        .map(|frame| u16::from_le_bytes([frame[6], frame[7]]))
+        .collect()
+}
+
+/// Checks what the server holds of `table`: the number of its commits, and
+/// the rows that `buffers` hold of it, in their order.
+fn assert_table_holds(server: &QwpWsModelServer, table: &str, commits: u64, buffers: &[&Buffer]) {
+    let held = server.model.table(table).unwrap();
+    assert_eq!(held.commits, commits, "commits of {table}");
+    let rows: Vec<String> = buffers
+        .iter()
+        .flat_map(|buffer| rows_of(table, buffer))
+        .collect();
+    assert_eq!(held.rows_as_text(), rows, "rows of {table}");
 }
 
 /// Flushes a buffer that is too large for one frame and that is not sent in
@@ -213,6 +251,117 @@ fn a_flush_that_loses_its_connection_part_way_is_sent_again_whole() {
     assert_eq!(table.commits, 2);
     assert_eq!(table.blocks.len() as u64, 1 + frame_count);
     assert_eq!(table.rows_as_text(), rows_of_all(&[&before, &large]));
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_flush_of_several_tables_above_the_frame_cap_is_one_commit_of_each_table() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, "");
+    // A flush of one frame that holds the first and the third table.
+    let mut before = buffer_of(FIRST, 0..3);
+    add_rows(&mut before, THIRD, 3..6);
+    let large = buffer_of_three_tables(10);
+    // A flush of one frame that holds the second table alone.
+    let after = buffer_of(SECOND, 5000..5003);
+
+    let blocks = blocks_per_frame(&frames_of_a_flush(&large, FRAME_LIMIT));
+    let frame_count = blocks.len() as u64;
+    assert!(frame_count > 40, "{frame_count} frames");
+    // One frame holds rows of all three tables, and the last frame holds
+    // rows of the third table alone: it commits the other two as well.
+    assert_eq!(blocks.iter().filter(|blocks| **blocks == 3).count(), 1);
+    assert_eq!(
+        blocks.iter().filter(|blocks| **blocks == 1).count(),
+        blocks.len() - 1
+    );
+    assert_eq!(blocks.last(), Some(&1));
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, FIRST, 1, &[&before]);
+    assert_table_holds(&server, THIRD, 1, &[&before]);
+    assert!(server.model.table(SECOND).is_none());
+
+    // Frame 0 is the flush before: the frames of this one are 1 to
+    // `frame_count`.
+    let mut flushed = large.clone();
+    assert_eq!(
+        sender.flush_and_get_fsn(&mut flushed).unwrap(),
+        Some(frame_count)
+    );
+    assert!(flushed.is_empty());
+    assert_eq!(sender.published_fsn().unwrap(), Some(frame_count));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(
+        sender.completed_fsn(AckLevel::Ok).unwrap(),
+        Some(frame_count)
+    );
+    assert_table_holds(&server, FIRST, 2, &[&before, &large]);
+    assert_table_holds(&server, SECOND, 1, &[&large]);
+    assert_table_holds(&server, THIRD, 2, &[&before, &large]);
+    // The server holds the two blocks of the flush before, and the blocks
+    // of every frame of this one.
+    let block_count = |table| server.model.table(table).unwrap().blocks.len();
+    let blocks_of_the_flush: usize = blocks.iter().map(|blocks| usize::from(*blocks)).sum();
+    assert_eq!(
+        block_count(FIRST) + block_count(SECOND) + block_count(THIRD),
+        2 + blocks_of_the_flush
+    );
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&after).unwrap(),
+        Some(frame_count + 1)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, FIRST, 2, &[&before, &large]);
+    assert_table_holds(&server, SECOND, 2, &[&large, &after]);
+    assert_table_holds(&server, THIRD, 2, &[&before, &large]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_whole() {
+    let before = buffer_of(FIRST, 0..3);
+    let large = buffer_of_three_tables(10);
+    let blocks = blocks_per_frame(&frames_of_a_flush(&large, FRAME_LIMIT));
+    let frame_count = blocks.len() as u64;
+    // The server takes the flush before and the frames of the large flush
+    // up to the third one that holds rows of the third table alone, and ends
+    // the connection. It then holds rows of all three tables.
+    let frame_of_three_tables = blocks.iter().position(|blocks| *blocks == 3).unwrap();
+    let cut_after_frames = 1 + frame_of_three_tables + 1 + 3;
+    assert!((cut_after_frames as u64) < frame_count);
+    let server = QwpWsModelServer::start_cutting_first_connection(FRAME_LIMIT, cut_after_frames);
+    let mut sender = sender_with(server.port, "");
+
+    // Confirmed while the first connection lives, so it is not sent again.
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frame_count)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    let totals = sender.qwp_ws_totals().unwrap();
+    assert_eq!(totals.reconnects_succeeded, 1);
+    assert!(
+        totals.frames_replayed >= cut_after_frames as u64 - 1,
+        "{} frames sent again",
+        totals.frames_replayed
+    );
+    // The rows that the first connection held are gone with it, of every
+    // table. The second one brought every frame of the flush, and committed
+    // each table once.
+    assert_table_holds(&server, FIRST, 2, &[&before, &large]);
+    assert_table_holds(&server, SECOND, 1, &[&large]);
+    assert_table_holds(&server, THIRD, 1, &[&large]);
     assert!(!sender.must_close());
     drop(sender);
     server.finish();
@@ -369,11 +518,23 @@ fn a_buffer_that_cannot_be_cut_is_refused_as_one_frame() {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let mut sender = sender_with(server.port, "");
 
-    let mut two_tables = buffer_of(TABLE, 0..2000);
-    two_tables
+    // Rows of two tables. The second table is why each buffer cannot be
+    // cut: it has a symbol column, or a row above the frame cap.
+    let mut with_symbols_in_its_last_table = buffer_of(TABLE, 0..2000);
+    with_symbols_in_its_last_table
         .table("other_rows")
         .unwrap()
+        .symbol("sym", "a")
+        .unwrap()
         .column_i64("id", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let mut with_a_row_above_the_cap_in_its_last_table = buffer_of(TABLE, 0..2000);
+    with_a_row_above_the_cap_in_its_last_table
+        .table("other_rows")
+        .unwrap()
+        .column_str("txt", "x".repeat(FRAME_LIMIT))
         .unwrap()
         .at_now()
         .unwrap();
@@ -396,20 +557,35 @@ fn a_buffer_that_cannot_be_cut_is_refused_as_one_frame() {
         &"x".repeat(FRAME_LIMIT),
     );
     for buffer in [
-        &mut two_tables,
+        &mut with_symbols_in_its_last_table,
+        &mut with_a_row_above_the_cap_in_its_last_table,
         &mut with_symbols,
         &mut with_a_row_above_the_cap,
     ] {
         assert_refused_as_one_frame(&mut sender, buffer, FRAME_LIMIT, SET_BY_SERVER);
     }
+    // Nothing of the refused buffers reached the server, not even a table.
+    assert!(server.model.table(TABLE).is_none());
+    assert!(server.model.table("other_rows").is_none());
 
-    // The sender then takes a buffer that can be cut.
-    let large = buffer_of(TABLE, 0..2000);
+    // The sender then takes a buffer that can be cut: the two tables, with
+    // columns the planner can size and rows within the frame cap.
+    let mut large = buffer_of(TABLE, 0..2000);
+    large
+        .table("other_rows")
+        .unwrap()
+        .column_i64("id", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
     sender.flush_and_keep(&large).unwrap();
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     let table = server.model.table(TABLE).unwrap();
     assert_eq!(table.commits, 1);
     assert_eq!(table.rows_as_text(), rows_of(TABLE, &large));
+    let other = server.model.table("other_rows").unwrap();
+    assert_eq!(other.commits, 1);
+    assert_eq!(other.rows_as_text(), rows_of("other_rows", &large));
     drop(sender);
     server.finish();
 }

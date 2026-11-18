@@ -195,12 +195,13 @@ pub(crate) fn add_rows(buffer: &mut Buffer, table: &str, ids: std::ops::Range<i6
     }
 }
 
-/// The rows a server holds when `buffer` reaches it as a single frame.
+/// The rows of `table` a server holds when `buffer` reaches it as a single
+/// frame. The frame is the one a flush within the frame cap sends, so that
+/// the rows do not depend on how a flush is cut.
 pub(crate) fn rows_of(table: &str, buffer: &Buffer) -> Vec<String> {
     let server = QwpWsServerModel::new();
-    let frames = frames_of_a_flush(buffer, usize::MAX);
-    assert_eq!(frames.len(), 1);
-    assert!(server.connect().receive(&frames[0]).is_some());
+    let frame = frame_of_a_whole_buffer(buffer, false);
+    assert!(server.connect().receive(&frame).is_some());
     server.table(table).unwrap().rows_as_text()
 }
 

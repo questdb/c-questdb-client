@@ -2790,6 +2790,10 @@ fn restore_displaced_geohash_precision(
     }
 }
 
+/// The most table blocks a frame holds: its header counts them in 16 bits.
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_WS_MAX_FRAME_BLOCKS: usize = u16::MAX as usize;
+
 /// One table block of a planned frame: rows `rows` of the buffer's table
 /// `table_idx`.
 #[cfg(feature = "_sender-qwp-ws")]
@@ -3992,57 +3996,73 @@ impl QwpWsColumnarBuffer {
     }
 
     /// Cuts the buffer into frames for a flush that does not fit one frame.
-    /// Each frame takes the most rows whose frame stays within `target`
-    /// bytes. A single row above `target` gets a frame of its own, which may
-    /// be up to `cap` bytes. Frame sizes are taken from the size bound of
-    /// their blocks, so an encoded frame is never larger.
+    /// The tables go in buffer order, and each frame takes the most rows
+    /// that keep it within `target` bytes: it goes on where the frame before
+    /// stopped, and from one table to the next. So a frame holds one block
+    /// of a table at most, and at most [`QWP_WS_MAX_FRAME_BLOCKS`] blocks. A
+    /// single row above `target` gets a frame of its own, which may be up to
+    /// `cap` bytes. Frame sizes are taken from the size bound of their
+    /// blocks, so an encoded frame is never larger.
     ///
-    /// `None` when the buffer cannot be cut: it holds rows of several
-    /// tables, a column kind without a size bound, a row whose frame would
-    /// exceed `cap`, or no rows at all.
+    /// `None` when the buffer cannot be cut: a table with rows has a column
+    /// kind without a size bound, the frame of a row would exceed `cap`, or
+    /// the buffer holds no rows at all.
     pub(crate) fn plan_frames(&self, target: usize, cap: usize) -> Option<QwpWsFramePlan> {
         debug_assert!(target <= cap);
-        let mut tables = self
-            .tables
-            .iter()
-            .enumerate()
-            .filter(|(_, table)| table.row_count > 0);
-        let (table_idx, table) = tables.next()?;
-        if tables.next().is_some() {
-            return None;
-        }
         // A frame without new symbols: the header, the dictionary start and
         // a zero symbol count.
         let frame_overhead =
             QWP_MESSAGE_HEADER_SIZE + QWP_WS_SYMBOL_ID_MAX_LEN + qwp_varint_size(0);
-        let block_target = target.saturating_sub(frame_overhead);
         let block_cap = cap.saturating_sub(frame_overhead);
 
         let mut plan = QwpWsFramePlan::default();
-        let mut lo = 0;
-        let mut like_rows = None;
-        while lo < table.row_count {
-            let (mut hi, mut block_size) = table.fitting_rows_end(lo, block_target, like_rows)?;
-            if hi == lo {
-                // Not even one row fits the target: the row travels alone.
-                hi = lo + 1;
-                block_size = table.encoded_rows_bound(lo..hi)?;
-                if block_size > block_cap {
-                    return None;
+        // The frame being filled: its first block, and its size so far.
+        let mut frame_start = 0;
+        let mut frame_size = frame_overhead;
+        for (table_idx, table) in self.tables.iter().enumerate() {
+            let mut lo = 0;
+            let mut like_rows = None;
+            while lo < table.row_count {
+                let frame_is_empty = plan.blocks.len() == frame_start;
+                let room = target.saturating_sub(frame_size);
+                let (mut hi, mut block_size) = table.fitting_rows_end(lo, room, like_rows)?;
+                if hi == lo && frame_is_empty {
+                    // Not even one row fits the target: the row travels alone.
+                    hi = lo + 1;
+                    block_size = table.encoded_rows_bound(lo..hi)?;
+                    if block_size > block_cap {
+                        return None;
+                    }
+                }
+                if hi > lo {
+                    plan.blocks.push(QwpWsFrameBlock {
+                        table_idx,
+                        rows: lo..hi,
+                    });
+                    frame_size += block_size;
+                    // Rows next to each other are the most alike: the search
+                    // for the next frame starts from the size of this one,
+                    // when the block had the frame to itself.
+                    like_rows = frame_is_empty.then_some(hi - lo);
+                    lo = hi;
+                }
+                // The frame is full when the next row of the table did not
+                // fit, and when it holds as many blocks as a frame can count.
+                if lo < table.row_count
+                    || plan.blocks.len() - frame_start == QWP_WS_MAX_FRAME_BLOCKS
+                {
+                    plan.frame_ends.push(plan.blocks.len());
+                    plan.frame_sizes.push(frame_size);
+                    frame_start = plan.blocks.len();
+                    frame_size = frame_overhead;
                 }
             }
-            plan.blocks.push(QwpWsFrameBlock {
-                table_idx,
-                rows: lo..hi,
-            });
-            plan.frame_ends.push(plan.blocks.len());
-            plan.frame_sizes.push(frame_overhead + block_size);
-            // Rows next to each other are the most alike: the search for
-            // the next frame starts from the size of this one.
-            like_rows = Some(hi - lo);
-            lo = hi;
         }
-        Some(plan)
+        if plan.blocks.len() > frame_start {
+            plan.frame_ends.push(plan.blocks.len());
+            plan.frame_sizes.push(frame_size);
+        }
+        (!plan.blocks.is_empty()).then_some(plan)
     }
 
     /// Encodes one frame of a plan: the message
@@ -13402,20 +13422,339 @@ mod tests {
         assert!(buf.plan_frames(target, long_row - 1).is_none());
     }
 
-    /// What the planner does not cut: a buffer without rows, rows of several
-    /// tables, and a column kind without a size bound. A table that holds no
-    /// rows, which `clear` leaves behind, is not in the way.
+    /// What the frames looked like that
+    /// [`assert_frame_plan_of_tables_is_full`] has checked, for a test to
+    /// tell that its targets reached the cases they are there for.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[derive(Debug, Default)]
+    struct FramePlanShapes {
+        /// Frames that hold blocks of three tables or more: a whole table
+        /// lies between the last rows of one and the first rows of another.
+        of_three_tables: usize,
+        /// Frames that end where a table ends, because the first row of the
+        /// next table did not fit.
+        ending_with_a_table: usize,
+        /// Frames that end inside a table.
+        ending_inside_a_table: usize,
+        /// Frames exactly as large as their target.
+        exact: usize,
+        /// The frame counts of the plans.
+        frame_counts: std::collections::BTreeSet<usize>,
+    }
+
+    /// The largest frame without new symbols that holds `blocks`, each a
+    /// table of `buf` and a range of its rows: 12 bytes of header, at most 3
+    /// of dictionary start, 1 of symbol count, and the encoded blocks.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn encoded_frame_len_of_blocks(
+        buf: &QwpWsColumnarBuffer,
+        blocks: &[(usize, Range<u32>)],
+    ) -> usize {
+        let mut encoded = Vec::new();
+        for (table_idx, rows) in blocks {
+            let table = &buf.tables[*table_idx];
+            let no_symbols = vec![Vec::new(); table.columns.len()];
+            table
+                .encode_rows(rows.clone(), &no_symbols, &mut encoded)
+                .unwrap();
+        }
+        12 + 3 + 1 + encoded.len()
+    }
+
+    /// Plans `buf`, which may hold several tables, and checks the plan. The
+    /// blocks hold every row once, the tables in buffer order and the rows
+    /// of a table in order. A frame holds one block of a table at most.
+    /// Every frame is within the target, and every frame but the last is
+    /// full: the row that comes next would not fit, as one more row of the
+    /// frame's last block or, when it is of another table, as a block of its
+    /// own. Frame sizes are taken from encoded blocks, not from the bound.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn assert_frame_plan_of_tables_is_full(
+        buf: &QwpWsColumnarBuffer,
+        target: usize,
+        shapes: &mut FramePlanShapes,
+    ) {
+        let plan = buf.plan_frames(target, target).unwrap();
+        let frames: Vec<Vec<(usize, Range<u32>)>> = plan
+            .frames()
+            .map(|frame| {
+                frame
+                    .iter()
+                    .map(|block| (block.table_idx, block.rows.clone()))
+                    .collect()
+            })
+            .collect();
+
+        let planned_rows: Vec<(usize, u32)> = frames
+            .iter()
+            .flatten()
+            .flat_map(|(table_idx, rows)| rows.clone().map(move |row| (*table_idx, row)))
+            .collect();
+        let buffer_rows: Vec<(usize, u32)> = buf
+            .tables
+            .iter()
+            .enumerate()
+            .flat_map(|(table_idx, table)| (0..table.row_count).map(move |row| (table_idx, row)))
+            .collect();
+        assert_eq!(planned_rows, buffer_rows, "target {target}");
+
+        let mut frame_lens = Vec::new();
+        for (frame_idx, frame) in frames.iter().enumerate() {
+            let case = format!("target {target} frame {frame_idx} {frame:?}");
+            assert!(
+                frame.iter().all(|(_, rows)| rows.start < rows.end),
+                "{case}"
+            );
+            assert!(frame.windows(2).all(|pair| pair[0].0 < pair[1].0), "{case}");
+            let len = encoded_frame_len_of_blocks(buf, frame);
+            assert!(len <= target, "{case}");
+            if let Some(next_frame) = frames.get(frame_idx + 1) {
+                let (next_table, next_rows) = &next_frame[0];
+                let mut one_more = frame.clone();
+                let last = one_more.last_mut().unwrap();
+                if last.0 == *next_table {
+                    last.1.end += 1;
+                    shapes.ending_inside_a_table += 1;
+                } else {
+                    one_more.push((*next_table, next_rows.start..next_rows.start + 1));
+                    shapes.ending_with_a_table += 1;
+                }
+                assert!(
+                    encoded_frame_len_of_blocks(buf, &one_more) > target,
+                    "{case}"
+                );
+            }
+            shapes.of_three_tables += usize::from(frame.len() >= 3);
+            shapes.exact += usize::from(len == target);
+            frame_lens.push(len);
+        }
+        assert_eq!(plan.frame_sizes(), frame_lens, "target {target}");
+        shapes.frame_counts.insert(frames.len());
+    }
+
+    /// A buffer of several tables is cut into frames that take the tables in
+    /// buffer order, hold one block of a table at most, stay within the
+    /// target and are full.
+    ///
+    /// The tables: a wide one, a narrow one whose rows fit a frame many at a
+    /// time, one of a single row, one without rows, and a wide one again.
+    /// The targets go one byte at a time from the largest single row, as for
+    /// one table, then around a half of the buffer and around all of it.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_cuts_several_tables_into_full_frames() {
+        let narrow_row = |buf: &mut QwpWsColumnarBuffer, i: i64| {
+            let row = buf.table("narrow").unwrap();
+            row.column_i64("v", i).unwrap().at_now().unwrap();
+        };
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        // `clear` keeps the tables, so `no_rows` stays between the others.
+        write_row_of_sized_kinds(&mut buf, "wide", 0);
+        narrow_row(&mut buf, 0);
+        write_row_of_sized_kinds(&mut buf, "one_row", 0);
+        write_row_of_sized_kinds(&mut buf, "no_rows", 0);
+        write_row_of_sized_kinds(&mut buf, "wide_too", 0);
+        buf.clear();
+        for i in 0..40 {
+            write_row_of_sized_kinds(&mut buf, "wide", i);
+        }
+        for i in 0..9 {
+            narrow_row(&mut buf, i);
+        }
+        write_row_of_sized_kinds(&mut buf, "one_row", 5);
+        for i in 0..75 {
+            write_row_of_sized_kinds(&mut buf, "wide_too", i);
+        }
+        let row_counts: Vec<u32> = buf.tables.iter().map(|table| table.row_count).collect();
+        assert_eq!(row_counts, [40, 9, 1, 0, 75]);
+
+        let whole_tables: Vec<(usize, Range<u32>)> = row_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, row_count)| **row_count > 0)
+            .map(|(table_idx, row_count)| (table_idx, 0..*row_count))
+            .collect();
+        let largest_row = whole_tables
+            .iter()
+            .flat_map(|(table_idx, rows)| rows.clone().map(move |row| (*table_idx, row..row + 1)))
+            .map(|row| encoded_frame_len_of_blocks(&buf, &[row]))
+            .max()
+            .unwrap();
+        let whole = encoded_frame_len_of_blocks(&buf, &whole_tables);
+        let targets = (largest_row..largest_row + 600)
+            .chain(whole / 2 - 2..=whole / 2 + 2)
+            .chain(whole - 2..=whole + 2);
+
+        let mut shapes = FramePlanShapes::default();
+        for target in targets {
+            assert_frame_plan_of_tables_is_full(&buf, target, &mut shapes);
+        }
+        // The targets did reach the cases they are there for.
+        assert!(shapes.of_three_tables > 100, "{shapes:?}");
+        assert!(shapes.ending_with_a_table > 100, "{shapes:?}");
+        assert!(shapes.ending_inside_a_table > 1000, "{shapes:?}");
+        assert!(shapes.exact > 100, "{shapes:?}");
+        let frame_counts = &shapes.frame_counts;
+        assert!(frame_counts.contains(&1) && frame_counts.contains(&2));
+        assert!(frame_counts.last().is_some_and(|most| *most > 50));
+    }
+
+    /// In a buffer of several tables too, a row whose frame is above the
+    /// target travels in a frame of its own: the frame before it ends, and
+    /// the rows after it, of its table or of the next one, go into the frame
+    /// after it. With one row above the cap, in a table that is not the
+    /// first, the buffer cannot be cut.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_of_several_tables_gives_a_row_above_the_target_a_frame_of_its_own()
+     {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut ts = 0;
+        for (table, lens) in [
+            ("a", &[10, 10][..]),
+            ("b", &[10, 500, 10]),
+            ("c", &[10, 501]),
+            ("d", &[10, 10]),
+        ] {
+            for len in lens {
+                buf.table(table)
+                    .unwrap()
+                    .column_str("s", "x".repeat(*len).as_str())
+                    .unwrap()
+                    .at(TimestampNanos::new(ts))
+                    .unwrap();
+                ts += 1;
+            }
+        }
+        // Two short rows of a table leave no room for a short row of the
+        // next table, and one short row leaves room for just one.
+        let target = 100;
+        let frame_len = |blocks: &[(usize, Range<u32>)]| encoded_frame_len_of_blocks(&buf, blocks);
+        assert!(frame_len(&[(0, 0..2), (1, 0..1)]) > target);
+        assert!(frame_len(&[(1, 2..3), (2, 0..1)]) <= target);
+        let long_row = frame_len(&[(1, 1..2)]);
+        let longest_row = frame_len(&[(2, 1..2)]);
+        assert!(long_row > target);
+        assert_eq!(longest_row, long_row + 1);
+
+        let plan = buf.plan_frames(target, longest_row).unwrap();
+        let frames: Vec<Vec<(usize, Range<u32>)>> = plan
+            .frames()
+            .map(|frame| {
+                frame
+                    .iter()
+                    .map(|block| (block.table_idx, block.rows.clone()))
+                    .collect()
+            })
+            .collect();
+        let expected = [
+            vec![(0, 0..2)],
+            vec![(1, 0..1)],
+            vec![(1, 1..2)],
+            vec![(1, 2..3), (2, 0..1)],
+            vec![(2, 1..2)],
+            vec![(3, 0..2)],
+        ];
+        assert_eq!(frames, expected);
+        let frame_lens: Vec<usize> = expected.iter().map(|frame| frame_len(frame)).collect();
+        assert_eq!(plan.frame_sizes(), frame_lens);
+        assert_eq!((frame_lens[2], frame_lens[4]), (long_row, longest_row));
+
+        // The cap takes the long row of the second table, not the longer
+        // one of the third.
+        assert!(buf.plan_frames(target, long_row).is_none());
+    }
+
+    /// A frame counts its blocks in 16 bits. A buffer of more tables than
+    /// that is cut there, however large the target is, and the frame of
+    /// 65,535 blocks is a message that the encoder takes. A buffer of
+    /// exactly that many tables is one frame.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_ends_a_frame_at_the_most_blocks_a_frame_counts() {
+        const MOST_BLOCKS: usize = 65_535;
+        let add_table = |buf: &mut QwpWsColumnarBuffer, table_idx: usize| {
+            let row = buf.table(format!("t{table_idx}").as_str()).unwrap();
+            row.column_i64("v", table_idx as i64)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        };
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for table_idx in 0..MOST_BLOCKS {
+            add_table(&mut buf, table_idx);
+        }
+        let plan = buf.plan_frames(usize::MAX, usize::MAX).unwrap();
+        let blocks_per_frame: Vec<usize> = plan.frames().map(|frame| frame.len()).collect();
+        assert_eq!(blocks_per_frame, [MOST_BLOCKS]);
+        assert_eq!(plan.frame_sizes().len(), 1);
+
+        for table_idx in MOST_BLOCKS..MOST_BLOCKS + 3 {
+            add_table(&mut buf, table_idx);
+        }
+        let plan = buf.plan_frames(usize::MAX, usize::MAX).unwrap();
+        let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
+        let blocks_per_frame: Vec<usize> = frames.iter().map(|frame| frame.len()).collect();
+        assert_eq!(blocks_per_frame, [MOST_BLOCKS, 3]);
+        for (table_idx, block) in frames.iter().copied().flatten().enumerate() {
+            assert_eq!((block.table_idx, block.rows.clone()), (table_idx, 0..1));
+        }
+
+        let mut scratch = QwpWsEncodeScratch::new();
+        let dict = SymbolGlobalDict::new();
+        let mut frame = Vec::new();
+        buf.encode_ws_frame(
+            frames[0],
+            &mut frame,
+            &mut scratch,
+            &dict,
+            QWP_VERSION_1,
+            true,
+        )
+        .unwrap();
+        assert_eq!(u16::from_le_bytes([frame[6], frame[7]]), u16::MAX);
+        // The dictionary start of a connection without symbols takes one
+        // byte of the three that the planner counts.
+        assert_eq!(plan.frame_sizes()[0], frame.len() + 2);
+
+        // One block more is not a frame.
+        let one_too_many: Vec<QwpWsFrameBlock> = (0..MOST_BLOCKS + 1)
+            .map(|table_idx| QwpWsFrameBlock {
+                table_idx,
+                rows: 0..1,
+            })
+            .collect();
+        let err = buf
+            .encode_ws_frame(
+                &one_too_many,
+                &mut frame,
+                &mut scratch,
+                &dict,
+                QWP_VERSION_1,
+                true,
+            )
+            .unwrap_err();
+        assert!(err.msg().contains("table count exceeds"), "{}", err.msg());
+    }
+
+    /// What the planner does not cut: a buffer without rows, and a buffer in
+    /// which a table with rows has a column of a kind without a size bound,
+    /// whichever of its tables that is. A table that holds no rows, which
+    /// `clear` leaves behind, is not in the way, whatever its columns.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_frame_plan_is_none_for_what_it_cannot_cut() {
+        const TABLES: [&str; 3] = ["first", "second", "third"];
         let target = 1024 * 1024;
+        let block = |table_idx, rows| QwpWsFrameBlock { table_idx, rows };
         let mut buf = QwpWsColumnarBuffer::new(127);
         assert!(buf.plan_frames(target, target).is_none());
 
         write_row_of_sized_kinds(&mut buf, "first", 0);
-        assert!(buf.plan_frames(target, target).is_some());
         write_row_of_sized_kinds(&mut buf, "second", 0);
-        assert!(buf.plan_frames(target, target).is_none());
+        let plan = buf.plan_frames(target, target).unwrap();
+        let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
+        assert_eq!(frames, [&[block(0, 0..1), block(1, 0..1)]]);
 
         buf.clear();
         assert_eq!(buf.tables.len(), 2);
@@ -13424,15 +13763,31 @@ mod tests {
         write_row_of_sized_kinds(&mut buf, "second", 1);
         let plan = buf.plan_frames(target, target).unwrap();
         let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
-        let second_table = QwpWsFrameBlock {
-            table_idx: 1,
-            rows: 0..2,
-        };
-        assert_eq!(frames, [&[second_table]]);
+        assert_eq!(frames, [&[block(1, 0..2)]]);
 
-        let row = buf.table("second").unwrap();
-        row.symbol("sym", "a").unwrap().at_now().unwrap();
-        assert!(buf.plan_frames(target, target).is_none());
+        for (unsized_idx, unsized_table) in TABLES.into_iter().enumerate() {
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            for table in TABLES {
+                write_row_of_sized_kinds(&mut buf, table, 0);
+            }
+            assert!(buf.plan_frames(target, target).is_some());
+            let row = buf.table(unsized_table).unwrap();
+            row.symbol("sym", "a").unwrap().at_now().unwrap();
+            assert!(buf.plan_frames(target, target).is_none(), "{unsized_table}");
+
+            // The table keeps its symbol column, and holds no rows.
+            buf.clear();
+            let mut sized_blocks = Vec::new();
+            for (table_idx, table) in TABLES.into_iter().enumerate() {
+                if table_idx != unsized_idx {
+                    write_row_of_sized_kinds(&mut buf, table, 0);
+                    sized_blocks.push(block(table_idx, 0..1));
+                }
+            }
+            let plan = buf.plan_frames(target, target).unwrap();
+            let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
+            assert_eq!(frames, [sized_blocks.as_slice()], "{unsized_table}");
+        }
     }
 
     /// A connection dictionary that earlier flushes left with `symbols`
@@ -13613,8 +13968,8 @@ mod tests {
 
     /// A frame takes its blocks in the order they are listed, each from its
     /// own table and row range: after the dictionary section come the blocks
-    /// back to back, and the header counts them. The planner makes no such
-    /// frame yet, so the blocks are written by hand.
+    /// back to back, and the header counts them. The blocks are written by
+    /// hand, the second table first, which is not the order of a plan.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_frame_holds_its_blocks_back_to_back() {
@@ -13681,7 +14036,9 @@ mod tests {
     /// planner does not cut a table with symbols yet. The last tables hold
     /// rows of very uneven size: string columns that are short in one half
     /// of the rows and a hundred times longer in the other half, so that the
-    /// average row says little about where a frame ends.
+    /// average row says little about where a frame ends. Then come buffers
+    /// of 10 and 100 MiB whose rows are spread evenly over 1 to 100,000
+    /// tables of six columns (`kind=tables`).
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     #[ignore = "performance benchmark"]
@@ -13701,17 +14058,19 @@ mod tests {
             plan_us.sort_by(f64::total_cmp);
 
             let plan = buf.plan_frames(TARGET, TARGET).unwrap();
-            let table = &buf.tables[0];
-            let no_symbols = vec![Vec::new(); table.columns.len()];
+            let most_columns = buf.tables.iter().map(|table| table.columns.len()).max();
+            let no_symbols = vec![Vec::new(); most_columns.unwrap()];
             let mut block = Vec::with_capacity(TARGET);
             let mut encode_us = Vec::with_capacity(SAMPLES);
             for _ in 0..SAMPLES {
                 let started = Instant::now();
                 for frame in plan.frames() {
                     block.clear();
-                    table
-                        .encode_rows(frame[0].rows.clone(), &no_symbols, &mut block)
-                        .unwrap();
+                    for rows_of_table in frame {
+                        buf.tables[rows_of_table.table_idx]
+                            .encode_rows(rows_of_table.rows.clone(), &no_symbols, &mut block)
+                            .unwrap();
+                    }
                     black_box(block.len());
                 }
                 encode_us.push(started.elapsed().as_secs_f64() * 1e6);
@@ -13741,8 +14100,9 @@ mod tests {
             frame_us.sort_by(f64::total_cmp);
 
             eprintln!(
-                "frame_plan_bench kind={shape} cols={cols} mib={mib} rows={} bytes={} frames={frame_count} plan_us_min={:.0} plan_us_median={:.0} encode_us_min={:.0} encode_us_median={:.0} frame_us_min={:.0} frame_us_median={:.0}",
-                table.row_count,
+                "frame_plan_bench kind={shape} cols={cols} mib={mib} tables={} rows={} bytes={} frames={frame_count} plan_us_min={:.0} plan_us_median={:.0} encode_us_min={:.0} encode_us_median={:.0} frame_us_min={:.0} frame_us_median={:.0}",
+                buf.tables.len(),
+                buf.tables.iter().map(|table| table.row_count).sum::<u32>(),
                 buf.len(),
                 plan_us[0],
                 plan_us[SAMPLES / 2],
@@ -13800,6 +14160,36 @@ mod tests {
                     buf.at(TimestampNanos::new(row_idx as i64)).unwrap();
                 }
                 time_plan(shape, cols, mib, &buf);
+            }
+        }
+
+        // Many tables: a long, a string and a timestamp column, twice over.
+        let names = names(6);
+        let fill_table = |buf: &mut QwpWsColumnarBuffer, table: &str, rows: usize| {
+            for row_idx in 0..rows {
+                let seq = row_idx as i64;
+                buf.table(table).unwrap();
+                for (col_idx, name) in names.iter().enumerate() {
+                    match col_idx % 3 {
+                        0 => buf.column_i64(name.as_str(), seq),
+                        1 => buf.column_str(name.as_str(), "SYM000"),
+                        _ => buf.column_ts(name.as_str(), TimestampMicros::new(seq)),
+                    }
+                    .unwrap();
+                }
+                buf.at(TimestampNanos::new(seq)).unwrap();
+            }
+        };
+        let mut probe = QwpWsColumnarBuffer::new(127);
+        fill_table(&mut probe, "t0", 100);
+        for tables in [1, 10, 100, 1000, 10_000, 100_000] {
+            for mib in [10, 100] {
+                let rows = mib * 1024 * 1024 * 100 / probe.len() / tables;
+                let mut buf = QwpWsColumnarBuffer::new(127);
+                for table_idx in 0..tables {
+                    fill_table(&mut buf, format!("t{table_idx}").as_str(), rows);
+                }
+                time_plan("tables", 6, mib, &buf);
             }
         }
     }
