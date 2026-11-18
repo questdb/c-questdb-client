@@ -277,7 +277,6 @@ impl QwpWsReplayEncoder {
     /// side-file stay as they are, so a frame that is not published needs no
     /// rollback. Only for a sender in delta mode, whose frames start their
     /// dictionary section at the connection dictionary's size.
-    #[allow(dead_code)] // No caller until a flush sends more than one frame.
     pub(crate) fn encode_frame(
         &mut self,
         buffer: &QwpWsColumnarBuffer,

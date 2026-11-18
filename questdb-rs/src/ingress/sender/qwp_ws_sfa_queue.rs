@@ -3530,7 +3530,6 @@ pub(crate) fn two_frame_segment_payload_capacity(segment_size_bytes: u64) -> usi
 /// when they are appended one after another to a segment that is filled up to
 /// `append_offset`: a frame that does not fit the segment starts a new one.
 /// `None` when a frame fits no segment.
-#[allow(dead_code)] // No caller until a flush sends more than one frame.
 fn new_segments_for_frames(
     segment_size_bytes: u64,
     mut append_offset: u64,
@@ -3562,7 +3561,6 @@ impl SfaProducer {
     /// installs a spare out of the free budget and the next rotation uses it.
     /// A no does not count the segments of confirmed frames that the runner
     /// has yet to free.
-    #[allow(dead_code)] // No caller until a flush sends more than one frame.
     pub(crate) fn has_room_for(&self, payload_lens: &[usize]) -> bool {
         let segment_size_bytes = self.engine.segment_size_bytes;
         let Some(new_segments) =

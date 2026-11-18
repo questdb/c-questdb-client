@@ -54,6 +54,9 @@ mod qwp_ws_defer_probe;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) mod qwp_ws_server_model;
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod qwp_ws_flush_in_frames;
+
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
 mod qwp_ws_publication_probe;
 

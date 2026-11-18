@@ -290,6 +290,18 @@ struct ServerShared {
 
 impl QwpWsModelServer {
     pub(crate) fn start(max_batch_size: usize) -> Self {
+        Self::start_with(max_batch_size, None)
+    }
+
+    /// A server that ends its first connection as soon as it has taken
+    /// `frames` frames of it, before it answers the last of them. The rows
+    /// that connection holds are gone, as after any disconnect. Every later
+    /// connection is served to its end.
+    pub(crate) fn start_cutting_first_connection(max_batch_size: usize, frames: usize) -> Self {
+        Self::start_with(max_batch_size, Some(frames))
+    }
+
+    fn start_with(max_batch_size: usize, mut cut_after_frames: Option<usize>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let model = QwpWsServerModel::new();
@@ -316,10 +328,12 @@ impl QwpWsModelServer {
                     let connection = model.connect();
                     shared.open.fetch_add(1, Ordering::SeqCst);
                     let open = OpenConnection(Arc::clone(&shared));
+                    // Only the first connection is cut.
+                    let cut_after_frames = cut_after_frames.take();
                     connections.push(thread::spawn(move || {
                         // Dropped last: the connection and its rows are gone.
                         let _open = open;
-                        serve_connection(stream, connection, max_batch_size);
+                        serve_connection(stream, connection, max_batch_size, cut_after_frames);
                     }));
                 }
                 // What stopped a connection stops the server.
@@ -400,9 +414,11 @@ fn serve_connection(
     mut stream: TcpStream,
     mut connection: QwpWsModelConnection,
     max_batch_size: usize,
+    cut_after_frames: Option<usize>,
 ) {
     let _close = CloseOnDrop(stream.try_clone().unwrap());
     upgrade_mock_stream_with_max_batch_size(&mut stream, Some(max_batch_size));
+    let mut frames = 0;
     // A read fails when the client went away or the server stops.
     while let Ok((fin, opcode, payload)) = read_frame(&mut stream) {
         let answered = match opcode {
@@ -414,7 +430,12 @@ fn serve_connection(
                      a server closes the connection, which the server model does not do",
                     payload.len()
                 );
-                match connection.receive(&payload) {
+                let answer = connection.receive(&payload);
+                frames += 1;
+                if cut_after_frames == Some(frames) {
+                    break;
+                }
+                match answer {
                     Some(answer) => write_server_binary_frame(&mut stream, &answer),
                     None => Ok(()),
                 }
@@ -773,6 +794,68 @@ mod tests {
         let table = server.model.table(TABLE).unwrap();
         assert_eq!(table.commits, 1);
         assert_eq!(table.rows_as_text(), rows_of(TABLE, &buffer));
+        server.finish();
+    }
+
+    #[test]
+    fn server_model_socket_ends_its_first_connection_after_the_frames_it_was_told() {
+        let buffer = buffer_of(TABLE, 0..40);
+        let frames = small_frames(&buffer);
+        let last = frames.len() - 1;
+        let server = QwpWsModelServer::start_cutting_first_connection(300, 2);
+
+        // The connection lives after one frame and ends with the second.
+        let mut cut = client_of(&server);
+        read_upgrade_answer(&mut cut);
+        write_server_frame(&mut cut, WS_OPCODE_BINARY, &frames[0], true).unwrap();
+        write_server_frame(&mut cut, WS_OPCODE_PING, b"alive", true).unwrap();
+        assert_eq!(
+            read_frame(&mut cut).unwrap(),
+            (true, WS_OPCODE_PONG, b"alive".to_vec())
+        );
+        write_server_frame(&mut cut, WS_OPCODE_BINARY, &frames[1], true).unwrap();
+        let end = read_frame(&mut cut).unwrap_err();
+        assert!(
+            !matches!(
+                end.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{end}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while server.open_connections() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the connection stayed open"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(server.model.table(TABLE).unwrap().commits, 0);
+
+        // The next connection is served to its end.
+        let mut stream = client_of(&server);
+        read_upgrade_answer(&mut stream);
+        for frame in &frames {
+            write_server_frame(&mut stream, WS_OPCODE_BINARY, frame, true).unwrap();
+        }
+        assert_eq!(
+            read_frame(&mut stream).unwrap(),
+            (true, WS_OPCODE_BINARY, ok(last, &[(TABLE, 1)]).unwrap())
+        );
+        let table = server.model.table(TABLE).unwrap();
+        assert_eq!(table.commits, 1);
+        assert_eq!(table.rows_as_text(), rows_of(TABLE, &buffer));
+        server.finish();
+
+        // A connection that ends with a frame without the flag: the frame
+        // commits, and its answer never comes.
+        let server = QwpWsModelServer::start_cutting_first_connection(300, 1);
+        let mut cut = client_of(&server);
+        read_upgrade_answer(&mut cut);
+        write_server_frame(&mut cut, WS_OPCODE_BINARY, &frames[last], true).unwrap();
+        let end = read_frame(&mut cut).unwrap_err();
+        assert_eq!(end.kind(), std::io::ErrorKind::UnexpectedEof, "{end}");
+        assert_eq!(server.model.table(TABLE).unwrap().commits, 1);
         server.finish();
     }
 

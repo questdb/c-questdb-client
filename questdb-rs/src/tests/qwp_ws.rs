@@ -9475,7 +9475,7 @@ fn spawn_max_batch_size_server(max_batch_size: Option<usize>) -> (u16, mpsc::Rec
     (port, rx)
 }
 
-fn spawn_max_batch_size_upgrade_only_server(max_batch_size: Option<usize>) -> u16 {
+pub(crate) fn spawn_max_batch_size_upgrade_only_server(max_batch_size: Option<usize>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {

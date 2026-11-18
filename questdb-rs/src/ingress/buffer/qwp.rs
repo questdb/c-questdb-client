@@ -2815,7 +2815,6 @@ pub(crate) struct QwpWsFramePlan {
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsFramePlan {
     /// The blocks of each frame, in sending order.
-    #[allow(dead_code)] // No caller until a flush sends more than one frame.
     pub(crate) fn frames(&self) -> impl Iterator<Item = &[QwpWsFrameBlock]> {
         let mut start = 0;
         self.frame_ends.iter().map(move |&end| {
@@ -2828,7 +2827,6 @@ impl QwpWsFramePlan {
     /// Per frame, in sending order, an upper bound of its encoded size. The
     /// encoded frame is up to two bytes shorter: the bound counts three bytes
     /// for where the dictionary section starts, and a small id takes one.
-    #[allow(dead_code)] // No caller until a flush sends more than one frame.
     pub(crate) fn frame_sizes(&self) -> &[usize] {
         &self.frame_sizes
     }
@@ -3968,7 +3966,7 @@ impl QwpWsColumnarBuffer {
             if table.row_count == 0 {
                 continue;
             }
-            table.encode_rows(
+            table.encode_block::<true>(
                 0..table.row_count,
                 &scratch.per_segment_symbol_globals[table_idx],
                 out,
@@ -4002,7 +4000,6 @@ impl QwpWsColumnarBuffer {
     /// `None` when the buffer cannot be cut: it holds rows of several
     /// tables, a column kind without a size bound, a row whose frame would
     /// exceed `cap`, or no rows at all.
-    #[allow(dead_code)] // No caller until a flush sends more than one frame.
     pub(crate) fn plan_frames(&self, target: usize, cap: usize) -> Option<QwpWsFramePlan> {
         debug_assert!(target <= cap);
         let mut tables = self
@@ -4056,7 +4053,6 @@ impl QwpWsColumnarBuffer {
     ///
     /// The tables of `blocks` must hold no symbol column, which is all the
     /// planner cuts so far.
-    #[allow(dead_code)] // No caller until a flush sends more than one frame.
     pub(crate) fn encode_ws_frame(
         &self,
         blocks: &[QwpWsFrameBlock],
@@ -4182,6 +4178,24 @@ impl QwpWsTableBuffer {
         symbol_globals: &[Vec<u64>],
         out: &mut Vec<u8>,
     ) -> crate::Result<()> {
+        if rows.start == 0 && rows.end == self.row_count {
+            self.encode_block::<true>(rows, symbol_globals, out)
+        } else {
+            self.encode_block::<false>(rows, symbol_globals, out)
+        }
+    }
+
+    /// [`Self::encode_rows`] with `WHOLE` saying that `rows` is the whole
+    /// table, as for [`QwpWsColumnBuffer::encode`]. The flush of one frame
+    /// calls the whole-table copy by itself: sharing one compiled function
+    /// with the copy for a range of rows slowed some column kinds down by a
+    /// tenth.
+    fn encode_block<const WHOLE: bool>(
+        &self,
+        rows: Range<u32>,
+        symbol_globals: &[Vec<u64>],
+        out: &mut Vec<u8>,
+    ) -> crate::Result<()> {
         write_qwp_bytes(out, &self.table_name);
         write_qwp_varint(out, u64::from(rows.end - rows.start));
         write_qwp_varint(out, self.columns.len() as u64);
@@ -4189,14 +4203,8 @@ impl QwpWsTableBuffer {
         // after col_count. No schema-mode byte, no schema id.
         out.extend_from_slice(&self.encoded_column_schema);
 
-        let whole = rows.start == 0 && rows.end == self.row_count;
         for (col_idx, column) in self.columns.iter().enumerate() {
-            let globals = &symbol_globals[col_idx];
-            if whole {
-                column.encode::<true>(rows.clone(), globals, out)?;
-            } else {
-                column.encode::<false>(rows.clone(), globals, out)?;
-            }
+            column.encode::<WHOLE>(rows.clone(), &symbol_globals[col_idx], out)?;
         }
         Ok(())
     }

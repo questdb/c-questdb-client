@@ -408,10 +408,12 @@ impl Sender {
         let (server_max, sfa_frame_payload_cap) = self
             .qwp_ws_frame_cap_inputs()
             .expect("QWP/WebSocket handler was checked above");
-        let (max, _) =
+        let (max, server_max_known) =
             effective_hard_frame_cap(self.max_buf_size, server_max, sfa_frame_payload_cap);
         let result = match &mut self.handler {
-            SyncProtocolHandler::SyncQwpWs(state) => flush_qwp_ws(state, qwp, max),
+            SyncProtocolHandler::SyncQwpWs(state) => {
+                flush_qwp_ws(state, qwp, max, self.max_buf_size, server_max_known)
+            }
             SyncProtocolHandler::ManualQwpWs(state) => flush_qwp_ws_manual(state, qwp, max),
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };

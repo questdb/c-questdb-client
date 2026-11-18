@@ -4191,15 +4191,36 @@ fn connect_blocking_transport_with_retry(
 // ---------- send / receive ----------
 
 /// Public flush entry point: publish through the replay queue and return once
-/// the frame is locally accepted. A sender-owned runner advances WebSocket I/O.
+/// the buffer is locally accepted. A sender-owned runner advances WebSocket I/O.
+///
+/// A buffer goes out as one frame, which is refused when it is larger than
+/// `frame_cap`. A buffer above `frame_cap` goes out in several frames that
+/// the server commits together instead, when all of this holds: the queue is
+/// in memory, the server has told its frame limit, the buffer is within
+/// `max_buf_size`, it can be cut into frames, and the queue has room for all
+/// of them now.
 pub(crate) fn flush_qwp_ws(
     state: &mut SyncQwpWsHandlerState,
     buffer: &QwpWsColumnarBuffer,
+    frame_cap: usize,
     max_buf_size: usize,
+    server_frame_limit_known: bool,
 ) -> crate::Result<Option<u64>> {
     let encoder = &mut state.encoder;
     let runner = &mut state.runner;
-    publish_qwp_ws_buffer(encoder, buffer, max_buf_size, |payload| {
+    if state.sfa_split_deferral_enabled && server_frame_limit_known {
+        let len = buffer.len();
+        if len > frame_cap && len <= max_buf_size {
+            let target = frame_cap.min(state.sfa_frame_split_target);
+            if let Some(plan) = buffer.plan_frames(target, frame_cap)
+                && let Some(producer) = runner.producer.as_ref()
+                && producer.has_room_for(plan.frame_sizes())
+            {
+                return publish_qwp_ws_frames(encoder, runner, buffer, &plan, frame_cap);
+            }
+        }
+    }
+    publish_qwp_ws_buffer(encoder, buffer, frame_cap, |payload| {
         runner.publish_replay_payload(payload)
     })
 }
@@ -4283,7 +4304,6 @@ fn publish_qwp_ws_buffer(
 /// When the first frame cannot be published, nothing of the flush is queued
 /// and the sender stays usable. When a later one cannot, the sender is
 /// stopped: see [`stop_after_unfinished_flush`].
-#[allow(dead_code)] // No caller until a flush sends more than one frame.
 fn publish_qwp_ws_frames<Q>(
     encoder: &mut QwpWsReplayEncoder,
     runner: &mut SyncQwpWsRunner<Q>,
@@ -8109,6 +8129,97 @@ mod tests {
                     ms(in_frames),
                     ms(single_frames[0]),
                     ms(single_frames[1]),
+                );
+            }
+        }
+    }
+
+    /// Times the `flush` of a buffer that fits one frame, for rows of
+    /// `columns` long columns and a timestamp: the call alone, on a buffer
+    /// that is cleared and filled again before every call, as a caller's is.
+    /// The queue is a memory queue of the default size, the server reads no
+    /// rows and confirms every frame. Run with:
+    /// `cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_flush_single_frame_benchmark --lib -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn qwp_ws_flush_single_frame_benchmark() {
+        const SEGMENT: u64 = 4 * 1024 * 1024;
+        const QUEUE: usize = 128 * 1024 * 1024;
+        // The frame limit a server advertises by default.
+        const SERVER_FRAME_LIMIT: usize = 2_097_138;
+        const MAX_BUF_SIZE: usize = 100 * 1024 * 1024;
+        let frame_cap = SERVER_FRAME_LIMIT.min(segment_payload_capacity(SEGMENT));
+        let samples = std::env::var("QWP_WS_FLUSH_BENCH_SAMPLES")
+            .ok()
+            .and_then(|samples| samples.parse().ok())
+            .unwrap_or(9);
+
+        println!("rows,columns,bytes,flushes,ns_per_flush");
+        for (rows, columns) in [
+            (1usize, 6usize),
+            (1, 100),
+            (1, 1000),
+            (100, 6),
+            (10_000, 6),
+            (100, 100),
+            (10, 1000),
+        ] {
+            let queue = SfaSlotQueue::open_memory(SfaMemoryQueueOptions {
+                segment_size_bytes: SEGMENT,
+                max_bytes: QUEUE,
+            })
+            .unwrap();
+            let transport = SinkTransport {
+                confirms: true,
+                confirmed: VecDeque::new(),
+            };
+            let mut encoder = QwpWsReplayEncoder::new(1);
+            encoder.set_delta_dict_enabled(true);
+            let mut state = SyncQwpWsHandlerState {
+                encoder,
+                runner: SyncQwpWsRunner::start(QwpWsCoreTestHarness::from_queue(queue, transport)),
+                server_max_batch_size: Arc::new(AtomicUsize::new(SERVER_FRAME_LIMIT)),
+                request_durable_ack: DurableAckTiers::Off,
+                token_provider: None,
+                sfa_frame_payload_cap: segment_payload_capacity(SEGMENT),
+                sfa_frame_split_target: two_frame_segment_payload_capacity(SEGMENT),
+                orphan_pool: None,
+                close_drain_timeout: Duration::ZERO,
+                delta_dict_enabled: true,
+                recovered_dict_entries: Vec::new(),
+                recovered_dict_count: 0,
+                persisted_symbol_dict: None,
+                sfa_split_deferral_enabled: true,
+            };
+            let names: Vec<String> = (0..columns).map(|column| format!("c{column}")).collect();
+            let flushes = (4_000_000 / (rows * (columns + 1))).clamp(20, 100_000);
+            let mut buffer = Buffer::new_qwp_ws();
+            for _ in 0..samples {
+                let mut in_flush = Duration::ZERO;
+                for _ in 0..flushes {
+                    buffer.clear();
+                    for row in 0..rows as i64 {
+                        buffer.table("flush_bench").unwrap();
+                        for name in &names {
+                            buffer.column_i64(name.as_str(), row).unwrap();
+                        }
+                        buffer
+                            .at(crate::ingress::TimestampNanos::new(
+                                1_700_000_000_000_000_000 + row,
+                            ))
+                            .unwrap();
+                    }
+                    let rows_of_buffer = buffer.as_qwp_ws().unwrap();
+                    let started = Instant::now();
+                    let fsn =
+                        flush_qwp_ws(&mut state, rows_of_buffer, frame_cap, MAX_BUF_SIZE, true);
+                    in_flush += started.elapsed();
+                    assert!(fsn.unwrap().is_some());
+                }
+                println!(
+                    "{rows},{columns},{},{flushes},{}",
+                    buffer.len(),
+                    in_flush.as_nanos() / flushes as u128
                 );
             }
         }
