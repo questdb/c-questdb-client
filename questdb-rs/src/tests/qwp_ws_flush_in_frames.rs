@@ -43,6 +43,11 @@
 //! buffer was not cut into several, the refusal names the table of the row,
 //! the size of the frame it needs, and the frame cap. Nothing of a refused
 //! buffer is published, and it keeps its rows.
+//! A flush in frames that stops after its first frame was published fails
+//! with `ErrorCode::FlushAborted`. Nothing of it is committed and the buffer
+//! keeps its rows. The sender takes no more flushes, each of which gets the
+//! same error, and goes on delivering the flushes before the failed one:
+//! `wait` and `close_drain` return once those are confirmed.
 //!
 //! The server is the model of [`crate::tests::qwp_ws_server_model`] behind a
 //! socket: it holds the rows of a frame with the defer flag and commits at
@@ -1733,6 +1738,278 @@ fn a_sender_that_was_closed_refuses_a_buffer_above_the_frame_cap() {
     sender.close_drain().unwrap();
 
     assert_refused_as_one_frame(&mut sender, &mut large, FRAME_LIMIT, SET_BY_SERVER);
+    drop(sender);
+    server.finish();
+}
+
+/// A sender whose connection takes `symbols` symbols and no more.
+fn sender_with_a_dictionary_of(port: u16, symbols: usize) -> Sender {
+    // The dictionary of a sender is made when the sender is built.
+    let _cap = crate::ingress::TestDictCapGuard::new(symbols);
+    sender_with(port, "")
+}
+
+/// The error of a flush in frames that stopped part way because the
+/// dictionary of its sender was full with `symbols` symbols.
+fn stopped_by_a_full_dictionary(symbols: usize) -> String {
+    format!(
+        "Could not flush buffer: the flush stopped part way: QWP/WS connection-scoped symbol \
+         dictionary reached its {symbols}-entry cap; retire this connection and continue on a \
+         fresh one (returning it to a pool recycles its dictionary). Nothing of this flush is \
+         committed and the buffer still holds its rows. This sender takes no more flushes and \
+         still delivers the flushes before this one: close it once they are confirmed, create \
+         a new sender and flush the buffer again."
+    )
+}
+
+/// Checks the error of a flush that stopped part way because the dictionary
+/// of its sender was full with `symbols` symbols, and what the sender says
+/// of itself right after it.
+fn assert_stopped_by_a_full_dictionary(sender: &Sender, err: &crate::Error, symbols: usize) {
+    assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+    assert_eq!(err.msg(), stopped_by_a_full_dictionary(symbols));
+    assert!(!err.in_doubt());
+    assert!(sender.must_close());
+}
+
+/// How many symbols the connection of a sender holds when it comes to
+/// `frame`, which must bring at least one more.
+fn symbols_held_before(frame: &[u8]) -> usize {
+    let (held, brought) = symbols_brought_by(frame);
+    assert!(!brought.is_empty());
+    held as usize
+}
+
+/// Waits until the server has seen the end of every connection.
+fn wait_for_no_connection(server: &QwpWsModelServer) {
+    let deadline = Instant::now() + WAIT;
+    while server.open_connections() > 0 {
+        assert!(Instant::now() < deadline, "a connection stayed open");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// How a test waits for the flushes before the failed one.
+#[derive(Clone, Copy)]
+enum WaitsBy {
+    Wait,
+    CloseDrain,
+}
+
+/// A flush before, which the server commits without telling, and a flush in
+/// frames whose frame `failing_frame(frame count)` finds the dictionary of
+/// the sender full. Checks the error of that flush and what the sender does
+/// after it, to the new sender that flushes the same buffer.
+fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
+    failing_frame: fn(usize) -> usize,
+    waits_by: WaitsBy,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    // The server takes what is flushed and keeps its answers to itself.
+    server.hold_answers();
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let mut large = buffer_of_symbols(TABLE, 10..1210);
+    let (rows, len) = (large.row_count(), large.len());
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before, false, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    assert!(frames.len() > 40, "{} frames", frames.len());
+    // The frames before this one are queued, and this one brings a symbol
+    // more than the connection takes.
+    let failing = failing_frame(frames.len());
+    assert!((1..frames.len()).contains(&failing));
+    let symbols = symbols_held_before(&frames[failing]);
+    let mut sender = sender_with_a_dictionary_of(server.port, symbols);
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    let err = sender.flush(&mut large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_eq!(
+        (large.row_count(), large.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    // The sender has published the flush before, and says no more.
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+    // It sends the frames of the failed flush that it had queued.
+    wait_for_frames_taken(&server, 1 + failing);
+
+    // Every later flush gets the same error, of one frame and in frames.
+    for later in [&buffer_of(TABLE, 0..3), &large] {
+        let refused = sender.flush_and_keep(later).unwrap_err();
+        assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+        assert!(!refused.in_doubt());
+    }
+    // A buffer with a symbol that is new to the full dictionary cannot be
+    // encoded, which the sender finds before it comes to its state.
+    let refused = sender
+        .flush_and_keep(&buffer_of_symbols(TABLE, 5000..5001))
+        .unwrap_err();
+    assert_eq!(
+        refused.code(),
+        ErrorCode::SymbolDictFull,
+        "{}",
+        refused.msg()
+    );
+    assert!(sender.must_close());
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+
+    // The sender waits for the answer to the flush before, and for nothing
+    // else: the server answers no frame of the failed flush.
+    thread::scope(|scope| {
+        let waiting = scope.spawn(|| match waits_by {
+            WaitsBy::Wait => sender.wait(AckLevel::Ok, WAIT),
+            WaitsBy::CloseDrain => sender.close_drain(),
+        });
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !waiting.is_finished(),
+            "the sender did not wait for the flush before"
+        );
+        assert_eq!(
+            server.frames_taken(),
+            1 + failing,
+            "no later flush is queued"
+        );
+        server.let_answers_go();
+        waiting.join().unwrap().unwrap();
+    });
+    if matches!(waits_by, WaitsBy::Wait) {
+        assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), Some(0));
+        assert_eq!(sender.published_fsn().unwrap(), Some(0));
+        sender.close_drain().unwrap();
+    }
+    assert!(sender.must_close());
+    // The server has committed the flush before, and holds the rows of the
+    // failed flush for a frame that never comes.
+    assert_eq!(server.frames_taken(), 1 + failing);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+
+    // What the error says to do: close the sender, and flush the buffer
+    // through a new one. The rows that the server held go with the
+    // connection, and every row of the buffer is committed once.
+    drop(sender);
+    wait_for_no_connection(&server);
+    let mut sender = sender_with(server.port, "");
+    sender.flush(&mut large).unwrap();
+    assert!(large.is_empty());
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    assert_table_holds(&server, TABLE, 2, &[&before, &large]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_flush_that_fails_at_its_second_frame_is_aborted_and_the_flush_before_it_is_delivered() {
+    assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(|_| 1, WaitsBy::Wait);
+}
+
+#[test]
+fn a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered() {
+    assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
+        |frames| frames / 2,
+        WaitsBy::CloseDrain,
+    );
+}
+
+#[test]
+fn a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered() {
+    assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
+        |frames| frames - 1,
+        WaitsBy::Wait,
+    );
+}
+
+#[test]
+fn a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut SymbolGlobalDict::new());
+    let failing = frames.len() / 2;
+    let symbols = symbols_held_before(&frames[failing]);
+    let mut sender = sender_with_a_dictionary_of(server.port, symbols);
+
+    let err = sender.flush_and_keep(&large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_eq!(sender.published_fsn().unwrap(), None);
+    wait_for_frames_taken(&server, failing);
+
+    // The server answers none of the frames it took, and the sender waits
+    // for none of them.
+    let started = Instant::now();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), None);
+    sender.close_drain().unwrap();
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_secs(2), "waited {waited:?}");
+    assert_eq!(server.frames_taken(), failing);
+    // The server made the table when it took the first frame for it.
+    assert_table_holds(&server, TABLE, 0, &[]);
+
+    drop(sender);
+    wait_for_no_connection(&server);
+    let mut sender = sender_with(server.port, "");
+    sender.flush_and_keep(&large).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&large]);
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection() {
+    // The server takes five frames of the flush before, and ends the
+    // connection: the rows it held are gone, and nothing is committed.
+    const CUT_AFTER_FRAMES: usize = 5;
+    let server = QwpWsModelServer::start_cutting_first_connection(FRAME_LIMIT, CUT_AFTER_FRAMES);
+    let before = buffer_of_symbols(TABLE, 2000..2300);
+    let large = buffer_of_symbols(FIRST, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    let before_frames = frames_of_a_sender(&before, FRAME_LIMIT, &mut sender_symbols).len();
+    assert!(before_frames > CUT_AFTER_FRAMES, "{before_frames} frames");
+    let last_before = before_frames as u64 - 1;
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    let failing = frames.len() / 2;
+    let symbols = symbols_held_before(&frames[failing]);
+    let mut sender = sender_with_a_dictionary_of(server.port, symbols);
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&before).unwrap(),
+        Some(last_before)
+    );
+    let err = sender.flush_and_keep(&large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_eq!(sender.published_fsn().unwrap(), Some(last_before));
+
+    // On its second connection the sender sends what its queue holds: the
+    // flush before, which the server commits and confirms, and the frames of
+    // the failed flush with their symbols, which it holds.
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(
+        sender.completed_fsn(AckLevel::Ok).unwrap(),
+        Some(last_before)
+    );
+    assert_eq!(sender.published_fsn().unwrap(), Some(last_before));
+    let totals = sender.qwp_ws_totals().unwrap();
+    assert_eq!(totals.reconnects_succeeded, 1);
+    // On a new connection the symbols that the sender had sent come first,
+    // in one frame without rows or in several.
+    wait_for_frames_taken(&server, CUT_AFTER_FRAMES + 1 + before_frames + failing);
+    let refused = sender.flush_and_keep(&large).unwrap_err();
+    assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+    sender.close_drain().unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    assert_table_holds(&server, FIRST, 0, &[]);
+
+    drop(sender);
+    wait_for_no_connection(&server);
+    let mut sender = sender_with(server.port, "");
+    sender.flush_and_keep(&large).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    assert_table_holds(&server, FIRST, 1, &[&large]);
     drop(sender);
     server.finish();
 }

@@ -331,6 +331,30 @@ pub enum ErrorCode {
     /// **by code** and take that specific action, without matching on the error
     /// message text.
     SymbolDictFull,
+
+    /// A [`Sender::flush`](crate::ingress::Sender::flush) of a row buffer
+    /// that goes out in several frames stopped part way: some of its frames
+    /// were queued, and a later one could not be. The message names the
+    /// cause.
+    ///
+    /// **Nothing of the flush is committed**, and the buffer still holds its
+    /// rows. The frame that commits the flush was never queued, and the
+    /// server drops the rows it holds for the flush when the sender is
+    /// closed. So [`in_doubt`](Error::in_doubt) is `false`: flushing the same
+    /// buffer through a new sender stores no row twice.
+    ///
+    /// The sender takes no more flushes: each one fails with this error, and
+    /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. It
+    /// still delivers the flushes before the failed one. To lose none of
+    /// them, call [`close_drain`](crate::ingress::Sender::close_drain) and
+    /// check that it succeeded: it waits for the flushes before the failed
+    /// one only, as [`wait`](crate::ingress::Sender::wait) does. Then drop
+    /// the sender, create a new one and flush the buffer again.
+    ///
+    /// Distinct from [`SocketError`](Self::SocketError), so that callers can
+    /// tell **by code** a flush that is safe to send again from a failure of
+    /// the connection.
+    FlushAborted,
 }
 
 /// How a token source or token provider classified a failure to supply a
@@ -964,6 +988,7 @@ mod tests {
                 ErrorCode::BatchTooLarge => {}
                 ErrorCode::StoreResendRequired => {}
                 ErrorCode::SymbolDictFull => {}
+                ErrorCode::FlushAborted => {}
             }
         }
         let _ = _exhaustive;

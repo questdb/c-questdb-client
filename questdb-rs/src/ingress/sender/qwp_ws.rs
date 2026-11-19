@@ -535,6 +535,9 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     sender_errors_pending: Arc<AtomicBool>,
     producer: Option<SfaProducer>,
     lifecycle: PublicationLifecycle,
+    /// The flush that left the sender closed for publications, if one did:
+    /// see [`Self::abort_flush`].
+    aborted_flush: Option<AbortedFlush>,
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
     append_deadline: Duration,
@@ -542,6 +545,14 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     traffic_gate: Arc<TrafficGate>,
     shutdown_timeout: Duration,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+/// A flush that queued some of its frames and could not queue the rest.
+struct AbortedFlush {
+    /// The last frame published before the flush, if there was one.
+    published_before: Option<u64>,
+    /// The error of the flush, which every later publication gets too.
+    error: crate::Error,
 }
 
 struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
@@ -677,6 +688,7 @@ where
             sender_errors_pending,
             producer,
             lifecycle,
+            aborted_flush: None,
             backpressure,
             ok_completed_upper,
             append_deadline,
@@ -733,6 +745,7 @@ where
             sender_errors_pending,
             producer,
             lifecycle,
+            aborted_flush: None,
             backpressure,
             ok_completed_upper,
             append_deadline,
@@ -834,9 +847,10 @@ where
     fn check_publication_open(&self) -> crate::Result<()> {
         match self.lifecycle.load() {
             PublicationState::Open => Ok(()),
-            PublicationState::Closing => {
-                Err(driver_error_to_error_without_state(DriverError::Closing))
-            }
+            PublicationState::Closing => Err(match &self.aborted_flush {
+                Some(flush) => flush.error.clone(),
+                None => driver_error_to_error_without_state(DriverError::Closing),
+            }),
             PublicationState::Terminal => {
                 let store = self.lock_shared()?;
                 Err(driver_error_to_error_from_store(
@@ -845,6 +859,43 @@ where
                 ))
             }
         }
+    }
+
+    /// Leaves a flush that queued its frames from `first_fsn` on and could
+    /// not queue the rest, because of `cause`. Returns the error of that
+    /// flush.
+    ///
+    /// The queued frames hold rows that only a later frame could commit, so
+    /// nothing may be published after them: the sender takes no more
+    /// publications, and each one gets the error of the flush. The network
+    /// thread is not told: it goes on sending what the queue holds, the
+    /// frames of this flush among them, and reading the server's answers, so
+    /// the flushes before this one are still delivered. The server answers
+    /// none of the frames of this flush: it holds their rows for a frame
+    /// that commits them, and drops them when the connection ends. So
+    /// callers are told that the sender has published what it had before
+    /// this flush, and wait for nothing more: see [`Self::published_fsn`]
+    /// and [`Self::drain_to_deadline`].
+    ///
+    /// A sender that has stopped for a reason of its own goes on reporting
+    /// that reason, here and at every later call.
+    fn abort_flush(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error {
+        let msg = format!(
+            "Could not flush buffer: the flush stopped part way: {}. Nothing of this flush is \
+             committed and the buffer still holds its rows. This sender takes no more flushes \
+             and still delivers the flushes before this one: close it once they are confirmed, \
+             create a new sender and flush the buffer again.",
+            cause.msg().trim_end_matches('.')
+        );
+        let error = cause
+            .reclassified(crate::ErrorCode::FlushAborted, msg)
+            .with_in_doubt(false);
+        self.aborted_flush = Some(AbortedFlush {
+            published_before: first_fsn.checked_sub(1),
+            error: error.clone(),
+        });
+        self.lifecycle.begin_close();
+        self.check_publication_open().err().unwrap_or(error)
     }
 
     fn check_error(&self) -> crate::Result<()> {
@@ -875,8 +926,14 @@ where
             .and_then(|store| store.reconnect_failure().cloned())
     }
 
+    /// The last frame published, or the last one before the flush that
+    /// failed part way, if one did: see [`Self::abort_flush`]. The queue
+    /// keeps its own position, which the network thread sends up to.
     fn published_fsn(&self) -> crate::Result<Option<u64>> {
         self.check_error()?;
+        if let Some(flush) = &self.aborted_flush {
+            return Ok(flush.published_before);
+        }
         if let Some(producer) = self.producer.as_ref() {
             return Ok(producer.published_fsn());
         }
@@ -975,6 +1032,10 @@ where
     /// close). While reconnecting keeps failing, that error names the latest
     /// failure, as the manual close drain's does. `deadline == None` waits
     /// indefinitely. Assumes [`Self::begin_close`] has already run.
+    ///
+    /// After a flush that failed part way ([`Self::abort_flush`]) the wait
+    /// is for the frames before that flush: its own frames are never
+    /// confirmed, and go with the queue.
     fn drain_to_deadline(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
         // No publication can pass the Closing lifecycle latch. Release the
         // detached producer's active-segment mapping before queue.close()
@@ -990,7 +1051,13 @@ where
                 // not let the public durability latch prevent close from
                 // reaching either recovery path.
                 check_store_terminal_error(&store)?;
-                if store.all_published_receipts_resolved() {
+                // The frames of a flush that failed part way are never
+                // confirmed: the wait ends at the frame before them.
+                let drained = match &self.aborted_flush {
+                    Some(flush) => store.completed_fsn() >= flush.published_before,
+                    None => store.all_published_receipts_resolved(),
+                };
+                if drained {
                     // Storage maintenance performs file work off the
                     // publication-store lock. A task may own segment mappings,
                     // create a hot-spare file, or unlink a retired segment, so
@@ -4436,8 +4503,8 @@ fn publish_qwp_ws_buffer(
 /// and the last one commits them all. Returns the number of the last frame.
 ///
 /// When the first frame cannot be published, nothing of the flush is queued
-/// and the sender stays usable. When a later one cannot, the sender is
-/// stopped: see [`stop_after_unfinished_flush`].
+/// and the sender stays usable. When a later one cannot, the sender takes no
+/// more publications: see [`SyncQwpWsRunner::abort_flush`].
 fn publish_qwp_ws_frames<Q>(
     encoder: &mut QwpWsReplayEncoder,
     runner: &mut SyncQwpWsRunner<Q>,
@@ -4449,6 +4516,7 @@ where
     Q: PublicationLog + Send + 'static,
 {
     let mut frames = plan.frames().peekable();
+    let mut first_fsn = None;
     let mut last_fsn = None;
     while let Some(blocks) = frames.next() {
         let defer_commit = frames.peek().is_some();
@@ -4456,43 +4524,16 @@ where
             encoder.encode_and_publish_frame(buffer, blocks, defer_commit, frame_cap, |payload| {
                 runner.publish_replay_payload(payload)
             });
-        match published {
-            Ok(fsn) => last_fsn = Some(fsn),
-            Err(err) if last_fsn.is_none() => return Err(err),
-            Err(err) => return Err(stop_after_unfinished_flush(runner, err)),
+        match (published, first_fsn) {
+            (Ok(fsn), _) => {
+                first_fsn.get_or_insert(fsn);
+                last_fsn = Some(fsn);
+            }
+            (Err(err), None) => return Err(err),
+            (Err(err), Some(first_fsn)) => return Err(runner.abort_flush(first_fsn, err)),
         }
     }
     Ok(last_fsn)
-}
-
-/// Stops a sender whose flush queued some of its frames and could not queue
-/// the rest, and returns the error that every later call reports.
-///
-/// The queued frames hold rows that only a later frame could commit, so
-/// nothing may be published after them: the sender turns terminal. Its
-/// network thread then ends and drops the connection, and the server drops
-/// the rows it held for it.
-///
-/// Provisional: everything else in the queue is lost with the sender too,
-/// earlier flushes that the server has not confirmed included.
-fn stop_after_unfinished_flush<Q>(runner: &SyncQwpWsRunner<Q>, cause: crate::Error) -> crate::Error
-where
-    Q: PublicationLog + Send + 'static,
-{
-    let mut store = match runner.lock_shared() {
-        Ok(store) => store,
-        Err(poisoned) => return poisoned,
-    };
-    let msg = format!(
-        "Could not flush buffer: the flush stopped part way: {}. Nothing of this flush is \
-         committed and the buffer still holds its rows. This sender cannot be used any more: \
-         close it, create a new sender and flush the buffer again.",
-        cause.msg().trim_end_matches('.')
-    );
-    let err = cause.reclassified(crate::ErrorCode::SocketError, msg);
-    store.mark_terminal(Some(err.clone()));
-    // An error that stopped the sender before this one stays the one it reports.
-    store.terminal_error().cloned().unwrap_or(err)
 }
 
 pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::Result<bool> {
@@ -7820,6 +7861,8 @@ mod tests {
     struct ModelWire {
         /// Each frame sent, and whether it has the defer flag.
         sent: Mutex<Vec<(SentFrame, bool)>>,
+        /// The server keeps its answers to itself while this is set.
+        answers_held: AtomicBool,
         /// The transport is gone, as a connection is once its runner thread
         /// has ended.
         closed: AtomicBool,
@@ -7838,6 +7881,9 @@ mod tests {
 
     impl QwpWsCoreTransport for ServerModelTransport {
         fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            if self.wire.answers_held.load(Ordering::Acquire) {
+                return Ok(TransportPoll::Idle);
+            }
             let Some(answer) = self.answers.pop_front() else {
                 return Ok(TransportPoll::Idle);
             };
@@ -8131,53 +8177,83 @@ mod tests {
     }
 
     #[test]
-    fn a_flush_that_cannot_queue_a_later_frame_stops_the_sender() {
+    fn a_flush_that_cannot_queue_a_later_frame_closes_the_sender_for_more() {
         let server = QwpWsServerModel::new();
-        // Two segments hold four frames of the flush. The server confirms
-        // none of them before the last frame of the flush, so their segments
-        // are never freed and the fifth frame finds no room.
+        // Two segments hold the flush before and three frames of the flush.
+        // The server confirms none of them before the last frame of the
+        // flush, so their segments are never freed and the fourth frame
+        // finds no room.
         let (mut runner, mut encoder, wire) =
             runner_on_model(&server, small_segments(2), Duration::from_millis(50), None);
-        let buffer = buffer_of(FLUSH_TABLE, 0..400);
+        let before = buffer_of(FLUSH_TABLE, 0..3);
+        let buffer = buffer_of(FLUSH_TABLE, 3..403);
         let plan = small_frames_plan(&buffer);
         assert!(plan.frames().count() > 8);
 
+        // The server takes the flush before and keeps its answer to itself.
+        wire.answers_held.store(true, Ordering::Release);
+        assert_eq!(publish_as_one_frame(&mut encoder, &mut runner, &before), 0);
+
         let err = publish_frames(&mut encoder, &mut runner, &buffer, &plan).unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(err.code(), crate::ErrorCode::FlushAborted);
         for part in [
             "Could not flush buffer: the flush stopped part way: ",
             "timed out waiting for ACK-driven segment trim",
             "Nothing of this flush is committed and the buffer still holds its rows.",
-            "This sender cannot be used any more: close it, create a new sender and flush the \
-             buffer again.",
+            "This sender takes no more flushes and still delivers the flushes before this one: \
+             close it once they are confirmed, create a new sender and flush the buffer again.",
         ] {
             assert!(err.msg().contains(part), "no {part:?} in: {}", err.msg());
         }
         assert!(!err.in_doubt());
-        assert!(runner.lifecycle_is_terminal());
+        // The sender is not stopped. It says that it has published the flush
+        // before and no more, while its queue holds the frames of the failed
+        // flush too, for the network thread to send.
+        assert!(!runner.lifecycle_is_terminal());
+        assert_eq!(runner.published_fsn().unwrap(), Some(0));
         assert_eq!(runner.lock_shared().unwrap().published_fsn(), Some(3));
+        assert_eq!(runner.acked_fsn().unwrap(), None);
 
         // Every later publication is refused with the same error.
         let refused = publish_frames(&mut encoder, &mut runner, &buffer, &plan).unwrap_err();
         assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
         let refused = runner.publish_replay_payload(b"more").unwrap_err();
         assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+        assert_eq!(runner.lock_shared().unwrap().published_fsn(), Some(3));
 
-        // The runner thread ends and drops the connection, and with it the
-        // rows the server held for it: nothing of the flush is committed.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !wire.closed.load(Ordering::Acquire) {
-            assert!(Instant::now() < deadline, "the connection stayed open");
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert!(wire.sent.lock().unwrap().iter().all(|(_, defer)| *defer));
-        let committed = server
-            .table(FLUSH_TABLE)
-            .map_or((0, 0), |table| (table.commits, table.row_count()));
-        assert_eq!(committed, (0, 0));
+        // The close drain waits for the answer to the flush before, and for
+        // nothing else: the server never answers a frame of the failed flush.
+        thread::scope(|scope| {
+            let drain = scope.spawn(|| runner.close_drain(Duration::from_secs(5)));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while wire.sent.lock().unwrap().len() < 4 {
+                assert!(Instant::now() < deadline, "the queued frames were not sent");
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread::sleep(Duration::from_millis(100));
+            assert!(
+                !drain.is_finished(),
+                "the close drain did not wait for the flush before"
+            );
+            wire.answers_held.store(false, Ordering::Release);
+            drain.join().unwrap().unwrap();
+        });
+        assert_eq!(runner.acked_fsn().unwrap(), Some(0));
 
-        // What the error tells the user to do: a new sender, the same buffer.
+        // The server has committed the flush before. It took the three
+        // frames of the failed flush and holds their rows.
+        let sent = wire.sent.lock().unwrap().clone();
+        let flags: Vec<bool> = sent.iter().map(|(_, defer)| *defer).collect();
+        assert_eq!(flags, [false, true, true, true]);
+        let table = server.table(FLUSH_TABLE).unwrap();
+        assert_eq!(table.commits, 1);
+        assert_eq!(table.rows_as_text(), rows_of(FLUSH_TABLE, &before));
+
+        // What the error tells the user to do: a new sender, the same
+        // buffer. The connection of the old one goes with it, and with the
+        // connection the rows that the server held.
         drop(runner);
+        assert!(wire.closed.load(Ordering::Acquire));
         let (mut runner, mut encoder, _wire) =
             runner_on_model(&server, small_segments(64), Duration::from_secs(5), None);
         let fsn = publish_frames(&mut encoder, &mut runner, &buffer, &plan)
@@ -8185,8 +8261,10 @@ mod tests {
             .unwrap();
         wait_for_ack(&runner, fsn);
         let table = server.table(FLUSH_TABLE).unwrap();
-        assert_eq!(table.commits, 1);
-        assert_eq!(table.rows_as_text(), rows_of(FLUSH_TABLE, &buffer));
+        assert_eq!(table.commits, 2);
+        let mut rows = rows_of(FLUSH_TABLE, &before);
+        rows.extend(rows_of(FLUSH_TABLE, &buffer));
+        assert_eq!(table.rows_as_text(), rows);
     }
 
     #[test]
@@ -8208,28 +8286,39 @@ mod tests {
     }
 
     #[test]
-    fn the_error_of_an_unfinished_flush_keeps_what_its_cause_says() {
+    fn the_error_of_an_aborted_flush_keeps_what_its_cause_says() {
         let server = QwpWsServerModel::new();
-        let (runner, _encoder, _wire) =
+        let (mut runner, _encoder, _wire) =
             runner_on_model(&server, small_segments(2), Duration::from_secs(5), None);
+        // A cause that could not tell whether its frame had gone out.
         let cause = crate::Error::new(
             crate::ErrorCode::AuthError,
             "WebSocket upgrade authentication failed: HTTP status 401.",
         )
-        .with_ws_http_status(401);
+        .with_ws_http_status(401)
+        .with_in_doubt(true);
 
-        let err = stop_after_unfinished_flush(&runner, cause);
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        let err = runner.abort_flush(0, cause);
+        assert_eq!(err.code(), crate::ErrorCode::FlushAborted);
         assert_eq!(
             err.msg(),
             "Could not flush buffer: the flush stopped part way: WebSocket upgrade \
              authentication failed: HTTP status 401. Nothing of this flush is committed and \
-             the buffer still holds its rows. This sender cannot be used any more: close it, \
-             create a new sender and flush the buffer again."
+             the buffer still holds its rows. This sender takes no more flushes and still \
+             delivers the flushes before this one: close it once they are confirmed, create a \
+             new sender and flush the buffer again."
         );
         assert_eq!(err.ws_http_status(), Some(401));
+        // Whatever its cause, nothing of the flush can be committed.
         assert!(!err.in_doubt());
-        assert!(runner.lifecycle_is_terminal());
+        assert!(!runner.lifecycle_is_terminal());
+        // The flush was the first of its sender: nothing was published
+        // before it, and the close drain has nothing to wait for.
+        assert_eq!(runner.published_fsn().unwrap(), None);
+        let refused = runner.publish_replay_payload(b"more").unwrap_err();
+        assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+        assert!(!refused.in_doubt());
+        runner.close_drain(Duration::from_secs(5)).unwrap();
     }
 
     /// A server that reads no rows, so that a flush is timed without it. It

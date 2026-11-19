@@ -143,6 +143,28 @@ TEST(test_query_timeout_is_a_distinct_appended_code)
         "neutral alias resolves to the same enumerator");
 }
 
+TEST(test_flush_aborted_is_a_distinct_appended_code)
+{
+    /* A flush that stopped part way is safe to send again through a new
+     * sender, which a failure of the connection is not: callers must be able
+     * to tell the two apart by code. */
+    CHECK(
+        line_sender_error_flush_aborted != line_sender_error_socket_error,
+        "flush_aborted distinct from socket_error");
+    CHECK(
+        line_sender_error_flush_aborted != line_sender_error_invalid_api_call,
+        "flush_aborted distinct from invalid_api_call");
+    CHECK(
+        line_sender_error_flush_aborted > line_sender_error_query_timeout,
+        "flush_aborted appended (not renumbered)");
+    CHECK(
+        line_sender_error_flush_aborted == 39,
+        "flush_aborted discriminant pinned at 39 for cached ABI consumers");
+    CHECK(
+        questdb_error_flush_aborted == line_sender_error_flush_aborted,
+        "neutral alias resolves to the same enumerator");
+}
+
 TEST(test_query_set_timeout_ms_null_query_is_tolerated)
 {
     /* Proves the symbol links and argument-marshals under a plain C
@@ -1647,6 +1669,7 @@ int main(void)
     RUN(test_appended_sender_error_codes_exist);
     RUN(test_symbol_dict_full_is_a_distinct_appended_code);
     RUN(test_query_timeout_is_a_distinct_appended_code);
+    RUN(test_flush_aborted_is_a_distinct_appended_code);
     RUN(test_query_set_timeout_ms_null_query_is_tolerated);
     RUN(test_egress_null_cursor_returns_error_tristate);
     RUN(test_egress_null_out_array_returns_error_tristate);

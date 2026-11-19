@@ -312,6 +312,26 @@ typedef enum line_sender_error_code
      *  and a DDL / INSERT / UPDATE that timed out waiting for the table
      *  writer may still be applied by that writer afterwards. */
     line_sender_error_query_timeout = 38,
+
+    /** A flush of a row buffer that goes out in several frames stopped part
+     *  way: some of its frames were queued, and a later one could not be. The
+     *  message names the cause.
+     *
+     *  Nothing of the flush is committed, and the buffer still holds its
+     *  rows: `line_sender_error_in_doubt` is false, and flushing the same
+     *  buffer through a new sender stores no row twice.
+     *
+     *  The sender takes no more flushes: each one fails with this code, and
+     *  `line_sender_must_close` returns true. It still delivers the flushes
+     *  before the failed one. To lose none of them, call
+     *  `line_sender_qwpws_close_drain` and check that it succeeded: it waits
+     *  for the flushes before the failed one only. Then `line_sender_close`,
+     *  create a new sender and flush the buffer again.
+     *
+     *  Distinct from `line_sender_error_socket_error`, so that callers can
+     *  tell by code a flush that is safe to send again from a failure of the
+     *  connection. */
+    line_sender_error_flush_aborted = 39,
 } line_sender_error_code;
 
 /**
@@ -375,6 +395,7 @@ typedef line_sender_error_code questdb_error_code;
     line_sender_error_store_resend_required
 #define questdb_error_symbol_dict_full line_sender_error_symbol_dict_full
 #define questdb_error_query_timeout line_sender_error_query_timeout
+#define questdb_error_flush_aborted line_sender_error_flush_aborted
 
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol

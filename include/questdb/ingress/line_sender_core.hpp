@@ -107,6 +107,7 @@ enum class error_code : int
     store_resend_required = ::line_sender_error_store_resend_required,
     symbol_dict_full = ::line_sender_error_symbol_dict_full,
     query_timeout = ::line_sender_error_query_timeout,
+    flush_aborted = ::line_sender_error_flush_aborted,
 };
 // clang-format on
 

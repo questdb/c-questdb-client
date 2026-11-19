@@ -422,10 +422,14 @@ impl Sender {
             SyncProtocolHandler::ManualQwpWs(state) => flush_qwp_ws_manual(state, qwp, max),
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
-        {
+        // After a flush that stopped part way the sender takes no more
+        // flushes, as after a failure of the connection.
+        if result.as_ref().is_err_and(|err| {
+            matches!(
+                err.code(),
+                crate::ErrorCode::SocketError | crate::ErrorCode::FlushAborted
+            )
+        }) {
             self.connected = false;
         }
         result.map_err(|err| {
@@ -679,7 +683,11 @@ impl Sender {
     /// `sf_append_deadline_millis` while the sender is disconnected and
     /// reconnecting keeps failing, the error names that failure and carries
     /// its OIDC detail (`Error::oidc_error`), as a `Sender::wait` timeout
-    /// does.
+    /// does. A flush in several frames that stops after some of them were
+    /// published fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted): nothing of
+    /// it is committed, the buffer keeps its rows, and the sender takes no
+    /// more flushes while it still delivers the ones before.
     ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.
@@ -753,6 +761,11 @@ impl Sender {
 
     /// Return the highest frame sequence number published locally by this
     /// QWP/WebSocket sender, or `None` if no frame has been published.
+    ///
+    /// After a flush that failed with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) this is
+    /// the last frame published before that flush, or `None` if there was
+    /// none: the frames of the failed flush are never confirmed.
     ///
     /// This is a sender-stream watermark, not a process-global receipt.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -888,6 +901,10 @@ impl Sender {
     /// reconnect is blocked on a token that the auth cannot supply until that
     /// callback returns. A wait on any other thread keeps waiting.
     /// When nothing has been published yet, a valid wait returns immediately.
+    /// After a flush that failed with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) the wait
+    /// covers the frames published before that flush, and succeeds once they
+    /// reach `ack_level`.
     /// QWP/WebSocket only; other protocols return `InvalidApiCall`. In manual
     /// progress mode this also drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1127,7 +1144,10 @@ impl Sender {
     }
 
     /// Stop accepting new QWP/WebSocket publications and wait for all already
-    /// published frames to complete.
+    /// published frames to complete. After a flush that failed with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) these are
+    /// the frames published before that flush: the frames of the failed flush
+    /// are dropped, and nothing of it is committed.
     ///
     /// The wait is bounded by the QWP/WebSocket `close_flush_timeout_millis`
     /// setting. Its default is 5000 ms, matching the Java sender. Values less
@@ -1167,7 +1187,10 @@ impl Sender {
     /// Returns `true` after an unrecoverable failure. For ILP-over-TCP this
     /// is any socket error. For QWP/WebSocket this also covers a server
     /// rejection or protocol violation that latches the publication
-    /// lifecycle to its terminal state. ILP-over-HTTP and QWP/UDP never
+    /// lifecycle to its terminal state, and a flush that failed with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted): that
+    /// sender takes no more flushes, and still delivers the ones before the
+    /// failed one until it is dropped. ILP-over-HTTP and QWP/UDP never
     /// transition into a permanently-unusable state and always return
     /// `false`.
     ///
