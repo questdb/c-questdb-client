@@ -28,7 +28,7 @@
 //!
 //! The rows and the checks of the tables are those of `qwp_ws_defer_probe`,
 //! which writes such frames to a raw WebSocket. Here the sender cuts the
-//! buffer and sends the frames. There are two tests:
+//! buffer and sends the frames. There are three tests:
 //!
 //! - a flush of one table without symbols into a table that the flush
 //!   creates, so the time until the server confirms includes the time it
@@ -36,12 +36,15 @@
 //! - a flush of two tables with symbols, one of them with more symbols than
 //!   a frame holds, into tables that exist. The buffer is flushed twice:
 //!   the first time its frames bring the symbols, the second time the
-//!   connection knows them.
+//!   connection knows them;
+//! - two flushes of one table, one right after the other, through a sender
+//!   whose queue takes one of them at a time: the second `flush` waits
+//!   until the server has confirmed the first.
 //!
-//! Each test also prints how long a flush took and how much memory the
-//! process held; the second one, how many frames its flushes took. For
-//! these numbers run one test at a time, from a release build. This runs
-//! both; the whole name of a test runs that one:
+//! Each test also prints how long a flush took; the first two, how much
+//! memory the process held; the second one, how many frames its flushes
+//! took. For these numbers run one test at a time, from a release build.
+//! This runs all three; the whole name of a test runs that one:
 //!
 //! `QDB_QWP_WS_LARGE_FLUSH_PROBE=1 QDB_QWP_WS_PORT=9000 cargo test --release --manifest-path questdb-rs/Cargo.toml --lib qwp_ws_real_server_large_flush -- --ignored --nocapture`
 //!
@@ -51,6 +54,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::ErrorCode;
 use crate::ingress::{AckLevel, Buffer, Sender, SenderBuilder, SymbolGlobalDict};
 
 use super::TestResult;
@@ -73,6 +77,9 @@ const CREATING_ROWS: usize = 20;
 /// How long the server may stay silent before the flush counts as lost. It
 /// answers a flush once, at the end.
 const WAIT: Duration = Duration::from_secs(30);
+/// A queue of 8 MiB, which is two of its segments: too small for a buffer
+/// of more than a few frames, whatever the server confirms.
+const QUEUE_TOO_SMALL: u64 = 8 * 1024 * 1024;
 
 #[test]
 #[ignore = "requires a real QuestDB server and QDB_QWP_WS_LARGE_FLUSH_PROBE=1"]
@@ -316,6 +323,177 @@ fn qwp_ws_real_server_large_flush_with_symbols_is_one_transaction_of_each_table(
         with_new_symbols.resident_at_most, with_known_symbols.resident_at_most
     );
     Ok(())
+}
+
+/// Two flushes far larger than a frame, one right after the other, through a
+/// sender whose queue takes one of them at a time. The second `flush` is
+/// called while the queue holds the first. It waits until the server has
+/// confirmed the first, then queues its own frames and returns. The server
+/// commits each flush as one transaction.
+///
+/// The sender itself tells how large that queue is: with a queue that can
+/// never take such a buffer, it refuses the buffer at once, and the error
+/// names the size of a queue that takes it.
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_LARGE_FLUSH_PROBE=1"]
+fn qwp_ws_real_server_large_flush_waits_for_room_in_the_queue() -> TestResult {
+    let Some((config, mib)) = probe_settings()? else {
+        return Ok(());
+    };
+    let server = Server::Live(&config);
+    let (table, _cleanup) = server.new_table("qwp_large_flush_waits");
+    let addr = format!("ws::addr={}:{};", config.host, config.qwp_ws_port);
+
+    // A few rows that create the table, then the rows of the two large
+    // flushes: each flush has rows of its own.
+    let mut creating = Buffer::new_qwp_ws();
+    for (id, text_len) in rows_from(0, CREATING_ROWS) {
+        push_row(&mut creating, &table, id, text_len, None)?;
+    }
+    let bytes = (mib * 1024 * 1024).saturating_sub(ROW_ROOM);
+    let mut first = Group::of_bytes(&table, CREATING_ROWS as i64, bytes)?.buffer;
+    let (first_rows, first_len) = (first.row_count(), first.len());
+    let second_from = (CREATING_ROWS + first_rows) as i64;
+    let mut second = Group::of_bytes(&table, second_from, bytes)?.buffer;
+    let (second_rows, second_len) = (second.row_count(), second.len());
+
+    // A queue that is too small for such a buffer: the sender refuses the
+    // buffer at once, queues nothing of it, and names the queue that it
+    // needs.
+    let conf = format!("{addr}sf_max_total_bytes={QUEUE_TOO_SMALL};");
+    let mut small = SenderBuilder::from_conf(conf)?.build()?;
+    let (frame_cap, told_by_server) = small.effective_frame_cap()?;
+    assert!(told_by_server, "the server told no frame limit");
+    assert!(
+        first_len > frame_cap,
+        "a buffer of {first_len} bytes fits one frame of {frame_cap}"
+    );
+    let started = Instant::now();
+    let refusal = match small.flush(&mut first) {
+        Err(refusal) => refusal,
+        Ok(()) => panic!("a queue of {QUEUE_TOO_SMALL} bytes took a buffer of {first_len} bytes"),
+    };
+    let refused_after = started.elapsed();
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::BatchTooLarge,
+        "{}",
+        refusal.msg()
+    );
+    assert_eq!(
+        (first.row_count(), first.len()),
+        (first_rows, first_len),
+        "the buffer keeps its rows"
+    );
+    assert_eq!(small.published_fsn()?, None, "nothing is queued");
+    assert!(!small.must_close());
+    drop(small);
+    let queue_bytes = queue_bytes_named_by(&refusal)?;
+    // That queue is too small for the two flushes together.
+    assert!(
+        queue_bytes < (first_len + second_len) as u64,
+        "a queue of {queue_bytes} bytes may take buffers of {first_len} and {second_len} bytes \
+         together, and then the second flush has nothing to wait for: use larger buffers"
+    );
+
+    // A sender with the queue that the error names. A flush of a few rows
+    // creates the table, so that the large flushes do not wait for that.
+    let conf = format!("{addr}sf_max_total_bytes={queue_bytes};");
+    let mut sender = SenderBuilder::from_conf(conf)?.build()?;
+    assert_eq!(sender.effective_frame_cap()?, (frame_cap, true));
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&creating)?, Some(0));
+    sender.wait(AckLevel::Ok, WAIT)?;
+    assert_eq!(server.transactions(&table)?, Some(1));
+
+    // The two flushes, with no wait for the server between them: only a
+    // look at what it has confirmed so far.
+    let started = Instant::now();
+    let first_fsn = sender.flush_and_get_fsn(&mut first)?;
+    let first_took = started.elapsed();
+    let confirmed_between = sender.completed_fsn(AckLevel::Ok)?;
+    let second_started = Instant::now();
+    let second_fsn = sender.flush_and_get_fsn(&mut second)?;
+    let second_took = second_started.elapsed();
+    let confirmed_at_return = sender.completed_fsn(AckLevel::Ok)?;
+    sender.wait(AckLevel::Ok, WAIT)?;
+    let confirmed_after = started.elapsed();
+
+    assert!(first.is_empty() && second.is_empty());
+    let first_fsn = first_fsn.expect("a flush of rows publishes frames");
+    let second_fsn = second_fsn.expect("a flush of rows publishes frames");
+    // The second flush was called while the queue held the first, whose
+    // frames stay there until the server confirms them, and the queue is
+    // too small for both. So it had no room, and got it when the server
+    // confirmed the first.
+    assert!(
+        confirmed_between < Some(first_fsn),
+        "the server had confirmed the first flush before the second was called, which then had \
+         nothing to wait for"
+    );
+    assert!(
+        confirmed_at_return >= Some(first_fsn),
+        "the second flush returned before the server had confirmed the first: a queue of \
+         {queue_bytes} bytes held both"
+    );
+    assert_eq!(sender.completed_fsn(AckLevel::Ok)?, Some(second_fsn));
+    // The frame that created the table is the first of this sender.
+    let (first_frames, second_frames) = (first_fsn, second_fsn - first_fsn);
+    for (frames, len) in [(first_frames, first_len), (second_frames, second_len)] {
+        assert!(
+            frames >= len.div_ceil(frame_cap) as u64,
+            "{frames} frames for {len} bytes"
+        );
+    }
+    // Every frame went out once, on the first connection, and the server
+    // refused none.
+    let totals = sender.qwp_ws_totals()?;
+    assert_eq!(
+        (
+            totals.frames_sent,
+            totals.frames_replayed,
+            totals.reconnect_attempts,
+            totals.server_errors
+        ),
+        (second_fsn + 1, 0, 0, 0),
+        "{totals:?}"
+    );
+    assert!(!sender.must_close());
+
+    // A transaction for each flush, and the table holds the rows of all
+    // three, each row once.
+    let rows = CREATING_ROWS + first_rows + second_rows;
+    server.wait_for_rows(&table, rows)?;
+    assert_eq!(
+        server.digest(&table)?,
+        Some(Digest::of(&rows_from(0, rows)))
+    );
+    assert_eq!(server.transactions(&table)?, Some(3));
+
+    eprintln!(
+        "large flush that waits: two flushes of {first_rows} and {second_rows} rows, {first_len} \
+         and {second_len} bytes in the buffer, {first_frames} and {second_frames} frames of at \
+         most {frame_cap} bytes, through a queue of {queue_bytes} bytes; the first flush \
+         returned after {first_took:?}; the second, called while the queue held the first, \
+         returned after {second_took:?}; the server had confirmed both {confirmed_after:?} \
+         after the first call began"
+    );
+    eprintln!(
+        "a queue of {QUEUE_TOO_SMALL} bytes refused the buffer after {refused_after:?}: {}",
+        refusal.msg()
+    );
+    Ok(())
+}
+
+/// The size of the queue that a sender asks for when it refuses a buffer
+/// that its queue can never take.
+fn queue_bytes_named_by(refusal: &crate::Error) -> ProbeResult<u64> {
+    let text = refusal.msg();
+    let named = text
+        .split_once("Set sf_max_total_bytes to at least ")
+        .and_then(|(_, rest)| rest.split_once(','))
+        .map(|(bytes, _)| bytes)
+        .ok_or_else(|| format!("no queue size in: {text}"))?;
+    Ok(named.parse()?)
 }
 
 /// The server to test against and the size of the large buffer in MiB.
