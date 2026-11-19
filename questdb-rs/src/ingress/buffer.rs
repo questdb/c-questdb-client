@@ -555,7 +555,8 @@ impl Buffer {
     /// id. It falls short only once store-and-forward sends full symbol
     /// dictionaries, which it does when its symbol side-file cannot be opened
     /// or rolled back. The sender enforces `max_buf_size` against the encoded
-    /// replay message.
+    /// replay message; a sender that sends a buffer above its per-frame cap in
+    /// several frames enforces it against this size hint.
     pub fn len(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.len(),

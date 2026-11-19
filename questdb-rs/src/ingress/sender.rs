@@ -666,9 +666,12 @@ impl Sender {
     ///
     /// With QWP-over-WebSocket, the function publishes the rows into local
     /// memory or Store-and-Forward storage and returns without waiting for the
-    /// submitted frame's server ACK. It may still wait for local capacity. In
-    /// the default background progress mode, a sender-owned runner sends,
-    /// receives ACKs, reconnects, and replays as needed. In manual progress
+    /// submitted frame's server ACK. A buffer larger than one frame is
+    /// published as several frames that the server commits together, where the
+    /// sender supports it: see `Sender::effective_frame_cap`. It may still
+    /// wait for local capacity. In the default background progress mode, a
+    /// sender-owned runner sends, receives ACKs, reconnects, and replays as
+    /// needed. In manual progress
     /// mode, the caller must use `Sender::drive_once` or
     /// `Sender::wait` to advance WebSocket progress. Server or
     /// transport failures observed later are reported by subsequent sender
@@ -724,8 +727,12 @@ impl Sender {
     /// that value is the binding limit.
     ///
     /// The cap is the smallest of `max_buf_size`, the server's advertised cap
-    /// and the store-and-forward segment payload capacity. A flush whose
-    /// encoded frame exceeds it fails with
+    /// and the store-and-forward segment payload capacity. A sender in
+    /// background progress mode that keeps its queue in memory (no `sf_dir`),
+    /// on a connection that advertised `X-QWP-Max-Batch-Size`, sends a buffer
+    /// above the cap in several frames, which the server commits together.
+    /// Any other sender publishes a buffer as one frame: a flush whose
+    /// encoded frame exceeds the cap fails with
     /// [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge) and
     /// publishes nothing. The value can change after a reconnect.
     #[cfg(feature = "sync-sender-qwp-ws")]

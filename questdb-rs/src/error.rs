@@ -231,9 +231,16 @@ pub enum ErrorCode {
     /// the store-and-forward segment payload capacity). Chunk publication
     /// splits oversize inputs into smaller frames automatically, so there this
     /// only surfaces for an irreducible unit (the table schema plus a single
-    /// row block). A row [`Buffer`](crate::ingress::Buffer) is published as one
-    /// frame and is never split, so flushing one whose encoded frame exceeds
-    /// the cap fails with this code and publishes nothing. Distinct from
+    /// row block). A sender in background progress mode that keeps its queue
+    /// in memory (no `sf_dir`), on a connection that advertised
+    /// `X-QWP-Max-Batch-Size`, also sends a row
+    /// [`Buffer`](crate::ingress::Buffer) above the cap in several frames. It
+    /// fails a flush with this code, and publishes nothing, when the buffer
+    /// is larger than `max_buf_size`, when one of its rows fits no frame, and
+    /// when the queue (`sf_max_total_bytes`) can never hold the frames of the
+    /// flush together. Any other sender publishes a row buffer as one frame
+    /// and never splits it, so flushing one whose encoded frame exceeds the
+    /// cap fails with this code and publishes nothing. Distinct from
     /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
     /// without matching on the error message text.
     BatchTooLarge,

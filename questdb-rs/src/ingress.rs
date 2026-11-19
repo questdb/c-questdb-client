@@ -2714,7 +2714,9 @@ impl SenderBuilder {
     ///
     /// For ILP this applies to the exact pending byte length.
     /// For QWP/UDP this applies to the buffer size hint exposed by [`Buffer::len`].
-    /// For QWP/WebSocket this applies to the encoded replay message size.
+    /// For QWP/WebSocket this applies to the encoded replay message size; a
+    /// sender that sends a buffer above its per-frame cap in several frames
+    /// applies it to the size hint exposed by [`Buffer::len`].
     pub fn max_buf_size(mut self, value: usize) -> Result<Self> {
         let min = 1024;
         if value < min {
