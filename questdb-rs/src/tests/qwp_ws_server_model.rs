@@ -622,8 +622,11 @@ fn serve_connection(
     let _close = CloseOnDrop(stream.try_clone().unwrap());
     upgrade_mock_stream_with_max_batch_size(&mut stream, Some(max_batch_size));
     let mut frames = 0;
-    // A read fails when the client went away or the server stops.
-    while let Ok((fin, opcode, payload)) = read_frame(&mut stream) {
+    while wait_for_a_frame(&stream, shared) {
+        // A read fails when the client went away or the server stops.
+        let Ok((fin, opcode, payload)) = read_frame(&mut stream) else {
+            break;
+        };
         let answered = match opcode {
             WS_OPCODE_BINARY => {
                 assert!(fin, "the server model takes whole messages");
@@ -657,6 +660,43 @@ fn serve_connection(
             break;
         }
     }
+}
+
+/// How long a connection waits for its client before it looks whether the
+/// server has stopped or gone down.
+const SERVER_STATE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Waits until the client has sent something. `false` when the client went
+/// away, and when the server stopped or went down in the meantime.
+///
+/// A connection has to find the end of its server by itself. The server
+/// shuts the socket down, which wakes a blocked read on Linux and macOS. On
+/// Windows it does not: there a blocked read goes on until the client closes
+/// its end, or until the system gives the half-closed connection up, which
+/// takes two minutes.
+fn wait_for_a_frame(stream: &TcpStream, shared: &ServerShared) -> bool {
+    if stream.set_read_timeout(Some(SERVER_STATE_POLL)).is_err() {
+        return false;
+    }
+    let ready = loop {
+        match stream.peek(&mut [0u8; 1]) {
+            Ok(0) => break false,
+            Ok(_) => break true,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if shared.stop.load(Ordering::SeqCst) || shared.down.load(Ordering::SeqCst) {
+                    break false;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    // A frame that has begun is read to its end, however long that takes.
+    stream.set_read_timeout(None).is_ok() && ready
 }
 
 #[cfg(test)]
@@ -1516,5 +1556,38 @@ mod tests {
             thread::sleep(std::time::Duration::from_millis(1));
         }
         server.finish();
+    }
+
+    #[test]
+    fn server_model_socket_does_not_wait_for_a_client_that_stays_connected() {
+        // The clients neither read nor go away until the test ends.
+        let limit = std::time::Duration::from_secs(10);
+
+        let server = QwpWsModelServer::start(300);
+        let mut idle = client_of(&server);
+        read_upgrade_answer(&mut idle);
+        assert_eq!(server.open_connections(), 1);
+        let started = std::time::Instant::now();
+        server.go_down();
+        while server.open_connections() != 0 {
+            assert!(
+                started.elapsed() < limit,
+                "a server that went down waits for its client to go away"
+            );
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        server.finish();
+
+        let server = QwpWsModelServer::start(300);
+        let mut connected = client_of(&server);
+        read_upgrade_answer(&mut connected);
+        let started = std::time::Instant::now();
+        server.finish();
+        assert!(
+            started.elapsed() < limit,
+            "a server that stopped waited {:?} for its client to go away",
+            started.elapsed()
+        );
+        drop((idle, connected));
     }
 }
