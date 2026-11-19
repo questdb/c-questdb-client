@@ -27,10 +27,12 @@
 //! Such a buffer goes out in several frames that the server commits together
 //! when all of this holds: the sender makes its progress in the background
 //! and keeps its queue in memory, the server has told its frame limit, the
-//! buffer is within `max_buf_size` and holds no value that cannot be sent,
-//! and the queue has room for all the frames. The buffer may hold rows of
-//! several tables: the server commits each of them once. Each frame brings
-//! the symbols that its rows are the first to use on the connection.
+//! buffer is within `max_buf_size` and holds no value that cannot be sent.
+//! The buffer may hold rows of several tables: the server commits each of
+//! them once. Each frame brings the symbols that its rows are the first to
+//! use on the connection. The flush waits until the queue has room for all
+//! its frames, as long as `sf_append_deadline_millis` allows, and publishes
+//! none of them before.
 //! A buffer whose frames the queue can never hold together is refused with
 //! an error that names `sf_max_total_bytes` and the value that would do.
 //! Any other flush goes out as one frame, as before: a buffer that is too
@@ -40,8 +42,10 @@
 //! The server is the model of [`crate::tests::qwp_ws_server_model`] behind a
 //! socket: it holds the rows of a frame with the defer flag and commits at
 //! every frame without it, so the number of its commits tells how the frames
-//! of a flush were flagged.
+//! of a flush were flagged. A test can make it keep its answers to itself, so
+//! that what was flushed stays in the queue of the sender.
 
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
@@ -1200,25 +1204,80 @@ fn a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do
     server.finish();
 }
 
-#[test]
-fn a_flush_that_the_queue_can_hold_but_not_now_is_refused_as_one_frame() {
-    // The server tells its frame limit and then confirms nothing: what is
-    // flushed stays in the queue.
-    let port = spawn_max_batch_size_upgrade_only_server(Some(FRAME_LIMIT));
-    // A queue of eight segments of 1,024 bytes, for frames that go two a
-    // segment.
-    let mut sender = sender_with(port, "sf_max_segment_bytes=1024;sf_max_total_bytes=8192;");
-    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
-    let first = buffer_of(TABLE, 0..170);
-    let mut second = buffer_of(TABLE, 170..340);
-    let mut too_large = buffer_of(TABLE, 340..740);
-    // A flush of nine to twelve frames takes five or six segments: the
-    // queue holds one, and has no room for a second one next to it.
+/// The settings of a sender whose queue is eight segments of 1,024 bytes,
+/// for frames that go two a segment.
+const EIGHT_SEGMENTS: &str = "sf_max_segment_bytes=1024;sf_max_total_bytes=8192;";
+
+/// Two flushes for the queue of [`EIGHT_SEGMENTS`], and the number of
+/// frames of each. The six frames of the first fill three segments. Next to
+/// them the queue has five segments, which hold ten of the eleven frames of
+/// the second: that flush lacks room for its last frame alone.
+fn two_flushes_for_a_queue_that_holds_one() -> (Buffer, usize, Buffer, usize) {
+    let first = buffer_of(TABLE, 0..94);
+    let second = buffer_of(TABLE, 100..268);
     let first_frames = frames_of_a_flush(&first, 492).len();
     let second_frames = frames_of_a_flush(&second, 492).len();
-    assert!((9..=12).contains(&first_frames), "{first_frames} frames");
-    assert!((9..=12).contains(&second_frames), "{second_frames} frames");
+    assert_eq!((first_frames, second_frames), (6, 11));
     assert!(queue_bytes_for(second_frames) <= 8192);
+    (first, first_frames, second, second_frames)
+}
+
+/// What the segments of the queue of [`EIGHT_SEGMENTS`] take once it holds
+/// a flush of `frames` frames and nothing else: the segments of the frames,
+/// and the one that the runner prepares for the next frame when it gets to
+/// it, which a runner that is reconnecting does not.
+fn allocated_after_a_flush_of(frames: usize) -> [usize; 2] {
+    let segments = frames.div_ceil(2);
+    [segments * 1024, (segments + 1) * 1024]
+}
+
+/// Checks the error of a flush that waited for room in the queue of
+/// [`EIGHT_SEGMENTS`] until `sf_append_deadline_millis` had passed, with the
+/// connection up. What the segments of the queue take then is one of
+/// `allocated`.
+fn assert_timed_out_waiting_for_room(err: &crate::Error, allocated: &[usize]) {
+    assert_eq!(err.code(), ErrorCode::SocketError, "{}", err.msg());
+    let texts: Vec<String> = allocated
+        .iter()
+        .map(|allocated| {
+            format!(
+                "QWP/WebSocket Store-and-Forward append timed out waiting for ACK-driven \
+                 segment trim; increase sf_max_total_bytes or drive pending acknowledgements \
+                 [segment_size_bytes=1024, allocated_segment_bytes={allocated}, \
+                 max_total_bytes=8192]"
+            )
+        })
+        .collect();
+    assert!(
+        texts.iter().any(|text| text == err.msg()),
+        "got: {}",
+        err.msg()
+    );
+}
+
+/// Waits until the server has taken `frames` frames.
+fn wait_for_frames_taken(server: &QwpWsModelServer, frames: usize) {
+    let deadline = Instant::now() + WAIT;
+    while server.frames_taken() < frames {
+        assert!(
+            Instant::now() < deadline,
+            "the server took {} of {frames} frames",
+            server.frames_taken()
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    // The server takes what is flushed and keeps its answers to itself: what
+    // is flushed stays in the queue.
+    server.hold_answers();
+    let mut sender = sender_with(server.port, EIGHT_SEGMENTS);
+    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
+    let (first, first_frames, second, second_frames) = two_flushes_for_a_queue_that_holds_one();
+    let mut too_large = buffer_of(TABLE, 340..740);
     let too_many_frames = frames_of_a_flush(&too_large, 492).len();
     assert!(queue_bytes_for(too_many_frames) > 8192);
 
@@ -1226,8 +1285,6 @@ fn a_flush_that_the_queue_can_hold_but_not_now_is_refused_as_one_frame() {
         sender.flush_and_keep_and_get_fsn(&first).unwrap(),
         Some(first_frames as u64 - 1)
     );
-    // Provisional: this flush will wait for room.
-    assert_refused_as_one_frame(&mut sender, &mut second, 992, SET_BY_SEGMENT);
 
     // What the queue can never hold is refused at once, whatever it holds.
     let started = Instant::now();
@@ -1239,6 +1296,156 @@ fn a_flush_that_the_queue_can_hold_but_not_now_is_refused_as_one_frame() {
         8192,
     );
     assert!(started.elapsed() < Duration::from_secs(5));
+
+    // The second flush waits for the answer to the first.
+    let last_fsn = thread::scope(|scope| {
+        let flush = scope.spawn(|| sender.flush_and_keep_and_get_fsn(&second));
+        wait_for_frames_taken(&server, first_frames);
+        thread::sleep(Duration::from_millis(200));
+        assert!(!flush.is_finished(), "the flush did not wait for room");
+        assert_eq!(
+            server.frames_taken(),
+            first_frames,
+            "no frame of the flush is sent before all of them have room"
+        );
+        server.let_answers_go();
+        flush.join().unwrap().unwrap()
+    });
+    assert_eq!(last_fsn, Some((first_frames + second_frames) as u64 - 1));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 2, &[&first, &second]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent() {
+    const DEADLINE: Duration = Duration::from_millis(300);
+    let settings = format!("{EIGHT_SEGMENTS}sf_append_deadline_millis=300;");
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let mut sender = sender_with(server.port, &settings);
+    let (first, first_frames, mut second, second_frames) = two_flushes_for_a_queue_that_holds_one();
+    let (rows, len) = (second.row_count(), second.len());
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&first).unwrap(),
+        Some(first_frames as u64 - 1)
+    );
+    let started = Instant::now();
+    let err = sender.flush(&mut second).unwrap_err();
+    let waited = started.elapsed();
+    assert!(waited >= DEADLINE && waited < WAIT, "waited {waited:?}");
+    // Half of the queue is free: enough for every frame but the last.
+    let allocated = allocated_after_a_flush_of(first_frames);
+    assert_eq!(allocated, [3072, 4096]);
+    assert_timed_out_waiting_for_room(&err, &allocated);
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        Some(first_frames as u64 - 1),
+        "nothing is published"
+    );
+    assert_eq!(
+        (second.row_count(), second.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    wait_for_frames_taken(&server, first_frames);
+    assert_eq!(server.frames_taken(), first_frames, "nothing is sent");
+    // As after a flush of one frame that waited as long, below: the sender
+    // says that it must be closed, and goes on working all the same.
+    assert!(sender.must_close());
+
+    // A flush of one frame that finds the queue full fails the same way.
+    let mut other = sender_with(server.port, &settings);
+    let one_frame = buffer_of(FIRST, 0..10);
+    assert!(one_frame.len() <= 492);
+    let err = loop {
+        if let Err(err) = other.flush_and_keep(&one_frame) {
+            break err;
+        }
+        assert!(!other.must_close());
+    };
+    assert_timed_out_waiting_for_room(&err, &[8192]);
+    assert!(other.must_close());
+    drop(other);
+
+    // The server answers, and the same flush goes through: it waits for the
+    // runner to free the segments of the first flush, and is tried again
+    // should that take longer than the deadline.
+    server.let_answers_go();
+    let retry_until = Instant::now() + WAIT;
+    let last_fsn = loop {
+        match sender.flush_and_keep_and_get_fsn(&second) {
+            Ok(fsn) => break fsn,
+            Err(err) => assert!(Instant::now() < retry_until, "{}", err.msg()),
+        }
+    };
+    assert_eq!(last_fsn, Some((first_frames + second_frames) as u64 - 1));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 2, &[&first, &second]);
+    assert!(sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let mut sender = sender_with(
+        server.port,
+        &format!(
+            "{EIGHT_SEGMENTS}sf_append_deadline_millis=300;\
+             reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;"
+        ),
+    );
+    let (first, first_frames, mut second, _) = two_flushes_for_a_queue_that_holds_one();
+    let (rows, len) = (second.row_count(), second.len());
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&first).unwrap(),
+        Some(first_frames as u64 - 1)
+    );
+
+    // The server goes down with the first flush unconfirmed, and the sender
+    // has tried to reconnect and failed.
+    server.go_down();
+    let deadline = Instant::now() + WAIT;
+    while sender.qwp_ws_totals().unwrap().reconnect_attempts < 2 {
+        assert!(Instant::now() < deadline, "the sender did not reconnect");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let err = sender.flush(&mut second).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError, "{}", err.msg());
+    let begins = allocated_after_a_flush_of(first_frames).map(|allocated| {
+        format!(
+            "QWP/WebSocket Store-and-Forward append timed out waiting for ACK-driven segment \
+             trim [segment_size_bytes=1024, allocated_segment_bytes={allocated}, \
+             max_total_bytes=8192]; the connection is down and reconnecting keeps failing: "
+        )
+    });
+    let end = ". The frames already published remain queued and the sender keeps reconnecting: \
+               retry the flush once that is resolved, or close the sender to give up.";
+    assert!(
+        begins.iter().any(|begin| err.msg().starts_with(begin)) && err.msg().ends_with(end),
+        "got: {}",
+        err.msg()
+    );
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        Some(first_frames as u64 - 1),
+        "nothing is published"
+    );
+    assert_eq!(
+        (second.row_count(), second.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    assert!(sender.must_close());
+    drop(sender);
+    server.finish();
 }
 
 #[test]

@@ -801,6 +801,36 @@ where
         }
     }
 
+    /// Waits until the queue has room for frames with payloads of
+    /// `payload_lens` bytes, all at once: see [`SfaProducer::has_room_for`].
+    /// Returns at once when it has.
+    ///
+    /// The room comes when the server confirms frames that the queue holds
+    /// and the runner frees their segments. The wait is the one of a single
+    /// frame in [`Self::publish_replay_payload`]: it ends at the append
+    /// deadline with the same error, and at once when the sender stops
+    /// taking publications. It queues nothing, so a flush that gives up here
+    /// has published nothing.
+    fn wait_for_room(&self, producer: &SfaProducer, payload_lens: &[usize]) -> crate::Result<()> {
+        if producer.has_room_for(payload_lens) {
+            return Ok(());
+        }
+        let deadline = Instant::now().checked_add(self.append_deadline);
+        loop {
+            let backpressure_generation = self.backpressure.generation();
+            self.check_publication_open()?;
+            if producer.has_room_for(payload_lens) {
+                return Ok(());
+            }
+            if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
+                return Err(submit_timeout_error(
+                    Some(producer.no_room_error()),
+                    self.reconnect_failure().as_ref(),
+                ));
+            }
+        }
+    }
+
     fn check_publication_open(&self) -> crate::Result<()> {
         match self.lifecycle.load() {
             PublicationState::Open => Ok(()),
@@ -4197,9 +4227,11 @@ fn connect_blocking_transport_with_retry(
 /// `frame_cap`. A buffer above `frame_cap` goes out in several frames that
 /// the server commits together instead, when all of this holds: the queue is
 /// in memory, the server has told its frame limit, the buffer is within
-/// `max_buf_size`, it can be cut into frames, and the queue has room for all
-/// of them now. When the queue can never have that room, the buffer is
-/// refused before anything of it is encoded.
+/// `max_buf_size`, and it can be cut into frames. Such a flush waits until
+/// the queue has room for all its frames, as a flush of one frame waits for
+/// the room of its frame, and queues nothing before. When the queue can
+/// never have that room, the buffer is refused before anything of it is
+/// encoded.
 pub(crate) fn flush_qwp_ws(
     state: &mut SyncQwpWsHandlerState,
     buffer: &QwpWsColumnarBuffer,
@@ -4215,22 +4247,23 @@ pub(crate) fn flush_qwp_ws(
             let target = frame_cap.min(state.sfa_frame_split_target);
             if let Some(plan) = buffer.plan_frames(target, frame_cap)
                 && let Some(producer) = runner.producer.as_ref()
+                && let Some(min_total_bytes) = producer.min_total_bytes_for(plan.frame_sizes())
             {
                 let frame_sizes = plan.frame_sizes();
                 let max_total_bytes = producer.max_total_bytes();
-                if let Some(min_total_bytes) = producer.min_total_bytes_for(frame_sizes)
-                    && min_total_bytes > max_total_bytes
-                {
+                if min_total_bytes > max_total_bytes {
                     return Err(QwpWsFlushError::Refused(flush_exceeds_queue_error(
                         frame_sizes.len(),
                         min_total_bytes,
                         max_total_bytes,
                     )));
                 }
-                if producer.has_room_for(frame_sizes) {
-                    return publish_qwp_ws_frames(encoder, runner, buffer, &plan, frame_cap)
-                        .map_err(QwpWsFlushError::Failed);
-                }
+                // The queue can hold the frames together, so the room comes
+                // once the server has confirmed what the queue holds now.
+                return runner
+                    .wait_for_room(producer, frame_sizes)
+                    .and_then(|()| publish_qwp_ws_frames(encoder, runner, buffer, &plan, frame_cap))
+                    .map_err(QwpWsFlushError::Failed);
             }
         }
     }
@@ -4246,8 +4279,9 @@ pub(crate) enum QwpWsFlushError {
     /// The buffer is refused before anything of it is encoded, with an error
     /// that names the limit in the way and what to do about it.
     Refused(crate::Error),
-    /// Any other error. Among these is the size error of a buffer that goes
-    /// out as one frame, to which `Sender` adds what sets the frame cap.
+    /// Any other error. Among these are the size error of a buffer that goes
+    /// out as one frame, to which `Sender` adds what sets the frame cap, and
+    /// the error of a flush that waited in vain for room in the queue.
     Failed(crate::Error),
 }
 
@@ -7419,6 +7453,52 @@ mod tests {
                 err.msg()
             );
             publish_thread.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn threaded_runner_wakes_a_wait_for_room_on_terminal_error() {
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (_ack_tx, ack_rx) = mpsc::channel();
+        let (terminal_tx, terminal_rx) = mpsc::channel();
+        let transport = SignalResponseTransport {
+            sent_frame: sent_tx,
+            ack: ack_rx,
+            terminal: terminal_rx,
+            sent_frames: Vec::new(),
+        };
+        let driver = QwpWsCoreTestHarness::from_queue(byte_backpressured_queue(), transport);
+        let mut runner =
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
+
+        runner.publish_replay_payload(b"aaaaaaaaaa").unwrap();
+        assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 0);
+        runner.publish_replay_payload(b"bbbbbbbbbb").unwrap();
+        assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 1);
+
+        std::thread::scope(|scope| {
+            let (waited_tx, waited_rx) = mpsc::channel();
+            let runner = &mut runner;
+            let wait_thread = scope.spawn(move || {
+                // One more frame needs a segment that the queue does not
+                // have while the two before are not confirmed.
+                let producer = runner.producer.as_ref().unwrap();
+                let _ = waited_tx.send(runner.wait_for_room(producer, &[10]));
+            });
+
+            assert!(waited_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            terminal_tx.send(()).unwrap();
+            let err = waited_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the wait ends when the sender stops, before its deadline")
+                .unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(
+                err.msg().contains("synthetic terminal failure"),
+                "got: {}",
+                err.msg()
+            );
+            wait_thread.join().unwrap();
         });
     }
 

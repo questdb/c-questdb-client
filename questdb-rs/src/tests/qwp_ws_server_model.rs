@@ -397,6 +397,9 @@ impl QwpWsModelConnection {
 /// A socket server that takes QWP/WebSocket connections and answers each as
 /// the model says. Its upgrade answer advertises `max_batch_size` as the
 /// frame limit.
+///
+/// A test can make it hold its answers back, as a server does that is slow
+/// to commit: see [`Self::hold_answers`].
 pub(crate) struct QwpWsModelServer {
     pub(crate) port: u16,
     pub(crate) model: QwpWsServerModel,
@@ -406,10 +409,37 @@ pub(crate) struct QwpWsModelServer {
 
 struct ServerShared {
     stop: AtomicBool,
+    /// The server ends every connection: see [`QwpWsModelServer::go_down`].
+    down: AtomicBool,
     /// The connections the server has taken and not yet seen the end of.
     open: AtomicUsize,
     /// Every connection taken so far, to end them when the server stops.
     streams: Mutex<Vec<TcpStream>>,
+    /// The frames taken so far, over all connections.
+    frames: AtomicUsize,
+    /// Locked for every write to a client, so that an answer that was held
+    /// back and one that is given at once never mix.
+    answers: Mutex<Answers>,
+}
+
+#[derive(Default)]
+struct Answers {
+    held_back: bool,
+    /// The answers held back, each with the connection that waits for it,
+    /// in the order the server made them.
+    waiting: Vec<(TcpStream, Vec<u8>)>,
+}
+
+impl ServerShared {
+    /// Gives the client its answer, or keeps it while answers are held back.
+    fn answer(&self, stream: &mut TcpStream, answer: Vec<u8>) -> std::io::Result<()> {
+        let mut answers = self.answers.lock().unwrap();
+        if answers.held_back {
+            answers.waiting.push((stream.try_clone()?, answer));
+            return Ok(());
+        }
+        write_server_binary_frame(stream, &answer)
+    }
 }
 
 impl QwpWsModelServer {
@@ -431,8 +461,11 @@ impl QwpWsModelServer {
         let model = QwpWsServerModel::new();
         let shared = Arc::new(ServerShared {
             stop: AtomicBool::new(false),
+            down: AtomicBool::new(false),
             open: AtomicUsize::new(0),
             streams: Mutex::new(Vec::new()),
+            frames: AtomicUsize::new(0),
+            answers: Mutex::default(),
         });
 
         let acceptor = thread::spawn({
@@ -447,6 +480,10 @@ impl QwpWsModelServer {
                         if shared.stop.load(Ordering::SeqCst) {
                             break;
                         }
+                        if shared.down.load(Ordering::SeqCst) {
+                            // Ended before the server answers anything.
+                            continue;
+                        }
                         streams.push(stream.try_clone().unwrap());
                     }
                     let connection = model.connect();
@@ -456,8 +493,14 @@ impl QwpWsModelServer {
                     let cut_after_frames = cut_after_frames.take();
                     connections.push(thread::spawn(move || {
                         // Dropped last: the connection and its rows are gone.
-                        let _open = open;
-                        serve_connection(stream, connection, max_batch_size, cut_after_frames);
+                        let open = open;
+                        serve_connection(
+                            stream,
+                            connection,
+                            max_batch_size,
+                            cut_after_frames,
+                            &open.0,
+                        );
                     }));
                 }
                 // What stopped a connection stops the server.
@@ -481,6 +524,41 @@ impl QwpWsModelServer {
     /// of. A connection that has ended has lost the rows it held.
     pub(crate) fn open_connections(&self) -> usize {
         self.shared.open.load(Ordering::SeqCst)
+    }
+
+    /// How many frames the server has taken so far, over all connections.
+    pub(crate) fn frames_taken(&self) -> usize {
+        self.shared.frames.load(Ordering::SeqCst)
+    }
+
+    /// From now on the server keeps its answers to itself. It takes every
+    /// frame as before, and commits as before: only the client does not
+    /// learn of it.
+    pub(crate) fn hold_answers(&self) {
+        self.shared.answers.lock().unwrap().held_back = true;
+    }
+
+    /// Gives the answers that were held back, in their order, and answers
+    /// every later frame at once again.
+    pub(crate) fn let_answers_go(&self) {
+        let mut answers = self.shared.answers.lock().unwrap();
+        answers.held_back = false;
+        for (mut stream, answer) in answers.waiting.drain(..) {
+            // The client may have gone away meanwhile.
+            let _ = write_server_binary_frame(&mut stream, &answer);
+        }
+    }
+
+    /// From now on the server is down for its clients: it ends the
+    /// connections it has, and every new one before it answers anything. It
+    /// keeps its port, so that a client that tries again never reaches the
+    /// server of another test.
+    pub(crate) fn go_down(&self) {
+        let streams = self.shared.streams.lock().unwrap();
+        self.shared.down.store(true, Ordering::SeqCst);
+        for stream in streams.iter() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
     }
 
     /// Stops the server. Panics if the model refused a frame of one of the
@@ -539,6 +617,7 @@ fn serve_connection(
     mut connection: QwpWsModelConnection,
     max_batch_size: usize,
     cut_after_frames: Option<usize>,
+    shared: &ServerShared,
 ) {
     let _close = CloseOnDrop(stream.try_clone().unwrap());
     upgrade_mock_stream_with_max_batch_size(&mut stream, Some(max_batch_size));
@@ -556,15 +635,19 @@ fn serve_connection(
                 );
                 let answer = connection.receive(&payload);
                 frames += 1;
+                shared.frames.fetch_add(1, Ordering::SeqCst);
                 if cut_after_frames == Some(frames) {
                     break;
                 }
                 match answer {
-                    Some(answer) => write_server_binary_frame(&mut stream, &answer),
+                    Some(answer) => shared.answer(&mut stream, answer),
                     None => Ok(()),
                 }
             }
-            WS_OPCODE_PING => write_server_frame(&mut stream, WS_OPCODE_PONG, &payload, false),
+            WS_OPCODE_PING => {
+                let _answers = shared.answers.lock().unwrap();
+                write_server_frame(&mut stream, WS_OPCODE_PONG, &payload, false)
+            }
             WS_OPCODE_PONG => Ok(()),
             WS_OPCODE_CLOSE => break,
             other => panic!("the server model does not take WebSocket opcode {other:#x}"),
@@ -578,7 +661,7 @@ fn serve_connection(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     use super::*;
     use crate::ingress::SentDictMirror;
@@ -1359,6 +1442,79 @@ mod tests {
             read_frame(&mut stream).unwrap(),
             (true, WS_OPCODE_BINARY, ok(0, &[(TABLE, 1)]).unwrap())
         );
+        server.finish();
+    }
+
+    #[test]
+    fn server_model_socket_holds_its_answers_back_until_they_are_let_go() {
+        let frame = |ids| frame_of_a_whole_buffer(&buffer_of(TABLE, ids), false);
+        let server = QwpWsModelServer::start(300);
+        let mut stream = client_of(&server);
+        read_upgrade_answer(&mut stream);
+
+        server.hold_answers();
+        write_server_frame(&mut stream, WS_OPCODE_BINARY, &frame(0..1), true).unwrap();
+        write_server_frame(&mut stream, WS_OPCODE_BINARY, &frame(1..2), true).unwrap();
+        // The answer to a ping is the next thing the server sends: it took
+        // both frames, committed each and answered neither.
+        write_server_frame(&mut stream, WS_OPCODE_PING, b"mark", true).unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap(),
+            (true, WS_OPCODE_PONG, b"mark".to_vec())
+        );
+        assert_eq!(server.frames_taken(), 2);
+        assert_eq!(server.model.table(TABLE).unwrap().commits, 2);
+
+        server.let_answers_go();
+        for (sequence, commit) in [(0, 1), (1, 2)] {
+            assert_eq!(
+                read_frame(&mut stream).unwrap(),
+                (
+                    true,
+                    WS_OPCODE_BINARY,
+                    ok(sequence, &[(TABLE, commit)]).unwrap()
+                )
+            );
+        }
+        // A later frame is answered at once again.
+        write_server_frame(&mut stream, WS_OPCODE_BINARY, &frame(2..3), true).unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap(),
+            (true, WS_OPCODE_BINARY, ok(2, &[(TABLE, 3)]).unwrap())
+        );
+        assert_eq!(server.frames_taken(), 3);
+        drop(stream);
+        server.finish();
+    }
+
+    #[test]
+    fn server_model_socket_ends_every_connection_once_it_is_down() {
+        let server = QwpWsModelServer::start(300);
+        let mut stream = client_of(&server);
+        read_upgrade_answer(&mut stream);
+        assert_eq!(server.open_connections(), 1);
+
+        server.go_down();
+        // A read finds the end of the connection, or fails, before its
+        // timeout.
+        let ends = |mut stream: TcpStream| match stream.read(&mut [0u8; 1]) {
+            Ok(read) => read == 0,
+            Err(err) => !matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+        };
+        assert!(ends(stream));
+        // So does a new connection, which gets no answer to an upgrade.
+        let late = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        late.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        assert!(ends(late));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while server.open_connections() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
         server.finish();
     }
 }

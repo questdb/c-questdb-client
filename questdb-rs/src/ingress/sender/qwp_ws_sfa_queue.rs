@@ -3600,6 +3600,20 @@ impl SfaProducer {
     pub(crate) fn max_total_bytes(&self) -> u64 {
         self.engine.max_bytes as u64
     }
+
+    /// What frames wait for that [`Self::has_room_for`] finds no room for:
+    /// segments, which the runner frees once the server has confirmed the
+    /// frames in them. The queue tells a single frame the same when its byte
+    /// budget is used up. Frames that need several segments get this answer
+    /// while some of the budget is still free.
+    pub(crate) fn no_room_error(&self) -> QueueError {
+        self.engine
+            .with_state(|state| QueueError::StorageSegmentCapFull {
+                segment_size_bytes: self.engine.segment_size_bytes,
+                allocated_segment_bytes: state.allocated_segment_bytes,
+                max_total_bytes: self.engine.max_bytes as u64,
+            })
+    }
 }
 
 fn first_unresolved_fsn_from_segments(
@@ -7393,6 +7407,38 @@ mod tests {
             producer.try_submit(&[0x5a; 30]).unwrap();
         }
         assert_eq!(queue.allocated_segment_bytes(), 400);
+    }
+
+    #[test]
+    fn no_room_error_tells_what_the_segments_take_of_the_budget() {
+        // Four segments of 100 bytes, each for one frame of 68 bytes.
+        let mut queue = SfaFrameQueue::open_memory(memory_options(100, 400)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        let no_room = |allocated_segment_bytes| QueueError::StorageSegmentCapFull {
+            segment_size_bytes: 100,
+            allocated_segment_bytes,
+            max_total_bytes: 400,
+        };
+
+        // Two frames take two segments. Three more wait for a segment to
+        // be freed although two are free: it is the answer of a queue whose
+        // budget is used up all the same, not that of one that prepares a
+        // segment.
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        assert!(!producer.has_room_for(&[68; 3]));
+        assert_eq!(producer.no_room_error(), no_room(200));
+
+        // The runner prepares a third segment, which takes nothing from the
+        // room: the three frames still lack a segment.
+        while queue.maintain_storage().unwrap() {}
+        assert!(!producer.has_room_for(&[68; 3]));
+        assert_eq!(producer.no_room_error(), no_room(300));
+
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        assert!(!producer.has_room_for(&[68]));
+        assert_eq!(producer.no_room_error(), no_room(400));
     }
 
     /// A flush for which the queue has the budget of `min_total_bytes_for`
