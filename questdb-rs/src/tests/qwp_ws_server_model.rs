@@ -106,15 +106,32 @@ const WS_OPCODE_PING: u8 = 0x9;
 const WS_OPCODE_PONG: u8 = 0xA;
 
 /// The frames of one flush of `buffer`, cut for frames of `target` bytes:
-/// every frame but the last has the defer flag. The connection has no symbols.
+/// every frame but the last has the defer flag. The buffer has no symbols.
 pub(crate) fn frames_of_a_flush(buffer: &Buffer, target: usize) -> Vec<Vec<u8>> {
+    let mut no_symbols = SymbolGlobalDict::new();
+    let frames = frames_of_a_sender(buffer, target, &mut no_symbols);
+    assert_eq!(
+        no_symbols.next_id(),
+        0,
+        "a buffer with symbols needs the dictionary of its sender"
+    );
+    frames
+}
+
+/// As [`frames_of_a_flush`], from a sender whose symbol dictionary is
+/// `symbols`: each frame brings the symbols that its rows use and the
+/// dictionary does not hold yet, and the dictionary holds them afterwards.
+pub(crate) fn frames_of_a_sender(
+    buffer: &Buffer,
+    target: usize,
+    symbols: &mut SymbolGlobalDict,
+) -> Vec<Vec<u8>> {
     let rows = buffer.as_qwp_ws().expect("a QWP/WebSocket buffer");
     let plan = rows
         .plan_frames(target, target)
         .expect("a buffer the planner can cut");
     let frame_count = plan.frames().count();
     let mut scratch = QwpWsEncodeScratch::new();
-    let no_symbols = SymbolGlobalDict::new();
     plan.frames()
         .enumerate()
         .map(|(frame_idx, blocks)| {
@@ -123,7 +140,7 @@ pub(crate) fn frames_of_a_flush(buffer: &Buffer, target: usize) -> Vec<Vec<u8>> 
                 blocks,
                 &mut frame,
                 &mut scratch,
-                &no_symbols,
+                symbols,
                 QWP_VERSION,
                 frame_idx + 1 < frame_count,
             )
@@ -200,7 +217,8 @@ pub(crate) fn add_rows(buffer: &mut Buffer, table: &str, ids: std::ops::Range<i6
 /// the rows do not depend on how a flush is cut.
 pub(crate) fn rows_of(table: &str, buffer: &Buffer) -> Vec<String> {
     let server = QwpWsServerModel::new();
-    let frame = frame_of_a_whole_buffer(buffer, false);
+    // A connection of its own: the frame brings every symbol of the buffer.
+    let frame = frame_of_a_sender(buffer, false, &mut SymbolGlobalDict::new());
     assert!(server.connect().receive(&frame).is_some());
     server.table(table).unwrap().rows_as_text()
 }

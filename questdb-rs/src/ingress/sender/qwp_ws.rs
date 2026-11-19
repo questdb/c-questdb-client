@@ -4318,9 +4318,10 @@ where
     let mut last_fsn = None;
     while let Some(blocks) = frames.next() {
         let defer_commit = frames.peek().is_some();
-        let published = encoder
-            .encode_frame(buffer, blocks, defer_commit, frame_cap)
-            .and_then(|payload| runner.publish_replay_payload(payload));
+        let published =
+            encoder.encode_and_publish_frame(buffer, blocks, defer_commit, frame_cap, |payload| {
+                runner.publish_replay_payload(payload)
+            });
         match published {
             Ok(fsn) => last_fsn = Some(fsn),
             Err(err) if last_fsn.is_none() => return Err(err),
@@ -7731,7 +7732,17 @@ mod tests {
         };
         let driver =
             QwpWsCoreTestHarness::from_queue(SfaFrameQueue::open_memory(queue).unwrap(), transport);
-        let runner = SyncQwpWsRunner::start_driver_with_append_deadline(driver, append_deadline);
+        // As for a sender that keeps its queue in memory: a frame brings the
+        // symbols that are new to the connection, and the driver keeps what
+        // it has sent, to bring it again on a new connection.
+        let (store, mut send_core) = driver.into_parts();
+        send_core.enable_delta_dict(&[], 0);
+        let runner = SyncQwpWsRunner::start_with_append_deadline(
+            store,
+            send_core,
+            append_deadline,
+            Arc::new(TrafficGate::default()),
+        );
         let mut encoder = QwpWsReplayEncoder::new(1);
         encoder.set_delta_dict_enabled(true);
         (runner, encoder, wire)
@@ -7895,6 +7906,41 @@ mod tests {
         assert_eq!(runner.published_fsn().unwrap(), None);
         assert!(wire.sent.lock().unwrap().is_empty());
 
+        let fsn = publish_frames(&mut encoder, &mut runner, &buffer, &plan)
+            .unwrap()
+            .unwrap();
+        wait_for_ack(&runner, fsn);
+        let table = server.table(FLUSH_TABLE).unwrap();
+        assert_eq!(table.commits, 1);
+        assert_eq!(table.rows_as_text(), rows_of(FLUSH_TABLE, &buffer));
+    }
+
+    #[test]
+    fn a_flush_whose_first_frame_is_refused_gives_its_symbols_back() {
+        let server = QwpWsServerModel::new();
+        let (mut runner, mut encoder, wire) =
+            runner_on_model(&server, small_segments(64), Duration::from_secs(5), None);
+        // A new symbol in every row: every frame brings some.
+        let mut buffer = Buffer::new_qwp_ws();
+        for id in 0..400 {
+            buffer.table(FLUSH_TABLE).unwrap();
+            buffer.symbol("sym", format!("s{id}")).unwrap();
+            buffer.column_i64("id", id).unwrap();
+            buffer.at_now().unwrap();
+        }
+        let plan = small_frames_plan(&buffer);
+        assert!(plan.frames().count() > 8);
+        let rows = buffer.as_qwp_ws().unwrap();
+
+        // No frame of the flush is as small as 64 bytes.
+        let err = publish_qwp_ws_frames(&mut encoder, &mut runner, rows, &plan, 64).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::BatchTooLarge);
+        assert!(!runner.lifecycle_is_terminal());
+        assert!(wire.sent.lock().unwrap().is_empty());
+
+        // The symbols of the refused frame did not stay with the sender: the
+        // server model refuses a frame whose symbols start behind those that
+        // its connection holds.
         let fsn = publish_frames(&mut encoder, &mut runner, &buffer, &plan)
             .unwrap()
             .unwrap();

@@ -4060,10 +4060,9 @@ impl QwpWsColumnarBuffer {
     /// `cap` bytes. Frame sizes are taken from the size bound of their
     /// blocks, so an encoded frame is never larger.
     ///
-    /// `None` when the buffer cannot be cut: a table with rows has a symbol
-    /// column, which a frame of a plan does not bring yet, or a decimal
-    /// value that the encoder refuses, the frame of a row would exceed
-    /// `cap`, or the buffer holds no rows at all.
+    /// `None` when the buffer cannot be cut: a table holds a decimal value
+    /// that the encoder refuses, the frame of a row would exceed `cap`, or
+    /// the buffer holds no rows at all.
     pub(crate) fn plan_frames(&self, target: usize, cap: usize) -> Option<QwpWsFramePlan> {
         debug_assert!(target <= cap);
         // A frame without new symbols: the header, the dictionary start and
@@ -4071,32 +4070,37 @@ impl QwpWsColumnarBuffer {
         let frame_overhead =
             QWP_MESSAGE_HEADER_SIZE + QWP_WS_SYMBOL_ID_MAX_LEN + qwp_varint_size(0);
         let block_cap = cap.saturating_sub(frame_overhead);
+        // A frame that brings symbols counts them in up to this many bytes
+        // more: no frame brings more symbols than a connection can hold.
+        let symbol_count_room = qwp_varint_size(MAX_CONN_SYMBOL_DICT_SIZE as u64) - 1;
 
         let mut plan = QwpWsFramePlan::default();
-        // The frame being filled: its first block, and its size so far.
+        // The frame being filled: its first block, its size so far, and
+        // whether that has the room to count symbols.
         let mut frame_start = 0;
         let mut frame_size = frame_overhead;
+        let mut frame_counts_symbols = false;
         for (table_idx, table) in self.tables.iter().enumerate() {
             // The frames of a plan are published one by one. A value that
-            // the encoder refuses must be found before the first of them.
-            if !table.decimals_can_be_encoded() {
-                return None;
-            }
-            // A frame of a plan brings no symbols yet.
-            if table.row_count > 0 && table.has_symbol_column() {
-                return None;
-            }
+            // cannot be sent must be found before the first of them.
+            // The blocks of a table with a symbol column may bring symbols.
+            let brings_symbols = table.has_symbol_column_if_sendable()?;
             let mut lo = 0;
             let mut like_rows = None;
             while lo < table.row_count {
                 let frame_is_empty = plan.blocks.len() == frame_start;
-                let room = target.saturating_sub(frame_size);
+                let count_room = if brings_symbols && !frame_counts_symbols {
+                    symbol_count_room
+                } else {
+                    0
+                };
+                let room = target.saturating_sub(frame_size + count_room);
                 let (mut hi, mut block_size) = table.fitting_rows_end(lo, room, like_rows)?;
                 if hi == lo && frame_is_empty {
                     // Not even one row fits the target: the row travels alone.
                     hi = lo + 1;
                     block_size = table.encoded_rows_bound(lo..hi)?;
-                    if block_size > block_cap {
+                    if count_room + block_size > block_cap {
                         return None;
                     }
                 }
@@ -4105,7 +4109,8 @@ impl QwpWsColumnarBuffer {
                         table_idx,
                         rows: lo..hi,
                     });
-                    frame_size += block_size;
+                    frame_size += count_room + block_size;
+                    frame_counts_symbols |= brings_symbols;
                     // Rows next to each other are the most alike: the search
                     // for the next frame starts from the size of this one,
                     // when the block had the frame to itself.
@@ -4121,6 +4126,7 @@ impl QwpWsColumnarBuffer {
                     plan.frame_sizes.push(frame_size);
                     frame_start = plan.blocks.len();
                     frame_size = frame_overhead;
+                    frame_counts_symbols = false;
                 }
             }
         }
@@ -4133,27 +4139,31 @@ impl QwpWsColumnarBuffer {
 
     /// Encodes one frame of a plan: the message
     /// [`Self::encode_ws_replay_message_with_defer`] writes in delta mode,
-    /// with `blocks` in place of every table whole. The frame brings no new
-    /// symbols: its dictionary section is the connection dictionary's next
-    /// id and a zero count.
+    /// with `blocks` in place of every table whole.
     ///
-    /// The tables of `blocks` must hold no symbol column, which is all the
-    /// planner cuts so far.
+    /// The frame brings the symbols that its blocks use and no frame of the
+    /// flush has used before, block by block and column by column: it
+    /// interns them into `global_dict`, and its dictionary section holds
+    /// those that were new to the connection. When the frame is not sent,
+    /// the caller takes them out of `global_dict` again.
+    ///
+    /// The frames of a flush are encoded in the order of the plan, with one
+    /// `scratch`. It keeps, for each symbol column, the connection id of
+    /// every symbol that the frames so far have used, and a block that
+    /// starts at the first row of its table starts that anew.
     pub(crate) fn encode_ws_frame(
         &self,
         blocks: &[QwpWsFrameBlock],
         out: &mut Vec<u8>,
         scratch: &mut QwpWsEncodeScratch,
-        global_dict: &SymbolGlobalDict,
+        global_dict: &mut SymbolGlobalDict,
         version: u8,
         defer_commit: bool,
     ) -> crate::Result<()> {
         out.clear();
         out.extend_from_slice(&[0u8; QWP_MESSAGE_HEADER_SIZE]);
-        write_qwp_varint(out, global_dict.next_id());
-        write_qwp_varint(out, 0);
 
-        let table_count = checked_qwp_u16(blocks.len(), "WS message table count")?;
+        let dict_start = global_dict.next_id();
         for block in blocks {
             let table = &self.tables[block.table_idx];
             // The block encoder takes a symbol id map per column, used or not.
@@ -4164,7 +4174,33 @@ impl QwpWsColumnarBuffer {
             while symbol_globals.len() < table.columns.len() {
                 symbol_globals.push(Vec::new());
             }
-            table.encode_rows(block.rows.clone(), symbol_globals, out)?;
+            for (column, globals) in table.columns.iter().zip(symbol_globals) {
+                column
+                    .values
+                    .intern_symbols_up_to(block.rows.clone(), globals, global_dict)?;
+            }
+        }
+        write_qwp_varint(out, dict_start);
+        let dict_end = global_dict.next_id();
+        write_qwp_varint(out, dict_end - dict_start);
+        for id in dict_start..dict_end {
+            let bytes = global_dict.entry(id).ok_or_else(|| {
+                error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP/WS frame encoder error: missing global symbol id {}",
+                    id
+                )
+            })?;
+            write_qwp_bytes(out, bytes);
+        }
+
+        let table_count = checked_qwp_u16(blocks.len(), "WS message table count")?;
+        for block in blocks {
+            self.tables[block.table_idx].encode_rows(
+                block.rows.clone(),
+                &scratch.per_segment_symbol_globals[block.table_idx],
+                out,
+            )?;
         }
 
         let header = QwpMessageHeader {
@@ -4312,18 +4348,23 @@ impl QwpWsTableBuffer {
         Some(bound)
     }
 
-    /// Whether the table has a symbol column.
-    fn has_symbol_column(&self) -> bool {
-        self.columns
-            .iter()
-            .any(|column| matches!(column.values, QwpWsColumnValues::Symbol { .. }))
-    }
-
-    /// Whether the encoder takes every decimal value of the table.
-    fn decimals_can_be_encoded(&self) -> bool {
-        self.columns
-            .iter()
-            .all(|column| column.values.decimals_can_be_encoded())
+    /// Looks through the table for a value that cannot be sent: a decimal
+    /// that the encoder refuses, or a symbol that a connection does not
+    /// take. `None` when the table holds one. Otherwise whether it has a
+    /// symbol column.
+    fn has_symbol_column_if_sendable(&self) -> Option<bool> {
+        let mut has_symbol_column = false;
+        for column in &self.columns {
+            if matches!(column.values, QwpWsColumnValues::Symbol { .. }) {
+                has_symbol_column = true;
+                if !column.symbols_can_be_interned() {
+                    return None;
+                }
+            } else if !column.values.decimals_can_be_encoded() {
+                return None;
+            }
+        }
+        Some(has_symbol_column)
     }
 
     /// The largest `hi` for which the size bound of rows `[lo, hi)` is at
@@ -5083,6 +5124,27 @@ impl QwpWsColumnBuffer {
         }
     }
 
+    /// Whether a connection takes every symbol of the column: it refuses one
+    /// longer than [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`] when a frame brings it
+    /// ([`SymbolGlobalDict::intern`]), which the column took.
+    ///
+    /// The length of such a symbol takes three bytes or more. So only a
+    /// column that has held a symbol of 16,384 bytes or more since it was
+    /// cleared is looked through.
+    fn symbols_can_be_interned(&self) -> bool {
+        if usize::from(self.symbol_len_prefix_max)
+            < qwp_varint_size(MAX_PERSISTED_SYMBOL_ENTRY_LEN + 1)
+        {
+            return true;
+        }
+        match &self.values {
+            QwpWsColumnValues::Symbol { dict, .. } => dict
+                .iter()
+                .all(|entry| u64::from(entry.len) <= MAX_PERSISTED_SYMBOL_ENTRY_LEN),
+            _ => true,
+        }
+    }
+
     /// An upper bound of what `rows` of the column add to a frame: what
     /// `encode` writes for them, which is the flag byte, the null bitmap and
     /// the values, and for a symbol column also the symbols that the rows
@@ -5514,6 +5576,55 @@ impl QwpWsColumnValues {
                         || narrow_decimal_le_fits(&bytes, width).is_some()
                 })
             })
+    }
+
+    /// For a symbol column, makes `globals` hold the connection id of every
+    /// symbol that the rows before `rows.end` use, in the order of the
+    /// column's own ids: the symbols it does not hold yet are interned into
+    /// `global_dict`. When the blocks of a column come in row order, those
+    /// are the symbols that `rows` bring. A block that starts at the first
+    /// row starts `globals` anew. Does nothing for a column of another kind.
+    fn intern_symbols_up_to(
+        &self,
+        rows: Range<u32>,
+        globals: &mut Vec<u64>,
+        global_dict: &mut SymbolGlobalDict,
+    ) -> crate::Result<()> {
+        let Self::Symbol {
+            cells, dict, data, ..
+        } = self
+        else {
+            return Ok(());
+        };
+        // How many symbols the rows before `row` use: the first cell at or
+        // behind `row` knows how many the column held before it. Without
+        // such a cell they are all that the column has.
+        let symbols_before_row = |row: u32| {
+            if cells.last().is_some_and(|last| last.row_idx >= row) {
+                let cell = cells.partition_point(|cell| cell.row_idx < row);
+                cells[cell].symbols_before as usize
+            } else {
+                dict.len()
+            }
+        };
+        if rows.start == 0 {
+            globals.clear();
+        }
+        debug_assert_eq!(
+            globals.len(),
+            symbols_before_row(rows.start),
+            "the blocks of a table are encoded in the order of its rows"
+        );
+        let symbols_end = symbols_before_row(rows.end);
+        let Some(brought) = dict.get(globals.len()..symbols_end) else {
+            return Ok(());
+        };
+        globals.reserve(brought.len());
+        for entry in brought {
+            let bytes = &data[entry.offset as usize..(entry.offset + entry.len) as usize];
+            globals.push(global_dict.intern(bytes)?.0);
+        }
+        Ok(())
     }
 
     /// Non-null values among the cells in `cell_range`. Only a decimal cell
@@ -14574,13 +14685,13 @@ mod tests {
         }
 
         let mut scratch = QwpWsEncodeScratch::new();
-        let dict = SymbolGlobalDict::new();
+        let mut dict = SymbolGlobalDict::new();
         let mut frame = Vec::new();
         buf.encode_ws_frame(
             frames[0],
             &mut frame,
             &mut scratch,
-            &dict,
+            &mut dict,
             QWP_VERSION_1,
             true,
         )
@@ -14602,7 +14713,7 @@ mod tests {
                 &one_too_many,
                 &mut frame,
                 &mut scratch,
-                &dict,
+                &mut dict,
                 QWP_VERSION_1,
                 true,
             )
@@ -14610,15 +14721,12 @@ mod tests {
         assert!(err.msg().contains("table count exceeds"), "{}", err.msg());
     }
 
-    /// What the planner does not cut: a buffer without rows, and a buffer in
-    /// which a table with rows has a symbol column, which a frame of a plan
-    /// does not bring yet, whichever of its tables that is. A table that
-    /// holds no rows, which `clear` leaves behind, is not in the way,
-    /// whatever its columns.
+    /// What the planner does not cut: a buffer without rows. A table that
+    /// holds no rows, which `clear` leaves behind, is not in the way. A table
+    /// with a symbol column is cut like any other.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_frame_plan_is_none_for_what_it_cannot_cut() {
-        const TABLES: [&str; 3] = ["first", "second", "third"];
         let target = 1024 * 1024;
         let block = |table_idx, rows| QwpWsFrameBlock { table_idx, rows };
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -14639,34 +14747,164 @@ mod tests {
         let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
         assert_eq!(frames, [&[block(1, 0..2)]]);
 
-        // One row with a symbol is enough.
-        let mut buf = QwpWsColumnarBuffer::new(127);
         let row = buf.table("first").unwrap();
         row.symbol("sym", "a").unwrap().at_now().unwrap();
-        assert!(buf.plan_frames(target, target).is_none());
+        let plan = buf.plan_frames(target, target).unwrap();
+        let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
+        assert_eq!(frames, [&[block(0, 0..1), block(1, 0..2)]]);
+    }
 
-        for (symbol_idx, symbol_table) in TABLES.into_iter().enumerate() {
-            let mut buf = QwpWsColumnarBuffer::new(127);
-            for table in TABLES {
-                write_row_of_sized_kinds(&mut buf, table, 0);
-            }
-            assert!(buf.plan_frames(target, target).is_some());
-            let row = buf.table(symbol_table).unwrap();
-            row.symbol("sym", "a").unwrap().at_now().unwrap();
-            assert!(buf.plan_frames(target, target).is_none(), "{symbol_table}");
+    /// A frame counts the symbols that it brings in one to three bytes. The
+    /// planner counts three for a frame that holds rows of a table with a
+    /// symbol column, and one for any other frame: two bytes more, once a
+    /// frame. With them a frame is within the target and full, and the
+    /// frame of a single row within the cap.
+    ///
+    /// The tables: one without symbols, two with, and one without again, so
+    /// that frames hold blocks of both kinds and of both tables with
+    /// symbols, and a frame without symbols follows one with.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_counts_the_symbols_of_a_frame_in_three_bytes() {
+        const SYMBOLS: [usize; 2] = [1, 2];
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..12 {
+            write_row_of_sized_kinds(&mut buf, "plain", i);
+        }
+        for i in 0..40 {
+            write_row_of_symbols(&mut buf, "symbols", i, true);
+        }
+        for i in 0..15 {
+            write_row_of_symbols(&mut buf, "symbols_too", i, false);
+        }
+        for i in 0..12 {
+            write_row_of_sized_kinds(&mut buf, "more", i);
+        }
+        // The frame of `blocks`, by the bounds of the blocks.
+        let frame_bound = |blocks: &[(usize, Range<u32>)]| {
+            let with_symbols = blocks
+                .iter()
+                .any(|(table_idx, _)| SYMBOLS.contains(table_idx));
+            let rows: usize = blocks
+                .iter()
+                .map(|(table_idx, rows)| buf.tables[*table_idx].encoded_rows_bound(rows.clone()))
+                .map(Option::unwrap)
+                .sum();
+            12 + 3 + 1 + if with_symbols { 2 } else { 0 } + rows
+        };
+        let largest_row = buf
+            .tables
+            .iter()
+            .enumerate()
+            .flat_map(|(table_idx, table)| {
+                (0..table.row_count).map(move |row| (table_idx, row..row + 1))
+            })
+            .map(|row| frame_bound(&[row]))
+            .max()
+            .unwrap();
 
-            // The table keeps its symbol column, and holds no rows.
-            buf.clear();
-            let mut sized_blocks = Vec::new();
-            for (table_idx, table) in TABLES.into_iter().enumerate() {
-                if table_idx != symbol_idx {
-                    write_row_of_sized_kinds(&mut buf, table, 0);
-                    sized_blocks.push(block(table_idx, 0..1));
-                }
-            }
+        let (mut of_both, mut of_two_with_symbols, mut plain_after_symbols) = (0, 0, 0);
+        for target in (largest_row..largest_row + 500).chain([usize::MAX]) {
             let plan = buf.plan_frames(target, target).unwrap();
-            let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
-            assert_eq!(frames, [sized_blocks.as_slice()], "{symbol_table}");
+            let frames: Vec<Vec<(usize, Range<u32>)>> = plan
+                .frames()
+                .map(|frame| {
+                    let blocks = frame.iter();
+                    blocks.map(|b| (b.table_idx, b.rows.clone())).collect()
+                })
+                .collect();
+            let mut sizes = Vec::new();
+            for (frame_idx, frame) in frames.iter().enumerate() {
+                let case = format!("target {target} frame {frame_idx} {frame:?}");
+                let size = frame_bound(frame);
+                assert!(size <= target, "{case}");
+                if let Some(next_frame) = frames.get(frame_idx + 1) {
+                    let (next_table, next_rows) = &next_frame[0];
+                    let mut one_more = frame.clone();
+                    let last = one_more.last_mut().unwrap();
+                    if last.0 == *next_table {
+                        last.1.end += 1;
+                    } else {
+                        one_more.push((*next_table, next_rows.start..next_rows.start + 1));
+                    }
+                    assert!(frame_bound(&one_more) > target, "{case}");
+                }
+                let tables: Vec<usize> = frame.iter().map(|(table_idx, _)| *table_idx).collect();
+                of_both += usize::from(tables.contains(&0) && tables.contains(&1));
+                of_two_with_symbols += usize::from(tables.contains(&1) && tables.contains(&2));
+                plain_after_symbols += usize::from(tables == [3]);
+                sizes.push(size);
+            }
+            assert_eq!(plan.frame_sizes(), sizes, "target {target}");
+        }
+        assert!(
+            of_both > 20 && of_two_with_symbols > 20 && plain_after_symbols > 20,
+            "{of_both} {of_two_with_symbols} {plain_after_symbols}"
+        );
+
+        // A row of symbols alone in its frame, which is exactly the cap.
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for i in 0..40 {
+            write_row_of_symbols(&mut buf, "symbols", i, true);
+        }
+        let table = &buf.tables[0];
+        let largest_row = (0..table.row_count)
+            .map(|row| 12 + 3 + 1 + 2 + table.encoded_rows_bound(row..row + 1).unwrap())
+            .max()
+            .unwrap();
+        let plan = buf.plan_frames(largest_row, largest_row).unwrap();
+        assert!(plan.frame_sizes().contains(&largest_row));
+        assert!(buf.plan_frames(largest_row - 1, largest_row - 1).is_none());
+        assert!(buf.plan_frames(64, largest_row).is_some());
+        assert!(buf.plan_frames(64, largest_row - 1).is_none());
+    }
+
+    /// The buffer takes a symbol of any length, and a connection refuses
+    /// one longer than a mebibyte when a frame brings it. A buffer that
+    /// holds such a symbol is not cut, so that no frame of a flush is
+    /// published before the frame that fails. A flush of one frame reports
+    /// the symbol. The longest symbol that a connection takes is cut, and
+    /// so is the buffer once the row of the refused symbol is taken back.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_is_none_for_a_symbol_that_a_connection_refuses() {
+        const LONGEST: usize = MAX_PERSISTED_SYMBOL_ENTRY_LEN as usize;
+        let cap = 8 * LONGEST;
+        let add_symbol = |buf: &mut QwpWsColumnarBuffer, column: &str, len: usize| {
+            let row = buf.table("symbols").unwrap();
+            row.symbol("short", "a").unwrap();
+            row.symbol(column, "x".repeat(len).as_str()).unwrap();
+            row.at_now().unwrap();
+        };
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        write_row_of_sized_kinds(&mut buf, "first", 0);
+        // A length of three bytes, and the longest that a connection takes.
+        add_symbol(&mut buf, "long", 16_384);
+        add_symbol(&mut buf, "long", LONGEST);
+        add_symbol(&mut buf, "other", 5);
+        write_row_of_sized_kinds(&mut buf, "last", 0);
+        assert!(buf.plan_frames(cap, cap).is_some());
+
+        for column in ["long", "other"] {
+            buf.set_marker().unwrap();
+            add_symbol(&mut buf, column, LONGEST + 1);
+            assert!(buf.plan_frames(cap, cap).is_none(), "{column}");
+            let err = buf
+                .encode_ws_replay_message(
+                    &mut QwpWsEncodeScratch::new(),
+                    &mut SymbolGlobalDict::new(),
+                    QWP_VERSION_1,
+                )
+                .unwrap_err();
+            assert_eq!(
+                err.msg(),
+                "QWP/WS symbol value is 1048577 bytes, exceeding the 1048576-byte per-symbol \
+                 maximum",
+                "{column}"
+            );
+            // The column keeps the mark of a long symbol, and holds none.
+            buf.rewind_to_marker().unwrap();
+            assert!(buf.plan_frames(cap, cap).is_some(), "{column}");
         }
     }
 
@@ -14897,7 +15135,7 @@ mod tests {
                     frames[0],
                     &mut frame,
                     &mut QwpWsEncodeScratch::new(),
-                    &dict,
+                    &mut dict,
                     VERSION,
                     defer_commit,
                 )
@@ -14942,7 +15180,7 @@ mod tests {
         let mut scratch = QwpWsEncodeScratch::new();
         let mut frame = Vec::new();
         for (symbols, start_len) in [(0, 1), (200, 2), (20_000, 3)] {
-            let dict = connection_dict_of(symbols);
+            let mut dict = connection_dict_of(symbols);
             let mut dict_start = Vec::new();
             write_qwp_varint(&mut dict_start, u64::from(symbols));
             assert_eq!(dict_start.len(), start_len);
@@ -14962,7 +15200,7 @@ mod tests {
                         blocks,
                         &mut frame,
                         &mut scratch,
-                        &dict,
+                        &mut dict,
                         QWP_VERSION_1,
                         defer_commit,
                     )
@@ -15068,7 +15306,7 @@ mod tests {
             &blocks,
             &mut frame,
             &mut QwpWsEncodeScratch::new(),
-            &SymbolGlobalDict::new(),
+            &mut SymbolGlobalDict::new(),
             QWP_VERSION_1,
             false,
         )
@@ -15089,19 +15327,29 @@ mod tests {
     /// Times cutting one table of 1, 10 and 100 MiB into 2 MiB frames, next
     /// to encoding the blocks of the plan, alone and as frames. Run with:
     /// `cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_columnar_frame_plan_benchmark --lib -- --ignored --nocapture --test-threads=1`
-    /// Every column of a table has one kind (0, 3 or 4 of
-    /// `fill_qwp_ws_encode_shape`: long, string, timestamp), because the
-    /// planner does not cut a table with symbols yet. The last tables hold
-    /// rows of very uneven size: string columns that are short in one half
-    /// of the rows and a hundred times longer in the other half, so that the
-    /// average row says little about where a frame ends. Then come buffers
-    /// of 10 and 100 MiB whose rows are spread evenly over 1 to 100,000
-    /// tables of six columns (`kind=tables`). Before those come tables of
-    /// the kinds 7 to 12 of `fill_qwp_ws_encode_shape`: decimals, arrays,
-    /// LONG256 and geohashes. `check_us_min` is the time of looking at every
-    /// decimal value for one that the encoder refuses, which the planner
-    /// does and `plan_us` holds. `encoded_bytes` is what the frames of the
-    /// plan take: next to `frames` it tells how full they are.
+    /// Every column of a table has one kind (0, 3, 4 or 5 of
+    /// `fill_qwp_ws_encode_shape`: long, string, timestamp, symbol). The
+    /// last tables hold rows of very uneven size: string columns that are
+    /// short in one half of the rows and a hundred times longer in the other
+    /// half, so that the average row says little about where a frame ends.
+    /// Then come buffers of 10 and 100 MiB whose rows are spread evenly over
+    /// 1 to 100,000 tables of six columns (`kind=tables`). Before those come
+    /// tables of the kinds 7 to 12 of `fill_qwp_ws_encode_shape`: decimals,
+    /// arrays, LONG256 and geohashes. `check_us_min` is the time of looking
+    /// at every decimal value for one that the encoder refuses, which the
+    /// planner does and `plan_us` holds. `encoded_bytes` is what the frames
+    /// of the plan take: next to `frames` it tells how full they are.
+    ///
+    /// Kind 5 gives every column the same four symbols. The tables after it
+    /// have symbols that keep coming, evenly over the rows, in six symbol
+    /// columns of 100,000 symbols each (`symbols_100k`), or one new symbol a
+    /// row next to five longs (`symbols_fresh`: 1.7 million of them in 100
+    /// MiB, near the most a connection holds), and buffers of many tables
+    /// with one such column each (`symbol_tables`). `frame_us` is the frames
+    /// on a connection that knows none of the symbols, `known_us` on one
+    /// that knows them all, with `known_bytes` for what the frames take
+    /// then. `whole_us` is the whole buffer as one message, which a buffer
+    /// above the frame cap is not sent as; 0 when a message cannot hold it.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     #[ignore = "performance benchmark"]
@@ -15126,16 +15374,87 @@ mod tests {
                 let can = buf
                     .tables
                     .iter()
-                    .all(|table| table.decimals_can_be_encoded());
+                    .flat_map(|table| &table.columns)
+                    .all(|column| column.values.decimals_can_be_encoded());
                 check_us.push(started.elapsed().as_secs_f64() * 1e6);
                 assert!(black_box(can));
             }
             check_us.sort_by(f64::total_cmp);
 
+            // The look for a symbol that a connection does not take, as the
+            // planner does it, and as a walk over every symbol.
+            let mut symbol_check_us = Vec::with_capacity(SAMPLES);
+            let mut symbol_walk_us = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                let can = buf
+                    .tables
+                    .iter()
+                    .flat_map(|table| &table.columns)
+                    .all(|column| column.symbols_can_be_interned());
+                symbol_check_us.push(started.elapsed().as_secs_f64() * 1e6);
+                assert!(black_box(can));
+
+                let started = Instant::now();
+                let can = buf
+                    .tables
+                    .iter()
+                    .flat_map(|table| &table.columns)
+                    .all(|column| match &column.values {
+                        QwpWsColumnValues::Symbol { dict, .. } => dict
+                            .iter()
+                            .all(|entry| u64::from(entry.len) <= MAX_PERSISTED_SYMBOL_ENTRY_LEN),
+                        _ => true,
+                    });
+                symbol_walk_us.push(started.elapsed().as_secs_f64() * 1e6);
+                assert!(black_box(can));
+            }
+            symbol_check_us.sort_by(f64::total_cmp);
+            symbol_walk_us.sort_by(f64::total_cmp);
+
             let plan = buf.plan_frames(TARGET, TARGET).unwrap();
-            let most_columns = buf.tables.iter().map(|table| table.columns.len()).max();
-            let no_symbols = vec![Vec::new(); most_columns.unwrap()];
+            let frame_count = plan.frames().count();
+            let mut scratch = QwpWsEncodeScratch::new();
             let mut block = Vec::with_capacity(TARGET);
+            // The frames of the plan for `dict`: the time and the bytes.
+            let mut encode_frames = |dict: &mut SymbolGlobalDict| {
+                let started = Instant::now();
+                let mut bytes = 0;
+                for (frame_idx, blocks) in plan.frames().enumerate() {
+                    buf.encode_ws_frame(
+                        blocks,
+                        &mut block,
+                        &mut scratch,
+                        dict,
+                        QWP_VERSION_1,
+                        frame_idx + 1 < frame_count,
+                    )
+                    .unwrap();
+                    bytes += black_box(block.len());
+                }
+                (started.elapsed().as_secs_f64() * 1e6, bytes)
+            };
+            let mut dict = SymbolGlobalDict::new();
+            let mut frame_us = Vec::with_capacity(SAMPLES);
+            let mut encoded_bytes = 0;
+            for _ in 0..SAMPLES {
+                dict = SymbolGlobalDict::new();
+                let (us, bytes) = encode_frames(&mut dict);
+                frame_us.push(us);
+                encoded_bytes = bytes;
+            }
+            frame_us.sort_by(f64::total_cmp);
+            let mut known_us = Vec::with_capacity(SAMPLES);
+            let mut known_bytes = 0;
+            for _ in 0..SAMPLES {
+                let (us, bytes) = encode_frames(&mut dict);
+                known_us.push(us);
+                known_bytes = bytes;
+            }
+            known_us.sort_by(f64::total_cmp);
+
+            // The blocks alone. The frames left the connection id of every
+            // symbol in `scratch`.
             let mut encode_us = Vec::with_capacity(SAMPLES);
             for _ in 0..SAMPLES {
                 let started = Instant::now();
@@ -15143,7 +15462,11 @@ mod tests {
                     block.clear();
                     for rows_of_table in frame {
                         buf.tables[rows_of_table.table_idx]
-                            .encode_rows(rows_of_table.rows.clone(), &no_symbols, &mut block)
+                            .encode_rows(
+                                rows_of_table.rows.clone(),
+                                &scratch.per_segment_symbol_globals[rows_of_table.table_idx],
+                                &mut block,
+                            )
                             .unwrap();
                     }
                     black_box(block.len());
@@ -15152,32 +15475,30 @@ mod tests {
             }
             encode_us.sort_by(f64::total_cmp);
 
-            let frame_count = plan.frames().count();
-            let mut scratch = QwpWsEncodeScratch::new();
-            let dict = SymbolGlobalDict::new();
-            let mut frame_us = Vec::with_capacity(SAMPLES);
-            let mut encoded_bytes = 0;
+            let mut whole_us = Vec::with_capacity(SAMPLES);
             for _ in 0..SAMPLES {
+                dict = SymbolGlobalDict::new();
                 let started = Instant::now();
-                encoded_bytes = 0;
-                for (frame_idx, blocks) in plan.frames().enumerate() {
-                    buf.encode_ws_frame(
-                        blocks,
-                        &mut block,
-                        &mut scratch,
-                        &dict,
-                        QWP_VERSION_1,
-                        frame_idx + 1 < frame_count,
-                    )
-                    .unwrap();
-                    encoded_bytes += black_box(block.len());
+                let encoded = buf.encode_ws_replay_message_with_defer(
+                    &mut block,
+                    &mut scratch,
+                    &mut dict,
+                    QWP_VERSION_1,
+                    false,
+                    true,
+                );
+                whole_us.push(started.elapsed().as_secs_f64() * 1e6);
+                black_box(block.len());
+                if encoded.is_err() {
+                    // More tables than a message counts.
+                    whole_us = vec![0.0];
+                    break;
                 }
-                frame_us.push(started.elapsed().as_secs_f64() * 1e6);
             }
-            frame_us.sort_by(f64::total_cmp);
+            whole_us.sort_by(f64::total_cmp);
 
             eprintln!(
-                "frame_plan_bench kind={shape} cols={cols} mib={mib} tables={} rows={} bytes={} frames={frame_count} plan_us_min={:.0} plan_us_median={:.0} encode_us_min={:.0} encode_us_median={:.0} frame_us_min={:.0} frame_us_median={:.0} check_us_min={:.0} encoded_bytes={}",
+                "frame_plan_bench kind={shape} cols={cols} mib={mib} tables={} rows={} bytes={} frames={frame_count} plan_us_min={:.0} plan_us_median={:.0} encode_us_min={:.0} encode_us_median={:.0} frame_us_min={:.0} frame_us_median={:.0} check_us_min={:.0} encoded_bytes={} symbols={} symbol_check_us_min={:.0} symbol_walk_us_min={:.0} known_us_min={:.0} known_bytes={} whole_us_min={:.0}",
                 buf.tables.len(),
                 buf.tables.iter().map(|table| table.row_count).sum::<u32>(),
                 buf.len(),
@@ -15189,6 +15510,12 @@ mod tests {
                 frame_us[SAMPLES / 2],
                 check_us[0],
                 encoded_bytes,
+                dict.next_id(),
+                symbol_check_us[0],
+                symbol_walk_us[0],
+                known_us[0],
+                known_bytes,
+                whole_us[0],
             );
         };
         let names = |cols: usize| -> Vec<String> {
@@ -15256,12 +15583,12 @@ mod tests {
         }
 
         // Many tables: a long, a string and a timestamp column, twice over.
-        let names = names(6);
+        let six_names = names(6);
         let fill_table = |buf: &mut QwpWsColumnarBuffer, table: &str, rows: usize| {
             for row_idx in 0..rows {
                 let seq = row_idx as i64;
                 buf.table(table).unwrap();
-                for (col_idx, name) in names.iter().enumerate() {
+                for (col_idx, name) in six_names.iter().enumerate() {
                     match col_idx % 3 {
                         0 => buf.column_i64(name.as_str(), seq),
                         1 => buf.column_str(name.as_str(), "SYM000"),
@@ -15283,6 +15610,75 @@ mod tests {
                 }
                 time_plan("tables", 6, mib, &buf);
             }
+        }
+
+        // Tables with symbols come last, so that the shapes above run as
+        // they did before there were any. First the same four symbols in
+        // every column.
+        for cols in [6, 100] {
+            let names = names(cols);
+            let mut probe = QwpWsColumnarBuffer::new(127);
+            fill_qwp_ws_encode_shape(&mut probe, &names, 100, Some(5));
+            for mib in [1, 10, 100] {
+                let rows = mib * 1024 * 1024 * 100 / probe.len();
+                let mut buf = QwpWsColumnarBuffer::new(127);
+                fill_qwp_ws_encode_shape(&mut buf, &names, rows, Some(5));
+                time_plan("5", cols, mib, &buf);
+            }
+        }
+
+        // Symbols that keep coming: `symbol_cols` symbol columns, then
+        // longs. Column `c` goes through its symbols in order, each for as
+        // many rows in a row as it takes to use `distinct` of them, or a new
+        // one in every row when `distinct` is 0.
+        let fill_symbols = |buf: &mut QwpWsColumnarBuffer,
+                            table: &str,
+                            names: &[String],
+                            symbol_cols: usize,
+                            rows: usize,
+                            distinct: usize| {
+            for row_idx in 0..rows {
+                let pick = match distinct {
+                    0 => row_idx,
+                    _ => (row_idx as u128 * distinct as u128 / rows as u128) as usize,
+                };
+                buf.table(table).unwrap();
+                for (col_idx, name) in names.iter().enumerate() {
+                    if col_idx < symbol_cols {
+                        buf.symbol(name.as_str(), format!("c{col_idx}s{pick:07}").as_str())
+                    } else {
+                        buf.column_i64(name.as_str(), row_idx as i64)
+                    }
+                    .unwrap();
+                }
+                buf.at(TimestampNanos::new(row_idx as i64)).unwrap();
+            }
+        };
+        for mib in [10, 100] {
+            // A row takes 3 bytes a symbol cell and 8 for its timestamp, and
+            // a symbol 11 bytes once.
+            let rows = (mib * 1024 * 1024 - 6 * 100_000 * 11) / (6 * 3 + 8);
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            fill_symbols(&mut buf, "symbols", &six_names, 6, rows, 100_000);
+            time_plan("symbols_100k", 6, mib, &buf);
+        }
+        for mib in [10, 100] {
+            // A row takes its symbol cell and its symbol, five longs and
+            // its timestamp.
+            let rows = mib * 1024 * 1024 / (3 + 11 + 5 * 8 + 8);
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            fill_symbols(&mut buf, "symbols", &six_names, 1, rows, 0);
+            time_plan("symbols_fresh", 6, mib, &buf);
+        }
+        for tables in [1000, 10_000] {
+            // A hundred symbols a table, each of which the next table has too.
+            let rows = 100 * 1024 * 1024 / (3 + 5 * 8 + 8) / tables;
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            for table_idx in 0..tables {
+                let table = format!("t{table_idx}");
+                fill_symbols(&mut buf, table.as_str(), &six_names, 1, rows, 100);
+            }
+            time_plan("symbol_tables", 6, 100, &buf);
         }
     }
 

@@ -27,9 +27,10 @@
 //! Such a buffer goes out in several frames that the server commits together
 //! when all of this holds: the sender makes its progress in the background
 //! and keeps its queue in memory, the server has told its frame limit, the
-//! buffer is within `max_buf_size` and holds no column the planner cannot
-//! size, and the queue has room for all the frames. The buffer may hold rows
-//! of several tables: the server commits each of them once.
+//! buffer is within `max_buf_size` and holds no value that cannot be sent,
+//! and the queue has room for all the frames. The buffer may hold rows of
+//! several tables: the server commits each of them once. Each frame brings
+//! the symbols that its rows are the first to use on the connection.
 //! Any other flush goes out as one frame, as before: a buffer that is too
 //! large for one frame is refused, nothing of it is published and it keeps
 //! its rows.
@@ -42,10 +43,14 @@
 use std::time::Duration;
 
 use crate::ErrorCode;
-use crate::ingress::{AckLevel, Buffer, Sender, SenderBuilder, TimestampMicros, TimestampNanos};
+use crate::ingress::{
+    AckLevel, Buffer, Sender, SenderBuilder, SymbolGlobalDict, TimestampMicros, TimestampNanos,
+    decode_qwp_varint,
+};
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
 use crate::tests::qwp_ws_server_model::{
-    QwpWsModelServer, add_rows, buffer_of, frames_of_a_flush, rows_of,
+    QwpWsModelServer, QwpWsServerModel, add_rows, buffer_of, frame_of_a_sender, frames_of_a_flush,
+    frames_of_a_sender, rows_of,
 };
 
 const TABLE: &str = "flush_rows";
@@ -267,6 +272,316 @@ fn assert_refused_as_one_frame(sender: &mut Sender, buffer: &mut Buffer, cap: us
         "the buffer keeps its rows"
     );
     assert!(!sender.must_close());
+}
+
+/// Adds row `id` of a table with three symbol columns, each left out of
+/// some rows. `venue` has four symbols. Every cell of `tag` brings a new
+/// one. `mixed` brings some and finds others, in no order: some of them are
+/// symbols of `venue`, and some are 130 bytes long, so that their length
+/// takes two bytes. A row's values depend on `id` alone, so two tables
+/// share the symbols of the ids that both hold.
+fn add_symbol_row(buffer: &mut Buffer, table: &str, id: i64) {
+    buffer.table(table).unwrap();
+    if id % 5 != 3 {
+        buffer.symbol("venue", format!("v{}", id % 4)).unwrap();
+    }
+    if id % 3 != 1 {
+        buffer.symbol("tag", format!("t{id}")).unwrap();
+    }
+    if id % 4 != 2 {
+        let pick = id * id % 37;
+        let mixed = match pick {
+            0..4 => format!("v{pick}"),
+            _ if pick % 5 == 0 => format!("m{pick}{}", "-".repeat(128)),
+            _ => format!("m{pick}"),
+        };
+        buffer.symbol("mixed", mixed).unwrap();
+    }
+    buffer.column_i64("id", id).unwrap();
+    if id % 2 == 1 {
+        buffer.column_str("txt", format!("row {id}")).unwrap();
+    }
+    buffer
+        .at(TimestampNanos::new(1_700_000_000_000_000_000 + id))
+        .unwrap();
+}
+
+/// Rows `ids` of [`add_symbol_row`] in a buffer of one table.
+fn buffer_of_symbols(table: &str, ids: std::ops::Range<i64>) -> Buffer {
+    let mut buffer = Buffer::new_qwp_ws();
+    for id in ids {
+        add_symbol_row(&mut buffer, table, id);
+    }
+    buffer
+}
+
+/// The symbols that a frame brings: the id of the first, and their texts.
+fn symbols_brought_by(frame: &[u8]) -> (u64, Vec<String>) {
+    let (first_id, pos) = decode_qwp_varint(frame, 12).unwrap();
+    let (count, mut pos) = decode_qwp_varint(frame, pos).unwrap();
+    let mut texts = Vec::new();
+    for _ in 0..count {
+        let (len, start) = decode_qwp_varint(frame, pos).unwrap();
+        pos = start + len as usize;
+        texts.push(String::from_utf8(frame[start..pos].to_vec()).unwrap());
+    }
+    (first_id, texts)
+}
+
+/// The frames of a flush bring the symbols of its rows, wherever the buffer
+/// is cut. For every frame limit from the smallest that the rows allow, on
+/// a connection that knows some of the symbols from a flush before:
+///
+/// - the symbols of a frame start where those of the frame before ended;
+/// - no symbol comes twice, none that the connection knew comes again, and
+///   together they are the symbols of the buffer that it did not know;
+/// - no frame is above the limit, which it would be if it brought a symbol
+///   before the frame whose rows use it;
+/// - a server holds the rows that one frame of the buffer gives, each table
+///   in one commit.
+///
+/// Over the limits, a frame begins at nearly every row of the first table.
+#[test]
+fn the_frames_of_a_flush_bring_each_symbol_once_wherever_the_buffer_is_cut() {
+    const FIRST_ROWS: usize = 90;
+    let before = buffer_of_symbols(THIRD, 20..45);
+    let mut large = buffer_of_symbols(FIRST, 0..FIRST_ROWS as i64);
+    for id in 60..110 {
+        add_symbol_row(&mut large, SECOND, id);
+    }
+    let (first_rows, second_rows) = (rows_of(FIRST, &large), rows_of(SECOND, &large));
+    let texts_of = |buffer: &Buffer| -> std::collections::BTreeSet<String> {
+        let frame = frame_of_a_sender(buffer, false, &mut SymbolGlobalDict::new());
+        symbols_brought_by(&frame).1.into_iter().collect()
+    };
+    let known = texts_of(&before);
+    let new: std::collections::BTreeSet<String> =
+        texts_of(&large).difference(&known).cloned().collect();
+    assert!(new.len() > 50 && new.len() < texts_of(&large).len());
+
+    let rows = large.as_qwp_ws().unwrap();
+    let least_limit = (64..)
+        .find(|limit| rows.plan_frames(*limit, *limit).is_some())
+        .unwrap();
+    let mut frame_starts = std::collections::BTreeSet::new();
+    let mut frame_counts = std::collections::BTreeSet::new();
+    for limit in (least_limit..least_limit + 500).chain([4096, usize::MAX]) {
+        let server = QwpWsServerModel::new();
+        let mut connection = server.connect();
+        let mut sender_symbols = SymbolGlobalDict::new();
+        let first_frame = frame_of_a_sender(&before, false, &mut sender_symbols);
+        assert!(connection.receive(&first_frame).is_some());
+        let mut held = known.len() as u64;
+        assert_eq!(sender_symbols.next_id(), held);
+
+        let frames = frames_of_a_sender(&large, limit, &mut sender_symbols);
+        let mut brought = std::collections::BTreeSet::new();
+        for (frame_idx, frame) in frames.iter().enumerate() {
+            let case = format!("limit {limit} frame {frame_idx}");
+            assert!(frame.len() <= limit, "{case}: {} bytes", frame.len());
+            let (first_id, texts) = symbols_brought_by(frame);
+            assert_eq!(first_id, held, "{case}");
+            held += texts.len() as u64;
+            for text in texts {
+                assert!(!known.contains(&text), "{case}: {text} was known");
+                assert!(brought.insert(text.clone()), "{case}: {text} again");
+            }
+            let answer = connection.receive(frame);
+            assert_eq!(answer.is_some(), frame_idx + 1 == frames.len(), "{case}");
+        }
+        assert_eq!(brought, new, "limit {limit}");
+        assert_eq!(sender_symbols.next_id(), held, "limit {limit}");
+
+        let first = server.table(FIRST).unwrap();
+        let second = server.table(SECOND).unwrap();
+        assert_eq!((first.commits, second.commits), (1, 1), "limit {limit}");
+        assert_eq!(first.rows_as_text(), first_rows, "limit {limit}");
+        assert_eq!(second.rows_as_text(), second_rows, "limit {limit}");
+        let mut row = 0;
+        for block in &first.blocks {
+            frame_starts.insert(row);
+            row += block.rows.len();
+        }
+        frame_counts.insert(frames.len());
+    }
+    // The first few rows fit the smallest frame together.
+    assert!(frame_starts.len() > FIRST_ROWS - 6, "{frame_starts:?}");
+    assert!(frame_counts.contains(&1) && frame_counts.contains(&2));
+    assert!(frame_counts.last().is_some_and(|most| *most > 20));
+}
+
+#[test]
+fn a_flush_with_symbols_above_the_frame_cap_is_one_commit() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, "");
+    let before = buffer_of_symbols(FIRST, 0..10);
+    // Two tables that share symbols with each other and with the flush
+    // before. The first has more symbols than one frame holds.
+    let mut large = buffer_of_symbols(FIRST, 10..1210);
+    for id in 1100..1400 {
+        add_symbol_row(&mut large, SECOND, id);
+    }
+    // It uses symbols that the large flush brought, and new ones.
+    let after = buffer_of_symbols(SECOND, 1392..1400);
+    assert!(before.len() < FRAME_LIMIT && after.len() < FRAME_LIMIT);
+
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before, false, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    let frame_count = frames.len() as u64;
+    let bringing_symbols = frames
+        .iter()
+        .filter(|frame| !symbols_brought_by(frame).1.is_empty())
+        .count();
+    assert!(bringing_symbols > 40, "{bringing_symbols} of {frame_count}");
+    assert!(frames.iter().all(|frame| frame.len() <= FRAME_LIMIT));
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, FIRST, 1, &[&before]);
+
+    let mut flushed = large.clone();
+    assert_eq!(
+        sender.flush_and_get_fsn(&mut flushed).unwrap(),
+        Some(frame_count)
+    );
+    assert!(flushed.is_empty());
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(
+        sender.completed_fsn(AckLevel::Ok).unwrap(),
+        Some(frame_count)
+    );
+    assert_table_holds(&server, FIRST, 2, &[&before, &large]);
+    assert_table_holds(&server, SECOND, 1, &[&large]);
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&after).unwrap(),
+        Some(frame_count + 1)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, FIRST, 2, &[&before, &large]);
+    assert_table_holds(&server, SECOND, 2, &[&large, &after]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_flush_with_symbols_that_loses_its_connection_part_way_is_sent_again_whole() {
+    // The server takes the flush before and eleven frames of the large
+    // flush, and ends the connection.
+    const CUT_AFTER_FRAMES: usize = 12;
+    let server = QwpWsModelServer::start_cutting_first_connection(FRAME_LIMIT, CUT_AFTER_FRAMES);
+    let mut sender = sender_with(server.port, "");
+    let before = buffer_of_symbols(FIRST, 0..10);
+    let large = buffer_of_symbols(FIRST, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before, false, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    let frame_count = frames.len() as u64;
+    assert!(frame_count > 40, "{frame_count} frames");
+    // The frames that the first connection took brought symbols, and so do
+    // frames that only the second one takes.
+    for frame in [1, CUT_AFTER_FRAMES - 2, CUT_AFTER_FRAMES + 5] {
+        assert!(!symbols_brought_by(&frames[frame]).1.is_empty(), "{frame}");
+    }
+
+    // Confirmed while the first connection lives, so it is not sent again.
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frame_count)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    let totals = sender.qwp_ws_totals().unwrap();
+    assert_eq!(totals.reconnects_succeeded, 1);
+    assert!(
+        totals.frames_replayed >= CUT_AFTER_FRAMES as u64 - 1,
+        "{} frames sent again",
+        totals.frames_replayed
+    );
+    // The second connection began without a symbol. The sender brought it
+    // the symbols of the first one, those of the flush before among them,
+    // and then every frame of the flush, which the server committed once.
+    let table = server.model.table(FIRST).unwrap();
+    assert_eq!(table.blocks.len() as u64, 1 + frame_count);
+    assert_table_holds(&server, FIRST, 2, &[&before, &large]);
+
+    // The sender goes on with the symbols that both connections know.
+    let after = buffer_of_symbols(FIRST, 1200..1215);
+    sender.flush_and_keep(&after).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, FIRST, 3, &[&before, &large, &after]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_buffer_with_a_symbol_that_a_connection_refuses_is_refused_before_its_first_frame() {
+    // A frame limit that a symbol of the longest size fits.
+    const LIMIT: usize = 2 * 1024 * 1024;
+    const LONGEST: usize = 1 << 20;
+    let server = QwpWsModelServer::start(LIMIT);
+    let mut sender = sender_with(server.port, "");
+    let before = buffer_of_symbols(FIRST, 0..10);
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    // 30,000 rows, in which row 20,000 has a symbol of `long` bytes.
+    let rows_with = |long: usize| {
+        let mut buffer = Buffer::new_qwp_ws();
+        for id in 0..30_000 {
+            let symbol = if id == 20_000 {
+                "x".repeat(long)
+            } else {
+                format!("s{}", id % 50)
+            };
+            buffer.table(TABLE).unwrap();
+            buffer.symbol("sym", symbol).unwrap();
+            buffer.column_i64("id", id).unwrap();
+            buffer.column_str("txt", "-".repeat(100)).unwrap();
+            buffer.at_now().unwrap();
+        }
+        buffer
+    };
+    let mut refused = rows_with(LONGEST + 1);
+    let (rows, len) = (refused.row_count(), refused.len());
+    assert!(len > 2 * LIMIT);
+    let err = sender.flush(&mut refused).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{}", err.msg());
+    assert_eq!(
+        err.msg(),
+        "QWP/WS symbol value is 1048577 bytes, exceeding the 1048576-byte per-symbol maximum"
+    );
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+    assert_eq!((refused.row_count(), refused.len()), (rows, len));
+    assert!(!sender.must_close());
+    assert!(server.model.table(TABLE).is_none());
+
+    // The sender goes on: the same rows with the longest symbol that a
+    // connection takes are one commit.
+    let taken = rows_with(LONGEST);
+    let frame_count = taken
+        .as_qwp_ws()
+        .unwrap()
+        .plan_frames(LIMIT, LIMIT)
+        .unwrap()
+        .frames()
+        .count() as u64;
+    assert!(frame_count > 2, "{frame_count} frames");
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&taken).unwrap(),
+        Some(frame_count)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&taken]);
+    assert_table_holds(&server, FIRST, 1, &[&before]);
+    drop(sender);
+    server.finish();
 }
 
 #[test]
@@ -716,18 +1031,9 @@ fn a_buffer_that_cannot_be_cut_is_refused_as_one_frame() {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let mut sender = sender_with(server.port, "");
 
-    // Rows of two tables. The second table is why each buffer cannot be
-    // cut: it has a symbol column, or a row above the frame cap.
-    let mut with_symbols_in_its_last_table = buffer_of(TABLE, 0..2000);
-    with_symbols_in_its_last_table
-        .table("other_rows")
-        .unwrap()
-        .symbol("sym", "a")
-        .unwrap()
-        .column_i64("id", 1)
-        .unwrap()
-        .at_now()
-        .unwrap();
+    // A row above the frame cap is why each buffer cannot be cut: in the
+    // second of its two tables, in its one table, and with a symbol that
+    // makes it so.
     let mut with_a_row_above_the_cap_in_its_last_table = buffer_of(TABLE, 0..2000);
     with_a_row_above_the_cap_in_its_last_table
         .table("other_rows")
@@ -736,29 +1042,24 @@ fn a_buffer_that_cannot_be_cut_is_refused_as_one_frame() {
         .unwrap()
         .at_now()
         .unwrap();
-    let mut with_symbols = Buffer::new_qwp_ws();
-    for id in 0..2000 {
-        with_symbols
-            .table(TABLE)
-            .unwrap()
-            .symbol("sym", "a")
-            .unwrap()
-            .column_i64("id", id)
-            .unwrap()
-            .at_now()
-            .unwrap();
-    }
     let mut with_a_row_above_the_cap = buffer_of(TABLE, 0..2000);
     add_row(
         &mut with_a_row_above_the_cap,
         2000,
         &"x".repeat(FRAME_LIMIT),
     );
+    let mut with_a_symbol_above_the_cap = buffer_of(TABLE, 0..2000);
+    with_a_symbol_above_the_cap
+        .table("other_rows")
+        .unwrap()
+        .symbol("sym", "x".repeat(FRAME_LIMIT))
+        .unwrap()
+        .at_now()
+        .unwrap();
     for buffer in [
-        &mut with_symbols_in_its_last_table,
         &mut with_a_row_above_the_cap_in_its_last_table,
-        &mut with_symbols,
         &mut with_a_row_above_the_cap,
+        &mut with_a_symbol_above_the_cap,
     ] {
         assert_refused_as_one_frame(&mut sender, buffer, FRAME_LIMIT, SET_BY_SERVER);
     }
@@ -767,10 +1068,13 @@ fn a_buffer_that_cannot_be_cut_is_refused_as_one_frame() {
     assert!(server.model.table("other_rows").is_none());
 
     // The sender then takes a buffer that can be cut: the two tables, with
-    // columns the planner can size and rows within the frame cap.
+    // rows within the frame cap. The refused symbol left nothing behind:
+    // the first symbol of this flush is the first of the connection.
     let mut large = buffer_of(TABLE, 0..2000);
     large
         .table("other_rows")
+        .unwrap()
+        .symbol("sym", "a")
         .unwrap()
         .column_i64("id", 1)
         .unwrap()
