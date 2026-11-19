@@ -27,17 +27,22 @@
 //! Such a buffer goes out in several frames that the server commits together
 //! when all of this holds: the sender makes its progress in the background
 //! and keeps its queue in memory, the server has told its frame limit, the
-//! buffer is within `max_buf_size` and holds no value that cannot be sent.
+//! buffer is within `max_buf_size`, each of its rows fits a frame and none of
+//! its values is one that cannot be sent.
 //! The buffer may hold rows of several tables: the server commits each of
 //! them once. Each frame brings the symbols that its rows are the first to
 //! use on the connection. The flush waits until the queue has room for all
 //! its frames, as long as `sf_append_deadline_millis` allows, and publishes
 //! none of them before.
-//! A buffer whose frames the queue can never hold together is refused with
-//! an error that names `sf_max_total_bytes` and the value that would do.
+//! Such a sender refuses a buffer above `max_buf_size` with an error that
+//! names `max_buf_size` and the size of the buffer, and a buffer whose frames
+//! the queue can never hold together with one that names
+//! `sf_max_total_bytes` and the value that would do.
 //! Any other flush goes out as one frame, as before: a buffer that is too
-//! large for one frame is refused. Nothing of a refused buffer is published,
-//! and it keeps its rows.
+//! large for one frame is refused. When a row that fits no frame is why the
+//! buffer was not cut into several, the refusal names the table of the row,
+//! the size of the frame it needs, and the frame cap. Nothing of a refused
+//! buffer is published, and it keeps its rows.
 //!
 //! The server is the model of [`crate::tests::qwp_ws_server_model`] behind a
 //! socket: it holds the rows of a frame with the defer flag and commits at
@@ -55,8 +60,8 @@ use crate::ingress::{
 };
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
 use crate::tests::qwp_ws_server_model::{
-    QwpWsModelServer, QwpWsServerModel, add_rows, buffer_of, frame_of_a_sender, frames_of_a_flush,
-    frames_of_a_sender, rows_of,
+    QwpWsModelServer, QwpWsServerModel, add_rows, buffer_of, frame_of_a_sender,
+    frame_of_a_whole_buffer, frames_of_a_flush, frames_of_a_sender, rows_of,
 };
 
 const TABLE: &str = "flush_rows";
@@ -248,25 +253,15 @@ fn assert_table_holds(server: &QwpWsModelServer, table: &str, commits: u64, buff
     assert_eq!(held.rows_as_text(), rows, "rows of {table}");
 }
 
-/// Flushes a buffer that is too large for one frame and that is not sent in
-/// frames either. The refusal is the one such a buffer got before: it names
-/// the frame cap and what sets it, nothing is published, the buffer keeps
-/// its rows and the sender stays usable.
-fn assert_refused_as_one_frame(sender: &mut Sender, buffer: &mut Buffer, cap: usize, set_by: &str) {
+/// Flushes a buffer that the sender refuses for its size, and gives the text
+/// of the refusal. Nothing is published, the buffer keeps its rows and the
+/// sender stays usable.
+fn refusal_of(sender: &mut Sender, buffer: &mut Buffer) -> String {
     let published = sender.published_fsn().unwrap();
     let (rows, len) = (buffer.row_count(), buffer.len());
 
     let err = sender.flush(buffer).unwrap_err();
     assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{}", err.msg());
-    let end =
-        format!(" bytes exceeds the per-frame cap of {cap} bytes. The cap is set by {set_by}.");
-    assert!(
-        err.msg()
-            .starts_with("Could not flush buffer: QWP/WebSocket encoded message size of ")
-            && err.msg().ends_with(&end),
-        "got: {}",
-        err.msg()
-    );
     assert_eq!(
         sender.published_fsn().unwrap(),
         published,
@@ -278,12 +273,61 @@ fn assert_refused_as_one_frame(sender: &mut Sender, buffer: &mut Buffer, cap: us
         "the buffer keeps its rows"
     );
     assert!(!sender.must_close());
+    err.msg().to_owned()
+}
+
+/// Flushes a buffer that is too large for one frame and that is not sent in
+/// frames either. The refusal is the one such a buffer got before: it names
+/// the frame cap and what sets it.
+fn assert_refused_as_one_frame(sender: &mut Sender, buffer: &mut Buffer, cap: usize, set_by: &str) {
+    let refusal = refusal_of(sender, buffer);
+    let end =
+        format!(" bytes exceeds the per-frame cap of {cap} bytes. The cap is set by {set_by}.");
+    assert!(
+        refusal.starts_with("Could not flush buffer: QWP/WebSocket encoded message size of ")
+            && refusal.ends_with(&end),
+        "got: {refusal}"
+    );
+}
+
+/// Flushes a buffer that is larger than `max_buf_size`. The refusal names
+/// the size of the buffer, `max_buf_size`, and the value that would do.
+fn assert_refused_for_max_buf_size(sender: &mut Sender, buffer: &mut Buffer, max_buf_size: usize) {
+    let len = buffer.len();
+    assert_eq!(
+        refusal_of(sender, buffer),
+        format!(
+            "Could not flush buffer: its size is {len} bytes, and max_buf_size is {max_buf_size} \
+             bytes. Set max_buf_size to at least {len}, or flush more often."
+        )
+    );
+}
+
+/// Flushes a buffer that is too large for one frame and that is not cut
+/// into several, because a row of `table` fits none. The refusal names the
+/// table, the `frame_size` bytes that a frame with that row alone takes, the
+/// frame cap and what sets it.
+fn assert_refused_for_a_row(
+    sender: &mut Sender,
+    buffer: &mut Buffer,
+    table: &str,
+    frame_size: usize,
+    cap: usize,
+    set_by: &str,
+) {
+    assert_eq!(
+        refusal_of(sender, buffer),
+        format!(
+            "Could not flush buffer: a row of table '{table}' needs a frame of {frame_size} \
+             bytes, and the per-frame cap is {cap} bytes. Make the row smaller, or raise the \
+             cap. The cap is set by {set_by}."
+        )
+    );
 }
 
 /// Flushes a buffer whose `frames` frames need a queue of `min_total_bytes`
 /// bytes, through a sender whose queue is one of `max_total_bytes`. The
-/// refusal names both, nothing is published, the buffer keeps its rows and
-/// the sender stays usable.
+/// refusal names both.
 fn assert_refused_for_the_queue(
     sender: &mut Sender,
     buffer: &mut Buffer,
@@ -291,30 +335,14 @@ fn assert_refused_for_the_queue(
     min_total_bytes: usize,
     max_total_bytes: usize,
 ) {
-    let published = sender.published_fsn().unwrap();
-    let (rows, len) = (buffer.row_count(), buffer.len());
-
-    let err = sender.flush(buffer).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{}", err.msg());
     assert_eq!(
-        err.msg(),
+        refusal_of(sender, buffer),
         format!(
             "Could not flush buffer: its {frames} frames need a store-and-forward queue of \
              {min_total_bytes} bytes, and sf_max_total_bytes is {max_total_bytes} bytes. Set \
              sf_max_total_bytes to at least {min_total_bytes}, or flush more often."
         )
     );
-    assert_eq!(
-        sender.published_fsn().unwrap(),
-        published,
-        "nothing is published"
-    );
-    assert_eq!(
-        (buffer.row_count(), buffer.len()),
-        (rows, len),
-        "the buffer keeps its rows"
-    );
-    assert!(!sender.must_close());
 }
 
 /// Adds row `id` of a table with three symbol columns, each left out of
@@ -1059,53 +1087,121 @@ fn a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refus
         sender.flush_and_keep_and_get_fsn(&at_max).unwrap(),
         Some(frame_count - 1)
     );
-    assert_refused_as_one_frame(&mut sender, &mut above_max, FRAME_LIMIT, SET_BY_SERVER);
+    assert_refused_for_max_buf_size(&mut sender, &mut above_max, MAX_BUF_SIZE);
+
+    // The sender goes on with a buffer that is within `max_buf_size`.
+    let after = buffer_of_len(2000, MAX_BUF_SIZE);
+    let frames_after = frames_of_a_flush(&after, FRAME_LIMIT).len() as u64;
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&after).unwrap(),
+        Some(frame_count + frames_after - 1)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let table = server.model.table(TABLE).unwrap();
+    assert_eq!(table.commits, 2);
+    assert_eq!(table.rows_as_text(), rows_of_all(&[&at_max, &after]));
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_buffer_above_max_buf_size_is_refused_for_its_size_whatever_else_it_holds() {
+    const MAX_BUF_SIZE: usize = 8192;
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, "max_buf_size=8192;");
+
+    // Each buffer has one more thing in the way of its flush: a decimal that
+    // the encoder refuses, and a row that fits no frame.
+    let mut with_a_value = buffer_of_decimals(0..2000, Some(1500));
+    let mut with_a_row = buffer_of(TABLE, 0..2000);
+    add_row(&mut with_a_row, 2000, &"x".repeat(FRAME_LIMIT));
+    for buffer in [&mut with_a_value, &mut with_a_row] {
+        assert!(buffer.len() > MAX_BUF_SIZE);
+        assert_refused_for_max_buf_size(&mut sender, buffer, MAX_BUF_SIZE);
+    }
+    assert!(server.model.table(TABLE).is_none());
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_max_buf_size_below_the_frame_limit_is_held_against_the_size_of_the_buffer() {
+    const MAX_BUF_SIZE: usize = 2000;
+    let server = QwpWsModelServer::start(LIMIT_ABOVE_TARGET);
+    let mut sender = sender_with(server.port, "max_buf_size=2000;");
+    // `max_buf_size` is the frame cap then, and no buffer goes out in frames.
+    assert_eq!(sender.effective_frame_cap().unwrap(), (MAX_BUF_SIZE, true));
+    let at_max = buffer_of_len(0, MAX_BUF_SIZE);
+    // The frame of this buffer takes two bytes less than the size that the
+    // buffer gives, which is within the frame cap: what is above
+    // `max_buf_size` is the buffer.
+    let mut above_max = buffer_of_len(1000, MAX_BUF_SIZE + 1);
+    assert_eq!(
+        frame_of_a_whole_buffer(&above_max, false).len(),
+        MAX_BUF_SIZE - 1
+    );
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&at_max).unwrap(), Some(0));
+    assert_refused_for_max_buf_size(&mut sender, &mut above_max, MAX_BUF_SIZE);
 
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     let table = server.model.table(TABLE).unwrap();
-    assert_eq!(table.commits, 1);
+    assert_eq!((table.commits, table.blocks.len()), (1, 1));
     assert_eq!(table.rows_as_text(), rows_of(TABLE, &at_max));
     drop(sender);
     server.finish();
 }
 
 #[test]
-fn a_buffer_that_cannot_be_cut_is_refused_as_one_frame() {
+fn a_buffer_with_a_row_that_fits_no_frame_is_refused_with_the_table_and_the_size_of_the_row() {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let mut sender = sender_with(server.port, "");
 
-    // A row above the frame cap is why each buffer cannot be cut: in the
-    // second of its two tables, in its one table, and with a symbol that
-    // makes it so.
-    let mut with_a_row_above_the_cap_in_its_last_table = buffer_of(TABLE, 0..2000);
-    with_a_row_above_the_cap_in_its_last_table
-        .table("other_rows")
-        .unwrap()
-        .column_str("txt", "x".repeat(FRAME_LIMIT))
-        .unwrap()
-        .at_now()
-        .unwrap();
-    let mut with_a_row_above_the_cap = buffer_of(TABLE, 0..2000);
-    add_row(
-        &mut with_a_row_above_the_cap,
-        2000,
-        &"x".repeat(FRAME_LIMIT),
-    );
-    let mut with_a_symbol_above_the_cap = buffer_of(TABLE, 0..2000);
-    with_a_symbol_above_the_cap
-        .table("other_rows")
-        .unwrap()
-        .symbol("sym", "x".repeat(FRAME_LIMIT))
-        .unwrap()
-        .at_now()
-        .unwrap();
-    for buffer in [
-        &mut with_a_row_above_the_cap_in_its_last_table,
-        &mut with_a_row_above_the_cap,
-        &mut with_a_symbol_above_the_cap,
-    ] {
-        assert_refused_as_one_frame(&mut sender, buffer, FRAME_LIMIT, SET_BY_SERVER);
-    }
+    // Three rows that fit no frame: of a table of its own, of the table of
+    // the rows before it, and with a symbol that makes it so.
+    let row_of_another_table = |buffer: &mut Buffer| {
+        buffer
+            .table("other_rows")
+            .unwrap()
+            .column_str("txt", "x".repeat(FRAME_LIMIT))
+            .unwrap()
+            .at_now()
+            .unwrap();
+    };
+    let row_of_the_table = |buffer: &mut Buffer| add_row(buffer, 2000, &"x".repeat(FRAME_LIMIT));
+    let row_with_a_symbol = |buffer: &mut Buffer| {
+        buffer
+            .table("other_rows")
+            .unwrap()
+            .symbol("sym", "x".repeat(FRAME_LIMIT))
+            .unwrap()
+            .at_now()
+            .unwrap();
+    };
+    // The size of the frame that holds a row alone is the size of a buffer
+    // that holds it alone, and two bytes more when the table has a symbol
+    // column: a frame that may bring symbols has the room to count them.
+    let mut refuse = |add_the_row: &dyn Fn(&mut Buffer), table, room_to_count_symbols| {
+        let mut alone = Buffer::new_qwp_ws();
+        add_the_row(&mut alone);
+        let frame_size = alone.len() + room_to_count_symbols;
+        assert!(frame_size > FRAME_LIMIT);
+
+        // The row comes behind 2,000 rows that frames can hold.
+        let mut buffer = buffer_of(TABLE, 0..2000);
+        add_the_row(&mut buffer);
+        assert_refused_for_a_row(
+            &mut sender,
+            &mut buffer,
+            table,
+            frame_size,
+            FRAME_LIMIT,
+            SET_BY_SERVER,
+        );
+    };
+    refuse(&row_of_another_table, "other_rows", 0);
+    refuse(&row_of_the_table, TABLE, 0);
+    refuse(&row_with_a_symbol, "other_rows", 2);
     // Nothing of the refused buffers reached the server, not even a table.
     assert!(server.model.table(TABLE).is_none());
     assert!(server.model.table("other_rows").is_none());
@@ -1131,6 +1227,187 @@ fn a_buffer_that_cannot_be_cut_is_refused_as_one_frame() {
     let other = server.model.table("other_rows").unwrap();
     assert_eq!(other.commits, 1);
     assert_eq!(other.rows_as_text(), rows_of("other_rows", &large));
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_row_whose_frame_is_exactly_the_frame_cap_travels_alone_and_one_byte_more_is_refused() {
+    // A flush is cut for frames that are smaller than the frame cap.
+    let server = QwpWsModelServer::start(LIMIT_ABOVE_TARGET);
+    let mut sender = sender_with(server.port, "sf_max_segment_bytes=4096;");
+    assert_eq!(
+        sender.effective_frame_cap().unwrap(),
+        (LIMIT_ABOVE_TARGET, true)
+    );
+    // A row whose frame takes `frame_size` bytes, between rows that fill
+    // other frames.
+    let rows_around_a_row_of = |frame_size: usize| {
+        let mut alone = Buffer::new_qwp_ws();
+        add_row(&mut alone, 100, "");
+        // A byte of text is a byte of the frame.
+        let text = "x".repeat(frame_size - alone.len());
+        let mut buffer = buffer_of(TABLE, 0..100);
+        add_row(&mut buffer, 100, &text);
+        add_rows(&mut buffer, TABLE, 101..200);
+        buffer
+    };
+    let at_cap = rows_around_a_row_of(LIMIT_ABOVE_TARGET);
+    let mut above_cap = rows_around_a_row_of(LIMIT_ABOVE_TARGET + 1);
+
+    sender.flush_and_keep(&at_cap).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let table = server.model.table(TABLE).unwrap();
+    assert_eq!(table.commits, 1);
+    assert_eq!(table.rows_as_text(), rows_of(TABLE, &at_cap));
+    let frames_of_one_row = table
+        .blocks
+        .iter()
+        .filter(|block| block.rows.len() == 1)
+        .count();
+    assert_eq!(frames_of_one_row, 1);
+
+    assert_refused_for_a_row(
+        &mut sender,
+        &mut above_cap,
+        TABLE,
+        LIMIT_ABOVE_TARGET + 1,
+        LIMIT_ABOVE_TARGET,
+        SET_BY_SERVER,
+    );
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_row_that_fits_no_frame_by_its_size_bound_is_sent_when_the_buffer_fits_one_frame() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, "");
+    // Rows with one symbol of 600 bytes and a text of `txt` bytes.
+    let add = |buffer: &mut Buffer, id: i64, txt: usize| {
+        buffer
+            .table(TABLE)
+            .unwrap()
+            .symbol("sym", "s".repeat(600))
+            .unwrap()
+            .column_i64("id", id)
+            .unwrap()
+            .column_str("txt", "x".repeat(txt))
+            .unwrap()
+            .at_now()
+            .unwrap();
+    };
+    let mut first = Buffer::new_qwp_ws();
+    add(&mut first, 0, 10);
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&first).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    // The size bound of a row takes its symbols as new to the connection.
+    // With its symbol this row needs a frame above the frame cap, and the
+    // connection has the symbol: the buffer fits one frame, and goes out.
+    let mut alone = Buffer::new_qwp_ws();
+    add(&mut alone, 1, 500);
+    let frame_size = alone.len() + 2;
+    assert!(frame_size > FRAME_LIMIT + 100);
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&alone).unwrap(), Some(1));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let table = server.model.table(TABLE).unwrap();
+    assert_eq!((table.commits, table.blocks.len()), (2, 2));
+
+    // Ahead of rows that do not fit one frame with it, the same row is why
+    // the buffer is not cut into frames. The refusal gives the size of its
+    // frame by the size bound, with the symbol.
+    let mut ahead_of_others = Buffer::new_qwp_ws();
+    add(&mut ahead_of_others, 2, 500);
+    for id in 3..60 {
+        add(&mut ahead_of_others, id, 10);
+    }
+    assert_refused_for_a_row(
+        &mut sender,
+        &mut ahead_of_others,
+        TABLE,
+        frame_size,
+        FRAME_LIMIT,
+        SET_BY_SERVER,
+    );
+
+    let table = server.model.table(TABLE).unwrap();
+    assert_eq!(table.commits, 2);
+    assert_eq!(table.rows_as_text(), rows_of_all(&[&first, &alone]));
+    drop(sender);
+    server.finish();
+}
+
+#[test]
+fn a_value_that_cannot_be_sent_is_named_before_a_row_that_fits_no_frame() {
+    const TWO_DIGITS: &str = "cannot rescale decimal from scale 2 to 1 without precision loss";
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, "");
+    // 2,000 rows with a decimal of one digit after the point. With
+    // `two_digits`, row 1,500 has two: a value that the encoder refuses.
+    let add_decimals = |buffer: &mut Buffer, table: &str, two_digits: bool| {
+        for id in 0..2000 {
+            let price = if two_digits && id == 1500 {
+                format!("{id}.25")
+            } else {
+                format!("{id}.5")
+            };
+            buffer
+                .table(table)
+                .unwrap()
+                .column_i64("id", id)
+                .unwrap()
+                .column_dec64("price", price.as_str())
+                .unwrap()
+                .at(TimestampNanos::new(1_700_000_000_000_000_000 + id))
+                .unwrap();
+        }
+    };
+    let add_a_row_above_the_cap = |buffer: &mut Buffer, table: &str| {
+        buffer
+            .table(table)
+            .unwrap()
+            .column_str("txt", "x".repeat(FRAME_LIMIT))
+            .unwrap()
+            .at_now()
+            .unwrap();
+    };
+    // The row in the table before that of the value, in the table after it,
+    // and in the same table.
+    let buffers_with = |two_digits: bool| {
+        let mut row_first = Buffer::new_qwp_ws();
+        add_a_row_above_the_cap(&mut row_first, FIRST);
+        add_decimals(&mut row_first, SECOND, two_digits);
+        let mut value_first = Buffer::new_qwp_ws();
+        add_decimals(&mut value_first, FIRST, two_digits);
+        add_a_row_above_the_cap(&mut value_first, SECOND);
+        let mut one_table = Buffer::new_qwp_ws();
+        add_a_row_above_the_cap(&mut one_table, FIRST);
+        add_decimals(&mut one_table, FIRST, two_digits);
+        [row_first, value_first, one_table]
+    };
+
+    for mut refused in buffers_with(true) {
+        let (rows, len) = (refused.row_count(), refused.len());
+        let err = sender.flush(&mut refused).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{}", err.msg());
+        assert_eq!(err.msg(), TWO_DIGITS);
+        assert_eq!(sender.published_fsn().unwrap(), None);
+        assert_eq!((refused.row_count(), refused.len()), (rows, len));
+        assert!(!sender.must_close());
+    }
+    // Without that value, the row is what each buffer is refused for.
+    for (mut refused, table) in buffers_with(false).into_iter().zip([FIRST, SECOND, FIRST]) {
+        let refusal = refusal_of(&mut sender, &mut refused);
+        assert!(
+            refusal.starts_with(&format!(
+                "Could not flush buffer: a row of table '{table}' needs a frame of "
+            )),
+            "got: {refusal}"
+        );
+    }
+    assert!(server.model.table(FIRST).is_none());
+    assert!(server.model.table(SECOND).is_none());
     drop(sender);
     server.finish();
 }

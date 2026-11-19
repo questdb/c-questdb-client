@@ -4177,6 +4177,12 @@ impl QwpWsColumnarBuffer {
         Ok(plan)
     }
 
+    /// The name of the table that [`QwpWsNoFramePlan::RowAboveCap`] numbers
+    /// `table_idx`.
+    pub(crate) fn table_name(&self, table_idx: usize) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.tables[table_idx].table_name)
+    }
+
     /// Encodes one frame of a plan: the message
     /// [`Self::encode_ws_replay_message_with_defer`] writes in delta mode,
     /// with `blocks` in place of every table whole.

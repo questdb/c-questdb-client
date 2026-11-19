@@ -9505,6 +9505,30 @@ fn build_buffer_with_payload_bytes(target_encoded_len: usize) -> Buffer {
     buf
 }
 
+/// How a sender ends its refusal of a buffer that holds one row of table `t`
+/// and is too large for a frame of `cap` bytes. A sender that makes its
+/// progress in the background, with a server that told its frame limit,
+/// names the row that kept the buffer from going out in several frames: the
+/// frame of that row takes what the buffer says of its size. Any other
+/// sender names the size of the frame it encoded.
+fn one_row_above_frame_cap_refusal(
+    progress: ProgressCase,
+    buf: &Buffer,
+    cap: usize,
+    set_by: &str,
+) -> String {
+    match progress {
+        ProgressCase::Background => format!(
+            "a row of table 't' needs a frame of {} bytes, and the per-frame cap is {cap} bytes. \
+             Make the row smaller, or raise the cap. The cap is set by {set_by}.",
+            buf.len()
+        ),
+        ProgressCase::Manual => {
+            format!("exceeds the per-frame cap of {cap} bytes. The cap is set by {set_by}.")
+        }
+    }
+}
+
 #[test]
 fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
@@ -9531,10 +9555,12 @@ fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes
             progress.name()
         );
         assert!(
-            err.msg().contains(
-                "exceeds the per-frame cap of 512 bytes. \
-                 The cap is set by the server's advertised X-QWP-Max-Batch-Size."
-            ),
+            err.msg().ends_with(&one_row_above_frame_cap_refusal(
+                progress,
+                &buf,
+                server_cap,
+                "the server's advertised X-QWP-Max-Batch-Size"
+            )),
             "mode={}: got: {}",
             progress.name(),
             err.msg()
@@ -9576,9 +9602,11 @@ fn segment_payload_capacity_clamps_flush_below_server_cap_in_all_progress_modes(
             progress.name()
         );
         assert!(
-            err.msg().contains(&format!(
-                "exceeds the per-frame cap of {cap} bytes. \
-                 The cap is set by the sf_max_segment_bytes segment payload capacity."
+            err.msg().ends_with(&one_row_above_frame_cap_refusal(
+                progress,
+                &buf,
+                cap,
+                "the sf_max_segment_bytes segment payload capacity"
             )),
             "mode={}: got: {}",
             progress.name(),
@@ -9719,11 +9747,23 @@ fn configured_max_wins_when_smaller_than_server_cap_in_all_progress_modes() {
             "mode={}",
             progress.name()
         );
-        assert!(
-            err.msg().contains(&format!(
+        // A sender that makes its progress in the background, with a server
+        // that told its frame limit, holds `max_buf_size` against the size
+        // of the buffer. Any other holds the frame against the frame cap,
+        // which `max_buf_size` sets here.
+        let refusal = match progress {
+            ProgressCase::Background => format!(
+                "its size is {len} bytes, and max_buf_size is {configured_max} bytes. \
+                 Set max_buf_size to at least {len}, or flush more often.",
+                len = buf.len()
+            ),
+            ProgressCase::Manual => format!(
                 "exceeds the per-frame cap of {configured_max} bytes. \
                  The cap is set by max_buf_size."
-            )),
+            ),
+        };
+        assert!(
+            err.msg().ends_with(&refusal),
             "mode={}: error should reference configured max {configured_max}, got: {}",
             progress.name(),
             err.msg()
@@ -9833,9 +9873,11 @@ fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
             progress.name()
         );
         assert!(
-            err.msg().contains(&format!(
-                "exceeds the per-frame cap of {server_cap} bytes. \
-                 The cap is set by the server's advertised X-QWP-Max-Batch-Size."
+            err.msg().ends_with(&one_row_above_frame_cap_refusal(
+                progress,
+                &buf,
+                server_cap,
+                "the server's advertised X-QWP-Max-Batch-Size"
             )),
             "mode={}: error should reference server cap {server_cap}, got: {}",
             progress.name(),
