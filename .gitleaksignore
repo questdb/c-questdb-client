@@ -1,0 +1,3 @@
+# The sample Sec-WebSocket-Key of RFC 6455 ("the sample nonce") in the upgrade request
+# that a test of the QWP/WebSocket server model sends. It is no secret.
+05fb413c3dea0f2eff0f0d946fa1a0a029f532bb:questdb-rs/src/tests/qwp_ws_server_model.rs:generic-api-key:708
