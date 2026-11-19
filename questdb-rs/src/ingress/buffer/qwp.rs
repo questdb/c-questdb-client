@@ -2892,6 +2892,28 @@ impl QwpWsFramePlan {
     }
 }
 
+/// Why a row buffer cannot be cut into frames.
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum QwpWsNoFramePlan {
+    /// The buffer holds no rows.
+    NoRows,
+    /// A table holds a value that cannot be sent: a decimal that the encoder
+    /// refuses, or a symbol that a connection does not take.
+    UnsendableValue,
+    /// Row `row` of table `table_idx` fits no frame: by its size bound, a
+    /// frame that holds this row alone takes `frame_size` bytes, which is
+    /// above the cap. Of several such rows it is the first in buffer order.
+    RowAboveCap {
+        table_idx: usize,
+        row: u32,
+        frame_size: usize,
+    },
+    /// A column has no size bound for its rows. No column kind is without
+    /// one, so no buffer gives this.
+    NoSizeBound,
+}
+
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug)]
 pub(crate) struct QwpWsColumnarBuffer {
@@ -4060,10 +4082,15 @@ impl QwpWsColumnarBuffer {
     /// `cap` bytes. Frame sizes are taken from the size bound of their
     /// blocks, so an encoded frame is never larger.
     ///
-    /// `None` when the buffer cannot be cut: a table holds a decimal value
-    /// that the encoder refuses, the frame of a row would exceed `cap`, or
-    /// the buffer holds no rows at all.
-    pub(crate) fn plan_frames(&self, target: usize, cap: usize) -> Option<QwpWsFramePlan> {
+    /// An error when the buffer cannot be cut, which says why. Of several
+    /// things in the way it names the first: the tables are taken in buffer
+    /// order, and each is looked through for a value that cannot be sent
+    /// before its rows are cut.
+    pub(crate) fn plan_frames(
+        &self,
+        target: usize,
+        cap: usize,
+    ) -> Result<QwpWsFramePlan, QwpWsNoFramePlan> {
         debug_assert!(target <= cap);
         // A frame without new symbols: the header, the dictionary start and
         // a zero symbol count.
@@ -4084,7 +4111,9 @@ impl QwpWsColumnarBuffer {
             // The frames of a plan are published one by one. A value that
             // cannot be sent must be found before the first of them.
             // The blocks of a table with a symbol column may bring symbols.
-            let brings_symbols = table.has_symbol_column_if_sendable()?;
+            let brings_symbols = table
+                .has_symbol_column_if_sendable()
+                .ok_or(QwpWsNoFramePlan::UnsendableValue)?;
             let mut lo = 0;
             let mut like_rows = None;
             while lo < table.row_count {
@@ -4095,13 +4124,21 @@ impl QwpWsColumnarBuffer {
                     0
                 };
                 let room = target.saturating_sub(frame_size + count_room);
-                let (mut hi, mut block_size) = table.fitting_rows_end(lo, room, like_rows)?;
+                let (mut hi, mut block_size) = table
+                    .fitting_rows_end(lo, room, like_rows)
+                    .ok_or(QwpWsNoFramePlan::NoSizeBound)?;
                 if hi == lo && frame_is_empty {
                     // Not even one row fits the target: the row travels alone.
                     hi = lo + 1;
-                    block_size = table.encoded_rows_bound(lo..hi)?;
+                    block_size = table
+                        .encoded_rows_bound(lo..hi)
+                        .ok_or(QwpWsNoFramePlan::NoSizeBound)?;
                     if count_room + block_size > block_cap {
-                        return None;
+                        return Err(QwpWsNoFramePlan::RowAboveCap {
+                            table_idx,
+                            row: lo,
+                            frame_size: frame_overhead + count_room + block_size,
+                        });
                     }
                 }
                 if hi > lo {
@@ -4134,7 +4171,10 @@ impl QwpWsColumnarBuffer {
             plan.frame_ends.push(plan.blocks.len());
             plan.frame_sizes.push(frame_size);
         }
-        (!plan.blocks.is_empty()).then_some(plan)
+        if plan.blocks.is_empty() {
+            return Err(QwpWsNoFramePlan::NoRows);
+        }
+        Ok(plan)
     }
 
     /// Encodes one frame of a plan: the message
@@ -14365,7 +14405,7 @@ mod tests {
 
     /// A row whose frame is above the target travels in a frame of its own,
     /// as long as that frame is within the cap. With one row above the cap
-    /// the buffer cannot be cut.
+    /// the buffer cannot be cut, and the planner names that row.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_frame_plan_gives_a_row_above_the_target_a_frame_of_its_own() {
@@ -14403,7 +14443,14 @@ mod tests {
         assert_eq!(plan.frame_sizes(), frame_lens);
         assert_eq!(frame_lens[1], long_row);
 
-        assert!(buf.plan_frames(target, long_row - 1).is_none());
+        assert_eq!(
+            buf.plan_frames(target, long_row - 1).unwrap_err(),
+            QwpWsNoFramePlan::RowAboveCap {
+                table_idx: 0,
+                row: 2,
+                frame_size: long_row,
+            }
+        );
     }
 
     /// What the frames looked like that
@@ -14587,7 +14634,8 @@ mod tests {
     /// target travels in a frame of its own: the frame before it ends, and
     /// the rows after it, of its table or of the next one, go into the frame
     /// after it. With one row above the cap, in a table that is not the
-    /// first, the buffer cannot be cut.
+    /// first, the buffer cannot be cut, and the planner names that row. With
+    /// two such rows it names the first, although the second is the longer.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_frame_plan_of_several_tables_gives_a_row_above_the_target_a_frame_of_its_own()
@@ -14646,7 +14694,128 @@ mod tests {
 
         // The cap takes the long row of the second table, not the longer
         // one of the third.
-        assert!(buf.plan_frames(target, long_row).is_none());
+        assert_eq!(
+            buf.plan_frames(target, long_row).unwrap_err(),
+            QwpWsNoFramePlan::RowAboveCap {
+                table_idx: 2,
+                row: 1,
+                frame_size: longest_row,
+            }
+        );
+        // One byte less, and it takes neither.
+        assert_eq!(
+            buf.plan_frames(target, long_row - 1).unwrap_err(),
+            QwpWsNoFramePlan::RowAboveCap {
+                table_idx: 1,
+                row: 1,
+                frame_size: long_row,
+            }
+        );
+    }
+
+    /// A row that fits no frame is named, wherever it is: its table, its
+    /// number and the size of the frame that would hold it alone. In a table
+    /// with a symbol column that size has the two bytes more in which a
+    /// frame counts its symbols. A cap of that size takes the row, and so
+    /// does the cap below it once the row is a byte shorter. Of two such
+    /// rows the planner names the one that comes first in the buffer, also
+    /// when the other is the longer.
+    ///
+    /// Three tables, the second with a symbol column. Every row in turn is
+    /// the long one, and every two rows. The target lets a frame hold one
+    /// short row, or as many rows as the cap takes, so that the planner
+    /// comes to the long row at the start of a frame and inside one.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_names_the_first_row_above_the_cap() {
+        const ROWS: [u32; 3] = [3, 2, 3];
+        const WITH_SYMBOLS: usize = 1;
+        // The rows hold a string of 10 bytes, but for those of `long`: a
+        // table, a row of it and the length of its string.
+        let buffer_with = |long: &[(usize, u32, usize)]| {
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            for (table_idx, rows) in ROWS.into_iter().enumerate() {
+                for row in 0..rows {
+                    let len = long
+                        .iter()
+                        .find(|long| (long.0, long.1) == (table_idx, row))
+                        .map_or(10, |long| long.2);
+                    let table = buf.table(format!("t{table_idx}").as_str()).unwrap();
+                    if table_idx == WITH_SYMBOLS {
+                        table.symbol("sym", "a").unwrap();
+                    }
+                    table
+                        .column_str("s", "x".repeat(len).as_str())
+                        .unwrap()
+                        .at(TimestampNanos::new(i64::from(row)))
+                        .unwrap();
+                }
+            }
+            buf
+        };
+        // The frame that holds one row alone, by the bound of the row.
+        let frame_of = |buf: &QwpWsColumnarBuffer, (table_idx, row): (usize, u32)| {
+            let block = buf.tables[table_idx]
+                .encoded_rows_bound(row..row + 1)
+                .unwrap();
+            12 + 3 + 1 + if table_idx == WITH_SYMBOLS { 2 } else { 0 } + block
+        };
+        let above_the_cap =
+            |(table_idx, row): (usize, u32), frame_size: usize| QwpWsNoFramePlan::RowAboveCap {
+                table_idx,
+                row,
+                frame_size,
+            };
+        let all_rows: Vec<(usize, u32)> = ROWS
+            .into_iter()
+            .enumerate()
+            .flat_map(|(table_idx, rows)| (0..rows).map(move |row| (table_idx, row)))
+            .collect();
+
+        for &long in &all_rows {
+            let buf = buffer_with(&[(long.0, long.1, 500)]);
+            let size = frame_of(&buf, long);
+            if long.0 != WITH_SYMBOLS {
+                // The bound of a row without symbols is its encoded size.
+                let block = (long.0, long.1..long.1 + 1);
+                assert_eq!(size, encoded_frame_len_of_blocks(&buf, &[block]));
+            }
+            let a_byte_shorter = buffer_with(&[(long.0, long.1, 499)]);
+            assert_eq!(frame_of(&a_byte_shorter, long), size - 1);
+            for target in [64, size - 1] {
+                let case = format!("row {long:?} target {target}");
+                assert_eq!(
+                    buf.plan_frames(target, size - 1).unwrap_err(),
+                    above_the_cap(long, size),
+                    "{case}"
+                );
+                let plan = a_byte_shorter.plan_frames(target, size - 1).unwrap();
+                assert!(plan.frame_sizes().contains(&(size - 1)), "{case}");
+                let plan = buf.plan_frames(target, size).unwrap();
+                assert!(plan.frame_sizes().contains(&size), "{case}");
+            }
+        }
+
+        for (first_idx, &first) in all_rows.iter().enumerate() {
+            for &second in &all_rows[first_idx + 1..] {
+                let buf = buffer_with(&[(first.0, first.1, 500), (second.0, second.1, 600)]);
+                let (first_size, second_size) = (frame_of(&buf, first), frame_of(&buf, second));
+                assert!(first_size < second_size);
+                // A cap that takes neither row, and one that takes the first.
+                for (cap, named) in [
+                    (first_size - 1, above_the_cap(first, first_size)),
+                    (second_size - 1, above_the_cap(second, second_size)),
+                ] {
+                    for target in [64, cap] {
+                        assert_eq!(
+                            buf.plan_frames(target, cap).unwrap_err(),
+                            named,
+                            "rows {first:?} and {second:?} target {target} cap {cap}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A frame counts its blocks in 16 bits. A buffer of more tables than
@@ -14721,16 +14890,19 @@ mod tests {
         assert!(err.msg().contains("table count exceeds"), "{}", err.msg());
     }
 
-    /// What the planner does not cut: a buffer without rows. A table that
-    /// holds no rows, which `clear` leaves behind, is not in the way. A table
-    /// with a symbol column is cut like any other.
+    /// The planner does not cut a buffer without rows, and says that this is
+    /// why. A table that holds no rows, which `clear` leaves behind, is not
+    /// in the way. A table with a symbol column is cut like any other.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
-    fn qwp_ws_columnar_frame_plan_is_none_for_what_it_cannot_cut() {
+    fn qwp_ws_columnar_frame_plan_does_not_cut_a_buffer_without_rows() {
         let target = 1024 * 1024;
         let block = |table_idx, rows| QwpWsFrameBlock { table_idx, rows };
         let mut buf = QwpWsColumnarBuffer::new(127);
-        assert!(buf.plan_frames(target, target).is_none());
+        assert_eq!(
+            buf.plan_frames(target, target).unwrap_err(),
+            QwpWsNoFramePlan::NoRows
+        );
 
         write_row_of_sized_kinds(&mut buf, "first", 0);
         write_row_of_sized_kinds(&mut buf, "second", 0);
@@ -14740,7 +14912,10 @@ mod tests {
 
         buf.clear();
         assert_eq!(buf.tables.len(), 2);
-        assert!(buf.plan_frames(target, target).is_none());
+        assert_eq!(
+            buf.plan_frames(target, target).unwrap_err(),
+            QwpWsNoFramePlan::NoRows
+        );
         write_row_of_sized_kinds(&mut buf, "second", 0);
         write_row_of_sized_kinds(&mut buf, "second", 1);
         let plan = buf.plan_frames(target, target).unwrap();
@@ -14848,26 +15023,44 @@ mod tests {
             write_row_of_symbols(&mut buf, "symbols", i, true);
         }
         let table = &buf.tables[0];
-        let largest_row = (0..table.row_count)
-            .map(|row| 12 + 3 + 1 + 2 + table.encoded_rows_bound(row..row + 1).unwrap())
-            .max()
-            .unwrap();
+        let frame_of_row =
+            |row: u32| 12 + 3 + 1 + 2 + table.encoded_rows_bound(row..row + 1).unwrap();
+        let largest_row = (0..table.row_count).map(frame_of_row).max().unwrap();
         let plan = buf.plan_frames(largest_row, largest_row).unwrap();
         assert!(plan.frame_sizes().contains(&largest_row));
-        assert!(buf.plan_frames(largest_row - 1, largest_row - 1).is_none());
-        assert!(buf.plan_frames(64, largest_row).is_some());
-        assert!(buf.plan_frames(64, largest_row - 1).is_none());
+        // With a cap of one byte less the first row of that size fits no
+        // frame, and the size that the planner names counts the two bytes.
+        let first_largest = (0..table.row_count)
+            .find(|row| frame_of_row(*row) == largest_row)
+            .unwrap();
+        assert!(first_largest > 0);
+        let above_the_cap = QwpWsNoFramePlan::RowAboveCap {
+            table_idx: 0,
+            row: first_largest,
+            frame_size: largest_row,
+        };
+        assert_eq!(
+            buf.plan_frames(largest_row - 1, largest_row - 1)
+                .unwrap_err(),
+            above_the_cap
+        );
+        assert!(buf.plan_frames(64, largest_row).is_ok());
+        assert_eq!(
+            buf.plan_frames(64, largest_row - 1).unwrap_err(),
+            above_the_cap
+        );
     }
 
     /// The buffer takes a symbol of any length, and a connection refuses
     /// one longer than a mebibyte when a frame brings it. A buffer that
     /// holds such a symbol is not cut, so that no frame of a flush is
-    /// published before the frame that fails. A flush of one frame reports
-    /// the symbol. The longest symbol that a connection takes is cut, and
-    /// so is the buffer once the row of the refused symbol is taken back.
+    /// published before the frame that fails: the planner says that it holds
+    /// a value that cannot be sent. A flush of one frame reports the symbol.
+    /// The longest symbol that a connection takes is cut, and so is the
+    /// buffer once the row of the refused symbol is taken back.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
-    fn qwp_ws_columnar_frame_plan_is_none_for_a_symbol_that_a_connection_refuses() {
+    fn qwp_ws_columnar_frame_plan_does_not_cut_a_symbol_that_a_connection_refuses() {
         const LONGEST: usize = MAX_PERSISTED_SYMBOL_ENTRY_LEN as usize;
         let cap = 8 * LONGEST;
         let add_symbol = |buf: &mut QwpWsColumnarBuffer, column: &str, len: usize| {
@@ -14883,12 +15076,16 @@ mod tests {
         add_symbol(&mut buf, "long", LONGEST);
         add_symbol(&mut buf, "other", 5);
         write_row_of_sized_kinds(&mut buf, "last", 0);
-        assert!(buf.plan_frames(cap, cap).is_some());
+        assert!(buf.plan_frames(cap, cap).is_ok());
 
         for column in ["long", "other"] {
             buf.set_marker().unwrap();
             add_symbol(&mut buf, column, LONGEST + 1);
-            assert!(buf.plan_frames(cap, cap).is_none(), "{column}");
+            assert_eq!(
+                buf.plan_frames(cap, cap).unwrap_err(),
+                QwpWsNoFramePlan::UnsendableValue,
+                "{column}"
+            );
             let err = buf
                 .encode_ws_replay_message(
                     &mut QwpWsEncodeScratch::new(),
@@ -14904,7 +15101,7 @@ mod tests {
             );
             // The column keeps the mark of a long symbol, and holds none.
             buf.rewind_to_marker().unwrap();
-            assert!(buf.plan_frames(cap, cap).is_some(), "{column}");
+            assert!(buf.plan_frames(cap, cap).is_ok(), "{column}");
         }
     }
 
@@ -14945,11 +15142,12 @@ mod tests {
     /// value is brought to the scale of its column, which the first value
     /// set, only when it is encoded. A buffer that holds such a value is not
     /// cut, in whichever of its tables the value is, so that no frame of a
-    /// flush is published before the frame that fails. A flush of one frame
-    /// reports the value. Without the row of that value the buffer is cut.
+    /// flush is published before the frame that fails: the planner says that
+    /// it holds a value that cannot be sent. A flush of one frame reports
+    /// the value. Without the row of that value the buffer is cut.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
-    fn qwp_ws_columnar_frame_plan_is_none_for_a_decimal_the_encoder_refuses() {
+    fn qwp_ws_columnar_frame_plan_does_not_cut_a_decimal_the_encoder_refuses() {
         const LOSES_DIGITS: &str =
             "cannot rescale decimal from scale 2 to 1 without precision loss";
         let target = 1024 * 1024;
@@ -15001,12 +15199,16 @@ mod tests {
             let mut buf = QwpWsColumnarBuffer::new(127);
             write_row_of_sized_kinds(&mut buf, "first", 0);
             add_decimal_row(&mut buf, "decimals", kind, first).unwrap();
-            assert!(buf.plan_frames(target, target).is_some(), "{case}");
+            assert!(buf.plan_frames(target, target).is_ok(), "{case}");
 
             buf.set_marker().unwrap();
             add_decimal_row(&mut buf, "decimals", kind, refused).unwrap();
             write_row_of_sized_kinds(&mut buf, "last", 0);
-            assert!(buf.plan_frames(target, target).is_none(), "{case}");
+            assert_eq!(
+                buf.plan_frames(target, target).unwrap_err(),
+                QwpWsNoFramePlan::UnsendableValue,
+                "{case}"
+            );
             let err = buf
                 .encode_ws_replay_message(
                     &mut QwpWsEncodeScratch::new(),
@@ -15023,9 +15225,82 @@ mod tests {
         }
     }
 
-    /// The planner refuses the decimal values that the encoder refuses, and
-    /// no others: for each width, every pair of the values below, the first
-    /// of which sets the scale of the column.
+    /// Of a value that cannot be sent and a row above the cap, the planner
+    /// names the one that it comes to first. It takes the tables in buffer
+    /// order, and looks through a table for such a value before it cuts the
+    /// rows of that table. So it names the row only when the table of the
+    /// row comes before the table of the value.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_frame_plan_names_what_it_comes_to_first() {
+        // Two tables of two rows, each row a string and a decimal. The
+        // first row of a table sets the scale of its decimals to one digit,
+        // so the encoder refuses the second row of `refused_table`. Row
+        // `long` has the long string.
+        let buffer_with = |long: (usize, u32), refused_table: usize| {
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            for table_idx in 0..2 {
+                for row in 0..2 {
+                    let len = if (table_idx, row) == long { 500 } else { 10 };
+                    let refused = table_idx == refused_table && row == 1;
+                    buf.table(format!("t{table_idx}").as_str())
+                        .unwrap()
+                        .column_str("s", "x".repeat(len).as_str())
+                        .unwrap()
+                        .column_dec64("d", if refused { "1.25" } else { "1.5" })
+                        .unwrap()
+                        .at(TimestampNanos::new(i64::from(row)))
+                        .unwrap();
+                }
+            }
+            buf
+        };
+        for (long, refused_table, names_the_row) in [
+            ((0, 0), 1, true),
+            ((0, 1), 1, true),
+            ((1, 0), 0, false),
+            ((1, 1), 0, false),
+            // One table holds both, the row before the value and with it.
+            ((0, 0), 0, false),
+            ((0, 1), 0, false),
+            ((1, 0), 1, false),
+            ((1, 1), 1, false),
+        ] {
+            let case = format!("long row {long:?}, refused value in table {refused_table}");
+            let buf = buffer_with(long, refused_table);
+            let (table_idx, row) = long;
+            let frame_size = 12
+                + 3
+                + 1
+                + buf.tables[table_idx]
+                    .encoded_rows_bound(row..row + 1)
+                    .unwrap();
+            let named = if names_the_row {
+                QwpWsNoFramePlan::RowAboveCap {
+                    table_idx,
+                    row,
+                    frame_size,
+                }
+            } else {
+                QwpWsNoFramePlan::UnsendableValue
+            };
+            assert_eq!(
+                buf.plan_frames(64, frame_size - 1).unwrap_err(),
+                named,
+                "{case}"
+            );
+            // Once the cap takes the row, the value is what is in the way.
+            assert_eq!(
+                buf.plan_frames(64, frame_size).unwrap_err(),
+                QwpWsNoFramePlan::UnsendableValue,
+                "{case}"
+            );
+        }
+    }
+
+    /// The planner refuses the decimal values that the encoder refuses, as
+    /// values that cannot be sent, and no others: for each width, every pair
+    /// of the values below, the first of which sets the scale of the column.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_frame_plan_takes_the_decimals_the_encoder_takes() {
@@ -15074,8 +15349,8 @@ mod tests {
                         )
                         .is_ok();
                     assert_eq!(
-                        buf.plan_frames(usize::MAX, usize::MAX).is_some(),
-                        encoded,
+                        buf.plan_frames(usize::MAX, usize::MAX).err(),
+                        (!encoded).then_some(QwpWsNoFramePlan::UnsendableValue),
                         "{kind}: {first}, then {second}"
                     );
                     taken += usize::from(encoded);

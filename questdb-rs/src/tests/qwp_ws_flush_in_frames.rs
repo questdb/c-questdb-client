@@ -404,7 +404,7 @@ fn the_frames_of_a_flush_bring_each_symbol_once_wherever_the_buffer_is_cut() {
 
     let rows = large.as_qwp_ws().unwrap();
     let least_limit = (64..)
-        .find(|limit| rows.plan_frames(*limit, *limit).is_some())
+        .find(|limit| rows.plan_frames(*limit, *limit).is_ok())
         .unwrap();
     let mut frame_starts = std::collections::BTreeSet::new();
     let mut frame_counts = std::collections::BTreeSet::new();

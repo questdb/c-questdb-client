@@ -4245,7 +4245,7 @@ pub(crate) fn flush_qwp_ws(
         let len = buffer.len();
         if len > frame_cap && len <= max_buf_size {
             let target = frame_cap.min(state.sfa_frame_split_target);
-            if let Some(plan) = buffer.plan_frames(target, frame_cap)
+            if let Ok(plan) = buffer.plan_frames(target, frame_cap)
                 && let Some(producer) = runner.producer.as_ref()
                 && let Some(min_total_bytes) = producer.min_total_bytes_for(plan.frame_sizes())
             {
