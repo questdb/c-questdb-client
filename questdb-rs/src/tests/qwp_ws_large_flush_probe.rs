@@ -28,7 +28,7 @@
 //!
 //! The rows and the checks of the tables are those of `qwp_ws_defer_probe`,
 //! which writes such frames to a raw WebSocket. Here the sender cuts the
-//! buffer and sends the frames. There are three tests:
+//! buffer and sends the frames. There are four tests:
 //!
 //! - a flush of one table without symbols into a table that the flush
 //!   creates, so the time until the server confirms includes the time it
@@ -39,12 +39,16 @@
 //!   connection knows them;
 //! - two flushes of one table, one right after the other, through a sender
 //!   whose queue takes one of them at a time: the second `flush` waits
-//!   until the server has confirmed the first.
+//!   until the server has confirmed the first;
+//! - a flush with symbols that fails part way, after a small flush of the
+//!   same sender: the server commits the small flush and no row of the
+//!   failed one, and the same buffer through a new sender is one
+//!   transaction.
 //!
 //! Each test also prints how long a flush took; the first two, how much
 //! memory the process held; the second one, how many frames its flushes
 //! took. For these numbers run one test at a time, from a release build.
-//! This runs all three; the whole name of a test runs that one:
+//! This runs all four; the whole name of a test runs that one:
 //!
 //! `QDB_QWP_WS_LARGE_FLUSH_PROBE=1 QDB_QWP_WS_PORT=9000 cargo test --release --manifest-path questdb-rs/Cargo.toml --lib qwp_ws_real_server_large_flush -- --ignored --nocapture`
 //!
@@ -55,15 +59,15 @@
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
-use crate::ingress::{AckLevel, Buffer, Sender, SenderBuilder, SymbolGlobalDict};
+use crate::ingress::{AckLevel, Buffer, Sender, SenderBuilder, SymbolGlobalDict, TestDictCapGuard};
 
 use super::TestResult;
 use super::qwp_ws_defer_probe::{
-    Digest, Group, SERVER_MAX_UNCOMMITTED_ROWS, Server, TagOf, push_row, rows_from, tag_of,
-    text_len_of,
+    Digest, Group, SERVER_MAX_UNCOMMITTED_ROWS, Server, TagOf, push_row, rows_from,
+    symbols_brought, tag_of, text_len_of,
 };
 use super::qwp_ws_protocol_probe::{ProbeConfig, ProbeResult, query_build};
-use super::qwp_ws_server_model::frame_of_a_sender;
+use super::qwp_ws_server_model::{frame_of_a_sender, frames_of_a_sender};
 
 /// More than 16 MiB, the largest message the protocol has.
 const DEFAULT_MIB: usize = 20;
@@ -80,6 +84,9 @@ const WAIT: Duration = Duration::from_secs(30);
 /// A queue of 8 MiB, which is two of its segments: too small for a buffer
 /// of more than a few frames, whatever the server confirms.
 const QUEUE_TOO_SMALL: u64 = 8 * 1024 * 1024;
+/// How long a server is given to see that a connection went away. Its log
+/// shows that it takes a few milliseconds.
+const DROP_SETTLE: Duration = Duration::from_secs(1);
 
 #[test]
 #[ignore = "requires a real QuestDB server and QDB_QWP_WS_LARGE_FLUSH_PROBE=1"]
@@ -480,6 +487,211 @@ fn qwp_ws_real_server_large_flush_waits_for_room_in_the_queue() -> TestResult {
     eprintln!(
         "a queue of {QUEUE_TOO_SMALL} bytes refused the buffer after {refused_after:?}: {}",
         refusal.msg()
+    );
+    Ok(())
+}
+
+/// A flush far larger than a frame that fails part way, after a small flush
+/// of the same sender. The rows of both have the symbols of the script. The
+/// test makes the symbol dictionary of the sender so small that it is full
+/// when the first half of the frames of the large flush is queued: the next
+/// frame brings a symbol more, and the flush fails there.
+///
+/// The large flush fails with `FlushAborted` and its buffer keeps its rows.
+/// The sender sends the frames that it had queued, which the server holds
+/// without committing them, and takes no more flushes. Its `wait` returns
+/// when the server has confirmed the small flush, and so does its
+/// `close_drain`. The table then holds the rows of the small flush, in one
+/// transaction, and still does when the sender is gone: the server drops
+/// the rows it held with the connection.
+///
+/// The same buffer through a new sender is one more transaction, and the
+/// table holds every row once.
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_LARGE_FLUSH_PROBE=1"]
+fn qwp_ws_real_server_large_flush_that_fails_part_way_commits_none_of_its_rows() -> TestResult {
+    let Some((config, mib)) = probe_settings()? else {
+        return Ok(());
+    };
+    let server = Server::Live(&config);
+    let (table, _cleanup) = server.new_table("qwp_large_flush_aborted");
+    let conf = format!("ws::addr={}:{};", config.host, config.qwp_ws_port);
+    // A sender that is only asked what the server takes in a frame.
+    let frame_cap = {
+        let sender = SenderBuilder::from_conf(&conf)?.build()?;
+        let (frame_cap, told_by_server) = sender.effective_frame_cap()?;
+        assert!(told_by_server, "the server told no frame limit");
+        frame_cap
+    };
+
+    // The small flush, which creates the table, and the large one. Ten rows
+    // share a tag, so every frame of the large one brings new symbols.
+    let small_rows = rows_from(0, CREATING_ROWS);
+    let mut small = Buffer::new_qwp_ws();
+    for (id, text_len) in &small_rows {
+        push_row(&mut small, &table, *id, *text_len, Some(tag_of))?;
+    }
+    let bytes = (mib * 1024 * 1024).saturating_sub(SYMBOL_ROW_ROOM);
+    let mut large = Buffer::new_qwp_ws();
+    let mut id = CREATING_ROWS as i64;
+    while large.len() < bytes {
+        push_row(&mut large, &table, id, text_len_of(id), Some(tag_of))?;
+        id += 1;
+    }
+    let (rows, len) = (large.row_count(), large.len());
+    // Fewer rows than a server holds before it commits by itself: it would
+    // commit a part of the failed flush.
+    assert!(
+        rows < SERVER_MAX_UNCOMMITTED_ROWS,
+        "a server commits a flush of {rows} rows in parts"
+    );
+
+    // The frames that a sender makes of the large buffer after the small
+    // one. The flush is to fail at the frame in the middle: the connection
+    // takes the symbols that it holds before that frame, and no more.
+    let (frame_count, failing, symbol_cap, all_symbols) = {
+        let mut symbols = SymbolGlobalDict::new();
+        frame_of_a_sender(&small, false, &mut symbols);
+        let frames = frames_of_a_sender(&large, frame_cap, &mut symbols);
+        let failing = frames.len() / 2;
+        assert!(failing >= 1, "{} frames: use a larger buffer", frames.len());
+        let (held_before, brought) = symbols_brought(&frames[failing..=failing])[0];
+        assert!(brought > 0, "frame {failing} brings no symbol");
+        (
+            frames.len(),
+            failing,
+            held_before as usize,
+            symbols.next_id(),
+        )
+    };
+    let mut sender = {
+        // The dictionary of a sender is made when the sender is built.
+        let _cap = TestDictCapGuard::new(symbol_cap);
+        SenderBuilder::from_conf(&conf)?.build()?
+    };
+    assert_eq!(sender.effective_frame_cap()?, (frame_cap, true));
+
+    // The two flushes, with no wait for the server between them.
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&small)?, Some(0));
+    let started = Instant::now();
+    let err = match sender.flush(&mut large) {
+        Err(err) => err,
+        Ok(()) => panic!(
+            "a connection that takes {symbol_cap} symbols took a buffer that brings \
+             {all_symbols}"
+        ),
+    };
+    let failed_after = started.elapsed();
+    assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+    let cause = format!("dictionary reached its {symbol_cap}-entry cap");
+    assert!(err.msg().contains(&cause), "{}", err.msg());
+    assert!(!err.in_doubt());
+    assert!(sender.must_close());
+    assert_eq!(
+        (large.row_count(), large.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    // The sender has published the small flush, and says no more.
+    assert_eq!(sender.published_fsn()?, Some(0));
+
+    // It waits for the answer to the small flush and for no other: the
+    // server answers no frame of the failed flush.
+    let confirmed_at_failure = sender.completed_fsn(AckLevel::Ok)?;
+    let wait_started = Instant::now();
+    sender.wait(AckLevel::Ok, WAIT)?;
+    let waited = wait_started.elapsed();
+    assert_eq!(sender.completed_fsn(AckLevel::Ok)?, Some(0));
+    assert_eq!(sender.published_fsn()?, Some(0));
+
+    // It sends the frames of the failed flush that it had queued, which are
+    // those before the failing one, each once.
+    let queued = 1 + failing as u64;
+    let deadline = Instant::now() + WAIT;
+    while sender.qwp_ws_totals()?.frames_sent < queued {
+        assert!(
+            Instant::now() < deadline,
+            "{:?}: the frames of the failed flush did not go out",
+            sender.qwp_ws_totals()?
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // A later flush gets the same error, and nothing of it is queued.
+    let refused = match sender.flush_and_keep(&small) {
+        Err(refused) => refused,
+        Ok(()) => panic!("the sender took a flush after the one that failed part way"),
+    };
+    assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+    assert_eq!(sender.published_fsn()?, Some(0));
+    let totals = sender.qwp_ws_totals()?;
+    assert_eq!(
+        (
+            totals.frames_sent,
+            totals.frames_replayed,
+            totals.reconnect_attempts,
+            totals.server_errors
+        ),
+        (queued, 0, 0, 0),
+        "{totals:?}"
+    );
+
+    // The server has committed the small flush and nothing else.
+    server.wait_for_rows(&table, small_rows.len())?;
+    assert_eq!(server.digest(&table)?, Some(Digest::of(&small_rows)));
+    assert_eq!(server.transactions(&table)?, Some(1));
+
+    // What the error says to do: close the sender, and flush the buffer
+    // through a new one. The close has nothing left to wait for.
+    let close_started = Instant::now();
+    sender.close_drain()?;
+    let closed_after = close_started.elapsed();
+    assert!(sender.must_close());
+    drop(sender);
+    // The rows that the server held go with the connection.
+    server.wait_for_the_drop(DROP_SETTLE);
+    assert_eq!(server.digest(&table)?, Some(Digest::of(&small_rows)));
+    assert_eq!(server.transactions(&table)?, Some(1));
+
+    let mut sender = SenderBuilder::from_conf(&conf)?.build()?;
+    let again = flush_and_wait(&mut sender, &large)?;
+    let frames_again = again.fsn + 1;
+    assert!(
+        frames_again >= len.div_ceil(frame_cap) as u64,
+        "{frames_again} frames for {len} bytes"
+    );
+    let totals = sender.qwp_ws_totals()?;
+    assert_eq!(
+        (
+            totals.frames_sent,
+            totals.frames_replayed,
+            totals.reconnect_attempts,
+            totals.server_errors
+        ),
+        (frames_again, 0, 0, 0),
+        "{totals:?}"
+    );
+    assert!(!sender.must_close());
+
+    // One more transaction, and the table holds every row once, each with
+    // its symbols.
+    let held = rows_from(0, CREATING_ROWS + rows);
+    server.wait_for_rows(&table, held.len())?;
+    server.expect_rows_with_tags(&table, &held, tag_of)?;
+    assert_eq!(server.transactions(&table)?, Some(2));
+
+    eprintln!(
+        "large flush that fails part way: {rows} rows, {len} bytes in the buffer, \
+         {frame_count} frames of at most {frame_cap} bytes, {all_symbols} symbols with those \
+         of the small flush before it; a connection that takes {symbol_cap} symbols failed \
+         the flush at frame {failing} after {failed_after:?}, with the {failing} frames \
+         before it queued; the server had confirmed {confirmed_at_failure:?} by then; wait \
+         returned after {waited:?}, close_drain after {closed_after:?}"
+    );
+    eprintln!("the error: {}", err.msg());
+    eprintln!(
+        "the same buffer through a new sender: {frames_again} frames; flush returned after \
+         {:?}, and the server had confirmed the rows {:?} after the call began",
+        again.flush_took, again.confirmed_after
     );
     Ok(())
 }

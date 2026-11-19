@@ -733,7 +733,7 @@ fn block_counts(frames: &[Vec<u8>]) -> Vec<usize> {
 }
 
 /// Per frame, the symbols it brings: the id of the first, and how many.
-fn symbols_brought(frames: &[Vec<u8>]) -> Vec<(u64, u64)> {
+pub(super) fn symbols_brought(frames: &[Vec<u8>]) -> Vec<(u64, u64)> {
     frames
         .iter()
         .map(|frame| {
@@ -1113,7 +1113,7 @@ impl Server<'_> {
     /// Waits until the server has seen that the last connection went away.
     /// The model server tells; a real server is given `settle`, and its log
     /// shows that it takes a few milliseconds.
-    fn wait_for_the_drop(&self, settle: Duration) {
+    pub(super) fn wait_for_the_drop(&self, settle: Duration) {
         match self {
             Self::Live(_) => std::thread::sleep(settle),
             Self::Model(server) => {
