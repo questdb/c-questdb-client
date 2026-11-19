@@ -412,7 +412,12 @@ impl Sender {
             effective_hard_frame_cap(self.max_buf_size, server_max, sfa_frame_payload_cap);
         let result = match &mut self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => {
-                flush_qwp_ws(state, qwp, max, self.max_buf_size, server_max_known)
+                match flush_qwp_ws(state, qwp, max, self.max_buf_size, server_max_known) {
+                    Ok(fsn) => Ok(fsn),
+                    // The error is complete: its limit is not the frame cap.
+                    Err(QwpWsFlushError::Refused(err)) => return Err(err),
+                    Err(QwpWsFlushError::Failed(err)) => Err(err),
+                }
             }
             SyncProtocolHandler::ManualQwpWs(state) => flush_qwp_ws_manual(state, qwp, max),
             _ => unreachable!("QWP/WebSocket handler was checked above"),

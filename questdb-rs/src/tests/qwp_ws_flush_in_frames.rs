@@ -31,16 +31,18 @@
 //! and the queue has room for all the frames. The buffer may hold rows of
 //! several tables: the server commits each of them once. Each frame brings
 //! the symbols that its rows are the first to use on the connection.
+//! A buffer whose frames the queue can never hold together is refused with
+//! an error that names `sf_max_total_bytes` and the value that would do.
 //! Any other flush goes out as one frame, as before: a buffer that is too
-//! large for one frame is refused, nothing of it is published and it keeps
-//! its rows.
+//! large for one frame is refused. Nothing of a refused buffer is published,
+//! and it keeps its rows.
 //!
 //! The server is the model of [`crate::tests::qwp_ws_server_model`] behind a
 //! socket: it holds the rows of a frame with the defer flag and commits at
 //! every frame without it, so the number of its commits tells how the frames
 //! of a flush were flagged.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::ingress::{
@@ -260,6 +262,43 @@ fn assert_refused_as_one_frame(sender: &mut Sender, buffer: &mut Buffer, cap: us
             && err.msg().ends_with(&end),
         "got: {}",
         err.msg()
+    );
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        published,
+        "nothing is published"
+    );
+    assert_eq!(
+        (buffer.row_count(), buffer.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    assert!(!sender.must_close());
+}
+
+/// Flushes a buffer whose `frames` frames need a queue of `min_total_bytes`
+/// bytes, through a sender whose queue is one of `max_total_bytes`. The
+/// refusal names both, nothing is published, the buffer keeps its rows and
+/// the sender stays usable.
+fn assert_refused_for_the_queue(
+    sender: &mut Sender,
+    buffer: &mut Buffer,
+    frames: usize,
+    min_total_bytes: usize,
+    max_total_bytes: usize,
+) {
+    let published = sender.published_fsn().unwrap();
+    let (rows, len) = (buffer.row_count(), buffer.len());
+
+    let err = sender.flush(buffer).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{}", err.msg());
+    assert_eq!(
+        err.msg(),
+        format!(
+            "Could not flush buffer: its {frames} frames need a store-and-forward queue of \
+             {min_total_bytes} bytes, and sf_max_total_bytes is {max_total_bytes} bytes. Set \
+             sf_max_total_bytes to at least {min_total_bytes}, or flush more often."
+        )
     );
     assert_eq!(
         sender.published_fsn().unwrap(),
@@ -1092,38 +1131,114 @@ fn a_buffer_that_cannot_be_cut_is_refused_as_one_frame() {
     server.finish();
 }
 
+/// The byte budget that a queue of segments of 1,024 bytes needs for a
+/// flush of `frames` frames that go two a segment: the segments that the
+/// frames fill, and the segment in use.
+fn queue_bytes_for(frames: usize) -> usize {
+    (frames.div_ceil(2) + 1) * 1024
+}
+
 #[test]
-fn a_flush_without_room_for_all_its_frames_is_refused_as_one_frame() {
+fn a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do() {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    // A queue of four segments of 1,024 bytes. A segment holds 992 bytes of
-    // one frame, which is the frame cap, or two frames of 492 bytes, which
-    // is what a flush is cut for. A flush that could not queue a frame
-    // would wait 200 ms for room.
-    let mut sender = sender_with(
-        server.port,
-        "sf_max_segment_bytes=1024;sf_max_total_bytes=4096;sf_append_deadline_millis=200;",
-    );
-    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
-    let mut too_many_frames = buffer_of(TABLE, 0..400);
-    let few_frames = buffer_of(TABLE, 400..460);
-    assert!(frames_of_a_flush(&too_many_frames, 492).len() > 8);
-    let few = frames_of_a_flush(&few_frames, 492).len() as u64;
+    // Segments of 1,024 bytes. One holds 992 bytes of one frame, which is
+    // the frame cap, or two frames of 492 bytes, which is what a flush is
+    // cut for.
+    const SEGMENTS: &str = "sf_max_segment_bytes=1024;";
+    let before = buffer_of(TABLE, 0..3);
+    let few_frames = buffer_of(TABLE, 3..63);
+    let mut too_large = buffer_of(TABLE, 63..463);
+    let few = frames_of_a_flush(&few_frames, 492).len();
     assert!((3..=6).contains(&few), "{few} frames");
+    let frames = frames_of_a_flush(&too_large, 492).len();
+    let min_total_bytes = queue_bytes_for(frames);
+    assert!(min_total_bytes > 3 * 4096, "{frames} frames");
 
-    assert_refused_as_one_frame(&mut sender, &mut too_many_frames, 992, SET_BY_SEGMENT);
+    // A queue of four segments.
+    let mut sender = sender_with(server.port, &format!("{SEGMENTS}sf_max_total_bytes=4096;"));
+    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    assert_refused_for_the_queue(&mut sender, &mut too_large, frames, min_total_bytes, 4096);
 
+    // The flush before is confirmed, and the sender takes a flush that its
+    // queue holds. The large one is refused again.
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&before]);
     assert_eq!(
         sender.flush_and_keep_and_get_fsn(&few_frames).unwrap(),
-        Some(few - 1)
+        Some(few as u64)
     );
     sender.wait(AckLevel::Ok, WAIT).unwrap();
-    let table = server.model.table(TABLE).unwrap();
-    assert_eq!(table.commits, 1);
-    assert_eq!(table.rows_as_text(), rows_of(TABLE, &few_frames));
+    assert_table_holds(&server, TABLE, 2, &[&before, &few_frames]);
+    assert_refused_for_the_queue(&mut sender, &mut too_large, frames, min_total_bytes, 4096);
+    drop(sender);
 
-    assert_refused_as_one_frame(&mut sender, &mut too_many_frames, 992, SET_BY_SEGMENT);
+    // A byte less than the error names is not enough, also for a queue that
+    // holds nothing else.
+    let settings = format!("{SEGMENTS}sf_max_total_bytes={};", min_total_bytes - 1);
+    let mut sender = sender_with(server.port, &settings);
+    assert_refused_for_the_queue(
+        &mut sender,
+        &mut too_large,
+        frames,
+        min_total_bytes,
+        min_total_bytes - 1,
+    );
+    drop(sender);
+
+    // With the queue that the error names, the buffer is one commit.
+    let settings = format!("{SEGMENTS}sf_max_total_bytes={min_total_bytes};");
+    let mut sender = sender_with(server.port, &settings);
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&too_large).unwrap(),
+        Some(frames as u64 - 1)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 3, &[&before, &few_frames, &too_large]);
+    assert!(!sender.must_close());
     drop(sender);
     server.finish();
+}
+
+#[test]
+fn a_flush_that_the_queue_can_hold_but_not_now_is_refused_as_one_frame() {
+    // The server tells its frame limit and then confirms nothing: what is
+    // flushed stays in the queue.
+    let port = spawn_max_batch_size_upgrade_only_server(Some(FRAME_LIMIT));
+    // A queue of eight segments of 1,024 bytes, for frames that go two a
+    // segment.
+    let mut sender = sender_with(port, "sf_max_segment_bytes=1024;sf_max_total_bytes=8192;");
+    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
+    let first = buffer_of(TABLE, 0..170);
+    let mut second = buffer_of(TABLE, 170..340);
+    let mut too_large = buffer_of(TABLE, 340..740);
+    // A flush of nine to twelve frames takes five or six segments: the
+    // queue holds one, and has no room for a second one next to it.
+    let first_frames = frames_of_a_flush(&first, 492).len();
+    let second_frames = frames_of_a_flush(&second, 492).len();
+    assert!((9..=12).contains(&first_frames), "{first_frames} frames");
+    assert!((9..=12).contains(&second_frames), "{second_frames} frames");
+    assert!(queue_bytes_for(second_frames) <= 8192);
+    let too_many_frames = frames_of_a_flush(&too_large, 492).len();
+    assert!(queue_bytes_for(too_many_frames) > 8192);
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&first).unwrap(),
+        Some(first_frames as u64 - 1)
+    );
+    // Provisional: this flush will wait for room.
+    assert_refused_as_one_frame(&mut sender, &mut second, 992, SET_BY_SEGMENT);
+
+    // What the queue can never hold is refused at once, whatever it holds.
+    let started = Instant::now();
+    assert_refused_for_the_queue(
+        &mut sender,
+        &mut too_large,
+        too_many_frames,
+        queue_bytes_for(too_many_frames),
+        8192,
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[test]

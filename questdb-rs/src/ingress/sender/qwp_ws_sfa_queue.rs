@@ -3575,6 +3575,31 @@ impl SfaProducer {
             new_segments <= spare + free_bytes / segment_size_bytes
         })
     }
+
+    /// The least byte budget (`sf_max_total_bytes`) with which a queue of
+    /// segments like this one's takes frames with payloads of `payload_lens`
+    /// bytes as one flush, whatever it took before. `None` when a frame fits
+    /// no segment.
+    ///
+    /// The frames of a flush are confirmed together, so the queue holds them
+    /// all at once. It holds them next to the segment in use, which keeps its
+    /// frames, confirmed or not, until it is full. So the budget is that
+    /// segment and the segments that the frames fill when the first of them
+    /// starts a new one. With it, the frames have room wherever the producer
+    /// stands, once every frame before them is confirmed and the runner has
+    /// freed their segments. With a segment less they have room only when
+    /// the first of them fits the segment in use.
+    pub(crate) fn min_total_bytes_for(&self, payload_lens: &[usize]) -> Option<u64> {
+        let segment_size_bytes = self.engine.segment_size_bytes;
+        let segments =
+            new_segments_for_frames(segment_size_bytes, segment_size_bytes, payload_lens)?;
+        Some((segments + 1).saturating_mul(segment_size_bytes))
+    }
+
+    /// The byte budget of the queue (`sf_max_total_bytes`).
+    pub(crate) fn max_total_bytes(&self) -> u64 {
+        self.engine.max_bytes as u64
+    }
 }
 
 fn first_unresolved_fsn_from_segments(
@@ -7313,5 +7338,183 @@ mod tests {
         let producer = queue.take_producer().unwrap();
         assert!(producer.has_room_for(&[68, 68, 68]));
         assert!(!producer.has_room_for(&[68, 69, 68]));
+    }
+
+    #[test]
+    fn min_total_bytes_for_counts_the_segment_in_use_and_the_segments_of_the_frames() {
+        // Segments of 100 bytes: a header of 24, then frames of their payload
+        // and 8 bytes each, so one frame of 68 bytes or two of 30.
+        let mut queue = SfaFrameQueue::open_memory(memory_options(100, 400)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        assert_eq!(producer.max_total_bytes(), 400);
+        let for_frames = |producer: &SfaProducer| {
+            [
+                producer.min_total_bytes_for(&[]),
+                producer.min_total_bytes_for(&[1]),
+                producer.min_total_bytes_for(&[30, 30]),
+                producer.min_total_bytes_for(&[30, 31]),
+                producer.min_total_bytes_for(&[30; 6]),
+                producer.min_total_bytes_for(&[30; 7]),
+                producer.min_total_bytes_for(&[68, 68, 68]),
+                producer.min_total_bytes_for(&[68, 68, 68, 1]),
+                producer.min_total_bytes_for(&[68, 69]),
+            ]
+        };
+        let expected = [
+            Some(100),
+            Some(200),
+            Some(200),
+            Some(300),
+            Some(400),
+            Some(500),
+            Some(400),
+            Some(500),
+            None,
+        ];
+        assert_eq!(for_frames(&producer), expected);
+
+        // The answer does not depend on what the queue holds: here two
+        // frames, each of which fills a segment.
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        let earlier = producer.try_submit(&[0x5a; 68]).unwrap();
+        assert_eq!(for_frames(&producer), expected);
+        assert!(!producer.has_room_for(&[30; 6]));
+
+        // When both are confirmed, the runner frees the segment of the
+        // first. The second stays in the segment in use. Six frames then
+        // have room next to it, in the three other segments of the queue,
+        // and seven never do.
+        queue.complete_through_fsn(earlier.fsn).unwrap();
+        while queue.maintain_storage().unwrap() {}
+        assert_eq!(queue.sealed_segment_count(), 0);
+        assert!(!producer.has_room_for(&[30; 7]));
+        assert!(producer.has_room_for(&[30; 6]));
+        for _ in 0..6 {
+            producer.try_submit(&[0x5a; 30]).unwrap();
+        }
+        assert_eq!(queue.allocated_segment_bytes(), 400);
+    }
+
+    /// A flush for which the queue has the budget of `min_total_bytes_for`
+    /// gets room once every frame before it is confirmed and the runner has
+    /// freed their segments, wherever the producer stands. A wait for room
+    /// relies on it: such a flush must not wait for room that never comes.
+    ///
+    /// With a smaller budget the flush has no room even then, unless its
+    /// first frames fit the segment in use, which can save one segment.
+    /// Without room, the frames can still all be appended in one case: none
+    /// of them fits the segment in use, which then holds confirmed frames
+    /// only, and the runner frees it while the flush runs.
+    #[test]
+    fn min_total_bytes_for_is_the_budget_with_which_a_flush_always_gets_room() {
+        let payload = [0x5a_u8; 1024];
+        let mut numbers = RoomTestNumbers(0x6a09_e667_f3bc_c908);
+        // By the segments that the budget has more than the flush needs:
+        // two less, one less, as many, one more, two more.
+        let mut seen = [0u32; 5];
+        let mut saved_a_segment = 0;
+        let mut short_by_a_segment_behind_a_full_one = 0;
+        let mut fitted_after_all = 0;
+        for case in 0..5000 {
+            let segment_size_bytes = ROOM_TEST_SEGMENT_SIZES[case % 4];
+            let frames = numbers.between(1, 14);
+            let lens = numbers.payload_lens(frames, segment_size_bytes);
+            let min_total_bytes = SfaFrameQueue::open_memory(memory_options(
+                segment_size_bytes,
+                2 * segment_size_bytes as usize,
+            ))
+            .unwrap()
+            .take_producer()
+            .unwrap()
+            .min_total_bytes_for(&lens)
+            .unwrap();
+            assert_eq!(min_total_bytes % segment_size_bytes, 0);
+
+            // A queue with that budget, or with up to two segments more or
+            // less, and with some bytes that make no segment.
+            let needed_segments = min_total_bytes / segment_size_bytes;
+            let max_segments = (needed_segments + numbers.between(0, 4)).saturating_sub(2);
+            if max_segments < 2 {
+                continue;
+            }
+            let max_bytes =
+                max_segments * segment_size_bytes + numbers.between(0, segment_size_bytes - 1);
+            let mut queue =
+                SfaFrameQueue::open_memory(memory_options(segment_size_bytes, max_bytes as usize))
+                    .unwrap();
+            let mut producer = queue.take_producer().unwrap();
+            assert_eq!(producer.max_total_bytes(), max_bytes);
+
+            // Earlier flushes of one frame each, as far as the queue takes
+            // them: the producer stands anywhere in a segment.
+            let mut published = 0u64;
+            let earlier = numbers.between(0, 12);
+            for len in numbers.payload_lens(earlier, segment_size_bytes) {
+                if numbers.between(0, 2) == 0 {
+                    queue.maintain_storage().unwrap();
+                }
+                if producer.try_submit(&payload[..len]).is_err() {
+                    break;
+                }
+                published += 1;
+            }
+            assert_eq!(producer.min_total_bytes_for(&lens), Some(min_total_bytes));
+            let has_the_budget = min_total_bytes <= producer.max_total_bytes();
+            assert_eq!(has_the_budget, max_segments >= needed_segments);
+            seen[(max_segments + 2 - needed_segments) as usize] += 1;
+
+            // The server confirms every frame, and the runner frees their
+            // segments, all but the one in use.
+            if published > 0 {
+                queue.complete_through_fsn(published - 1).unwrap();
+            }
+            while queue.maintain_storage().unwrap() {}
+            assert_eq!(queue.sealed_segment_count(), 0);
+            let first_frame_fits_the_segment_in_use = producer.active_append_offset
+                + (FRAME_HEADER_SIZE + lens[0]) as u64
+                <= segment_size_bytes;
+            let has_room = producer.has_room_for(&lens);
+
+            // The frames of the flush: the server confirms none of them
+            // before the last, and the runner does what it likes.
+            let maintenance = numbers.between(0, 2);
+            let mut appended = 0;
+            for len in &lens {
+                if maintenance == 2 || (maintenance == 1 && numbers.between(0, 1) == 0) {
+                    queue.maintain_storage().unwrap();
+                }
+                match producer.try_submit(&payload[..*len]) {
+                    Ok(_) => appended += 1,
+                    Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull { .. })) => break,
+                    Err(err) => panic!("case {case}: {err:?}"),
+                }
+            }
+            let case = format!(
+                "case {case}: segments of {segment_size_bytes} bytes, a budget of {max_bytes} \
+                 bytes, {min_total_bytes} needed; {appended} of the frames {lens:?} were appended"
+            );
+            let appended_all = appended == lens.len();
+            if has_room || maintenance == 0 || first_frame_fits_the_segment_in_use {
+                assert_eq!(has_room, appended_all, "{case}");
+            } else {
+                fitted_after_all += u32::from(appended_all);
+            }
+            if has_the_budget {
+                assert!(has_room, "{case}");
+            } else if has_room {
+                assert_eq!(max_segments + 1, needed_segments, "{case}");
+                assert!(first_frame_fits_the_segment_in_use, "{case}");
+                saved_a_segment += 1;
+            } else if max_segments + 1 == needed_segments && !first_frame_fits_the_segment_in_use {
+                short_by_a_segment_behind_a_full_one += 1;
+            }
+        }
+        assert!(seen.iter().all(|cases| *cases > 500), "{seen:?}");
+        assert!(saved_a_segment > 100, "{saved_a_segment}");
+        assert!(
+            short_by_a_segment_behind_a_full_one > 100,
+            "{short_by_a_segment_behind_a_full_one}"
+        );
+        assert!(fitted_after_all > 100, "{fitted_after_all}");
     }
 }

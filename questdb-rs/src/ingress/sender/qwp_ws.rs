@@ -4198,14 +4198,15 @@ fn connect_blocking_transport_with_retry(
 /// the server commits together instead, when all of this holds: the queue is
 /// in memory, the server has told its frame limit, the buffer is within
 /// `max_buf_size`, it can be cut into frames, and the queue has room for all
-/// of them now.
+/// of them now. When the queue can never have that room, the buffer is
+/// refused before anything of it is encoded.
 pub(crate) fn flush_qwp_ws(
     state: &mut SyncQwpWsHandlerState,
     buffer: &QwpWsColumnarBuffer,
     frame_cap: usize,
     max_buf_size: usize,
     server_frame_limit_known: bool,
-) -> crate::Result<Option<u64>> {
+) -> Result<Option<u64>, QwpWsFlushError> {
     let encoder = &mut state.encoder;
     let runner = &mut state.runner;
     if state.sfa_split_deferral_enabled && server_frame_limit_known {
@@ -4214,15 +4215,55 @@ pub(crate) fn flush_qwp_ws(
             let target = frame_cap.min(state.sfa_frame_split_target);
             if let Some(plan) = buffer.plan_frames(target, frame_cap)
                 && let Some(producer) = runner.producer.as_ref()
-                && producer.has_room_for(plan.frame_sizes())
             {
-                return publish_qwp_ws_frames(encoder, runner, buffer, &plan, frame_cap);
+                let frame_sizes = plan.frame_sizes();
+                let max_total_bytes = producer.max_total_bytes();
+                if let Some(min_total_bytes) = producer.min_total_bytes_for(frame_sizes)
+                    && min_total_bytes > max_total_bytes
+                {
+                    return Err(QwpWsFlushError::Refused(flush_exceeds_queue_error(
+                        frame_sizes.len(),
+                        min_total_bytes,
+                        max_total_bytes,
+                    )));
+                }
+                if producer.has_room_for(frame_sizes) {
+                    return publish_qwp_ws_frames(encoder, runner, buffer, &plan, frame_cap)
+                        .map_err(QwpWsFlushError::Failed);
+                }
             }
         }
     }
     publish_qwp_ws_buffer(encoder, buffer, frame_cap, |payload| {
         runner.publish_replay_payload(payload)
     })
+    .map_err(QwpWsFlushError::Failed)
+}
+
+/// Why [`flush_qwp_ws`] did not publish a buffer.
+#[derive(Debug)]
+pub(crate) enum QwpWsFlushError {
+    /// The buffer is refused before anything of it is encoded, with an error
+    /// that names the limit in the way and what to do about it.
+    Refused(crate::Error),
+    /// Any other error. Among these is the size error of a buffer that goes
+    /// out as one frame, to which `Sender` adds what sets the frame cap.
+    Failed(crate::Error),
+}
+
+/// The refusal of a flush whose frames the queue can never hold together,
+/// whatever the server confirms.
+fn flush_exceeds_queue_error(
+    frame_count: usize,
+    min_total_bytes: u64,
+    max_total_bytes: u64,
+) -> crate::Error {
+    error::fmt!(
+        BatchTooLarge,
+        "Could not flush buffer: its {frame_count} frames need a store-and-forward queue of \
+         {min_total_bytes} bytes, and sf_max_total_bytes is {max_total_bytes} bytes. Set \
+         sf_max_total_bytes to at least {min_total_bytes}, or flush more often."
+    )
 }
 
 pub(crate) fn publish_qwp_ws_payload_background(
