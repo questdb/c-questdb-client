@@ -44,6 +44,8 @@ const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
 const BASE_TS_NANOS: i64 = 1_700_100_000_000_000_000;
+/// The most bytes an answer to a query may have.
+const QUERY_ANSWER_LIMIT: u64 = 256 * 1024 * 1024;
 
 pub(super) type ProbeResult<T> = std::result::Result<T, TestError>;
 
@@ -714,7 +716,13 @@ pub(super) fn query_json(config: &ProbeConfig, sql: &str) -> ProbeResult<serde_j
         None => request,
     };
     let response = request.call()?;
-    let body = response.into_body().read_to_vec()?;
+    // More than the 10 MB that a body may have when no limit is named: a
+    // query that lists every symbol of a large table answers with more.
+    let body = response
+        .into_body()
+        .into_with_config()
+        .limit(QUERY_ANSWER_LIMIT)
+        .read_to_vec()?;
     let value: serde_json::Value = serde_json::from_slice(&body)?;
     if let Some(error) = value.get("error").and_then(|err| err.as_str()) {
         return Err(Box::new(IoError::other(format!(

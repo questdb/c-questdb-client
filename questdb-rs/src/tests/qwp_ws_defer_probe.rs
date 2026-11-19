@@ -60,7 +60,7 @@ const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 const BASE_TS_NANOS: i64 = 1_700_200_000_000_000_000;
 /// The server commits a table by itself once it holds this many uncommitted
 /// rows (`qwp.max.uncommitted.rows`). The groups of the script stay below.
-const SERVER_MAX_UNCOMMITTED_ROWS: usize = 1_000_000;
+pub(super) const SERVER_MAX_UNCOMMITTED_ROWS: usize = 1_000_000;
 /// The frame limit the model server advertises: small, for a quick test.
 const MODEL_FRAME_LIMIT: usize = 16 * 1024;
 /// What a row of the script takes in a frame, on average: two numbers and a
@@ -674,13 +674,13 @@ fn a_new_connection_gets_the_symbols_again_before_the_frames(
 
 /// `count` rows of the script from `first_id` on: per row its id and the
 /// length of its text.
-fn rows_from(first_id: i64, count: usize) -> Vec<(i64, usize)> {
+pub(super) fn rows_from(first_id: i64, count: usize) -> Vec<(i64, usize)> {
     (first_id..first_id + count as i64)
         .map(|id| (id, text_len_of(id)))
         .collect()
 }
 
-fn text_len_of(id: i64) -> usize {
+pub(super) fn text_len_of(id: i64) -> usize {
     150 + (id % 50) as usize
 }
 
@@ -715,7 +715,8 @@ fn frames_over_tables(
                 frames.push(frame_of_a_sender(&buffer, true, symbols));
                 buffer = Buffer::new_qwp_ws();
             }
-            push_row(&mut buffer, table, *id, *text_len, with_symbols)?;
+            let tag_of = with_symbols.then_some(tag_of as TagOf);
+            push_row(&mut buffer, table, *id, *text_len, tag_of)?;
         }
     }
     frames.push(frame_of_a_sender(&buffer, false, symbols));
@@ -753,12 +754,15 @@ fn venue_of(id: i64) -> String {
     format!("venue-{}", id % 7)
 }
 
-/// The second symbol of a row. One row in eleven has none. One in thirteen
-/// has the venue of the row behind it: a text of both symbol columns. The
-/// others share a text among ten rows, so new texts keep coming as the ids
-/// rise, and most frames begin with rows whose text the frame before
-/// brought.
-fn tag_of(id: i64) -> Option<String> {
+/// The second symbol of a row, by the id of the row.
+pub(super) type TagOf = fn(i64) -> Option<String>;
+
+/// The second symbol of a row of the script. One row in eleven has none.
+/// One in thirteen has the venue of the row behind it: a text of both
+/// symbol columns. The others share a text among ten rows, so new texts
+/// keep coming as the ids rise, and most frames begin with rows whose text
+/// the frame before brought.
+pub(super) fn tag_of(id: i64) -> Option<String> {
     if id % 11 == 0 {
         None
     } else if id % 13 == 0 {
@@ -773,8 +777,8 @@ fn tag_of(id: i64) -> Option<String> {
 type RowsPerSymbol = BTreeMap<(&'static str, Option<String>), (i64, i64)>;
 
 /// What a table has per symbol when it holds exactly `rows`, each with its
-/// symbols.
-fn rows_per_symbol_of(rows: &[(i64, usize)]) -> RowsPerSymbol {
+/// venue and the tag that `tag_of` gives it.
+fn rows_per_symbol_of(rows: &[(i64, usize)], tag_of: TagOf) -> RowsPerSymbol {
     let mut per_symbol = RowsPerSymbol::new();
     for (id, _) in rows {
         for (column, symbol) in [("venue", Some(venue_of(*id))), ("tag", tag_of(*id))] {
@@ -786,20 +790,20 @@ fn rows_per_symbol_of(rows: &[(i64, usize)]) -> RowsPerSymbol {
     per_symbol
 }
 
-/// One row: two numbers, a text, and its own timestamp; with `symbols`,
-/// its two symbols before them.
-fn push_row(
+/// One row: two numbers, a text, and its own timestamp; with `tag_of`, two
+/// symbols before them: its venue and the tag that `tag_of` gives it.
+pub(super) fn push_row(
     buffer: &mut Buffer,
     table: &str,
     id: i64,
     text_len: usize,
-    symbols: bool,
+    tag_of: Option<TagOf>,
 ) -> ProbeResult<()> {
     let text = char::from(b'a' + (id % 26) as u8)
         .to_string()
         .repeat(text_len);
     buffer.table(table)?;
-    if symbols {
+    if let Some(tag_of) = tag_of {
         buffer
             .symbol("venue", venue_of(id))?
             .symbol_opt("tag", tag_of(id))?;
@@ -848,7 +852,7 @@ impl Group {
     }
 
     fn push(&mut self, table: &str, id: i64, text_len: usize) -> ProbeResult<()> {
-        push_row(&mut self.buffer, table, id, text_len, false)?;
+        push_row(&mut self.buffer, table, id, text_len, None)?;
         self.rows.push((id, text_len));
         Ok(())
     }
@@ -888,16 +892,19 @@ pub(super) struct Digest {
 
 impl Digest {
     /// What a table holds when it holds exactly `rows`: per row its id and
-    /// the length of its text, the ids rising.
-    fn of(rows: &[(i64, usize)]) -> Self {
+    /// the length of its text. A row that is listed twice is in the table
+    /// twice.
+    pub(super) fn of(rows: &[(i64, usize)]) -> Self {
+        let ids: BTreeSet<i64> = rows.iter().map(|(id, _)| *id).collect();
         Self {
             rows: rows.len() as i64,
-            ids: rows.len() as i64,
-            min_id: rows.first().unwrap().0,
-            max_id: rows.last().unwrap().0,
+            ids: ids.len() as i64,
+            min_id: *ids.first().unwrap(),
+            max_id: *ids.last().unwrap(),
             mix_sum: rows.iter().map(|(id, _)| mix_of(*id)).sum(),
             text_bytes: rows.iter().map(|(_, len)| *len as i64).sum(),
-            timestamps: rows.len() as i64,
+            // A row has the timestamp of its id.
+            timestamps: ids.len() as i64,
         }
     }
 }
@@ -1049,10 +1056,24 @@ impl Server<'_> {
         Ok(per_symbol)
     }
 
-    /// The table holds exactly `rows`, each with its symbols.
+    /// The table holds exactly `rows`, each with the symbols of the script.
     fn expect_rows_with_symbols(&self, table: &str, rows: &[(i64, usize)]) -> ProbeResult<()> {
+        self.expect_rows_with_tags(table, rows, tag_of)
+    }
+
+    /// The table holds exactly `rows`, each with its venue and the tag that
+    /// `tag_of` gives it. A row that is listed twice is in the table twice.
+    pub(super) fn expect_rows_with_tags(
+        &self,
+        table: &str,
+        rows: &[(i64, usize)],
+        tag_of: TagOf,
+    ) -> ProbeResult<()> {
         assert_eq!(self.digest(table)?, Some(Digest::of(rows)));
-        let (held, expected) = (self.rows_per_symbol(table)?, rows_per_symbol_of(rows));
+        let (held, expected) = (
+            self.rows_per_symbol(table)?,
+            rows_per_symbol_of(rows, tag_of),
+        );
         // Not the maps whole: a table has thousands of symbols.
         let differs = held
             .iter()
