@@ -2494,7 +2494,7 @@ fn close_drain_timed_out(frames: usize) -> String {
     format!(
         "QWP/WebSocket close drain timed out before all published frames were acknowledged: \
          {frames} of them are not confirmed. Without sf_dir they are dropped with the sender: \
-         call wait before closing, raise close_flush_timeout, or use sf_dir."
+         call wait before closing, raise close_flush_timeout_millis, or use sf_dir."
     )
 }
 

@@ -5148,7 +5148,7 @@ fn close_drain_timeout_error(
         format!(
             "QWP/WebSocket close drain timed out before all published frames were \
              acknowledged: {not_confirmed}{cause}. Without sf_dir they are dropped with the \
-             sender: call wait before closing, raise close_flush_timeout, or use sf_dir."
+             sender: call wait before closing, raise close_flush_timeout_millis, or use sf_dir."
         )
     };
     match reconnect_failure {
@@ -5355,7 +5355,7 @@ mod tests {
             "QWP/WebSocket close drain timed out before all published frames were \
              acknowledged: 3 of them are not confirmed (the latest reconnect failed: write \
              failed). Without sf_dir they are dropped with the sender: call wait before \
-             closing, raise close_flush_timeout, or use sf_dir."
+             closing, raise close_flush_timeout_millis, or use sf_dir."
         );
         assert!(err.qwp_ws_rejection().is_none());
 
@@ -5365,7 +5365,7 @@ mod tests {
             err.msg(),
             "QWP/WebSocket close drain timed out before all published frames were \
              acknowledged: 1 of them is not confirmed. Without sf_dir they are dropped with \
-             the sender: call wait before closing, raise close_flush_timeout, or use sf_dir."
+             the sender: call wait before closing, raise close_flush_timeout_millis, or use sf_dir."
         );
         assert!(err.qwp_ws_rejection().is_none());
     }
