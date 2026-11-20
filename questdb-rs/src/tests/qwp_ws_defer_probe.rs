@@ -26,8 +26,9 @@
 //! frame: every frame but the last carries the defer flag. One script sends
 //! such frames over a raw WebSocket and checks the answers and what the
 //! tables hold afterwards: for a flush of one table, for a flush over
-//! two, and for a flush of rows with symbols, whose frames bring the
-//! symbols as they go, also after the connection was lost. It runs against
+//! two, for a flush of rows with symbols, whose frames bring the
+//! symbols as they go, also after the connection was lost, and for a flush
+//! with a frame that the server rejects. It runs against
 //! a real QuestDB server in an ignored test, and against the server model
 //! of the tests (`qwp_ws_server_model`) in a test that always runs, so the
 //! model is held to what a real server showed.
@@ -53,6 +54,7 @@ use super::qwp_ws_protocol_probe::{
 const WS_OPCODE_BINARY: u8 = 0x2;
 const WS_OPCODE_PONG: u8 = 0xA;
 const QWP_STATUS_OK: u8 = 0x00;
+const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_VERSION: u8 = 1;
 const QWP_HEADER_SIZE: usize = 12;
 const QWP_FLAGS_OFFSET: usize = 5;
@@ -127,6 +129,7 @@ fn run_defer_rules_script(server: &Server<'_>, settings: &ScriptSettings) -> Pro
     a_dropped_group_over_two_tables_leaves_no_rows(server, settings)?;
     a_group_brings_its_symbols_frame_by_frame(server, settings)?;
     a_new_connection_gets_the_symbols_again_before_the_frames(server, settings)?;
+    a_group_with_a_frame_that_the_server_rejects_leaves_no_rows(server, settings)?;
     Ok(())
 }
 
@@ -672,6 +675,133 @@ fn a_new_connection_gets_the_symbols_again_before_the_frames(
     Ok(())
 }
 
+/// A group over two tables with a frame in its middle that the server
+/// rejects: a text for a column that is a number in the table. The answer
+/// to that frame is an error that names it. The rows that the connection
+/// held by then are gone, of both tables. The connection stays, and the
+/// server takes no later frame of it: the rest of the group gets no
+/// answer, the frame without the flag too, and commits nothing. The same
+/// group without that frame is one transaction of each table on a new
+/// connection.
+fn a_group_with_a_frame_that_the_server_rejects_leaves_no_rows(
+    server: &Server<'_>,
+    settings: &ScriptSettings,
+) -> ProbeResult<()> {
+    let (first, _cleanup_first) = server.new_table("qwp_defer_rejected_one");
+    let (second, _cleanup_second) = server.new_table("qwp_defer_rejected_two");
+    let mut connection = server.connect()?;
+    let limit = connection.frame_limit;
+
+    // The tables get their columns from a frame that is committed.
+    let before = [rows_from(0, 10), rows_from(1_000_000, 10)];
+    let frames = frames_over_tables(&[(&first, &before[0]), (&second, &before[1])], limit, None)?;
+    assert_eq!(frames.len(), 1);
+    connection.send(&frames[0])?;
+    assert_eq!(
+        connection.expect_ok()?,
+        OkAnswer::of_tables(0, &[(&first, 1), (&second, 1)])
+    );
+    let holds_what_was_there_before = |when: &str| -> ProbeResult<()> {
+        for (table, rows) in [(&first, &before[0]), (&second, &before[1])] {
+            assert_eq!(server.digest(table)?, Some(Digest::of(rows)), "{when}");
+            assert_eq!(server.transactions(table)?, Some(1), "{when}");
+        }
+        Ok(())
+    };
+    server.wait_for_rows(&first, before[0].len())?;
+    server.wait_for_rows(&second, before[1].len())?;
+    holds_what_was_there_before("before the group")?;
+
+    let of_first = rows_from(2_000_000, settings.group_bytes / 4 / ROW_BYTES);
+    let of_second = rows_from(3_000_000, settings.group_bytes / 4 / ROW_BYTES);
+    let group = frames_over_tables(&[(&first, &of_first), (&second, &of_second)], limit, None)?;
+    // The frame that the server rejects comes when the connection holds
+    // rows of both tables, and frames of the group follow it.
+    let shared = block_counts(&group)
+        .iter()
+        .position(|count| *count == 2)
+        .unwrap_or(0);
+    let rejected = shared + 1;
+    assert!(
+        shared >= 1 && rejected < group.len(),
+        "{:?}",
+        block_counts(&group)
+    );
+    let mut frames = group.clone();
+    frames.insert(rejected, frame_with_a_text_for_a_number(&second)?);
+    // The group's frames are 1 and up on this connection.
+    server.will_reject_the_frame_that_comes_as(1 + rejected);
+
+    for frame in &frames[..=rejected] {
+        connection.send(frame)?;
+    }
+    let (status, sequence, text) = connection.expect_rejection()?;
+    assert_eq!(
+        (status, sequence),
+        (QWP_STATUS_SCHEMA_MISMATCH, 1 + rejected as u64),
+        "{text}"
+    );
+    // The connection stays: the server answers a ping, and has nothing else
+    // to say.
+    connection.expect_no_answer(settings.quiet)?;
+    holds_what_was_there_before("after the rejection")?;
+
+    for frame in &frames[rejected + 1..] {
+        connection.send(frame)?;
+    }
+    connection.expect_no_answer(settings.quiet)?;
+    holds_what_was_there_before("after the rest of the group")?;
+    connection.drop_without_close();
+    server.wait_for_the_drop(settings.settle);
+    holds_what_was_there_before("after the connection went away")?;
+
+    let mut connection = server.connect()?;
+    let last = group.len() - 1;
+    for frame in &group[..last] {
+        connection.send(frame)?;
+    }
+    connection.expect_no_answer(settings.quiet)?;
+    connection.send(&group[last])?;
+    assert_eq!(
+        connection.expect_ok()?,
+        OkAnswer::of_tables(last, &[(&first, 2), (&second, 2)])
+    );
+    let [before_first, before_second] = before;
+    let (of_first, of_second) = (
+        [before_first, of_first].concat(),
+        [before_second, of_second].concat(),
+    );
+    server.wait_for_rows(&first, of_first.len())?;
+    server.wait_for_rows(&second, of_second.len())?;
+    assert_eq!(server.digest(&first)?, Some(Digest::of(&of_first)));
+    assert_eq!(server.digest(&second)?, Some(Digest::of(&of_second)));
+    assert_eq!(server.transactions(&first)?, Some(2));
+    assert_eq!(server.transactions(&second)?, Some(2));
+    eprintln!(
+        "rejected frame: frame {rejected} of {} of a group over two tables; the server said \
+         {text:?}",
+        frames.len()
+    );
+    Ok(())
+}
+
+/// A frame with the defer flag that a server rejects once `table` has the
+/// columns of the script: its row has a text where the table has a number.
+fn frame_with_a_text_for_a_number(table: &str) -> ProbeResult<Vec<u8>> {
+    let mut buffer = Buffer::new_qwp_ws();
+    buffer
+        .table(table)?
+        .column_i64("id", -1)?
+        .column_str("mix", "not a number")?
+        .column_str("txt", "")?
+        .at(TimestampNanos::new(BASE_TS_NANOS))?;
+    Ok(frame_of_a_sender(
+        &buffer,
+        true,
+        &mut SymbolGlobalDict::new(),
+    ))
+}
+
 /// `count` rows of the script from `first_id` on: per row its id and the
 /// length of its text.
 pub(super) fn rows_from(first_id: i64, count: usize) -> Vec<(i64, usize)> {
@@ -923,6 +1053,16 @@ impl Server<'_> {
                 config.auth_header.as_deref(),
             ),
             Self::Model(server) => Connection::open("127.0.0.1", server.port, None),
+        }
+    }
+
+    /// The server will reject the frame that it takes as number `frame` from
+    /// now, the next one being 1. A real server finds by itself the frame
+    /// whose columns disagree with the table. The model takes any columns,
+    /// so it is told; it has taken every frame that was answered so far.
+    fn will_reject_the_frame_that_comes_as(&self, frame: usize) {
+        if let Self::Model(server) = self {
+            server.reject_frame(server.frames_taken() + frame, QWP_STATUS_SCHEMA_MISMATCH);
         }
     }
 
@@ -1286,6 +1426,28 @@ impl Connection {
     fn expect_ok(&mut self) -> ProbeResult<OkAnswer> {
         let (_fin, opcode, payload) = read_frame(&mut self.stream)?;
         ok_answer(opcode, &payload)
+    }
+
+    /// The next thing the server sends is an error: its status, the
+    /// sequence of the frame it rejects, and what it says of it.
+    fn expect_rejection(&mut self) -> ProbeResult<(u8, u64, String)> {
+        let (_fin, opcode, payload) = read_frame(&mut self.stream)?;
+        if opcode != WS_OPCODE_BINARY || payload.len() < 11 || payload[0] == QWP_STATUS_OK {
+            return Err(invalid(format!(
+                "expected an error, got opcode {opcode:#x} with {} bytes: {:?}",
+                payload.len(),
+                &payload[..payload.len().min(64)]
+            ))
+            .into());
+        }
+        let sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+        let text_len = usize::from(u16::from_le_bytes([payload[9], payload[10]]));
+        assert_eq!(payload.len(), 11 + text_len, "bytes after the error");
+        Ok((
+            payload[0],
+            sequence,
+            String::from_utf8(payload[11..].to_vec())?,
+        ))
     }
 
     /// Goes away as a process that died would: no close frame.

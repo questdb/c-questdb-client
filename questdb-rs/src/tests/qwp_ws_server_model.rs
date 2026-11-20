@@ -49,6 +49,10 @@
 //!   may bring symbols the connection holds, under the same numbers.
 //! - A connection that goes away loses the rows it holds, of every table,
 //!   and its symbols.
+//! - A frame that the server rejects gets an error as its answer, which
+//!   names the sequence of the frame. The rows that the connection holds
+//!   are gone, of every table. The connection stays, and the server takes
+//!   no later frame of it: it reads them, answers none and commits nothing.
 //! - A table exists from the first frame that names it, committed or not.
 //!
 //! What the model cannot do it refuses with a panic, so that no test passes
@@ -66,15 +70,16 @@
 //!
 //! Four things a server does are neither modelled nor refused. A server
 //! rejects a frame whose column types disagree with the table; the model
-//! takes any columns. A server may commit frames without the flag together,
-//! as one transaction, when they arrive in one read; the model commits each
-//! on its own. So a test may count on one commit for a group, never on one
-//! commit per frame without the flag. A server may likewise answer several
-//! frames without the flag with one OK, which counts for the frames before
-//! it too; the model answers each. And a server names the tables of an
-//! OK in the order the connection first named them, the model in the order
-//! of their names; the script does not look at the order, and the client
-//! reads each entry by itself.
+//! takes any columns, and rejects the frame that a test tells it to
+//! ([`QwpWsModelServer::reject_frame`]). A server may commit frames without
+//! the flag together, as one transaction, when they arrive in one read; the
+//! model commits each on its own. So a test may count on one commit for a
+//! group, never on one commit per frame without the flag. A server may
+//! likewise answer several frames without the flag with one OK, which
+//! counts for the frames before it too; the model answers each. And a
+//! server names the tables of an OK in the order the connection first named
+//! them, the model in the order of their names; the script does not look at
+//! the order, and the client reads each entry by itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -268,6 +273,7 @@ impl QwpWsServerModel {
             next_sequence: 0,
             symbols: Vec::new(),
             held: BTreeMap::new(),
+            rejected_a_frame: false,
         }
     }
 
@@ -287,12 +293,17 @@ pub(crate) struct QwpWsModelConnection {
     symbols: Vec<String>,
     /// Per table, the blocks that wait for a frame without the defer flag.
     held: BTreeMap<String, Vec<DecodedTable>>,
+    /// The connection has rejected a frame, and takes no frame since.
+    rejected_a_frame: bool,
 }
 
 impl QwpWsModelConnection {
     /// Takes the next message of the client. Returns the answer of the
     /// server, if it gives one.
     pub(crate) fn receive(&mut self, message: &[u8]) -> Option<Vec<u8>> {
+        if self.rejected_a_frame {
+            return None;
+        }
         let sequence = self.next_sequence;
         self.next_sequence += 1;
 
@@ -363,6 +374,23 @@ impl QwpWsModelConnection {
         Some(ok)
     }
 
+    /// Rejects the next message of the client with `status`, as a server
+    /// rejects a frame whose column types disagree with the table. Returns
+    /// the answer: an error that names the sequence of the message. The
+    /// connection takes no message from now on, so the rows that it holds
+    /// are never committed.
+    pub(crate) fn reject(&mut self, status: u8) -> Vec<u8> {
+        const TEXT: &[u8] = b"the server model was told to reject this frame";
+        assert_ne!(status, QWP_STATUS_OK, "an OK rejects nothing");
+        self.rejected_a_frame = true;
+        // An error: the status, the sequence, then a text behind its length.
+        let mut error = vec![status];
+        error.extend_from_slice(&self.next_sequence.to_le_bytes());
+        error.extend_from_slice(&(TEXT.len() as u16).to_le_bytes());
+        error.extend_from_slice(TEXT);
+        error
+    }
+
     /// Takes the symbols a frame brings: behind the header, the id of the
     /// first, their count, and each as its length and its text. Returns
     /// where the table blocks of the frame begin.
@@ -417,6 +445,9 @@ struct ServerShared {
     streams: Mutex<Vec<TcpStream>>,
     /// The frames taken so far, over all connections.
     frames: AtomicUsize,
+    /// The frame to reject and the status to reject it with: see
+    /// [`QwpWsModelServer::reject_frame`].
+    rejection: Mutex<Option<(usize, u8)>>,
     /// Locked for every write to a client, so that an answer that was held
     /// back and one that is given at once never mix.
     answers: Mutex<Answers>,
@@ -431,6 +462,17 @@ struct Answers {
 }
 
 impl ServerShared {
+    /// The status to reject the next frame with, if it is the one that the
+    /// server was told to reject.
+    fn rejection_of_the_next_frame(&self) -> Option<u8> {
+        let next = self.frames.load(Ordering::SeqCst) + 1;
+        self.rejection
+            .lock()
+            .unwrap()
+            .filter(|(frame, _)| *frame == next)
+            .map(|(_, status)| status)
+    }
+
     /// Gives the client its answer, or keeps it while answers are held back.
     fn answer(&self, stream: &mut TcpStream, answer: Vec<u8>) -> std::io::Result<()> {
         let mut answers = self.answers.lock().unwrap();
@@ -465,6 +507,7 @@ impl QwpWsModelServer {
             open: AtomicUsize::new(0),
             streams: Mutex::new(Vec::new()),
             frames: AtomicUsize::new(0),
+            rejection: Mutex::default(),
             answers: Mutex::default(),
         });
 
@@ -529,6 +572,19 @@ impl QwpWsModelServer {
     /// How many frames the server has taken so far, over all connections.
     pub(crate) fn frames_taken(&self) -> usize {
         self.shared.frames.load(Ordering::SeqCst)
+    }
+
+    /// The server rejects one frame with `status`: the one that makes
+    /// [`Self::frames_taken`] reach `frame`, so the first frame it ever
+    /// takes is frame 1. It does to that frame's connection what
+    /// [`QwpWsModelConnection::reject`] says. A real server finds the frame
+    /// to reject by itself; the model has to be told.
+    pub(crate) fn reject_frame(&self, frame: usize, status: u8) {
+        assert!(
+            frame > self.frames_taken(),
+            "frame {frame} was taken before the server was told to reject it"
+        );
+        *self.shared.rejection.lock().unwrap() = Some((frame, status));
     }
 
     /// From now on the server keeps its answers to itself. It takes every
@@ -636,7 +692,10 @@ fn serve_connection(
                      a server closes the connection, which the server model does not do",
                     payload.len()
                 );
-                let answer = connection.receive(&payload);
+                let answer = match shared.rejection_of_the_next_frame() {
+                    Some(status) => Some(connection.reject(status)),
+                    None => connection.receive(&payload),
+                };
                 frames += 1;
                 shared.frames.fetch_add(1, Ordering::SeqCst);
                 if cut_after_frames == Some(frames) {
@@ -827,6 +886,64 @@ mod tests {
         let table = server.table(TABLE).unwrap();
         assert_eq!(table.commits, 1);
         assert_eq!(table.rows_as_text(), rows_of(TABLE, &kept));
+    }
+
+    #[test]
+    fn server_model_drops_the_held_rows_when_it_rejects_a_frame_and_takes_none_behind_it() {
+        const STATUS: u8 = 0x03;
+        let whole = |buffer: &Buffer| frames_of_a_flush(buffer, usize::MAX).remove(0);
+        let kept = buffer_of("model_one", 0..3);
+        let lost = buffer_of("model_one", 100..140);
+        let lost_of_two = buffer_of("model_two", 0..3);
+        let server = QwpWsServerModel::new();
+        let mut connection = server.connect();
+        assert_eq!(
+            connection.receive(&whole(&kept)),
+            ok(0, &[("model_one", 1)])
+        );
+
+        // The connection holds rows of two tables when it rejects a frame.
+        let frames = small_frames(&lost);
+        let last = frames.len() - 1;
+        for frame in &frames[..last] {
+            assert_eq!(connection.receive(frame), None);
+        }
+        let mut held_of_two = whole(&lost_of_two);
+        held_of_two[QWP_FLAGS_OFFSET] |= QWP_FLAG_DEFER_COMMIT;
+        assert_eq!(connection.receive(&held_of_two), None);
+        // The error names the frame: frame 0 was committed, and `last` frames
+        // and one more are held.
+        let error = connection.reject(STATUS);
+        let text = &error[11..];
+        assert_eq!(error[0], STATUS);
+        assert_eq!(error[1..9], (last as u64 + 2).to_le_bytes());
+        assert_eq!(error[9..11], (text.len() as u16).to_le_bytes());
+        assert!(!text.is_empty());
+
+        // No frame behind it is taken: not the one that would have committed
+        // the held rows, and not one that brings rows and commits them.
+        assert_eq!(connection.receive(&frames[last]), None);
+        assert_eq!(
+            connection.receive(&whole(&buffer_of("model_one", 200..203))),
+            None
+        );
+        let rows_of_one = |server: &QwpWsServerModel| {
+            let table = server.table("model_one").unwrap();
+            (table.commits, table.rows_as_text())
+        };
+        assert_eq!(rows_of_one(&server), (1, rows_of("model_one", &kept)));
+        assert_eq!(server.table("model_two").unwrap().commits, 0);
+
+        // A new connection commits what it brings, and nothing of what the
+        // first one held.
+        let mut second = server.connect();
+        assert_eq!(
+            second.receive(&whole(&lost_of_two)),
+            ok(0, &[("model_two", 1)])
+        );
+        assert_eq!(rows_of_one(&server), (1, rows_of("model_one", &kept)));
+        let table = server.table("model_two").unwrap();
+        assert_eq!(table.rows_as_text(), rows_of("model_two", &lost_of_two));
     }
 
     #[test]
@@ -1446,6 +1563,52 @@ mod tests {
         let end = read_frame(&mut cut).unwrap_err();
         assert_eq!(end.kind(), std::io::ErrorKind::UnexpectedEof, "{end}");
         assert_eq!(server.model.table(TABLE).unwrap().commits, 1);
+        server.finish();
+    }
+
+    #[test]
+    fn server_model_socket_rejects_the_frame_it_was_told_and_takes_none_behind_it() {
+        const STATUS: u8 = 0x03;
+        let buffer = buffer_of(TABLE, 0..40);
+        let frames = small_frames(&buffer);
+        let last = frames.len() - 1;
+        assert!(last >= 2, "{} frames", frames.len());
+        let server = QwpWsModelServer::start(300);
+        server.reject_frame(2, STATUS);
+
+        // One answer to all the frames: the error, which names the second.
+        let mut stream = client_of(&server);
+        read_upgrade_answer(&mut stream);
+        for frame in &frames {
+            write_server_frame(&mut stream, WS_OPCODE_BINARY, frame, true).unwrap();
+        }
+        let (_fin, opcode, error) = read_frame(&mut stream).unwrap();
+        assert_eq!(opcode, WS_OPCODE_BINARY);
+        assert_eq!((error[0], &error[1..9]), (STATUS, &1u64.to_le_bytes()[..]));
+        // The connection stays, and the frame that would have committed got
+        // no answer.
+        write_server_frame(&mut stream, WS_OPCODE_PING, b"alive", true).unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap(),
+            (true, WS_OPCODE_PONG, b"alive".to_vec())
+        );
+        assert_eq!(server.frames_taken(), frames.len());
+        assert_eq!(server.model.table(TABLE).unwrap().commits, 0);
+
+        // The server rejects that one frame: the same frames are a commit on
+        // a new connection.
+        let mut again = client_of(&server);
+        read_upgrade_answer(&mut again);
+        for frame in &frames {
+            write_server_frame(&mut again, WS_OPCODE_BINARY, frame, true).unwrap();
+        }
+        assert_eq!(
+            read_frame(&mut again).unwrap(),
+            (true, WS_OPCODE_BINARY, ok(last, &[(TABLE, 1)]).unwrap())
+        );
+        let table = server.model.table(TABLE).unwrap();
+        assert_eq!(table.commits, 1);
+        assert_eq!(table.rows_as_text(), rows_of(TABLE, &buffer));
         server.finish();
     }
 
