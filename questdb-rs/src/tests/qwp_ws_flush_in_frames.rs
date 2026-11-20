@@ -2486,27 +2486,21 @@ fn a_flush_whose_every_connection_the_server_closes_stops_the_sender_at_the_four
 }
 
 /// What `close_drain` says when its time is up before the server has
-/// confirmed what the sender published.
-const CLOSE_DRAIN_TIMED_OUT: &str =
-    "QWP/WebSocket close drain timed out before all published frames were acknowledged";
+/// confirmed `frames` of the frames that the sender published.
+fn close_drain_timed_out(frames: usize) -> String {
+    format!(
+        "QWP/WebSocket close drain timed out before all published frames were acknowledged: \
+         {frames} of them are not confirmed. Without sf_dir they are dropped with the sender: \
+         call wait before closing, raise close_flush_timeout, or use sf_dir."
+    )
+}
 
-/// `close_drain` right after a flush in frames whose answer does not come:
-/// it sends what is queued, waits as long as `close_flush_timeout` says and
-/// fails. The server has taken every frame of the flush by then.
-fn a_close_drain_after_a_flush_in_frames_that_is_not_confirmed_in_time_fails(progress: Progress) {
-    const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
-    let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, progress, "close_flush_timeout_millis=200;");
-    let large = buffer_of(TABLE, 0..2000);
-    let frame_count = frames_of_a_flush(&large, FRAME_LIMIT).len();
-    assert!(frame_count > 40, "{frame_count} frames");
-    // The server takes the flush, commits it and keeps the answer to itself.
-    server.hold_answers();
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+const CLOSE_FLUSH_TIMEOUT_SETTING: &str = "close_flush_timeout_millis=200;";
 
-    assert_eq!(
-        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
-        Some(frame_count as u64 - 1)
-    );
+/// Closes `sender`, whose `close_drain` fails when `close_flush_timeout` is
+/// over, and gives the text of the error.
+fn close_drain_that_times_out(sender: &mut Sender) -> String {
     let started = Instant::now();
     let err = sender.close_drain().unwrap_err();
     assert!(
@@ -2514,14 +2508,72 @@ fn a_close_drain_after_a_flush_in_frames_that_is_not_confirmed_in_time_fails(pro
         "gave up after {:?}",
         started.elapsed()
     );
-    assert_eq!(err.code(), ErrorCode::SocketError);
-    assert!(
-        err.msg().starts_with(CLOSE_DRAIN_TIMED_OUT),
-        "{}",
-        err.msg()
+    assert_eq!(err.code(), ErrorCode::SocketError, "{}", err.msg());
+    err.msg().to_string()
+}
+
+/// `close_drain` right after a flush in frames whose answer does not come:
+/// it sends what is queued, waits as long as `close_flush_timeout` says and
+/// fails. The error says how many frames are not confirmed, which are those
+/// of the flush and not the one of the flush before, and what to do.
+fn a_close_drain_after_a_flush_in_frames_that_is_not_confirmed_in_time_fails(progress: Progress) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, progress, CLOSE_FLUSH_TIMEOUT_SETTING);
+    let before = buffer_of(TABLE, 0..3);
+    let large = buffer_of(TABLE, 3..2003);
+    let frame_count = frames_of_a_flush(&large, FRAME_LIMIT).len();
+    assert!(frame_count > 40, "{frame_count} frames");
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    // The server takes the flush, commits it and keeps the answer to itself.
+    server.hold_answers();
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frame_count as u64)
     );
-    assert_eq!(server.frames_taken(), frame_count);
-    assert_table_holds(&server, TABLE, 1, &[&large]);
+    assert_eq!(
+        close_drain_that_times_out(&mut sender),
+        close_drain_timed_out(frame_count)
+    );
+    // It had sent every frame: the server commits the flush.
+    wait_for_frames_taken(&server, 1 + frame_count);
+    assert_table_holds(&server, TABLE, 2, &[&before, &large]);
+    drop(sender);
+    server.finish();
+}
+
+/// `close_drain` of a sender whose flush failed part way, while the server
+/// has not confirmed the flush before it. The sender waits for that flush
+/// alone, so the error counts its frames and none of the failed flush.
+fn a_close_drain_that_times_out_after_a_failed_flush_counts_the_frames_before_it(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let before = buffer_of_symbols(TABLE, 2000..2100);
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    let before_frames = frames_of_a_sender(&before, FRAME_LIMIT, &mut sender_symbols).len();
+    assert!(before_frames > 2, "{before_frames} frames");
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    let failing = frames.len() / 2;
+    let symbols = symbols_held_before(&frames[failing]);
+    let mut sender = {
+        let _cap = crate::ingress::TestDictCapGuard::new(symbols);
+        sender_with(server.port, progress, CLOSE_FLUSH_TIMEOUT_SETTING)
+    };
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&before).unwrap(),
+        Some(before_frames as u64 - 1)
+    );
+    let err = sender.flush_and_keep(&large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_eq!(
+        close_drain_that_times_out(&mut sender),
+        close_drain_timed_out(before_frames)
+    );
     drop(sender);
     server.finish();
 }
@@ -2583,4 +2635,5 @@ in_both_progress_modes! {
     a_flush_whose_connection_is_lost_after_the_commit_and_before_its_answer_is_committed_again
     a_flush_whose_every_connection_the_server_closes_stops_the_sender_at_the_fourth_close
     a_close_drain_after_a_flush_in_frames_that_is_not_confirmed_in_time_fails
+    a_close_drain_that_times_out_after_a_failed_flush_counts_the_frames_before_it
 }

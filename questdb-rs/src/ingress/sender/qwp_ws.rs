@@ -1118,7 +1118,12 @@ where
             }
 
             if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
-                return Err(close_drain_timeout_error(self.reconnect_failure().as_ref()));
+                let unconfirmed =
+                    unconfirmed_at_close(&*self.lock_shared()?, self.aborted_flush.as_ref());
+                return Err(close_drain_timeout_error(
+                    unconfirmed,
+                    self.reconnect_failure().as_ref(),
+                ));
             }
         }
     }
@@ -5103,23 +5108,52 @@ fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Re
 }
 
 fn qwp_ws_manual_close_timeout_error(state: &ManualQwpWsHandlerState) -> crate::Error {
-    close_drain_timeout_error(state.store.reconnect_failure())
+    close_drain_timeout_error(
+        unconfirmed_at_close(&state.store, state.aborted_flush.as_ref()),
+        state.store.reconnect_failure(),
+    )
+}
+
+/// How many of the frames that a close drain waits for the server has not
+/// confirmed: of all that were published, or of those before a flush that
+/// failed part way.
+fn unconfirmed_at_close<Q: PublicationLog>(
+    store: &QwpWsPublicationStore<Q>,
+    aborted_flush: Option<&AbortedFlush>,
+) -> u64 {
+    store.unconfirmed_through(match aborted_flush {
+        Some(flush) => flush.published_before,
+        None => store.published_fsn(),
+    })
 }
 
 /// The error of a close drain, in either progress mode, whose deadline passed
-/// before every published frame was acknowledged, naming the latest reconnect
-/// failure if there is one. As for an ACK-wait timeout, the failure's
+/// before every published frame was acknowledged. It says how many frames
+/// are not confirmed, names the latest reconnect failure if there is one,
+/// and says what a caller can do. As for an ACK-wait timeout, the failure's
 /// diagnostics are kept except a server-rejection diagnostic, which marks a
 /// terminal error.
-fn close_drain_timeout_error(reconnect_failure: Option<&crate::Error>) -> crate::Error {
-    let prefix =
-        "QWP/WebSocket close drain timed out before all published frames were acknowledged";
+fn close_drain_timeout_error(
+    unconfirmed: u64,
+    reconnect_failure: Option<&crate::Error>,
+) -> crate::Error {
+    let not_confirmed = match unconfirmed {
+        1 => "1 of them is not confirmed".to_string(),
+        frames => format!("{frames} of them are not confirmed"),
+    };
+    let msg = |cause: &str| {
+        format!(
+            "QWP/WebSocket close drain timed out before all published frames were \
+             acknowledged: {not_confirmed}{cause}. Without sf_dir they are dropped with the \
+             sender: call wait before closing, raise close_flush_timeout, or use sf_dir."
+        )
+    };
     match reconnect_failure {
         Some(cause) => cause.clone().without_qwp_ws_rejection().reclassified(
             crate::ErrorCode::SocketError,
-            format!("{prefix}; the latest reconnect failed: {}", cause.msg()),
+            msg(&format!(" (the latest reconnect failed: {})", cause.msg())),
         ),
-        None => error::fmt!(SocketError, "{prefix}"),
+        None => error::fmt!(SocketError, "{}", msg("")),
     }
 }
 
@@ -5311,17 +5345,25 @@ mod tests {
         // the structured rejection that marks one (`line_sender_error_qwpws_get_view`).
         let cause = retriable_server_rejection("write failed");
 
-        let err = close_drain_timeout_error(Some(&cause));
+        let err = close_drain_timeout_error(3, Some(&cause));
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
-        assert!(
-            err.msg()
-                .contains("the latest reconnect failed: write failed"),
-            "{err}"
+        assert_eq!(
+            err.msg(),
+            "QWP/WebSocket close drain timed out before all published frames were \
+             acknowledged: 3 of them are not confirmed (the latest reconnect failed: write \
+             failed). Without sf_dir they are dropped with the sender: call wait before \
+             closing, raise close_flush_timeout, or use sf_dir."
         );
         assert!(err.qwp_ws_rejection().is_none());
 
-        let err = close_drain_timeout_error(None);
+        let err = close_drain_timeout_error(1, None);
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            err.msg(),
+            "QWP/WebSocket close drain timed out before all published frames were \
+             acknowledged: 1 of them is not confirmed. Without sf_dir they are dropped with \
+             the sender: call wait before closing, raise close_flush_timeout, or use sf_dir."
+        );
         assert!(err.qwp_ws_rejection().is_none());
     }
 

@@ -793,6 +793,14 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.completed_fsn()
     }
 
+    /// How many of the frames up to `last` the server has not confirmed.
+    pub(crate) fn unconfirmed_through(&self, last: Option<u64>) -> u64 {
+        match (self.queue.oldest_unresolved_fsn(), last) {
+            (Some(oldest), Some(last)) if oldest <= last => last - oldest + 1,
+            _ => 0,
+        }
+    }
+
     pub(crate) fn close_queue(&mut self) -> Result<(), DriverError> {
         self.queue.close()
     }
