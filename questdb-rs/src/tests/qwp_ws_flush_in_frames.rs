@@ -1839,8 +1839,8 @@ pub(super) fn stopped_by_a_full_dictionary(symbols: usize) -> String {
          dictionary reached its {symbols}-entry cap; retire this connection and continue on a \
          fresh one (returning it to a pool recycles its dictionary). Nothing of this flush is \
          committed and the buffer still holds its rows. This sender takes no more flushes and \
-         still delivers the flushes before this one: close it once they are confirmed, create \
-         a new sender and flush the buffer again."
+         still delivers the flushes before this one: once they are confirmed, close it or \
+         return it to its pool, and flush the buffer again through a new sender."
     )
 }
 

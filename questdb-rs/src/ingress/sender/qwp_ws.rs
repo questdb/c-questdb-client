@@ -573,8 +573,8 @@ impl AbortedFlush {
         let msg = format!(
             "Could not flush buffer: the flush stopped part way: {}. Nothing of this flush is \
              committed and the buffer still holds its rows. This sender takes no more flushes \
-             and still delivers the flushes before this one: close it once they are confirmed, \
-             create a new sender and flush the buffer again.",
+             and still delivers the flushes before this one: once they are confirmed, close it \
+             or return it to its pool, and flush the buffer again through a new sender.",
             cause.msg().trim_end_matches('.')
         );
         Self {
@@ -8410,7 +8410,8 @@ mod tests {
             "timed out waiting for ACK-driven segment trim",
             "Nothing of this flush is committed and the buffer still holds its rows.",
             "This sender takes no more flushes and still delivers the flushes before this one: \
-             close it once they are confirmed, create a new sender and flush the buffer again.",
+             once they are confirmed, close it or return it to its pool, and flush the buffer \
+             again through a new sender.",
         ] {
             assert!(err.msg().contains(part), "no {part:?} in: {}", err.msg());
         }
@@ -8514,8 +8515,8 @@ mod tests {
             "Could not flush buffer: the flush stopped part way: WebSocket upgrade \
              authentication failed: HTTP status 401. Nothing of this flush is committed and \
              the buffer still holds its rows. This sender takes no more flushes and still \
-             delivers the flushes before this one: close it once they are confirmed, create a \
-             new sender and flush the buffer again."
+             delivers the flushes before this one: once they are confirmed, close it or return \
+             it to its pool, and flush the buffer again through a new sender."
         );
         assert_eq!(err.ws_http_status(), Some(401));
         // Whatever its cause, nothing of the flush can be committed.
