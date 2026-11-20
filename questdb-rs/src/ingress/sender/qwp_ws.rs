@@ -572,9 +572,12 @@ impl AbortedFlush {
     fn new(first_fsn: u64, cause: crate::Error) -> Self {
         let msg = format!(
             "Could not flush buffer: the flush stopped part way: {}. Nothing of this flush is \
-             committed and the buffer still holds its rows. This sender takes no more flushes \
-             and still delivers the flushes before this one: once they are confirmed, close it \
-             or return it to its pool, and flush the buffer again through a new sender.",
+             committed and the buffer still holds its rows. Only a flush with more rows of one \
+             table than the server's qwp.max.uncommitted.rows may be committed in part, and \
+             flushing it again then stores that part twice unless the table has DEDUP keys. \
+             This sender takes no more flushes and still delivers the flushes before this one: \
+             once they are confirmed, close it or return it to its pool, and flush the buffer \
+             again through a new sender.",
             cause.msg().trim_end_matches('.')
         );
         Self {
@@ -8569,9 +8572,12 @@ mod tests {
             err.msg(),
             "Could not flush buffer: the flush stopped part way: WebSocket upgrade \
              authentication failed: HTTP status 401. Nothing of this flush is committed and \
-             the buffer still holds its rows. This sender takes no more flushes and still \
-             delivers the flushes before this one: once they are confirmed, close it or return \
-             it to its pool, and flush the buffer again through a new sender."
+             the buffer still holds its rows. Only a flush with more rows of one table than \
+             the server's qwp.max.uncommitted.rows may be committed in part, and flushing it \
+             again then stores that part twice unless the table has DEDUP keys. This sender \
+             takes no more flushes and still delivers the flushes before this one: once they \
+             are confirmed, close it or return it to its pool, and flush the buffer again \
+             through a new sender."
         );
         assert_eq!(err.ws_http_status(), Some(401));
         // Whatever its cause, nothing of the flush can be committed.

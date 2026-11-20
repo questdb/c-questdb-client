@@ -1886,9 +1886,12 @@ pub(super) fn stopped_by_a_full_dictionary(symbols: usize) -> String {
         "Could not flush buffer: the flush stopped part way: QWP/WS connection-scoped symbol \
          dictionary reached its {symbols}-entry cap; retire this connection and continue on a \
          fresh one (returning it to a pool recycles its dictionary). Nothing of this flush is \
-         committed and the buffer still holds its rows. This sender takes no more flushes and \
-         still delivers the flushes before this one: once they are confirmed, close it or \
-         return it to its pool, and flush the buffer again through a new sender."
+         committed and the buffer still holds its rows. Only a flush with more rows of one \
+         table than the server's qwp.max.uncommitted.rows may be committed in part, and \
+         flushing it again then stores that part twice unless the table has DEDUP keys. This \
+         sender takes no more flushes and still delivers the flushes before this one: once \
+         they are confirmed, close it or return it to its pool, and flush the buffer again \
+         through a new sender."
     )
 }
 
