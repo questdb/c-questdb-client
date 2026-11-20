@@ -51,6 +51,10 @@
 //! keeps its rows. The sender takes no more flushes, each of which gets the
 //! same error, and goes on delivering the flushes before the failed one:
 //! `wait` and `close_drain` return once those are confirmed.
+//! A frame of a flush that the server rejects leaves nothing of the flush
+//! committed. A rejection for good stops the sender, which reports it at
+//! `wait` and at `close_drain`. After any other the sender connects again
+//! and sends the whole flush, which the server commits once.
 //!
 //! The server is the model of [`crate::tests::qwp_ws_server_model`] behind a
 //! socket: it holds the rows of a frame with the defer flag and commits at
@@ -63,8 +67,8 @@ use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::ingress::{
-    AckLevel, Buffer, Sender, SenderBuilder, SymbolGlobalDict, TimestampMicros, TimestampNanos,
-    decode_qwp_varint,
+    AckLevel, Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, Sender, SenderBuilder,
+    SymbolGlobalDict, TimestampMicros, TimestampNanos, decode_qwp_varint,
 };
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
 use crate::tests::qwp_ws_server_model::{
@@ -2171,6 +2175,191 @@ fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_co
     server.finish();
 }
 
+/// What a server answers a frame whose columns disagree with the table. A
+/// sender that gets it stops for good.
+const SCHEMA_MISMATCH: u8 = 0x03;
+/// What a server answers a frame that it could not write. A sender that gets
+/// it connects again and sends every frame that is not confirmed.
+const WRITE_ERROR: u8 = 0x09;
+
+/// The error that stopped `sender` for good, once it has read the answer of
+/// the server that did so.
+fn the_error_that_stops(sender: &mut Sender, progress: Progress) -> crate::Error {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match progress {
+            Progress::Background => thread::sleep(Duration::from_millis(1)),
+            // What it reads may be what stops it.
+            Progress::Manual => drop(sender.drive_once()),
+        }
+        if let Err(err) = sender.completed_fsn(AckLevel::Ok) {
+            return err;
+        }
+        assert!(Instant::now() < deadline, "the sender did not stop");
+    }
+}
+
+/// Checks that `err` is the rejection for good of frame `fsn` of the sender.
+fn assert_rejected_for_good(err: &crate::Error, fsn: u64) {
+    assert_eq!(err.code(), ErrorCode::ServerRejection, "{}", err.msg());
+    let rejection = err.qwp_ws_rejection().expect("what the server rejected");
+    assert_eq!(rejection.category, QwpWsErrorCategory::SchemaMismatch);
+    assert_eq!(rejection.applied_policy, QwpWsErrorPolicy::Terminal);
+    assert_eq!(rejection.status, Some(SCHEMA_MISMATCH));
+    assert_eq!((rejection.from_fsn, rejection.to_fsn), (fsn, fsn));
+}
+
+/// The server rejects a middle frame of a flush in frames for good, and the
+/// sender learns of it after `flush` returned: `wait` and `close_drain`
+/// report the rejection, which names that frame, and the sender takes no
+/// more flushes. Nothing of the flush is committed, the flush before it
+/// stays, and the same rows through a new sender are one commit.
+fn a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, progress, "");
+    let before = buffer_of(TABLE, 0..3);
+    let large = buffer_of(TABLE, 3..2003);
+    let frame_count = frames_of_a_flush(&large, FRAME_LIMIT).len();
+    assert!(frame_count > 40, "{frame_count} frames");
+    // Of the frames of the flush, counted from 0.
+    let rejected = frame_count / 2;
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    // The flush before is the first frame that the server takes and frame 0
+    // of the sender, so the frames of the flush are 2 and up for the server
+    // and 1 and up for the sender. The answer waits until `flush` returned.
+    server.reject_frame(2 + rejected, SCHEMA_MISMATCH);
+    server.hold_answers();
+    let mut flushed = large.clone();
+    let last = sender.flush_and_get_fsn(&mut flushed).unwrap();
+    assert_eq!(last, Some(frame_count as u64));
+    assert!(flushed.is_empty());
+    wait_for_frames_sent(&mut sender, progress, &server, 1 + frame_count);
+    assert!(!sender.must_close());
+    server.let_answers_go();
+
+    // The rejected frame belongs to the flush whose number is the first at
+    // or above it.
+    let fsn = 1 + rejected as u64;
+    assert!(Some(0) < Some(fsn) && Some(fsn) < last);
+    assert_rejected_for_good(&sender.wait(AckLevel::Ok, WAIT).unwrap_err(), fsn);
+    assert!(sender.must_close());
+    assert_rejected_for_good(&sender.flush_and_keep(&before).unwrap_err(), fsn);
+    assert_rejected_for_good(&sender.close_drain().unwrap_err(), fsn);
+    // The server has read every frame of the flush, and committed none.
+    assert_eq!(server.frames_taken(), 1 + frame_count);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+
+    drop(sender);
+    wait_for_no_connection(&server);
+    let mut sender = sender_with(server.port, progress, "");
+    sender.flush_and_keep(&large).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 2, &[&before, &large]);
+    drop(sender);
+    server.finish();
+}
+
+/// The server rejects a middle frame of a flush in frames with an error
+/// that a sender answers by connecting again. The rows that the first
+/// connection held are gone with the rejection. The sender sends the whole
+/// flush again, and the server commits it once. In the background the
+/// rejection may come while `flush` still publishes.
+fn a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole(progress: Progress) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, progress, "");
+    let before = buffer_of(TABLE, 0..3);
+    let large = buffer_of(TABLE, 3..2003);
+    let after = buffer_of(TABLE, 2003..2006);
+    let frame_count = frames_of_a_flush(&large, FRAME_LIMIT).len() as u64;
+    assert!(frame_count > 40, "{frame_count} frames");
+    let rejected = frame_count / 2;
+
+    // Confirmed while the first connection lives, so it is not sent again.
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    server.reject_frame(2 + rejected as usize, WRITE_ERROR);
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frame_count)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(
+        sender.completed_fsn(AckLevel::Ok).unwrap(),
+        Some(frame_count)
+    );
+
+    let totals = sender.qwp_ws_totals().unwrap();
+    assert_eq!(
+        (totals.server_errors, totals.reconnects_succeeded),
+        (1, 1),
+        "{totals:?}"
+    );
+    // The first connection took the frames up to the rejected one at least.
+    assert!(
+        totals.frames_replayed > rejected,
+        "{} frames sent again",
+        totals.frames_replayed
+    );
+    let table = server.model.table(TABLE).unwrap();
+    assert_eq!(table.commits, 2);
+    assert_eq!(table.blocks.len() as u64, 1 + frame_count);
+    assert_eq!(table.rows_as_text(), rows_of_all(&[&before, &large]));
+    assert!(!sender.must_close());
+
+    // The sender goes on.
+    sender.flush_and_keep(&after).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 3, &[&before, &large, &after]);
+    drop(sender);
+    server.finish();
+}
+
+/// A sender whose flush failed part way sends the frames of that flush that
+/// it had queued, and the server rejects one of them for good. The sender
+/// has then nothing to wait for, since the flush before is confirmed, and
+/// still reports the rejection when it is closed.
+fn a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before, false, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    let failing = frames.len() / 2;
+    assert!(failing > 2, "{} frames", frames.len());
+    let symbols = symbols_held_before(&frames[failing]);
+    let mut sender = sender_with_a_dictionary_of(server.port, progress, symbols);
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    // The server takes the flush before as its first frame. It rejects the
+    // second frame of the failed flush, which is frame 2 of the sender, and
+    // tells so when the flush has failed.
+    server.reject_frame(3, SCHEMA_MISMATCH);
+    server.hold_answers();
+    let err = sender.flush_and_keep(&large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    wait_for_frames_sent(&mut sender, progress, &server, 1 + failing);
+    server.let_answers_go();
+
+    assert_rejected_for_good(&the_error_that_stops(&mut sender, progress), 2);
+    // Its position is the error too, not the frame before the failed flush.
+    assert_rejected_for_good(&sender.published_fsn().unwrap_err(), 2);
+    assert_rejected_for_good(&sender.wait(AckLevel::Ok, WAIT).unwrap_err(), 2);
+    assert_rejected_for_good(&sender.close_drain().unwrap_err(), 2);
+    assert!(sender.must_close());
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    drop(sender);
+    server.finish();
+}
+
 /// Makes two tests of each test that takes the progress mode of its senders:
 /// `<test>::background` and `<test>::manual`.
 macro_rules! in_both_progress_modes {
@@ -2221,4 +2410,7 @@ in_both_progress_modes! {
     a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
     a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
+    a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
+    a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
+    a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good
 }

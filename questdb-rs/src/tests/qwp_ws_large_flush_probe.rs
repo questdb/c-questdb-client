@@ -28,7 +28,7 @@
 //!
 //! The rows and the checks of the tables are those of `qwp_ws_defer_probe`,
 //! which writes such frames to a raw WebSocket. Here the sender cuts the
-//! buffer and sends the frames. There are five tests:
+//! buffer and sends the frames. There are six tests:
 //!
 //! - a flush of one table without symbols into a table that the flush
 //!   creates, so the time until the server confirms includes the time it
@@ -48,12 +48,18 @@
 //!   the caller drives the connection, and then two flushes of such a
 //!   sender through a queue that takes one of them at a time: the second
 //!   `flush` drives the connection itself until the server has confirmed
-//!   the first.
+//!   the first;
+//! - a flush over three tables with a frame in its middle that the server
+//!   rejects for good, after a small flush of the same sender, in both
+//!   progress modes: the sender stops with the server's rejection, the
+//!   server commits the small flush and no row of the rejected one, and
+//!   the rows without the fault are one transaction of each table through
+//!   a new sender.
 //!
 //! Each test also prints how long a flush took; the first two, how much
 //! memory the process held; the second one, how many frames its flushes
 //! took. For these numbers run one test at a time, from a release build.
-//! This runs all five; the whole name of a test runs that one:
+//! This runs all six; the whole name of a test runs that one:
 //!
 //! `QDB_QWP_WS_LARGE_FLUSH_PROBE=1 QDB_QWP_WS_PORT=9000 cargo test --release --manifest-path questdb-rs/Cargo.toml --lib qwp_ws_real_server_large_flush -- --ignored --nocapture`
 //!
@@ -64,15 +70,18 @@
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
-use crate::ingress::{AckLevel, Buffer, Sender, SenderBuilder, SymbolGlobalDict, TestDictCapGuard};
+use crate::ingress::{
+    AckLevel, Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, Sender, SenderBuilder,
+    SymbolGlobalDict, TestDictCapGuard,
+};
 
 use super::TestResult;
 use super::qwp_ws_defer_probe::{
-    Digest, Group, SERVER_MAX_UNCOMMITTED_ROWS, Server, TagOf, push_row, rows_from,
-    symbols_brought, tag_of, text_len_of,
+    Digest, Group, SERVER_MAX_UNCOMMITTED_ROWS, Server, TagOf, push_row,
+    push_row_with_a_text_for_a_number, rows_from, symbols_brought, tag_of, text_len_of,
 };
 use super::qwp_ws_protocol_probe::{ProbeConfig, ProbeResult, query_build};
-use super::qwp_ws_server_model::{frame_of_a_sender, frames_of_a_sender};
+use super::qwp_ws_server_model::{frame_of_a_sender, frames_of_a_flush, frames_of_a_sender};
 
 /// More than 16 MiB, the largest message the protocol has.
 const DEFAULT_MIB: usize = 20;
@@ -901,6 +910,175 @@ fn qwp_ws_real_server_large_flush_in_manual_progress_mode_is_one_transaction() -
          {confirmed_after:?} after the first call began"
     );
     Ok(())
+}
+
+/// A flush far larger than a frame with a frame in its middle that the
+/// server rejects for good, after a small flush of the same sender, once
+/// for each progress mode. The flush has rows of three tables: of the
+/// first for its first half, five of the second, and of the third. The
+/// rows of the second table have a text in a column that is a number in
+/// the table, so the server rejects the frame that brings them, when it
+/// holds rows of the first table and before the frames of the third.
+///
+/// The sender stops with the server's rejection, which names that frame.
+/// A sender in manual progress mode sends nothing before `wait`, so `flush`
+/// returns and `wait` reports the rejection. In the background the answer
+/// of the server can come while `flush` still queues frames, and `flush`
+/// then fails with it. `close_drain` reports it too. Each table then holds
+/// the rows of the small flush, in one transaction, and still does when the
+/// sender is gone.
+///
+/// The same rows with a number where the text was are one more transaction
+/// of each table through a new sender.
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_LARGE_FLUSH_PROBE=1"]
+fn qwp_ws_real_server_large_flush_with_a_frame_that_the_server_rejects_commits_none_of_its_rows()
+-> TestResult {
+    let Some((config, mib)) = probe_settings()? else {
+        return Ok(());
+    };
+    let server = Server::Live(&config);
+    for (mode, progress) in [("background", ""), ("manual", "qwp_ws_progress=manual;")] {
+        let created = ["one", "two", "three"]
+            .map(|name| server.new_table(&format!("qwp_large_flush_rejected_{name}")));
+        let tables = [&created[0].0, &created[1].0, &created[2].0];
+        let conf = format!("ws::addr={}:{};{progress}", config.host, config.qwp_ws_port);
+        let mut sender = SenderBuilder::from_conf(&conf)?.build()?;
+        let (frame_cap, told_by_server) = sender.effective_frame_cap()?;
+        assert!(told_by_server, "the server told no frame limit");
+
+        // The small flush creates the tables: `mix` is a number in each.
+        let small_rows = [0, 1_000_000, 2_000_000].map(|id| rows_from(id, CREATING_ROWS));
+        let mut small = Buffer::new_qwp_ws();
+        for (table, rows) in tables.iter().zip(&small_rows) {
+            for (id, text_len) in rows {
+                push_row(&mut small, table, *id, *text_len, None)?;
+            }
+        }
+        let bytes = (mib * 1024 * 1024).saturating_sub(ROW_ROOM);
+        let (large, _) = buffer_over_three_tables(tables, bytes, true)?;
+        // The frame that the server rejects is the one with the rows of the
+        // second table: the only frame that holds more than one table.
+        let (frame_count, rejected) = {
+            let frames = frames_of_a_flush(&large, frame_cap);
+            let blocks = |frame: &Vec<u8>| u16::from_le_bytes([frame[6], frame[7]]);
+            let rejected = frames.iter().position(|frame| blocks(frame) > 1);
+            (frames.len(), rejected.expect("a frame of several tables"))
+        };
+        assert!(
+            rejected >= 1 && rejected + 1 < frame_count,
+            "frame {rejected} of {frame_count}: use a larger buffer"
+        );
+
+        assert_eq!(sender.flush_and_keep_and_get_fsn(&small)?, Some(0));
+        sender.wait(AckLevel::Ok, WAIT)?;
+        let started = Instant::now();
+        let flushed = sender.flush_and_keep_and_get_fsn(&large);
+        let flush_took = started.elapsed();
+        let (err, told_by) = match flushed {
+            Ok(last) => {
+                assert_eq!(last, Some(frame_count as u64));
+                (sender.wait(AckLevel::Ok, WAIT).unwrap_err(), "wait")
+            }
+            Err(err) => {
+                assert_eq!(mode, "background", "{}", err.msg());
+                (err, "flush")
+            }
+        };
+        let told_after = started.elapsed();
+        assert_eq!(err.code(), ErrorCode::ServerRejection, "{}", err.msg());
+        let rejection = err.qwp_ws_rejection().expect("what the server rejected");
+        assert_eq!(rejection.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(rejection.applied_policy, QwpWsErrorPolicy::Terminal);
+        // The small flush is frame 0 of the sender.
+        let fsn = 1 + rejected as u64;
+        assert_eq!((rejection.from_fsn, rejection.to_fsn), (fsn, fsn));
+        assert!(sender.must_close());
+        let closed = sender.close_drain().unwrap_err();
+        assert_eq!(
+            closed.code(),
+            ErrorCode::ServerRejection,
+            "{}",
+            closed.msg()
+        );
+
+        let holds_the_small_flush = |when: &str| -> ProbeResult<()> {
+            for (table, rows) in tables.iter().zip(&small_rows) {
+                assert_eq!(
+                    server.digest(table)?,
+                    Some(Digest::of(rows)),
+                    "{mode}, {when}"
+                );
+                assert_eq!(server.transactions(table)?, Some(1), "{mode}, {when}");
+            }
+            Ok(())
+        };
+        for table in tables {
+            server.wait_for_rows(table, CREATING_ROWS)?;
+        }
+        holds_the_small_flush("after the rejection")?;
+        drop(sender);
+        std::thread::sleep(DROP_SETTLE);
+        holds_the_small_flush("after the sender is gone")?;
+
+        let (large, large_rows) = buffer_over_three_tables(tables, bytes, false)?;
+        let mut sender = SenderBuilder::from_conf(&conf)?.build()?;
+        sender.flush_and_keep(&large)?;
+        sender.wait(AckLevel::Ok, WAIT)?;
+        for ((table, small), large) in tables.iter().zip(&small_rows).zip(&large_rows) {
+            let rows = [small.as_slice(), large.as_slice()].concat();
+            server.wait_for_rows(table, rows.len())?;
+            assert_eq!(server.digest(table)?, Some(Digest::of(&rows)), "{mode}");
+            assert_eq!(server.transactions(table)?, Some(2), "{mode}");
+        }
+        eprintln!(
+            "rejected flush, {mode}: {} bytes in the buffer, {frame_count} frames of at most \
+             {frame_cap} bytes; the server rejected frame {rejected} of them; flush returned \
+             after {flush_took:?} and {told_by} told of the rejection {told_after:?} after the \
+             call began: {}",
+            large.len(),
+            err.msg()
+        );
+    }
+    Ok(())
+}
+
+/// The rows of a table: per row its id and the length of its text.
+type Rows = Vec<(i64, usize)>;
+
+/// A buffer of about `bytes`: rows of the first table for its first half,
+/// five rows of the second, and rows of the third. With
+/// `text_for_a_number` the rows of the second table have a text in `mix`,
+/// which is a number in the rows of the script. Returns the rows of each
+/// table too.
+fn buffer_over_three_tables(
+    tables: [&String; 3],
+    bytes: usize,
+    text_for_a_number: bool,
+) -> ProbeResult<(Buffer, [Rows; 3])> {
+    let mut buffer = Buffer::new_qwp_ws();
+    let mut rows = [Vec::new(), Vec::new(), Vec::new()];
+    let mut id = 10_000_000;
+    while buffer.len() < bytes / 2 {
+        push_row(&mut buffer, tables[0], id, text_len_of(id), None)?;
+        rows[0].push((id, text_len_of(id)));
+        id += 1;
+    }
+    for _ in 0..5 {
+        if text_for_a_number {
+            push_row_with_a_text_for_a_number(&mut buffer, tables[1], id)?;
+        } else {
+            push_row(&mut buffer, tables[1], id, text_len_of(id), None)?;
+        }
+        rows[1].push((id, text_len_of(id)));
+        id += 1;
+    }
+    while buffer.len() < bytes {
+        push_row(&mut buffer, tables[2], id, text_len_of(id), None)?;
+        rows[2].push((id, text_len_of(id)));
+        id += 1;
+    }
+    Ok((buffer, rows))
 }
 
 /// The size of the queue that a sender asks for when it refuses a buffer

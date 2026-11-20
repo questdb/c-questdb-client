@@ -789,17 +789,28 @@ fn a_group_with_a_frame_that_the_server_rejects_leaves_no_rows(
 /// columns of the script: its row has a text where the table has a number.
 fn frame_with_a_text_for_a_number(table: &str) -> ProbeResult<Vec<u8>> {
     let mut buffer = Buffer::new_qwp_ws();
-    buffer
-        .table(table)?
-        .column_i64("id", -1)?
-        .column_str("mix", "not a number")?
-        .column_str("txt", "")?
-        .at(TimestampNanos::new(BASE_TS_NANOS))?;
+    push_row_with_a_text_for_a_number(&mut buffer, table, -1)?;
     Ok(frame_of_a_sender(
         &buffer,
         true,
         &mut SymbolGlobalDict::new(),
     ))
+}
+
+/// One row that a server rejects once `table` has the columns of the
+/// script: a text in `mix`, which is a number there.
+pub(super) fn push_row_with_a_text_for_a_number(
+    buffer: &mut Buffer,
+    table: &str,
+    id: i64,
+) -> ProbeResult<()> {
+    buffer
+        .table(table)?
+        .column_i64("id", id)?
+        .column_str("mix", "not a number")?
+        .column_str("txt", "")?
+        .at(TimestampNanos::new(BASE_TS_NANOS + id * 1_000))?;
+    Ok(())
 }
 
 /// `count` rows of the script from `first_id` on: per row its id and the
