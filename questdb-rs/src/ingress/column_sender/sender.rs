@@ -38,13 +38,14 @@ use crate::ingress::conf::DurableAckTiers;
 use crate::ingress::sender::ack_wait_timeout_error;
 use crate::ingress::sender::effective_hard_frame_cap;
 use crate::ingress::sender::qwp_ws::{
-    QwpWsFlushError, SyncQwpWsHandlerState, flush_qwp_ws_pooled, publish_qwp_ws_payload_background,
-    qwp_ws_acked_fsn_background, qwp_ws_begin_close_background, qwp_ws_check_error_background,
-    qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
-    qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
-    qwp_ws_progress_generation_background, qwp_ws_published_fsn_background,
-    qwp_ws_reconnect_failure_background, qwp_ws_sender_errors_dropped_background,
-    qwp_ws_wait_for_progress_background, sfa_has_deferred_commit_slot,
+    NO_FRAME_LIMIT_TOLD, QwpWsFlushError, SyncQwpWsHandlerState, flush_qwp_ws_pooled,
+    publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background, qwp_ws_begin_close_background,
+    qwp_ws_check_error_background, qwp_ws_drain_to_deadline_background,
+    qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background, qwp_ws_poll_sender_error_background,
+    qwp_ws_poll_sender_error_notification_background, qwp_ws_progress_generation_background,
+    qwp_ws_published_fsn_background, qwp_ws_reconnect_failure_background,
+    qwp_ws_sender_errors_dropped_background, qwp_ws_wait_for_progress_background,
+    sfa_has_deferred_commit_slot,
 };
 use crate::ingress::sender::qwp_ws_publisher::QwpWsFlushEncoder;
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
@@ -1714,6 +1715,11 @@ impl SfaBackend {
         // soft target as a split of a chunk has.
         let (frame_cap, server_frame_limit_known) = self.effective_hard_frame_cap();
         let max_buf_size = self.max_buf_size;
+        // Only the server's silence about its frame limit keeps a buffer
+        // above the frame cap from going out in several frames.
+        let no_frame_limit_told = !server_frame_limit_known
+            && frame_cap < max_buf_size
+            && self.state.sfa_split_deferral_enabled;
         let result = {
             let Self {
                 foreground,
@@ -1735,6 +1741,15 @@ impl SfaBackend {
             )
         };
         let result = result.map_err(|err| match err {
+            // The buffer did not fit one frame.
+            QwpWsFlushError::Failed(err)
+                if no_frame_limit_told && err.code() == ErrorCode::BatchTooLarge =>
+            {
+                crate::Error::new(
+                    ErrorCode::BatchTooLarge,
+                    format!("{}{}", err.msg(), NO_FRAME_LIMIT_TOLD),
+                )
+            }
             QwpWsFlushError::Refused(err) | QwpWsFlushError::Failed(err) => err,
         });
         if let Err(err) = &result {

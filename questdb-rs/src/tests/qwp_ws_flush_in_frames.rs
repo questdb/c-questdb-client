@@ -84,6 +84,12 @@ pub(super) const WAIT: Duration = Duration::from_secs(10);
 const SET_BY_SERVER: &str = "the server's advertised X-QWP-Max-Batch-Size";
 /// The same for a cap that is what a segment of the queue holds.
 const SET_BY_SEGMENT: &str = "the sf_max_segment_bytes segment payload capacity";
+/// What ends the refusal of a buffer above the frame cap that only the
+/// server's silence about its frame limit keeps from going out in frames.
+pub(super) const NO_FRAME_LIMIT_TOLD: &str = " It is not sent in several frames, because the \
+    server has not told its frame limit: either the sender is not connected yet (flush again \
+    once it is), or the server is too old to commit several frames together (upgrade it, or \
+    flush smaller batches).";
 
 /// How a sender makes its progress. Every test of a sender here runs once
 /// for each: see [`in_both_progress_modes`].
@@ -1048,11 +1054,44 @@ fn a_sender_whose_server_tells_no_frame_limit_refuses_a_buffer_above_the_frame_c
 ) {
     let port = spawn_max_batch_size_upgrade_only_server(None);
     // The cap is then what a segment of the queue holds: its 4,096 bytes
-    // less the headers of the segment and of a frame, 24 and 8 bytes.
-    let mut sender = sender_with(port, progress, "sf_max_segment_bytes=4096;");
+    // less the headers of the segment and of a frame, 24 and 8 bytes. This
+    // server answers no frame: the sender does not wait for it at its end.
+    let settings = "sf_max_segment_bytes=4096;close_flush_timeout_millis=0;";
+    let mut sender = sender_with(port, progress, settings);
     assert_eq!(sender.effective_frame_cap().unwrap(), (4064, false));
     let mut large = buffer_of(TABLE, 0..2000);
 
+    // The refusal says what keeps the buffer from going out in frames.
+    let refusal = refusal_of(&mut sender, &mut large);
+    let end = format!(
+        " bytes exceeds the per-frame cap of 4064 bytes. The cap is set by \
+         {SET_BY_SEGMENT}.{NO_FRAME_LIMIT_TOLD}"
+    );
+    assert!(refusal.ends_with(&end), "got: {refusal}");
+    // A buffer that fits one frame is sent as before.
+    sender.flush(&mut buffer_of(TABLE, 0..3)).unwrap();
+
+    // Where `max_buf_size` is the cap, no server would get the buffer in
+    // frames, and the refusal says no more than before.
+    let port = spawn_max_batch_size_upgrade_only_server(None);
+    let mut sender = sender_with(
+        port,
+        progress,
+        "sf_max_segment_bytes=4096;max_buf_size=3000;",
+    );
+    assert_eq!(sender.effective_frame_cap().unwrap(), (3000, false));
+    assert_refused_as_one_frame(&mut sender, &mut large, 3000, "max_buf_size");
+
+    // The same with `sf_dir`, where no buffer goes out in frames whatever
+    // the server tells.
+    let port = spawn_max_batch_size_upgrade_only_server(None);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let settings = format!(
+        "sf_dir={};sender_id=large;sf_max_segment_bytes=4096;",
+        sf_dir.path().display()
+    );
+    let mut sender = sender_with(port, progress, &settings);
+    assert_eq!(sender.effective_frame_cap().unwrap(), (4064, false));
     assert_refused_as_one_frame(&mut sender, &mut large, 4064, SET_BY_SEGMENT);
 }
 

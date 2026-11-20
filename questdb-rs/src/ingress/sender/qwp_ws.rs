@@ -531,7 +531,7 @@ pub(crate) struct ManualQwpWsHandlerState {
     /// as [`SyncQwpWsHandlerState::sfa_frame_split_target`]. `None` with
     /// `sf_dir`, where no flush goes out in frames: see
     /// [`SyncQwpWsHandlerState::sfa_split_deferral_enabled`].
-    sfa_frame_split_target: Option<usize>,
+    pub(crate) sfa_frame_split_target: Option<usize>,
     /// The flush that left the sender closed for publications, if one did:
     /// see [`ManualQwpWsPublisher`].
     aborted_flush: Option<AbortedFlush>,
@@ -4377,6 +4377,19 @@ pub(crate) fn flush_qwp_ws_pooled(
         split_target,
     )
 }
+
+/// Ends the refusal of a buffer that is above the frame cap and that would
+/// go out in several frames, had the server told its frame limit: the queue
+/// is in memory, and `max_buf_size` is not what the buffer is held against.
+///
+/// A server tells its frame limit since the release that can commit several
+/// frames together, so the frames of a buffer are never cut for a server
+/// that tells none. A sender that is not connected yet does not know its
+/// server, and cannot be told from one whose server tells no limit.
+pub(crate) const NO_FRAME_LIMIT_TOLD: &str = " It is not sent in several frames, because the \
+    server has not told its frame limit: either the sender is not connected yet (flush again \
+    once it is), or the server is too old to commit several frames together (upgrade it, or \
+    flush smaller batches).";
 
 /// Publishes a buffer through `publisher`: for a sender in either progress
 /// mode, and for a sender of a pool.

@@ -410,6 +410,15 @@ impl Sender {
             .expect("QWP/WebSocket handler was checked above");
         let (max, server_max_known) =
             effective_hard_frame_cap(self.max_buf_size, server_max, sfa_frame_payload_cap);
+        // Only the server's silence about its frame limit keeps a buffer
+        // above the frame cap from going out in several frames.
+        let no_frame_limit_told = !server_max_known
+            && max < self.max_buf_size
+            && match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => state.sfa_split_deferral_enabled,
+                SyncProtocolHandler::ManualQwpWs(state) => state.sfa_frame_split_target.is_some(),
+                _ => false,
+            };
         let flushed = match &mut self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => {
                 flush_qwp_ws(state, qwp, max, self.max_buf_size, server_max_known)
@@ -442,9 +451,14 @@ impl Sender {
                     server_max,
                     sfa_frame_payload_cap,
                 );
+                let hint = if no_frame_limit_told {
+                    NO_FRAME_LIMIT_TOLD
+                } else {
+                    ""
+                };
                 crate::Error::new(
                     crate::ErrorCode::BatchTooLarge,
-                    format!("{} The cap is set by {}.", err.msg(), source),
+                    format!("{} The cap is set by {}.{}", err.msg(), source, hint),
                 )
             } else {
                 err

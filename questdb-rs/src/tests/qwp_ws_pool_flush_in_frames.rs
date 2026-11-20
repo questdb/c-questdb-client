@@ -57,7 +57,7 @@ use crate::ingress::column_sender::Chunk;
 use crate::ingress::{AckLevel, Buffer, SymbolGlobalDict, TestDictCapGuard};
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
 use crate::tests::qwp_ws_flush_in_frames::{
-    EIGHT_SEGMENTS, FIRST, FRAME_LIMIT, SECOND, TABLE, WAIT, add_symbol_row,
+    EIGHT_SEGMENTS, FIRST, FRAME_LIMIT, NO_FRAME_LIMIT_TOLD, SECOND, TABLE, WAIT, add_symbol_row,
     allocated_after_a_flush_of, assert_table_holds, assert_timed_out_waiting_for_room,
     buffer_of_len, buffer_of_symbols, queue_bytes_for, stopped_by_a_full_dictionary,
     symbols_held_before, two_flushes_for_a_queue_that_holds_one, wait_for_frames_taken,
@@ -829,11 +829,66 @@ fn a_pooled_sender_with_sf_dir_refuses_a_buffer_above_the_frame_cap() {
 fn a_pooled_sender_whose_server_tells_no_frame_limit_refuses_a_buffer_above_the_frame_cap() {
     let port = spawn_max_batch_size_upgrade_only_server(None);
     // The cap is then what a segment of the queue holds: its 4,096 bytes
-    // less the headers of the segment and of a frame, 24 and 8 bytes.
-    let db = pool_with(port, "sf_max_segment_bytes=4096;");
+    // less the headers of the segment and of a frame, 24 and 8 bytes. This
+    // server answers no frame: the pool does not wait for it.
+    let db = pool_with(
+        port,
+        "sf_max_segment_bytes=4096;close_flush_timeout_millis=0;",
+    );
     let mut sender = db.borrow_sender().unwrap();
     assert_eq!(sender.effective_frame_cap_for_test(), (4064, false));
     let mut large = buffer_of(TABLE, 0..2000);
 
+    // The refusal says what keeps the buffer from going out in frames.
+    let refusal = size_refusal_of(&mut sender, &mut large);
+    let end = format!(
+        " bytes) exceeds the store-and-forward per-frame cap (4064 bytes, the smaller of \
+         max_buf_size and the sf_max_segment_bytes segment payload capacity)\
+         {NO_FRAME_LIMIT_TOLD}"
+    );
+    assert!(
+        refusal.starts_with("QWP frame (") && refusal.ends_with(&end),
+        "got: {refusal}"
+    );
+    // A buffer that fits one frame is sent as before.
+    sender.flush_buffer(&mut buffer_of(TABLE, 0..3)).unwrap();
+    drop(sender);
+
+    // Where `max_buf_size` is the cap, no server would get the buffer in
+    // frames, and the refusal says no more than before.
+    let port = spawn_max_batch_size_upgrade_only_server(None);
+    let db = pool_with(port, "sf_max_segment_bytes=4096;max_buf_size=3000;");
+    let mut sender = db.borrow_sender().unwrap();
+    assert_eq!(sender.effective_frame_cap_for_test(), (3000, false));
+    assert_refused_as_one_frame(&mut sender, &mut large, 3000);
+    drop(sender);
+
+    // The same with `sf_dir`, where no buffer goes out in frames whatever
+    // the server tells.
+    let port = spawn_max_batch_size_upgrade_only_server(None);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let settings = format!(
+        "sf_dir={};sender_id=large;sf_max_segment_bytes=4096;",
+        sf_dir.path().display()
+    );
+    let db = pool_with(port, &settings);
+    let mut sender = db.borrow_sender().unwrap();
+    assert_eq!(sender.effective_frame_cap_for_test(), (4064, false));
     assert_refused_as_one_frame(&mut sender, &mut large, 4064);
+}
+
+/// A pool that connects when its first sender is used: that sender does not
+/// know its server yet.
+#[test]
+fn a_pooled_sender_that_is_not_connected_yet_refuses_a_buffer_above_the_frame_cap() {
+    // No server ever answers on this port.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let db = pool_with(port, "lazy_connect=true;sf_max_segment_bytes=4096;");
+    let mut sender = db.borrow_sender().unwrap();
+    assert_eq!(sender.effective_frame_cap_for_test(), (4064, false));
+    let mut large = buffer_of(TABLE, 0..2000);
+
+    let refusal = size_refusal_of(&mut sender, &mut large);
+    assert!(refusal.ends_with(NO_FRAME_LIMIT_TOLD), "got: {refusal}");
 }
