@@ -72,14 +72,14 @@ use crate::tests::qwp_ws_server_model::{
     frame_of_a_whole_buffer, frames_of_a_flush, frames_of_a_sender, rows_of,
 };
 
-const TABLE: &str = "flush_rows";
+pub(super) const TABLE: &str = "flush_rows";
 /// The tables of a flush over several tables, in the order of its buffer.
-const FIRST: &str = "first_rows";
-const SECOND: &str = "second_rows";
+pub(super) const FIRST: &str = "first_rows";
+pub(super) const SECOND: &str = "second_rows";
 const THIRD: &str = "third_rows";
 /// The frame limit the server tells, where a test names no other.
-const FRAME_LIMIT: usize = 1024;
-const WAIT: Duration = Duration::from_secs(10);
+pub(super) const FRAME_LIMIT: usize = 1024;
+pub(super) const WAIT: Duration = Duration::from_secs(10);
 /// What the refusal of a frame says of a cap that is the server's frame limit.
 const SET_BY_SERVER: &str = "the server's advertised X-QWP-Max-Batch-Size";
 /// The same for a cap that is what a segment of the queue holds.
@@ -131,7 +131,7 @@ fn add_row(buffer: &mut Buffer, id: i64, txt: &str) {
 
 /// Rows like those of [`buffer_of`], from `first_id` on, in a buffer whose
 /// `len()` is exactly `len`: the text of the last row is as long as it takes.
-fn buffer_of_len(first_id: i64, len: usize) -> Buffer {
+pub(super) fn buffer_of_len(first_id: i64, len: usize) -> Buffer {
     let mut buffer = Buffer::new_qwp_ws();
     let mut id = first_id;
     while buffer.len() + 64 < len {
@@ -276,7 +276,12 @@ fn blocks_per_frame(frames: &[Vec<u8>]) -> Vec<u16> {
 
 /// Checks what the server holds of `table`: the number of its commits, and
 /// the rows that `buffers` hold of it, in their order.
-fn assert_table_holds(server: &QwpWsModelServer, table: &str, commits: u64, buffers: &[&Buffer]) {
+pub(super) fn assert_table_holds(
+    server: &QwpWsModelServer,
+    table: &str,
+    commits: u64,
+    buffers: &[&Buffer],
+) {
     let held = server.model.table(table).unwrap();
     assert_eq!(held.commits, commits, "commits of {table}");
     let rows: Vec<String> = buffers
@@ -384,7 +389,7 @@ fn assert_refused_for_the_queue(
 /// symbols of `venue`, and some are 130 bytes long, so that their length
 /// takes two bytes. A row's values depend on `id` alone, so two tables
 /// share the symbols of the ids that both hold.
-fn add_symbol_row(buffer: &mut Buffer, table: &str, id: i64) {
+pub(super) fn add_symbol_row(buffer: &mut Buffer, table: &str, id: i64) {
     buffer.table(table).unwrap();
     if id % 5 != 3 {
         buffer.symbol("venue", format!("v{}", id % 4)).unwrap();
@@ -411,7 +416,7 @@ fn add_symbol_row(buffer: &mut Buffer, table: &str, id: i64) {
 }
 
 /// Rows `ids` of [`add_symbol_row`] in a buffer of one table.
-fn buffer_of_symbols(table: &str, ids: std::ops::Range<i64>) -> Buffer {
+pub(super) fn buffer_of_symbols(table: &str, ids: std::ops::Range<i64>) -> Buffer {
     let mut buffer = Buffer::new_qwp_ws();
     for id in ids {
         add_symbol_row(&mut buffer, table, id);
@@ -1473,7 +1478,7 @@ fn a_value_that_cannot_be_sent_is_named_before_a_row_that_fits_no_frame(progress
 /// The byte budget that a queue of segments of 1,024 bytes needs for a
 /// flush of `frames` frames that go two a segment: the segments that the
 /// frames fill, and the segment in use.
-fn queue_bytes_for(frames: usize) -> usize {
+pub(super) fn queue_bytes_for(frames: usize) -> usize {
     (frames.div_ceil(2) + 1) * 1024
 }
 
@@ -1546,13 +1551,13 @@ fn a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do
 
 /// The settings of a sender whose queue is eight segments of 1,024 bytes,
 /// for frames that go two a segment.
-const EIGHT_SEGMENTS: &str = "sf_max_segment_bytes=1024;sf_max_total_bytes=8192;";
+pub(super) const EIGHT_SEGMENTS: &str = "sf_max_segment_bytes=1024;sf_max_total_bytes=8192;";
 
 /// Two flushes for the queue of [`EIGHT_SEGMENTS`], and the number of
 /// frames of each. The six frames of the first fill three segments. Next to
 /// them the queue has five segments, which hold ten of the eleven frames of
 /// the second: that flush lacks room for its last frame alone.
-fn two_flushes_for_a_queue_that_holds_one() -> (Buffer, usize, Buffer, usize) {
+pub(super) fn two_flushes_for_a_queue_that_holds_one() -> (Buffer, usize, Buffer, usize) {
     let first = buffer_of(TABLE, 0..94);
     let second = buffer_of(TABLE, 100..268);
     let first_frames = frames_of_a_flush(&first, 492).len();
@@ -1566,7 +1571,7 @@ fn two_flushes_for_a_queue_that_holds_one() -> (Buffer, usize, Buffer, usize) {
 /// a flush of `frames` frames and nothing else: the segments of the frames,
 /// and the one that the runner prepares for the next frame when it gets to
 /// it, which a runner that is reconnecting does not.
-fn allocated_after_a_flush_of(frames: usize) -> [usize; 2] {
+pub(super) fn allocated_after_a_flush_of(frames: usize) -> [usize; 2] {
     let segments = frames.div_ceil(2);
     [segments * 1024, (segments + 1) * 1024]
 }
@@ -1575,7 +1580,7 @@ fn allocated_after_a_flush_of(frames: usize) -> [usize; 2] {
 /// [`EIGHT_SEGMENTS`] until `sf_append_deadline_millis` had passed, with the
 /// connection up. What the segments of the queue take then is one of
 /// `allocated`.
-fn assert_timed_out_waiting_for_room(err: &crate::Error, allocated: &[usize]) {
+pub(super) fn assert_timed_out_waiting_for_room(err: &crate::Error, allocated: &[usize]) {
     assert_eq!(err.code(), ErrorCode::SocketError, "{}", err.msg());
     let texts: Vec<String> = allocated
         .iter()
@@ -1616,7 +1621,7 @@ fn wait_for_frames_sent(
 /// Waits until the server has taken `frames` frames, while another thread
 /// holds the sender: a flush that waits for room, a `wait` or a
 /// `close_drain`, each of which drives a sender in manual progress mode.
-fn wait_for_frames_taken(server: &QwpWsModelServer, frames: usize) {
+pub(super) fn wait_for_frames_taken(server: &QwpWsModelServer, frames: usize) {
     let deadline = Instant::now() + WAIT;
     while server.frames_taken() < frames {
         assert!(
@@ -1828,7 +1833,7 @@ fn sender_with_a_dictionary_of(port: u16, progress: Progress, symbols: usize) ->
 
 /// The error of a flush in frames that stopped part way because the
 /// dictionary of its sender was full with `symbols` symbols.
-fn stopped_by_a_full_dictionary(symbols: usize) -> String {
+pub(super) fn stopped_by_a_full_dictionary(symbols: usize) -> String {
     format!(
         "Could not flush buffer: the flush stopped part way: QWP/WS connection-scoped symbol \
          dictionary reached its {symbols}-entry cap; retire this connection and continue on a \
@@ -1851,14 +1856,14 @@ fn assert_stopped_by_a_full_dictionary(sender: &Sender, err: &crate::Error, symb
 
 /// How many symbols the connection of a sender holds when it comes to
 /// `frame`, which must bring at least one more.
-fn symbols_held_before(frame: &[u8]) -> usize {
+pub(super) fn symbols_held_before(frame: &[u8]) -> usize {
     let (held, brought) = symbols_brought_by(frame);
     assert!(!brought.is_empty());
     held as usize
 }
 
 /// Waits until the server has seen the end of every connection.
-fn wait_for_no_connection(server: &QwpWsModelServer) {
+pub(super) fn wait_for_no_connection(server: &QwpWsModelServer) {
     let deadline = Instant::now() + WAIT;
     while server.open_connections() > 0 {
         assert!(Instant::now() < deadline, "a connection stayed open");

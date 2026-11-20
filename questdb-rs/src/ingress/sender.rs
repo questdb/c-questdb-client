@@ -83,7 +83,7 @@ pub(crate) use qwp_ws_orphan::has_any_sfa_file;
 pub(crate) use qwp_ws_orphan::is_candidate_orphan;
 
 #[cfg(feature = "_sender-qwp-ws")]
-mod qwp_ws_publisher;
+pub(crate) mod qwp_ws_publisher;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_queue;

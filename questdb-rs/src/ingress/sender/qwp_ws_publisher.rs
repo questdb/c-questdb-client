@@ -31,6 +31,33 @@ use crate::ingress::buffer::{
     SymbolGlobalDictMark,
 };
 
+/// What a flush encodes its frames with: the encoder of a sender, or the one
+/// that the row and column flushes of a pooled sender share. Either takes
+/// the symbols of a frame that was not published out of its dictionary
+/// again.
+pub(crate) trait QwpWsFlushEncoder {
+    /// Encodes `buffer` as one frame, refuses it when it is larger than
+    /// `max_buf_size`, and hands it to `publish`.
+    fn encode_and_publish(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        max_buf_size: usize,
+        publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
+    ) -> crate::Result<u64>;
+
+    /// Encodes one frame of a plan, refuses it when it is larger than
+    /// `frame_cap`, and hands it to `publish`. The frames of a flush come in
+    /// the order of the plan.
+    fn encode_and_publish_frame(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        blocks: &[QwpWsFrameBlock],
+        defer_commit: bool,
+        frame_cap: usize,
+        publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
+    ) -> crate::Result<u64>;
+}
+
 pub(crate) struct QwpWsReplayEncoder {
     payload: Vec<u8>,
     scratch: QwpWsEncodeScratch,
@@ -240,7 +267,9 @@ impl QwpWsReplayEncoder {
         self.encode_and_persist(buffer, max_buf_size)?;
         Ok(&self.payload)
     }
+}
 
+impl QwpWsFlushEncoder for QwpWsReplayEncoder {
     /// Encodes `buffer`, write-aheads its new symbols, then hands the payload to
     /// `publish`. **If `publish` fails, the connection dict and side-file are
     /// rolled back** so the aborted frame's symbol ids are freed and reused by the
@@ -254,7 +283,7 @@ impl QwpWsReplayEncoder {
     /// `delta_start` would outrun the mirror and the torn-dict guard would mark
     /// the whole slot terminal, losing all queued data. Mirrors the column
     /// backend's `SfaColumnBackend::publish_chunk_sfa`.
-    pub(crate) fn encode_and_publish(
+    fn encode_and_publish(
         &mut self,
         buffer: &QwpWsColumnarBuffer,
         max_buf_size: usize,
@@ -282,7 +311,7 @@ impl QwpWsReplayEncoder {
     ///
     /// Only for a sender in delta mode without a side-file, whose frames
     /// start their dictionary section at the connection dictionary's size.
-    pub(crate) fn encode_and_publish_frame(
+    fn encode_and_publish_frame(
         &mut self,
         buffer: &QwpWsColumnarBuffer,
         blocks: &[QwpWsFrameBlock],

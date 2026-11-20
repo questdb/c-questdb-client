@@ -66,7 +66,9 @@ use super::qwp_ws_orphan::{
     scan_orphan_slots,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
-use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
+use super::qwp_ws_publisher::{
+    QwpWsFlushEncoder, QwpWsReplayEncoder, qwp_ws_encoded_message_size_error,
+};
 use super::qwp_ws_queue::{OutboundFrame, SentFrame};
 use super::qwp_ws_sfa_queue::{
     SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError, segment_payload_capacity,
@@ -4354,7 +4356,30 @@ pub(crate) fn flush_qwp_ws(
     )
 }
 
-/// Publishes a buffer through `publisher`, in either progress mode.
+/// [`flush_qwp_ws`] for a sender of a pool, which has no encoder of its own:
+/// its row and column flushes share `encoder`. See [`flush_qwp_ws_through`].
+pub(crate) fn flush_qwp_ws_pooled(
+    state: &mut SyncQwpWsHandlerState,
+    encoder: &mut impl QwpWsFlushEncoder,
+    buffer: &QwpWsColumnarBuffer,
+    frame_cap: usize,
+    max_buf_size: usize,
+    server_frame_limit_known: bool,
+) -> Result<Option<u64>, QwpWsFlushError> {
+    let split_target = (state.sfa_split_deferral_enabled && server_frame_limit_known)
+        .then_some(state.sfa_frame_split_target);
+    flush_qwp_ws_through(
+        encoder,
+        &mut state.runner,
+        buffer,
+        frame_cap,
+        max_buf_size,
+        split_target,
+    )
+}
+
+/// Publishes a buffer through `publisher`: for a sender in either progress
+/// mode, and for a sender of a pool.
 ///
 /// A buffer goes out as one frame, which is refused when it is larger than
 /// `frame_cap`. When the queue is in memory and the server has told its
@@ -4372,7 +4397,7 @@ pub(crate) fn flush_qwp_ws(
 /// with such a row is sent when it fits one frame, and is refused with an
 /// error that names the row when it does not.
 fn flush_qwp_ws_through(
-    encoder: &mut QwpWsReplayEncoder,
+    encoder: &mut impl QwpWsFlushEncoder,
     publisher: &mut impl QwpWsFlushPublisher,
     buffer: &QwpWsColumnarBuffer,
     frame_cap: usize,
@@ -4653,7 +4678,7 @@ where
 }
 
 fn publish_qwp_ws_buffer(
-    encoder: &mut QwpWsReplayEncoder,
+    encoder: &mut impl QwpWsFlushEncoder,
     buffer: &QwpWsColumnarBuffer,
     max_buf_size: usize,
     publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
@@ -4675,7 +4700,7 @@ fn publish_qwp_ws_buffer(
 /// and the sender stays usable. When a later one cannot, the sender takes no
 /// more publications: see [`SyncQwpWsRunner::abort_flush`].
 fn publish_qwp_ws_frames(
-    encoder: &mut QwpWsReplayEncoder,
+    encoder: &mut impl QwpWsFlushEncoder,
     publisher: &mut impl QwpWsFlushPublisher,
     buffer: &QwpWsColumnarBuffer,
     plan: &QwpWsFramePlan,
