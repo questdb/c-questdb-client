@@ -723,8 +723,11 @@ fn serve_connection(
                 if close_after_frames == Some(frames) {
                     let mut close = CLOSE_CODE.to_be_bytes().to_vec();
                     close.extend_from_slice(b"the server model closes every connection");
-                    let _answers = shared.answers.lock().unwrap();
-                    let _ = write_server_frame(&mut stream, WS_OPCODE_CLOSE, &close, false);
+                    {
+                        let _answers = shared.answers.lock().unwrap();
+                        let _ = write_server_frame(&mut stream, WS_OPCODE_CLOSE, &close, false);
+                    }
+                    read_until_the_client_is_gone(&mut stream, shared);
                     break;
                 }
                 match answer {
@@ -742,6 +745,25 @@ fn serve_connection(
         };
         if answered.is_err() {
             // The client went away before it read the answer.
+            break;
+        }
+    }
+}
+
+/// Ends the server's side of a connection after its close frame, and reads
+/// what the client still sends, taking none of it, until the client has
+/// closed its end.
+///
+/// A client in the middle of a flush goes on sending frames. A socket that
+/// is closed with bytes it has not read is reset, and on Windows and macOS a
+/// reset takes with it what the client has not read yet, the close frame
+/// among it: the client then sees a connection that dropped, which is not a
+/// close by the server.
+fn read_until_the_client_is_gone(stream: &mut TcpStream, shared: &ServerShared) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let mut unread = [0u8; 64 * 1024];
+    while wait_for_a_frame(stream, shared) {
+        if !matches!(std::io::Read::read(stream, &mut unread), Ok(read) if read > 0) {
             break;
         }
     }
