@@ -160,10 +160,13 @@ does not come, the flush fails and nothing of it was sent.
   One flush with more rows of one table than that is committed in parts:
   2,500,000 rows are three transactions, with every row stored once. If such
   a flush fails after a part was committed, that part stays, and sending the
-  buffer again stores it twice. With rows of several tables in the flush, a
-  reconnect during it can do the same. Keep the rows of a table in one flush
-  below the limit, raise the limit on the server, or use `DEDUP`. The client
-  does not check the limit.
+  buffer again stores it twice. A reconnect during such a flush stores
+  nothing twice when the flush has rows of one table only: the server
+  confirms what it committed, and the sender sends the rest. With rows of
+  several tables the server confirms nothing before the end, the sender
+  sends the whole flush again, and the part that was committed is stored
+  twice. Keep the rows of a table in one flush below the limit, raise the
+  limit on the server, or use `DEDUP`. The client does not check the limit.
 - **Rows without a timestamp.** The server gives the rows added with
   `at_now()` the time at which it takes their frame, so the rows of a flush in
   several frames carry one timestamp per frame.
