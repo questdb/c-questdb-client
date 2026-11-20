@@ -28,7 +28,7 @@
 //!
 //! The rows and the checks of the tables are those of `qwp_ws_defer_probe`,
 //! which writes such frames to a raw WebSocket. Here the sender cuts the
-//! buffer and sends the frames. There are four tests:
+//! buffer and sends the frames. There are five tests:
 //!
 //! - a flush of one table without symbols into a table that the flush
 //!   creates, so the time until the server confirms includes the time it
@@ -43,12 +43,17 @@
 //! - a flush with symbols that fails part way, after a small flush of the
 //!   same sender: the server commits the small flush and no row of the
 //!   failed one, and the same buffer through a new sender is one
-//!   transaction.
+//!   transaction;
+//! - a flush of a sender in manual progress mode, which sends nothing until
+//!   the caller drives the connection, and then two flushes of such a
+//!   sender through a queue that takes one of them at a time: the second
+//!   `flush` drives the connection itself until the server has confirmed
+//!   the first.
 //!
 //! Each test also prints how long a flush took; the first two, how much
 //! memory the process held; the second one, how many frames its flushes
 //! took. For these numbers run one test at a time, from a release build.
-//! This runs all four; the whole name of a test runs that one:
+//! This runs all five; the whole name of a test runs that one:
 //!
 //! `QDB_QWP_WS_LARGE_FLUSH_PROBE=1 QDB_QWP_WS_PORT=9000 cargo test --release --manifest-path questdb-rs/Cargo.toml --lib qwp_ws_real_server_large_flush -- --ignored --nocapture`
 //!
@@ -692,6 +697,208 @@ fn qwp_ws_real_server_large_flush_that_fails_part_way_commits_none_of_its_rows()
         "the same buffer through a new sender: {frames_again} frames; flush returned after \
          {:?}, and the server had confirmed the rows {:?} after the call began",
         again.flush_took, again.confirmed_after
+    );
+    Ok(())
+}
+
+/// Flushes far larger than a frame through senders in manual progress mode,
+/// where nobody sends frames or reads the server's answers unless the
+/// caller drives the connection.
+///
+/// The first sender has the queue of its defaults. Its flush only queues
+/// the frames, and none goes out. `wait` drives the connection, and the
+/// server commits the flush as one transaction, which creates the table.
+///
+/// The second sender has a queue that takes one such flush at a time, and
+/// flushes twice with nothing in between. The second `flush` finds the
+/// queue full of the frames of the first, which nobody has sent. It drives
+/// the connection itself until the server has confirmed the first flush,
+/// queues its own frames in the room that this gives, and sends none of
+/// them: they go out with the `wait` that follows.
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_LARGE_FLUSH_PROBE=1"]
+fn qwp_ws_real_server_large_flush_in_manual_progress_mode_is_one_transaction() -> TestResult {
+    let Some((config, mib)) = probe_settings()? else {
+        return Ok(());
+    };
+    let server = Server::Live(&config);
+    let (table, _cleanup) = server.new_table("qwp_large_flush_manual");
+    let addr = format!(
+        "ws::addr={}:{};qwp_ws_progress=manual;",
+        config.host, config.qwp_ws_port
+    );
+
+    // Three flushes, each with rows of its own.
+    let bytes = (mib * 1024 * 1024).saturating_sub(ROW_ROOM);
+    let mut alone = Group::of_bytes(&table, 0, bytes)?.buffer;
+    let (alone_rows, alone_len) = (alone.row_count(), alone.len());
+    let mut first = Group::of_bytes(&table, alone_rows as i64, bytes)?.buffer;
+    let (first_rows, first_len) = (first.row_count(), first.len());
+    let second_from = (alone_rows + first_rows) as i64;
+    let mut second = Group::of_bytes(&table, second_from, bytes)?.buffer;
+    let (second_rows, second_len) = (second.row_count(), second.len());
+
+    // A sender as its defaults make it, but for the progress mode.
+    let mut sender = SenderBuilder::from_conf(&addr)?.build()?;
+    let (frame_cap, told_by_server) = sender.effective_frame_cap()?;
+    assert!(told_by_server, "the server told no frame limit");
+    assert!(
+        alone_len > frame_cap,
+        "a buffer of {alone_len} bytes fits one frame of {frame_cap}"
+    );
+    let started = Instant::now();
+    let alone_fsn = sender.flush_and_get_fsn(&mut alone)?;
+    let alone_took = started.elapsed();
+    // The frames of the flush are the first of this sender.
+    let alone_fsn = alone_fsn.expect("a flush of rows publishes frames");
+    let alone_frames = alone_fsn + 1;
+    assert!(alone.is_empty());
+    assert!(
+        alone_frames >= alone_len.div_ceil(frame_cap) as u64,
+        "{alone_frames} frames for {alone_len} bytes"
+    );
+    // The flush had room, so it drove nothing: every frame is queued, and
+    // none went out.
+    assert_eq!(sender.published_fsn()?, Some(alone_fsn));
+    assert_eq!(
+        sender.qwp_ws_totals()?.frames_sent,
+        0,
+        "a flush that had room sent frames"
+    );
+    assert_eq!(sender.completed_fsn(AckLevel::Ok)?, None);
+    // `wait` drives: it sends the frames and reads the server's answer.
+    sender.wait(AckLevel::Ok, WAIT)?;
+    let alone_confirmed_after = started.elapsed();
+    assert_eq!(sender.completed_fsn(AckLevel::Ok)?, Some(alone_fsn));
+    // Every frame went out once, on the first connection, and the server
+    // refused none.
+    let totals = sender.qwp_ws_totals()?;
+    assert_eq!(
+        (
+            totals.frames_sent,
+            totals.frames_replayed,
+            totals.reconnect_attempts,
+            totals.server_errors
+        ),
+        (alone_frames, 0, 0, 0),
+        "{totals:?}"
+    );
+    assert!(!sender.must_close());
+    drop(sender);
+    server.wait_for_rows(&table, alone_rows)?;
+    assert_eq!(
+        server.digest(&table)?,
+        Some(Digest::of(&rows_from(0, alone_rows)))
+    );
+    assert_eq!(server.transactions(&table)?, Some(1));
+
+    // A queue that is too small for such a buffer: the sender refuses the
+    // buffer at once and names the queue that it needs.
+    let conf = format!("{addr}sf_max_total_bytes={QUEUE_TOO_SMALL};");
+    let mut small = SenderBuilder::from_conf(conf)?.build()?;
+    let refusal = match small.flush(&mut first) {
+        Err(refusal) => refusal,
+        Ok(()) => panic!("a queue of {QUEUE_TOO_SMALL} bytes took a buffer of {first_len} bytes"),
+    };
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::BatchTooLarge,
+        "{}",
+        refusal.msg()
+    );
+    assert_eq!(small.published_fsn()?, None, "nothing is queued");
+    drop(small);
+    let queue_bytes = queue_bytes_named_by(&refusal)?;
+    // That queue is too small for the two flushes together.
+    assert!(
+        queue_bytes < (first_len + second_len) as u64,
+        "a queue of {queue_bytes} bytes may take buffers of {first_len} and {second_len} bytes \
+         together, and then the second flush has nothing to wait for: use larger buffers"
+    );
+
+    // A sender with the queue that the error names, and the two flushes with
+    // nothing between them that drives the connection.
+    let conf = format!("{addr}sf_max_total_bytes={queue_bytes};");
+    let mut sender = SenderBuilder::from_conf(conf)?.build()?;
+    assert_eq!(sender.effective_frame_cap()?, (frame_cap, true));
+    let started = Instant::now();
+    let first_fsn = sender.flush_and_get_fsn(&mut first)?;
+    let first_took = started.elapsed();
+    let first_fsn = first_fsn.expect("a flush of rows publishes frames");
+    assert_eq!(
+        sender.qwp_ws_totals()?.frames_sent,
+        0,
+        "a flush that had room sent frames"
+    );
+    let second_started = Instant::now();
+    let second_fsn = sender.flush_and_get_fsn(&mut second)?;
+    let second_took = second_started.elapsed();
+    let second_fsn = second_fsn.expect("a flush of rows publishes frames");
+    assert!(first.is_empty() && second.is_empty());
+    let (first_frames, second_frames) = (first_fsn + 1, second_fsn - first_fsn);
+    for (frames, len) in [(first_frames, first_len), (second_frames, second_len)] {
+        assert!(
+            frames >= len.div_ceil(frame_cap) as u64,
+            "{frames} frames for {len} bytes"
+        );
+    }
+    // The second flush was called while the queue held the frames of the
+    // first, and the queue is too small for both. Nobody else drives this
+    // sender, so the flush itself sent the frames of the first and read
+    // the server's answer to them. Then it had room: its own frames are
+    // queued, and none of them went out.
+    assert_eq!(sender.published_fsn()?, Some(second_fsn));
+    assert_eq!(
+        sender.completed_fsn(AckLevel::Ok)?,
+        Some(first_fsn),
+        "the second flush returned, and the server has not confirmed exactly the first: a \
+         queue of {queue_bytes} bytes held both, or frames of the second went out"
+    );
+    assert_eq!(
+        sender.qwp_ws_totals()?.frames_sent,
+        first_frames,
+        "the second flush sent other frames than those of the first"
+    );
+    assert_eq!(server.transactions(&table)?, Some(2));
+    sender.wait(AckLevel::Ok, WAIT)?;
+    let confirmed_after = started.elapsed();
+    assert_eq!(sender.completed_fsn(AckLevel::Ok)?, Some(second_fsn));
+    let totals = sender.qwp_ws_totals()?;
+    assert_eq!(
+        (
+            totals.frames_sent,
+            totals.frames_replayed,
+            totals.reconnect_attempts,
+            totals.server_errors
+        ),
+        (first_frames + second_frames, 0, 0, 0),
+        "{totals:?}"
+    );
+    assert!(!sender.must_close());
+
+    // A transaction for each flush, and the table holds the rows of all
+    // three, each row once.
+    let rows = alone_rows + first_rows + second_rows;
+    server.wait_for_rows(&table, rows)?;
+    assert_eq!(
+        server.digest(&table)?,
+        Some(Digest::of(&rows_from(0, rows)))
+    );
+    assert_eq!(server.transactions(&table)?, Some(3));
+
+    eprintln!(
+        "large flush in manual progress mode: {alone_rows} rows, {alone_len} bytes in the \
+         buffer, {alone_frames} frames of at most {frame_cap} bytes; flush queued them in \
+         {alone_took:?} and sent none; with wait driving, the server had confirmed the rows \
+         {alone_confirmed_after:?} after the call began"
+    );
+    eprintln!(
+        "manual flush that waits: two flushes of {first_rows} and {second_rows} rows, \
+         {first_len} and {second_len} bytes in the buffer, {first_frames} and {second_frames} \
+         frames, through a queue of {queue_bytes} bytes; the first flush queued its frames in \
+         {first_took:?}; the second, called while the queue held the first, drove the \
+         connection and returned after {second_took:?}; the server had confirmed both \
+         {confirmed_after:?} after the first call began"
     );
     Ok(())
 }
