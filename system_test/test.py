@@ -1646,8 +1646,10 @@ class QwpWsTestSupport:
             for endpoint_host, endpoint_port in endpoints)
         conf = [
             f'{scheme}::addr={addr};',
-            f'sender_id={sender_id};',
-            f'sf_dir={sf_dir};']
+            f'sender_id={sender_id};']
+        # Without `sf_dir` the sender keeps its queue in memory.
+        if sf_dir is not None:
+            conf.append(f'sf_dir={sf_dir};')
         for key, value in settings.items():
             conf.append(f'{key}={value};')
         return ''.join(conf)
@@ -1876,6 +1878,56 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             expected_distinct_id=self.ROWS,
             expected_min_id=0,
             expected_max_id=self.ROWS - 1)
+
+    def test_flush_above_frame_cap_is_one_transaction(self):
+        # One flush of a row buffer of about four times the server's frame
+        # limit (2 MiB by default), through a sender that keeps its queue in
+        # memory: it goes out in several frames, and the server commits them
+        # together.
+        table_name = 'qwp_ws_large_flush_' + uuid.uuid4().hex[:8]
+        sender_id = 'large-' + self._variant_name() + '-' + uuid.uuid4().hex[:8]
+        rows = 8 * 1024
+        pad = 'x' * 1024
+
+        sender = self._connect_sender(self._sender_conf_for_variant(
+            sender_id,
+            None))
+        try:
+            for row_id in range(rows):
+                (sender
+                 .table(table_name)
+                 .column('id', row_id)
+                 .column('pad', pad)
+                 .at_micros(self.BASE_TS_US + row_id * self.TS_STEP_US))
+            self.assertGreater(len(sender._buffer), rows * len(pad))
+            fsn = sender.flush_and_get_fsn()
+            # The frames of the flush are the first of this sender, and it
+            # returns the number of its last frame.
+            self.assertGreaterEqual(
+                fsn, 3, 'the flush did not go out in several frames')
+            sender.wait(timeout_millis=30000)
+            self.assertEqual(sender.acked_fsn(), fsn)
+            sender.close_drain()
+        finally:
+            sender.close(False)
+
+        self._retry_assert_aggregates(
+            table_name,
+            expected_count=rows,
+            expected_distinct_id=rows,
+            expected_min_id=0,
+            expected_max_id=rows - 1)
+        resp = sql_query(
+            f"select sum(length(pad)) from '{table_name}'")
+        self.assertEqual(int(resp['dataset'][0][0]), rows * len(pad))
+        # The server answers the frame that commits after the commit, so the
+        # count is exact by now.
+        resp = sql_query(
+            f"select count() from wal_transactions('{table_name}')")
+        self.assertEqual(
+            int(resp['dataset'][0][0]),
+            1,
+            'the flush is one transaction of the table')
 
     def test_native_shared_pool_examples(self):
         if QWP_WS_SMOKE_TLS or getattr(QDB_FIXTURE, 'http_auth', False):
