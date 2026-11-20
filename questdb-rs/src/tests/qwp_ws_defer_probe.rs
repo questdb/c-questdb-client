@@ -110,6 +110,125 @@ fn qwp_ws_server_model_follows_the_defer_rules_of_a_real_server() -> TestResult 
     Ok(())
 }
 
+/// What a server does with a group above its row limit when the connection
+/// goes away before the last frame, and the frames come again as a sender
+/// sends them after a reconnect: from the first frame that the server has
+/// not confirmed.
+///
+/// One table: the server commits the table by itself at the frame that
+/// brings its uncommitted rows to the limit, **and confirms the frames up
+/// to that one**. A sender sends the rest again, and the table holds every
+/// row once.
+///
+/// Two tables: the server commits the large table by itself in the same
+/// way, but **confirms nothing** while the other table holds rows that are
+/// not committed. A sender sends every frame again, and the rows that the
+/// server had committed by itself are in the table twice.
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_DEFER_PROBE=1"]
+fn qwp_ws_real_server_dropped_group_above_the_row_limit_probe() -> TestResult {
+    if std::env::var("QDB_QWP_WS_DEFER_PROBE").as_deref() != Ok("1") {
+        eprintln!("set QDB_QWP_WS_DEFER_PROBE=1 to run the real-server row limit probe");
+        return Ok(());
+    }
+    let config = ProbeConfig::from_env()?;
+    let server = Server::Live(&config);
+    let settle = Duration::from_secs(1);
+    // The rows of a table, and how many ids they have.
+    let rows_and_ids = |table: &str| -> ProbeResult<(i64, i64)> {
+        let sql = format!("select count(), count_distinct(id) from \"{table}\"");
+        let row = first_row(&config, &sql)?.ok_or_else(|| invalid(format!("no table {table}")))?;
+        Ok((row[0], row[1]))
+    };
+    // Rows without a text, so that a frame holds tens of thousands of them:
+    // a fifth more than the server holds without a commit.
+    let limit_rows = SERVER_MAX_UNCOMMITTED_ROWS as i64;
+    let of_large: Vec<(i64, usize)> = (0..limit_rows * 6 / 5).map(|id| (id, 0)).collect();
+    let total = of_large.len() as i64;
+
+    // One table. The server confirms what it committed by itself.
+    let (alone, _cleanup_alone) = server.new_table("qwp_defer_limit_alone");
+    let mut connection = server.connect()?;
+    let frames = frames_over_tables(&[(&alone, &of_large)], connection.frame_limit, None)?;
+    let last = frames.len() - 1;
+    for frame in &frames[..last] {
+        connection.send(frame)?;
+    }
+    let answers = connection.answers_so_far()?;
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    let confirmed = answers[0].sequence as usize;
+    assert_eq!(answers[0], OkAnswer::of(confirmed, &alone, 1));
+    assert!(confirmed < last - 1, "frame {confirmed} of {last}");
+    connection.drop_without_close();
+    server.wait_for_the_drop(settle);
+    server.wait_for_rows(&alone, SERVER_MAX_UNCOMMITTED_ROWS)?;
+    let (by_itself, _ids) = rows_and_ids(&alone)?;
+    assert!((limit_rows..total).contains(&by_itself), "{by_itself} rows");
+    // The frames that were not confirmed, again.
+    let mut connection = server.connect()?;
+    for frame in &frames[confirmed + 1..] {
+        connection.send(frame)?;
+    }
+    assert_eq!(
+        connection.expect_ok()?,
+        OkAnswer::of(last - confirmed - 1, &alone, 2)
+    );
+    server.wait_for_rows(&alone, of_large.len())?;
+    std::thread::sleep(settle);
+    assert_eq!(rows_and_ids(&alone)?, (total, total));
+    assert_eq!(server.transactions(&alone)?, Some(2));
+
+    // Two tables. A few rows of the small one come first and stay
+    // uncommitted while the large one passes the limit.
+    let (small, _cleanup_small) = server.new_table("qwp_defer_limit_small");
+    let (large, _cleanup_large) = server.new_table("qwp_defer_limit_large");
+    let of_small: Vec<(i64, usize)> = (0..10).map(|id| (5_000_000 + id, 0)).collect();
+    let mut connection = server.connect()?;
+    let frames = frames_over_tables(
+        &[(&small, &of_small), (&large, &of_large)],
+        connection.frame_limit,
+        None,
+    )?;
+    let last = frames.len() - 1;
+    assert_eq!(block_counts(&frames)[0], 2);
+    for frame in &frames[..last] {
+        connection.send(frame)?;
+    }
+    // The server has committed the large table by itself, and confirms
+    // nothing.
+    connection.expect_no_answer(Duration::from_millis(300))?;
+    server.wait_for_rows(&large, SERVER_MAX_UNCOMMITTED_ROWS)?;
+    let (by_itself, _ids) = rows_and_ids(&large)?;
+    assert!((limit_rows..total).contains(&by_itself), "{by_itself} rows");
+    assert_eq!(server.transactions(&large)?, Some(1));
+    assert_eq!(server.row_count(&small)?, 0);
+    connection.drop_without_close();
+    server.wait_for_the_drop(settle);
+    assert_eq!(rows_and_ids(&large)?, (by_itself, by_itself));
+    assert_eq!(server.row_count(&small)?, 0);
+    // Nothing was confirmed, so every frame comes again.
+    let mut connection = server.connect()?;
+    for frame in &frames[..last] {
+        connection.send(frame)?;
+    }
+    connection.expect_no_answer(Duration::from_millis(300))?;
+    connection.send(&frames[last])?;
+    assert_eq!(
+        connection.expect_ok()?,
+        OkAnswer::of_tables(last, &[(&large, 3), (&small, 1)])
+    );
+    server.wait_for_rows(&large, (total + by_itself) as usize)?;
+    std::thread::sleep(settle);
+    // The rows that the server committed by itself are there twice.
+    assert_eq!(rows_and_ids(&large)?, (total + by_itself, total));
+    assert_eq!(rows_and_ids(&small)?, (10, 10));
+    eprintln!(
+        "one table: {total} rows once, in 2 transactions; two tables: {by_itself} of {total} \
+         rows twice, in 3 transactions"
+    );
+    Ok(())
+}
+
 struct ScriptSettings {
     /// The least size of the buffer that is sent as the large group. A
     /// group over two tables holds about as many bytes of rows.
