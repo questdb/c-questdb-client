@@ -525,6 +525,14 @@ pub(crate) struct ManualQwpWsHandlerState {
     /// Hard cap on a single queued frame's payload, as on
     /// [`SyncQwpWsHandlerState::sfa_frame_payload_cap`].
     pub(crate) sfa_frame_payload_cap: usize,
+    /// The size that the frames of a flush above the frame cap are cut for,
+    /// as [`SyncQwpWsHandlerState::sfa_frame_split_target`]. `None` with
+    /// `sf_dir`, where no flush goes out in frames: see
+    /// [`SyncQwpWsHandlerState::sfa_split_deferral_enabled`].
+    sfa_frame_split_target: Option<usize>,
+    /// The flush that left the sender closed for publications, if one did:
+    /// see [`ManualQwpWsPublisher`].
+    aborted_flush: Option<AbortedFlush>,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
@@ -553,6 +561,49 @@ struct AbortedFlush {
     published_before: Option<u64>,
     /// The error of the flush, which every later publication gets too.
     error: crate::Error,
+}
+
+impl AbortedFlush {
+    /// A flush that queued its frames from `first_fsn` on and could not
+    /// queue the rest, because of `cause`. Its error keeps what the cause
+    /// carried, and is never in doubt: nothing of the flush is committed.
+    fn new(first_fsn: u64, cause: crate::Error) -> Self {
+        let msg = format!(
+            "Could not flush buffer: the flush stopped part way: {}. Nothing of this flush is \
+             committed and the buffer still holds its rows. This sender takes no more flushes \
+             and still delivers the flushes before this one: close it once they are confirmed, \
+             create a new sender and flush the buffer again.",
+            cause.msg().trim_end_matches('.')
+        );
+        Self {
+            published_before: first_fsn.checked_sub(1),
+            error: cause
+                .reclassified(crate::ErrorCode::FlushAborted, msg)
+                .with_in_doubt(false),
+        }
+    }
+}
+
+/// What a flush publishes through: the runner of a sender in background
+/// progress mode, or the store and the connection of a sender in manual
+/// progress mode ([`ManualQwpWsPublisher`]).
+trait QwpWsFlushPublisher {
+    /// The producer of the queue, which tells what room frames need. `None`
+    /// once the sender has given it up to close its queue.
+    fn producer(&self) -> Option<&SfaProducer>;
+
+    /// Waits until the queue has room for frames with payloads of
+    /// `payload_lens` bytes, all at once, as long as a single frame waits
+    /// for the room of its own. Queues nothing.
+    fn await_room(&mut self, payload_lens: &[usize]) -> crate::Result<()>;
+
+    /// Queues one frame, and returns its number.
+    fn publish(&mut self, payload: &[u8]) -> crate::Result<u64>;
+
+    /// Leaves a flush that queued its frames from `first_fsn` on and could
+    /// not queue the rest, because of `cause`: the sender takes no more
+    /// publications. Returns the error of that flush.
+    fn abort(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error;
 }
 
 struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
@@ -880,20 +931,9 @@ where
     /// A sender that has stopped for a reason of its own goes on reporting
     /// that reason, here and at every later call.
     fn abort_flush(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error {
-        let msg = format!(
-            "Could not flush buffer: the flush stopped part way: {}. Nothing of this flush is \
-             committed and the buffer still holds its rows. This sender takes no more flushes \
-             and still delivers the flushes before this one: close it once they are confirmed, \
-             create a new sender and flush the buffer again.",
-            cause.msg().trim_end_matches('.')
-        );
-        let error = cause
-            .reclassified(crate::ErrorCode::FlushAborted, msg)
-            .with_in_doubt(false);
-        self.aborted_flush = Some(AbortedFlush {
-            published_before: first_fsn.checked_sub(1),
-            error: error.clone(),
-        });
+        let flush = AbortedFlush::new(first_fsn, cause);
+        let error = flush.error.clone();
+        self.aborted_flush = Some(flush);
         self.lifecycle.begin_close();
         self.check_publication_open().err().unwrap_or(error)
     }
@@ -4090,6 +4130,11 @@ pub(crate) fn open_manual_qwp_ws(
         request_durable_ack: *qwp_ws.request_durable_ack,
         token_provider: qwp_ws.token_provider.clone(),
         sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
+        sfa_frame_split_target: qwp_ws
+            .sf_dir
+            .is_none()
+            .then(|| two_frame_segment_payload_capacity(*qwp_ws.sf_max_segment_bytes)),
+        aborted_flush: None,
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
@@ -4289,11 +4334,33 @@ fn connect_blocking_transport_with_retry(
 
 /// Public flush entry point: publish through the replay queue and return once
 /// the buffer is locally accepted. A sender-owned runner advances WebSocket I/O.
+/// See [`flush_qwp_ws_through`].
+pub(crate) fn flush_qwp_ws(
+    state: &mut SyncQwpWsHandlerState,
+    buffer: &QwpWsColumnarBuffer,
+    frame_cap: usize,
+    max_buf_size: usize,
+    server_frame_limit_known: bool,
+) -> Result<Option<u64>, QwpWsFlushError> {
+    let split_target = (state.sfa_split_deferral_enabled && server_frame_limit_known)
+        .then_some(state.sfa_frame_split_target);
+    flush_qwp_ws_through(
+        &mut state.encoder,
+        &mut state.runner,
+        buffer,
+        frame_cap,
+        max_buf_size,
+        split_target,
+    )
+}
+
+/// Publishes a buffer through `publisher`, in either progress mode.
 ///
 /// A buffer goes out as one frame, which is refused when it is larger than
 /// `frame_cap`. When the queue is in memory and the server has told its
-/// frame limit, a buffer above `frame_cap` goes out in several frames that
-/// the server commits together instead. Such a flush waits until the queue
+/// frame limit (`split_target`, the size its frames are then cut for), a
+/// buffer above `frame_cap` goes out in several frames that the server
+/// commits together instead. Such a flush waits until the queue
 /// has room for all its frames, as a flush of one frame waits for the room
 /// of its frame, and queues nothing before. It is refused before anything of
 /// it is encoded when the buffer is above `max_buf_size`, and when the queue
@@ -4304,19 +4371,18 @@ fn connect_blocking_transport_with_retry(
 /// that fits no frame by its size bound may fit one all the same: a buffer
 /// with such a row is sent when it fits one frame, and is refused with an
 /// error that names the row when it does not.
-pub(crate) fn flush_qwp_ws(
-    state: &mut SyncQwpWsHandlerState,
+fn flush_qwp_ws_through(
+    encoder: &mut QwpWsReplayEncoder,
+    publisher: &mut impl QwpWsFlushPublisher,
     buffer: &QwpWsColumnarBuffer,
     frame_cap: usize,
     max_buf_size: usize,
-    server_frame_limit_known: bool,
+    split_target: Option<usize>,
 ) -> Result<Option<u64>, QwpWsFlushError> {
-    let encoder = &mut state.encoder;
-    let runner = &mut state.runner;
     // The row that keeps the buffer from being cut into frames, when one
     // does: its table and the size of its frame.
     let mut row_above_cap = None;
-    if state.sfa_split_deferral_enabled && server_frame_limit_known {
+    if let Some(split_target) = split_target {
         let len = buffer.len();
         if len > frame_cap {
             if len > max_buf_size {
@@ -4325,10 +4391,10 @@ pub(crate) fn flush_qwp_ws(
                     max_buf_size,
                 )));
             }
-            let target = frame_cap.min(state.sfa_frame_split_target);
+            let target = frame_cap.min(split_target);
             match buffer.plan_frames(target, frame_cap) {
                 Ok(plan) => {
-                    if let Some(producer) = runner.producer.as_ref()
+                    if let Some(producer) = publisher.producer()
                         && let Some(min_total_bytes) =
                             producer.min_total_bytes_for(plan.frame_sizes())
                     {
@@ -4344,10 +4410,10 @@ pub(crate) fn flush_qwp_ws(
                         // The queue can hold the frames together, so the room
                         // comes once the server has confirmed what the queue
                         // holds now.
-                        return runner
-                            .wait_for_room(producer, frame_sizes)
+                        return publisher
+                            .await_room(frame_sizes)
                             .and_then(|()| {
-                                publish_qwp_ws_frames(encoder, runner, buffer, &plan, frame_cap)
+                                publish_qwp_ws_frames(encoder, publisher, buffer, &plan, frame_cap)
                             })
                             .map_err(QwpWsFlushError::Failed);
                     }
@@ -4366,7 +4432,7 @@ pub(crate) fn flush_qwp_ws(
         }
     }
     publish_qwp_ws_buffer(encoder, buffer, frame_cap, |payload| {
-        runner.publish_replay_payload(payload)
+        publisher.publish(payload)
     })
     .map_err(|err| match row_above_cap {
         // The buffer is too large for one frame, and this row is why it was
@@ -4379,7 +4445,7 @@ pub(crate) fn flush_qwp_ws(
     .map_err(QwpWsFlushError::Failed)
 }
 
-/// Why [`flush_qwp_ws`] did not publish a buffer.
+/// Why [`flush_qwp_ws`] or [`flush_qwp_ws_manual`] did not publish a buffer.
 #[derive(Debug)]
 pub(crate) enum QwpWsFlushError {
     /// The buffer is refused before anything of it is encoded, with an error
@@ -4466,21 +4532,124 @@ pub(crate) fn sfa_has_deferred_commit_slot(state: &SyncQwpWsHandlerState) -> boo
     state.sfa_split_deferral_enabled && state.runner.has_deferred_commit_headroom().unwrap_or(false)
 }
 
+/// [`flush_qwp_ws`] for a sender in manual progress mode, where nobody sends
+/// or reads the server's answers unless the caller drives: the flush only
+/// queues its frames, and where it waits for room in the queue it drives the
+/// connection itself. See [`flush_qwp_ws_through`].
 pub(crate) fn flush_qwp_ws_manual(
     state: &mut ManualQwpWsHandlerState,
     buffer: &QwpWsColumnarBuffer,
+    frame_cap: usize,
     max_buf_size: usize,
-) -> crate::Result<Option<u64>> {
-    let encoder = &mut state.encoder;
-    let store = &mut state.store;
-    let send_core = &mut state.send_core;
-    let append_deadline = state.append_deadline;
-    publish_qwp_ws_buffer(encoder, buffer, max_buf_size, |payload| {
-        match manual_submit_with_drive_deadline(store, send_core, payload, append_deadline) {
-            Ok(fsn) => Ok(fsn),
-            Err(err) => Err(driver_error_to_error_from_store(store, err)),
+    server_frame_limit_known: bool,
+) -> Result<Option<u64>, QwpWsFlushError> {
+    let split_target = state
+        .sfa_frame_split_target
+        .filter(|_| server_frame_limit_known);
+    let mut publisher = ManualQwpWsPublisher {
+        store: &mut state.store,
+        send_core: &mut state.send_core,
+        aborted_flush: &mut state.aborted_flush,
+        append_deadline: state.append_deadline,
+    };
+    flush_qwp_ws_through(
+        &mut state.encoder,
+        &mut publisher,
+        buffer,
+        frame_cap,
+        max_buf_size,
+        split_target,
+    )
+}
+
+/// The store and the connection of a sender in manual progress mode, as what
+/// a flush publishes through.
+///
+/// After a flush that failed part way ([`QwpWsFlushPublisher::abort`]) the
+/// sender is in the state of [`SyncQwpWsRunner::abort_flush`]: the store is
+/// closed for publications, each of which gets the error of that flush;
+/// what the caller drives goes on sending the queue, the frames of that
+/// flush among them, and reading the answers; and callers are told that the
+/// sender has published what it had before that flush: see
+/// [`qwp_ws_published_fsn_manual`] and [`qwp_ws_close_drain_manual`].
+struct ManualQwpWsPublisher<'a> {
+    store: &'a mut QwpWsPublicationStore<SfaSlotQueue>,
+    send_core: &'a mut QwpWsSendCore<BlockingQwpWsTransport>,
+    aborted_flush: &'a mut Option<AbortedFlush>,
+    append_deadline: Duration,
+}
+
+impl ManualQwpWsPublisher<'_> {
+    /// The error of a publication that the store did not take.
+    fn error_of(&self, err: DriverError) -> crate::Error {
+        match (err, &*self.aborted_flush) {
+            (DriverError::Closing, Some(flush)) => flush.error.clone(),
+            (err, _) => driver_error_to_error_from_store(self.store, err),
         }
-    })
+    }
+}
+
+impl QwpWsFlushPublisher for ManualQwpWsPublisher<'_> {
+    fn producer(&self) -> Option<&SfaProducer> {
+        self.store.producer()
+    }
+
+    fn await_room(&mut self, payload_lens: &[usize]) -> crate::Result<()> {
+        let has_room = |store: &mut QwpWsPublicationStore<SfaSlotQueue>| match store.producer() {
+            Some(producer) if !producer.has_room_for(payload_lens) => {
+                Err(match store.lifecycle().load() {
+                    PublicationState::Open => DriverError::Queue(producer.no_room_error()),
+                    _ => DriverError::Closing,
+                })
+            }
+            _ => Ok(()),
+        };
+        manual_drive_until_taken(self.store, self.send_core, self.append_deadline, has_room)
+            .map_err(|err| self.error_of(err))
+    }
+
+    fn publish(&mut self, payload: &[u8]) -> crate::Result<u64> {
+        let submit = |store: &mut QwpWsPublicationStore<SfaSlotQueue>| {
+            store.try_submit(payload).map(|receipt| receipt.fsn)
+        };
+        manual_drive_until_taken(self.store, self.send_core, self.append_deadline, submit)
+            .map_err(|err| self.error_of(err))
+    }
+
+    fn abort(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error {
+        let flush = AbortedFlush::new(first_fsn, cause);
+        let error = flush.error.clone();
+        *self.aborted_flush = Some(flush);
+        self.store.set_closing();
+        // Nothing drives the connection between two frames of a flush that
+        // had its room, so the sender has not stopped for a reason of its
+        // own in between, as one in background progress mode can have.
+        error
+    }
+}
+
+impl<Q> QwpWsFlushPublisher for SyncQwpWsRunner<Q>
+where
+    Q: PublicationLog + Send + 'static,
+{
+    fn producer(&self) -> Option<&SfaProducer> {
+        self.producer.as_ref()
+    }
+
+    fn await_room(&mut self, payload_lens: &[usize]) -> crate::Result<()> {
+        match self.producer.as_ref() {
+            Some(producer) => self.wait_for_room(producer, payload_lens),
+            None => Ok(()),
+        }
+    }
+
+    fn publish(&mut self, payload: &[u8]) -> crate::Result<u64> {
+        self.publish_replay_payload(payload)
+    }
+
+    fn abort(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error {
+        self.abort_flush(first_fsn, cause)
+    }
 }
 
 fn publish_qwp_ws_buffer(
@@ -4505,16 +4674,13 @@ fn publish_qwp_ws_buffer(
 /// When the first frame cannot be published, nothing of the flush is queued
 /// and the sender stays usable. When a later one cannot, the sender takes no
 /// more publications: see [`SyncQwpWsRunner::abort_flush`].
-fn publish_qwp_ws_frames<Q>(
+fn publish_qwp_ws_frames(
     encoder: &mut QwpWsReplayEncoder,
-    runner: &mut SyncQwpWsRunner<Q>,
+    publisher: &mut impl QwpWsFlushPublisher,
     buffer: &QwpWsColumnarBuffer,
     plan: &QwpWsFramePlan,
     frame_cap: usize,
-) -> crate::Result<Option<u64>>
-where
-    Q: PublicationLog + Send + 'static,
-{
+) -> crate::Result<Option<u64>> {
     let mut frames = plan.frames().peekable();
     let mut first_fsn = None;
     let mut last_fsn = None;
@@ -4522,7 +4688,7 @@ where
         let defer_commit = frames.peek().is_some();
         let published =
             encoder.encode_and_publish_frame(buffer, blocks, defer_commit, frame_cap, |payload| {
-                runner.publish_replay_payload(payload)
+                publisher.publish(payload)
             });
         match (published, first_fsn) {
             (Ok(fsn), _) => {
@@ -4530,7 +4696,7 @@ where
                 last_fsn = Some(fsn);
             }
             (Err(err), None) => return Err(err),
-            (Err(err), Some(first_fsn)) => return Err(runner.abort_flush(first_fsn, err)),
+            (Err(err), Some(first_fsn)) => return Err(publisher.abort(first_fsn, err)),
         }
     }
     Ok(last_fsn)
@@ -4621,7 +4787,10 @@ pub(crate) fn qwp_ws_published_fsn_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
     check_manual_driver_error(state)?;
-    Ok(state.store.published_fsn())
+    Ok(match &state.aborted_flush {
+        Some(flush) => flush.published_before,
+        None => state.store.published_fsn(),
+    })
 }
 
 pub(crate) fn qwp_ws_acked_fsn_manual(
@@ -4754,6 +4923,17 @@ pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> 
     }
     let deadline = Instant::now().checked_add(state.close_drain_timeout);
     loop {
+        // The frames of a flush that failed part way are never confirmed:
+        // the wait ends at the frame before them, and they go with the queue.
+        if let Some(flush) = &state.aborted_flush
+            && !state.store.is_terminal()
+            && state.store.completed_fsn() >= flush.published_before
+        {
+            return state
+                .send_core
+                .close_publication_queue(&mut state.store)
+                .map_err(driver_error_to_error_without_state);
+        }
         match state.send_core.close_drain_ready_once(&mut state.store) {
             Ok(CloseOutcome::Drained) => return Ok(()),
             Ok(CloseOutcome::Terminal) => return qwp_ws_manual_terminal_error(state),
@@ -4782,12 +4962,16 @@ pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> 
     }
 }
 
-fn manual_submit_with_drive_deadline<Q, T>(
+/// Asks `queue` until it takes what the caller has for it. While it answers
+/// that it has no room, drives the connection, which nobody else does in
+/// manual progress mode: the room comes when the server confirms frames that
+/// the queue holds. Gives up at the append deadline.
+fn manual_drive_until_taken<Q, T, R>(
     store: &mut QwpWsPublicationStore<Q>,
     send_core: &mut QwpWsSendCore<T>,
-    payload: &[u8],
     append_deadline: Duration,
-) -> Result<u64, DriverError>
+    queue: impl Fn(&mut QwpWsPublicationStore<Q>) -> Result<R, DriverError>,
+) -> Result<R, DriverError>
 where
     Q: PublicationLog,
     T: QwpWsCoreTransport,
@@ -4797,8 +4981,8 @@ where
         if store.is_terminal() {
             return Err(DriverError::Terminal);
         }
-        match store.try_submit(payload) {
-            Ok(receipt) => return Ok(receipt.fsn),
+        match queue(store) {
+            Ok(taken) => return Ok(taken),
             Err(err) => {
                 let Some(backpressure) = driver_error_backpressure_queue(&err) else {
                     return Err(err);

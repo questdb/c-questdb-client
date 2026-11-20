@@ -25,10 +25,13 @@
 //! `Sender::flush` of a row buffer that does not fit one frame.
 //!
 //! Such a buffer goes out in several frames that the server commits together
-//! when all of this holds: the sender makes its progress in the background
-//! and keeps its queue in memory, the server has told its frame limit, the
-//! buffer is within `max_buf_size`, each of its rows fits a frame and none of
-//! its values is one that cannot be sent.
+//! when all of this holds: the sender keeps its queue in memory, the server
+//! has told its frame limit, the buffer is within `max_buf_size`, each of its
+//! rows fits a frame and none of its values is one that cannot be sent.
+//! The sender may make its progress in the background or be driven by its
+//! caller (`qwp_ws_progress=manual`): every test of a sender runs with both.
+//! A sender that is driven by its caller only queues the frames, and drives
+//! itself where a flush has to wait for room in the queue.
 //! The buffer may hold rows of several tables: the server commits each of
 //! them once. Each frame brings the symbols that its rows are the first to
 //! use on the connection. The flush waits until the queue has room for all
@@ -82,11 +85,36 @@ const SET_BY_SERVER: &str = "the server's advertised X-QWP-Max-Batch-Size";
 /// The same for a cap that is what a segment of the queue holds.
 const SET_BY_SEGMENT: &str = "the sf_max_segment_bytes segment payload capacity";
 
-fn sender_with(port: u16, settings: &str) -> Sender {
-    SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{port};{settings}"))
+/// How a sender makes its progress. Every test of a sender here runs once
+/// for each: see [`in_both_progress_modes`].
+#[derive(Clone, Copy)]
+enum Progress {
+    /// A thread of the sender sends what is queued and reads the answers.
+    Background,
+    /// Nobody does unless the test drives the sender: with `drive_once`, with
+    /// `wait` or `close_drain`, or with a `flush` that waits for room.
+    Manual,
+}
+
+fn sender_with(port: u16, progress: Progress, settings: &str) -> Sender {
+    let mode = match progress {
+        Progress::Background => "",
+        Progress::Manual => "qwp_ws_progress=manual;",
+    };
+    SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{port};{mode}{settings}"))
         .unwrap()
         .build()
         .unwrap()
+}
+
+/// Gives `sender` the time to send and to read, or makes it do so.
+fn let_it_work(sender: &mut Sender, progress: Progress) {
+    match progress {
+        Progress::Background => thread::sleep(Duration::from_millis(1)),
+        Progress::Manual => {
+            sender.drive_once().unwrap();
+        }
+    }
 }
 
 fn add_row(buffer: &mut Buffer, id: i64, txt: &str) {
@@ -486,10 +514,9 @@ fn the_frames_of_a_flush_bring_each_symbol_once_wherever_the_buffer_is_cut() {
     assert!(frame_counts.last().is_some_and(|most| *most > 20));
 }
 
-#[test]
-fn a_flush_with_symbols_above_the_frame_cap_is_one_commit() {
+fn a_flush_with_symbols_above_the_frame_cap_is_one_commit(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     let before = buffer_of_symbols(FIRST, 0..10);
     // Two tables that share symbols with each other and with the flush
     // before. The first has more symbols than one frame holds.
@@ -542,13 +569,12 @@ fn a_flush_with_symbols_above_the_frame_cap_is_one_commit() {
     server.finish();
 }
 
-#[test]
-fn a_flush_with_symbols_that_loses_its_connection_part_way_is_sent_again_whole() {
+fn a_flush_with_symbols_that_loses_its_connection_part_way_is_sent_again_whole(progress: Progress) {
     // The server takes the flush before and eleven frames of the large
     // flush, and ends the connection.
     const CUT_AFTER_FRAMES: usize = 12;
     let server = QwpWsModelServer::start_cutting_first_connection(FRAME_LIMIT, CUT_AFTER_FRAMES);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     let before = buffer_of_symbols(FIRST, 0..10);
     let large = buffer_of_symbols(FIRST, 10..1210);
     let mut sender_symbols = SymbolGlobalDict::new();
@@ -596,13 +622,14 @@ fn a_flush_with_symbols_that_loses_its_connection_part_way_is_sent_again_whole()
     server.finish();
 }
 
-#[test]
-fn a_buffer_with_a_symbol_that_a_connection_refuses_is_refused_before_its_first_frame() {
+fn a_buffer_with_a_symbol_that_a_connection_refuses_is_refused_before_its_first_frame(
+    progress: Progress,
+) {
     // A frame limit that a symbol of the longest size fits.
     const LIMIT: usize = 2 * 1024 * 1024;
     const LONGEST: usize = 1 << 20;
     let server = QwpWsModelServer::start(LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     let before = buffer_of_symbols(FIRST, 0..10);
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
     sender.wait(AckLevel::Ok, WAIT).unwrap();
@@ -660,10 +687,9 @@ fn a_buffer_with_a_symbol_that_a_connection_refuses_is_refused_before_its_first_
     server.finish();
 }
 
-#[test]
-fn a_flush_above_the_frame_cap_is_one_commit() {
+fn a_flush_above_the_frame_cap_is_one_commit(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
     let before = buffer_of(TABLE, 0..3);
     let large = buffer_of(TABLE, 3..2003);
@@ -709,13 +735,12 @@ fn a_flush_above_the_frame_cap_is_one_commit() {
     server.finish();
 }
 
-#[test]
-fn a_flush_that_loses_its_connection_part_way_is_sent_again_whole() {
+fn a_flush_that_loses_its_connection_part_way_is_sent_again_whole(progress: Progress) {
     // The server takes the flush before and five frames of the large flush,
     // and ends the connection.
     const CUT_AFTER_FRAMES: usize = 6;
     let server = QwpWsModelServer::start_cutting_first_connection(FRAME_LIMIT, CUT_AFTER_FRAMES);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     let before = buffer_of(TABLE, 0..3);
     let large = buffer_of(TABLE, 3..2003);
     let frame_count = frames_of_a_flush(&large, FRAME_LIMIT).len() as u64;
@@ -749,10 +774,9 @@ fn a_flush_that_loses_its_connection_part_way_is_sent_again_whole() {
     server.finish();
 }
 
-#[test]
-fn a_flush_of_several_tables_above_the_frame_cap_is_one_commit_of_each_table() {
+fn a_flush_of_several_tables_above_the_frame_cap_is_one_commit_of_each_table(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     // A flush of one frame that holds the first and the third table.
     let mut before = buffer_of(FIRST, 0..3);
     add_rows(&mut before, THIRD, 3..6);
@@ -817,8 +841,9 @@ fn a_flush_of_several_tables_above_the_frame_cap_is_one_commit_of_each_table() {
     server.finish();
 }
 
-#[test]
-fn a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_whole() {
+fn a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_whole(
+    progress: Progress,
+) {
     let before = buffer_of(FIRST, 0..3);
     let large = buffer_of_three_tables(10);
     let blocks = blocks_per_frame(&frames_of_a_flush(&large, FRAME_LIMIT));
@@ -830,7 +855,7 @@ fn a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_wh
     let cut_after_frames = 1 + frame_of_three_tables + 1 + 3;
     assert!((cut_after_frames as u64) < frame_count);
     let server = QwpWsModelServer::start_cutting_first_connection(FRAME_LIMIT, cut_after_frames);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
 
     // Confirmed while the first connection lives, so it is not sent again.
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
@@ -860,10 +885,9 @@ fn a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_wh
     server.finish();
 }
 
-#[test]
-fn a_flush_with_a_column_of_every_kind_above_the_frame_cap_is_one_commit() {
+fn a_flush_with_a_column_of_every_kind_above_the_frame_cap_is_one_commit(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     let row_of_every_kind = |ids: std::ops::Range<i64>| {
         let mut buffer = Buffer::new_qwp_ws();
         for id in ids {
@@ -912,11 +936,12 @@ fn a_flush_with_a_column_of_every_kind_above_the_frame_cap_is_one_commit() {
     server.finish();
 }
 
-#[test]
-fn a_buffer_with_a_decimal_that_cannot_be_written_is_refused_before_its_first_frame() {
+fn a_buffer_with_a_decimal_that_cannot_be_written_is_refused_before_its_first_frame(
+    progress: Progress,
+) {
     const TWO_DIGITS: &str = "cannot rescale decimal from scale 2 to 1 without precision loss";
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     let before = buffer_of(FIRST, 0..3);
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
     sender.wait(AckLevel::Ok, WAIT).unwrap();
@@ -956,27 +981,55 @@ fn a_buffer_with_a_decimal_that_cannot_be_written_is_refused_before_its_first_fr
     server.finish();
 }
 
+/// A sender in manual progress mode queues the frames of a flush and sends
+/// none of them. The server gets them when the caller drives the sender, a
+/// frame a call at most, and commits them when it has the last one.
 #[test]
-fn a_sender_in_manual_progress_mode_refuses_a_buffer_above_the_frame_cap() {
+fn a_flush_in_manual_progress_mode_is_sent_when_its_caller_drives() {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "qwp_ws_progress=manual;");
-    assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
-    let mut large = buffer_of(TABLE, 0..2000);
+    // Segments of 1,024 bytes, two frames each: the flush fills many.
+    let settings = "sf_max_segment_bytes=1024;sf_max_total_bytes=131072;";
+    let mut sender = sender_with(server.port, Progress::Manual, settings);
+    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
+    let large = buffer_of(TABLE, 0..2000);
+    let frame_count = frames_of_a_flush(&large, 492).len();
+    assert!(frame_count > 100, "{frame_count} frames");
+    let last_fsn = Some(frame_count as u64 - 1);
 
-    assert_refused_as_one_frame(&mut sender, &mut large, FRAME_LIMIT, SET_BY_SERVER);
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&large).unwrap(), last_fsn);
+    assert_eq!(sender.published_fsn().unwrap(), last_fsn);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.frames_taken(), 0, "the flush sends nothing");
+    assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), None);
+
+    // A call less than the flush has frames: the server lacks the last one,
+    // holds the rows of the others and has committed none.
+    for _ in 1..frame_count {
+        sender.drive_once().unwrap();
+    }
+    let sent = sender.qwp_ws_totals().unwrap().frames_sent as usize;
+    assert!((1..frame_count).contains(&sent), "{sent} frames sent");
+    wait_for_frames_taken(&server, sent);
+    assert_table_holds(&server, TABLE, 0, &[]);
+    assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), None);
+
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), last_fsn);
+    assert_eq!(server.frames_taken(), frame_count);
+    assert_table_holds(&server, TABLE, 1, &[&large]);
+    assert!(!sender.must_close());
     drop(sender);
     server.finish();
 }
 
-#[test]
-fn a_sender_with_sf_dir_refuses_a_buffer_above_the_frame_cap() {
+fn a_sender_with_sf_dir_refuses_a_buffer_above_the_frame_cap(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let sf_dir = tempfile::TempDir::new().unwrap();
     let settings = format!(
         "sf_dir={};sender_id=large;sf_max_segment_bytes=65536;",
         sf_dir.path().display()
     );
-    let mut sender = sender_with(server.port, &settings);
+    let mut sender = sender_with(server.port, progress, &settings);
     assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
     let mut large = buffer_of(TABLE, 0..2000);
 
@@ -985,12 +1038,13 @@ fn a_sender_with_sf_dir_refuses_a_buffer_above_the_frame_cap() {
     server.finish();
 }
 
-#[test]
-fn a_sender_whose_server_tells_no_frame_limit_refuses_a_buffer_above_the_frame_cap() {
+fn a_sender_whose_server_tells_no_frame_limit_refuses_a_buffer_above_the_frame_cap(
+    progress: Progress,
+) {
     let port = spawn_max_batch_size_upgrade_only_server(None);
     // The cap is then what a segment of the queue holds: its 4,096 bytes
     // less the headers of the segment and of a frame, 24 and 8 bytes.
-    let mut sender = sender_with(port, "sf_max_segment_bytes=4096;");
+    let mut sender = sender_with(port, progress, "sf_max_segment_bytes=4096;");
     assert_eq!(sender.effective_frame_cap().unwrap(), (4064, false));
     let mut large = buffer_of(TABLE, 0..2000);
 
@@ -1004,10 +1058,9 @@ const TWO_FRAME_TARGET: usize = 2028;
 /// 4,096 bytes holds: the frame cap of a sender with such segments.
 const LIMIT_ABOVE_TARGET: usize = 3000;
 
-#[test]
-fn a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two() {
+fn a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two(progress: Progress) {
     let server = QwpWsModelServer::start(LIMIT_ABOVE_TARGET);
-    let mut sender = sender_with(server.port, "sf_max_segment_bytes=4096;");
+    let mut sender = sender_with(server.port, progress, "sf_max_segment_bytes=4096;");
     assert_eq!(
         sender.effective_frame_cap().unwrap(),
         (LIMIT_ABOVE_TARGET, true)
@@ -1035,10 +1088,9 @@ fn a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two() 
     server.finish();
 }
 
-#[test]
-fn a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone() {
+fn a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone(progress: Progress) {
     let server = QwpWsModelServer::start(LIMIT_ABOVE_TARGET);
-    let mut sender = sender_with(server.port, "sf_max_segment_bytes=4096;");
+    let mut sender = sender_with(server.port, progress, "sf_max_segment_bytes=4096;");
     assert_eq!(
         sender.effective_frame_cap().unwrap(),
         (LIMIT_ABOVE_TARGET, true)
@@ -1078,11 +1130,12 @@ fn a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone() {
     server.finish();
 }
 
-#[test]
-fn a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refused() {
+fn a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refused(
+    progress: Progress,
+) {
     const MAX_BUF_SIZE: usize = 8192;
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "max_buf_size=8192;");
+    let mut sender = sender_with(server.port, progress, "max_buf_size=8192;");
     assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
     let at_max = buffer_of_len(0, MAX_BUF_SIZE);
     let mut above_max = buffer_of_len(1000, MAX_BUF_SIZE + 1);
@@ -1109,11 +1162,10 @@ fn a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refus
     server.finish();
 }
 
-#[test]
-fn a_buffer_above_max_buf_size_is_refused_for_its_size_whatever_else_it_holds() {
+fn a_buffer_above_max_buf_size_is_refused_for_its_size_whatever_else_it_holds(progress: Progress) {
     const MAX_BUF_SIZE: usize = 8192;
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "max_buf_size=8192;");
+    let mut sender = sender_with(server.port, progress, "max_buf_size=8192;");
 
     // Each buffer has one more thing in the way of its flush: a decimal that
     // the encoder refuses, and a row that fits no frame.
@@ -1129,11 +1181,10 @@ fn a_buffer_above_max_buf_size_is_refused_for_its_size_whatever_else_it_holds() 
     server.finish();
 }
 
-#[test]
-fn a_max_buf_size_below_the_frame_limit_is_held_against_the_size_of_the_buffer() {
+fn a_max_buf_size_below_the_frame_limit_is_held_against_the_size_of_the_buffer(progress: Progress) {
     const MAX_BUF_SIZE: usize = 2000;
     let server = QwpWsModelServer::start(LIMIT_ABOVE_TARGET);
-    let mut sender = sender_with(server.port, "max_buf_size=2000;");
+    let mut sender = sender_with(server.port, progress, "max_buf_size=2000;");
     // `max_buf_size` is the frame cap then, and no buffer goes out in frames.
     assert_eq!(sender.effective_frame_cap().unwrap(), (MAX_BUF_SIZE, true));
     let at_max = buffer_of_len(0, MAX_BUF_SIZE);
@@ -1157,10 +1208,11 @@ fn a_max_buf_size_below_the_frame_limit_is_held_against_the_size_of_the_buffer()
     server.finish();
 }
 
-#[test]
-fn a_buffer_with_a_row_that_fits_no_frame_is_refused_with_the_table_and_the_size_of_the_row() {
+fn a_buffer_with_a_row_that_fits_no_frame_is_refused_with_the_table_and_the_size_of_the_row(
+    progress: Progress,
+) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
 
     // Three rows that fit no frame: of a table of its own, of the table of
     // the rows before it, and with a symbol that makes it so.
@@ -1236,11 +1288,12 @@ fn a_buffer_with_a_row_that_fits_no_frame_is_refused_with_the_table_and_the_size
     server.finish();
 }
 
-#[test]
-fn a_row_whose_frame_is_exactly_the_frame_cap_travels_alone_and_one_byte_more_is_refused() {
+fn a_row_whose_frame_is_exactly_the_frame_cap_travels_alone_and_one_byte_more_is_refused(
+    progress: Progress,
+) {
     // A flush is cut for frames that are smaller than the frame cap.
     let server = QwpWsModelServer::start(LIMIT_ABOVE_TARGET);
-    let mut sender = sender_with(server.port, "sf_max_segment_bytes=4096;");
+    let mut sender = sender_with(server.port, progress, "sf_max_segment_bytes=4096;");
     assert_eq!(
         sender.effective_frame_cap().unwrap(),
         (LIMIT_ABOVE_TARGET, true)
@@ -1284,10 +1337,11 @@ fn a_row_whose_frame_is_exactly_the_frame_cap_travels_alone_and_one_byte_more_is
     server.finish();
 }
 
-#[test]
-fn a_row_that_fits_no_frame_by_its_size_bound_is_sent_when_the_buffer_fits_one_frame() {
+fn a_row_that_fits_no_frame_by_its_size_bound_is_sent_when_the_buffer_fits_one_frame(
+    progress: Progress,
+) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     // Rows with one symbol of 600 bytes and a text of `txt` bytes.
     let add = |buffer: &mut Buffer, id: i64, txt: usize| {
         buffer
@@ -1343,11 +1397,10 @@ fn a_row_that_fits_no_frame_by_its_size_bound_is_sent_when_the_buffer_fits_one_f
     server.finish();
 }
 
-#[test]
-fn a_value_that_cannot_be_sent_is_named_before_a_row_that_fits_no_frame() {
+fn a_value_that_cannot_be_sent_is_named_before_a_row_that_fits_no_frame(progress: Progress) {
     const TWO_DIGITS: &str = "cannot rescale decimal from scale 2 to 1 without precision loss";
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     // 2,000 rows with a decimal of one digit after the point. With
     // `two_digits`, row 1,500 has two: a value that the encoder refuses.
     let add_decimals = |buffer: &mut Buffer, table: &str, two_digits: bool| {
@@ -1424,8 +1477,9 @@ fn queue_bytes_for(frames: usize) -> usize {
     (frames.div_ceil(2) + 1) * 1024
 }
 
-#[test]
-fn a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do() {
+fn a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do(
+    progress: Progress,
+) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     // Segments of 1,024 bytes. One holds 992 bytes of one frame, which is
     // the frame cap, or two frames of 492 bytes, which is what a flush is
@@ -1441,7 +1495,11 @@ fn a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do
     assert!(min_total_bytes > 3 * 4096, "{frames} frames");
 
     // A queue of four segments.
-    let mut sender = sender_with(server.port, &format!("{SEGMENTS}sf_max_total_bytes=4096;"));
+    let mut sender = sender_with(
+        server.port,
+        progress,
+        &format!("{SEGMENTS}sf_max_total_bytes=4096;"),
+    );
     assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
     assert_refused_for_the_queue(&mut sender, &mut too_large, frames, min_total_bytes, 4096);
@@ -1462,7 +1520,7 @@ fn a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do
     // A byte less than the error names is not enough, also for a queue that
     // holds nothing else.
     let settings = format!("{SEGMENTS}sf_max_total_bytes={};", min_total_bytes - 1);
-    let mut sender = sender_with(server.port, &settings);
+    let mut sender = sender_with(server.port, progress, &settings);
     assert_refused_for_the_queue(
         &mut sender,
         &mut too_large,
@@ -1474,7 +1532,7 @@ fn a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do
 
     // With the queue that the error names, the buffer is one commit.
     let settings = format!("{SEGMENTS}sf_max_total_bytes={min_total_bytes};");
-    let mut sender = sender_with(server.port, &settings);
+    let mut sender = sender_with(server.port, progress, &settings);
     assert_eq!(
         sender.flush_and_keep_and_get_fsn(&too_large).unwrap(),
         Some(frames as u64 - 1)
@@ -1537,7 +1595,27 @@ fn assert_timed_out_waiting_for_room(err: &crate::Error, allocated: &[usize]) {
     );
 }
 
-/// Waits until the server has taken `frames` frames.
+/// Waits until the server has taken `frames` frames from `sender`.
+fn wait_for_frames_sent(
+    sender: &mut Sender,
+    progress: Progress,
+    server: &QwpWsModelServer,
+    frames: usize,
+) {
+    let deadline = Instant::now() + WAIT;
+    while server.frames_taken() < frames {
+        assert!(
+            Instant::now() < deadline,
+            "the server took {} of {frames} frames",
+            server.frames_taken()
+        );
+        let_it_work(sender, progress);
+    }
+}
+
+/// Waits until the server has taken `frames` frames, while another thread
+/// holds the sender: a flush that waits for room, a `wait` or a
+/// `close_drain`, each of which drives a sender in manual progress mode.
 fn wait_for_frames_taken(server: &QwpWsModelServer, frames: usize) {
     let deadline = Instant::now() + WAIT;
     while server.frames_taken() < frames {
@@ -1550,13 +1628,12 @@ fn wait_for_frames_taken(server: &QwpWsModelServer, frames: usize) {
     }
 }
 
-#[test]
-fn a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds() {
+fn a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     // The server takes what is flushed and keeps its answers to itself: what
     // is flushed stays in the queue.
     server.hold_answers();
-    let mut sender = sender_with(server.port, EIGHT_SEGMENTS);
+    let mut sender = sender_with(server.port, progress, EIGHT_SEGMENTS);
     assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
     let (first, first_frames, second, second_frames) = two_flushes_for_a_queue_that_holds_one();
     let mut too_large = buffer_of(TABLE, 340..740);
@@ -1601,13 +1678,12 @@ fn a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds() {
     server.finish();
 }
 
-#[test]
-fn a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent() {
+fn a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent(progress: Progress) {
     const DEADLINE: Duration = Duration::from_millis(300);
     let settings = format!("{EIGHT_SEGMENTS}sf_append_deadline_millis=300;");
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     server.hold_answers();
-    let mut sender = sender_with(server.port, &settings);
+    let mut sender = sender_with(server.port, progress, &settings);
     let (first, first_frames, mut second, second_frames) = two_flushes_for_a_queue_that_holds_one();
     let (rows, len) = (second.row_count(), second.len());
 
@@ -1633,14 +1709,14 @@ fn a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent() {
         (rows, len),
         "the buffer keeps its rows"
     );
-    wait_for_frames_taken(&server, first_frames);
+    wait_for_frames_sent(&mut sender, progress, &server, first_frames);
     assert_eq!(server.frames_taken(), first_frames, "nothing is sent");
     // As after a flush of one frame that waited as long, below: the sender
     // says that it must be closed, and goes on working all the same.
     assert!(sender.must_close());
 
     // A flush of one frame that finds the queue full fails the same way.
-    let mut other = sender_with(server.port, &settings);
+    let mut other = sender_with(server.port, progress, &settings);
     let one_frame = buffer_of(FIRST, 0..10);
     assert!(one_frame.len() <= 492);
     let err = loop {
@@ -1672,12 +1748,14 @@ fn a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent() {
     server.finish();
 }
 
-#[test]
-fn a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails() {
+fn a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails(
+    progress: Progress,
+) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     server.hold_answers();
     let mut sender = sender_with(
         server.port,
+        progress,
         &format!(
             "{EIGHT_SEGMENTS}sf_append_deadline_millis=300;\
              reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;"
@@ -1696,7 +1774,7 @@ fn a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_f
     let deadline = Instant::now() + WAIT;
     while sender.qwp_ws_totals().unwrap().reconnect_attempts < 2 {
         assert!(Instant::now() < deadline, "the sender did not reconnect");
-        thread::sleep(Duration::from_millis(1));
+        let_it_work(&mut sender, progress);
     }
 
     let err = sender.flush(&mut second).unwrap_err();
@@ -1730,10 +1808,9 @@ fn a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_f
     server.finish();
 }
 
-#[test]
-fn a_sender_that_was_closed_refuses_a_buffer_above_the_frame_cap() {
+fn a_sender_that_was_closed_refuses_a_buffer_above_the_frame_cap(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     let mut large = buffer_of(TABLE, 0..2000);
     sender.close_drain().unwrap();
 
@@ -1743,10 +1820,10 @@ fn a_sender_that_was_closed_refuses_a_buffer_above_the_frame_cap() {
 }
 
 /// A sender whose connection takes `symbols` symbols and no more.
-fn sender_with_a_dictionary_of(port: u16, symbols: usize) -> Sender {
+fn sender_with_a_dictionary_of(port: u16, progress: Progress, symbols: usize) -> Sender {
     // The dictionary of a sender is made when the sender is built.
     let _cap = crate::ingress::TestDictCapGuard::new(symbols);
-    sender_with(port, "")
+    sender_with(port, progress, "")
 }
 
 /// The error of a flush in frames that stopped part way because the
@@ -1801,6 +1878,7 @@ enum WaitsBy {
 /// the sender full. Checks the error of that flush and what the sender does
 /// after it, to the new sender that flushes the same buffer.
 fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
+    progress: Progress,
     failing_frame: fn(usize) -> usize,
     waits_by: WaitsBy,
 ) {
@@ -1819,7 +1897,7 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
     let failing = failing_frame(frames.len());
     assert!((1..frames.len()).contains(&failing));
     let symbols = symbols_held_before(&frames[failing]);
-    let mut sender = sender_with_a_dictionary_of(server.port, symbols);
+    let mut sender = sender_with_a_dictionary_of(server.port, progress, symbols);
 
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
     let err = sender.flush(&mut large).unwrap_err();
@@ -1832,7 +1910,7 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
     // The sender has published the flush before, and says no more.
     assert_eq!(sender.published_fsn().unwrap(), Some(0));
     // It sends the frames of the failed flush that it had queued.
-    wait_for_frames_taken(&server, 1 + failing);
+    wait_for_frames_sent(&mut sender, progress, &server, 1 + failing);
 
     // Every later flush gets the same error, of one frame and in frames.
     for later in [&buffer_of(TABLE, 0..3), &large] {
@@ -1890,7 +1968,7 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
     // connection, and every row of the buffer is committed once.
     drop(sender);
     wait_for_no_connection(&server);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     sender.flush(&mut large).unwrap();
     assert!(large.is_empty());
     sender.wait(AckLevel::Ok, WAIT).unwrap();
@@ -1901,40 +1979,46 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
     server.finish();
 }
 
-#[test]
-fn a_flush_that_fails_at_its_second_frame_is_aborted_and_the_flush_before_it_is_delivered() {
-    assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(|_| 1, WaitsBy::Wait);
+fn a_flush_that_fails_at_its_second_frame_is_aborted_and_the_flush_before_it_is_delivered(
+    progress: Progress,
+) {
+    assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(progress, |_| 1, WaitsBy::Wait);
 }
 
-#[test]
-fn a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered() {
+fn a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered(
+    progress: Progress,
+) {
     assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
+        progress,
         |frames| frames / 2,
         WaitsBy::CloseDrain,
     );
 }
 
-#[test]
-fn a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered() {
+fn a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered(
+    progress: Progress,
+) {
     assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
+        progress,
         |frames| frames - 1,
         WaitsBy::Wait,
     );
 }
 
-#[test]
-fn a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for() {
+fn a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for(
+    progress: Progress,
+) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let large = buffer_of_symbols(TABLE, 10..1210);
     let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut SymbolGlobalDict::new());
     let failing = frames.len() / 2;
     let symbols = symbols_held_before(&frames[failing]);
-    let mut sender = sender_with_a_dictionary_of(server.port, symbols);
+    let mut sender = sender_with_a_dictionary_of(server.port, progress, symbols);
 
     let err = sender.flush_and_keep(&large).unwrap_err();
     assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
     assert_eq!(sender.published_fsn().unwrap(), None);
-    wait_for_frames_taken(&server, failing);
+    wait_for_frames_sent(&mut sender, progress, &server, failing);
 
     // The server answers none of the frames it took, and the sender waits
     // for none of them.
@@ -1950,7 +2034,7 @@ fn a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait
 
     drop(sender);
     wait_for_no_connection(&server);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     sender.flush_and_keep(&large).unwrap();
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     assert_table_holds(&server, TABLE, 1, &[&large]);
@@ -1958,8 +2042,36 @@ fn a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait
     server.finish();
 }
 
-#[test]
-fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection() {
+fn a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush(progress: Progress) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let large = buffer_of_symbols(TABLE, 10..160);
+    let frames = frames_of_a_sender(&large, 492, &mut SymbolGlobalDict::new());
+    // The queue of eight segments holds the flush, two frames a segment.
+    assert!((10..=14).contains(&frames.len()), "{} frames", frames.len());
+    let failing = frames.len() - 1;
+    let symbols = symbols_held_before(&frames[failing]);
+    let settings = format!("{EIGHT_SEGMENTS}sf_append_deadline_millis=1000;");
+    let mut sender = {
+        let _cap = crate::ingress::TestDictCapGuard::new(symbols);
+        sender_with(server.port, progress, &settings)
+    };
+
+    let err = sender.flush_and_keep(&large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    // The frames of the failed flush stay in the queue, which has no room
+    // for as many again, and gets none: the server confirms none of them.
+    // The sender does not wait for it.
+    let refused = sender.flush_and_keep(&large).unwrap_err();
+    assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+    assert_eq!(sender.published_fsn().unwrap(), None);
+    sender.close_drain().unwrap();
+    drop(sender);
+    server.finish();
+}
+
+fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection(
+    progress: Progress,
+) {
     // The server takes five frames of the flush before, and ends the
     // connection: the rows it held are gone, and nothing is committed.
     const CUT_AFTER_FRAMES: usize = 5;
@@ -1973,7 +2085,7 @@ fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_co
     let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
     let failing = frames.len() / 2;
     let symbols = symbols_held_before(&frames[failing]);
-    let mut sender = sender_with_a_dictionary_of(server.port, symbols);
+    let mut sender = sender_with_a_dictionary_of(server.port, progress, symbols);
 
     assert_eq!(
         sender.flush_and_keep_and_get_fsn(&before).unwrap(),
@@ -1996,7 +2108,8 @@ fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_co
     assert_eq!(totals.reconnects_succeeded, 1);
     // On a new connection the symbols that the sender had sent come first,
     // in one frame without rows or in several.
-    wait_for_frames_taken(&server, CUT_AFTER_FRAMES + 1 + before_frames + failing);
+    let sent = CUT_AFTER_FRAMES + 1 + before_frames + failing;
+    wait_for_frames_sent(&mut sender, progress, &server, sent);
     let refused = sender.flush_and_keep(&large).unwrap_err();
     assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
     sender.close_drain().unwrap();
@@ -2005,11 +2118,63 @@ fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_co
 
     drop(sender);
     wait_for_no_connection(&server);
-    let mut sender = sender_with(server.port, "");
+    let mut sender = sender_with(server.port, progress, "");
     sender.flush_and_keep(&large).unwrap();
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     assert_table_holds(&server, TABLE, 1, &[&before]);
     assert_table_holds(&server, FIRST, 1, &[&large]);
     drop(sender);
     server.finish();
+}
+
+/// Makes two tests of each test that takes the progress mode of its senders:
+/// `<test>::background` and `<test>::manual`.
+macro_rules! in_both_progress_modes {
+    ($($test:ident)*) => {$(
+        mod $test {
+            #[test]
+            fn background() {
+                super::$test(super::Progress::Background);
+            }
+
+            #[test]
+            fn manual() {
+                super::$test(super::Progress::Manual);
+            }
+        }
+    )*};
+}
+
+in_both_progress_modes! {
+    a_flush_with_symbols_above_the_frame_cap_is_one_commit
+    a_flush_with_symbols_that_loses_its_connection_part_way_is_sent_again_whole
+    a_buffer_with_a_symbol_that_a_connection_refuses_is_refused_before_its_first_frame
+    a_flush_above_the_frame_cap_is_one_commit
+    a_flush_that_loses_its_connection_part_way_is_sent_again_whole
+    a_flush_of_several_tables_above_the_frame_cap_is_one_commit_of_each_table
+    a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_whole
+    a_flush_with_a_column_of_every_kind_above_the_frame_cap_is_one_commit
+    a_buffer_with_a_decimal_that_cannot_be_written_is_refused_before_its_first_frame
+    a_sender_with_sf_dir_refuses_a_buffer_above_the_frame_cap
+    a_sender_whose_server_tells_no_frame_limit_refuses_a_buffer_above_the_frame_cap
+    a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two
+    a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone
+    a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refused
+    a_buffer_above_max_buf_size_is_refused_for_its_size_whatever_else_it_holds
+    a_max_buf_size_below_the_frame_limit_is_held_against_the_size_of_the_buffer
+    a_buffer_with_a_row_that_fits_no_frame_is_refused_with_the_table_and_the_size_of_the_row
+    a_row_whose_frame_is_exactly_the_frame_cap_travels_alone_and_one_byte_more_is_refused
+    a_row_that_fits_no_frame_by_its_size_bound_is_sent_when_the_buffer_fits_one_frame
+    a_value_that_cannot_be_sent_is_named_before_a_row_that_fits_no_frame
+    a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do
+    a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds
+    a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
+    a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails
+    a_sender_that_was_closed_refuses_a_buffer_above_the_frame_cap
+    a_flush_that_fails_at_its_second_frame_is_aborted_and_the_flush_before_it_is_delivered
+    a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered
+    a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered
+    a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
+    a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
+    a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
 }

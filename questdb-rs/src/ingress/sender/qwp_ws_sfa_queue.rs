@@ -2596,6 +2596,10 @@ impl PublicationLog for SfaFrameQueue {
         SfaFrameQueue::take_producer(self)
     }
 
+    fn producer(&self) -> Option<&SfaProducer> {
+        self.producer.as_ref()
+    }
+
     fn progress_view(&self) -> SfaProgressView {
         SfaFrameQueue::progress_view(self)
     }

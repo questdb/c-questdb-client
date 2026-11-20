@@ -410,17 +410,20 @@ impl Sender {
             .expect("QWP/WebSocket handler was checked above");
         let (max, server_max_known) =
             effective_hard_frame_cap(self.max_buf_size, server_max, sfa_frame_payload_cap);
-        let result = match &mut self.handler {
+        let flushed = match &mut self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => {
-                match flush_qwp_ws(state, qwp, max, self.max_buf_size, server_max_known) {
-                    Ok(fsn) => Ok(fsn),
-                    // The error is complete: its limit is not the frame cap.
-                    Err(QwpWsFlushError::Refused(err)) => return Err(err),
-                    Err(QwpWsFlushError::Failed(err)) => Err(err),
-                }
+                flush_qwp_ws(state, qwp, max, self.max_buf_size, server_max_known)
             }
-            SyncProtocolHandler::ManualQwpWs(state) => flush_qwp_ws_manual(state, qwp, max),
+            SyncProtocolHandler::ManualQwpWs(state) => {
+                flush_qwp_ws_manual(state, qwp, max, self.max_buf_size, server_max_known)
+            }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
+        };
+        let result = match flushed {
+            Ok(fsn) => Ok(fsn),
+            // The error is complete: its limit is not the frame cap.
+            Err(QwpWsFlushError::Refused(err)) => return Err(err),
+            Err(QwpWsFlushError::Failed(err)) => Err(err),
         };
         // After a flush that stopped part way the sender takes no more
         // flushes, as after a failure of the connection.
@@ -735,11 +738,11 @@ impl Sender {
     /// that value is the binding limit.
     ///
     /// The cap is the smallest of `max_buf_size`, the server's advertised cap
-    /// and the store-and-forward segment payload capacity. A sender in
-    /// background progress mode that keeps its queue in memory (no `sf_dir`),
-    /// on a connection that advertised `X-QWP-Max-Batch-Size`, sends a buffer
-    /// above the cap in several frames, which the server commits together.
-    /// Any other sender publishes a buffer as one frame: a flush whose
+    /// and the store-and-forward segment payload capacity. A sender that
+    /// keeps its queue in memory (no `sf_dir`), on a connection that
+    /// advertised `X-QWP-Max-Batch-Size`, sends a buffer above the cap in
+    /// several frames, which the server commits together, in either progress
+    /// mode. Any other sender publishes a buffer as one frame: a flush whose
     /// encoded frame exceeds the cap fails with
     /// [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge) and
     /// publishes nothing. The value can change after a reconnect.

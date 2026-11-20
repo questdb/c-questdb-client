@@ -2264,10 +2264,10 @@ bool line_sender_qwpws_errors_dropped(
 /**
  * Return the current hard per-frame cap of a QWP/WebSocket sender: the
  * smallest of `max_buf_size`, the server's advertised `X-QWP-Max-Batch-Size`
- * and the store-and-forward segment payload capacity. A sender in background
- * progress mode that keeps its queue in memory (no `sf_dir`), on a connection
- * that advertised `X-QWP-Max-Batch-Size`, sends a buffer above the cap in
- * several frames, which the server commits together. Any other sender
+ * and the store-and-forward segment payload capacity. A sender that keeps its
+ * queue in memory (no `sf_dir`), on a connection that advertised
+ * `X-QWP-Max-Batch-Size`, sends a buffer above the cap in several frames,
+ * which the server commits together, in either progress mode. Any other sender
  * publishes a buffer as one frame: a flush whose encoded frame exceeds the cap
  * fails with `line_sender_error_batch_too_large` and publishes nothing.
  * `*server_cap_known_out` is true when the current connection advertised

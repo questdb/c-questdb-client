@@ -231,10 +231,10 @@ pub enum ErrorCode {
     /// the store-and-forward segment payload capacity). Chunk publication
     /// splits oversize inputs into smaller frames automatically, so there this
     /// only surfaces for an irreducible unit (the table schema plus a single
-    /// row block). A sender in background progress mode that keeps its queue
-    /// in memory (no `sf_dir`), on a connection that advertised
-    /// `X-QWP-Max-Batch-Size`, also sends a row
-    /// [`Buffer`](crate::ingress::Buffer) above the cap in several frames. It
+    /// row block). A sender that keeps its queue in memory (no `sf_dir`), on
+    /// a connection that advertised `X-QWP-Max-Batch-Size`, also sends a row
+    /// [`Buffer`](crate::ingress::Buffer) above the cap in several frames,
+    /// in either progress mode. It
     /// fails a flush with this code, and publishes nothing, when the buffer
     /// is larger than `max_buf_size`, when one of its rows fits no frame, and
     /// when the queue (`sf_max_total_bytes`) can never hold the frames of the
