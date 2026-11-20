@@ -55,6 +55,11 @@
 //! committed. A rejection for good stops the sender, which reports it at
 //! `wait` and at `close_drain`. After any other the sender connects again
 //! and sends the whole flush, which the server commits once.
+//! A flush whose connection is lost is sent again whole on the next one,
+//! wherever it was lost: the server commits it once, or a second time when
+//! it had committed the flush and only its answer was lost. A server that
+//! closes every connection during one flush stops the sender at the fourth
+//! close. `close_drain` gives up at `close_flush_timeout`.
 //!
 //! The server is the model of [`crate::tests::qwp_ws_server_model`] behind a
 //! socket: it holds the rows of a frame with the defer flag and commits at
@@ -72,7 +77,7 @@ use crate::ingress::{
 };
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
 use crate::tests::qwp_ws_server_model::{
-    QwpWsModelServer, QwpWsServerModel, add_rows, buffer_of, frame_of_a_sender,
+    ModelTable, QwpWsModelServer, QwpWsServerModel, add_rows, buffer_of, frame_of_a_sender,
     frame_of_a_whole_buffer, frames_of_a_flush, frames_of_a_sender, rows_of,
 };
 
@@ -2360,6 +2365,167 @@ fn a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_
     server.finish();
 }
 
+/// Flushes a few rows, which the server confirms, and then a buffer of
+/// several frames through a sender whose first connection the server ends
+/// when it has taken the flush before and `taken` frames of the large one.
+/// The sender connects again. Returns what the table holds when `wait` has
+/// returned, and both buffers.
+fn flush_through_a_connection_that_is_lost(
+    progress: Progress,
+    taken: usize,
+) -> (ModelTable, Buffer, Buffer) {
+    let server = QwpWsModelServer::start_cutting_first_connection(FRAME_LIMIT, 1 + taken);
+    let mut sender = sender_with(server.port, progress, "");
+    let before = buffer_of(TABLE, 0..3);
+    let large = buffer_of(TABLE, 3..403);
+    let frame_count = frames_of_a_flush(&large, FRAME_LIMIT).len() as u64;
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frame_count)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(
+        sender.completed_fsn(AckLevel::Ok).unwrap(),
+        Some(frame_count)
+    );
+    let totals = sender.qwp_ws_totals().unwrap();
+    assert_eq!(totals.reconnects_succeeded, 1, "{taken} frames taken");
+    assert!(!sender.must_close());
+    drop(sender);
+    let table = server.model.table(TABLE).unwrap();
+    server.finish();
+    (table, before, large)
+}
+
+/// The connection is lost when the server has taken some frames of a flush
+/// and not its last: after one frame, after two, and so on to all but the
+/// last. Each time the rows that the server held are gone, the sender sends
+/// the whole flush again, and the server commits it once. In the background
+/// the connection may be lost while `flush` still publishes.
+fn a_flush_is_committed_once_wherever_its_connection_is_lost_before_the_commit(progress: Progress) {
+    let frame_count = frames_of_a_flush(&buffer_of(TABLE, 3..403), FRAME_LIMIT).len();
+    assert!(frame_count >= 8, "{frame_count} frames");
+    for taken in 1..frame_count {
+        let (table, before, large) = flush_through_a_connection_that_is_lost(progress, taken);
+        assert_eq!(table.commits, 2, "{taken} frames taken");
+        assert_eq!(table.blocks.len(), 1 + frame_count);
+        assert_eq!(
+            table.rows_as_text(),
+            rows_of_all(&[&before, &large]),
+            "{taken} frames taken"
+        );
+    }
+}
+
+/// The connection is lost when the server has taken every frame of a flush
+/// and committed it, before the sender has the answer. The sender cannot
+/// tell this from a flush that was not committed: it sends the flush again,
+/// and the server commits it a second time. The table holds every row of
+/// the flush twice, each time as one commit.
+fn a_flush_whose_connection_is_lost_after_the_commit_and_before_its_answer_is_committed_again(
+    progress: Progress,
+) {
+    let frame_count = frames_of_a_flush(&buffer_of(TABLE, 3..403), FRAME_LIMIT).len();
+    let (table, before, large) = flush_through_a_connection_that_is_lost(progress, frame_count);
+    assert_eq!(table.commits, 3);
+    assert_eq!(table.blocks.len(), 1 + 2 * frame_count);
+    assert_eq!(
+        table.rows_as_text(),
+        rows_of_all(&[&before, &large, &large])
+    );
+}
+
+/// The server closes every connection when it has taken a few frames of
+/// it, so a flush of more frames never reaches its last one. No frame of
+/// a flush is confirmed before the last, so each close finds the same frame
+/// as the oldest that is not confirmed: at the fourth close
+/// (`max_frame_rejections`) the sender stops for good. Nothing of the flush
+/// is committed, and the flush before it stays.
+fn a_flush_whose_every_connection_the_server_closes_stops_the_sender_at_the_fourth_close(
+    progress: Progress,
+) {
+    const CLOSED_AFTER_FRAMES: usize = 6;
+    let server = QwpWsModelServer::start_closing_every_connection(FRAME_LIMIT, CLOSED_AFTER_FRAMES);
+    // Closes count at once, not only those of five seconds and more.
+    let mut sender = sender_with(
+        server.port,
+        progress,
+        "poison_min_escalation_window_millis=0;",
+    );
+    let before = buffer_of(TABLE, 0..3);
+    let large = buffer_of(TABLE, 3..2003);
+    let frame_count = frames_of_a_flush(&large, FRAME_LIMIT).len() as u64;
+    assert!(frame_count > 40, "{frame_count} frames");
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frame_count)
+    );
+
+    // Frame 1 of the sender is the first of the flush.
+    const STOPPED: &str = "QWP/WebSocket frame fsn 1 was closed 4 times without ACK progress";
+    let err = sender.wait(AckLevel::Ok, WAIT).unwrap_err();
+    assert!(err.msg().contains(STOPPED), "{}", err.msg());
+    assert!(sender.must_close());
+    let refused = sender.flush_and_keep(&before).unwrap_err();
+    assert!(refused.msg().contains(STOPPED), "{}", refused.msg());
+    let closed = sender.close_drain().unwrap_err();
+    assert!(closed.msg().contains(STOPPED), "{}", closed.msg());
+
+    // Four connections, each closed at its sixth frame. The first one took
+    // the flush before as its first frame.
+    assert_eq!(server.frames_taken(), 4 * CLOSED_AFTER_FRAMES);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    drop(sender);
+    server.finish();
+}
+
+/// What `close_drain` says when its time is up before the server has
+/// confirmed what the sender published.
+const CLOSE_DRAIN_TIMED_OUT: &str =
+    "QWP/WebSocket close drain timed out before all published frames were acknowledged";
+
+/// `close_drain` right after a flush in frames whose answer does not come:
+/// it sends what is queued, waits as long as `close_flush_timeout` says and
+/// fails. The server has taken every frame of the flush by then.
+fn a_close_drain_after_a_flush_in_frames_that_is_not_confirmed_in_time_fails(progress: Progress) {
+    const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, progress, "close_flush_timeout_millis=200;");
+    let large = buffer_of(TABLE, 0..2000);
+    let frame_count = frames_of_a_flush(&large, FRAME_LIMIT).len();
+    assert!(frame_count > 40, "{frame_count} frames");
+    // The server takes the flush, commits it and keeps the answer to itself.
+    server.hold_answers();
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frame_count as u64 - 1)
+    );
+    let started = Instant::now();
+    let err = sender.close_drain().unwrap_err();
+    assert!(
+        started.elapsed() >= CLOSE_FLUSH_TIMEOUT,
+        "gave up after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg().starts_with(CLOSE_DRAIN_TIMED_OUT),
+        "{}",
+        err.msg()
+    );
+    assert_eq!(server.frames_taken(), frame_count);
+    assert_table_holds(&server, TABLE, 1, &[&large]);
+    drop(sender);
+    server.finish();
+}
+
 /// Makes two tests of each test that takes the progress mode of its senders:
 /// `<test>::background` and `<test>::manual`.
 macro_rules! in_both_progress_modes {
@@ -2413,4 +2579,8 @@ in_both_progress_modes! {
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
     a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
     a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good
+    a_flush_is_committed_once_wherever_its_connection_is_lost_before_the_commit
+    a_flush_whose_connection_is_lost_after_the_commit_and_before_its_answer_is_committed_again
+    a_flush_whose_every_connection_the_server_closes_stops_the_sender_at_the_fourth_close
+    a_close_drain_after_a_flush_in_frames_that_is_not_confirmed_in_time_fails
 }

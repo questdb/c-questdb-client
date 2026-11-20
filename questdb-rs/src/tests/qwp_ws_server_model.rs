@@ -109,6 +109,10 @@ const WS_OPCODE_BINARY: u8 = 0x2;
 const WS_OPCODE_CLOSE: u8 = 0x8;
 const WS_OPCODE_PING: u8 = 0x9;
 const WS_OPCODE_PONG: u8 = 0xA;
+/// The code of the close that
+/// [`QwpWsModelServer::start_closing_every_connection`] sends: an internal
+/// error of the server.
+pub(crate) const CLOSE_CODE: u16 = 1011;
 
 /// The frames of one flush of `buffer`, cut for frames of `target` bytes:
 /// every frame but the last has the defer flag. The buffer has no symbols.
@@ -486,7 +490,7 @@ impl ServerShared {
 
 impl QwpWsModelServer {
     pub(crate) fn start(max_batch_size: usize) -> Self {
-        Self::start_with(max_batch_size, None)
+        Self::start_with(max_batch_size, None, None)
     }
 
     /// A server that ends its first connection as soon as it has taken
@@ -494,10 +498,23 @@ impl QwpWsModelServer {
     /// that connection holds are gone, as after any disconnect. Every later
     /// connection is served to its end.
     pub(crate) fn start_cutting_first_connection(max_batch_size: usize, frames: usize) -> Self {
-        Self::start_with(max_batch_size, Some(frames))
+        Self::start_with(max_batch_size, Some(frames), None)
     }
 
-    fn start_with(max_batch_size: usize, mut cut_after_frames: Option<usize>) -> Self {
+    /// A server that closes every connection as soon as it has taken
+    /// `frames` frames of it, before it answers the last of them: it sends
+    /// a WebSocket close with [`CLOSE_CODE`], which is not the code of an
+    /// orderly close. The rows that the connection holds are gone, as after
+    /// any disconnect.
+    pub(crate) fn start_closing_every_connection(max_batch_size: usize, frames: usize) -> Self {
+        Self::start_with(max_batch_size, None, Some(frames))
+    }
+
+    fn start_with(
+        max_batch_size: usize,
+        mut cut_after_frames: Option<usize>,
+        close_after_frames: Option<usize>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let model = QwpWsServerModel::new();
@@ -542,6 +559,7 @@ impl QwpWsModelServer {
                             connection,
                             max_batch_size,
                             cut_after_frames,
+                            close_after_frames,
                             &open.0,
                         );
                     }));
@@ -673,6 +691,7 @@ fn serve_connection(
     mut connection: QwpWsModelConnection,
     max_batch_size: usize,
     cut_after_frames: Option<usize>,
+    close_after_frames: Option<usize>,
     shared: &ServerShared,
 ) {
     let _close = CloseOnDrop(stream.try_clone().unwrap());
@@ -699,6 +718,13 @@ fn serve_connection(
                 frames += 1;
                 shared.frames.fetch_add(1, Ordering::SeqCst);
                 if cut_after_frames == Some(frames) {
+                    break;
+                }
+                if close_after_frames == Some(frames) {
+                    let mut close = CLOSE_CODE.to_be_bytes().to_vec();
+                    close.extend_from_slice(b"the server model closes every connection");
+                    let _answers = shared.answers.lock().unwrap();
+                    let _ = write_server_frame(&mut stream, WS_OPCODE_CLOSE, &close, false);
                     break;
                 }
                 match answer {
@@ -1609,6 +1635,37 @@ mod tests {
         let table = server.model.table(TABLE).unwrap();
         assert_eq!(table.commits, 1);
         assert_eq!(table.rows_as_text(), rows_of(TABLE, &buffer));
+        server.finish();
+    }
+
+    #[test]
+    fn server_model_socket_closes_every_connection_after_the_frames_it_was_told() {
+        let buffer = buffer_of(TABLE, 0..40);
+        let frames = small_frames(&buffer);
+        assert!(frames.len() > 2, "{} frames", frames.len());
+        let server = QwpWsModelServer::start_closing_every_connection(300, 2);
+
+        for _ in 0..3 {
+            // The connection lives after one frame and is closed with the
+            // second.
+            let mut stream = client_of(&server);
+            read_upgrade_answer(&mut stream);
+            write_server_frame(&mut stream, WS_OPCODE_BINARY, &frames[0], true).unwrap();
+            write_server_frame(&mut stream, WS_OPCODE_PING, b"alive", true).unwrap();
+            assert_eq!(
+                read_frame(&mut stream).unwrap(),
+                (true, WS_OPCODE_PONG, b"alive".to_vec())
+            );
+            write_server_frame(&mut stream, WS_OPCODE_BINARY, &frames[1], true).unwrap();
+            let (_fin, opcode, close) = read_frame(&mut stream).unwrap();
+            assert_eq!(
+                (opcode, &close[..2]),
+                (WS_OPCODE_CLOSE, &CLOSE_CODE.to_be_bytes()[..])
+            );
+            assert!(read_frame(&mut stream).is_err(), "the connection stayed");
+        }
+        assert_eq!(server.frames_taken(), 6);
+        assert_eq!(server.model.table(TABLE).unwrap().commits, 0);
         server.finish();
     }
 
