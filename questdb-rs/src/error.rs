@@ -351,6 +351,12 @@ pub enum ErrorCode {
     /// one only, as [`wait`](crate::ingress::Sender::wait) does. Then drop
     /// the sender, create a new one and flush the buffer again.
     ///
+    /// A sender borrowed from the pool of a `QuestDb` is not closed by its
+    /// holder. To lose none of the flushes before the failed one, call its
+    /// `wait` and check that it succeeded. Then give the sender back: the
+    /// pool closes it instead of lending it again. Borrow a new sender and
+    /// flush the buffer through it.
+    ///
     /// Distinct from [`SocketError`](Self::SocketError), so that callers can
     /// tell **by code** a flush that is safe to send again from a failure of
     /// the connection.

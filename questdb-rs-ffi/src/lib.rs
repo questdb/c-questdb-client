@@ -482,6 +482,13 @@ pub enum line_sender_error_code {
     /// for the flushes before the failed one only. Then `line_sender_close`,
     /// create a new sender and flush the buffer again.
     ///
+    /// A sender borrowed from a pool (`questdb_db_borrow_sender`) is not
+    /// closed by its holder. To lose none of the flushes before the failed
+    /// one, call `qwp_sender_wait` and check that it succeeded. Then give
+    /// the sender back with `questdb_db_return_sender`: the pool closes it
+    /// instead of lending it again. Borrow a new sender and flush the buffer
+    /// through it.
+    ///
     /// Distinct from `line_sender_error_socket_error`, so that callers can
     /// tell by code a flush that is safe to send again from a failure of the
     /// connection.
