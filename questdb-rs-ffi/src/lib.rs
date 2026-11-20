@@ -484,6 +484,12 @@ pub enum line_sender_error_code {
     /// rows: `line_sender_error_in_doubt` is false, and flushing the same
     /// buffer through a new sender stores no row twice.
     ///
+    /// This holds for a flush with no more rows of one table than the
+    /// server's `qwp.max.uncommitted.rows` (1,000,000 by default). Above
+    /// that the server commits a part of the table's rows by itself: that
+    /// part stays, and flushing the buffer again stores it twice unless the
+    /// table has `DEDUP` keys.
+    ///
     /// The sender takes no more flushes: each one fails with this code, and
     /// `line_sender_must_close` returns true. It still delivers the flushes
     /// before the failed one. To lose none of them, call

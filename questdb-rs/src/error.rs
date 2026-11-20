@@ -343,6 +343,12 @@ pub enum ErrorCode {
     /// closed. So [`in_doubt`](Error::in_doubt) is `false`: flushing the same
     /// buffer through a new sender stores no row twice.
     ///
+    /// This holds for a flush with no more rows of one table than the
+    /// server's `qwp.max.uncommitted.rows` (1,000,000 by default). Above that
+    /// the server commits a part of the table's rows by itself: that part
+    /// stays, and flushing the buffer again stores it twice unless the table
+    /// has `DEDUP` keys.
+    ///
     /// The sender takes no more flushes: each one fails with this error, and
     /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. It
     /// still delivers the flushes before the failed one. To lose none of
