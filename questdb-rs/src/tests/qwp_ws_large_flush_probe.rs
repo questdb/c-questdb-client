@@ -28,7 +28,7 @@
 //!
 //! The rows and the checks of the tables are those of `qwp_ws_defer_probe`,
 //! which writes such frames to a raw WebSocket. Here the sender cuts the
-//! buffer and sends the frames. There are six tests:
+//! buffer and sends the frames. There are seven tests:
 //!
 //! - a flush of one table without symbols into a table that the flush
 //!   creates, so the time until the server confirms includes the time it
@@ -54,12 +54,16 @@
 //!   progress modes: the sender stops with the server's rejection, the
 //!   server commits the small flush and no row of the rejected one, and
 //!   the rows without the fault are one transaction of each table through
-//!   a new sender.
+//!   a new sender;
+//! - a flush of more rows of one table than a server holds uncommitted
+//!   (1,000,000 by default): the server commits the table each time it
+//!   holds that many rows, so the flush is three transactions of the table,
+//!   not one.
 //!
 //! Each test also prints how long a flush took; the first two, how much
 //! memory the process held; the second one, how many frames its flushes
 //! took. For these numbers run one test at a time, from a release build.
-//! This runs all six; the whole name of a test runs that one:
+//! This runs all seven; the whole name of a test runs that one:
 //!
 //! `QDB_QWP_WS_LARGE_FLUSH_PROBE=1 QDB_QWP_WS_PORT=9000 cargo test --release --manifest-path questdb-rs/Cargo.toml --lib qwp_ws_real_server_large_flush -- --ignored --nocapture`
 //!
@@ -1040,6 +1044,89 @@ fn qwp_ws_real_server_large_flush_with_a_frame_that_the_server_rejects_commits_n
             err.msg()
         );
     }
+    Ok(())
+}
+
+/// One flush of more rows of one table than a server holds uncommitted
+/// (`qwp.max.uncommitted.rows`, 1,000,000 by default). A server commits a
+/// table by itself at the end of the frame that brings its uncommitted rows
+/// to that number, so such a flush is not one transaction of the table: it
+/// is one for each time the table reaches the limit, and one more for the
+/// rows that the last frame commits. Every row is in the table once.
+///
+/// The rows have no text, so that 2,500,000 of them are a buffer that a
+/// sender takes in one flush. `QDB_QWP_WS_LARGE_FLUSH_PROBE_MIB` does not
+/// change the size of this flush.
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_LARGE_FLUSH_PROBE=1"]
+fn qwp_ws_real_server_large_flush_above_the_row_limit_is_committed_in_parts() -> TestResult {
+    const ROWS: usize = 2_500_000;
+    /// What a row takes in a frame at the least: two numbers and a
+    /// timestamp of 8 bytes each.
+    const ROW_BYTES_AT_LEAST: usize = 24;
+
+    let Some((config, _)) = probe_settings()? else {
+        return Ok(());
+    };
+    let server = Server::Live(&config);
+    let (table, _cleanup) = server.new_table("qwp_large_flush_rows");
+
+    let conf = format!("ws::addr={}:{};", config.host, config.qwp_ws_port);
+    let mut sender = SenderBuilder::from_conf(conf)?.build()?;
+    let (frame_cap, told_by_server) = sender.effective_frame_cap()?;
+    assert!(told_by_server, "the server told no frame limit");
+
+    let mut buffer = Buffer::new_qwp_ws();
+    for id in 0..ROWS as i64 {
+        push_row(&mut buffer, &table, id, 0, None)?;
+    }
+    let expected = Digest::of(&(0..ROWS as i64).map(|id| (id, 0)).collect::<Rows>());
+    let len = buffer.len();
+
+    let started = Instant::now();
+    let fsn = sender.flush_and_get_fsn(&mut buffer)?;
+    let flush_took = started.elapsed();
+    sender.wait(AckLevel::Ok, WAIT)?;
+    let confirmed_after = started.elapsed();
+
+    let frames = fsn.expect("a flush of rows publishes frames") + 1;
+    assert!(buffer.is_empty());
+    assert_eq!(sender.completed_fsn(AckLevel::Ok)?, fsn);
+    // Every frame went out once, on the first connection, and the server
+    // refused none.
+    let totals = sender.qwp_ws_totals()?;
+    assert_eq!(
+        (
+            totals.frames_sent,
+            totals.frames_replayed,
+            totals.reconnect_attempts,
+            totals.server_errors
+        ),
+        (frames, 0, 0, 0),
+        "{totals:?}"
+    );
+
+    // A frame brings less than a quarter of the limit. So the table reaches
+    // the limit with fewer than 1,250,000 rows each time, twice in
+    // 2,500,000 rows, and rows are left for the frame that commits.
+    assert!(frame_cap / ROW_BYTES_AT_LEAST < SERVER_MAX_UNCOMMITTED_ROWS / 4);
+    let transactions = 3;
+
+    server.wait_for_rows(&table, ROWS)?;
+    assert_eq!(server.digest(&table)?, Some(expected));
+    assert_eq!(
+        server.transactions(&table)?,
+        Some(transactions),
+        "one flush of {ROWS} rows of one table, above the {SERVER_MAX_UNCOMMITTED_ROWS} rows \
+         that a server holds uncommitted"
+    );
+
+    eprintln!(
+        "large flush above the row limit: {ROWS} rows, {len} bytes in the buffer, {frames} \
+         frames of at most {frame_cap} bytes, {transactions} transactions of the table; flush \
+         returned after {flush_took:?}, and the server had confirmed the rows \
+         {confirmed_after:?} after the call began"
+    );
     Ok(())
 }
 
