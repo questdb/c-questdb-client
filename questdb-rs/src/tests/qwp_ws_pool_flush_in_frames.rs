@@ -41,6 +41,9 @@
 //! - a sender whose flush stopped part way refuses every later flush, of
 //!   rows and of columns, and says that it must be closed: the pool does not
 //!   hand its connection out again;
+//! - the pool closes such a sender when it is returned. It waits for the
+//!   answers to the flushes before the failed one and for nothing else, it
+//!   sends nothing more, and nothing of the failed flush is committed;
 //! - any other buffer that is too large for one frame gets the refusal that
 //!   a pooled sender gave before.
 //!
@@ -68,6 +71,11 @@ use crate::{BorrowedSender, ErrorCode, QuestDb};
 /// How long a test makes the server hold its answers back, where a call of
 /// the sender must wait for them.
 const HELD: Duration = Duration::from_millis(200);
+
+/// A `close_flush_timeout` that no test here lives to see. A pool that
+/// closes a sender waits that long for what the server never confirms, so a
+/// return that ends within [`WAIT`] did not wait for it.
+const LONG_CLOSE_FLUSH: &str = "close_flush_timeout_millis=30000;";
 
 /// A pool whose senders connect to the server on `port`, the first of them
 /// before this returns. It opens no connection for queries, which the test
@@ -482,6 +490,79 @@ fn a_pooled_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
     server.finish();
 }
 
+/// A buffer whose flush in frames stops at a middle frame: its sender has
+/// flushed `before`, if there is one, and has a dictionary that is full
+/// when the flush comes to that frame. Gives the buffer, how many of its
+/// frames are queued when the flush stops, and the size of that dictionary.
+fn a_buffer_whose_flush_stops_part_way(before: Option<&Buffer>) -> (Buffer, usize, usize) {
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    if let Some(before) = before {
+        frame_of_a_sender(before, false, &mut sender_symbols);
+    }
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    assert!(frames.len() > 40, "{} frames", frames.len());
+    // The frames before this one are queued, and this one brings a symbol
+    // more than the connection takes.
+    let failing = frames.len() / 2;
+    let symbols = symbols_held_before(&frames[failing]);
+    (large, failing, symbols)
+}
+
+/// Flushes `before`, if there is one, and then `large`, whose flush stops
+/// when `queued` of its frames are queued. Returns when the server has
+/// taken every frame that the sender queued.
+fn stop_a_flush_part_way(
+    sender: &mut BorrowedSender<'_>,
+    server: &QwpWsModelServer,
+    before: Option<&Buffer>,
+    large: &Buffer,
+    queued: usize,
+) {
+    if let Some(before) = before {
+        assert_eq!(
+            sender.flush_buffer_and_keep_and_get_fsn(before).unwrap(),
+            Some(0)
+        );
+    }
+    let err = sender.flush_buffer_and_keep(large).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+    assert!(sender.must_close_for_test());
+    wait_for_frames_taken(server, before.iter().len() + queued);
+}
+
+/// Checks how long a pool with [`LONG_CLOSE_FLUSH`] took to close a sender
+/// that had nothing left that the server would confirm.
+fn assert_did_not_wait_for_close_flush_timeout(took: Duration) {
+    assert!(
+        took < WAIT,
+        "the pool waited {took:?}, for frames that the server never confirms"
+    );
+}
+
+/// Gives a sender back to its pool, by `give_back`, while the server holds
+/// its answers back, and lets the answers go a while later. Gives how long
+/// the return took, and what the server had when it let its answers go: the
+/// frames taken, and the connections.
+fn give_back_while_answers_are_held(
+    server: &QwpWsModelServer,
+    give_back: impl FnOnce(),
+) -> (Duration, usize, usize) {
+    thread::scope(|scope| {
+        let started = Instant::now();
+        let watching = scope.spawn(move || {
+            thread::sleep(HELD);
+            let (taken, open) = (server.frames_taken(), server.open_connections());
+            server.let_answers_go();
+            (taken, open)
+        });
+        give_back();
+        let took = started.elapsed();
+        let (taken, open) = watching.join().unwrap();
+        (took, taken, open)
+    })
+}
+
 /// A flush before, which the server commits without telling, and a flush in
 /// frames whose middle frame finds the dictionary of the sender full.
 #[test]
@@ -489,19 +570,11 @@ fn a_pooled_flush_that_fails_part_way_is_aborted_and_its_connection_is_not_hande
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     server.hold_answers();
     let before = buffer_of_symbols(TABLE, 0..10);
-    let mut large = buffer_of_symbols(TABLE, 10..1210);
+    let (mut large, failing, symbols) = a_buffer_whose_flush_stops_part_way(Some(&before));
     let (rows, len) = (large.row_count(), large.len());
-    let mut sender_symbols = SymbolGlobalDict::new();
-    frame_of_a_sender(&before, false, &mut sender_symbols);
-    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
-    assert!(frames.len() > 40, "{} frames", frames.len());
-    // The frames before this one are queued, and this one brings a symbol
-    // more than the connection takes.
-    let failing = frames.len() / 2;
-    let symbols = symbols_held_before(&frames[failing]);
     // The dictionary of a pooled sender is made with its connection.
     let cap = TestDictCapGuard::new(symbols);
-    let db = pool_with(server.port, "");
+    let db = pool_with(server.port, LONG_CLOSE_FLUSH);
     let mut sender = db.borrow_sender().unwrap();
     drop(cap);
 
@@ -565,9 +638,12 @@ fn a_pooled_flush_that_fails_part_way_is_aborted_and_its_connection_is_not_hande
     assert_table_holds(&server, TABLE, 1, &[&before]);
 
     // The pool closes the connection of a sender that must be closed, and
-    // the rows that the server held go with it. The next sender has a new
-    // connection, through which every row of the buffer is committed once.
+    // the rows that the server held go with it. It has nothing to wait for.
+    // The next sender has a new connection, through which every row of the
+    // buffer is committed once.
+    let started = Instant::now();
     drop(sender);
+    assert_did_not_wait_for_close_flush_timeout(started.elapsed());
     wait_for_no_connection(&server);
     let mut sender = db.borrow_sender().unwrap();
     assert!(!sender.must_close_for_test());
@@ -580,6 +656,152 @@ fn a_pooled_flush_that_fails_part_way_is_aborted_and_its_connection_is_not_hande
     assert_table_holds(&server, TABLE, 2, &[&before, &large]);
     drop(sender);
     db.close();
+    server.finish();
+}
+
+/// The sender is given back while the server has not answered the flush
+/// before the failed one.
+#[test]
+fn the_pool_closes_a_sender_whose_flush_failed_part_way_when_the_flush_before_it_is_confirmed() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let (large, queued, symbols) = a_buffer_whose_flush_stops_part_way(Some(&before));
+    let cap = TestDictCapGuard::new(symbols);
+    // A pool of one sender: the next one needs the place of this one.
+    let settings = format!("sender_pool_max=1;{LONG_CLOSE_FLUSH}");
+    let db = pool_with(server.port, &settings);
+    let mut sender = db.borrow_sender().unwrap();
+    drop(cap);
+    stop_a_flush_part_way(&mut sender, &server, Some(&before), &large, queued);
+
+    // The pool waits for the answer to the flush before, with the
+    // connection open, and for nothing else: the server answers no frame of
+    // the failed flush.
+    let (took, taken, open) = give_back_while_answers_are_held(&server, || drop(sender));
+    assert!(took >= HELD, "the pool did not wait for the flush before");
+    assert_did_not_wait_for_close_flush_timeout(took);
+    assert_eq!((taken, open), (1 + queued, 1));
+
+    // The connection is closed, and the rows that the server held go with
+    // it. The pool has sent nothing more: no frame that would commit them.
+    wait_for_no_connection(&server);
+    assert_eq!(server.frames_taken(), 1 + queued);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    // The pool keeps nothing of the sender: none that is idle, none to reap.
+    assert_eq!((db.free_count(), db.in_use_count()), (0, 0));
+    assert_eq!(db.reap_idle(), 0);
+
+    // Its place is free: the next sender has a new connection, through
+    // which every row of the buffer is committed once.
+    let mut sender = db.borrow_sender().unwrap();
+    assert!(!sender.must_close_for_test());
+    assert_eq!(sender.published_fsn().unwrap(), None);
+    sender.flush_buffer_and_keep(&large).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 2, &[&before, &large]);
+    drop(sender);
+    db.close();
+    server.finish();
+}
+
+/// Nothing of the sender is left that the server would answer: the failed
+/// flush was its first.
+#[test]
+fn the_pool_closes_a_sender_whose_first_flush_failed_part_way_without_waiting() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let (large, queued, symbols) = a_buffer_whose_flush_stops_part_way(None);
+    let cap = TestDictCapGuard::new(symbols);
+    let db = pool_with(server.port, LONG_CLOSE_FLUSH);
+    let mut sender = db.borrow_sender().unwrap();
+    drop(cap);
+    stop_a_flush_part_way(&mut sender, &server, None, &large, queued);
+    assert_eq!(sender.published_fsn().unwrap(), None);
+
+    // Neither the return of the sender nor the close of the pool waits.
+    let started = Instant::now();
+    drop(sender);
+    assert_eq!((db.free_count(), db.in_use_count()), (0, 0));
+    db.close();
+    assert_did_not_wait_for_close_flush_timeout(started.elapsed());
+
+    wait_for_no_connection(&server);
+    assert_eq!(server.frames_taken(), queued);
+    // The server made the table when it took the first frame for it.
+    assert_table_holds(&server, TABLE, 0, &[]);
+    server.finish();
+}
+
+/// A pool with `close_flush_timeout` 0 waits for no answer when it closes a
+/// sender: here the server never answers the flush before the failed one.
+#[test]
+fn a_pool_that_waits_for_nothing_at_close_gives_up_a_sender_whose_flush_failed_part_way_at_once() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let (large, queued, symbols) = a_buffer_whose_flush_stops_part_way(Some(&before));
+    let cap = TestDictCapGuard::new(symbols);
+    let db = pool_with(server.port, "close_flush_timeout_millis=0;");
+    let mut sender = db.borrow_sender().unwrap();
+    drop(cap);
+    stop_a_flush_part_way(&mut sender, &server, Some(&before), &large, queued);
+
+    // Less than the `close_flush_timeout` of a pool that is told none.
+    let started = Instant::now();
+    drop(sender);
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(2), "the pool waited {took:?}");
+
+    wait_for_no_connection(&server);
+    assert_eq!(server.frames_taken(), 1 + queued);
+    // The server had committed the flush before when it took its frame.
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    db.close();
+    server.finish();
+}
+
+/// The pool is closed while the sender is out, which the lifetime of a
+/// borrowed sender rules out and a sender that owns its place allows: the
+/// kind that the C and the Python client hold.
+#[cfg(feature = "ffi-support")]
+#[test]
+fn a_closed_pool_closes_a_sender_whose_flush_failed_part_way_when_it_comes_back() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let (large, queued, symbols) = a_buffer_whose_flush_stops_part_way(Some(&before));
+    let cap = TestDictCapGuard::new(symbols);
+    let db = pool_with(server.port, LONG_CLOSE_FLUSH);
+    let mut sender = db.borrow_sender_owned().unwrap();
+    drop(cap);
+    assert_eq!(
+        sender
+            .get_mut()
+            .flush_buffer_and_keep_and_get_fsn(&before)
+            .unwrap(),
+        Some(0)
+    );
+    let err = sender.get_mut().flush_buffer_and_keep(&large).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+    wait_for_frames_taken(&server, 1 + queued);
+
+    // The close of the pool does not wait for a sender that is out, and
+    // leaves its connection alone.
+    let started = Instant::now();
+    db.close();
+    assert_did_not_wait_for_close_flush_timeout(started.elapsed());
+    assert!(sender.must_close());
+    assert_eq!(server.open_connections(), 1);
+
+    // The sender comes back as to an open pool.
+    let (took, taken, open) = give_back_while_answers_are_held(&server, || drop(sender));
+    assert!(took >= HELD, "the pool did not wait for the flush before");
+    assert_did_not_wait_for_close_flush_timeout(took);
+    assert_eq!((taken, open), (1 + queued, 1));
+    wait_for_no_connection(&server);
+    assert_eq!(server.frames_taken(), 1 + queued);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
     server.finish();
 }
 
