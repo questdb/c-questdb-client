@@ -117,6 +117,118 @@ At capacity, borrow operations wait up to `acquire_timeout_ms` or fail
 immediately when it is zero. Keep borrows short and size these limits against
 both application concurrency and server connection capacity.
 
+## Row buffers larger than one frame
+
+A QWP/WebSocket frame cannot be larger than the per-frame cap: the smallest of
+`max_buf_size`, the limit the server advertises (2 MiB by default) and what
+one store-and-forward segment holds. `effective_frame_cap` returns it.
+
+A sender that keeps its queue in memory (no `sf_dir`), connected to a server
+that advertised its frame limit, sends a row buffer above the cap in several
+frames. All but the last tell the server to hold their rows, and the last one
+commits them. So one flush is one commit per table, for a buffer of any size
+up to `max_buf_size` (100 MiB by default). This holds for the row sender in
+both progress modes and for a sender borrowed from the pool, in Rust, C and
+C++. The frame number that such a flush returns is the one of its last frame,
+and a `wait` covers the whole flush.
+
+A buffer above the cap is refused with `batch_too_large`, nothing of it is
+sent and it keeps its rows, when:
+
+- the sender uses `sf_dir`;
+- the server did not advertise a frame limit, because it is too old to commit
+  several frames together, or the sender has not connected yet;
+- the buffer is larger than `max_buf_size`, or one of its rows fits no frame;
+  or
+- the queue (`sf_max_total_bytes`, 128 MiB by default without `sf_dir`) can
+  never hold the frames of the flush together. The error names the value that
+  would.
+
+Before its first frame, a flush in several frames waits until the queue has
+room for all of them, for up to `sf_append_deadline_millis`. When the room
+does not come, the flush fails and nothing of it was sent.
+
+### What one flush guarantees
+
+- **One commit per table, not one for the flush.** A flush with rows of
+  several tables commits each table by itself.
+- **At least once.** After a reconnect the sender sends again what the server
+  has not confirmed. A commit whose confirmation was lost is sent again, and
+  its rows are stored twice unless the table has `DEDUP` keys.
+- **The server's row limit.** A server commits a table by itself once it holds
+  `qwp.max.uncommitted.rows` uncommitted rows of it (1,000,000 by default).
+  One flush with more rows of one table than that is committed in parts:
+  2,500,000 rows are three transactions, with every row stored once. If such
+  a flush fails after a part was committed, that part stays, and sending the
+  buffer again stores it twice. With rows of several tables in the flush, a
+  reconnect during it can do the same. Keep the rows of a table in one flush
+  below the limit, raise the limit on the server, or use `DEDUP`. The client
+  does not check the limit.
+- **Rows without a timestamp.** The server gives the rows added with
+  `at_now()` the time at which it takes their frame, so the rows of a flush in
+  several frames carry one timestamp per frame.
+
+### Memory
+
+A flush in several frames needs two to three times the buffer's length in
+memory. The buffer itself takes 1.2 to 2 times its `len()` for ordinary rows,
+and the queue holds every frame of the flush until the server has confirmed
+the last one. With a server on the same machine, one flush of 100 MiB peaked
+at 230 to 330 MiB of resident memory, depending on its rows, where the same
+rows flushed a frame at a time needed 20 to 75 MiB. The flush took no longer.
+
+A connection also keeps every symbol it has sent, about 200 bytes for a symbol
+of 40 to 50 bytes, and takes at most 2,000,000 symbols or 256 MiB of symbol
+text over its life. A
+server creates a symbol column with room for 256 symbols; when one flush
+brings hundreds of thousands of new symbols, the rows show in the table
+seconds later than their confirmation, unless the table was created with a
+symbol capacity to match.
+
+### A flush that stops part way
+
+A flush that has queued some of its frames and cannot queue the rest, for
+example because the connection has no room for more symbols, fails with
+`flush_aborted`. The frame that commits the flush was never sent, so nothing
+of the flush is committed (below the server's row limit, see above), the
+buffer keeps its rows, and the error is not in doubt. The sender takes no more
+flushes and reports `must_close`, but it still delivers the flushes before the
+failed one. To lose none of them, call `close_drain` and check that it
+succeeded; then close the sender, create a new one and flush the buffer again.
+The holder of a pooled sender calls `wait` instead and returns the sender,
+which the pool closes instead of lending it again.
+
+A frame that the server rejects takes the whole flush with it: the server
+drops the rows it holds for the connection and commits nothing of the flush.
+The rejection usually arrives while `flush` is still queuing frames, and
+`flush` then fails with it while the buffer keeps its rows. Otherwise the next
+`wait`, `flush` or `close_drain` reports it. A rejection names a range of frame
+numbers; it belongs to the flush whose returned frame number is the first at
+or above the end of that range.
+
+### Waiting and closing
+
+- The `wait` timeout counts the time without a new confirmation, and the
+  server confirms a flush in several frames once, at its end. Pass a timeout
+  that covers sending and committing the whole flush, or zero to wait without
+  a limit. A timeout is not a failure: the frames stay queued, so call `wait`
+  again and do not flush the same rows again. `flush_buffer_and_wait` of a
+  pooled sender uses `request_timeout` in the same way.
+- "Flush, then close" can lose a large flush. `close_drain` waits for
+  `close_flush_timeout_millis` in total (5 seconds by default), closing or
+  dropping a sender without it does not wait at all, and without `sf_dir` the
+  frames that are not confirmed by then are dropped with the sender. The
+  timeout error of `close_drain` says how many those are. Call `wait` before
+  closing, or raise `close_flush_timeout_millis`.
+- One flush must reach the server and be committed within the life of one
+  connection: after a reconnect the sender sends it again from its first
+  frame. When the server ends the connection with a WebSocket close frame
+  other than a normal or going-away close four times in a row
+  (`max_frame_rejections`) without confirming anything in between, and
+  `poison_min_escalation_window_millis` has passed, the sender stops for good.
+  A connection that just drops is never counted. Raise the two settings for
+  flushes that take long.
+
 ## Data types and validation
 
 Names and string values must be valid UTF-8; C APIs take explicit lengths and
