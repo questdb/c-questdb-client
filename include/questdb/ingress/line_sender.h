@@ -221,10 +221,19 @@ typedef enum line_sender_error_code
     /** Arrow C Data Interface export failed. `arrow` feature only. */
     line_sender_error_arrow_export = 34,
 
-    /** An irreducible QWP/WebSocket unit (the table schema plus a single row
-     *  block) exceeds the negotiated per-batch cap. Chunk publication splits
-     *  oversize inputs into smaller frames automatically, so this only surfaces
-     *  when splitting cannot make a frame fit. Distinct from
+    /** A QWP/WebSocket frame exceeds the negotiated per-frame cap (see
+     *  `line_sender_qwpws_effective_frame_cap`). Chunk publication splits
+     *  oversize inputs into smaller frames automatically, so there this only
+     *  surfaces for an irreducible unit (the table schema plus a single row
+     *  block). A sender that keeps its queue in memory (no `sf_dir`), on a
+     *  connection that advertised `X-QWP-Max-Batch-Size`, also sends a row
+     *  buffer above the cap in several frames, in either progress mode. It
+     *  fails a flush with this code, and publishes nothing, when the buffer is
+     *  larger than `max_buf_size`, when one of its rows fits no frame, and
+     *  when the queue (`sf_max_total_bytes`) can never hold the frames of the
+     *  flush together. Any other sender publishes a row buffer as one frame
+     *  and never splits it, so flushing one whose encoded frame exceeds the
+     *  cap fails with this code and publishes nothing. Distinct from
      *  `line_sender_error_invalid_api_call` so callers can recognise it without
      *  matching on the error message text. */
     line_sender_error_batch_too_large = 35,
@@ -2099,7 +2108,9 @@ line_sender_buffer* line_sender_buffer_new_for_sender(
  * Returns true after an unrecoverable failure. For ILP-over-TCP this is any
  * socket error. For QWP/WebSocket this also covers a server rejection or
  * protocol violation that latches the publication lifecycle to its terminal
- * state. ILP-over-HTTP and QWP/UDP never transition into a
+ * state, and a flush that failed with `line_sender_error_flush_aborted`: that
+ * sender takes no more flushes, and still delivers the ones before the failed
+ * one until it is closed. ILP-over-HTTP and QWP/UDP never transition into a
  * permanently-unusable state and always return false.
  * @param[in] sender Line sender object.
  * @return true if an error occurred with a sender and it must be closed.
@@ -2117,7 +2128,8 @@ void line_sender_close(line_sender* sender);
 /**
  * Publish a QWP/WebSocket buffer locally, clear it on success, and return the
  * assigned frame sequence number. Empty buffers succeed with
- * `fsn_out->has_value == false`.
+ * `fsn_out->has_value == false`. A buffer that goes out in several frames (see
+ * `line_sender_flush`) returns the number of its last frame.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_flush_and_get_fsn(
@@ -2129,7 +2141,8 @@ bool line_sender_qwpws_flush_and_get_fsn(
 /**
  * Publish a QWP/WebSocket buffer locally without clearing it and return the
  * assigned frame sequence number. Empty buffers succeed with
- * `fsn_out->has_value == false`.
+ * `fsn_out->has_value == false`. A buffer that goes out in several frames (see
+ * `line_sender_flush`) returns the number of its last frame.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_flush_and_keep_and_get_fsn(
@@ -2148,7 +2161,10 @@ bool line_sender_qwpws_drive_once(
 
 /**
  * Return the highest QWP/WebSocket frame sequence number published locally, or
- * no value if no frame has been published.
+ * no value if no frame has been published. After a flush that failed with
+ * `line_sender_error_flush_aborted` this is the last frame published before
+ * that flush, or no value if there was none: the frames of the failed flush
+ * are never confirmed.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_published_fsn(
@@ -2209,6 +2225,10 @@ typedef enum qwpws_ack_level
  * attached OIDC auth could not supply a token (`questdb_error_oidc_get_view`
  * reports `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` when a new sign-in is
  * needed). The published frames stay queued either way.
+ *
+ * After a flush that failed with `line_sender_error_flush_aborted` the wait
+ * covers the frames published before that flush, and succeeds once they reach
+ * `ack_level`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_wait(
@@ -2290,10 +2310,16 @@ bool line_sender_qwpws_effective_frame_cap(
 
 /**
  * Stop accepting new QWP/WebSocket publications and wait for already-published
- * frames to resolve. The timeout is configured with the QWP/WebSocket
+ * frames to resolve. After a flush that failed with
+ * `line_sender_error_flush_aborted` these are the frames published before that
+ * flush: the frames of the failed flush are dropped, and nothing of it is
+ * committed. The timeout is configured with the QWP/WebSocket
  * `close_flush_timeout_millis` config key; the default is 5000 ms, and values
  * less than or equal to 0 configure a zero-timeout fast close. Timeout and
- * terminal failure are reported through `err_out`. A timeout while the sender
+ * terminal failure are reported through `err_out`. The timeout error says how
+ * many published frames are not confirmed. Without `sf_dir` they are dropped
+ * with the sender: call `line_sender_qwpws_wait` before closing, raise
+ * `close_flush_timeout_millis`, or use `sf_dir`. A timeout while the sender
  * is disconnected and reconnecting keeps failing names that failure, in either
  * progress mode, as `line_sender_qwpws_wait` does.
  */
@@ -2325,12 +2351,21 @@ bool line_sender_qwpws_close_drain(
  * guarantee for the logical batch.
  *
  * With QWP-over-WebSocket, the function publishes the buffer into the local
- * sender queue and returns before the server necessarily ACKs the frame. Later
+ * sender queue and returns before the server necessarily ACKs the frame. A
+ * buffer larger than one frame is published as several frames that the server
+ * commits together, where the sender supports it: see
+ * `line_sender_qwpws_effective_frame_cap`. Later
  * terminal diagnostics fail subsequent sender calls and are also observable
- * through the QWP/WebSocket diagnostic polling API. A flush that waits out
+ * through the QWP/WebSocket diagnostic polling API. Such a failure can also
+ * fail a flush that is still queuing its frames, for example when the server
+ * rejects one of them: the flush fails with the code of that failure, nothing
+ * of it is committed, and the buffer keeps its rows. A flush that waits out
  * `sf_append_deadline_millis` on a full queue while the sender is disconnected
  * and reconnecting keeps failing names that failure, as
- * `line_sender_qwpws_wait` does.
+ * `line_sender_qwpws_wait` does. A flush in several frames that stops after
+ * some of them were published fails with `line_sender_error_flush_aborted`:
+ * nothing of it is committed, the buffer keeps its rows, and the sender takes
+ * no more flushes while it still delivers the ones before.
  *
  * HTTP should be the first choice, but use TCP if you need to continuously
  * send data to the server at a high rate.

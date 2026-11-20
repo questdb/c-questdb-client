@@ -2005,8 +2005,18 @@ public:
      *
      * With QWP-over-WebSocket, the function publishes the buffer into the
      * local sender queue and returns before the server necessarily ACKs the
-     * frame. Later terminal diagnostics fail subsequent sender calls and are
-     * also observable through the QWP/WebSocket diagnostic polling API.
+     * frame. A buffer larger than one frame is published as several frames
+     * that the server commits together, where the sender supports it: see
+     * `line_sender_qwpws_effective_frame_cap`. Later terminal diagnostics fail
+     * subsequent sender calls and are also observable through the
+     * QWP/WebSocket diagnostic polling API. Such a failure can also fail a
+     * flush that is still queuing its frames, for example when the server
+     * rejects one of them: the flush throws with the code of that failure,
+     * nothing of it is committed, and the buffer keeps its rows. A flush in
+     * several frames that stops after some of them were published throws
+     * `line_sender_error_code::flush_aborted`: nothing of it is committed, the
+     * buffer keeps its rows, and the sender takes no more flushes while it
+     * still delivers the ones before.
      *
      * HTTP should be the first choice, but use TCP if you need to continuously
      * send data to the server at a high rate.
@@ -2111,6 +2121,8 @@ public:
     /**
      * Publish a QWP/WebSocket buffer locally, clear it on success, and return
      * the assigned frame sequence number. Empty buffers return `std::nullopt`.
+     * A buffer that goes out in several frames (see `flush()`) returns the
+     * number of its last frame.
      */
     std::optional<uint64_t> flush_and_get_fsn(line_sender_buffer& buffer)
     {
@@ -2125,6 +2137,8 @@ public:
     /**
      * Publish a QWP/WebSocket buffer locally without clearing it and return the
      * assigned frame sequence number. Empty buffers return `std::nullopt`.
+     * A buffer that goes out in several frames (see `flush()`) returns the
+     * number of its last frame.
      */
     std::optional<uint64_t> flush_and_keep_and_get_fsn(
         const line_sender_buffer& buffer)
@@ -2159,7 +2173,10 @@ public:
 
     /**
      * Return the highest QWP/WebSocket frame sequence number published locally,
-     * or `std::nullopt` if no frame has been published.
+     * or `std::nullopt` if no frame has been published. After a flush that
+     * failed with `line_sender_error_code::flush_aborted` this is the last
+     * frame published before that flush, or `std::nullopt` if there was none:
+     * the frames of the failed flush are never confirmed.
      */
     std::optional<uint64_t> published_fsn() const
     {
@@ -2194,7 +2211,10 @@ public:
      * `request_durable_ack=local`; otherwise this throws `invalid_api_call`
      * even when nothing has been published. Throws on the
      * no-progress timeout, a server rejection, or a transport failure; returns
-     * immediately when nothing has been published yet.
+     * immediately when nothing has been published yet. After a flush that
+     * failed with `line_sender_error_code::flush_aborted` the wait covers the
+     * frames published before that flush, and returns once they reach
+     * `ack_level`.
      */
     void wait(
         qwpws_ack_level ack_level = qwpws_ack_level::ok,
@@ -2266,10 +2286,16 @@ public:
 
     /**
      * Stop accepting new QWP/WebSocket publications and wait for already
-     * published frames to resolve. The timeout is configured with
+     * published frames to resolve. After a flush that failed with
+     * `line_sender_error_code::flush_aborted` these are the frames published
+     * before that flush: the frames of the failed flush are dropped, and
+     * nothing of it is committed. The timeout is configured with
      * `close_flush_timeout_millis`; the default is 5000 ms, and values less
      * than or equal to 0 configure a zero-timeout fast close. Throws on
-     * timeout or terminal failure.
+     * timeout or terminal failure. The timeout error says how many published
+     * frames are not confirmed. Without `sf_dir` they are dropped with the
+     * sender: call `wait()` before closing, raise
+     * `close_flush_timeout_millis`, or use `sf_dir`.
      */
     void close_drain()
     {
@@ -2282,8 +2308,11 @@ public:
      * Returns true after an unrecoverable failure. For ILP-over-TCP this is
      * any socket error. For QWP/WebSocket this also covers a server
      * rejection or protocol violation that latches the publication
-     * lifecycle to its terminal state. ILP-over-HTTP and QWP/UDP never
-     * transition into a permanently-unusable state and always return false.
+     * lifecycle to its terminal state, and a flush that failed with
+     * `line_sender_error_code::flush_aborted`: that sender takes no more
+     * flushes, and still delivers the ones before the failed one until it is
+     * closed. ILP-over-HTTP and QWP/UDP never transition into a
+     * permanently-unusable state and always return false.
      * @return true if an error occurred with a sender and it must be
      * closed.
      */

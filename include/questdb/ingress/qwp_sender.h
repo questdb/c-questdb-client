@@ -379,7 +379,20 @@ line_sender_buffer* questdb_db_new_buffer(
 QUESTDB_CLIENT_API
 size_t questdb_db_buffer_max_name_len(const questdb_db* db);
 
-/** Publish and clear a Buffer after local store-and-forward acceptance. */
+/**
+ * Publish and clear a Buffer after local store-and-forward acceptance.
+ *
+ * A Buffer above the frame cap (`qwp_sender_effective_frame_cap`) is published
+ * as several frames that the server commits together, when the pool keeps its
+ * queue in memory (no `sf_dir`) and the connection advertised
+ * `X-QWP-Max-Batch-Size`. Otherwise it fails with
+ * `line_sender_error_batch_too_large` and nothing is published. A flush in
+ * several frames that stops after some of them were published fails with
+ * `line_sender_error_flush_aborted`: nothing of it is committed, the Buffer
+ * keeps its rows, and the sender takes no more flushes while it still delivers
+ * the ones before. That code says what the holder of a pooled sender does
+ * next. The same holds for the other `qwp_sender_flush_buffer*` functions.
+ */
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_buffer(
     qwp_sender* sender,
@@ -1622,7 +1635,8 @@ bool qwp_sender_flush_chunk_and_get_fsn(
  * connection advertised `X-QWP-Max-Batch-Size`, whether or not that value is
  * the binding limit; otherwise the result is bounded only by local
  * configuration and queue segment capacity. The value can change after
- * reconnect.
+ * reconnect. A Buffer above the cap is published as several frames or
+ * refused: see `qwp_sender_flush_buffer`.
  */
 QUESTDB_CLIENT_API
 bool qwp_sender_effective_frame_cap(
@@ -1634,7 +1648,10 @@ bool qwp_sender_effective_frame_cap(
 /**
  * Return the highest QWP/WebSocket frame sequence number published locally
  * through this borrowed store-and-forward QWP sender, or no value if no
- * frame has been published.
+ * frame has been published. After a flush that failed with
+ * `line_sender_error_flush_aborted` this is the last frame published before
+ * that flush, or no value if there was none: the frames of the failed flush
+ * are never confirmed.
  */
 QUESTDB_CLIENT_API
 bool qwp_sender_published_fsn(
@@ -1682,7 +1699,9 @@ bool qwp_sender_error_events_dropped(
  * published nothing. The barrier is a watermark check plus a terminal-latch
  * check: only a terminal connection failure fails it. Server rejections are
  * delivered to the pool's rejection handler (default: logged) rather than
- * raised here; retriable ones are replayed by the queue.
+ * raised here; retriable ones are replayed by the queue. After a flush that
+ * failed with `line_sender_error_flush_aborted` the barrier covers the frames
+ * published before that flush, and succeeds once they reach `ack_level`.
  *
  * `ack_level` carries a `qwpws_ack_level_*` constant. The
  * parameter is `uint32_t` rather than `enum qwpws_ack_level` so

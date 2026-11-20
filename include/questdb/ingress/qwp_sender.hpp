@@ -882,7 +882,8 @@ public:
     /**
      * Return the current hard frame cap. `server_cap_known` is true when the
      * current connection advertised `X-QWP-Max-Batch-Size`, whether or not it
-     * is the binding limit.
+     * is the binding limit. A Buffer above the cap is published as several
+     * frames or refused: see `borrowed_sender::flush`.
      */
     frame_cap effective_frame_cap() const
     {
@@ -897,7 +898,9 @@ public:
 
     /**
      * Return the highest QWP/WebSocket frame sequence number published locally,
-     * or `std::nullopt` if no frame has been published.
+     * or `std::nullopt` if no frame has been published. After a flush that
+     * failed with `line_sender_error_code::flush_aborted` this is the last
+     * frame published before that flush, or `std::nullopt` if there was none.
      */
     std::optional<uint64_t> published_fsn() const
     {
@@ -922,7 +925,9 @@ public:
      * The SFA queue owns delivery, so this is needed only to *observe* the ack,
      * never for durability. `timeout` is a no-progress deadline (it fires only
      * if the ack watermark fails to advance for that long); the default of zero
-     * waits indefinitely. Throws on error.
+     * waits indefinitely. Throws on error. After a flush that failed with
+     * `line_sender_error_code::flush_aborted` the wait covers the frames
+     * published before that flush, and returns once they reach `level`.
      */
     void wait(
         qwpws_ack_level level = qwpws_ack_level::ok,
@@ -1233,7 +1238,22 @@ public:
             line_sender_buffer::_backend_kind::qwp_ws};
     }
 
-    /** Publish and clear a Buffer after local queue acceptance. */
+    /**
+     * Publish and clear a Buffer after local queue acceptance.
+     *
+     * A Buffer above the frame cap of the connection is published as several
+     * frames that the server commits together, when the pool keeps its queue
+     * in memory (no `sf_dir`) and the connection advertised
+     * `X-QWP-Max-Batch-Size`. Otherwise it throws
+     * `line_sender_error_code::batch_too_large` and nothing is published. A
+     * flush in several frames that stops after some of them were published
+     * throws `line_sender_error_code::flush_aborted`: nothing of it is
+     * committed, the Buffer keeps its rows, and the sender takes no more
+     * flushes while it still delivers the ones before. To lose none of those,
+     * call `wait()` and let it return. Then let this guard go: the pool closes
+     * the sender instead of lending it again. Flush the Buffer through a newly
+     * borrowed sender. The same holds for the other Buffer flushes.
+     */
     void flush(line_sender_buffer& buffer)
     {
         buffer.may_init();
@@ -1333,7 +1353,9 @@ public:
 
     /**
      * Return the highest QWP/WebSocket frame sequence number published locally,
-     * or `std::nullopt` if no frame has been published.
+     * or `std::nullopt` if no frame has been published. After a flush that
+     * failed with `line_sender_error_code::flush_aborted` this is the last
+     * frame published before that flush, or `std::nullopt` if there was none.
      */
     std::optional<uint64_t> published_fsn() const
     {
@@ -1354,7 +1376,9 @@ public:
      * The SFA queue owns delivery, so this is needed only to *observe* the ack,
      * never for durability. `timeout` is a no-progress deadline (it fires only
      * if the ack watermark fails to advance for that long); the default of zero
-     * waits indefinitely. Throws on error.
+     * waits indefinitely. Throws on error. After a flush that failed with
+     * `line_sender_error_code::flush_aborted` the wait covers the frames
+     * published before that flush, and returns once they reach `level`.
      */
     void wait(
         qwpws_ack_level level = qwpws_ack_level::ok,
