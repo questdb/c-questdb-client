@@ -140,16 +140,20 @@ never rejected on that account.
 A buffer larger than one frame (see
 [`sender.effective_frame_cap()`](Sender::effective_frame_cap)) is published as
 several frames that the server commits together, one commit per table, when
-the sender keeps its queue in memory (no `sf_dir`) and the server advertised
-its frame limit. The FSN that such a flush returns is the one of its last
-frame, and the server confirms the flush once, at its end. Any other sender
-refuses such a buffer with
+the server advertised its frame limit, with the queue in memory and with
+`sf_dir`. The FSN that such a flush returns is the one of its last frame, and
+the server confirms the flush once, at its end. A sender whose server
+advertised no frame limit, and one that could not write the symbol file of its
+`sf_dir` slot, refuses such a buffer with
 [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge) and sends nothing
 of it. A flush that stops after some of its frames were queued fails with
 [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted): the buffer keeps
-its rows, and the sender must be replaced. The memory such a flush needs, the
-server's row limit and the timeouts to mind are in the section "Row buffers
-larger than one frame" of the
+its rows, and the sender must be replaced. With `sf_dir`, a sender that opens
+a slot removes a flush whose last frame was never written: after a process
+was killed inside a flush nothing of that flush is sent, so flush the buffer
+again. The memory such a flush needs, the server's row limit, the timeouts to
+mind, what a large flush costs with `sf_dir` and what an older client does
+with such a slot are in the section "Row buffers larger than one frame" of the
 [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md#row-buffers-larger-than-one-frame).
 
 Configure `sf_dir` to recover the local publication log after reconnects and

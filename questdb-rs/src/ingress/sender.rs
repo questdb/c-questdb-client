@@ -754,11 +754,12 @@ impl Sender {
     /// that value is the binding limit.
     ///
     /// The cap is the smallest of `max_buf_size`, the server's advertised cap
-    /// and the store-and-forward segment payload capacity. A sender that
-    /// keeps its queue in memory (no `sf_dir`), on a connection that
-    /// advertised `X-QWP-Max-Batch-Size`, sends a buffer above the cap in
-    /// several frames, which the server commits together, in either progress
-    /// mode. Any other sender publishes a buffer as one frame: a flush whose
+    /// and the store-and-forward segment payload capacity. On a connection
+    /// that advertised `X-QWP-Max-Batch-Size` the sender sends a buffer above
+    /// the cap in several frames, which the server commits together, in
+    /// either progress mode, with its queue in memory and with `sf_dir`. On
+    /// any other connection, and with an `sf_dir` slot whose symbol file it
+    /// could not write, it publishes a buffer as one frame: a flush whose
     /// encoded frame exceeds the cap fails with
     /// [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge) and
     /// publishes nothing. The value can change after a reconnect.

@@ -73,8 +73,9 @@ power loss. Configure
 memory-map/file-sync checkpoints. The interval defaults to 5000 ms and is a
 target cadence, not a hard upper bound: sender scheduling and storage latency
 extend the actual recovery window. If a segment fills before its published
-data is durable, rotation waits for a requested checkpoint and publication
-sees the normal store-and-forward backpressure response.
+data is durable, the flush that needs the next segment syncs it first. While
+a checkpoint is already under way it waits for that one, and publication sees
+the normal store-and-forward backpressure response.
 
 In manual QWP progress mode, periodic checkpoints advance only when the
 application calls a progress-driving API such as `drive_once` or `wait`.
@@ -123,26 +124,32 @@ A QWP/WebSocket frame cannot be larger than the per-frame cap: the smallest of
 `max_buf_size`, the limit the server advertises (2 MiB by default) and what
 one store-and-forward segment holds. `effective_frame_cap` returns it.
 
-A sender that keeps its queue in memory (no `sf_dir`), connected to a server
-that advertised its frame limit, sends a row buffer above the cap in several
-frames. All but the last tell the server to hold their rows, and the last one
-commits them. So one flush is one commit per table, for a buffer of any size
-up to `max_buf_size` (100 MiB by default). This holds for the row sender in
+A sender connected to a server that advertised its frame limit sends a row
+buffer above the cap in several frames. All but the last tell the server to
+hold their rows, and the last one commits them. So one flush is one commit per
+table, for a buffer of any size up to `max_buf_size` (100 MiB by default).
+This holds with the queue in memory and with `sf_dir`, for the row sender in
 both progress modes and for a sender borrowed from the pool, in Rust, C and
 C++. The frame number that such a flush returns is the one of its last frame,
 and a `wait` covers the whole flush.
 
+This is about row buffers. A chunk of the column sender that is too large for
+one frame is split as well, and with `sf_dir` each of its frames still commits
+by itself.
+
 A buffer above the cap is refused with `batch_too_large`, nothing of it is
 sent and it keeps its rows, when:
 
-- the sender uses `sf_dir`;
 - the server did not advertise a frame limit, because it is too old to commit
   several frames together, or the sender has not connected yet;
+- the sender could not write the symbol file of its `sf_dir` slot. The error
+  says so: flush smaller buffers, or close the sender, see to the disk of
+  `sf_dir` and create a new sender;
 - the buffer is larger than `max_buf_size`, or one of its rows fits no frame;
   or
-- the queue (`sf_max_total_bytes`, 128 MiB by default without `sf_dir`) can
-  never hold the frames of the flush together. The error names the value that
-  would.
+- the queue (`sf_max_total_bytes`, by default 128 MiB in memory and 10 GiB
+  with `sf_dir`) can never hold the frames of the flush together. The error
+  names the value that would.
 
 Before its first frame, a flush in several frames waits until the queue has
 room for all of them, for up to `sf_append_deadline_millis`. When the room
@@ -208,6 +215,44 @@ The rejection usually arrives while `flush` is still queuing frames, and
 `wait`, `flush` or `close_drain` reports it. A rejection names a range of frame
 numbers; it belongs to the flush whose returned frame number is the first at
 or above the end of that range.
+
+### With `sf_dir`
+
+The frames of a flush stay in the files of the sender's slot until the server
+has confirmed the flush. A sender that opens a slot again, after the process
+was killed or the sender before it was closed, finds one of two things at its
+end:
+
+- **A flush with its last frame** is sent whole, unless the server has
+  confirmed it. When the server committed it and the confirmation was lost, it
+  is committed again (at least once).
+- **A flush without its last frame** is removed. The process was killed inside
+  `flush`, or the flush failed with `flush_aborted`. Nothing of it was
+  committed (below the server's row limit, see above) and nothing of it is
+  sent, so flush the buffer again. The flushes before it are sent as usual.
+
+A pool that opens a slot does the same, and so does the drainer of a slot that
+no sender owns. A segment file that the process was killed while creating is
+removed as well. Opening a slot that held 100 MiB took about 40 ms.
+
+**Older clients.** Releases 7.0.0 to 7.3.0 do not remove a flush without its
+last frame. One of them that opens such a slot sends the frames, and its next
+flush would commit their rows, a part of a flush. Before a slot goes back to
+one of these releases after a kill inside a flush or a `flush_aborted`, open
+it once with this release: build a sender with the same `sf_dir` and
+`sender_id`, or the pool, and close it. Or delete the slot's folder when its
+rows are not needed. The format of a slot is the same: one whose flushes all
+have their last frame is read by every release.
+
+**Speed.** With `sf_dir` a sender pays for every segment file it fills, not
+for the bytes: about 20 ms a file on an NVMe disk with ext4, and 26 ms with
+`sf_durability=periodic`. Small flushes pay the same for each file. With the
+default `sf_max_segment_bytes` of 4 MiB, one flush of 100 MiB returned after
+0.54 s (0.66 s with `periodic`), where a sender with its queue in memory took
+0.07 s. For large flushes raise `sf_max_segment_bytes`: with 64 MiB the same
+flush returned after 0.07 s (0.09 s). The per-frame cap stays what the server
+advertises. Larger segments give disk space back in larger steps, and
+`sf_max_total_bytes` must hold the segments that one flush fills and one more.
 
 ### Waiting and closing
 

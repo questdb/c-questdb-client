@@ -3786,9 +3786,10 @@ unsafe fn acquire_qwp_sender(
 /// clear it after local acceptance.
 ///
 /// A Buffer above the frame cap (`qwp_sender_effective_frame_cap`) is published
-/// as several frames that the server commits together, when the pool keeps its
-/// queue in memory (no `sf_dir`) and the connection advertised
-/// `X-QWP-Max-Batch-Size`. Otherwise it fails with
+/// as several frames that the server commits together, when the connection
+/// advertised `X-QWP-Max-Batch-Size`, with the queue in memory and with
+/// `sf_dir`. When the connection advertised none, and when the sender could not
+/// write the symbol file of its `sf_dir` slot, it fails with
 /// `line_sender_error_batch_too_large` and nothing is published. A flush in
 /// several frames that stops after some of them were published fails with
 /// `line_sender_error_flush_aborted`: nothing of it is committed, the Buffer

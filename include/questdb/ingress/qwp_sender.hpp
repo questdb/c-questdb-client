@@ -1242,9 +1242,10 @@ public:
      * Publish and clear a Buffer after local queue acceptance.
      *
      * A Buffer above the frame cap of the connection is published as several
-     * frames that the server commits together, when the pool keeps its queue
-     * in memory (no `sf_dir`) and the connection advertised
-     * `X-QWP-Max-Batch-Size`. Otherwise it throws
+     * frames that the server commits together, when the connection advertised
+     * `X-QWP-Max-Batch-Size`, with the queue in memory and with `sf_dir`. When
+     * the connection advertised none, and when the sender could not write the
+     * symbol file of its `sf_dir` slot, it throws
      * `line_sender_error_code::batch_too_large` and nothing is published. A
      * flush in several frames that stops after some of them were published
      * throws `line_sender_error_code::flush_aborted`: nothing of it is

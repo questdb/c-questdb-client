@@ -383,15 +383,17 @@ pub enum line_sender_error_code {
     /// `line_sender_qwpws_effective_frame_cap`). Chunk publication splits
     /// oversize inputs into smaller frames automatically, so there this only
     /// surfaces for an irreducible unit (the table schema plus a single row
-    /// block). A sender that keeps its queue in memory (no `sf_dir`), on a
-    /// connection that advertised `X-QWP-Max-Batch-Size`, also sends a row
-    /// buffer above the cap in several frames, in either progress mode. It
-    /// fails a flush with this code, and publishes nothing, when the buffer is
-    /// larger than `max_buf_size`, when one of its rows fits no frame, and
-    /// when the queue (`sf_max_total_bytes`) can never hold the frames of the
-    /// flush together. Any other sender publishes a row buffer as one frame
-    /// and never splits it, so flushing one whose encoded frame exceeds the
-    /// cap fails with this code and publishes nothing. Distinct from
+    /// block). A sender on a connection that advertised
+    /// `X-QWP-Max-Batch-Size` also sends a row buffer above the cap in several
+    /// frames, in either progress mode, with its queue in memory and with
+    /// `sf_dir`. It fails a flush with this code, and publishes nothing, when
+    /// the buffer is larger than `max_buf_size`, when one of its rows fits no
+    /// frame, and when the queue (`sf_max_total_bytes`) can never hold the
+    /// frames of the flush together. A sender whose server advertised no cap,
+    /// and one that could not write the symbol file of its `sf_dir` slot,
+    /// publishes a row buffer as one frame and never splits it, so flushing
+    /// one whose encoded frame exceeds the cap fails with this code and
+    /// publishes nothing. Distinct from
     /// `line_sender_error_invalid_api_call` so callers can recognise it without
     /// matching on the error message text.
     line_sender_error_batch_too_large = 35,
@@ -482,7 +484,9 @@ pub enum line_sender_error_code {
     ///
     /// Nothing of the flush is committed, and the buffer still holds its
     /// rows: `line_sender_error_in_doubt` is false, and flushing the same
-    /// buffer through a new sender stores no row twice.
+    /// buffer through a new sender stores no row twice. With `sf_dir` the
+    /// frames of the flush stay in the slot, and the sender that opens the
+    /// slot next removes them and sends nothing of the flush.
     ///
     /// This holds for a flush with no more rows of one table than the
     /// server's `qwp.max.uncommitted.rows` (1,000,000 by default). Above
