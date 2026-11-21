@@ -231,9 +231,18 @@ pub enum ErrorCode {
     /// the store-and-forward segment payload capacity). Chunk publication
     /// splits oversize inputs into smaller frames automatically, so there this
     /// only surfaces for an irreducible unit (the table schema plus a single
-    /// row block). A row [`Buffer`](crate::ingress::Buffer) is published as one
-    /// frame and is never split, so flushing one whose encoded frame exceeds
-    /// the cap fails with this code and publishes nothing. Distinct from
+    /// row block). A sender on a connection that advertised
+    /// `X-QWP-Max-Batch-Size` also sends a row
+    /// [`Buffer`](crate::ingress::Buffer) above the cap in several frames,
+    /// in either progress mode, with its queue in memory and with `sf_dir`.
+    /// It fails a flush with this code, and publishes nothing, when the
+    /// buffer is larger than `max_buf_size`, when one of its rows fits no
+    /// frame, and when the queue (`sf_max_total_bytes`) can never hold the
+    /// frames of the flush together. A sender whose server advertised no
+    /// cap, and one that could not write the symbol file of its `sf_dir`
+    /// slot, publishes a row buffer as one frame and never splits it, so
+    /// flushing one whose encoded frame exceeds the cap fails with this code
+    /// and publishes nothing. Distinct from
     /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
     /// without matching on the error message text.
     BatchTooLarge,
@@ -324,6 +333,44 @@ pub enum ErrorCode {
     /// **by code** and take that specific action, without matching on the error
     /// message text.
     SymbolDictFull,
+
+    /// A [`Sender::flush`](crate::ingress::Sender::flush) of a row buffer
+    /// that goes out in several frames stopped part way: some of its frames
+    /// were queued, and a later one could not be. The message names the
+    /// cause.
+    ///
+    /// **Nothing of the flush is committed**, and the buffer still holds its
+    /// rows. The frame that commits the flush was never queued, and the
+    /// server drops the rows it holds for the flush when the sender is
+    /// closed. So [`in_doubt`](Error::in_doubt) is `false`: flushing the same
+    /// buffer through a new sender stores no row twice. With `sf_dir` the
+    /// frames of the flush stay in the slot, and the sender that opens the
+    /// slot next removes them and sends nothing of the flush.
+    ///
+    /// This holds for a flush with no more rows of one table than the
+    /// server's `qwp.max.uncommitted.rows` (1,000,000 by default). Above that
+    /// the server commits a part of the table's rows by itself: that part
+    /// stays, and flushing the buffer again stores it twice unless the table
+    /// has `DEDUP` keys.
+    ///
+    /// The sender takes no more flushes: each one fails with this error, and
+    /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. It
+    /// still delivers the flushes before the failed one. To lose none of
+    /// them, call [`close_drain`](crate::ingress::Sender::close_drain) and
+    /// check that it succeeded: it waits for the flushes before the failed
+    /// one only, as [`wait`](crate::ingress::Sender::wait) does. Then drop
+    /// the sender, create a new one and flush the buffer again.
+    ///
+    /// A sender borrowed from the pool of a `QuestDb` is not closed by its
+    /// holder. To lose none of the flushes before the failed one, call its
+    /// `wait` and check that it succeeded. Then give the sender back: the
+    /// pool closes it instead of lending it again. Borrow a new sender and
+    /// flush the buffer through it.
+    ///
+    /// Distinct from [`SocketError`](Self::SocketError), so that callers can
+    /// tell **by code** a flush that is safe to send again from a failure of
+    /// the connection.
+    FlushAborted,
 }
 
 /// How a token source or token provider classified a failure to supply a
@@ -957,6 +1004,7 @@ mod tests {
                 ErrorCode::BatchTooLarge => {}
                 ErrorCode::StoreResendRequired => {}
                 ErrorCode::SymbolDictFull => {}
+                ErrorCode::FlushAborted => {}
             }
         }
         let _ = _exhaustive;

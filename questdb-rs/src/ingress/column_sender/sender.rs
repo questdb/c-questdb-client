@@ -31,19 +31,23 @@ use std::time::{Duration, Instant};
 use crate::ErrorCode;
 use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
-use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+use crate::ingress::buffer::{
+    Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, QwpWsFrameBlock, SymbolGlobalDict,
+};
 use crate::ingress::conf::DurableAckTiers;
 use crate::ingress::sender::ack_wait_timeout_error;
 use crate::ingress::sender::effective_hard_frame_cap;
 use crate::ingress::sender::qwp_ws::{
-    SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
-    qwp_ws_begin_close_background, qwp_ws_check_error_background,
-    qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
-    qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
-    qwp_ws_progress_generation_background, qwp_ws_published_fsn_background,
-    qwp_ws_reconnect_failure_background, qwp_ws_sender_errors_dropped_background,
-    qwp_ws_wait_for_progress_background, sfa_has_deferred_commit_slot,
+    QwpWsFlushError, SyncQwpWsHandlerState, flush_qwp_ws_pooled, publish_qwp_ws_payload_background,
+    qwp_ws_acked_fsn_background, qwp_ws_begin_close_background, qwp_ws_check_error_background,
+    qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_not_in_frames_hint,
+    qwp_ws_ok_fsn_background, qwp_ws_poll_sender_error_background,
+    qwp_ws_poll_sender_error_notification_background, qwp_ws_progress_generation_background,
+    qwp_ws_published_fsn_background, qwp_ws_reconnect_failure_background,
+    qwp_ws_sender_errors_dropped_background, qwp_ws_wait_for_progress_background,
+    sfa_has_deferred_commit_slot,
 };
+use crate::ingress::sender::qwp_ws_publisher::QwpWsFlushEncoder;
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
 #[cfg(feature = "arrow-ingress")]
 use crate::ingress::{ColumnName, TableName};
@@ -281,6 +285,98 @@ struct SfaBackend {
     last_ok_sync_boundary: Option<u64>,
     last_durable_sync_boundary: Option<u64>,
     drop_on_return: bool,
+}
+
+/// The encoder that the row and column flushes of a pooled sender share, as
+/// what a flush of a row buffer encodes its frames with. Each frame is one
+/// transaction of [`SfaForegroundPublisher::encode_persist_publish`].
+struct SfaBufferEncoder<'a> {
+    foreground: &'a mut SfaForegroundPublisher,
+    scratch: &'a mut QwpWsEncodeScratch,
+}
+
+impl SfaBufferEncoder<'_> {
+    fn publish_frame(
+        &mut self,
+        frame_cap: usize,
+        encode: impl FnOnce(
+            &mut Vec<u8>,
+            &mut QwpWsEncodeScratch,
+            &mut SymbolGlobalDict,
+            bool,
+        ) -> crate::Result<()>,
+        publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
+    ) -> crate::Result<u64> {
+        let scratch = &mut *self.scratch;
+        let outcome = self.foreground.encode_persist_publish(
+            frame_cap,
+            |payload, symbol_dict, delta_enabled| {
+                encode(payload, scratch, symbol_dict, delta_enabled)
+            },
+            publish,
+        )?;
+        match outcome {
+            SfaPublishOutcome::Published(fsn) => Ok(fsn),
+            SfaPublishOutcome::TooLarge {
+                encoded_len,
+                max_buf_size,
+            } => Err(sfa_frame_size_error(encoded_len, max_buf_size)),
+        }
+    }
+}
+
+impl QwpWsFlushEncoder for SfaBufferEncoder<'_> {
+    fn encode_and_publish(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        max_buf_size: usize,
+        publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
+    ) -> crate::Result<u64> {
+        self.publish_frame(
+            max_buf_size,
+            |payload, scratch, symbol_dict, delta_enabled| {
+                buffer.encode_ws_replay_message_with_defer(
+                    payload,
+                    scratch,
+                    symbol_dict,
+                    super::wire::QWP_VERSION_1,
+                    false,
+                    delta_enabled,
+                )
+            },
+            publish,
+        )
+    }
+
+    /// Only while [`Self::delta_dict_enabled`] holds: the frame is encoded
+    /// in delta mode whatever the publisher says.
+    fn encode_and_publish_frame(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        blocks: &[QwpWsFrameBlock],
+        defer_commit: bool,
+        frame_cap: usize,
+        publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
+    ) -> crate::Result<u64> {
+        self.publish_frame(
+            frame_cap,
+            |payload, scratch, symbol_dict, _| {
+                buffer.encode_ws_frame(
+                    blocks,
+                    payload,
+                    scratch,
+                    symbol_dict,
+                    super::wire::QWP_VERSION_1,
+                    defer_commit,
+                )
+            },
+            publish,
+        )
+    }
+
+    fn delta_dict_enabled(&self) -> bool {
+        self.foreground.delta_enabled()
+    }
 }
 
 impl Debug for PooledSenderCore {
@@ -1584,8 +1680,15 @@ impl SfaBackend {
     /// leaves the slot unresolved persists the dictionary too, and the next
     /// borrower re-seeds from the side-file at the same size (see the
     /// `SymbolDictFull` remedy docs).
+    ///
+    /// The same for [`FlushAborted`](ErrorCode::FlushAborted), the error of a
+    /// flush of a row buffer that stopped part way: the connection takes no
+    /// more publications, each of which gets that error.
     fn latch_if_connection_is_spent(&mut self, err: &crate::Error) {
-        if err.code() == ErrorCode::SymbolDictFull {
+        if matches!(
+            err.code(),
+            ErrorCode::SymbolDictFull | ErrorCode::FlushAborted
+        ) {
             self.drop_on_return = true;
         }
     }
@@ -1606,9 +1709,24 @@ impl SfaBackend {
             return Ok(None);
         }
 
-        // A Buffer is one indivisible publication (no row-range slicing), so
-        // only the hard cap applies — there is no split to soft-target.
-        let frame_cap = self.effective_frame_caps().hard;
+        buffer
+            .check_can_flush()
+            .map_err(FlushFailure::NotDelivered)?;
+
+        // A buffer goes out as one frame, or in frames that the server
+        // commits together when it is above the frame cap and the server
+        // has told its frame limit: see `flush_qwp_ws_through`. Either way
+        // it is one publication, with no soft target as a split of a chunk
+        // has.
+        let (frame_cap, server_frame_limit_known) = self.effective_hard_frame_cap();
+        let max_buf_size = self.max_buf_size;
+        // What keeps a buffer above the frame cap from going out in several
+        // frames, when one thing does.
+        let not_in_frames_hint = qwp_ws_not_in_frames_hint(
+            frame_cap >= max_buf_size,
+            server_frame_limit_known,
+            self.foreground.delta_enabled(),
+        );
         let result = {
             let Self {
                 foreground,
@@ -1616,39 +1734,39 @@ impl SfaBackend {
                 buffer_scratch,
                 ..
             } = self;
-            foreground.encode_persist_publish(
+            let mut encoder = SfaBufferEncoder {
+                foreground,
+                scratch: buffer_scratch,
+            };
+            flush_qwp_ws_pooled(
+                state,
+                &mut encoder,
+                buffer,
                 frame_cap,
-                |payload, symbol_dict, delta_enabled| {
-                    buffer.encode_ws_replay_message_with_defer(
-                        payload,
-                        buffer_scratch,
-                        symbol_dict,
-                        super::wire::QWP_VERSION_1,
-                        false,
-                        delta_enabled,
-                    )
-                },
-                |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
+                max_buf_size,
+                server_frame_limit_known,
             )
         };
+        let result = result.map_err(|err| match err {
+            // The buffer did not fit one frame.
+            QwpWsFlushError::Failed(err)
+                if !not_in_frames_hint.is_empty() && err.code() == ErrorCode::BatchTooLarge =>
+            {
+                crate::Error::new(
+                    ErrorCode::BatchTooLarge,
+                    format!("{}{}", err.msg(), not_in_frames_hint),
+                )
+            }
+            QwpWsFlushError::Refused(err) | QwpWsFlushError::Failed(err) => err,
+        });
         if let Err(err) = &result {
             self.latch_if_connection_is_spent(err);
         }
-        match result.map_err(FlushFailure::NotDelivered)? {
-            SfaPublishOutcome::Published(fsn) => {
-                // A buffer frame always commits, so it also closes a group a
-                // failed split could not.
-                self.sfa_deferred_group_open = false;
-                Ok(Some(fsn))
-            }
-            SfaPublishOutcome::TooLarge {
-                encoded_len,
-                max_buf_size,
-            } => Err(FlushFailure::NotDelivered(sfa_frame_size_error(
-                encoded_len,
-                max_buf_size,
-            ))),
-        }
+        let fsn = result.map_err(FlushFailure::NotDelivered)?;
+        // The last frame of a buffer always commits, so it also closes a
+        // group a failed split could not.
+        self.sfa_deferred_group_open = false;
+        Ok(fsn)
     }
 
     fn flush_chunk(

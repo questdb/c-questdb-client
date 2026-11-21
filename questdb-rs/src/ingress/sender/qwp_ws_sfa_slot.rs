@@ -172,6 +172,10 @@ impl PublicationLog for SfaSlotQueue {
         self.queue.take_producer()
     }
 
+    fn producer(&self) -> Option<&SfaProducer> {
+        PublicationLog::producer(&self.queue)
+    }
+
     fn progress_view(&self) -> super::qwp_ws_sfa_queue::SfaProgressView {
         self.queue.progress_view()
     }

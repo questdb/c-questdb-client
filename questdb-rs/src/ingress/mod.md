@@ -137,6 +137,25 @@ A durable poll or wait the sender was not opened for is rejected;
 `acked_fsn` reports the watermark at the sender's configured level and is
 never rejected on that account.
 
+A buffer larger than one frame (see
+[`sender.effective_frame_cap()`](Sender::effective_frame_cap)) is published as
+several frames that the server commits together, one commit per table, when
+the server advertised its frame limit, with the queue in memory and with
+`sf_dir`. The FSN that such a flush returns is the one of its last frame, and
+the server confirms the flush once, at its end. A sender whose server
+advertised no frame limit, and one that could not write the symbol file of its
+`sf_dir` slot, refuses such a buffer with
+[`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge) and sends nothing
+of it. A flush that stops after some of its frames were queued fails with
+[`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted): the buffer keeps
+its rows, and the sender must be replaced. With `sf_dir`, a sender that opens
+a slot removes a flush whose last frame was never written: after a process
+was killed inside a flush nothing of that flush is sent, so flush the buffer
+again. The memory such a flush needs, the server's row limit, the timeouts to
+mind, what a large flush costs with `sf_dir` and what an older client does
+with such a slot are in the section "Row buffers larger than one frame" of the
+[Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md#row-buffers-larger-than-one-frame).
+
 Configure `sf_dir` to recover the local publication log after reconnects and
 producer-process restarts. The default `sf_durability=memory` mode relies on
 the OS page cache and does not cover host power loss.
@@ -385,6 +404,12 @@ In order to ensure in advance that a flush will be transactional, call
 [`sender.flush_and_keep_with_flags(&mut buffer, true)`](Sender::flush_and_keep_with_flags).
 This call will refuse to flush a buffer if the flush wouldn't be transactional.
 
+With QWP/WebSocket, the rows that one `flush()` brings for a table are one
+commit, also when the buffer is larger than one frame and goes out in several
+(see [QWP/WebSocket](#qwpwebsocket) above). A flush with rows of several
+tables commits each table by itself, and one with more rows of a table than
+the server's `qwp.max.uncommitted.rows` is committed in parts.
+
 ## When to Choose the TCP Transport?
 
 As discussed above, the TCP transport mode is raw and simplistic: it doesn't
@@ -534,6 +559,7 @@ document covers these topics:
 * Data Quality
 * Client-side checks and server errors
 * Flushing
+* Row buffers larger than one QWP/WebSocket frame
 * Disconnections, data errors and troubleshooting
 
 # Troubleshooting Common Issues

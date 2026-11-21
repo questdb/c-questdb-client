@@ -573,6 +573,11 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.take_producer()
     }
 
+    /// See [`PublicationLog::producer`].
+    pub(crate) fn producer(&self) -> Option<&SfaProducer> {
+        self.queue.producer()
+    }
+
     pub(crate) fn progress_view(&self) -> SfaProgressView {
         self.queue.progress_view()
     }
@@ -786,6 +791,14 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
     pub(crate) fn completed_fsn(&self) -> Option<u64> {
         self.queue.completed_fsn()
+    }
+
+    /// How many of the frames up to `last` the server has not confirmed.
+    pub(crate) fn unconfirmed_through(&self, last: Option<u64>) -> u64 {
+        match (self.queue.oldest_unresolved_fsn(), last) {
+            (Some(oldest), Some(last)) if oldest <= last => last - oldest + 1,
+            _ => 0,
+        }
     }
 
     pub(crate) fn close_queue(&mut self) -> Result<(), DriverError> {
@@ -1319,7 +1332,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         Ok(DriveOutcome::Acked { wire_seq })
     }
 
-    fn close_publication_queue<Q: PublicationLog>(
+    pub(crate) fn close_publication_queue<Q: PublicationLog>(
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
     ) -> Result<(), DriverError> {
@@ -2982,6 +2995,11 @@ pub(super) fn retry_budget_exhausted_error(
 pub(crate) trait PublicationLog {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError>;
     fn take_producer(&mut self) -> Option<SfaProducer> {
+        None
+    }
+    /// The producer, while the log holds it: until [`Self::take_producer`]
+    /// or the close of the log.
+    fn producer(&self) -> Option<&SfaProducer> {
         None
     }
     fn progress_view(&self) -> SfaProgressView;

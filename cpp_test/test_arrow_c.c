@@ -143,6 +143,28 @@ TEST(test_query_timeout_is_a_distinct_appended_code)
         "neutral alias resolves to the same enumerator");
 }
 
+TEST(test_flush_aborted_is_a_distinct_appended_code)
+{
+    /* A flush that stopped part way is safe to send again through a new
+     * sender, which a failure of the connection is not: callers must be able
+     * to tell the two apart by code. */
+    CHECK(
+        line_sender_error_flush_aborted != line_sender_error_socket_error,
+        "flush_aborted distinct from socket_error");
+    CHECK(
+        line_sender_error_flush_aborted != line_sender_error_invalid_api_call,
+        "flush_aborted distinct from invalid_api_call");
+    CHECK(
+        line_sender_error_flush_aborted > line_sender_error_query_timeout,
+        "flush_aborted appended (not renumbered)");
+    CHECK(
+        line_sender_error_flush_aborted == 39,
+        "flush_aborted discriminant pinned at 39 for cached ABI consumers");
+    CHECK(
+        questdb_error_flush_aborted == line_sender_error_flush_aborted,
+        "neutral alias resolves to the same enumerator");
+}
+
 TEST(test_query_set_timeout_ms_null_query_is_tolerated)
 {
     /* Proves the symbol links and argument-marshals under a plain C
@@ -1204,6 +1226,265 @@ TEST(test_one_sender_flushes_buffer_and_chunk)
     mock_return_close(mock, db, sender);
 }
 
+/* A standalone QWP/WebSocket sender, connected to a mock that takes ingress
+ * frames as a server with a frame limit of `frame_limit` bytes does. Returns
+ * NULL on any setup failure; populates *out_mock on success. */
+static line_sender* ingress_sender(qwp_mock_c** out_mock, size_t frame_limit)
+{
+    *out_mock = NULL;
+    qwp_mock_c* mock = qwp_mock_c_start_ingress(frame_limit);
+    if (mock == NULL)
+        return NULL;
+    char conf[128];
+    snprintf(conf, sizeof(conf), "ws::addr=%s;", qwp_mock_c_addr(mock));
+    line_sender_utf8 conf_utf8 = {strlen(conf), conf};
+    line_sender_error* err = NULL;
+    line_sender* sender = line_sender_from_conf(conf_utf8, &err);
+    if (sender == NULL)
+    {
+        if (err)
+            line_sender_error_free(err);
+        qwp_mock_c_stop(mock);
+        return NULL;
+    }
+    *out_mock = mock;
+    return sender;
+}
+
+/* True when `err` has `code` and its message contains `text`. Frees `err`. */
+static bool error_is(
+    line_sender_error* err, line_sender_error_code code, const char* text)
+{
+    if (err == NULL)
+        return false;
+    size_t len = 0;
+    const char* msg = line_sender_error_msg(err, &len);
+    const size_t text_len = strlen(text);
+    bool found = false;
+    for (size_t i = 0; !found && i + text_len <= len; ++i)
+        found = memcmp(msg + i, text, text_len) == 0;
+    const bool same_code = line_sender_error_get_code(err) == code;
+    if (!same_code || !found)
+        fprintf(
+            stderr,
+            "error code %d: %.*s\n",
+            (int)line_sender_error_get_code(err),
+            (int)len,
+            msg);
+    line_sender_error_free(err);
+    return same_code && found;
+}
+
+/* One flush of a row buffer above the frame cap goes out in several frames:
+ * all but the last have the defer flag, so the server commits them together
+ * when the last one comes, and its answer confirms the whole flush. */
+TEST(test_flush_above_the_frame_cap_goes_out_in_frames)
+{
+    const size_t frame_limit = 64 * 1024;
+    const int64_t rows = 20000;
+    qwp_mock_c* mock;
+    line_sender* sender = ingress_sender(&mock, frame_limit);
+    CHECK(sender != NULL, "sender connected to the mock");
+    if (sender == NULL)
+        return;
+    line_sender_error* err = NULL;
+    line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
+    CHECK(buffer != NULL, "buffer of the sender");
+
+    size_t cap = 0;
+    bool server_cap_known = false;
+    CHECK(
+        line_sender_qwpws_effective_frame_cap(
+            sender, &cap, &server_cap_known, &err),
+        "frame cap read");
+    CHECK(cap == frame_limit, "the frame cap is the limit the server told");
+    CHECK(server_cap_known, "the server told its frame limit");
+
+    line_sender_table_name table = make_table("c_large_flush");
+    line_sender_column_name id = make_col("id");
+    bool added = true;
+    for (int64_t i = 0; added && i < rows; ++i)
+        added = line_sender_buffer_table(buffer, table, &err) &&
+                line_sender_buffer_column_i64(buffer, id, i, &err) &&
+                line_sender_buffer_at_nanos(
+                    buffer, 1700000000000000000LL + i, &err);
+    CHECK(added, "rows added");
+    CHECK(
+        line_sender_buffer_size(buffer) > 4 * frame_limit,
+        "the buffer is several times the frame cap");
+
+    line_sender_qwpws_fsn fsn = {false, 0};
+    CHECK(
+        line_sender_qwpws_flush_and_get_fsn(sender, buffer, &fsn, &err),
+        "a buffer above the frame cap is flushed");
+    CHECK(line_sender_buffer_row_count(buffer) == 0, "the flush clears it");
+    CHECK(
+        line_sender_qwpws_wait(sender, qwpws_ack_level_ok, 5000, &err),
+        "the flush is confirmed");
+    line_sender_qwpws_fsn acked = {false, 0};
+    CHECK(line_sender_qwpws_acked_fsn(sender, &acked, &err), "acked read");
+    CHECK(
+        fsn.has_value && acked.has_value && acked.value == fsn.value,
+        "the flush is confirmed up to its last frame");
+
+    /* The server answered the last frame, so it has counted them all. */
+    const size_t frames = qwp_mock_c_ingress_frame_count(mock);
+    CHECK(frames > 4, "the flush went out in several frames");
+    CHECK(
+        fsn.value + 1 == frames,
+        "the flush returns the number of its last frame");
+    for (size_t i = 0; i < frames; ++i)
+    {
+        size_t size = 0;
+        bool deferred = false;
+        CHECK(
+            qwp_mock_c_ingress_frame(mock, i, &size, &deferred),
+            "frame recorded");
+        CHECK(size <= frame_limit, "each frame is within the frame limit");
+        CHECK(
+            deferred == (i + 1 < frames),
+            "every frame but the last has the defer flag");
+    }
+
+    CHECK(line_sender_qwpws_close_drain(sender, &err), "close_drain");
+    CHECK(!line_sender_must_close(sender), "the sender is in order");
+    CHECK(err == NULL, "no error");
+    if (err != NULL)
+        line_sender_error_free(err);
+    line_sender_buffer_free(buffer);
+    line_sender_close(sender);
+    qwp_mock_c_stop(mock);
+}
+
+/* A flush in several frames that cannot queue one of them, here because the
+ * symbol dictionary of the connection is full (2,000,000 entries), fails
+ * with `line_sender_error_flush_aborted`: nothing of it is committed, the
+ * buffer keeps its rows, and the sender takes no more flushes while it still
+ * delivers the flush before. */
+TEST(test_flush_that_stops_part_way_fails_with_flush_aborted)
+{
+    const size_t frame_limit = 1024 * 1024;
+    /* With the symbol of the first flush, one more than the dictionary
+     * holds. */
+    const size_t symbols = 2000000;
+    qwp_mock_c* mock;
+    line_sender* sender = ingress_sender(&mock, frame_limit);
+    CHECK(sender != NULL, "sender connected to the mock");
+    if (sender == NULL)
+        return;
+    line_sender_error* err = NULL;
+    line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
+    CHECK(buffer != NULL, "buffer of the sender");
+    line_sender_table_name table = make_table("c_aborted_flush");
+    line_sender_column_name sym = make_col("sym");
+
+    line_sender_utf8 first = {strlen("first"), "first"};
+    CHECK(
+        line_sender_buffer_table(buffer, table, &err) &&
+            line_sender_buffer_symbol(buffer, sym, first, &err) &&
+            line_sender_buffer_at_nanos(buffer, 1700000000000000000LL, &err),
+        "a row added");
+    line_sender_qwpws_fsn before = {false, 0};
+    CHECK(
+        line_sender_qwpws_flush_and_get_fsn(sender, buffer, &before, &err),
+        "the flush before");
+    CHECK(before.has_value, "the flush before has a frame number");
+
+    bool added = true;
+    for (size_t i = 0; added && i < symbols; ++i)
+    {
+        char text[16];
+        const int len = snprintf(text, sizeof(text), "%x", (unsigned)i);
+        line_sender_utf8 symbol = {(size_t)len, text};
+        added = line_sender_buffer_table(buffer, table, &err) &&
+                line_sender_buffer_symbol(buffer, sym, symbol, &err) &&
+                line_sender_buffer_at_nanos(
+                    buffer, 1700000000000000000LL + (int64_t)i, &err);
+    }
+    CHECK(added, "rows added");
+    CHECK(err == NULL, "no error so far");
+
+    CHECK(
+        !line_sender_flush(sender, buffer, &err),
+        "the flush that fills the dictionary fails");
+    CHECK(
+        err != NULL && !line_sender_error_in_doubt(err),
+        "nothing of the flush is committed: the error is not in doubt");
+    CHECK(
+        error_is(
+            err, line_sender_error_flush_aborted, "the flush stopped part way"),
+        "the flush fails with flush_aborted");
+    err = NULL;
+    CHECK(
+        line_sender_buffer_row_count(buffer) == symbols,
+        "the buffer keeps its rows");
+    CHECK(line_sender_must_close(sender), "the sender must be closed");
+    line_sender_qwpws_fsn published = {false, 0};
+    CHECK(
+        line_sender_qwpws_published_fsn(sender, &published, &err),
+        "published read");
+    CHECK(
+        published.has_value && published.value == before.value,
+        "published is the last frame before the failed flush");
+
+    /* A row whose symbol the dictionary holds: its flush would fit. */
+    line_sender_buffer* small = line_sender_buffer_new_for_sender(sender);
+    CHECK(small != NULL, "second buffer of the sender");
+    CHECK(
+        line_sender_buffer_table(small, table, &err) &&
+            line_sender_buffer_symbol(small, sym, first, &err) &&
+            line_sender_buffer_at_nanos(small, 1700000000000000000LL, &err),
+        "a row added");
+    CHECK(
+        !line_sender_flush(sender, small, &err),
+        "the sender takes no more flushes");
+    CHECK(
+        error_is(
+            err, line_sender_error_flush_aborted, "the flush stopped part way"),
+        "a later flush fails with flush_aborted too");
+    err = NULL;
+    CHECK(
+        line_sender_buffer_row_count(small) == 1, "that buffer keeps its row");
+    line_sender_buffer_free(small);
+
+    CHECK(
+        line_sender_qwpws_wait(sender, qwpws_ack_level_ok, 5000, &err),
+        "wait covers the flush before the failed one");
+    line_sender_qwpws_fsn acked = {false, 0};
+    CHECK(line_sender_qwpws_acked_fsn(sender, &acked, &err), "acked read");
+    CHECK(
+        acked.has_value && acked.value == before.value,
+        "the flush before is confirmed");
+    CHECK(
+        line_sender_qwpws_close_drain(sender, &err),
+        "close_drain succeeds after the failed flush");
+    CHECK(err == NULL, "no error after the failed flush");
+    if (err != NULL)
+        line_sender_error_free(err);
+    line_sender_buffer_free(buffer);
+    line_sender_close(sender);
+
+    /* The server took the flush before, and of the failed flush only frames
+     * with the defer flag: never the frame that commits it. */
+    CHECK(
+        qwp_mock_c_wait_for_ingress_closed(mock, 1, 5000),
+        "the connection ended");
+    const size_t frames = qwp_mock_c_ingress_frame_count(mock);
+    CHECK(frames > 2, "frames of the failed flush were sent");
+    for (size_t i = 0; i < frames; ++i)
+    {
+        size_t size = 0;
+        bool deferred = false;
+        CHECK(
+            qwp_mock_c_ingress_frame(mock, i, &size, &deferred),
+            "frame recorded");
+        CHECK(
+            deferred == (i > 0),
+            "only the flush before was sent to be committed");
+    }
+    qwp_mock_c_stop(mock);
+}
+
 static void run_arrow_flush(
     struct ArrowArray* arr,
     struct ArrowSchema* sch,
@@ -1647,6 +1928,7 @@ int main(void)
     RUN(test_appended_sender_error_codes_exist);
     RUN(test_symbol_dict_full_is_a_distinct_appended_code);
     RUN(test_query_timeout_is_a_distinct_appended_code);
+    RUN(test_flush_aborted_is_a_distinct_appended_code);
     RUN(test_query_set_timeout_ms_null_query_is_tolerated);
     RUN(test_egress_null_cursor_returns_error_tristate);
     RUN(test_egress_null_out_array_returns_error_tristate);
@@ -1678,6 +1960,8 @@ int main(void)
     RUN(test_chunk_append_numpy_column_data_len_exact_ok);
     RUN(test_error_codes_survive_ffi_boundary);
     RUN(test_one_sender_flushes_buffer_and_chunk);
+    RUN(test_flush_above_the_frame_cap_goes_out_in_frames);
+    RUN(test_flush_that_stops_part_way_fails_with_flush_aborted);
     RUN(test_mock_ingress_null_array_via_real_conn);
     RUN(test_mock_ingress_at_column_empty_name_via_real_conn);
     RUN(test_mock_ingress_boolean_column);

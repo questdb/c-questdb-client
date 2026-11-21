@@ -3784,6 +3784,18 @@ unsafe fn acquire_qwp_sender(
 
 /// Publish a QWP/WebSocket Buffer into the local store-and-forward queue and
 /// clear it after local acceptance.
+///
+/// A Buffer above the frame cap (`qwp_sender_effective_frame_cap`) is published
+/// as several frames that the server commits together, when the connection
+/// advertised `X-QWP-Max-Batch-Size`, with the queue in memory and with
+/// `sf_dir`. When the connection advertised none, and when the sender could not
+/// write the symbol file of its `sf_dir` slot, it fails with
+/// `line_sender_error_batch_too_large` and nothing is published. A flush in
+/// several frames that stops after some of them were published fails with
+/// `line_sender_error_flush_aborted`: nothing of it is committed, the Buffer
+/// keeps its rows, and the sender takes no more flushes while it still delivers
+/// the ones before. That code says what the holder of a pooled sender does
+/// next. The same holds for the other `qwp_sender_flush_buffer*` functions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_sender_flush_buffer(
     sender: *mut qwp_sender,
@@ -4322,7 +4334,8 @@ pub unsafe extern "C" fn qwp_sender_error_events_dropped(
 /// whether the current connection advertised `X-QWP-Max-Batch-Size` (whether
 /// or not that value is the binding limit). The cap is always bounded by
 /// configured `max_buf_size` and the queue's segment payload capacity, and may
-/// change after reconnect.
+/// change after reconnect. A Buffer above the cap is published as several
+/// frames or refused: see `qwp_sender_flush_buffer`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_sender_effective_frame_cap(
     sender: *const qwp_sender,
@@ -4387,7 +4400,10 @@ pub unsafe extern "C" fn qwp_sender_effective_frame_cap(
 
 /// Return the highest QWP/WebSocket frame sequence number published locally
 /// through this store-and-forward QWP sender, or no value if no frame has
-/// been published.
+/// been published. After a flush that failed with
+/// `line_sender_error_flush_aborted` this is the last frame published before
+/// that flush, or no value if there was none: the frames of the failed flush
+/// are never confirmed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_sender_published_fsn(
     sender: *const qwp_sender,
@@ -5382,7 +5398,9 @@ unsafe fn cs_wait_body<T: CsHandle>(
 /// terminal connection failure fails it. Server rejections — the borrow's
 /// own and earlier borrows' alike — are delivered to the pool's rejection
 /// handler (default: logged) rather than raised here; retriable ones are
-/// replayed by the queue.
+/// replayed by the queue. After a flush that failed with
+/// `line_sender_error_flush_aborted` the barrier covers the frames published
+/// before that flush, and succeeds once they reach `ack_level`.
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.

@@ -103,6 +103,41 @@ fn take_sfa_barriers() -> Vec<SfaBarrierEvent> {
     SFA_BARRIER_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }
 
+#[cfg(test)]
+thread_local! {
+    static UNFINISHED_FLUSH_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROTATION_SYNC_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` once, on this thread, when a rotation is about to sync the
+/// segment it leaves: see [`SfaProducer::rotate_active`].
+#[cfg(test)]
+fn before_rotation_sync_for_test(hook: impl FnOnce() + 'static) {
+    ROTATION_SYNC_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_rotation_sync_hook() {
+    if let Some(hook) = ROTATION_SYNC_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Runs `open` with the recovery of a release that does not know
+/// [`remove_unfinished_flush`].
+#[cfg(test)]
+fn as_a_release_without_the_removal<R>(open: impl FnOnce() -> R) -> R {
+    UNFINISHED_FLUSH_KEPT.with(|kept| kept.set(true));
+    let opened = open();
+    UNFINISHED_FLUSH_KEPT.with(|kept| kept.set(false));
+    opened
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SfaQueueOptions {
     pub(crate) slot_dir: PathBuf,
@@ -1602,7 +1637,7 @@ impl SfaProducer {
         // Reserve the topology transaction and detach its manifest writer.
         // Until commit, readers keep seeing the previous active and sealed
         // chain. No filesystem operation below holds the engine-state mutex.
-        let (candidate, mut manifest, old_active, head_base, reserved_new_segment) = {
+        let (candidate, mut manifest, old_active, head_base, reserved_new_segment, sync_old_active) = {
             let mut state = self.engine.lock_state()?;
             let active = state.active.as_ref().ok_or(SfaQueueError::Closed)?;
             if !Arc::ptr_eq(active, &self.active) {
@@ -1613,7 +1648,18 @@ impl SfaProducer {
             if state.topology_io_in_flight {
                 return Err(self.engine.rotation_backpressure_error(&state).into());
             }
-            if self.engine.request_sync_before_rotation(active) {
+            // Periodic durability seals a segment only once it is synced.
+            // The runner syncs on its cadence, but it gets to storage
+            // maintenance only from its connected loop: not while it
+            // reconnects, and not while it is parked in socket I/O. So
+            // this appender syncs the segment itself, inside the topology
+            // transaction reserved below, which keeps a sync of the runner
+            // out. When a storage task of the runner is under way, it waits
+            // for that one, which may be this sync.
+            let sync_old_active =
+                self.engine.periodic_sync_interval.is_some() && !active.is_published_durable();
+            if sync_old_active && state.storage_maintenance_in_flight {
+                self.engine.sync_requested.store(true, Ordering::Release);
                 return Err(self.engine.rotation_backpressure_error(&state).into());
             }
             if self.engine.slot_dir.is_some() && state.manifest.is_none() {
@@ -1681,11 +1727,26 @@ impl SfaProducer {
                 old_active,
                 head_base,
                 reserved_new_segment,
+                sync_old_active,
             )
         };
 
-        let prepared = match candidate {
-            Candidate::Existing(mut segment) => {
+        #[cfg(test)]
+        if sync_old_active {
+            run_rotation_sync_hook();
+        }
+        // A failed sync fails this append and no other: the next one syncs
+        // again. Nothing is latched, because only a sync of the runner would
+        // clear a latch.
+        let synced = if sync_old_active {
+            old_active.sync_published()
+        } else {
+            Ok(())
+        };
+        let prepared = match (synced, candidate) {
+            (Err(err), Candidate::Existing(segment)) => Err((Some(segment), err.into())),
+            (Err(err), Candidate::Create { .. }) => Err((None, err.into())),
+            (Ok(()), Candidate::Existing(mut segment)) => {
                 let result = match Arc::get_mut(&mut segment) {
                     Some(shared) => shared.rebase_empty(self.next_fsn).map_err(Into::into),
                     None => Err(SfaQueueError::CorruptSegments {
@@ -1697,7 +1758,7 @@ impl SfaProducer {
                     Err(err) => Err((Some(segment), err)),
                 }
             }
-            Candidate::Create { path, created_us } => {
+            (Ok(()), Candidate::Create { path, created_us }) => {
                 let result = match path.as_deref() {
                     Some(path) => match path.parent() {
                         Some(slot_dir) => create_manifested_segment(
@@ -1917,14 +1978,6 @@ impl SfaEngine {
         state.storage_maintenance_in_flight = false;
         state.hot_spare_creation_in_flight = false;
         Ok(())
-    }
-
-    fn request_sync_before_rotation(&self, active: &SfaSharedSegment) -> bool {
-        if self.periodic_sync_interval.is_some() && !active.is_published_durable() {
-            self.sync_requested.store(true, Ordering::Release);
-            return true;
-        }
-        false
     }
 
     fn rotation_backpressure_error(&self, state: &SfaEngineState) -> QueueError {
@@ -2596,6 +2649,10 @@ impl PublicationLog for SfaFrameQueue {
         SfaFrameQueue::take_producer(self)
     }
 
+    fn producer(&self) -> Option<&SfaProducer> {
+        self.producer.as_ref()
+    }
+
     fn progress_view(&self) -> SfaProgressView {
         SfaFrameQueue::progress_view(self)
     }
@@ -2794,6 +2851,7 @@ struct RecoveredSegment {
 fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueueError> {
     let mut all = Vec::new();
     let mut corrupt_paths = Vec::new();
+    let mut never_written_paths = Vec::new();
     let mut diagnostics = Vec::new();
 
     for entry in fs::read_dir(&options.slot_dir)? {
@@ -2811,6 +2869,10 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
                 return Err(err.into());
             }
             Err(err) => {
+                if segment_file_was_never_written(&path, &err)? {
+                    never_written_paths.push(path);
+                    continue;
+                }
                 diagnostics.push(SfaRecoveryDiagnostic::SkippedSegment {
                     path: path.clone(),
                     error: format!("{err:?}"),
@@ -2843,6 +2905,22 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
             torn_tail_bytes: scan.torn_tail_bytes,
             manifest_required: scan.manifest_required,
         });
+    }
+
+    // A segment file gets its name before it gets its header. A process that
+    // died in between left a file that was never written: the spare that the
+    // runner makes after every rotation, or the successor that an appender
+    // makes itself. It holds no frame, and no manifest names it, because a
+    // segment is named only once its header is synced. So it goes like any
+    // other leftover file and is not a corrupt segment, which would refuse a
+    // slot whose segment in use is still empty.
+    for path in never_written_paths {
+        if let Err(err) = remove_file_if_exists(&path) {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path,
+                error: err.to_string(),
+            });
+        }
     }
 
     let mut manifest = SfManifest::open(&options.slot_dir)?;
@@ -3001,6 +3079,12 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
     cleanup_recovered_extras(&options.slot_dir, &all, &chain, &mut diagnostics);
     quarantine_paths(&corrupt_paths);
     opened.last_mut().unwrap().sanitize_torn_tail()?;
+    remove_unfinished_flush(
+        &options.slot_dir,
+        &mut opened,
+        manifest.as_mut(),
+        &mut diagnostics,
+    )?;
 
     let active = opened.pop().unwrap();
     let sealed_segments = VecDeque::from(opened);
@@ -3028,6 +3112,125 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
         manifest,
         diagnostics,
     })
+}
+
+/// Removes a flush that has no last frame from the end of a recovered chain.
+///
+/// A flush of several frames asks the server, in every frame but its last,
+/// to hold the rows until a later frame commits them. A process that died
+/// inside such a flush, or a sender that gave it up part way, leaves frames
+/// that defer their commit at the end of the slot with no frame behind them
+/// that commits. Nothing may ever follow them: the next frame that commits
+/// would commit their rows with its own. So the frames after the last one
+/// that commits are removed here, for a sender and for a drainer alike,
+/// before either sees the chain.
+///
+/// The frame that the watermark names as confirmed counts as one that
+/// commits: a server may confirm a part of a flush early, and nothing at or
+/// below a confirmed frame is removed. Removing it would also leave the
+/// watermark ahead of the chain, which the open distrusts and resets, and
+/// confirmed frames would be sent again. A watermark at or beyond the end of
+/// the chain is not trusted here either.
+///
+/// The frames go from the end backwards, and every step leaves a slot that
+/// this recovery, and that of every release, opens:
+///
+/// 1. the active segment is cut back, to the first frame to remove or to its
+///    own first frame, and synced ([`SfaSegment::cut_back_to`]): a segment
+///    that has lost every frame is what a rotation leaves before its first
+///    append;
+/// 2. when frames of the segment before are to go too, the manifest names
+///    that segment as the active one. The emptied file is then an extra,
+///    which is deleted here or by the next open, and the removal goes on
+///    with step 1.
+///
+/// An open that is stopped on the way leaves fewer frames of the same flush,
+/// and the next one finds the same place.
+fn remove_unfinished_flush(
+    slot_dir: &Path,
+    opened: &mut Vec<SfaSegment>,
+    mut manifest: Option<&mut SfManifest>,
+    diagnostics: &mut Vec<SfaRecoveryDiagnostic>,
+) -> Result<(), SfaQueueError> {
+    #[cfg(test)]
+    if UNFINISHED_FLUSH_KEPT.with(|kept| kept.get()) {
+        return Ok(());
+    }
+    let frames_end = |segment: &SfaSegment, frames: u64| {
+        segment
+            .header()
+            .base_seq
+            .checked_add(frames)
+            .ok_or(QueueError::SequenceOverflow)
+    };
+    let (Some(head), Some(tail)) = (opened.first(), opened.last()) else {
+        return Ok(());
+    };
+    let chain_end = frames_end(tail, tail.frame_count())?;
+    let committed_end = match opened
+        .iter()
+        .rev()
+        .find(|segment| segment.committed_frame_count() > 0)
+    {
+        Some(segment) => frames_end(segment, segment.committed_frame_count())?,
+        None => head.header().base_seq,
+    };
+    if committed_end >= chain_end {
+        return Ok(());
+    }
+    // The open reads the watermark after this, through the same call.
+    let confirmed_end = SfaAckWatermark::open(slot_dir)?
+        .read()?
+        .and_then(|acked_fsn| ack_watermark_completed_upper(acked_fsn, chain_end))
+        .unwrap_or(0);
+    let cut = committed_end.max(confirmed_end);
+    if cut >= chain_end {
+        return Ok(());
+    }
+    log::warn!(
+        "QWP/WebSocket store-and-forward slot {}: removing {} frame(s) of a flush that was cut          off before its last frame; nothing of that flush is committed.",
+        slot_dir.display(),
+        chain_end - cut
+    );
+
+    while let Some(active) = opened.last_mut() {
+        let active_base = active.header().base_seq;
+        active.cut_back_to(cut.saturating_sub(active_base))?;
+        if cut >= active_base || opened.len() == 1 {
+            break;
+        }
+        let previous_base = opened[opened.len() - 2].header().base_seq;
+        manifest
+            .as_deref_mut()
+            .ok_or_else(|| {
+                recovery_error(
+                    "cannot remove an unfinished flush from an SFA slot without its manifest",
+                )
+            })?
+            .move_active_back(previous_base)?;
+        // The mapping and the handle go first: an open file cannot be
+        // deleted everywhere.
+        let emptied = opened
+            .pop()
+            .and_then(|segment| segment.path().map(Path::to_path_buf));
+        #[cfg(test)]
+        super::qwp_ws_sfa_segment::removal_step_for_test()?;
+        if let Some(path) = emptied
+            && let Err(err) = remove_file_if_exists(&path)
+        {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path,
+                error: err.to_string(),
+            });
+        }
+        if let Err(err) = sync_directory(slot_dir) {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path: slot_dir.to_path_buf(),
+                error: err.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn recovery_error(reason: &'static str) -> SfaQueueError {
@@ -3093,6 +3296,30 @@ fn sanitize_sealed_residue(
         return Err(SfaQueueError::SanitizedResidue { path });
     }
     Ok(())
+}
+
+/// Whether a file that the scan refused as a segment was never written: it
+/// is shorter than a segment header or has zeroes where the magic belongs,
+/// and holds nothing but zeroes. A file with any other byte may be a damaged
+/// segment with frames, and stays a corrupt one.
+fn segment_file_was_never_written(path: &Path, refused: &SfaSegmentError) -> io::Result<bool> {
+    if !matches!(
+        refused,
+        SfaSegmentError::FileTooShort { .. } | SfaSegmentError::BadMagic { actual: 0 }
+    ) {
+        return Ok(false);
+    }
+    let mut file = fs::File::open(path)?;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match io::Read::read(&mut file, &mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(read) if chunk[..read].iter().any(|byte| *byte != 0) => return Ok(false),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn cleanup_recovered_extras(
@@ -3526,6 +3753,96 @@ pub(crate) fn two_frame_segment_payload_capacity(segment_size_bytes: u64) -> usi
     segment_payload_capacity(segment_size_bytes).saturating_sub(FRAME_HEADER_SIZE) / 2
 }
 
+/// How many new segments frames with payloads of `payload_lens` bytes take
+/// when they are appended one after another to a segment that is filled up to
+/// `append_offset`: a frame that does not fit the segment starts a new one.
+/// `None` when a frame fits no segment.
+fn new_segments_for_frames(
+    segment_size_bytes: u64,
+    mut append_offset: u64,
+    payload_lens: &[usize],
+) -> Option<u64> {
+    let payload_capacity = segment_payload_capacity(segment_size_bytes);
+    let mut new_segments = 0;
+    for &payload_len in payload_lens {
+        if payload_len > payload_capacity {
+            return None;
+        }
+        let frame_len = (FRAME_HEADER_SIZE + payload_len) as u64;
+        if append_offset + frame_len > segment_size_bytes {
+            new_segments += 1;
+            append_offset = HEADER_SIZE as u64;
+        }
+        append_offset += frame_len;
+    }
+    Some(new_segments)
+}
+
+impl SfaProducer {
+    /// Whether frames with payloads of `payload_lens` bytes can all be
+    /// appended now, one after another, without a wait for queue room.
+    ///
+    /// Every new segment they take must be the prepared spare or come out of
+    /// the free byte budget. A yes holds until the frames are appended: only
+    /// the appends of this producer take either away, because the runner
+    /// installs a spare out of the free budget and the next rotation uses it.
+    /// A no does not count the segments of confirmed frames that the runner
+    /// has yet to free.
+    pub(crate) fn has_room_for(&self, payload_lens: &[usize]) -> bool {
+        let segment_size_bytes = self.engine.segment_size_bytes;
+        let Some(new_segments) =
+            new_segments_for_frames(segment_size_bytes, self.active_append_offset, payload_lens)
+        else {
+            return false;
+        };
+        self.engine.with_state(|state| {
+            let spare = u64::from(state.hot_spare.is_some());
+            let free_bytes =
+                (self.engine.max_bytes as u64).saturating_sub(state.allocated_segment_bytes);
+            new_segments <= spare + free_bytes / segment_size_bytes
+        })
+    }
+
+    /// The least byte budget (`sf_max_total_bytes`) with which a queue of
+    /// segments like this one's takes frames with payloads of `payload_lens`
+    /// bytes as one flush, whatever it took before. `None` when a frame fits
+    /// no segment.
+    ///
+    /// The frames of a flush are confirmed together, so the queue holds them
+    /// all at once. It holds them next to the segment in use, which keeps its
+    /// frames, confirmed or not, until it is full. So the budget is that
+    /// segment and the segments that the frames fill when the first of them
+    /// starts a new one. With it, the frames have room wherever the producer
+    /// stands, once every frame before them is confirmed and the runner has
+    /// freed their segments. With a segment less they have room only when
+    /// the first of them fits the segment in use.
+    pub(crate) fn min_total_bytes_for(&self, payload_lens: &[usize]) -> Option<u64> {
+        let segment_size_bytes = self.engine.segment_size_bytes;
+        let segments =
+            new_segments_for_frames(segment_size_bytes, segment_size_bytes, payload_lens)?;
+        Some((segments + 1).saturating_mul(segment_size_bytes))
+    }
+
+    /// The byte budget of the queue (`sf_max_total_bytes`).
+    pub(crate) fn max_total_bytes(&self) -> u64 {
+        self.engine.max_bytes as u64
+    }
+
+    /// What frames wait for that [`Self::has_room_for`] finds no room for:
+    /// segments, which the runner frees once the server has confirmed the
+    /// frames in them. The queue tells a single frame the same when its byte
+    /// budget is used up. Frames that need several segments get this answer
+    /// while some of the budget is still free.
+    pub(crate) fn no_room_error(&self) -> QueueError {
+        self.engine
+            .with_state(|state| QueueError::StorageSegmentCapFull {
+                segment_size_bytes: self.engine.segment_size_bytes,
+                allocated_segment_bytes: state.allocated_segment_bytes,
+                max_total_bytes: self.engine.max_bytes as u64,
+            })
+    }
+}
+
 fn first_unresolved_fsn_from_segments(
     sealed_segments: &VecDeque<Arc<SfaSharedSegment>>,
     active: &Arc<SfaSharedSegment>,
@@ -3563,7 +3880,8 @@ mod tests {
         CloseOutcome, DriveOutcome, DriverEvent, FakeOrderedServer, QwpWsCoreTestHarness,
     };
     use super::super::qwp_ws_sfa_segment::{
-        fail_sync_after_for_test, initial_segment_path, scan_file, spare_segment_path,
+        clear_removal_stop_for_test, fail_sync_after_for_test, initial_segment_path, scan_file,
+        spare_segment_path, stop_removal_after_for_test,
     };
     use super::*;
 
@@ -3668,30 +3986,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn periodic_rotation_waits_for_a_requested_predecessor_sync() {
-        let dir = TempDir::new().unwrap();
+    /// A queue with periodic durability whose segments hold two frames of
+    /// 16 bytes, with two such frames in its first segment. They are not
+    /// synced: the next frame needs a new segment.
+    fn periodic_queue_with_a_full_segment(dir: &TempDir, first_sync_done: bool) -> SfaFrameQueue {
         let segment_size = (HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + 16)) as u64;
         let mut queue = SfaFrameQueue::open(periodic_options_with(
-            &dir,
+            dir,
             segment_size,
             3 * segment_size as usize,
         ))
         .unwrap();
-
-        assert!(queue.maintain_storage().unwrap());
-        assert!(active_is_durable(&queue));
+        if first_sync_done {
+            // The first sync of the network thread, which is due at once.
+            // The next is due an hour later.
+            assert!(queue.maintain_storage().unwrap());
+            assert!(active_is_durable(&queue));
+        }
         queue.try_submit(&[1; 16]).unwrap();
         queue.try_submit(&[2; 16]).unwrap();
         assert!(!active_is_durable(&queue));
         assert!(queue.hot_spare_installed());
+        queue
+    }
 
-        let err = queue.try_submit(&[3; 16]).unwrap_err();
-        assert!(matches!(
-            err,
-            SfaQueueError::Queue(QueueError::StorageSpareNotReady { .. })
-        ));
-        assert_eq!(queue.published_fsn(), Some(1));
+    fn sealed_are_durable(queue: &SfaFrameQueue) -> bool {
+        queue.engine.with_state(|state| {
+            state
+                .sealed_segments
+                .iter()
+                .all(|segment| segment.is_published_durable())
+        })
+    }
+
+    /// Notes, when the manifest of `queue` is next written, whether the
+    /// segment in use is synced by then.
+    fn note_durability_at_the_next_manifest_write(queue: &SfaFrameQueue) -> Arc<AtomicBool> {
+        let durable = Arc::new(AtomicBool::new(false));
+        let mut state = queue.engine.state.lock().unwrap();
+        let active = Arc::clone(state.active.as_ref().unwrap());
+        let noted = Arc::clone(&durable);
+        state
+            .manifest
+            .as_mut()
+            .unwrap()
+            .set_before_sync_hook(Arc::new(move || {
+                noted.store(active.is_published_durable(), Ordering::Release);
+                Ok(())
+            }));
+        durable
+    }
+
+    #[test]
+    fn periodic_rotation_syncs_the_segment_it_leaves_before_it_seals_it() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, true);
+        let durable_at_manifest_write = note_durability_at_the_next_manifest_write(&queue);
+
+        take_sfa_barriers();
+        assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
+        assert!(
+            durable_at_manifest_write.load(Ordering::Acquire),
+            "the manifest named the next segment before the one it leaves was synced"
+        );
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(sealed_are_durable(&queue));
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
+
+        // The appender did it alone: the network thread was neither waited
+        // for nor asked to sync ahead of its time.
+        assert!(!queue.engine.sync_requested.load(Ordering::Acquire));
+        queue.maintain_storage().unwrap();
+        assert!(!take_sfa_barriers().iter().any(|event| matches!(
+            event,
+            SfaBarrierEvent::PeriodicSyncAttempt(_) | SfaBarrierEvent::PeriodicSyncCompleted
+        )));
+        queue.close().unwrap();
+    }
+
+    #[test]
+    fn periodic_rotation_leaves_a_segment_alone_that_the_network_thread_has_synced() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, false);
 
         take_sfa_barriers();
         assert!(queue.maintain_storage().unwrap());
@@ -3704,8 +4080,145 @@ mod tests {
         );
         assert!(active_is_durable(&queue));
 
+        before_rotation_sync_for_test(|| panic!("the rotation synced a segment that is synced"));
         assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
         assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(sealed_are_durable(&queue));
+    }
+
+    #[test]
+    fn periodic_rotation_waits_for_a_storage_task_of_the_network_thread() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, false);
+
+        // The network thread has taken its sync and not done it yet.
+        let step = queue
+            .take_storage_maintenance_step(false)
+            .unwrap()
+            .expect("the first periodic sync is due immediately");
+        assert!(matches!(step, SfaStorageStep::SyncPublished(_)));
+
+        let err = queue.try_submit(&[3; 16]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SfaQueueError::Queue(QueueError::StorageSpareNotReady { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(queue.published_fsn(), Some(1));
+        assert_eq!(queue.sealed_segment_count(), 0);
+        assert!(!active_is_durable(&queue));
+        assert!(queue.engine.sync_requested.load(Ordering::Acquire));
+
+        let result = step.perform().unwrap();
+        queue.finish_storage_maintenance(result, true).unwrap();
+        queue.complete_storage_maintenance().unwrap();
+        assert!(active_is_durable(&queue));
+        assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(sealed_are_durable(&queue));
+    }
+
+    #[test]
+    fn periodic_rotation_keeps_the_network_thread_from_syncing_while_it_syncs() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, false);
+
+        let seen = Arc::new(AtomicBool::new(false));
+        before_rotation_sync_for_test({
+            let engine = Arc::clone(&queue.engine);
+            let seen = Arc::clone(&seen);
+            move || {
+                // The first sync of the network thread is due, and waits.
+                assert!(
+                    engine.take_periodic_sync_step().unwrap().is_none(),
+                    "the network thread got its sync while the rotation synced"
+                );
+                assert!(engine.storage_maintenance_in_flight().unwrap());
+                assert!(matches!(
+                    engine.close(&mut None),
+                    Err(SfaQueueError::StorageMaintenanceInFlight)
+                ));
+                seen.store(true, Ordering::Release);
+            }
+        });
+        assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
+        assert!(seen.load(Ordering::Acquire), "the rotation did not sync");
+        assert!(sealed_are_durable(&queue));
+
+        // The rotation is over: the network thread syncs, the queue closes.
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
+        take_sfa_barriers();
+        assert!(queue.maintain_storage().unwrap());
+        assert!(take_sfa_barriers().contains(&SfaBarrierEvent::PeriodicSyncCompleted));
+        queue.close().unwrap();
+    }
+
+    /// What a rotation whose sync failed leaves: the frames and the segment
+    /// in use as they were, nothing reserved, nothing latched.
+    fn assert_the_failed_rotation_left_nothing(
+        queue: &SfaFrameQueue,
+        err: SfaQueueError,
+        published: u64,
+        sealed: usize,
+        allocated: u64,
+    ) {
+        assert!(
+            matches!(err, SfaQueueError::Segment(SfaSegmentError::Io(_))),
+            "{err:?}"
+        );
+        assert_eq!(
+            queue.published_fsn(),
+            Some(published),
+            "a failed append must not reserve an FSN"
+        );
+        assert_eq!(queue.sealed_segment_count(), sealed);
+        assert_eq!(queue.allocated_segment_bytes(), allocated);
+        assert!(!active_is_durable(queue));
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
+        queue.check_durability().unwrap();
+        assert!(!queue.engine.sync_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn periodic_rotation_whose_sync_fails_fails_that_append_and_latches_nothing() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, true);
+        let allocated = queue.allocated_segment_bytes();
+
+        fail_sync_after_for_test(0);
+        let err = queue.try_submit(&[3; 16]).unwrap_err();
+        assert_the_failed_rotation_left_nothing(&queue, err, 1, 0, allocated);
+        assert!(queue.hot_spare_installed());
+
+        // The next append syncs again.
+        let durable_at_manifest_write = note_durability_at_the_next_manifest_write(&queue);
+        assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
+        assert!(durable_at_manifest_write.load(Ordering::Acquire));
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(sealed_are_durable(&queue));
+    }
+
+    #[test]
+    fn periodic_rotation_whose_sync_fails_gives_back_the_segment_it_reserved() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, true);
+        // The spare goes to the second segment, and nobody makes another:
+        // the next rotation reserves the bytes of a segment of its own.
+        queue.try_submit(&[3; 16]).unwrap();
+        queue.try_submit(&[4; 16]).unwrap();
+        assert!(!queue.hot_spare_installed());
+        let allocated = queue.allocated_segment_bytes();
+
+        fail_sync_after_for_test(0);
+        let err = queue.try_submit(&[5; 16]).unwrap_err();
+        assert_the_failed_rotation_left_nothing(&queue, err, 3, 1, allocated);
+        assert!(!queue.hot_spare_installed());
+
+        assert_eq!(queue.try_submit(&[5; 16]).unwrap().fsn, 4);
+        assert_eq!(queue.sealed_segment_count(), 2);
+        assert!(sealed_are_durable(&queue));
     }
 
     #[test]
@@ -3750,11 +4263,6 @@ mod tests {
         queue.maintain_storage().unwrap();
         queue.try_submit(&[1; 16]).unwrap();
         queue.try_submit(&[2; 16]).unwrap();
-        assert!(matches!(
-            queue.try_submit(&[3; 16]).unwrap_err(),
-            SfaQueueError::Queue(QueueError::StorageSpareNotReady { .. })
-        ));
-        queue.maintain_storage().unwrap();
         queue.try_submit(&[3; 16]).unwrap();
         reset_live_durability(&queue);
 
@@ -7049,5 +7557,1105 @@ mod tests {
             }
         }
         assert_eq!(sent_fsns, vec![42, 43]);
+    }
+
+    /// Numbers for the tests of queue room, the same on every run.
+    struct RoomTestNumbers(u64);
+
+    impl RoomTestNumbers {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// A number from `lo` to `hi`, both included.
+        fn between(&mut self, lo: u64, hi: u64) -> u64 {
+            lo + self.next() % (hi - lo + 1)
+        }
+
+        /// Payload sizes of frames that fit a segment: many small ones, some
+        /// that fill a segment or nearly.
+        fn payload_lens(&mut self, count: u64, segment_size_bytes: u64) -> Vec<usize> {
+            let capacity = segment_payload_capacity(segment_size_bytes) as u64;
+            (0..count)
+                .map(|_| match self.between(0, 9) {
+                    0 => capacity,
+                    1 => self.between(capacity / 2, capacity),
+                    _ => self.between(1, capacity / 3),
+                } as usize)
+                .collect()
+        }
+    }
+
+    const ROOM_TEST_SEGMENT_SIZES: [u64; 4] = [64, 100, 257, 1024];
+
+    #[test]
+    fn new_segments_for_frames_counts_the_rotations_of_real_appends() {
+        let payload = [0x5a_u8; 1024];
+        let mut numbers = RoomTestNumbers(0x9e37_79b9_7f4a_7c15);
+        let mut counts = std::collections::BTreeSet::new();
+        for case in 0..1500 {
+            let segment_size_bytes = ROOM_TEST_SEGMENT_SIZES[case % 4];
+            let mut queue = SfaFrameQueue::open_memory(memory_options(
+                segment_size_bytes,
+                64 * segment_size_bytes as usize,
+            ))
+            .unwrap();
+            let mut producer = queue.take_producer().unwrap();
+            // The frames start anywhere in a segment.
+            let before = numbers.between(0, 3);
+            for len in numbers.payload_lens(before, segment_size_bytes) {
+                producer.try_submit(&payload[..len]).unwrap();
+            }
+            let frames = numbers.between(1, 24);
+            let lens = numbers.payload_lens(frames, segment_size_bytes);
+
+            let counted =
+                new_segments_for_frames(segment_size_bytes, producer.active_append_offset, &lens);
+            let sealed_before = queue.sealed_segment_count();
+            for len in &lens {
+                producer.try_submit(&payload[..*len]).unwrap();
+            }
+            let rotations = (queue.sealed_segment_count() - sealed_before) as u64;
+            assert_eq!(counted, Some(rotations), "case {case}: {lens:?}");
+            counts.insert(rotations);
+        }
+        assert!(counts.contains(&0) && counts.len() > 12, "{counts:?}");
+    }
+
+    #[test]
+    fn new_segments_for_frames_follows_the_fit_rule_of_a_segment_to_the_byte() {
+        // A segment of 100 bytes: a header of 24, then frames of their
+        // payload and 8 bytes each.
+        assert_eq!(new_segments_for_frames(100, 24, &[68]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 24, &[69]), None);
+        assert_eq!(new_segments_for_frames(100, 24, &[30, 30]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 24, &[30, 31]), Some(1));
+        assert_eq!(new_segments_for_frames(100, 62, &[30]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 63, &[30]), Some(1));
+        // In the new segment the frame starts after the header again.
+        assert_eq!(new_segments_for_frames(100, 63, &[30, 30]), Some(1));
+        assert_eq!(new_segments_for_frames(100, 63, &[30, 31]), Some(2));
+        assert_eq!(new_segments_for_frames(100, 100, &[68, 68, 68]), Some(3));
+        assert_eq!(new_segments_for_frames(100, 24, &[]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 24, &[1, 69, 1]), None);
+    }
+
+    /// The room for a flush is counted right when the count says whether
+    /// the frames can then be appended without a wait.
+    ///
+    /// Each case is a queue in some state: earlier frames, a part of them
+    /// confirmed and their segments freed, the spare segment installed or
+    /// used up. Then come the frames of one flush. The server confirms none
+    /// of them before the last. The runner's storage maintenance runs before
+    /// every one of them, before some, around every one, or not at all.
+    ///
+    /// "Room" must mean that every frame is appended, whatever the runner
+    /// does. "No room" must mean that a frame is refused, with one exception:
+    /// when the queue still holds confirmed frames, the runner may free their
+    /// segment while the flush runs, and the flush may then fit after all.
+    #[test]
+    fn has_room_for_says_whether_the_frames_can_be_appended_without_a_wait() {
+        let payload = [0x5a_u8; 1024];
+        let mut numbers = RoomTestNumbers(0x2545_f491_4f6c_dd1d);
+        // [no room, room] by [no spare, spare] at the time of the count.
+        let mut seen = [[0u32; 2]; 2];
+        let mut fitted_after_all = 0;
+        for case in 0..6000 {
+            let segment_size_bytes = ROOM_TEST_SEGMENT_SIZES[case % 4];
+            let max_segments = numbers.between(2, 7);
+            let mut queue = SfaFrameQueue::open_memory(memory_options(
+                segment_size_bytes,
+                (max_segments * segment_size_bytes) as usize,
+            ))
+            .unwrap();
+            let mut producer = queue.take_producer().unwrap();
+
+            // Earlier flushes of one frame each, as far as the queue takes
+            // them.
+            let mut published = 0u64;
+            let earlier = numbers.between(0, 12);
+            for len in numbers.payload_lens(earlier, segment_size_bytes) {
+                if numbers.between(0, 2) == 0 {
+                    queue.maintain_storage().unwrap();
+                }
+                if producer.try_submit(&payload[..len]).is_err() {
+                    break;
+                }
+                published += 1;
+            }
+            // The server confirms some of them, and the runner frees their
+            // segments, or has not got to it yet.
+            let confirmed = numbers.between(0, published);
+            if confirmed > 0 {
+                queue.complete_through_fsn(confirmed - 1).unwrap();
+            }
+            if numbers.between(0, 3) > 0 {
+                while queue.maintain_storage().unwrap() {}
+            }
+            // More frames may use up the spare.
+            let more = numbers.between(0, 2);
+            for len in numbers.payload_lens(more, segment_size_bytes) {
+                if producer.try_submit(&payload[..len]).is_err() {
+                    break;
+                }
+            }
+
+            let frames = numbers.between(1, 14);
+            let lens = numbers.payload_lens(frames, segment_size_bytes);
+            let has_room = producer.has_room_for(&lens);
+            seen[usize::from(has_room)][usize::from(queue.hot_spare_installed())] += 1;
+            let segments = queue.engine.segments_snapshot();
+            let oldest_held = segments
+                .sealed_segments
+                .first()
+                .or(segments.active.as_ref())
+                .unwrap()
+                .base_seq();
+            let holds_confirmed_frames = oldest_held < confirmed;
+            drop(segments);
+
+            let maintenance = numbers.between(0, 3);
+            let mut appended = 0;
+            for len in &lens {
+                let frame = &payload[..*len];
+                let submitted = if maintenance == 3 {
+                    // A step of the runner begins before the append and ends
+                    // after it, as it can on the runner's own thread.
+                    match queue.take_storage_maintenance_step(true).unwrap() {
+                        Some(step) => {
+                            let result = step.perform().unwrap();
+                            let submitted = producer.try_submit(frame);
+                            let finish = queue.finish_storage_maintenance(result, true).unwrap();
+                            if let Some(cleanup) = finish.into_cleanup() {
+                                assert!(cleanup.perform().is_none());
+                            }
+                            queue.complete_storage_maintenance().unwrap();
+                            submitted
+                        }
+                        None => producer.try_submit(frame),
+                    }
+                } else {
+                    if maintenance == 2 || (maintenance == 1 && numbers.between(0, 1) == 0) {
+                        queue.maintain_storage().unwrap();
+                    }
+                    producer.try_submit(frame)
+                };
+                match submitted {
+                    Ok(_) => appended += 1,
+                    Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull { .. })) => break,
+                    Err(err) => panic!("case {case}: {err:?}"),
+                }
+            }
+            let appended_all = appended == lens.len();
+            let case = format!(
+                "case {case}: segments of {segment_size_bytes} bytes, at most {max_segments}; \
+                 {appended} of the frames {lens:?} were appended"
+            );
+            if has_room || maintenance == 0 || !holds_confirmed_frames {
+                assert_eq!(has_room, appended_all, "{case}");
+            } else {
+                fitted_after_all += u32::from(appended_all);
+            }
+        }
+        assert!(seen.iter().flatten().all(|cases| *cases > 300), "{seen:?}");
+        assert!(fitted_after_all > 20, "{fitted_after_all}");
+    }
+
+    #[test]
+    fn has_room_for_refuses_a_frame_that_fits_no_segment() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(100, 800)).unwrap();
+        let producer = queue.take_producer().unwrap();
+        assert!(producer.has_room_for(&[68, 68, 68]));
+        assert!(!producer.has_room_for(&[68, 69, 68]));
+    }
+
+    #[test]
+    fn min_total_bytes_for_counts_the_segment_in_use_and_the_segments_of_the_frames() {
+        // Segments of 100 bytes: a header of 24, then frames of their payload
+        // and 8 bytes each, so one frame of 68 bytes or two of 30.
+        let mut queue = SfaFrameQueue::open_memory(memory_options(100, 400)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        assert_eq!(producer.max_total_bytes(), 400);
+        let for_frames = |producer: &SfaProducer| {
+            [
+                producer.min_total_bytes_for(&[]),
+                producer.min_total_bytes_for(&[1]),
+                producer.min_total_bytes_for(&[30, 30]),
+                producer.min_total_bytes_for(&[30, 31]),
+                producer.min_total_bytes_for(&[30; 6]),
+                producer.min_total_bytes_for(&[30; 7]),
+                producer.min_total_bytes_for(&[68, 68, 68]),
+                producer.min_total_bytes_for(&[68, 68, 68, 1]),
+                producer.min_total_bytes_for(&[68, 69]),
+            ]
+        };
+        let expected = [
+            Some(100),
+            Some(200),
+            Some(200),
+            Some(300),
+            Some(400),
+            Some(500),
+            Some(400),
+            Some(500),
+            None,
+        ];
+        assert_eq!(for_frames(&producer), expected);
+
+        // The answer does not depend on what the queue holds: here two
+        // frames, each of which fills a segment.
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        let earlier = producer.try_submit(&[0x5a; 68]).unwrap();
+        assert_eq!(for_frames(&producer), expected);
+        assert!(!producer.has_room_for(&[30; 6]));
+
+        // When both are confirmed, the runner frees the segment of the
+        // first. The second stays in the segment in use. Six frames then
+        // have room next to it, in the three other segments of the queue,
+        // and seven never do.
+        queue.complete_through_fsn(earlier.fsn).unwrap();
+        while queue.maintain_storage().unwrap() {}
+        assert_eq!(queue.sealed_segment_count(), 0);
+        assert!(!producer.has_room_for(&[30; 7]));
+        assert!(producer.has_room_for(&[30; 6]));
+        for _ in 0..6 {
+            producer.try_submit(&[0x5a; 30]).unwrap();
+        }
+        assert_eq!(queue.allocated_segment_bytes(), 400);
+    }
+
+    #[test]
+    fn no_room_error_tells_what_the_segments_take_of_the_budget() {
+        // Four segments of 100 bytes, each for one frame of 68 bytes.
+        let mut queue = SfaFrameQueue::open_memory(memory_options(100, 400)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        let no_room = |allocated_segment_bytes| QueueError::StorageSegmentCapFull {
+            segment_size_bytes: 100,
+            allocated_segment_bytes,
+            max_total_bytes: 400,
+        };
+
+        // Two frames take two segments. Three more wait for a segment to
+        // be freed although two are free: it is the answer of a queue whose
+        // budget is used up all the same, not that of one that prepares a
+        // segment.
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        assert!(!producer.has_room_for(&[68; 3]));
+        assert_eq!(producer.no_room_error(), no_room(200));
+
+        // The runner prepares a third segment, which takes nothing from the
+        // room: the three frames still lack a segment.
+        while queue.maintain_storage().unwrap() {}
+        assert!(!producer.has_room_for(&[68; 3]));
+        assert_eq!(producer.no_room_error(), no_room(300));
+
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        producer.try_submit(&[0x5a; 68]).unwrap();
+        assert!(!producer.has_room_for(&[68]));
+        assert_eq!(producer.no_room_error(), no_room(400));
+    }
+
+    /// A flush for which the queue has the budget of `min_total_bytes_for`
+    /// gets room once every frame before it is confirmed and the runner has
+    /// freed their segments, wherever the producer stands. A wait for room
+    /// relies on it: such a flush must not wait for room that never comes.
+    ///
+    /// With a smaller budget the flush has no room even then, unless its
+    /// first frames fit the segment in use, which can save one segment.
+    /// Without room, the frames can still all be appended in one case: none
+    /// of them fits the segment in use, which then holds confirmed frames
+    /// only, and the runner frees it while the flush runs.
+    #[test]
+    fn min_total_bytes_for_is_the_budget_with_which_a_flush_always_gets_room() {
+        let payload = [0x5a_u8; 1024];
+        let mut numbers = RoomTestNumbers(0x6a09_e667_f3bc_c908);
+        // By the segments that the budget has more than the flush needs:
+        // two less, one less, as many, one more, two more.
+        let mut seen = [0u32; 5];
+        let mut saved_a_segment = 0;
+        let mut short_by_a_segment_behind_a_full_one = 0;
+        let mut fitted_after_all = 0;
+        for case in 0..5000 {
+            let segment_size_bytes = ROOM_TEST_SEGMENT_SIZES[case % 4];
+            let frames = numbers.between(1, 14);
+            let lens = numbers.payload_lens(frames, segment_size_bytes);
+            let min_total_bytes = SfaFrameQueue::open_memory(memory_options(
+                segment_size_bytes,
+                2 * segment_size_bytes as usize,
+            ))
+            .unwrap()
+            .take_producer()
+            .unwrap()
+            .min_total_bytes_for(&lens)
+            .unwrap();
+            assert_eq!(min_total_bytes % segment_size_bytes, 0);
+
+            // A queue with that budget, or with up to two segments more or
+            // less, and with some bytes that make no segment.
+            let needed_segments = min_total_bytes / segment_size_bytes;
+            let max_segments = (needed_segments + numbers.between(0, 4)).saturating_sub(2);
+            if max_segments < 2 {
+                continue;
+            }
+            let max_bytes =
+                max_segments * segment_size_bytes + numbers.between(0, segment_size_bytes - 1);
+            let mut queue =
+                SfaFrameQueue::open_memory(memory_options(segment_size_bytes, max_bytes as usize))
+                    .unwrap();
+            let mut producer = queue.take_producer().unwrap();
+            assert_eq!(producer.max_total_bytes(), max_bytes);
+
+            // Earlier flushes of one frame each, as far as the queue takes
+            // them: the producer stands anywhere in a segment.
+            let mut published = 0u64;
+            let earlier = numbers.between(0, 12);
+            for len in numbers.payload_lens(earlier, segment_size_bytes) {
+                if numbers.between(0, 2) == 0 {
+                    queue.maintain_storage().unwrap();
+                }
+                if producer.try_submit(&payload[..len]).is_err() {
+                    break;
+                }
+                published += 1;
+            }
+            assert_eq!(producer.min_total_bytes_for(&lens), Some(min_total_bytes));
+            let has_the_budget = min_total_bytes <= producer.max_total_bytes();
+            assert_eq!(has_the_budget, max_segments >= needed_segments);
+            seen[(max_segments + 2 - needed_segments) as usize] += 1;
+
+            // The server confirms every frame, and the runner frees their
+            // segments, all but the one in use.
+            if published > 0 {
+                queue.complete_through_fsn(published - 1).unwrap();
+            }
+            while queue.maintain_storage().unwrap() {}
+            assert_eq!(queue.sealed_segment_count(), 0);
+            let first_frame_fits_the_segment_in_use = producer.active_append_offset
+                + (FRAME_HEADER_SIZE + lens[0]) as u64
+                <= segment_size_bytes;
+            let has_room = producer.has_room_for(&lens);
+
+            // The frames of the flush: the server confirms none of them
+            // before the last, and the runner does what it likes.
+            let maintenance = numbers.between(0, 2);
+            let mut appended = 0;
+            for len in &lens {
+                if maintenance == 2 || (maintenance == 1 && numbers.between(0, 1) == 0) {
+                    queue.maintain_storage().unwrap();
+                }
+                match producer.try_submit(&payload[..*len]) {
+                    Ok(_) => appended += 1,
+                    Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull { .. })) => break,
+                    Err(err) => panic!("case {case}: {err:?}"),
+                }
+            }
+            let case = format!(
+                "case {case}: segments of {segment_size_bytes} bytes, a budget of {max_bytes} \
+                 bytes, {min_total_bytes} needed; {appended} of the frames {lens:?} were appended"
+            );
+            let appended_all = appended == lens.len();
+            if has_room || maintenance == 0 || first_frame_fits_the_segment_in_use {
+                assert_eq!(has_room, appended_all, "{case}");
+            } else {
+                fitted_after_all += u32::from(appended_all);
+            }
+            if has_the_budget {
+                assert!(has_room, "{case}");
+            } else if has_room {
+                assert_eq!(max_segments + 1, needed_segments, "{case}");
+                assert!(first_frame_fits_the_segment_in_use, "{case}");
+                saved_a_segment += 1;
+            } else if max_segments + 1 == needed_segments && !first_frame_fits_the_segment_in_use {
+                short_by_a_segment_behind_a_full_one += 1;
+            }
+        }
+        assert!(seen.iter().all(|cases| *cases > 500), "{seen:?}");
+        assert!(saved_a_segment > 100, "{saved_a_segment}");
+        assert!(
+            short_by_a_segment_behind_a_full_one > 100,
+            "{short_by_a_segment_behind_a_full_one}"
+        );
+        assert!(fitted_after_all > 100, "{fitted_after_all}");
+    }
+
+    // ---- A flush without its last frame is removed when a slot is opened ----
+
+    /// A frame of a flush that waits for a later frame to commit it.
+    const D: bool = true;
+    /// A frame that commits: the last of a flush, or a flush of one frame.
+    const C: bool = false;
+    /// Segments of [`flush_options`] hold three frames of [`flush_frame`].
+    const FLUSH_SEGMENT: u64 = 256;
+
+    fn flush_options(dir: &Path) -> SfaQueueOptions {
+        SfaQueueOptions {
+            slot_dir: dir.to_path_buf(),
+            segment_size_bytes: FLUSH_SEGMENT,
+            max_bytes: 16 * FLUSH_SEGMENT as usize,
+            periodic_sync_interval: None,
+        }
+    }
+
+    /// A payload of 60 bytes with the header of a QWP message that defers its
+    /// commit or does not, and `tag` in every byte behind the header.
+    fn flush_frame(defers_commit: bool, tag: u8) -> Vec<u8> {
+        let mut payload = vec![tag; 60];
+        payload[..4].copy_from_slice(b"QWP1");
+        payload[4] = 1;
+        payload[5] = if defers_commit { 0x09 } else { 0x08 };
+        payload[6..12].fill(0);
+        payload
+    }
+
+    /// The frames of [`write_flush_slot`], by their number.
+    fn flush_frames(frames: &[bool]) -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .enumerate()
+            .map(|(tag, defers_commit)| flush_frame(*defers_commit, tag as u8))
+            .collect()
+    }
+
+    /// Writes a slot with one frame for each entry of `frames`, three to a
+    /// segment, none of them confirmed, and leaves it as a process that
+    /// ends does.
+    fn write_flush_slot(frames: &[bool]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(flush_options(dir.path())).unwrap();
+        for payload in flush_frames(frames) {
+            submit_with_storage_maintenance(&mut queue, &payload);
+        }
+        assert_eq!(queue.published_fsn(), (frames.len() as u64).checked_sub(1));
+        drop(queue);
+        dir
+    }
+
+    fn copy_of_slot(slot: &Path) -> TempDir {
+        let copy = TempDir::new().unwrap();
+        for entry in fs::read_dir(slot).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), copy.path().join(entry.file_name())).unwrap();
+        }
+        copy
+    }
+
+    /// The frames that `queue` holds, from the first one of its chain.
+    fn frames_held(queue: &SfaFrameQueue) -> Vec<Vec<u8>> {
+        let first = queue.engine.with_state(|state| {
+            state
+                .sealed_segments
+                .front()
+                .or(state.active.as_ref())
+                .map_or(0, |segment| segment.base_seq())
+        });
+        let end = queue.published_fsn().map_or(0, |fsn| fsn + 1);
+        (first..end)
+            .map(|fsn| queue.payload_vec_for_fsn(fsn).unwrap())
+            .collect()
+    }
+
+    /// The segment files of a slot that hold frames, by their first frame:
+    /// that number and the frames, read from the bytes of the file. Fails
+    /// when a file holds anything but zeroes behind its last frame.
+    fn frames_on_disk(slot: &Path) -> Vec<(u64, Vec<Vec<u8>>)> {
+        let mut segments = Vec::new();
+        for entry in fs::read_dir(slot).unwrap() {
+            let path = entry.unwrap().path();
+            if !is_sfa_file(&path) {
+                continue;
+            }
+            let scan = scan_file(&path).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            assert!(
+                bytes[scan.append_offset as usize..]
+                    .iter()
+                    .all(|byte| *byte == 0),
+                "{} holds bytes behind its last frame",
+                path.display()
+            );
+            if !scan.frames.is_empty() {
+                let frames = scan.frames.into_iter().map(|frame| frame.payload).collect();
+                segments.push((scan.header.base_seq, frames));
+            }
+        }
+        segments.sort();
+        segments
+    }
+
+    /// What a sender finds in a slot: the frames, the number of the last
+    /// one, and the number of the last confirmed one.
+    fn opened_by_a_sender(slot: &Path) -> (Vec<Vec<u8>>, Option<u64>, Option<u64>) {
+        let queue = SfaFrameQueue::open(flush_options(slot)).unwrap();
+        let found = (
+            frames_held(&queue),
+            queue.published_fsn(),
+            queue.completed_fsn(),
+        );
+        drop(queue);
+        let on_disk: Vec<Vec<u8>> = frames_on_disk(slot)
+            .into_iter()
+            .flat_map(|(_, frames)| frames)
+            .collect();
+        assert_eq!(on_disk, found.0, "the files hold what the queue holds");
+        found
+    }
+
+    /// Slots that end with a flush without its last frame, and the number of
+    /// frames that stay.
+    const UNFINISHED_FLUSHES: &[(&[bool], usize)] = &[
+        // In one segment.
+        (&[C, D, D], 1),
+        (&[D, C, D], 2),
+        // In two: the flush begins in the first, and with the second.
+        (&[C, C, D, D, D], 2),
+        (&[C, C, C, D, D], 3),
+        // In three, and in four.
+        (&[C, D, D, D, D, D, D], 1),
+        (&[D, D, C, D, D, D, D, D, D, D], 3),
+        // Behind a whole flush of several frames.
+        (&[D, D, D, D, C, D, D, D], 5),
+        // Behind frames that commit in two segments.
+        (&[C, C, C, C, D, D, D], 4),
+        // Nothing else in the slot.
+        (&[D], 0),
+        (&[D, D, D, D], 0),
+    ];
+
+    #[test]
+    fn a_flush_without_its_last_frame_is_removed_when_a_sender_opens_the_slot() {
+        for (frames, kept) in UNFINISHED_FLUSHES {
+            let slot = write_flush_slot(frames);
+            let expected = flush_frames(frames)[..*kept].to_vec();
+            let last = (*kept as u64).checked_sub(1);
+
+            let mut queue = SfaFrameQueue::open(flush_options(slot.path())).unwrap();
+            assert_eq!(frames_held(&queue), expected, "{frames:?}");
+            assert_eq!(queue.published_fsn(), last, "{frames:?}");
+            assert_eq!(queue.completed_fsn(), None, "{frames:?}");
+            // The segments up to the one that takes the next frame, and the
+            // spare: no file of a segment that was given up is left.
+            assert_eq!(sfa_file_count(slot.path()), kept / 3 + 2, "{frames:?}");
+            // The next frame takes the number of the first one removed.
+            let next = flush_frame(C, 0xEE);
+            let receipt = submit_with_storage_maintenance(&mut queue, &next);
+            assert_eq!(receipt.fsn, *kept as u64, "{frames:?}");
+            drop(queue);
+
+            // And a second open finds the frames that stayed and that one.
+            let mut expected = expected;
+            expected.push(next);
+            let (held, published, _) = opened_by_a_sender(slot.path());
+            assert_eq!(held, expected, "{frames:?}");
+            assert_eq!(published, Some(*kept as u64), "{frames:?}");
+        }
+    }
+
+    #[test]
+    fn a_flush_without_its_last_frame_is_removed_when_a_drainer_opens_the_slot() {
+        for (frames, kept) in UNFINISHED_FLUSHES {
+            let slot = write_flush_slot(frames);
+            let expected = flush_frames(frames)[..*kept].to_vec();
+
+            let mut queue = SfaFrameQueue::open_replay_only(flush_options(slot.path())).unwrap();
+            assert!(queue.producer.is_none());
+            assert_eq!(frames_held(&queue), expected, "{frames:?}");
+            assert_eq!(queue.published_fsn(), (*kept as u64).checked_sub(1));
+            // The drainer comes to its end: what stayed is confirmed, and
+            // the slot is drained.
+            if let Some(last) = queue.published_fsn() {
+                assert_eq!(queue.oldest_unresolved_fsn(), Some(0), "{frames:?}");
+                queue.complete_through_fsn(last).unwrap();
+            }
+            assert_eq!(queue.oldest_unresolved_fsn(), None, "{frames:?}");
+            queue.close().unwrap();
+            assert_eq!(sfa_file_count(slot.path()), 0, "{frames:?}");
+        }
+    }
+
+    #[test]
+    fn a_drainer_without_the_removal_never_comes_to_the_end_of_an_unfinished_flush() {
+        // What the removal is for: the frames of the flush are never
+        // confirmed, so a drainer that keeps them is never done.
+        let slot = write_flush_slot(&[C, D, D]);
+        let mut queue = as_a_release_without_the_removal(|| {
+            SfaFrameQueue::open_replay_only(flush_options(slot.path())).unwrap()
+        });
+        assert_eq!(queue.published_fsn(), Some(2));
+        queue.complete_through_fsn(0).unwrap();
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(1));
+    }
+
+    #[test]
+    fn a_slot_that_ends_with_a_frame_that_commits_is_opened_as_it_is() {
+        let slots: &[&[bool]] = &[
+            &[],
+            &[C],
+            &[C, C, C],
+            &[D, C],
+            &[C, D, D, C],
+            &[D, D, D, D, D, D, C],
+            &[C, D, C, D, D, D, D, C, C],
+        ];
+        for frames in slots {
+            let slot = write_flush_slot(frames);
+            let before = frames_on_disk(slot.path());
+            let (held, published, completed) = opened_by_a_sender(slot.path());
+            assert_eq!(held, flush_frames(frames), "{frames:?}");
+            assert_eq!(
+                published,
+                (frames.len() as u64).checked_sub(1),
+                "{frames:?}"
+            );
+            assert_eq!(completed, None, "{frames:?}");
+            assert_eq!(frames_on_disk(slot.path()), before, "{frames:?}");
+        }
+    }
+
+    /// Every file of a slot as release 7.3.0 wrote it: see the README of the
+    /// fixtures.
+    const RELEASE_7_3_0_SLOT: &str =
+        include_str!("../../tests/interop/qwp-ws-sfa/rust-7.3.0-slot.hex");
+
+    fn write_release_7_3_0_slot() -> TempDir {
+        let slot = TempDir::new().unwrap();
+        for line in RELEASE_7_3_0_SLOT.lines() {
+            let mut fields = line.split(' ');
+            let name = fields.next().unwrap();
+            let size: usize = fields.next().unwrap().parse().unwrap();
+            let mut bytes = decode_hex_fixture(fields.next().unwrap());
+            bytes.resize(size, 0);
+            fs::write(slot.path().join(name), bytes).unwrap();
+        }
+        slot
+    }
+
+    #[test]
+    fn a_slot_written_by_release_7_3_0_is_opened_as_it_is() {
+        // No release writes a frame that defers its commit to disk, so the
+        // removal finds nothing in a slot of one.
+        let frames: Vec<Vec<u8>> = (0..8).map(|tag| flush_frame(C, tag)).collect();
+        let on_disk = vec![
+            (0, frames[..3].to_vec()),
+            (3, frames[3..6].to_vec()),
+            (6, frames[6..].to_vec()),
+        ];
+
+        let slot = write_release_7_3_0_slot();
+        assert_eq!(frames_on_disk(slot.path()), on_disk);
+        let queue = SfaFrameQueue::open_replay_only(flush_options(slot.path())).unwrap();
+        assert_eq!(frames_held(&queue), frames);
+        assert_eq!(queue.published_fsn(), Some(7));
+        assert_eq!(queue.completed_fsn(), Some(1));
+        drop(queue);
+        assert_eq!(frames_on_disk(slot.path()), on_disk);
+
+        let slot = write_release_7_3_0_slot();
+        let (held, published, completed) = opened_by_a_sender(slot.path());
+        assert_eq!(held, frames);
+        assert_eq!(published, Some(7));
+        assert_eq!(completed, Some(1));
+        assert_eq!(frames_on_disk(slot.path()), on_disk);
+    }
+
+    #[test]
+    fn the_removal_ends_in_the_same_slot_wherever_it_is_stopped() {
+        // Every write, sync and delete of the removal is a step. A process
+        // that dies at a step leaves what the steps before it wrote: the
+        // slot must open with the recovery of a release that does not know
+        // the removal, and the next open of this one must end where a
+        // removal that was not stopped ends.
+        let slots: &[(&[bool], usize, usize)] = &[
+            // The frames, how many stay, and the least number of steps: two
+            // for each frame, one for the sync of each segment, and three
+            // for each segment that is given up.
+            (&[C, D, D], 1, 5),
+            (&[C, C, C, D, D], 3, 5),
+            (&[C, C, D, D, D], 2, 11),
+            (&[C, D, D, D, D, D, D, D], 1, 23),
+            (&[D, D, D, D], 0, 13),
+        ];
+        for (frames, kept, least_steps) in slots {
+            let original = write_flush_slot(frames);
+            let expected = flush_frames(frames)[..*kept].to_vec();
+            let reference = opened_by_a_sender(copy_of_slot(original.path()).path());
+            assert_eq!(reference.0, expected, "{frames:?}");
+
+            let mut step = 0;
+            loop {
+                let slot = copy_of_slot(original.path());
+                stop_removal_after_for_test(step);
+                let opened = SfaFrameQueue::open(flush_options(slot.path()));
+                if clear_removal_stop_for_test() {
+                    // The removal ran through before it came to this step.
+                    opened.unwrap();
+                    break;
+                }
+                let err = opened.unwrap_err();
+                assert!(
+                    format!("{err:?}").contains("injected stop of the removal"),
+                    "{frames:?}, step {step}: {err:?}"
+                );
+                // A release without the removal opens what the stop left,
+                // with frames of the flush and of nothing else.
+                let left = as_a_release_without_the_removal(|| opened_by_a_sender(slot.path()));
+                assert!(
+                    left.0.len() >= *kept
+                        && left.0.len() <= frames.len()
+                        && left.0[..] == flush_frames(frames)[..left.0.len()],
+                    "{frames:?}, step {step}: {} frames",
+                    left.0.len()
+                );
+                // And the next open ends the removal.
+                assert_eq!(
+                    opened_by_a_sender(slot.path()),
+                    reference,
+                    "{frames:?}, step {step}"
+                );
+                step += 1;
+            }
+            assert!(step >= *least_steps, "{frames:?}: {step} steps");
+        }
+    }
+
+    #[test]
+    fn a_removal_that_is_stopped_at_any_step_leaves_no_frame_for_a_later_one_to_bring_back() {
+        // The frames that a later flush appends are as long as the removed
+        // ones. Were a removed frame left whole behind the end of a segment,
+        // the scan of the next open would run on into it.
+        let frames: &[bool] = &[C, D, D, D, D];
+        let original = write_flush_slot(frames);
+        let again = [
+            flush_frame(D, 0xA0),
+            flush_frame(D, 0xA1),
+            flush_frame(D, 0xA2),
+            flush_frame(D, 0xA3),
+            flush_frame(C, 0xA4),
+        ];
+        let mut expected = vec![flush_frame(C, 0)];
+        expected.extend(again.iter().cloned());
+
+        let mut step = 0;
+        loop {
+            let slot = copy_of_slot(original.path());
+            stop_removal_after_for_test(step);
+            let stopped = SfaFrameQueue::open(flush_options(slot.path())).is_err();
+            let ran_through = clear_removal_stop_for_test();
+            assert_ne!(stopped, ran_through, "step {step}");
+
+            let mut queue = SfaFrameQueue::open(flush_options(slot.path())).unwrap();
+            for payload in &again {
+                submit_with_storage_maintenance(&mut queue, payload);
+            }
+            drop(queue);
+            let on_disk: Vec<Vec<u8>> = frames_on_disk(slot.path())
+                .into_iter()
+                .flat_map(|(_, frames)| frames)
+                .collect();
+            assert_eq!(on_disk, expected, "step {step}");
+            let (held, published, _) = opened_by_a_sender(slot.path());
+            assert_eq!(held, expected, "step {step}");
+            assert_eq!(published, Some(5), "step {step}");
+            if ran_through {
+                break;
+            }
+            step += 1;
+        }
+        assert!(step >= 11, "{step} steps");
+    }
+
+    #[test]
+    fn a_segment_that_is_not_synced_after_its_frames_went_is_not_given_up() {
+        // The manifest may name the segment before as the active one only
+        // once the emptied segment is on disk without its frames: a power
+        // loss could bring them back, beyond the active segment, and such a
+        // slot is refused.
+        let frames: &[bool] = &[C, D, D, D, D];
+        let slot = write_flush_slot(frames);
+        let manifest_before = fs::read(manifest_path(slot.path())).unwrap();
+
+        fail_sync_after_for_test(0);
+        let err = SfaFrameQueue::open(flush_options(slot.path())).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("injected sync failure of a cut segment"),
+            "{err:?}"
+        );
+        assert_eq!(
+            fs::read(manifest_path(slot.path())).unwrap(),
+            manifest_before,
+            "the manifest still names the last segment"
+        );
+
+        let (held, published, _) = opened_by_a_sender(slot.path());
+        assert_eq!(held, vec![flush_frame(C, 0)]);
+        assert_eq!(published, Some(0));
+    }
+
+    #[test]
+    fn a_flush_that_is_cut_off_twice_is_removed_twice() {
+        // Two restarts: the frames of the second attempt lie where those of
+        // the first lay, and the second removal takes them alone.
+        let slot = write_flush_slot(&[C, D, D, D, D]);
+        let mut queue = SfaFrameQueue::open(flush_options(slot.path())).unwrap();
+        assert_eq!(queue.published_fsn(), Some(0));
+        for tag in 0xB0..0xB3 {
+            submit_with_storage_maintenance(&mut queue, &flush_frame(D, tag));
+        }
+        drop(queue);
+
+        let (held, published, _) = opened_by_a_sender(slot.path());
+        assert_eq!(held, vec![flush_frame(C, 0)]);
+        assert_eq!(published, Some(0));
+    }
+
+    #[test]
+    fn the_confirmed_frame_inside_a_flush_bounds_the_removal() {
+        // A server may confirm a part of a flush before its last frame.
+        // Nothing at or below the confirmed frame is removed, wherever it
+        // lies, and nothing is sent again.
+        let frames: &[bool] = &[C, D, D, D, D, D, D];
+        for confirmed in 0..frames.len() as u64 {
+            let slot = write_flush_slot(frames);
+            write_ack_watermark(slot.path(), confirmed as i64);
+
+            let queue = SfaFrameQueue::open(flush_options(slot.path())).unwrap();
+            let kept = confirmed as usize + 1;
+            assert_eq!(frames_held(&queue), flush_frames(frames)[..kept]);
+            assert_eq!(queue.published_fsn(), Some(confirmed));
+            assert_eq!(queue.completed_fsn(), Some(confirmed));
+            assert_eq!(queue.oldest_unresolved_fsn(), None);
+            drop(queue);
+            assert_eq!(recovered_ack_watermark_fsn(slot.path()), Some(confirmed));
+        }
+    }
+
+    #[test]
+    fn a_watermark_beyond_the_slot_does_not_bound_the_removal() {
+        // Such a watermark is not trusted by the open either, which resets
+        // it and sends the slot again.
+        for confirmed in [7, 8, 100] {
+            let slot = write_flush_slot(&[C, D, D, D, D, D, D]);
+            write_ack_watermark(slot.path(), confirmed);
+            let (held, published, completed) = opened_by_a_sender(slot.path());
+            assert_eq!(held, vec![flush_frame(C, 0)]);
+            assert_eq!(published, Some(0));
+            assert_eq!(completed, None);
+        }
+    }
+
+    #[test]
+    fn only_a_qwp_frame_with_the_defer_flag_is_removed() {
+        let deferred = flush_frame(D, 9);
+        // Not a QWP message, with the bit of the flag where a QWP message
+        // has it.
+        let mut other_magic = deferred.clone();
+        other_magic[..4].copy_from_slice(b"QWP2");
+        // Shorter than the header of a QWP message.
+        let short = deferred[..11].to_vec();
+        // A QWP message with every flag but the one that defers.
+        let mut other_flags = deferred.clone();
+        other_flags[5] = 0xFE;
+
+        for last_that_stays in [other_magic, short, other_flags] {
+            let slot = TempDir::new().unwrap();
+            let mut queue = SfaFrameQueue::open(flush_options(slot.path())).unwrap();
+            let written = [
+                flush_frame(C, 0),
+                flush_frame(D, 1),
+                last_that_stays,
+                flush_frame(D, 3),
+                flush_frame(D, 4),
+            ];
+            for payload in &written {
+                submit_with_storage_maintenance(&mut queue, payload);
+            }
+            drop(queue);
+
+            let (held, published, _) = opened_by_a_sender(slot.path());
+            assert_eq!(held, written[..3]);
+            assert_eq!(published, Some(2));
+        }
+    }
+
+    #[test]
+    fn a_flush_that_lost_its_last_segment_is_removed_and_the_slot_is_not_refused() {
+        // What a power loss can leave of a flush across three segments: the
+        // files and the manifest of the rotations, and no frame in the last
+        // segment.
+        let frames: &[bool] = &[C, D, D, D, D, D, D, C];
+        let slot = write_flush_slot(frames);
+        let last = fs::read_dir(slot.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                is_sfa_file(path) && {
+                    let scan = scan_file(path).unwrap();
+                    scan.header.base_seq == 6 && !scan.frames.is_empty()
+                }
+            })
+            .unwrap();
+        let mut bytes = fs::read(&last).unwrap();
+        bytes[HEADER_SIZE..].fill(0);
+        fs::write(&last, bytes).unwrap();
+
+        let (held, published, completed) = opened_by_a_sender(slot.path());
+        assert_eq!(held, vec![flush_frame(C, 0)]);
+        assert_eq!(published, Some(0));
+        assert_eq!(completed, None);
+    }
+    // ---- A segment file that was never written is removed when a slot is opened ----
+
+    /// Slots as a process leaves them, by the frames of each segment, the
+    /// last one being the segment in use: one that died right after a
+    /// rotation, before the first frame went into the new segment; one
+    /// that had no frame yet, or none left; one with frames in the segment
+    /// in use; and one that had not made its first segment.
+    const SLOTS_OF_A_PROCESS_THAT_DIED: &[&[usize]] = &[&[3, 0], &[0], &[2], &[]];
+
+    /// Writes one of [`SLOTS_OF_A_PROCESS_THAT_DIED`], with its manifest,
+    /// and returns it with its frames.
+    fn write_slot_of_a_process_that_died(segments: &[usize]) -> (TempDir, Vec<Vec<u8>>) {
+        let dir = TempDir::new().unwrap();
+        let frames = flush_frames(&vec![C; segments.iter().sum()]);
+        let mut base = 0;
+        for (idx, count) in segments.iter().enumerate() {
+            let path = spare_segment_path(dir.path(), idx as u64);
+            let mut segment =
+                SfaSegment::create_new_manifested(&path, base as u64, FLUSH_SEGMENT, 0).unwrap();
+            for frame in &frames[base..base + count] {
+                segment.try_append(frame).unwrap();
+            }
+            segment.sync_header().unwrap();
+            base += count;
+        }
+        if let Some(in_use) = segments.last() {
+            create_manifested_slot(dir.path(), 0, (base - in_use) as u64);
+        }
+        (dir, frames)
+    }
+
+    /// The name that the next segment file of such a slot gets.
+    fn next_segment_file(slot: &Path, segments: &[usize]) -> PathBuf {
+        spare_segment_path(slot, segments.len() as u64)
+    }
+
+    /// What is left of a segment file whose process died while it made the
+    /// file: the name alone, a part of its zeroes, or all of them, in a file
+    /// shorter than a segment header, as long as one, and longer than what
+    /// one read takes.
+    const NEVER_WRITTEN: [usize; 6] = [
+        0,
+        1,
+        HEADER_SIZE - 1,
+        HEADER_SIZE,
+        FLUSH_SEGMENT as usize,
+        200_000,
+    ];
+
+    #[test]
+    fn a_segment_file_that_was_never_written_is_removed_when_a_sender_opens_the_slot() {
+        for segments in SLOTS_OF_A_PROCESS_THAT_DIED {
+            for len in NEVER_WRITTEN {
+                let (slot, frames) = write_slot_of_a_process_that_died(segments);
+                let never_written = next_segment_file(slot.path(), segments);
+                fs::write(&never_written, vec![0u8; len]).unwrap();
+                let case = format!("segments of {segments:?} frames, a file of {len} zeroes");
+
+                let mut queue = SfaFrameQueue::open(flush_options(slot.path())).unwrap();
+                assert_eq!(frames_held(&queue), frames, "{case}");
+                assert_eq!(
+                    queue.published_fsn(),
+                    (frames.len() as u64).checked_sub(1),
+                    "{case}"
+                );
+                assert_eq!(queue.recovery_diagnostics(), vec![], "{case}");
+                // The file is not kept as a corrupt segment, and the next
+                // segment file that the open makes has taken its name.
+                assert!(!corrupt_segment_path(&never_written).exists(), "{case}");
+                let made_again = scan_file(&never_written).unwrap();
+                assert_eq!(made_again.frames.len(), 0, "{case}");
+                // The slot takes the next frame, and a second open finds it
+                // behind the others.
+                let next = flush_frame(C, 0xEE);
+                let receipt = submit_with_storage_maintenance(&mut queue, &next);
+                assert_eq!(receipt.fsn, frames.len() as u64, "{case}");
+                drop(queue);
+                let (held, published, _) = opened_by_a_sender(slot.path());
+                assert_eq!(held, [frames, vec![next]].concat(), "{case}");
+                assert_eq!(published, Some(receipt.fsn), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_segment_file_that_was_never_written_is_removed_when_a_drainer_opens_the_slot() {
+        for segments in SLOTS_OF_A_PROCESS_THAT_DIED {
+            for len in NEVER_WRITTEN {
+                let (slot, frames) = write_slot_of_a_process_that_died(segments);
+                let never_written = next_segment_file(slot.path(), segments);
+                fs::write(&never_written, vec![0u8; len]).unwrap();
+                let case = format!("segments of {segments:?} frames, a file of {len} zeroes");
+
+                let mut queue =
+                    SfaFrameQueue::open_replay_only(flush_options(slot.path())).unwrap();
+                assert_eq!(frames_held(&queue), frames, "{case}");
+                assert_eq!(queue.recovery_diagnostics(), vec![], "{case}");
+                assert!(!never_written.exists(), "{case}");
+                assert!(!corrupt_segment_path(&never_written).exists(), "{case}");
+                // The drainer comes to its end, and the slot is drained.
+                if let Some(last) = queue.published_fsn() {
+                    queue.complete_through_fsn(last).unwrap();
+                }
+                assert_eq!(queue.oldest_unresolved_fsn(), None, "{case}");
+                queue.close().unwrap();
+                assert_eq!(sfa_file_count(slot.path()), 0, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_without_a_segment_header_that_holds_a_byte_is_still_a_corrupt_segment() {
+        // The length of the file, and where it holds its one byte that is
+        // not zero: in a file shorter than a header, behind the magic, where
+        // the first frame belongs, at the end of a segment, and behind what
+        // one read takes.
+        let files = [
+            (HEADER_SIZE - 1, 0),
+            (HEADER_SIZE - 1, HEADER_SIZE - 2),
+            (FLUSH_SEGMENT as usize, 4),
+            (FLUSH_SEGMENT as usize, HEADER_SIZE),
+            (FLUSH_SEGMENT as usize, FLUSH_SEGMENT as usize - 1),
+            (200_000, 199_999),
+        ];
+        // The slots that are refused with a corrupt segment beside them: the
+        // segment in use is empty, so that file may be the one with frames.
+        for (segments, reason) in [
+            (&[3, 0][..], "missing expected SFA active or tail segment"),
+            (&[0][..], "missing SFA chain between committed boundaries"),
+        ] {
+            for (len, at) in files {
+                let (slot, _) = write_slot_of_a_process_that_died(segments);
+                let damaged = next_segment_file(slot.path(), segments);
+                let mut bytes = vec![0u8; len];
+                bytes[at] = 1;
+                fs::write(&damaged, &bytes).unwrap();
+                let case = format!("segments of {segments:?} frames, {len} bytes, one at {at}");
+
+                type Open = fn(SfaQueueOptions) -> Result<SfaFrameQueue, SfaQueueError>;
+                for open in [SfaFrameQueue::open as Open, SfaFrameQueue::open_replay_only] {
+                    match open(flush_options(slot.path())) {
+                        Err(SfaQueueError::Recovery { reason: refused }) => {
+                            assert_eq!(refused, reason, "{case}")
+                        }
+                        Err(other) => panic!("{case}: {other:?}"),
+                        Ok(_) => panic!("{case}: the slot was opened"),
+                    }
+                    assert_eq!(fs::read(&damaged).unwrap(), bytes, "{case}");
+                }
+            }
+        }
     }
 }

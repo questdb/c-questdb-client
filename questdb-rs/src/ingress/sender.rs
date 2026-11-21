@@ -83,13 +83,15 @@ pub(crate) use qwp_ws_orphan::has_any_sfa_file;
 pub(crate) use qwp_ws_orphan::is_candidate_orphan;
 
 #[cfg(feature = "_sender-qwp-ws")]
-mod qwp_ws_publisher;
+pub(crate) mod qwp_ws_publisher;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_segment;
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use qwp_ws_sfa_segment::fail_sync_after_for_test;
 
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) mod qwp_ws_sfa_manifest;
@@ -110,7 +112,7 @@ pub(crate) mod qwp_ws_sfa_symbol_dict;
 mod qwp_ws_sfa_catchup;
 
 #[cfg(all(test, feature = "_sender-qwp-ws"))]
-pub(crate) use qwp_ws_sfa_catchup::fail_next_catch_up_allocation_for_test;
+pub(crate) use qwp_ws_sfa_catchup::{SentDictMirror, fail_next_catch_up_allocation_for_test};
 
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
@@ -408,17 +410,40 @@ impl Sender {
         let (server_max, sfa_frame_payload_cap) = self
             .qwp_ws_frame_cap_inputs()
             .expect("QWP/WebSocket handler was checked above");
-        let (max, _) =
+        let (max, server_max_known) =
             effective_hard_frame_cap(self.max_buf_size, server_max, sfa_frame_payload_cap);
-        let result = match &mut self.handler {
-            SyncProtocolHandler::SyncQwpWs(state) => flush_qwp_ws(state, qwp, max),
-            SyncProtocolHandler::ManualQwpWs(state) => flush_qwp_ws_manual(state, qwp, max),
+        let not_in_frames_hint = qwp_ws_not_in_frames_hint(
+            max >= self.max_buf_size,
+            server_max_known,
+            match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => state.encoder_delta_dict_enabled(),
+                SyncProtocolHandler::ManualQwpWs(state) => state.encoder_delta_dict_enabled(),
+                _ => unreachable!("QWP/WebSocket handler was checked above"),
+            },
+        );
+        let flushed = match &mut self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => {
+                flush_qwp_ws(state, qwp, max, self.max_buf_size, server_max_known)
+            }
+            SyncProtocolHandler::ManualQwpWs(state) => {
+                flush_qwp_ws_manual(state, qwp, max, self.max_buf_size, server_max_known)
+            }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
-        {
+        let result = match flushed {
+            Ok(fsn) => Ok(fsn),
+            // The error is complete: its limit is not the frame cap.
+            Err(QwpWsFlushError::Refused(err)) => return Err(err),
+            Err(QwpWsFlushError::Failed(err)) => Err(err),
+        };
+        // After a flush that stopped part way the sender takes no more
+        // flushes, as after a failure of the connection.
+        if result.as_ref().is_err_and(|err| {
+            matches!(
+                err.code(),
+                crate::ErrorCode::SocketError | crate::ErrorCode::FlushAborted
+            )
+        }) {
             self.connected = false;
         }
         result.map_err(|err| {
@@ -430,7 +455,12 @@ impl Sender {
                 );
                 crate::Error::new(
                     crate::ErrorCode::BatchTooLarge,
-                    format!("{} The cap is set by {}.", err.msg(), source),
+                    format!(
+                        "{} The cap is set by {}.{}",
+                        err.msg(),
+                        source,
+                        not_in_frames_hint
+                    ),
                 )
             } else {
                 err
@@ -659,9 +689,12 @@ impl Sender {
     ///
     /// With QWP-over-WebSocket, the function publishes the rows into local
     /// memory or Store-and-Forward storage and returns without waiting for the
-    /// submitted frame's server ACK. It may still wait for local capacity. In
-    /// the default background progress mode, a sender-owned runner sends,
-    /// receives ACKs, reconnects, and replays as needed. In manual progress
+    /// submitted frame's server ACK. A buffer larger than one frame is
+    /// published as several frames that the server commits together, where the
+    /// sender supports it: see `Sender::effective_frame_cap`. It may still
+    /// wait for local capacity. In the default background progress mode, a
+    /// sender-owned runner sends, receives ACKs, reconnects, and replays as
+    /// needed. In manual progress
     /// mode, the caller must use `Sender::drive_once` or
     /// `Sender::wait` to advance WebSocket progress. Server or
     /// transport failures observed later are reported by subsequent sender
@@ -669,7 +702,11 @@ impl Sender {
     /// `sf_append_deadline_millis` while the sender is disconnected and
     /// reconnecting keeps failing, the error names that failure and carries
     /// its OIDC detail (`Error::oidc_error`), as a `Sender::wait` timeout
-    /// does.
+    /// does. A flush in several frames that stops after some of them were
+    /// published fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted): nothing of
+    /// it is committed, the buffer keeps its rows, and the sender takes no
+    /// more flushes while it still delivers the ones before.
     ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.
@@ -717,8 +754,13 @@ impl Sender {
     /// that value is the binding limit.
     ///
     /// The cap is the smallest of `max_buf_size`, the server's advertised cap
-    /// and the store-and-forward segment payload capacity. A flush whose
-    /// encoded frame exceeds it fails with
+    /// and the store-and-forward segment payload capacity. On a connection
+    /// that advertised `X-QWP-Max-Batch-Size` the sender sends a buffer above
+    /// the cap in several frames, which the server commits together, in
+    /// either progress mode, with its queue in memory and with `sf_dir`. On
+    /// any other connection, and with an `sf_dir` slot whose symbol file it
+    /// could not write, it publishes a buffer as one frame: a flush whose
+    /// encoded frame exceeds the cap fails with
     /// [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge) and
     /// publishes nothing. The value can change after a reconnect.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -739,6 +781,11 @@ impl Sender {
 
     /// Return the highest frame sequence number published locally by this
     /// QWP/WebSocket sender, or `None` if no frame has been published.
+    ///
+    /// After a flush that failed with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) this is
+    /// the last frame published before that flush, or `None` if there was
+    /// none: the frames of the failed flush are never confirmed.
     ///
     /// This is a sender-stream watermark, not a process-global receipt.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -874,6 +921,10 @@ impl Sender {
     /// reconnect is blocked on a token that the auth cannot supply until that
     /// callback returns. A wait on any other thread keeps waiting.
     /// When nothing has been published yet, a valid wait returns immediately.
+    /// After a flush that failed with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) the wait
+    /// covers the frames published before that flush, and succeeds once they
+    /// reach `ack_level`.
     /// QWP/WebSocket only; other protocols return `InvalidApiCall`. In manual
     /// progress mode this also drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1113,14 +1164,20 @@ impl Sender {
     }
 
     /// Stop accepting new QWP/WebSocket publications and wait for all already
-    /// published frames to complete.
+    /// published frames to complete. After a flush that failed with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) these are
+    /// the frames published before that flush: the frames of the failed flush
+    /// are dropped, and nothing of it is committed.
     ///
     /// The wait is bounded by the QWP/WebSocket `close_flush_timeout_millis`
     /// setting. Its default is 5000 ms, matching the Java sender. Values less
-    /// than or equal to zero skip the wait. If the deadline passes while the
-    /// sender is disconnected and reconnecting keeps failing, in either
-    /// progress mode, the error names that failure and carries its OIDC detail
-    /// (`Error::oidc_error`).
+    /// than or equal to zero skip the wait. When the deadline passes, the
+    /// error says how many published frames are not confirmed. Without
+    /// `sf_dir` they are dropped with the sender: call [`Self::wait`] before
+    /// closing, raise `close_flush_timeout_millis`, or use `sf_dir`. If the
+    /// deadline passes while the sender is disconnected and reconnecting
+    /// keeps failing, in either progress mode, the error names that failure
+    /// and carries its OIDC detail (`Error::oidc_error`).
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn close_drain(&mut self) -> Result<()> {
         let result = match &mut self.handler {
@@ -1153,7 +1210,10 @@ impl Sender {
     /// Returns `true` after an unrecoverable failure. For ILP-over-TCP this
     /// is any socket error. For QWP/WebSocket this also covers a server
     /// rejection or protocol violation that latches the publication
-    /// lifecycle to its terminal state. ILP-over-HTTP and QWP/UDP never
+    /// lifecycle to its terminal state, and a flush that failed with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted): that
+    /// sender takes no more flushes, and still delivers the ones before the
+    /// failed one until it is dropped. ILP-over-HTTP and QWP/UDP never
     /// transition into a permanently-unusable state and always return
     /// `false`.
     ///

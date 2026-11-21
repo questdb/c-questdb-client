@@ -738,10 +738,14 @@ bool recv_all(socket_t fd, uint8_t* data, size_t len)
 
 // Read the HTTP request, find Sec-WebSocket-Key, write the upgrade
 // response with X-QWP-Version: 1. A non-empty `grant_durable_ack` is echoed
-// as `X-QWP-Durable-Ack` when the request asks for exactly that tier.
+// as `X-QWP-Durable-Ack` when the request asks for exactly that tier. A
+// non-zero `max_batch_size` is told as `X-QWP-Max-Batch-Size`.
 // Returns true on success.
 bool ws_handshake(
-    socket_t fd, bool reject_401, const std::string& grant_durable_ack)
+    socket_t fd,
+    bool reject_401,
+    const std::string& grant_durable_ack,
+    size_t max_batch_size)
 {
     std::string buf;
     buf.reserve(1024);
@@ -831,6 +835,9 @@ bool ws_handshake(
     if (!grant_durable_ack.empty() &&
         requested_durable_ack == grant_durable_ack)
         resp += "X-QWP-Durable-Ack: " + grant_durable_ack + "\r\n";
+    if (max_batch_size > 0)
+        resp +=
+            "X-QWP-Max-Batch-Size: " + std::to_string(max_batch_size) + "\r\n";
     resp += "\r\n";
     return send_all(
         fd, reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
@@ -1042,6 +1049,9 @@ struct MockServer::Impl
     std::mutex workers_mtx;
     std::vector<std::vector<uint8_t>> captured;
     mutable std::mutex captured_mtx;
+    std::vector<IngressFrame> ingress_frames;
+    mutable std::mutex ingress_mtx;
+    std::atomic<int> ingress_closed_count{0};
 
 #ifdef _WIN32
     static void wsa_init()
@@ -1131,18 +1141,57 @@ struct MockServer::Impl
         }
     }
 
+    // Runs `ActionServeIngress` until the client closes.
+    void serve_ingress(socket_t fd)
+    {
+        // The QWP header: magic, version, flags, table count, payload length.
+        const size_t header_size = 12;
+        const size_t flags_offset = 5;
+        const uint8_t flag_defer_commit = 0x01;
+        uint64_t next_wire_seq = 0;
+        while (true)
+        {
+            WsFrame f = ws_read(fd);
+            if (f.opcode < 0 || f.opcode == 0x8)
+                break;
+            if (f.opcode == 0x9)
+            {
+                std::vector<uint8_t> pong = {0x8A, uint8_t(f.payload.size())};
+                pong.insert(pong.end(), f.payload.begin(), f.payload.end());
+                if (!send_all(fd, pong.data(), pong.size()))
+                    break;
+                continue;
+            }
+            if (f.opcode != 0x2 || f.payload.size() < header_size)
+                continue;
+            const bool deferred =
+                (f.payload[flags_offset] & flag_defer_commit) != 0;
+            {
+                std::lock_guard<std::mutex> g(ingress_mtx);
+                ingress_frames.push_back({f.payload.size(), deferred});
+            }
+            const uint64_t wire_seq = next_wire_seq++;
+            if (!deferred && !ws_write_binary(fd, ingress_ok_frame(wire_seq)))
+                break;
+        }
+        ingress_closed_count.fetch_add(1);
+    }
+
     void run_worker(socket_t fd, Script script)
     {
         bool reject = false;
         std::string grant_durable_ack;
+        size_t max_batch_size = 0;
         for (const auto& a : script)
         {
             if (std::holds_alternative<ActionReject401>(a))
                 reject = true;
             else if (std::holds_alternative<ActionServeLocalDurableAck>(a))
                 grant_durable_ack = "local";
+            else if (auto* ingress = std::get_if<ActionServeIngress>(&a))
+                max_batch_size = ingress->max_batch_size;
         }
-        if (!ws_handshake(fd, reject, grant_durable_ack))
+        if (!ws_handshake(fd, reject, grant_durable_ack, max_batch_size))
         {
             close_socket(fd);
             return;
@@ -1251,6 +1300,10 @@ struct MockServer::Impl
             else if (auto* a = std::get_if<ActionServeLocalDurableAck>(&action))
             {
                 serve_local_durable_ack(fd, a->table);
+            }
+            else if (std::holds_alternative<ActionServeIngress>(action))
+            {
+                serve_ingress(fd);
             }
         }
 #ifdef _MSC_VER
@@ -1385,6 +1438,25 @@ std::vector<std::vector<uint8_t>> MockServer::captured_requests() const
 {
     std::lock_guard<std::mutex> g(_impl->captured_mtx);
     return _impl->captured;
+}
+
+std::vector<IngressFrame> MockServer::ingress_frames() const
+{
+    std::lock_guard<std::mutex> g(_impl->ingress_mtx);
+    return _impl->ingress_frames;
+}
+
+bool MockServer::wait_for_ingress_closed(
+    int n, std::chrono::milliseconds timeout) const
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (_impl->ingress_closed_count.load() < n)
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return _impl->ingress_closed_count.load() >= n;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
 }
 
 } // namespace qwp_mock

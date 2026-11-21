@@ -48,6 +48,14 @@ pub(crate) const HEADER_SIZE: usize = 24;
 pub(crate) const FRAME_HEADER_SIZE: usize = 8;
 pub(crate) const INITIAL_SEGMENT_FILE_NAME: &str = "sf-initial.sfa";
 
+// The header of a QWP message, as far as a segment reads its frames' payloads:
+// see `payload_defers_commit`. Duplicated from the wire encoders, as in
+// `qwp_ws_sfa_catchup`.
+const QWP_HEADER_SIZE: usize = 12;
+const QWP_MAGIC: [u8; 4] = *b"QWP1";
+const QWP_FLAGS_OFFSET: usize = 5;
+const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
+
 #[cfg(unix)]
 static MLOCK_REFUSAL_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -74,6 +82,44 @@ fn should_fail_sync_for_test() -> bool {
             false
         }
         None => false,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static REMOVAL_STOP_COUNTDOWN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes the removal of an unfinished flush at the open of a slot stop with
+/// an error at its step number `steps`, counted from zero, as a process that
+/// dies there would: what the steps before wrote stays written.
+#[cfg(test)]
+pub(crate) fn stop_removal_after_for_test(steps: usize) {
+    REMOVAL_STOP_COUNTDOWN.with(|countdown| countdown.set(Some(steps)));
+}
+
+/// Takes the stop of [`stop_removal_after_for_test`] back. Returns whether
+/// it was still armed: whether the removal ended before it got that far.
+#[cfg(test)]
+pub(crate) fn clear_removal_stop_for_test() -> bool {
+    REMOVAL_STOP_COUNTDOWN.with(|countdown| countdown.take().is_some())
+}
+
+/// One step of the removal of an unfinished flush: a write, a sync or a
+/// delete follows. See [`stop_removal_after_for_test`].
+#[cfg(test)]
+pub(crate) fn removal_step_for_test() -> io::Result<()> {
+    REMOVAL_STOP_COUNTDOWN.with(|countdown| match countdown.get() {
+        Some(0) => {
+            countdown.set(None);
+            Err(io::Error::other("injected stop of the removal"))
+        }
+        Some(remaining) => {
+            countdown.set(Some(remaining - 1));
+            Ok(())
+        }
+        None => Ok(()),
     })
 }
 
@@ -144,6 +190,8 @@ pub(crate) struct SfaSegmentMetadataScan {
     pub(crate) header: SfaSegmentHeader,
     pub(crate) manifest_required: bool,
     pub(crate) frame_count: u64,
+    /// See [`SfaSegment::committed_frame_count`].
+    pub(crate) committed_frame_count: u64,
     pub(crate) append_offset: u64,
     pub(crate) torn_tail_bytes: u64,
     pub(crate) first_empty_payload_fsn: Option<u64>,
@@ -177,6 +225,7 @@ pub(crate) struct SfaSegment {
     manifest_required: bool,
     append_offset: u64,
     frame_count: u64,
+    committed_frame_count: u64,
     // Recovery records this on opened segments; queue recovery also reports the
     // metadata scan directly before opening the segment.
     #[allow(dead_code)]
@@ -266,6 +315,7 @@ impl SfaSegment {
             manifest_required: false,
             append_offset: HEADER_SIZE as u64,
             frame_count: 0,
+            committed_frame_count: 0,
             torn_tail_bytes: 0,
         })
     }
@@ -319,6 +369,7 @@ impl SfaSegment {
             manifest_required,
             append_offset: HEADER_SIZE as u64,
             frame_count: 0,
+            committed_frame_count: 0,
             torn_tail_bytes: 0,
         })
     }
@@ -348,6 +399,7 @@ impl SfaSegment {
             manifest_required: scan.manifest_required,
             append_offset: scan.append_offset,
             frame_count: scan.frame_count,
+            committed_frame_count: scan.committed_frame_count,
             torn_tail_bytes: scan.torn_tail_bytes,
         })
     }
@@ -518,6 +570,68 @@ impl SfaSegment {
         Ok(())
     }
 
+    /// Removes every frame after the first `keep_frames` and syncs the
+    /// segment. For recovery, which owns the segment alone: see
+    /// `remove_unfinished_flush` in `qwp_ws_sfa_queue`.
+    ///
+    /// The frames go from the end backwards, and of each one the payload
+    /// before its header. A process that dies on the way leaves the frames
+    /// it had not reached whole and at most one frame behind them whose
+    /// header stands and whose checksum fails, which the next open cleans up
+    /// as a torn tail ([`Self::sanitize_torn_tail`]). The other order would
+    /// leave whole frames behind a zeroed header: a frame has no number of
+    /// its own, the scan takes zeroes for the clean end of the segment, and
+    /// a later frame of the same length as the one that stood there would
+    /// make the next scan run on into them.
+    pub(crate) fn cut_back_to(&mut self, keep_frames: u64) -> Result<(), SfaSegmentError> {
+        if keep_frames >= self.frame_count {
+            return Ok(());
+        }
+        // Where the frames to remove begin, in file order, and where the
+        // last of them ends.
+        let mut bounds = Vec::new();
+        let mut pos = HEADER_SIZE as u64;
+        for index in 0..self.frame_count {
+            if index >= keep_frames {
+                bounds.push(pos);
+            }
+            pos = self
+                .next_frame_offset_with_limit(pos, self.append_offset)
+                .ok_or(SfaSegmentError::OffsetOverflow)?;
+        }
+        bounds.push(pos);
+        let to_usize =
+            |offset: u64| usize::try_from(offset).map_err(|_| SfaSegmentError::OffsetOverflow);
+        for frame in bounds.windows(2).rev() {
+            let (start, end) = (to_usize(frame[0])?, to_usize(frame[1])?);
+            let payload_start = start + FRAME_HEADER_SIZE;
+            #[cfg(test)]
+            removal_step_for_test()?;
+            self.mapping.zero_range(payload_start, end - payload_start);
+            #[cfg(test)]
+            removal_step_for_test()?;
+            self.mapping.zero_range(start, FRAME_HEADER_SIZE);
+        }
+        let (cut, end) = (to_usize(bounds[0])?, to_usize(pos)?);
+        #[cfg(test)]
+        removal_step_for_test()?;
+        self.mapping.flush_range(cut, end - cut)?;
+        #[cfg(test)]
+        if should_fail_sync_for_test() {
+            return Err(SfaSegmentError::Io(io::Error::other(
+                "injected sync failure of a cut segment",
+            )));
+        }
+        if let Some(file) = self.file.as_ref() {
+            file.sync_data()?;
+        }
+        self.append_offset = bounds[0];
+        self.frame_count = keep_frames;
+        self.committed_frame_count = self.committed_frame_count.min(keep_frames);
+        self.torn_tail_bytes = 0;
+        Ok(())
+    }
+
     /// `start` is a known `(fsn, offset)` frame boundary in this segment to scan from.
     pub(crate) fn frame_offset_for_fsn_with_limit(
         &self,
@@ -565,6 +679,14 @@ impl SfaSegment {
 
     pub(crate) fn frame_count(&self) -> u64 {
         self.frame_count
+    }
+
+    /// How many of the frames that the segment held when it was opened lie
+    /// at or before its last frame that commits: all of them when the last
+    /// frame commits, none when no frame does. A frame is one that commits
+    /// unless it defers its commit ([`payload_defers_commit`]).
+    pub(crate) fn committed_frame_count(&self) -> u64 {
+        self.committed_frame_count
     }
 
     pub(crate) fn torn_tail_bytes(&self) -> u64 {
@@ -782,6 +904,7 @@ fn scan_segment_metadata_source<S: ReadAt + ?Sized>(
         header: raw.header,
         manifest_required: raw.manifest_required,
         frame_count: raw.frame_count,
+        committed_frame_count: raw.committed_frame_count,
         append_offset: raw.append_offset,
         torn_tail_bytes: raw.torn_tail_bytes,
         first_empty_payload_fsn: raw.first_empty_payload_fsn,
@@ -820,6 +943,7 @@ struct RawSegmentScan {
     header: SfaSegmentHeader,
     manifest_required: bool,
     frame_count: u64,
+    committed_frame_count: u64,
     append_offset: u64,
     torn_tail_bytes: u64,
     first_empty_payload_fsn: Option<u64>,
@@ -874,6 +998,7 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
 
     let mut chunk = vec![0u8; SCAN_CHUNK_BYTES];
     let mut frame_count = 0u64;
+    let mut committed_frame_count = 0u64;
     let mut first_empty_payload_fsn = None;
     let mut pos = HEADER_SIZE as u64;
     while pos + (FRAME_HEADER_SIZE as u64) <= source_len {
@@ -895,12 +1020,16 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
         // The CRC covers the length field and the payload; stream the payload
         // through the bounded chunk instead of materialising the frame.
         let mut crc_calc = crc32c_update(0, &frame_header[4..8]);
+        let mut defers_commit = false;
         let mut read_pos = payload_start;
         while read_pos < frame_end {
             let n = chunk
                 .len()
                 .min(usize::try_from(frame_end - read_pos).unwrap_or(chunk.len()));
             read_exact_at(source, &mut chunk[..n], read_pos)?;
+            if read_pos == payload_start {
+                defers_commit = payload_defers_commit(&chunk[..n]);
+            }
             crc_calc = crc32c_update(crc_calc, &chunk[..n]);
             read_pos += n as u64;
         }
@@ -919,6 +1048,9 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
         frame_count = frame_count
             .checked_add(1)
             .ok_or(SfaSegmentError::OffsetOverflow)?;
+        if !defers_commit {
+            committed_frame_count = frame_count;
+        }
         pos = frame_end;
     }
 
@@ -926,10 +1058,22 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
         header,
         manifest_required,
         frame_count,
+        committed_frame_count,
         append_offset: pos,
         torn_tail_bytes: detect_torn_tail(source, source_len, pos)?,
         first_empty_payload_fsn,
     })
+}
+
+/// Whether a frame whose payload begins with `head` asks the server to hold
+/// its rows until a later frame commits them: a QWP message with the
+/// defer-commit flag. The server answers such a frame only together with the
+/// frame that commits it. Any other payload counts as one that commits,
+/// whatever it is.
+fn payload_defers_commit(head: &[u8]) -> bool {
+    head.len() >= QWP_HEADER_SIZE
+        && head[..4] == QWP_MAGIC
+        && head[QWP_FLAGS_OFFSET] & QWP_FLAG_DEFER_COMMIT != 0
 }
 
 fn encode_header(header: SfaSegmentHeader, manifest_required: bool) -> [u8; HEADER_SIZE] {
