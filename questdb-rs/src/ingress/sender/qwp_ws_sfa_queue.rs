@@ -108,6 +108,26 @@ thread_local! {
     static UNFINISHED_FLUSH_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static ROTATION_SYNC_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` once, on this thread, when a rotation is about to sync the
+/// segment it leaves: see [`SfaProducer::rotate_active`].
+#[cfg(test)]
+fn before_rotation_sync_for_test(hook: impl FnOnce() + 'static) {
+    ROTATION_SYNC_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_rotation_sync_hook() {
+    if let Some(hook) = ROTATION_SYNC_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
 /// Runs `open` with the recovery of a release that does not know
 /// [`remove_unfinished_flush`].
 #[cfg(test)]
@@ -1617,7 +1637,7 @@ impl SfaProducer {
         // Reserve the topology transaction and detach its manifest writer.
         // Until commit, readers keep seeing the previous active and sealed
         // chain. No filesystem operation below holds the engine-state mutex.
-        let (candidate, mut manifest, old_active, head_base, reserved_new_segment) = {
+        let (candidate, mut manifest, old_active, head_base, reserved_new_segment, sync_old_active) = {
             let mut state = self.engine.lock_state()?;
             let active = state.active.as_ref().ok_or(SfaQueueError::Closed)?;
             if !Arc::ptr_eq(active, &self.active) {
@@ -1628,7 +1648,18 @@ impl SfaProducer {
             if state.topology_io_in_flight {
                 return Err(self.engine.rotation_backpressure_error(&state).into());
             }
-            if self.engine.request_sync_before_rotation(active) {
+            // Periodic durability seals a segment only once it is synced.
+            // The runner syncs on its cadence, but it gets to storage
+            // maintenance only from its connected loop: not while it
+            // reconnects, and not while it is parked in socket I/O. So
+            // this appender syncs the segment itself, inside the topology
+            // transaction reserved below, which keeps a sync of the runner
+            // out. When a storage task of the runner is under way, it waits
+            // for that one, which may be this sync.
+            let sync_old_active =
+                self.engine.periodic_sync_interval.is_some() && !active.is_published_durable();
+            if sync_old_active && state.storage_maintenance_in_flight {
+                self.engine.sync_requested.store(true, Ordering::Release);
                 return Err(self.engine.rotation_backpressure_error(&state).into());
             }
             if self.engine.slot_dir.is_some() && state.manifest.is_none() {
@@ -1696,11 +1727,26 @@ impl SfaProducer {
                 old_active,
                 head_base,
                 reserved_new_segment,
+                sync_old_active,
             )
         };
 
-        let prepared = match candidate {
-            Candidate::Existing(mut segment) => {
+        #[cfg(test)]
+        if sync_old_active {
+            run_rotation_sync_hook();
+        }
+        // A failed sync fails this append and no other: the next one syncs
+        // again. Nothing is latched, because only a sync of the runner would
+        // clear a latch.
+        let synced = if sync_old_active {
+            old_active.sync_published()
+        } else {
+            Ok(())
+        };
+        let prepared = match (synced, candidate) {
+            (Err(err), Candidate::Existing(segment)) => Err((Some(segment), err.into())),
+            (Err(err), Candidate::Create { .. }) => Err((None, err.into())),
+            (Ok(()), Candidate::Existing(mut segment)) => {
                 let result = match Arc::get_mut(&mut segment) {
                     Some(shared) => shared.rebase_empty(self.next_fsn).map_err(Into::into),
                     None => Err(SfaQueueError::CorruptSegments {
@@ -1712,7 +1758,7 @@ impl SfaProducer {
                     Err(err) => Err((Some(segment), err)),
                 }
             }
-            Candidate::Create { path, created_us } => {
+            (Ok(()), Candidate::Create { path, created_us }) => {
                 let result = match path.as_deref() {
                     Some(path) => match path.parent() {
                         Some(slot_dir) => create_manifested_segment(
@@ -1932,14 +1978,6 @@ impl SfaEngine {
         state.storage_maintenance_in_flight = false;
         state.hot_spare_creation_in_flight = false;
         Ok(())
-    }
-
-    fn request_sync_before_rotation(&self, active: &SfaSharedSegment) -> bool {
-        if self.periodic_sync_interval.is_some() && !active.is_published_durable() {
-            self.sync_requested.store(true, Ordering::Release);
-            return true;
-        }
-        false
     }
 
     fn rotation_backpressure_error(&self, state: &SfaEngineState) -> QueueError {
@@ -3903,30 +3941,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn periodic_rotation_waits_for_a_requested_predecessor_sync() {
-        let dir = TempDir::new().unwrap();
+    /// A queue with periodic durability whose segments hold two frames of
+    /// 16 bytes, with two such frames in its first segment. They are not
+    /// synced: the next frame needs a new segment.
+    fn periodic_queue_with_a_full_segment(dir: &TempDir, first_sync_done: bool) -> SfaFrameQueue {
         let segment_size = (HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + 16)) as u64;
         let mut queue = SfaFrameQueue::open(periodic_options_with(
-            &dir,
+            dir,
             segment_size,
             3 * segment_size as usize,
         ))
         .unwrap();
-
-        assert!(queue.maintain_storage().unwrap());
-        assert!(active_is_durable(&queue));
+        if first_sync_done {
+            // The first sync of the network thread, which is due at once.
+            // The next is due an hour later.
+            assert!(queue.maintain_storage().unwrap());
+            assert!(active_is_durable(&queue));
+        }
         queue.try_submit(&[1; 16]).unwrap();
         queue.try_submit(&[2; 16]).unwrap();
         assert!(!active_is_durable(&queue));
         assert!(queue.hot_spare_installed());
+        queue
+    }
 
-        let err = queue.try_submit(&[3; 16]).unwrap_err();
-        assert!(matches!(
-            err,
-            SfaQueueError::Queue(QueueError::StorageSpareNotReady { .. })
-        ));
-        assert_eq!(queue.published_fsn(), Some(1));
+    fn sealed_are_durable(queue: &SfaFrameQueue) -> bool {
+        queue.engine.with_state(|state| {
+            state
+                .sealed_segments
+                .iter()
+                .all(|segment| segment.is_published_durable())
+        })
+    }
+
+    /// Notes, when the manifest of `queue` is next written, whether the
+    /// segment in use is synced by then.
+    fn note_durability_at_the_next_manifest_write(queue: &SfaFrameQueue) -> Arc<AtomicBool> {
+        let durable = Arc::new(AtomicBool::new(false));
+        let mut state = queue.engine.state.lock().unwrap();
+        let active = Arc::clone(state.active.as_ref().unwrap());
+        let noted = Arc::clone(&durable);
+        state
+            .manifest
+            .as_mut()
+            .unwrap()
+            .set_before_sync_hook(Arc::new(move || {
+                noted.store(active.is_published_durable(), Ordering::Release);
+                Ok(())
+            }));
+        durable
+    }
+
+    #[test]
+    fn periodic_rotation_syncs_the_segment_it_leaves_before_it_seals_it() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, true);
+        let durable_at_manifest_write = note_durability_at_the_next_manifest_write(&queue);
+
+        take_sfa_barriers();
+        assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
+        assert!(
+            durable_at_manifest_write.load(Ordering::Acquire),
+            "the manifest named the next segment before the one it leaves was synced"
+        );
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(sealed_are_durable(&queue));
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
+
+        // The appender did it alone: the network thread was neither waited
+        // for nor asked to sync ahead of its time.
+        assert!(!queue.engine.sync_requested.load(Ordering::Acquire));
+        queue.maintain_storage().unwrap();
+        assert!(!take_sfa_barriers().iter().any(|event| matches!(
+            event,
+            SfaBarrierEvent::PeriodicSyncAttempt(_) | SfaBarrierEvent::PeriodicSyncCompleted
+        )));
+        queue.close().unwrap();
+    }
+
+    #[test]
+    fn periodic_rotation_leaves_a_segment_alone_that_the_network_thread_has_synced() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, false);
 
         take_sfa_barriers();
         assert!(queue.maintain_storage().unwrap());
@@ -3939,8 +4035,145 @@ mod tests {
         );
         assert!(active_is_durable(&queue));
 
+        before_rotation_sync_for_test(|| panic!("the rotation synced a segment that is synced"));
         assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
         assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(sealed_are_durable(&queue));
+    }
+
+    #[test]
+    fn periodic_rotation_waits_for_a_storage_task_of_the_network_thread() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, false);
+
+        // The network thread has taken its sync and not done it yet.
+        let step = queue
+            .take_storage_maintenance_step(false)
+            .unwrap()
+            .expect("the first periodic sync is due immediately");
+        assert!(matches!(step, SfaStorageStep::SyncPublished(_)));
+
+        let err = queue.try_submit(&[3; 16]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SfaQueueError::Queue(QueueError::StorageSpareNotReady { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(queue.published_fsn(), Some(1));
+        assert_eq!(queue.sealed_segment_count(), 0);
+        assert!(!active_is_durable(&queue));
+        assert!(queue.engine.sync_requested.load(Ordering::Acquire));
+
+        let result = step.perform().unwrap();
+        queue.finish_storage_maintenance(result, true).unwrap();
+        queue.complete_storage_maintenance().unwrap();
+        assert!(active_is_durable(&queue));
+        assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(sealed_are_durable(&queue));
+    }
+
+    #[test]
+    fn periodic_rotation_keeps_the_network_thread_from_syncing_while_it_syncs() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, false);
+
+        let seen = Arc::new(AtomicBool::new(false));
+        before_rotation_sync_for_test({
+            let engine = Arc::clone(&queue.engine);
+            let seen = Arc::clone(&seen);
+            move || {
+                // The first sync of the network thread is due, and waits.
+                assert!(
+                    engine.take_periodic_sync_step().unwrap().is_none(),
+                    "the network thread got its sync while the rotation synced"
+                );
+                assert!(engine.storage_maintenance_in_flight().unwrap());
+                assert!(matches!(
+                    engine.close(&mut None),
+                    Err(SfaQueueError::StorageMaintenanceInFlight)
+                ));
+                seen.store(true, Ordering::Release);
+            }
+        });
+        assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
+        assert!(seen.load(Ordering::Acquire), "the rotation did not sync");
+        assert!(sealed_are_durable(&queue));
+
+        // The rotation is over: the network thread syncs, the queue closes.
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
+        take_sfa_barriers();
+        assert!(queue.maintain_storage().unwrap());
+        assert!(take_sfa_barriers().contains(&SfaBarrierEvent::PeriodicSyncCompleted));
+        queue.close().unwrap();
+    }
+
+    /// What a rotation whose sync failed leaves: the frames and the segment
+    /// in use as they were, nothing reserved, nothing latched.
+    fn assert_the_failed_rotation_left_nothing(
+        queue: &SfaFrameQueue,
+        err: SfaQueueError,
+        published: u64,
+        sealed: usize,
+        allocated: u64,
+    ) {
+        assert!(
+            matches!(err, SfaQueueError::Segment(SfaSegmentError::Io(_))),
+            "{err:?}"
+        );
+        assert_eq!(
+            queue.published_fsn(),
+            Some(published),
+            "a failed append must not reserve an FSN"
+        );
+        assert_eq!(queue.sealed_segment_count(), sealed);
+        assert_eq!(queue.allocated_segment_bytes(), allocated);
+        assert!(!active_is_durable(queue));
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
+        queue.check_durability().unwrap();
+        assert!(!queue.engine.sync_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn periodic_rotation_whose_sync_fails_fails_that_append_and_latches_nothing() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, true);
+        let allocated = queue.allocated_segment_bytes();
+
+        fail_sync_after_for_test(0);
+        let err = queue.try_submit(&[3; 16]).unwrap_err();
+        assert_the_failed_rotation_left_nothing(&queue, err, 1, 0, allocated);
+        assert!(queue.hot_spare_installed());
+
+        // The next append syncs again.
+        let durable_at_manifest_write = note_durability_at_the_next_manifest_write(&queue);
+        assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
+        assert!(durable_at_manifest_write.load(Ordering::Acquire));
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(sealed_are_durable(&queue));
+    }
+
+    #[test]
+    fn periodic_rotation_whose_sync_fails_gives_back_the_segment_it_reserved() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = periodic_queue_with_a_full_segment(&dir, true);
+        // The spare goes to the second segment, and nobody makes another:
+        // the next rotation reserves the bytes of a segment of its own.
+        queue.try_submit(&[3; 16]).unwrap();
+        queue.try_submit(&[4; 16]).unwrap();
+        assert!(!queue.hot_spare_installed());
+        let allocated = queue.allocated_segment_bytes();
+
+        fail_sync_after_for_test(0);
+        let err = queue.try_submit(&[5; 16]).unwrap_err();
+        assert_the_failed_rotation_left_nothing(&queue, err, 3, 1, allocated);
+        assert!(!queue.hot_spare_installed());
+
+        assert_eq!(queue.try_submit(&[5; 16]).unwrap().fsn, 4);
+        assert_eq!(queue.sealed_segment_count(), 2);
+        assert!(sealed_are_durable(&queue));
     }
 
     #[test]
@@ -3985,11 +4218,6 @@ mod tests {
         queue.maintain_storage().unwrap();
         queue.try_submit(&[1; 16]).unwrap();
         queue.try_submit(&[2; 16]).unwrap();
-        assert!(matches!(
-            queue.try_submit(&[3; 16]).unwrap_err(),
-            SfaQueueError::Queue(QueueError::StorageSpareNotReady { .. })
-        ));
-        queue.maintain_storage().unwrap();
         queue.try_submit(&[3; 16]).unwrap();
         reset_live_durability(&queue);
 

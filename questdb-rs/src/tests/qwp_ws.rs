@@ -10091,6 +10091,195 @@ fn qwp_ws_in_callback_wait_rejects_only_the_blocked_sibling() {
         .expect("the blocked sibling's frame must drain after the callback returns");
 }
 
+// ---------- sf_durability=periodic: a new segment whatever the network thread does ----------
+
+/// Flushes `rows` `flushes` times. Each must be queued: a sender with a
+/// disk queue takes flushes whatever its server does.
+fn assert_every_flush_is_queued(
+    sender: &mut crate::ingress::Sender,
+    rows: &Buffer,
+    flushes: usize,
+    when: &str,
+) {
+    for flush in 0..flushes {
+        let started = Instant::now();
+        if let Err(err) = sender.flush_and_keep(rows) {
+            panic!(
+                "{when}: flush {flush} of {flushes} failed after {:?}: {err}",
+                started.elapsed()
+            );
+        }
+    }
+}
+
+fn sfa_files_of(slot: &Path) -> usize {
+    std::fs::read_dir(slot)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sfa"))
+        .count()
+}
+
+/// With `sf_durability=periodic` a segment of the disk queue is synced
+/// before the next one is taken. The sender does that itself where it
+/// appends, so it does not depend on its network thread, which is busy
+/// with reconnecting here.
+#[test]
+fn periodic_sf_sender_takes_new_segments_while_its_server_is_down() {
+    use crate::tests::qwp_ws_server_model::{QwpWsModelServer, buffer_of};
+
+    for manual in [false, true] {
+        let when = if manual {
+            "driven by its caller"
+        } else {
+            "in the background"
+        };
+        let server = QwpWsModelServer::start(1024);
+        let sf_dir = tempfile::TempDir::new().unwrap();
+        let mode = if manual {
+            "qwp_ws_progress=manual;"
+        } else {
+            ""
+        };
+        // A segment holds three flushes.
+        let mut sender = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{};{mode}sf_dir={};sender_id=periodic;\
+             sf_durability=periodic;sf_max_segment_bytes=1024;sf_max_total_bytes=1048576;\
+             sf_append_deadline_millis=2000;\
+             reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;",
+            server.port,
+            sf_dir.path().display()
+        ))
+        .unwrap()
+        .build()
+        .unwrap();
+        let rows = buffer_of("periodic_rows", 0..10);
+        sender.flush_and_keep(&rows).unwrap();
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+            .unwrap();
+
+        server.go_down();
+        // Something to send, so that the sender finds its connection gone.
+        sender.flush_and_keep(&rows).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                if manual {
+                    let _ = sender.drive_once();
+                }
+                sender.qwp_ws_totals().unwrap().reconnect_attempts >= 2
+            }),
+            "{when}: the sender did not try to reconnect"
+        );
+
+        assert_every_flush_is_queued(&mut sender, &rows, 30, when);
+        let segments = sfa_files_of(&sf_dir.path().join("periodic"));
+        assert!(
+            segments >= 10,
+            "{when}: 32 flushes took {segments} segment files: the test rotated too little"
+        );
+        drop(sender);
+        drop(server);
+    }
+}
+
+/// With a server that answers, the sender and its network thread both work
+/// on the files of the queue: the one syncs a segment and takes the next,
+/// the other syncs when its time comes, frees the segments of confirmed
+/// frames and makes spare ones.
+#[test]
+fn periodic_sf_sender_takes_new_segments_while_its_network_thread_tends_the_queue() {
+    use crate::tests::qwp_ws_server_model::{QwpWsModelServer, buffer_of};
+
+    const FLUSHES: usize = 90;
+    for manual in [false, true] {
+        let when = if manual {
+            "driven by its caller"
+        } else {
+            "in the background"
+        };
+        let server = QwpWsModelServer::start(1024);
+        let sf_dir = tempfile::TempDir::new().unwrap();
+        let mode = if manual {
+            "qwp_ws_progress=manual;"
+        } else {
+            ""
+        };
+        // A segment holds three flushes.
+        let mut sender = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{};{mode}sf_dir={};sender_id=periodic;\
+             sf_durability=periodic;sf_sync_interval_millis=1;\
+             sf_max_segment_bytes=1024;sf_max_total_bytes=1048576;",
+            server.port,
+            sf_dir.path().display()
+        ))
+        .unwrap()
+        .build()
+        .unwrap();
+        let rows = buffer_of("periodic_rows", 0..10);
+
+        assert_every_flush_is_queued(&mut sender, &rows, FLUSHES, when);
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(30))
+            .unwrap_or_else(|err| panic!("{when}: {err}"));
+        assert_eq!(
+            server.model.table("periodic_rows").unwrap().row_count(),
+            10 * FLUSHES,
+            "{when}"
+        );
+        sender.close_drain().unwrap();
+        server.finish();
+    }
+}
+
+/// The same while the network thread sits in a write to a server that has
+/// stopped reading.
+#[test]
+fn periodic_sf_sender_takes_new_segments_while_its_server_does_not_read() {
+    const FLUSHES: usize = 60;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (stop, stopped) = mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        upgrade_mock_stream_with_max_batch_size(&mut stream, Some(1024 * 1024));
+        // Reads nothing more, and keeps the connection.
+        let _ = stopped.recv_timeout(Duration::from_secs(120));
+    });
+
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    // A segment holds two flushes.
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{port};sf_dir={};sender_id=periodic;sf_durability=periodic;\
+         sf_max_segment_bytes=1048576;sf_max_total_bytes=1073741824;\
+         sf_append_deadline_millis=2000;",
+        sf_dir.path().display()
+    ))
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut rows = sender.new_buffer();
+    rows.table("periodic_rows")
+        .unwrap()
+        .column_str("v", "x".repeat(400 * 1024))
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    assert_every_flush_is_queued(&mut sender, &rows, FLUSHES, "server not reading");
+    let sent = sender.qwp_ws_totals().unwrap().frames_sent;
+    assert!(
+        (sent as usize) < FLUSHES,
+        "the server read nothing and took all {sent} frames: the network thread was never \
+         held in a write, so the test proved nothing"
+    );
+
+    let _ = stop.send(());
+    server.join().unwrap();
+    drop(sender);
+}
+
 #[cfg(feature = "_oidc")]
 mod closed_provider_sf;
 
