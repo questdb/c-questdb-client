@@ -2,10 +2,12 @@
 
 These fixtures are committed compatibility data for the Rust QWP/WebSocket
 Store-and-Forward on-disk formats: the `.sfa` segment codec and the
-`.symbol-dict` side-file. Every one of them holds bytes the **Java reference
-client actually wrote**, so the Rust tests that load them prove cross-client
-parity rather than re-asserting this client's own round-trip. Normal Rust tests
-load these hex files and do not need a Java checkout.
+`.symbol-dict` side-file. Every `java-*` one of them holds bytes the **Java
+reference client actually wrote**, so the Rust tests that load them prove
+cross-client parity rather than re-asserting this client's own round-trip.
+Normal Rust tests load these hex files and do not need a Java checkout.
+`rust-7.3.0-slot.hex` holds a slot that release 7.3.0 of this client wrote: see
+the last section.
 
 ## `.sfa` segment fixtures
 
@@ -84,3 +86,23 @@ QDB_JAVA_CLIENT_CORE=<core> cargo test --manifest-path questdb-rs/Cargo.toml \
 QDB_JAVA_CLIENT_CORE=<core> cargo test --manifest-path questdb-rs/Cargo.toml \
   print_java_symbol_dict_fixture_hex -- --ignored --nocapture
 ```
+
+## A slot written by release 7.3.0
+
+`rust-7.3.0-slot.hex` holds every file of one slot as the queue of release
+7.3.0 left it (`SfaFrameQueue`, built from the tag), one file a line: its name,
+its size in bytes, and its bytes in hex without the zeroes at its end.
+
+- segments of 256 bytes, three frames each: `sf-0000000000000000.sfa` (frames 0
+  to 2), `sf-0000000000000001.sfa` (3 to 5), `sf-0000000000000002.sfa` (6 and 7);
+- every payload is 60 bytes: a QWP header without the defer-commit flag
+  (`QWP1`, version 1, flags `0x08`, six zero bytes) and the number of the frame
+  in each of the other 48 bytes;
+- `sf-manifest.bin` names the first segment as the head and the third as the
+  active one; `.ack-watermark` names frame 1 as confirmed; `.symbol-dict` is
+  empty.
+
+No release up to 7.3.0 writes a frame with the defer-commit flag to disk. The
+test `a_slot_written_by_release_7_3_0_is_opened_as_it_is` pins that an open
+leaves the frames of such a slot alone: it removes only a flush that was cut
+off before its last frame.

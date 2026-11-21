@@ -173,7 +173,28 @@ impl SfManifest {
         {
             return Ok(());
         }
+        self.write(new_head_base, new_active_base)
+    }
 
+    /// Names an earlier segment as the active one, which [`Self::update`]
+    /// never does. Only for recovery, when it removes an unfinished flush
+    /// from the end of the slot (`remove_unfinished_flush` in
+    /// `qwp_ws_sfa_queue`): the segment that was active must hold no frame
+    /// by then, durably, because a segment with frames beyond the active one
+    /// refuses the slot.
+    pub(crate) fn move_active_back(&mut self, new_active_base: u64) -> io::Result<()> {
+        if new_active_base < self.head_base || new_active_base >= self.active_base {
+            return Err(invalid_data("invalid earlier SF manifest active boundary"));
+        }
+        #[cfg(test)]
+        super::qwp_ws_sfa_segment::removal_step_for_test()?;
+        self.write(self.head_base, new_active_base)
+    }
+
+    /// Writes the next record and syncs it. The record is in the file before
+    /// the sync: after a failure it may or may not be the one a later open
+    /// reads.
+    fn write(&mut self, new_head_base: u64, new_active_base: u64) -> io::Result<()> {
         let next_generation = self
             .generation
             .checked_add(1)
@@ -192,6 +213,8 @@ impl SfManifest {
         if let Some(hook) = &self.before_sync {
             (hook.0)()?;
         }
+        #[cfg(test)]
+        super::qwp_ws_sfa_segment::removal_step_for_test()?;
         self.file.sync_all()?;
         self.generation = next_generation;
         self.head_base = new_head_base;
@@ -470,6 +493,35 @@ mod tests {
         let reopened = SfManifest::open(dir.path()).unwrap().unwrap();
         assert_eq!(reopened.head_base(), 12);
         assert_eq!(reopened.active_base(), 25);
+    }
+
+    #[test]
+    fn manifest_names_an_earlier_active_segment_only_when_it_is_asked_to_move_back() {
+        let dir = TempDir::new().unwrap();
+        let mut manifest = SfManifest::create(dir.path(), 10, 20).unwrap();
+        // Not earlier than the active segment, or before the head.
+        for refused in [20, 21, 9, 0] {
+            let err = manifest.move_active_back(refused).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{refused}");
+        }
+        assert_eq!(manifest.generation(), 1);
+
+        manifest.move_active_back(14).unwrap();
+        assert_eq!(manifest.generation(), 2);
+        assert_eq!((manifest.head_base(), manifest.active_base()), (10, 14));
+        // The head may be the new active segment.
+        manifest.move_active_back(10).unwrap();
+        assert_eq!((manifest.head_base(), manifest.active_base()), (10, 10));
+        drop(manifest);
+
+        // The newest record is the one that an open reads, and from there
+        // the values only grow again.
+        let mut manifest = SfManifest::open(dir.path()).unwrap().unwrap();
+        assert_eq!(manifest.generation(), 3);
+        assert_eq!((manifest.head_base(), manifest.active_base()), (10, 10));
+        manifest.update(10, 13).unwrap();
+        manifest.update(10, 11).unwrap();
+        assert_eq!((manifest.head_base(), manifest.active_base()), (10, 13));
     }
 
     #[test]
