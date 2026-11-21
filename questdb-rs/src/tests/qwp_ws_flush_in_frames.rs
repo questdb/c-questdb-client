@@ -25,9 +25,14 @@
 //! `Sender::flush` of a row buffer that does not fit one frame.
 //!
 //! Such a buffer goes out in several frames that the server commits together
-//! when all of this holds: the sender keeps its queue in memory, the server
-//! has told its frame limit, the buffer is within `max_buf_size`, each of its
-//! rows fits a frame and none of its values is one that cannot be sent.
+//! when all of this holds: the server has told its frame limit, the buffer
+//! is within `max_buf_size`, each of its rows fits a frame and none of its
+//! values is one that cannot be sent. The sender may keep its queue in
+//! memory or in a slot of its `sf_dir`. With `sf_dir` the frames of a flush
+//! that stopped part way stay in the slot, and the next sender on the slot
+//! removes them when it starts: it sends the flushes before that one, and
+//! nothing of it. A sender that could not make the symbol file of its slot
+//! sends every buffer as one frame.
 //! The sender may make its progress in the background or be driven by its
 //! caller (`qwp_ws_progress=manual`): every test of a sender runs with both.
 //! A sender that is driven by its caller only queues the frames, and drives
@@ -71,6 +76,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
+use crate::ingress::sender::fail_sync_after_for_test;
+use crate::ingress::sender::qwp_ws_sfa_manifest::fail_manifest_sync_after_for_test;
 use crate::ingress::{
     AckLevel, Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, Sender, SenderBuilder,
     SymbolGlobalDict, TimestampMicros, TimestampNanos, decode_qwp_varint,
@@ -111,12 +118,40 @@ enum Progress {
     Manual,
 }
 
+thread_local! {
+    /// The folder in which the senders of a test keep their queues, and how
+    /// many senders the test has built: see [`on_disk`].
+    static SF_DIR: std::cell::RefCell<Option<(tempfile::TempDir, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `test` with the queue of every sender it builds on disk: each
+/// sender gets a slot of its own in a temporary `sf_dir`, as each has a
+/// queue of its own in memory.
+fn on_disk(test: fn(Progress), progress: Progress) {
+    SF_DIR.with(|sf_dir| *sf_dir.borrow_mut() = Some((tempfile::TempDir::new().unwrap(), 0)));
+    test(progress);
+    SF_DIR.with(|sf_dir| sf_dir.borrow_mut().take());
+}
+
 fn sender_with(port: u16, progress: Progress, settings: &str) -> Sender {
     let mode = match progress {
         Progress::Background => "",
         Progress::Manual => "qwp_ws_progress=manual;",
     };
-    SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{port};{mode}{settings}"))
+    // A test that names its `sf_dir` keeps it.
+    let slot = SF_DIR
+        .with(|sf_dir| {
+            let mut sf_dir = sf_dir.borrow_mut();
+            let (dir, senders) = sf_dir.as_mut().filter(|_| !settings.contains("sf_dir="))?;
+            *senders += 1;
+            Some(format!(
+                "sf_dir={};sender_id=sender{senders};",
+                dir.path().display()
+            ))
+        })
+        .unwrap_or_default();
+    SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{port};{mode}{slot}{settings}"))
         .unwrap()
         .build()
         .unwrap()
@@ -1042,18 +1077,507 @@ fn a_flush_in_manual_progress_mode_is_sent_when_its_caller_drives() {
     server.finish();
 }
 
-fn a_sender_with_sf_dir_refuses_a_buffer_above_the_frame_cap(progress: Progress) {
+/// The settings of a sender whose queue is the slot `large` of `sf_dir`, in
+/// segments of 4,096 bytes: one holds three or four frames of a flush that
+/// is cut for a frame limit of 1,024 bytes.
+fn slot_settings(sf_dir: &tempfile::TempDir) -> String {
+    format!(
+        "sf_dir={};sender_id=large;sf_max_segment_bytes=4096;",
+        sf_dir.path().display()
+    )
+}
+
+/// How many segment files the slot of [`slot_settings`] holds.
+fn segment_files(sf_dir: &tempfile::TempDir) -> usize {
+    std::fs::read_dir(sf_dir.path().join("large"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sfa"))
+        .count()
+}
+
+/// Waits until the server has committed to `table` `commits` times.
+fn wait_for_commits(
+    sender: &mut Sender,
+    progress: Progress,
+    server: &QwpWsModelServer,
+    table: &str,
+    commits: u64,
+) {
+    let deadline = Instant::now() + WAIT;
+    while server.model.table(table).map(|held| held.commits) != Some(commits) {
+        assert!(
+            Instant::now() < deadline,
+            "the server committed to {table} {:?} times, not {commits}",
+            server.model.table(table).map(|held| held.commits)
+        );
+        let_it_work(sender, progress);
+    }
+}
+
+/// Takes the server away from a sender that has nothing to send, and waits
+/// until the sender has found that out: its flush of `unsent`, which stays
+/// in the queue, makes it look.
+fn take_the_server_away(
+    sender: &mut Sender,
+    progress: Progress,
+    server: &QwpWsModelServer,
+    unsent: &Buffer,
+) {
+    server.go_down();
+    sender.flush_and_keep(unsent).unwrap();
+    let deadline = Instant::now() + WAIT;
+    while sender.qwp_ws_totals().unwrap().reconnect_attempts < 2 {
+        assert!(Instant::now() < deadline, "the sender did not reconnect");
+        let_it_work(sender, progress);
+    }
+}
+
+/// What makes a sender try a server that is away again soon.
+const RECONNECT_SOON: &str = "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;";
+/// What makes a sender end without waiting for what its server has not
+/// confirmed. Its slot keeps its files then, whatever was confirmed.
+const NO_WAIT_AT_THE_END: &str = "close_flush_timeout_millis=0;";
+
+fn a_flush_in_frames_with_sf_dir_leaves_no_segment_file_once_it_is_confirmed(progress: Progress) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    // What is flushed stays in the queue until the server answers.
+    server.hold_answers();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let mut sender = sender_with(server.port, progress, &slot_settings(&sf_dir));
+    assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
+    let large = buffer_of_symbols(TABLE, 0..600);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut SymbolGlobalDict::new()).len();
+    assert!(frames > 12, "{frames} frames");
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frames as u64 - 1)
+    );
+    let files = segment_files(&sf_dir);
+    assert!(files >= frames / 4, "{files} files for {frames} frames");
+    server.let_answers_go();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&large]);
+    assert!(!sender.must_close());
+
+    sender.close_drain().unwrap();
+    assert_eq!(segment_files(&sf_dir), 0);
+    drop(sender);
+    server.finish();
+}
+
+/// The frames of a flush that need a new segment each, in a queue of
+/// segments of `segment` bytes whose segment in use holds frames of `held`
+/// bytes. A segment has a header of 24 bytes, and each frame one of 8.
+fn frames_that_take_a_new_segment(
+    segment: usize,
+    held: &[usize],
+    frames: &[Vec<u8>],
+) -> Vec<usize> {
+    let mut used = 24 + held.iter().map(|len| 8 + len).sum::<usize>();
+    assert!(used <= segment, "{held:?}");
+    let mut taking = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        if used + 8 + frame.len() > segment {
+            taking.push(index);
+            used = 24;
+        }
+        used += 8 + frame.len();
+    }
+    taking
+}
+
+/// What stops a flush in frames with `sf_dir` after its first frame.
+#[derive(Clone, Copy)]
+enum StoppedBy {
+    /// A frame brings a symbol more than the dictionary of the sender takes.
+    FullDictionary,
+    /// A frame needs a new segment, and the manifest that names the segment
+    /// cannot be synced.
+    ManifestSync,
+    /// With `sf_durability=periodic`: a frame needs a new segment, and the
+    /// segment that it leaves cannot be synced.
+    SegmentSync,
+}
+
+/// A flush that the server has confirmed, one that it has not, and a flush
+/// in frames that stops part way: at frame `which(frame count)` when the
+/// dictionary is full, else at the frame that takes new segment number
+/// `which(count of such frames)`. The sender is dropped as it is, with the
+/// frames of the stopped flush in its slot.
+///
+/// A new sender on the slot delivers the flush that was not confirmed and
+/// nothing of the stopped one, takes the same buffer again, and then a
+/// flush with symbols that the slot knows and new ones.
+fn assert_a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_stopped(
+    progress: Progress,
+    stopped_by: StoppedBy,
+    which: fn(usize) -> usize,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let durability = match stopped_by {
+        StoppedBy::SegmentSync => "sf_durability=periodic;sf_sync_interval_millis=3600000;",
+        _ => "",
+    };
+    let settings = format!("{}{RECONNECT_SOON}{durability}", slot_settings(&sf_dir));
+    let dropped = format!("{settings}{NO_WAIT_AT_THE_END}");
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let unsent = buffer_of_symbols(TABLE, 5..15);
+    let mut large = buffer_of_symbols(TABLE, 10..1210);
+    let (rows, len) = (large.row_count(), large.len());
+    let mut sender_symbols = SymbolGlobalDict::new();
+    let held = [
+        frame_of_a_sender(&before, false, &mut sender_symbols).len(),
+        frame_of_a_sender(&unsent, false, &mut sender_symbols).len(),
+    ];
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    assert!(frames.len() > 40, "{} frames", frames.len());
+    let taking = frames_that_take_a_new_segment(4096, &held, &frames);
+    assert!(taking.len() > 8 && taking[0] > 0, "{taking:?}");
+    let (failing, cause) = match stopped_by {
+        StoppedBy::FullDictionary => (which(frames.len()), "symbol dictionary reached its"),
+        StoppedBy::ManifestSync => (
+            taking[which(taking.len())],
+            "injected SF manifest sync failure",
+        ),
+        StoppedBy::SegmentSync => (
+            taking[which(taking.len())],
+            "injected periodic SF sync failure",
+        ),
+    };
+    assert!((1..frames.len()).contains(&failing));
+
+    let mut sender = match stopped_by {
+        StoppedBy::FullDictionary => {
+            let _cap = crate::ingress::TestDictCapGuard::new(symbols_held_before(&frames[failing]));
+            sender_with(server.port, progress, &dropped)
+        }
+        _ => sender_with(server.port, progress, &dropped),
+    };
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    take_the_server_away(&mut sender, progress, &server, &unsent);
+
+    // The new segments that the flush gets before the one that it does not.
+    let segments_before = taking.iter().filter(|frame| **frame < failing).count();
+    match stopped_by {
+        StoppedBy::FullDictionary => {}
+        StoppedBy::ManifestSync => fail_manifest_sync_after_for_test(segments_before),
+        StoppedBy::SegmentSync => fail_sync_after_for_test(segments_before),
+    }
+    let err = sender.flush(&mut large).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+    assert!(
+        err.msg()
+            .starts_with("Could not flush buffer: the flush stopped part way: ")
+            && err.msg().contains(cause),
+        "{}",
+        err.msg()
+    );
+    assert!(!err.in_doubt());
+    assert!(sender.must_close());
+    assert_eq!(
+        (large.row_count(), large.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    assert_eq!(sender.published_fsn().unwrap(), Some(1));
+    assert!(segment_files(&sf_dir) > segments_before);
+    drop(sender);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+
+    server.come_back();
+    let mut sender = sender_with(server.port, progress, &settings);
+    wait_for_commits(&mut sender, progress, &server, TABLE, 2);
+    assert_table_holds(&server, TABLE, 2, &[&before, &unsent]);
+    sender.flush(&mut large).unwrap();
+    assert!(large.is_empty());
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    assert_table_holds(&server, TABLE, 3, &[&before, &unsent, &large]);
+    let after = buffer_of_symbols(TABLE, 1200..1220);
+    sender.flush_and_keep(&after).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 4, &[&before, &unsent, &large, &after]);
+    assert!(!sender.must_close());
+
+    sender.close_drain().unwrap();
+    assert_eq!(segment_files(&sf_dir), 0);
+    drop(sender);
+    server.finish();
+}
+
+fn a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_a_full_dictionary_stopped(
+    progress: Progress,
+) {
+    for which in [|_| 1, |frames| frames / 2, |frames| frames - 1] {
+        assert_a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_stopped(
+            progress,
+            StoppedBy::FullDictionary,
+            which,
+        );
+    }
+}
+
+fn a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_a_manifest_sync_stopped(
+    progress: Progress,
+) {
+    for which in [|_| 0, |segments| segments / 2, |segments| segments - 1] {
+        assert_a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_stopped(
+            progress,
+            StoppedBy::ManifestSync,
+            which,
+        );
+    }
+}
+
+fn a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_a_segment_sync_stopped(
+    progress: Progress,
+) {
+    for which in [|_| 0, |segments| segments / 2, |segments| segments - 1] {
+        assert_a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_stopped(
+            progress,
+            StoppedBy::SegmentSync,
+            which,
+        );
+    }
+}
+
+fn a_flush_in_frames_that_its_sender_did_not_deliver_is_one_commit_of_a_new_sender_on_the_slot(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let settings = format!("{}{RECONNECT_SOON}", slot_settings(&sf_dir));
+    let dropped = format!("{settings}{NO_WAIT_AT_THE_END}");
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let unsent = buffer_of_symbols(TABLE, 5..15);
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before, false, &mut sender_symbols);
+    frame_of_a_sender(&unsent, false, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols).len();
+
+    let mut sender = sender_with(server.port, progress, &dropped);
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    take_the_server_away(&mut sender, progress, &server, &unsent);
+    // The server told its frame limit, and the sender still goes by it.
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(1 + frames as u64)
+    );
+    assert!(!sender.must_close());
+    drop(sender);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+
+    server.come_back();
+    let mut sender = sender_with(server.port, progress, &settings);
+    wait_for_commits(&mut sender, progress, &server, TABLE, 3);
+    assert_table_holds(&server, TABLE, 3, &[&before, &unsent, &large]);
+    let after = buffer_of_symbols(TABLE, 1200..1220);
+    sender.flush_and_keep(&after).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 4, &[&before, &unsent, &large, &after]);
+
+    sender.close_drain().unwrap();
+    assert_eq!(segment_files(&sf_dir), 0);
+    drop(sender);
+    server.finish();
+}
+
+fn a_flush_in_frames_with_periodic_durability_is_queued_while_the_server_is_away(
+    progress: Progress,
+) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let sf_dir = tempfile::TempDir::new().unwrap();
     let settings = format!(
-        "sf_dir={};sender_id=large;sf_max_segment_bytes=65536;",
+        "{}{RECONNECT_SOON}sf_durability=periodic;sf_append_deadline_millis=2000;",
+        slot_settings(&sf_dir)
+    );
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let unsent = buffer_of_symbols(TABLE, 5..15);
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before, false, &mut sender_symbols);
+    frame_of_a_sender(&unsent, false, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols).len();
+
+    let mut sender = sender_with(server.port, progress, &settings);
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    take_the_server_away(&mut sender, progress, &server, &unsent);
+    // Every segment that the flush fills is synced where it is appended.
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(1 + frames as u64)
+    );
+    assert!(segment_files(&sf_dir) >= frames / 4);
+
+    // The server is back, and the same sender delivers what it queued.
+    server.come_back();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 3, &[&before, &unsent, &large]);
+    sender.close_drain().unwrap();
+    assert_eq!(segment_files(&sf_dir), 0);
+    drop(sender);
+    server.finish();
+}
+
+fn a_new_sender_on_the_slot_knows_the_symbols_of_a_flush_whose_segments_are_freed(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let settings = format!("{}{RECONNECT_SOON}", slot_settings(&sf_dir));
+    let dropped = format!("{settings}{NO_WAIT_AT_THE_END}");
+    let first = buffer_of_symbols(TABLE, 0..600);
+    // It uses symbols that the first flush brought, and brings new ones.
+    let second = buffer_of_symbols(TABLE, 590..1190);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    let first_frames = frames_of_a_sender(&first, FRAME_LIMIT, &mut sender_symbols).len();
+    let second_frames = frames_of_a_sender(&second, FRAME_LIMIT, &mut sender_symbols);
+    assert!(first_frames > 12 && second_frames.len() > 12);
+    assert!(symbols_held_before(&second_frames[0]) > 100);
+
+    let mut sender = sender_with(server.port, progress, &dropped);
+    sender.flush_and_keep(&first).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&first]);
+    // The sender frees the segments of the confirmed frames: the slot keeps
+    // the segment in use, and a spare one.
+    let deadline = Instant::now() + WAIT;
+    while segment_files(&sf_dir) > 2 {
+        assert!(Instant::now() < deadline, "the segments were not freed");
+        let_it_work(&mut sender, progress);
+    }
+
+    // The frames of the second flush stay in the slot. They name the
+    // symbols of the first by their numbers.
+    server.go_down();
+    sender.flush_and_keep(&second).unwrap();
+    drop(sender);
+
+    server.come_back();
+    let mut sender = sender_with(server.port, progress, &settings);
+    wait_for_commits(&mut sender, progress, &server, TABLE, 2);
+    assert_table_holds(&server, TABLE, 2, &[&first, &second]);
+    sender.close_drain().unwrap();
+    drop(sender);
+    server.finish();
+}
+
+fn a_flush_whose_first_frame_gets_no_segment_takes_its_symbols_out_of_the_symbol_file(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    // Segments of 1,024 bytes: the frame cap is 992 bytes, and a flush is
+    // cut for two frames a segment, of 492 bytes.
+    let settings = format!(
+        "sf_dir={};sender_id=large;sf_max_segment_bytes=1024;",
         sf_dir.path().display()
     );
-    let mut sender = sender_with(server.port, progress, &settings);
-    assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
-    let mut large = buffer_of(TABLE, 0..2000);
+    let symbol_file = sf_dir
+        .path()
+        .join("large")
+        .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+    // One frame that leaves its segment no room for a frame of the flush
+    // after it.
+    let before = buffer_of_symbols(TABLE, 0..16);
+    let mut large = buffer_of_symbols(TABLE, 120..320);
+    let (rows, len) = (large.row_count(), large.len());
+    let mut sender_symbols = SymbolGlobalDict::new();
+    let held = [frame_of_a_sender(&before, false, &mut sender_symbols).len()];
+    let frames = frames_of_a_sender(&large, 492, &mut sender_symbols);
+    assert!(held[0] <= 992 && frames.len() > 6, "{held:?}");
+    assert!(!symbols_brought_by(&frames[0]).1.is_empty());
+    assert_eq!(
+        frames_that_take_a_new_segment(1024, &held, &frames).first(),
+        Some(&0),
+        "{held:?}"
+    );
 
-    assert_refused_as_one_frame(&mut sender, &mut large, FRAME_LIMIT, SET_BY_SERVER);
+    let mut sender = sender_with(server.port, progress, &settings);
+    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let symbol_bytes = std::fs::metadata(&symbol_file).unwrap().len();
+
+    fail_manifest_sync_after_for_test(0);
+    let err = sender.flush(&mut large).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError, "{}", err.msg());
+    assert!(
+        err.msg().contains("injected SF manifest sync failure"),
+        "{}",
+        err.msg()
+    );
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        Some(0),
+        "nothing is published"
+    );
+    assert_eq!(
+        (large.row_count(), large.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    assert_eq!(
+        std::fs::metadata(&symbol_file).unwrap().len(),
+        symbol_bytes,
+        "the symbols of the frame that was not published stayed in the symbol file"
+    );
+
+    // The same flush goes through, and its symbols get the same numbers.
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frames.len() as u64)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 2, &[&before, &large]);
+    assert!(std::fs::metadata(&symbol_file).unwrap().len() > symbol_bytes);
+    drop(sender);
+    server.finish();
+}
+
+fn a_sender_whose_slot_has_no_symbol_file_refuses_a_buffer_above_the_frame_cap(progress: Progress) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    // A folder where the symbol file of the slot belongs: the sender cannot
+    // make the file, and sends every symbol with every frame.
+    let symbol_file = sf_dir
+        .path()
+        .join("large")
+        .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+    std::fs::create_dir_all(&symbol_file).unwrap();
+    let mut sender = sender_with(server.port, progress, &slot_settings(&sf_dir));
+    assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
+    let mut large = buffer_of_symbols(TABLE, 0..600);
+
+    let refusal = refusal_of(&mut sender, &mut large);
+    let end = format!(
+        " bytes exceeds the per-frame cap of {FRAME_LIMIT} bytes. The cap is set by \
+         {SET_BY_SERVER}. It is not sent in several frames, because this sender could not \
+         write the symbol file of its store-and-forward slot: flush smaller batches, or close \
+         the sender, see to the disk of sf_dir, and build a new one."
+    );
+    assert!(
+        refusal.starts_with("Could not flush buffer: QWP/WebSocket encoded message size of ")
+            && refusal.ends_with(&end),
+        "got: {refusal}"
+    );
+    // Buffers that fit one frame are sent as before.
+    let small = [
+        buffer_of_symbols(TABLE, 0..10),
+        buffer_of_symbols(TABLE, 5..15),
+    ];
+    for buffer in &small {
+        sender.flush_and_keep(buffer).unwrap();
+    }
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 2, &[&small[0], &small[1]]);
     drop(sender);
     server.finish();
 }
@@ -1091,17 +1615,16 @@ fn a_sender_whose_server_tells_no_frame_limit_refuses_a_buffer_above_the_frame_c
     assert_eq!(sender.effective_frame_cap().unwrap(), (3000, false));
     assert_refused_as_one_frame(&mut sender, &mut large, 3000, "max_buf_size");
 
-    // The same with `sf_dir`, where no buffer goes out in frames whatever
-    // the server tells.
+    // With `sf_dir` the refusal says the same.
     let port = spawn_max_batch_size_upgrade_only_server(None);
     let sf_dir = tempfile::TempDir::new().unwrap();
     let settings = format!(
-        "sf_dir={};sender_id=large;sf_max_segment_bytes=4096;",
+        "sf_dir={};sender_id=large;sf_max_segment_bytes=4096;close_flush_timeout_millis=0;",
         sf_dir.path().display()
     );
     let mut sender = sender_with(port, progress, &settings);
     assert_eq!(sender.effective_frame_cap().unwrap(), (4064, false));
-    assert_refused_as_one_frame(&mut sender, &mut large, 4064, SET_BY_SEGMENT);
+    assert!(refusal_of(&mut sender, &mut large).ends_with(&end));
 }
 
 /// A segment of 4,096 bytes holds two frames of 2,028 bytes: its header of
@@ -2599,6 +3122,30 @@ macro_rules! in_both_progress_modes {
     )*};
 }
 
+/// Makes two more tests of a test of senders, with their queues on disk:
+/// `on_disk::<test>::background` and `on_disk::<test>::manual`.
+macro_rules! on_disk_in_both_progress_modes {
+    ($($test:ident)*) => {
+        mod on_disk {
+            $(
+                mod $test {
+                    use super::super::{Progress, on_disk};
+
+                    #[test]
+                    fn background() {
+                        on_disk(super::super::$test, Progress::Background);
+                    }
+
+                    #[test]
+                    fn manual() {
+                        on_disk(super::super::$test, Progress::Manual);
+                    }
+                }
+            )*
+        }
+    };
+}
+
 in_both_progress_modes! {
     a_flush_with_symbols_above_the_frame_cap_is_one_commit
     a_flush_with_symbols_that_loses_its_connection_part_way_is_sent_again_whole
@@ -2609,7 +3156,15 @@ in_both_progress_modes! {
     a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_whole
     a_flush_with_a_column_of_every_kind_above_the_frame_cap_is_one_commit
     a_buffer_with_a_decimal_that_cannot_be_written_is_refused_before_its_first_frame
-    a_sender_with_sf_dir_refuses_a_buffer_above_the_frame_cap
+    a_flush_in_frames_with_sf_dir_leaves_no_segment_file_once_it_is_confirmed
+    a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_a_full_dictionary_stopped
+    a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_a_manifest_sync_stopped
+    a_new_sender_on_the_slot_sends_nothing_of_a_flush_that_a_segment_sync_stopped
+    a_flush_in_frames_that_its_sender_did_not_deliver_is_one_commit_of_a_new_sender_on_the_slot
+    a_flush_in_frames_with_periodic_durability_is_queued_while_the_server_is_away
+    a_new_sender_on_the_slot_knows_the_symbols_of_a_flush_whose_segments_are_freed
+    a_flush_whose_first_frame_gets_no_segment_takes_its_symbols_out_of_the_symbol_file
+    a_sender_whose_slot_has_no_symbol_file_refuses_a_buffer_above_the_frame_cap
     a_sender_whose_server_tells_no_frame_limit_refuses_a_buffer_above_the_frame_cap
     a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two
     a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone
@@ -2637,6 +3192,40 @@ in_both_progress_modes! {
     a_flush_is_committed_once_wherever_its_connection_is_lost_before_the_commit
     a_flush_whose_connection_is_lost_after_the_commit_and_before_its_answer_is_committed_again
     a_flush_whose_every_connection_the_server_closes_stops_the_sender_at_the_fourth_close
+    a_close_drain_after_a_flush_in_frames_that_is_not_confirmed_in_time_fails
+    a_close_drain_that_times_out_after_a_failed_flush_counts_the_frames_before_it
+}
+
+// What a sender does with a buffer above the frame cap does not depend on
+// where it keeps its queue. These tests run once more with `sf_dir`: the ones
+// in which frames reach the queue.
+on_disk_in_both_progress_modes! {
+    a_flush_with_symbols_above_the_frame_cap_is_one_commit
+    a_flush_with_symbols_that_loses_its_connection_part_way_is_sent_again_whole
+    a_buffer_with_a_symbol_that_a_connection_refuses_is_refused_before_its_first_frame
+    a_flush_above_the_frame_cap_is_one_commit
+    a_flush_that_loses_its_connection_part_way_is_sent_again_whole
+    a_flush_of_several_tables_above_the_frame_cap_is_one_commit_of_each_table
+    a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_whole
+    a_flush_with_a_column_of_every_kind_above_the_frame_cap_is_one_commit
+    a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two
+    a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone
+    a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refused
+    a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do
+    a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds
+    a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
+    a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails
+    a_flush_that_fails_at_its_second_frame_is_aborted_and_the_flush_before_it_is_delivered
+    a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered
+    a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered
+    a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
+    a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
+    a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
+    a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
+    a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
+    a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good
+    a_flush_is_committed_once_wherever_its_connection_is_lost_before_the_commit
+    a_flush_whose_connection_is_lost_after_the_commit_and_before_its_answer_is_committed_again
     a_close_drain_after_a_flush_in_frames_that_is_not_confirmed_in_time_fails
     a_close_drain_that_times_out_after_a_failed_flush_counts_the_frames_before_it
 }

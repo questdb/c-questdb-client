@@ -491,7 +491,10 @@ pub(crate) struct SyncQwpWsHandlerState {
     /// [`super::column_sender::PooledSenderCore::new_store_and_forward`]; the two are
     /// mutually exclusive. `None` in memory mode / on side-file open failure.
     pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
-    /// Whether a split chunk may defer its non-final frames' commit.
+    /// Whether a split chunk of a column sender may defer its non-final
+    /// frames' commit, and whether a row buffer of a pooled sender goes out
+    /// in frames. The row buffer of a `Sender` does not ask: see
+    /// [`flush_qwp_ws`].
     ///
     /// Memory mode only. `FLAG_DEFER_COMMIT` is unknown to the queue, segment,
     /// manifest and recovery layers, so a process death between a deferred
@@ -506,6 +509,12 @@ pub(crate) struct SyncQwpWsHandlerState {
 }
 
 impl SyncQwpWsHandlerState {
+    /// Whether the encoder of a `Sender` sends its symbols as a delta: see
+    /// [`QwpWsFlushEncoder::delta_dict_enabled`].
+    pub(crate) fn encoder_delta_dict_enabled(&self) -> bool {
+        self.encoder.delta_dict_enabled()
+    }
+
     /// Releases the recovered dictionary seeded into the standalone replay
     /// encoder at connect. The pooled core uses its own dictionary and never
     /// touches this encoder, so that seed is dead weight once the pooled core
@@ -528,16 +537,21 @@ pub(crate) struct ManualQwpWsHandlerState {
     /// [`SyncQwpWsHandlerState::sfa_frame_payload_cap`].
     pub(crate) sfa_frame_payload_cap: usize,
     /// The size that the frames of a flush above the frame cap are cut for,
-    /// as [`SyncQwpWsHandlerState::sfa_frame_split_target`]. `None` with
-    /// `sf_dir`, where no flush goes out in frames: see
-    /// [`SyncQwpWsHandlerState::sfa_split_deferral_enabled`].
-    pub(crate) sfa_frame_split_target: Option<usize>,
+    /// as [`SyncQwpWsHandlerState::sfa_frame_split_target`].
+    pub(crate) sfa_frame_split_target: usize,
     /// The flush that left the sender closed for publications, if one did:
     /// see [`ManualQwpWsPublisher`].
     aborted_flush: Option<AbortedFlush>,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
+}
+
+impl ManualQwpWsHandlerState {
+    /// As [`SyncQwpWsHandlerState::encoder_delta_dict_enabled`].
+    pub(crate) fn encoder_delta_dict_enabled(&self) -> bool {
+        self.encoder.delta_dict_enabled()
+    }
 }
 
 pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
@@ -4140,10 +4154,7 @@ pub(crate) fn open_manual_qwp_ws(
         request_durable_ack: *qwp_ws.request_durable_ack,
         token_provider: qwp_ws.token_provider.clone(),
         sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
-        sfa_frame_split_target: qwp_ws
-            .sf_dir
-            .is_none()
-            .then(|| two_frame_segment_payload_capacity(*qwp_ws.sf_max_segment_bytes)),
+        sfa_frame_split_target: two_frame_segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
         aborted_flush: None,
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
@@ -4352,8 +4363,7 @@ pub(crate) fn flush_qwp_ws(
     max_buf_size: usize,
     server_frame_limit_known: bool,
 ) -> Result<Option<u64>, QwpWsFlushError> {
-    let split_target = (state.sfa_split_deferral_enabled && server_frame_limit_known)
-        .then_some(state.sfa_frame_split_target);
+    let split_target = server_frame_limit_known.then_some(state.sfa_frame_split_target);
     flush_qwp_ws_through(
         &mut state.encoder,
         &mut state.runner,
@@ -4387,8 +4397,8 @@ pub(crate) fn flush_qwp_ws_pooled(
 }
 
 /// Ends the refusal of a buffer that is above the frame cap and that would
-/// go out in several frames, had the server told its frame limit: the queue
-/// is in memory, and `max_buf_size` is not what the buffer is held against.
+/// go out in several frames, had the server told its frame limit:
+/// `max_buf_size` is not what the buffer is held against.
 ///
 /// A server tells its frame limit since the release that can commit several
 /// frames together, so the frames of a buffer are never cut for a server
@@ -4399,14 +4409,23 @@ pub(crate) const NO_FRAME_LIMIT_TOLD: &str = " It is not sent in several frames,
     once it is), or the server is too old to commit several frames together (upgrade it, or \
     flush smaller batches).";
 
+/// Ends the refusal of a buffer that is above the frame cap and that would
+/// go out in several frames, had the sender a symbol file in the slot of its
+/// `sf_dir`: it could not make the file when it started, or could not take
+/// the symbols of a frame out of it again. Without the file it sends every
+/// symbol with every frame, and the frames of a flush are not cut for that.
+pub(crate) const NO_SYMBOL_FILE: &str = " It is not sent in several frames, because this \
+    sender could not write the symbol file of its store-and-forward slot: flush smaller \
+    batches, or close the sender, see to the disk of sf_dir, and build a new one.";
+
 /// Publishes a buffer through `publisher`: for a sender in either progress
 /// mode, and for a sender of a pool.
 ///
 /// A buffer goes out as one frame, which is refused when it is larger than
-/// `frame_cap`. When the queue is in memory and the server has told its
-/// frame limit (`split_target`, the size its frames are then cut for), a
-/// buffer above `frame_cap` goes out in several frames that the server
-/// commits together instead. Such a flush waits until the queue
+/// `frame_cap`. When the server has told its frame limit (`split_target`,
+/// the size its frames are then cut for) and `encoder` sends its symbols as
+/// a delta, a buffer above `frame_cap` goes out in several frames that the
+/// server commits together instead. Such a flush waits until the queue
 /// has room for all its frames, as a flush of one frame waits for the room
 /// of its frame, and queues nothing before. It is refused before anything of
 /// it is encoded when the buffer is above `max_buf_size`, and when the queue
@@ -4428,7 +4447,7 @@ fn flush_qwp_ws_through(
     // The row that keeps the buffer from being cut into frames, when one
     // does: its table and the size of its frame.
     let mut row_above_cap = None;
-    if let Some(split_target) = split_target {
+    if let Some(split_target) = split_target.filter(|_| encoder.delta_dict_enabled()) {
         let len = buffer.len();
         if len > frame_cap {
             if len > max_buf_size {
@@ -4489,6 +4508,27 @@ fn flush_qwp_ws_through(
         _ => err,
     })
     .map_err(QwpWsFlushError::Failed)
+}
+
+/// What ends the refusal of a buffer above the frame cap, when one thing
+/// keeps a `Sender` from cutting it into frames: the server's silence about
+/// its frame limit, or a slot without a symbol file. Empty when the buffer
+/// is held against `max_buf_size` itself (`frame_cap_is_max_buf_size`), and
+/// when such a buffer is cut.
+pub(crate) fn qwp_ws_not_in_frames_hint(
+    frame_cap_is_max_buf_size: bool,
+    server_frame_limit_known: bool,
+    delta_dict_enabled: bool,
+) -> &'static str {
+    if frame_cap_is_max_buf_size {
+        ""
+    } else if !server_frame_limit_known {
+        NO_FRAME_LIMIT_TOLD
+    } else if !delta_dict_enabled {
+        NO_SYMBOL_FILE
+    } else {
+        ""
+    }
 }
 
 /// Why [`flush_qwp_ws`] or [`flush_qwp_ws_manual`] did not publish a buffer.
@@ -4589,9 +4629,7 @@ pub(crate) fn flush_qwp_ws_manual(
     max_buf_size: usize,
     server_frame_limit_known: bool,
 ) -> Result<Option<u64>, QwpWsFlushError> {
-    let split_target = state
-        .sfa_frame_split_target
-        .filter(|_| server_frame_limit_known);
+    let split_target = server_frame_limit_known.then_some(state.sfa_frame_split_target);
     let mut publisher = ManualQwpWsPublisher {
         store: &mut state.store,
         send_core: &mut state.send_core,

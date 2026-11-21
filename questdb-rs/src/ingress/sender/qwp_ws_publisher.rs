@@ -47,7 +47,8 @@ pub(crate) trait QwpWsFlushEncoder {
 
     /// Encodes one frame of a plan, refuses it when it is larger than
     /// `frame_cap`, and hands it to `publish`. The frames of a flush come in
-    /// the order of the plan.
+    /// the order of the plan. Only for an encoder that
+    /// [sends its symbols as a delta](Self::delta_dict_enabled).
     fn encode_and_publish_frame(
         &mut self,
         buffer: &QwpWsColumnarBuffer,
@@ -56,6 +57,13 @@ pub(crate) trait QwpWsFlushEncoder {
         frame_cap: usize,
         publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
     ) -> crate::Result<u64>;
+
+    /// Whether a frame brings only the symbols that its connection does not
+    /// hold yet. The frames of a plan are sized and encoded that way, so a
+    /// flush is cut into frames only while this holds. An encoder whose
+    /// store-and-forward slot has no usable symbol file sends every symbol
+    /// with every frame instead.
+    fn delta_dict_enabled(&self) -> bool;
 }
 
 pub(crate) struct QwpWsReplayEncoder {
@@ -309,8 +317,13 @@ impl QwpWsFlushEncoder for QwpWsReplayEncoder {
     /// for its reason: a flush whose first frame finds no room leaves the
     /// sender open, and its dictionary must not be ahead of what was sent.
     ///
-    /// Only for a sender in delta mode without a side-file, whose frames
-    /// start their dictionary section at the connection dictionary's size.
+    /// With a side-file, the symbols are written to it before the frame is
+    /// published and taken out of it with the dictionary's, as
+    /// [`Self::encode_and_persist`] does it: a slot that is opened again
+    /// finds the symbols of every frame it holds.
+    ///
+    /// Only for a sender in delta mode, whose frames start their dictionary
+    /// section at the connection dictionary's size.
     fn encode_and_publish_frame(
         &mut self,
         buffer: &QwpWsColumnarBuffer,
@@ -319,8 +332,10 @@ impl QwpWsFlushEncoder for QwpWsReplayEncoder {
         frame_cap: usize,
         publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
     ) -> crate::Result<u64> {
-        debug_assert!(self.delta_dict_enabled && self.persisted_symbol_dict.is_none());
+        debug_assert!(self.delta_dict_enabled);
         let global_dict_mark = self.global_dict.mark();
+        let frame_base_id = self.global_dict.next_id();
+        let pd_mark = self.persisted_symbol_dict.as_ref().map(|pd| pd.mark());
         let published = buffer
             .encode_ws_frame(
                 blocks,
@@ -335,12 +350,17 @@ impl QwpWsFlushEncoder for QwpWsReplayEncoder {
                 if encoded_len > frame_cap {
                     return Err(qwp_ws_encoded_message_size_error(encoded_len, frame_cap));
                 }
+                self.persist_new_symbols(frame_base_id)?;
                 publish(&self.payload)
             });
         if published.is_err() {
-            self.global_dict.rollback(global_dict_mark);
+            self.rollback_frame(global_dict_mark, pd_mark);
         }
         published
+    }
+
+    fn delta_dict_enabled(&self) -> bool {
+        self.delta_dict_enabled
     }
 }
 

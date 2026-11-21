@@ -372,6 +372,10 @@ impl QwpWsFlushEncoder for SfaBufferEncoder<'_> {
             publish,
         )
     }
+
+    fn delta_dict_enabled(&self) -> bool {
+        self.foreground.delta_enabled()
+    }
 }
 
 impl Debug for PooledSenderCore {

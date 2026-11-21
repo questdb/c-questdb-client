@@ -10091,6 +10091,135 @@ fn qwp_ws_in_callback_wait_rejects_only_the_blocked_sibling() {
         .expect("the blocked sibling's frame must drain after the callback returns");
 }
 
+// ---------- a flush in frames with durable acknowledgements ----------
+
+/// A server answers only the last frame of a flush in frames, and its
+/// durable acknowledgement names the transactions of that answer. So the
+/// flush is confirmed once, whole, at that acknowledgement.
+#[test]
+fn qwp_ws_flush_in_frames_is_durable_at_the_durable_ack_of_its_last_frame() {
+    use crate::ingress::AckLevel;
+    use crate::tests::qwp_ws_server_model::buffer_of;
+
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (allow_ack_tx, allow_ack_rx) = mpsc::channel();
+        let (frames_tx, frames_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            // The server tells its frame limit and grants durable
+            // acknowledgements.
+            let request = read_request_until_blank(&mut stream).unwrap();
+            let request = String::from_utf8_lossy(&request).to_string();
+            assert_eq!(
+                parse_header(&request, "X-QWP-Request-Durable-Ack").as_deref(),
+                Some("true")
+            );
+            let accept = compute_accept(&parse_header(&request, "Sec-WebSocket-Key").unwrap());
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n\
+                 X-QWP-Version: 1\r\n\
+                 X-QWP-Max-Batch-Size: 1024\r\n\
+                 X-QWP-Durable-Ack: enabled\r\n\
+                 \r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+
+            // Every frame but the last asks the server to hold its rows,
+            // and gets no answer.
+            let mut frames = 0u64;
+            loop {
+                let (_, opcode, payload) = read_frame(&mut stream).unwrap();
+                assert_eq!(opcode, 0x2);
+                assert_eq!(&payload[0..4], b"QWP1");
+                frames += 1;
+                if payload[5] & 0x01 == 0 {
+                    break;
+                }
+            }
+            frames_tx.send(frames).unwrap();
+            write_qwp_ok_response_with_table_entries(
+                &mut stream,
+                FIRST_WIRE_SEQUENCE + frames - 1,
+                &[("durable_rows", 10)],
+            )
+            .unwrap();
+            allow_ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            write_qwp_durable_ack_response(&mut stream, &[("durable_rows", 10)]).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let sf_dir = tempfile::TempDir::new().unwrap();
+        let conf = format!(
+            "ws::addr=127.0.0.1:{port};qwp_ws_progress={};request_durable_ack=on;\
+             sf_dir={};sender_id=durable;",
+            progress.name(),
+            sf_dir.path().display()
+        );
+        let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+        let large = buffer_of("durable_rows", 0..600);
+        let last = sender.flush_and_keep_and_get_fsn(&large).unwrap().unwrap();
+        assert!(last > 10, "mode={}: {last}", progress.name());
+
+        // The server has taken the flush and answered its last frame, and
+        // the flush is not durable yet.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let frames = loop {
+            if let Ok(frames) = frames_rx.try_recv() {
+                break frames;
+            }
+            assert!(Instant::now() < deadline, "mode={}", progress.name());
+            if matches!(progress, ProgressCase::Manual) {
+                sender.drive_once().unwrap();
+            } else {
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        assert_eq!(frames, last + 1, "mode={}", progress.name());
+        let err = sender
+            .wait(AckLevel::Durable, Duration::from_millis(50))
+            .expect_err("the durable acknowledgement is held back");
+        assert!(
+            err.msg().contains("timed out"),
+            "mode={}: {}",
+            progress.name(),
+            err.msg()
+        );
+        assert_eq!(
+            sender.acked_fsn().unwrap(),
+            None,
+            "mode={}",
+            progress.name()
+        );
+
+        allow_ack_tx.send(()).unwrap();
+        sender
+            .wait(AckLevel::Durable, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            sender.acked_fsn().unwrap(),
+            Some(last),
+            "mode={}",
+            progress.name()
+        );
+        sender.close_drain().unwrap();
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+}
+
 // ---------- sf_durability=periodic: a new segment whatever the network thread does ----------
 
 /// Flushes `rows` `flushes` times. Each must be queued: a sender with a

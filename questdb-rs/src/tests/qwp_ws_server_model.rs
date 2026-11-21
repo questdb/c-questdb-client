@@ -635,6 +635,13 @@ impl QwpWsModelServer {
         }
     }
 
+    /// The server is up again after [`Self::go_down`], with what it had
+    /// committed: it takes new connections and serves them.
+    pub(crate) fn come_back(&self) {
+        let _streams = self.shared.streams.lock().unwrap();
+        self.shared.down.store(false, Ordering::SeqCst);
+    }
+
     /// Stops the server. Panics if the model refused a frame of one of the
     /// connections.
     pub(crate) fn finish(mut self) {

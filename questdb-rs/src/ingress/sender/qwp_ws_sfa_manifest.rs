@@ -48,6 +48,37 @@ const CRC_OFFSET: usize = 60;
 const RECORD_SLOT_SIZE: u64 = 4 * 1024;
 pub(crate) const DUAL_SLOT_FILE_SIZE: u64 = 8 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static SYNC_FAILURE_COUNTDOWN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes the sync of a manifest record fail once on this thread, after
+/// `successful_writes` records that are written and synced. The record is
+/// in the file by then, as it is when a disk refuses the sync. It reaches
+/// the manifest of a sender, whose rotations run on the thread that
+/// flushes, which [`SfManifest::set_before_sync_hook`] does not.
+#[cfg(test)]
+pub(crate) fn fail_manifest_sync_after_for_test(successful_writes: usize) {
+    SYNC_FAILURE_COUNTDOWN.with(|countdown| countdown.set(Some(successful_writes)));
+}
+
+#[cfg(test)]
+fn should_fail_sync_for_test() -> bool {
+    SYNC_FAILURE_COUNTDOWN.with(|countdown| match countdown.get() {
+        Some(0) => {
+            countdown.set(None);
+            true
+        }
+        Some(remaining) => {
+            countdown.set(Some(remaining - 1));
+            false
+        }
+        None => false,
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct SfManifest {
     file: File,
@@ -215,6 +246,10 @@ impl SfManifest {
         }
         #[cfg(test)]
         super::qwp_ws_sfa_segment::removal_step_for_test()?;
+        #[cfg(test)]
+        if should_fail_sync_for_test() {
+            return Err(io::Error::other("injected SF manifest sync failure"));
+        }
         self.file.sync_all()?;
         self.generation = next_generation;
         self.head_base = new_head_base;

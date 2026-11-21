@@ -90,6 +90,8 @@ mod qwp_ws_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_segment;
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use qwp_ws_sfa_segment::fail_sync_after_for_test;
 
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) mod qwp_ws_sfa_manifest;
@@ -410,15 +412,15 @@ impl Sender {
             .expect("QWP/WebSocket handler was checked above");
         let (max, server_max_known) =
             effective_hard_frame_cap(self.max_buf_size, server_max, sfa_frame_payload_cap);
-        // Only the server's silence about its frame limit keeps a buffer
-        // above the frame cap from going out in several frames.
-        let no_frame_limit_told = !server_max_known
-            && max < self.max_buf_size
-            && match &self.handler {
-                SyncProtocolHandler::SyncQwpWs(state) => state.sfa_split_deferral_enabled,
-                SyncProtocolHandler::ManualQwpWs(state) => state.sfa_frame_split_target.is_some(),
-                _ => false,
-            };
+        let not_in_frames_hint = qwp_ws_not_in_frames_hint(
+            max >= self.max_buf_size,
+            server_max_known,
+            match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => state.encoder_delta_dict_enabled(),
+                SyncProtocolHandler::ManualQwpWs(state) => state.encoder_delta_dict_enabled(),
+                _ => unreachable!("QWP/WebSocket handler was checked above"),
+            },
+        );
         let flushed = match &mut self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => {
                 flush_qwp_ws(state, qwp, max, self.max_buf_size, server_max_known)
@@ -451,14 +453,14 @@ impl Sender {
                     server_max,
                     sfa_frame_payload_cap,
                 );
-                let hint = if no_frame_limit_told {
-                    NO_FRAME_LIMIT_TOLD
-                } else {
-                    ""
-                };
                 crate::Error::new(
                     crate::ErrorCode::BatchTooLarge,
-                    format!("{} The cap is set by {}.{}", err.msg(), source, hint),
+                    format!(
+                        "{} The cap is set by {}.{}",
+                        err.msg(),
+                        source,
+                        not_in_frames_hint
+                    ),
                 )
             } else {
                 err
