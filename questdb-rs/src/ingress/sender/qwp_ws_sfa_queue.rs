@@ -2851,6 +2851,7 @@ struct RecoveredSegment {
 fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueueError> {
     let mut all = Vec::new();
     let mut corrupt_paths = Vec::new();
+    let mut never_written_paths = Vec::new();
     let mut diagnostics = Vec::new();
 
     for entry in fs::read_dir(&options.slot_dir)? {
@@ -2868,6 +2869,10 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
                 return Err(err.into());
             }
             Err(err) => {
+                if segment_file_was_never_written(&path, &err)? {
+                    never_written_paths.push(path);
+                    continue;
+                }
                 diagnostics.push(SfaRecoveryDiagnostic::SkippedSegment {
                     path: path.clone(),
                     error: format!("{err:?}"),
@@ -2900,6 +2905,22 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
             torn_tail_bytes: scan.torn_tail_bytes,
             manifest_required: scan.manifest_required,
         });
+    }
+
+    // A segment file gets its name before it gets its header. A process that
+    // died in between left a file that was never written: the spare that the
+    // runner makes after every rotation, or the successor that an appender
+    // makes itself. It holds no frame, and no manifest names it, because a
+    // segment is named only once its header is synced. So it goes like any
+    // other leftover file and is not a corrupt segment, which would refuse a
+    // slot whose segment in use is still empty.
+    for path in never_written_paths {
+        if let Err(err) = remove_file_if_exists(&path) {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path,
+                error: err.to_string(),
+            });
+        }
     }
 
     let mut manifest = SfManifest::open(&options.slot_dir)?;
@@ -3275,6 +3296,30 @@ fn sanitize_sealed_residue(
         return Err(SfaQueueError::SanitizedResidue { path });
     }
     Ok(())
+}
+
+/// Whether a file that the scan refused as a segment was never written: it
+/// is shorter than a segment header or has zeroes where the magic belongs,
+/// and holds nothing but zeroes. A file with any other byte may be a damaged
+/// segment with frames, and stays a corrupt one.
+fn segment_file_was_never_written(path: &Path, refused: &SfaSegmentError) -> io::Result<bool> {
+    if !matches!(
+        refused,
+        SfaSegmentError::FileTooShort { .. } | SfaSegmentError::BadMagic { actual: 0 }
+    ) {
+        return Ok(false);
+    }
+    let mut file = fs::File::open(path)?;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match io::Read::read(&mut file, &mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(read) if chunk[..read].iter().any(|byte| *byte != 0) => return Ok(false),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn cleanup_recovered_extras(
@@ -8460,5 +8505,157 @@ mod tests {
         assert_eq!(held, vec![flush_frame(C, 0)]);
         assert_eq!(published, Some(0));
         assert_eq!(completed, None);
+    }
+    // ---- A segment file that was never written is removed when a slot is opened ----
+
+    /// Slots as a process leaves them, by the frames of each segment, the
+    /// last one being the segment in use: one that died right after a
+    /// rotation, before the first frame went into the new segment; one
+    /// that had no frame yet, or none left; one with frames in the segment
+    /// in use; and one that had not made its first segment.
+    const SLOTS_OF_A_PROCESS_THAT_DIED: &[&[usize]] = &[&[3, 0], &[0], &[2], &[]];
+
+    /// Writes one of [`SLOTS_OF_A_PROCESS_THAT_DIED`], with its manifest,
+    /// and returns it with its frames.
+    fn write_slot_of_a_process_that_died(segments: &[usize]) -> (TempDir, Vec<Vec<u8>>) {
+        let dir = TempDir::new().unwrap();
+        let frames = flush_frames(&vec![C; segments.iter().sum()]);
+        let mut base = 0;
+        for (idx, count) in segments.iter().enumerate() {
+            let path = spare_segment_path(dir.path(), idx as u64);
+            let mut segment =
+                SfaSegment::create_new_manifested(&path, base as u64, FLUSH_SEGMENT, 0).unwrap();
+            for frame in &frames[base..base + count] {
+                segment.try_append(frame).unwrap();
+            }
+            segment.sync_header().unwrap();
+            base += count;
+        }
+        if let Some(in_use) = segments.last() {
+            create_manifested_slot(dir.path(), 0, (base - in_use) as u64);
+        }
+        (dir, frames)
+    }
+
+    /// The name that the next segment file of such a slot gets.
+    fn next_segment_file(slot: &Path, segments: &[usize]) -> PathBuf {
+        spare_segment_path(slot, segments.len() as u64)
+    }
+
+    /// What is left of a segment file whose process died while it made the
+    /// file: the name alone, a part of its zeroes, or all of them, in a file
+    /// shorter than a segment header, as long as one, and longer than what
+    /// one read takes.
+    const NEVER_WRITTEN: [usize; 6] = [
+        0,
+        1,
+        HEADER_SIZE - 1,
+        HEADER_SIZE,
+        FLUSH_SEGMENT as usize,
+        200_000,
+    ];
+
+    #[test]
+    fn a_segment_file_that_was_never_written_is_removed_when_a_sender_opens_the_slot() {
+        for segments in SLOTS_OF_A_PROCESS_THAT_DIED {
+            for len in NEVER_WRITTEN {
+                let (slot, frames) = write_slot_of_a_process_that_died(segments);
+                let never_written = next_segment_file(slot.path(), segments);
+                fs::write(&never_written, vec![0u8; len]).unwrap();
+                let case = format!("segments of {segments:?} frames, a file of {len} zeroes");
+
+                let mut queue = SfaFrameQueue::open(flush_options(slot.path())).unwrap();
+                assert_eq!(frames_held(&queue), frames, "{case}");
+                assert_eq!(
+                    queue.published_fsn(),
+                    (frames.len() as u64).checked_sub(1),
+                    "{case}"
+                );
+                assert_eq!(queue.recovery_diagnostics(), vec![], "{case}");
+                // The file is not kept as a corrupt segment, and the next
+                // segment file that the open makes has taken its name.
+                assert!(!corrupt_segment_path(&never_written).exists(), "{case}");
+                let made_again = scan_file(&never_written).unwrap();
+                assert_eq!(made_again.frames.len(), 0, "{case}");
+                // The slot takes the next frame, and a second open finds it
+                // behind the others.
+                let next = flush_frame(C, 0xEE);
+                let receipt = submit_with_storage_maintenance(&mut queue, &next);
+                assert_eq!(receipt.fsn, frames.len() as u64, "{case}");
+                drop(queue);
+                let (held, published, _) = opened_by_a_sender(slot.path());
+                assert_eq!(held, [frames, vec![next]].concat(), "{case}");
+                assert_eq!(published, Some(receipt.fsn), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_segment_file_that_was_never_written_is_removed_when_a_drainer_opens_the_slot() {
+        for segments in SLOTS_OF_A_PROCESS_THAT_DIED {
+            for len in NEVER_WRITTEN {
+                let (slot, frames) = write_slot_of_a_process_that_died(segments);
+                let never_written = next_segment_file(slot.path(), segments);
+                fs::write(&never_written, vec![0u8; len]).unwrap();
+                let case = format!("segments of {segments:?} frames, a file of {len} zeroes");
+
+                let mut queue =
+                    SfaFrameQueue::open_replay_only(flush_options(slot.path())).unwrap();
+                assert_eq!(frames_held(&queue), frames, "{case}");
+                assert_eq!(queue.recovery_diagnostics(), vec![], "{case}");
+                assert!(!never_written.exists(), "{case}");
+                assert!(!corrupt_segment_path(&never_written).exists(), "{case}");
+                // The drainer comes to its end, and the slot is drained.
+                if let Some(last) = queue.published_fsn() {
+                    queue.complete_through_fsn(last).unwrap();
+                }
+                assert_eq!(queue.oldest_unresolved_fsn(), None, "{case}");
+                queue.close().unwrap();
+                assert_eq!(sfa_file_count(slot.path()), 0, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_without_a_segment_header_that_holds_a_byte_is_still_a_corrupt_segment() {
+        // The length of the file, and where it holds its one byte that is
+        // not zero: in a file shorter than a header, behind the magic, where
+        // the first frame belongs, at the end of a segment, and behind what
+        // one read takes.
+        let files = [
+            (HEADER_SIZE - 1, 0),
+            (HEADER_SIZE - 1, HEADER_SIZE - 2),
+            (FLUSH_SEGMENT as usize, 4),
+            (FLUSH_SEGMENT as usize, HEADER_SIZE),
+            (FLUSH_SEGMENT as usize, FLUSH_SEGMENT as usize - 1),
+            (200_000, 199_999),
+        ];
+        // The slots that are refused with a corrupt segment beside them: the
+        // segment in use is empty, so that file may be the one with frames.
+        for (segments, reason) in [
+            (&[3, 0][..], "missing expected SFA active or tail segment"),
+            (&[0][..], "missing SFA chain between committed boundaries"),
+        ] {
+            for (len, at) in files {
+                let (slot, _) = write_slot_of_a_process_that_died(segments);
+                let damaged = next_segment_file(slot.path(), segments);
+                let mut bytes = vec![0u8; len];
+                bytes[at] = 1;
+                fs::write(&damaged, &bytes).unwrap();
+                let case = format!("segments of {segments:?} frames, {len} bytes, one at {at}");
+
+                type Open = fn(SfaQueueOptions) -> Result<SfaFrameQueue, SfaQueueError>;
+                for open in [SfaFrameQueue::open as Open, SfaFrameQueue::open_replay_only] {
+                    match open(flush_options(slot.path())) {
+                        Err(SfaQueueError::Recovery { reason: refused }) => {
+                            assert_eq!(refused, reason, "{case}")
+                        }
+                        Err(other) => panic!("{case}: {other:?}"),
+                        Ok(_) => panic!("{case}: the slot was opened"),
+                    }
+                    assert_eq!(fs::read(&damaged).unwrap(), bytes, "{case}");
+                }
+            }
+        }
     }
 }
