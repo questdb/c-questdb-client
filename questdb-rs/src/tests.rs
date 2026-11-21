@@ -66,6 +66,9 @@ mod qwp_ws_publication_probe;
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
 mod qwp_ws_large_flush_probe;
 
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
+mod qwp_ws_large_flush_kill_probe;
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 mod qwp_ws_java_golden;
 

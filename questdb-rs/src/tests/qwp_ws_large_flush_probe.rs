@@ -90,21 +90,21 @@ use super::qwp_ws_server_model::{frame_of_a_sender, frames_of_a_flush, frames_of
 /// More than 16 MiB, the largest message the protocol has.
 const DEFAULT_MIB: usize = 20;
 /// A row of the group takes less than this in a buffer.
-const ROW_ROOM: usize = 256;
+pub(super) const ROW_ROOM: usize = 256;
 /// A row with symbols takes less than this in a buffer, a tag of its own
 /// included.
 const SYMBOL_ROW_ROOM: usize = 512;
 /// How many rows of each table the flush that creates the tables has.
-const CREATING_ROWS: usize = 20;
+pub(super) const CREATING_ROWS: usize = 20;
 /// How long the server may stay silent before the flush counts as lost. It
 /// answers a flush once, at the end.
-const WAIT: Duration = Duration::from_secs(30);
+pub(super) const WAIT: Duration = Duration::from_secs(30);
 /// A queue of 8 MiB, which is two of its segments: too small for a buffer
 /// of more than a few frames, whatever the server confirms.
 const QUEUE_TOO_SMALL: u64 = 8 * 1024 * 1024;
 /// How long a server is given to see that a connection went away. Its log
 /// shows that it takes a few milliseconds.
-const DROP_SETTLE: Duration = Duration::from_secs(1);
+pub(super) const DROP_SETTLE: Duration = Duration::from_secs(1);
 
 #[test]
 #[ignore = "requires a real QuestDB server and QDB_QWP_WS_LARGE_FLUSH_PROBE=1"]
@@ -1182,7 +1182,7 @@ fn queue_bytes_named_by(refusal: &crate::Error) -> ProbeResult<u64> {
 
 /// The server to test against and the size of the large buffer in MiB.
 /// `None` when the probe is not switched on.
-fn probe_settings() -> ProbeResult<Option<(ProbeConfig, usize)>> {
+pub(super) fn probe_settings() -> ProbeResult<Option<(ProbeConfig, usize)>> {
     if std::env::var("QDB_QWP_WS_LARGE_FLUSH_PROBE").as_deref() != Ok("1") {
         eprintln!("set QDB_QWP_WS_LARGE_FLUSH_PROBE=1 to run the real-server large flush probe");
         return Ok(None);
@@ -1210,9 +1210,9 @@ fn own_tag_of(id: i64) -> Option<String> {
 }
 
 /// One flush and the wait for the server.
-struct Flushed {
+pub(super) struct Flushed {
     /// The number of the last frame of the flush.
-    fsn: u64,
+    pub(super) fsn: u64,
     flush_took: Duration,
     /// From the start of the `flush` call until the server had confirmed.
     confirmed_after: Duration,
@@ -1222,7 +1222,7 @@ struct Flushed {
 
 /// Flushes `buffer`, which keeps its rows, and waits until the server has
 /// confirmed the flush.
-fn flush_and_wait(sender: &mut Sender, buffer: &Buffer) -> ProbeResult<Flushed> {
+pub(super) fn flush_and_wait(sender: &mut Sender, buffer: &Buffer) -> ProbeResult<Flushed> {
     let started = Instant::now();
     let fsn = sender.flush_and_keep_and_get_fsn(buffer)?;
     let flush_took = started.elapsed();
