@@ -38,10 +38,10 @@ use crate::ingress::conf::DurableAckTiers;
 use crate::ingress::sender::ack_wait_timeout_error;
 use crate::ingress::sender::effective_hard_frame_cap;
 use crate::ingress::sender::qwp_ws::{
-    NO_FRAME_LIMIT_TOLD, QwpWsFlushError, SyncQwpWsHandlerState, flush_qwp_ws_pooled,
-    publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background, qwp_ws_begin_close_background,
-    qwp_ws_check_error_background, qwp_ws_drain_to_deadline_background,
-    qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background, qwp_ws_poll_sender_error_background,
+    QwpWsFlushError, SyncQwpWsHandlerState, flush_qwp_ws_pooled, publish_qwp_ws_payload_background,
+    qwp_ws_acked_fsn_background, qwp_ws_begin_close_background, qwp_ws_check_error_background,
+    qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_not_in_frames_hint,
+    qwp_ws_ok_fsn_background, qwp_ws_poll_sender_error_background,
     qwp_ws_poll_sender_error_notification_background, qwp_ws_progress_generation_background,
     qwp_ws_published_fsn_background, qwp_ws_reconnect_failure_background,
     qwp_ws_sender_errors_dropped_background, qwp_ws_wait_for_progress_background,
@@ -348,7 +348,8 @@ impl QwpWsFlushEncoder for SfaBufferEncoder<'_> {
         )
     }
 
-    /// Only for a queue in memory, whose frames are always in delta mode.
+    /// Only while [`Self::delta_dict_enabled`] holds: the frame is encoded
+    /// in delta mode whatever the publisher says.
     fn encode_and_publish_frame(
         &mut self,
         buffer: &QwpWsColumnarBuffer,
@@ -1713,17 +1714,19 @@ impl SfaBackend {
             .map_err(FlushFailure::NotDelivered)?;
 
         // A buffer goes out as one frame, or in frames that the server
-        // commits together when it is above the frame cap, the queue is in
-        // memory and the server has told its frame limit: see
-        // `flush_qwp_ws_through`. Either way it is one publication, with no
-        // soft target as a split of a chunk has.
+        // commits together when it is above the frame cap and the server
+        // has told its frame limit: see `flush_qwp_ws_through`. Either way
+        // it is one publication, with no soft target as a split of a chunk
+        // has.
         let (frame_cap, server_frame_limit_known) = self.effective_hard_frame_cap();
         let max_buf_size = self.max_buf_size;
-        // Only the server's silence about its frame limit keeps a buffer
-        // above the frame cap from going out in several frames.
-        let no_frame_limit_told = !server_frame_limit_known
-            && frame_cap < max_buf_size
-            && self.state.sfa_split_deferral_enabled;
+        // What keeps a buffer above the frame cap from going out in several
+        // frames, when one thing does.
+        let not_in_frames_hint = qwp_ws_not_in_frames_hint(
+            frame_cap >= max_buf_size,
+            server_frame_limit_known,
+            self.foreground.delta_enabled(),
+        );
         let result = {
             let Self {
                 foreground,
@@ -1747,11 +1750,11 @@ impl SfaBackend {
         let result = result.map_err(|err| match err {
             // The buffer did not fit one frame.
             QwpWsFlushError::Failed(err)
-                if no_frame_limit_told && err.code() == ErrorCode::BatchTooLarge =>
+                if !not_in_frames_hint.is_empty() && err.code() == ErrorCode::BatchTooLarge =>
             {
                 crate::Error::new(
                     ErrorCode::BatchTooLarge,
-                    format!("{}{}", err.msg(), NO_FRAME_LIMIT_TOLD),
+                    format!("{}{}", err.msg(), not_in_frames_hint),
                 )
             }
             QwpWsFlushError::Refused(err) | QwpWsFlushError::Failed(err) => err,

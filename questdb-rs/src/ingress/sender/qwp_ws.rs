@@ -492,19 +492,15 @@ pub(crate) struct SyncQwpWsHandlerState {
     /// mutually exclusive. `None` in memory mode / on side-file open failure.
     pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
     /// Whether a split chunk of a column sender may defer its non-final
-    /// frames' commit, and whether a row buffer of a pooled sender goes out
-    /// in frames. The row buffer of a `Sender` does not ask: see
-    /// [`flush_qwp_ws`].
+    /// frames' commit. A row buffer does not ask: see
+    /// [`flush_qwp_ws_through`].
     ///
-    /// Memory mode only. `FLAG_DEFER_COMMIT` is unknown to the queue, segment,
-    /// manifest and recovery layers, so a process death between a deferred
-    /// append and its committing append leaves a persisted tail nothing
-    /// downstream can interpret: the orphan drainer opens replay-only with no
-    /// producer, so it can never append the committing frame, and
-    /// `orphan_queue_drained` is `completed >= published`, which such a tail
-    /// never satisfies. In memory mode the queue dies with the process, so
-    /// there is no tail to strand. Lifting this needs commit-boundary
-    /// recovery in the queue itself.
+    /// Memory mode only: with `sf_dir` every frame of a split chunk commits
+    /// by itself. Frames that wait for their commit on disk need a slot
+    /// that, when it is opened, removes the ones whose committing frame
+    /// never came. A slot does that for the frames of a row buffer
+    /// (`remove_unfinished_flush` in `qwp_ws_sfa_queue`); the split of a
+    /// chunk has not been moved onto it.
     pub(crate) sfa_split_deferral_enabled: bool,
 }
 
@@ -4384,8 +4380,7 @@ pub(crate) fn flush_qwp_ws_pooled(
     max_buf_size: usize,
     server_frame_limit_known: bool,
 ) -> Result<Option<u64>, QwpWsFlushError> {
-    let split_target = (state.sfa_split_deferral_enabled && server_frame_limit_known)
-        .then_some(state.sfa_frame_split_target);
+    let split_target = server_frame_limit_known.then_some(state.sfa_frame_split_target);
     flush_qwp_ws_through(
         encoder,
         &mut state.runner,
@@ -4511,7 +4506,7 @@ fn flush_qwp_ws_through(
 }
 
 /// What ends the refusal of a buffer above the frame cap, when one thing
-/// keeps a `Sender` from cutting it into frames: the server's silence about
+/// keeps a sender from cutting it into frames: the server's silence about
 /// its frame limit, or a slot without a symbol file. Empty when the buffer
 /// is held against `max_buf_size` itself (`frame_cap_is_max_buf_size`), and
 /// when such a buffer is cut.

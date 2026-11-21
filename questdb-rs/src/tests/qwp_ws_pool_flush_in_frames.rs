@@ -27,11 +27,11 @@
 //!
 //! Such a sender sends the buffer as a `Sender` does, which
 //! `qwp_ws_flush_in_frames` tests in full: in frames that the server commits
-//! together, when the pool keeps its queues in memory and the server has
-//! told its frame limit; with the same refusals before the first frame, the
-//! same wait for room in the queue, and the same error of a flush that stops
-//! part way. The tests here show that each of these holds for a pooled
-//! sender, and what is the pool's own:
+//! together, when the server has told its frame limit; with the same
+//! refusals before the first frame, the same wait for room in the queue, and
+//! the same error of a flush that stops part way. The tests here show that
+//! each of these holds for a pooled sender, with the queues of the pool in
+//! memory and with `sf_dir`, and what is the pool's own:
 //!
 //! - a buffer is flushed in five ways, and each sends it in frames;
 //! - the row and column flushes of a pooled sender share one dictionary of
@@ -44,6 +44,11 @@
 //! - the pool closes such a sender when it is returned. It waits for the
 //!   answers to the flushes before the failed one and for nothing else, it
 //!   sends nothing more, and nothing of the failed flush is committed;
+//! - with `sf_dir`, the frames of the failed flush stay in the slot of that
+//!   sender. Whoever opens the slot next removes them and delivers the
+//!   flushes before them that the server has not confirmed: the next sender
+//!   of the pool in that place, a new pool on the folder, or the sender of
+//!   a smaller pool that drains a slot beyond its own;
 //! - any other buffer that is too large for one frame gets the refusal that
 //!   a pooled sender gave before.
 //!
@@ -57,11 +62,11 @@ use crate::ingress::column_sender::Chunk;
 use crate::ingress::{AckLevel, Buffer, SymbolGlobalDict, TestDictCapGuard};
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
 use crate::tests::qwp_ws_flush_in_frames::{
-    EIGHT_SEGMENTS, FIRST, FRAME_LIMIT, NO_FRAME_LIMIT_TOLD, SECOND, TABLE, WAIT, add_symbol_row,
-    allocated_after_a_flush_of, assert_table_holds, assert_timed_out_waiting_for_room,
-    buffer_of_len, buffer_of_symbols, queue_bytes_for, stopped_by_a_full_dictionary,
-    symbols_held_before, two_flushes_for_a_queue_that_holds_one, wait_for_frames_taken,
-    wait_for_no_connection,
+    EIGHT_SEGMENTS, FIRST, FRAME_LIMIT, NO_FRAME_LIMIT_TOLD, NO_WAIT_AT_THE_END, RECONNECT_SOON,
+    SECOND, TABLE, WAIT, add_symbol_row, allocated_after_a_flush_of, assert_table_holds,
+    assert_timed_out_waiting_for_room, buffer_of_len, buffer_of_symbols, queue_bytes_for,
+    slot_settings, stopped_by_a_full_dictionary, symbols_held_before,
+    two_flushes_for_a_queue_that_holds_one, wait_for_frames_taken, wait_for_no_connection,
 };
 use crate::tests::qwp_ws_server_model::{
     QwpWsModelServer, buffer_of, frame_of_a_sender, frames_of_a_flush, frames_of_a_sender,
@@ -77,11 +82,48 @@ const HELD: Duration = Duration::from_millis(200);
 /// return that ends within [`WAIT`] did not wait for it.
 const LONG_CLOSE_FLUSH: &str = "close_flush_timeout_millis=30000;";
 
+thread_local! {
+    /// The folder in which the pools of a test keep the queues of their
+    /// senders, and how many pools the test has made: see [`on_disk`].
+    static SF_DIR: std::cell::RefCell<Option<(tempfile::TempDir, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `test` with the queues of every pool it makes on disk: each pool
+/// gets slots of its own in a temporary `sf_dir`, as each has queues of its
+/// own in memory.
+fn on_disk(test: fn()) {
+    SF_DIR.with(|sf_dir| *sf_dir.borrow_mut() = Some((tempfile::TempDir::new().unwrap(), 0)));
+    test();
+    SF_DIR.with(|sf_dir| sf_dir.borrow_mut().take());
+}
+
+/// What a new sender has published when it takes the place of a sender of
+/// its pool that had published one frame and then a flush that stopped part
+/// way. With the queues in memory, nothing: the queue went with that sender.
+/// With the queues on disk the new sender has the slot of that sender, which
+/// holds the one frame and nothing of the flush that stopped.
+fn published_in_the_place_of_a_sender_whose_flush_stopped() -> Option<u64> {
+    SF_DIR.with(|sf_dir| sf_dir.borrow().is_some()).then_some(0)
+}
+
 /// A pool whose senders connect to the server on `port`, the first of them
 /// before this returns. It opens no connection for queries, which the test
 /// servers do not answer.
 fn pool_with(port: u16, settings: &str) -> QuestDb {
-    let conf = format!("ws::addr=127.0.0.1:{port};query_pool_min=0;{settings}");
+    // A test that names its `sf_dir` keeps it.
+    let slots = SF_DIR
+        .with(|sf_dir| {
+            let mut sf_dir = sf_dir.borrow_mut();
+            let (dir, pools) = sf_dir.as_mut().filter(|_| !settings.contains("sf_dir="))?;
+            *pools += 1;
+            Some(format!(
+                "sf_dir={};sender_id=pool{pools};",
+                dir.path().display()
+            ))
+        })
+        .unwrap_or_default();
+    let conf = format!("ws::addr=127.0.0.1:{port};query_pool_min=0;{slots}{settings}");
     QuestDb::connect(&conf).unwrap()
 }
 
@@ -647,7 +689,10 @@ fn a_pooled_flush_that_fails_part_way_is_aborted_and_its_connection_is_not_hande
     wait_for_no_connection(&server);
     let mut sender = db.borrow_sender().unwrap();
     assert!(!sender.must_close_for_test());
-    assert_eq!(sender.published_fsn().unwrap(), None);
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        published_in_the_place_of_a_sender_whose_flush_stopped()
+    );
     sender
         .flush_buffer_and_wait(&mut large, AckLevel::Ok)
         .unwrap();
@@ -696,7 +741,10 @@ fn the_pool_closes_a_sender_whose_flush_failed_part_way_when_the_flush_before_it
     // which every row of the buffer is committed once.
     let mut sender = db.borrow_sender().unwrap();
     assert!(!sender.must_close_for_test());
-    assert_eq!(sender.published_fsn().unwrap(), None);
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        published_in_the_place_of_a_sender_whose_flush_stopped()
+    );
     sender.flush_buffer_and_keep(&large).unwrap();
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     assert_table_holds(&server, TABLE, 2, &[&before, &large]);
@@ -805,21 +853,336 @@ fn a_closed_pool_closes_a_sender_whose_flush_failed_part_way_when_it_comes_back(
     server.finish();
 }
 
+/// How many segment files the slot of sender number `index` holds, in a
+/// pool with the settings of [`slot_settings`].
+fn segment_files(sf_dir: &tempfile::TempDir, index: usize) -> usize {
+    let Ok(slot) = std::fs::read_dir(sf_dir.path().join(format!("large-ingest-{index}"))) else {
+        return 0;
+    };
+    slot.flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sfa"))
+        .count()
+}
+
+/// Waits until the server has committed to `table` `commits` times.
+fn wait_for_commits(server: &QwpWsModelServer, table: &str, commits: u64) {
+    let deadline = Instant::now() + WAIT;
+    while server.model.table(table).map(|held| held.commits) != Some(commits) {
+        assert!(
+            Instant::now() < deadline,
+            "the server committed to {table} {:?} times, not {commits}",
+            server.model.table(table).map(|held| held.commits)
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
-fn a_pooled_sender_with_sf_dir_refuses_a_buffer_above_the_frame_cap() {
+fn a_pooled_flush_in_frames_with_sf_dir_is_in_the_slot_of_its_sender_until_it_is_confirmed() {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
+    // What is flushed stays in the queue until the server answers.
+    server.hold_answers();
     let sf_dir = tempfile::TempDir::new().unwrap();
-    let settings = format!(
-        "sf_dir={};sender_id=large;sf_max_segment_bytes=65536;",
-        sf_dir.path().display()
-    );
-    let db = pool_with(server.port, &settings);
+    let db = pool_with(server.port, &slot_settings(&sf_dir));
     let mut sender = db.borrow_sender().unwrap();
     assert_eq!(sender.effective_frame_cap_for_test(), (FRAME_LIMIT, true));
-    let mut large = buffer_of(TABLE, 0..2000);
+    let large = buffer_of_symbols(TABLE, 0..600);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut SymbolGlobalDict::new()).len();
+    assert!(frames > 12, "{frames} frames");
 
-    assert_refused_as_one_frame(&mut sender, &mut large, FRAME_LIMIT);
+    assert_eq!(
+        sender.flush_buffer_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frames as u64 - 1)
+    );
+    let files = segment_files(&sf_dir, 0);
+    assert!(files >= frames / 4, "{files} files for {frames} frames");
+    server.let_answers_go();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 1, &[&large]);
+    assert!(!sender.must_close_for_test());
+
+    drop(sender);
+    db.close();
+    assert_eq!(segment_files(&sf_dir, 0), 0);
+    server.finish();
+}
+
+/// What a sender flushes that leaves a flush that stopped part way in its
+/// slot: see [`leave_a_flush_that_stopped_in_the_slot`].
+struct EndsWithAFlushThatStops {
+    /// One frame, which the server confirms.
+    before: Buffer,
+    /// One frame, which the server never gets from that sender.
+    unsent: Buffer,
+    /// The buffer whose flush in frames stops at a middle frame.
+    large: Buffer,
+    /// How many frames of `large` are queued when its flush stops.
+    queued: usize,
+    /// The size of the dictionary that is full then.
+    symbols: usize,
+}
+
+impl EndsWithAFlushThatStops {
+    fn new() -> Self {
+        let before = buffer_of_symbols(TABLE, 0..10);
+        let unsent = buffer_of_symbols(TABLE, 5..15);
+        let large = buffer_of_symbols(TABLE, 10..1210);
+        let mut sender_symbols = SymbolGlobalDict::new();
+        frame_of_a_sender(&before, false, &mut sender_symbols);
+        frame_of_a_sender(&unsent, false, &mut sender_symbols);
+        let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+        assert!(frames.len() > 40, "{} frames", frames.len());
+        let queued = frames.len() / 2;
+        let symbols = symbols_held_before(&frames[queued]);
+        Self {
+            before,
+            unsent,
+            large,
+            queued,
+            symbols,
+        }
+    }
+
+    /// The settings of a pool of at most `senders` senders whose slots are
+    /// in `sf_dir`. It waits for nothing when it closes a sender, so what
+    /// the server has not confirmed stays in the slot.
+    fn pool_settings(sf_dir: &tempfile::TempDir, senders: usize) -> String {
+        format!(
+            "{}{RECONNECT_SOON}{NO_WAIT_AT_THE_END}sender_pool_max={senders};",
+            slot_settings(sf_dir)
+        )
+    }
+
+    /// Flushes `before`, which the server confirms, takes the server away,
+    /// and flushes `unsent` and `large`, whose flush stops part way.
+    /// `sender` has a dictionary of `symbols` symbols: it was borrowed
+    /// under a [`TestDictCapGuard`].
+    fn leave_a_flush_that_stopped_in_the_slot(
+        &self,
+        sender: &mut BorrowedSender<'_>,
+        server: &QwpWsModelServer,
+    ) {
+        assert_eq!(sender.effective_frame_cap_for_test(), (FRAME_LIMIT, true));
+        assert_eq!(
+            sender
+                .flush_buffer_and_keep_and_get_fsn(&self.before)
+                .unwrap(),
+            Some(0)
+        );
+        sender.wait(AckLevel::Ok, WAIT).unwrap();
+        // The server told its frame limit, and the sender still goes by it.
+        server.go_down();
+        assert_eq!(
+            sender
+                .flush_buffer_and_keep_and_get_fsn(&self.unsent)
+                .unwrap(),
+            Some(1)
+        );
+        let err = sender.flush_buffer_and_keep(&self.large).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+        assert_eq!(err.msg(), stopped_by_a_full_dictionary(self.symbols));
+        assert!(sender.must_close_for_test());
+        assert_eq!(sender.published_fsn().unwrap(), Some(1));
+    }
+
+    /// `sender` is the first to open the slot after the server came back:
+    /// it has the two flushes before the one that stopped, delivers the one
+    /// that the server had not confirmed, and takes the buffer of the
+    /// flush that stopped again, and then a flush with symbols that the
+    /// slot knows and new ones.
+    fn assert_the_slot_holds_the_flushes_before_and_takes_the_buffer_again(
+        &self,
+        sender: &mut BorrowedSender<'_>,
+        server: &QwpWsModelServer,
+    ) {
+        assert!(!sender.must_close_for_test());
+        assert_eq!(
+            sender.published_fsn().unwrap(),
+            Some(1),
+            "the slot holds the two flushes before, and no frame of the one that stopped"
+        );
+        wait_for_commits(server, TABLE, 2);
+        assert_table_holds(server, TABLE, 2, &[&self.before, &self.unsent]);
+        self.assert_takes_the_buffer_again(sender, server);
+    }
+
+    /// `sender` flushes the buffer of the flush that stopped, whose rows
+    /// the server then holds once, and a flush with symbols of that buffer
+    /// and new ones.
+    fn assert_takes_the_buffer_again(
+        &self,
+        sender: &mut BorrowedSender<'_>,
+        server: &QwpWsModelServer,
+    ) {
+        sender.flush_buffer_and_keep(&self.large).unwrap();
+        sender.wait(AckLevel::Ok, WAIT).unwrap();
+        let held = [&self.before, &self.unsent, &self.large];
+        assert_table_holds(server, TABLE, 3, &held);
+        let after = buffer_of_symbols(TABLE, 1200..1220);
+        sender.flush_buffer_and_keep(&after).unwrap();
+        sender.wait(AckLevel::Ok, WAIT).unwrap();
+        assert_table_holds(
+            server,
+            TABLE,
+            4,
+            &[&self.before, &self.unsent, &self.large, &after],
+        );
+        assert!(!sender.must_close_for_test());
+    }
+}
+
+/// The pool gives the place of a sender whose flush stopped part way to the
+/// next sender, which opens the slot of that place.
+#[test]
+fn the_next_sender_of_a_slot_delivers_the_flushes_before_a_flush_that_stopped_and_nothing_of_it() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let flushes = EndsWithAFlushThatStops::new();
+    let cap = TestDictCapGuard::new(flushes.symbols);
+    let db = pool_with(
+        server.port,
+        &EndsWithAFlushThatStops::pool_settings(&sf_dir, 1),
+    );
+    let mut sender = db.borrow_sender().unwrap();
+    drop(cap);
+    flushes.leave_a_flush_that_stopped_in_the_slot(&mut sender, &server);
+    // The frames of the flush that stopped are in the slot.
+    let files = segment_files(&sf_dir, 0);
+    assert!(files >= flushes.queued / 4, "{files} files");
+    drop(sender);
+    assert_eq!((db.free_count(), db.in_use_count()), (0, 0));
+    assert_table_holds(&server, TABLE, 1, &[&flushes.before]);
+
+    server.come_back();
+    let mut sender = db.borrow_sender().unwrap();
+    flushes
+        .assert_the_slot_holds_the_flushes_before_and_takes_the_buffer_again(&mut sender, &server);
+    drop(sender);
+    db.close();
+    server.finish();
+}
+
+/// A pool is closed, or its process ends, with a flush that stopped part
+/// way in the slot of a sender. A new pool on the folder opens the slots of
+/// its senders that hold frames when it starts, before any sender is asked
+/// for.
+#[test]
+fn a_pool_that_starts_over_a_slot_with_a_flush_that_stopped_delivers_the_flushes_before_it() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let settings = EndsWithAFlushThatStops::pool_settings(&sf_dir, 1);
+    let flushes = EndsWithAFlushThatStops::new();
+    let cap = TestDictCapGuard::new(flushes.symbols);
+    let db = pool_with(server.port, &settings);
+    let mut sender = db.borrow_sender().unwrap();
+    drop(cap);
+    flushes.leave_a_flush_that_stopped_in_the_slot(&mut sender, &server);
+    drop(sender);
+    db.close();
+    assert!(segment_files(&sf_dir, 0) >= flushes.queued / 4);
+    assert_table_holds(&server, TABLE, 1, &[&flushes.before]);
+
+    server.come_back();
+    let db = pool_with(server.port, &settings);
+    wait_for_commits(&server, TABLE, 2);
+    assert_table_holds(&server, TABLE, 2, &[&flushes.before, &flushes.unsent]);
+    let mut sender = db.borrow_sender().unwrap();
+    flushes
+        .assert_the_slot_holds_the_flushes_before_and_takes_the_buffer_again(&mut sender, &server);
+    drop(sender);
+    db.close();
+    server.finish();
+}
+
+/// The new pool has fewer senders than the one before it, and the slot with
+/// the flush that stopped is beyond its own: its first sender drains that
+/// slot, with a connection of its own that sends what the slot holds and
+/// takes no flush.
+#[test]
+fn a_smaller_pool_drains_a_slot_with_a_flush_that_stopped_to_the_flush_before_it() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let flushes = EndsWithAFlushThatStops::new();
+    let cap = TestDictCapGuard::new(flushes.symbols);
+    let db = pool_with(
+        server.port,
+        &EndsWithAFlushThatStops::pool_settings(&sf_dir, 2),
+    );
+    // The second sender of the pool has the slot with number 1.
+    let first = db.borrow_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    drop(cap);
+    flushes.leave_a_flush_that_stopped_in_the_slot(&mut sender, &server);
+    drop(sender);
+    drop(first);
+    db.close();
+    assert!(segment_files(&sf_dir, 1) >= flushes.queued / 4);
+    assert_table_holds(&server, TABLE, 1, &[&flushes.before]);
+
+    server.come_back();
+    let db = pool_with(
+        server.port,
+        &EndsWithAFlushThatStops::pool_settings(&sf_dir, 1),
+    );
+    wait_for_commits(&server, TABLE, 2);
+    assert_table_holds(&server, TABLE, 2, &[&flushes.before, &flushes.unsent]);
+    // The slot is drained: no frame of the flush that stopped is left that
+    // the server would never confirm.
+    let deadline = Instant::now() + WAIT;
+    while segment_files(&sf_dir, 1) > 0 {
+        assert!(Instant::now() < deadline, "the slot was not drained");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_table_holds(&server, TABLE, 2, &[&flushes.before, &flushes.unsent]);
+
+    // The sender of the pool has a slot of its own, which holds nothing.
+    let mut sender = db.borrow_sender().unwrap();
+    assert_eq!(sender.published_fsn().unwrap(), None);
+    flushes.assert_takes_the_buffer_again(&mut sender, &server);
+    drop(sender);
+    db.close();
+    server.finish();
+}
+
+#[test]
+fn a_pooled_sender_whose_slot_has_no_symbol_file_refuses_a_buffer_above_the_frame_cap() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    // A folder where the symbol file of the slot belongs: the sender cannot
+    // make the file, and sends every symbol with every frame.
+    let symbol_file = sf_dir
+        .path()
+        .join("large-ingest-0")
+        .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+    std::fs::create_dir_all(&symbol_file).unwrap();
+    let db = pool_with(server.port, &slot_settings(&sf_dir));
+    let mut sender = db.borrow_sender().unwrap();
+    assert_eq!(sender.effective_frame_cap_for_test(), (FRAME_LIMIT, true));
+    let mut large = buffer_of_symbols(TABLE, 0..600);
+
+    let refusal = size_refusal_of(&mut sender, &mut large);
+    let end = format!(
+        " bytes) exceeds the store-and-forward per-frame cap ({FRAME_LIMIT} bytes, the smaller \
+         of max_buf_size and the sf_max_segment_bytes segment payload capacity) It is not sent \
+         in several frames, because this sender could not write the symbol file of its \
+         store-and-forward slot: flush smaller batches, or close the sender, see to the disk \
+         of sf_dir, and build a new one."
+    );
+    assert!(
+        refusal.starts_with("QWP frame (") && refusal.ends_with(&end),
+        "got: {refusal}"
+    );
     assert_eq!(server.frames_taken(), 0);
+    // Buffers that fit one frame are sent as before.
+    let small = [
+        buffer_of_symbols(TABLE, 0..10),
+        buffer_of_symbols(TABLE, 5..15),
+    ];
+    for buffer in &small {
+        sender.flush_buffer_and_keep(buffer).unwrap();
+    }
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 2, &[&small[0], &small[1]]);
     drop(sender);
     db.close();
     server.finish();
@@ -863,18 +1226,14 @@ fn a_pooled_sender_whose_server_tells_no_frame_limit_refuses_a_buffer_above_the_
     assert_refused_as_one_frame(&mut sender, &mut large, 3000);
     drop(sender);
 
-    // The same with `sf_dir`, where no buffer goes out in frames whatever
-    // the server tells.
+    // With `sf_dir` the refusal says the same.
     let port = spawn_max_batch_size_upgrade_only_server(None);
     let sf_dir = tempfile::TempDir::new().unwrap();
-    let settings = format!(
-        "sf_dir={};sender_id=large;sf_max_segment_bytes=4096;",
-        sf_dir.path().display()
-    );
-    let db = pool_with(port, &settings);
+    let db = pool_with(port, &slot_settings(&sf_dir));
     let mut sender = db.borrow_sender().unwrap();
     assert_eq!(sender.effective_frame_cap_for_test(), (4064, false));
-    assert_refused_as_one_frame(&mut sender, &mut large, 4064);
+    let refusal = size_refusal_of(&mut sender, &mut large);
+    assert!(refusal.ends_with(&end), "got: {refusal}");
 }
 
 /// A pool that connects when its first sender is used: that sender does not
@@ -891,4 +1250,37 @@ fn a_pooled_sender_that_is_not_connected_yet_refuses_a_buffer_above_the_frame_ca
 
     let refusal = size_refusal_of(&mut sender, &mut large);
     assert!(refusal.ends_with(NO_FRAME_LIMIT_TOLD), "got: {refusal}");
+}
+
+/// Makes one more test of a test of a pool, with the queues of its senders
+/// on disk: `<test>::on_disk`.
+macro_rules! on_disk {
+    ($($(#[$gate:meta])* $test:ident)*) => {$(
+        $(#[$gate])*
+        mod $test {
+            #[test]
+            fn on_disk() {
+                super::on_disk(super::$test);
+            }
+        }
+    )*};
+}
+
+// What a pooled sender does with a buffer above the frame cap does not
+// depend on where the pool keeps its queues. These tests run once more with
+// `sf_dir`.
+on_disk! {
+    a_pooled_sender_sends_a_buffer_above_the_frame_cap_in_frames_whichever_way_it_is_flushed
+    the_frames_of_a_pooled_flush_bring_the_symbols_that_the_connection_does_not_know
+    a_pooled_flush_in_frames_shares_its_symbols_with_the_flushes_of_columns
+    a_pooled_sender_refuses_a_buffer_above_max_buf_size_for_its_size
+    a_pooled_sender_names_the_row_that_fits_no_frame
+    a_pooled_flush_that_the_queue_can_never_hold_is_refused_and_one_without_room_waits
+    a_pooled_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
+    a_pooled_flush_that_fails_part_way_is_aborted_and_its_connection_is_not_handed_out_again
+    the_pool_closes_a_sender_whose_flush_failed_part_way_when_the_flush_before_it_is_confirmed
+    the_pool_closes_a_sender_whose_first_flush_failed_part_way_without_waiting
+    a_pool_that_waits_for_nothing_at_close_gives_up_a_sender_whose_flush_failed_part_way_at_once
+    #[cfg(feature = "ffi-support")]
+    a_closed_pool_closes_a_sender_whose_flush_failed_part_way_when_it_comes_back
 }

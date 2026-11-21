@@ -1080,7 +1080,7 @@ fn a_flush_in_manual_progress_mode_is_sent_when_its_caller_drives() {
 /// The settings of a sender whose queue is the slot `large` of `sf_dir`, in
 /// segments of 4,096 bytes: one holds three or four frames of a flush that
 /// is cut for a frame limit of 1,024 bytes.
-fn slot_settings(sf_dir: &tempfile::TempDir) -> String {
+pub(super) fn slot_settings(sf_dir: &tempfile::TempDir) -> String {
     format!(
         "sf_dir={};sender_id=large;sf_max_segment_bytes=4096;",
         sf_dir.path().display()
@@ -1134,10 +1134,11 @@ fn take_the_server_away(
 }
 
 /// What makes a sender try a server that is away again soon.
-const RECONNECT_SOON: &str = "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;";
+pub(super) const RECONNECT_SOON: &str =
+    "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;";
 /// What makes a sender end without waiting for what its server has not
 /// confirmed. Its slot keeps its files then, whatever was confirmed.
-const NO_WAIT_AT_THE_END: &str = "close_flush_timeout_millis=0;";
+pub(super) const NO_WAIT_AT_THE_END: &str = "close_flush_timeout_millis=0;";
 
 fn a_flush_in_frames_with_sf_dir_leaves_no_segment_file_once_it_is_confirmed(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
