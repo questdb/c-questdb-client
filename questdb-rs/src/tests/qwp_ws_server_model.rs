@@ -1488,9 +1488,16 @@ mod tests {
             .unwrap();
         stream
             .write_all(
-                b"GET /write/v4 HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-                  Sec-WebSocket-Version: 13\r\n\r\n",
+                concat!(
+                    "GET /write/v4 HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Upgrade: websocket\r\n",
+                    "Connection: Upgrade\r\n",
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", // gitleaks:allow
+                    "Sec-WebSocket-Version: 13\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
             )
             .unwrap();
         stream
