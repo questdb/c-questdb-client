@@ -136,6 +136,16 @@ impl SfaSlotQueue {
         result
     }
 
+    /// As [`Self::close`], giving up the frames that the server has not
+    /// confirmed: see [`SfaFrameQueue::close_abandoning_unresolved`].
+    pub(crate) fn close_abandoning_unresolved(&mut self) -> Result<(), SfaQueueError> {
+        let result = self.queue.close_abandoning_unresolved();
+        if result.is_ok() {
+            drop(self.lock.take());
+        }
+        result
+    }
+
     pub(crate) fn slot_dir(&self) -> Option<&Path> {
         self.lock.as_ref().map(SlotLock::slot_dir)
     }
@@ -227,6 +237,10 @@ impl PublicationLog for SfaSlotQueue {
 
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(SfaSlotQueue::close(self)?)
+    }
+
+    fn close_abandoning_unresolved(&mut self) -> Result<(), DriverError> {
+        Ok(SfaSlotQueue::close_abandoning_unresolved(self)?)
     }
 
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {

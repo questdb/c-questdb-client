@@ -1167,7 +1167,8 @@ impl Sender {
     /// published frames to complete. After a flush that failed with
     /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) these are
     /// the frames published before that flush: the frames of the failed flush
-    /// are dropped, and nothing of it is committed.
+    /// are dropped, and nothing of it is committed. With `sf_dir` a wait that
+    /// succeeds then leaves the slot empty.
     ///
     /// The wait is bounded by the QWP/WebSocket `close_flush_timeout_millis`
     /// setting. Its default is 5000 ms, matching the Java sender. Values less

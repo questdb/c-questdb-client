@@ -343,7 +343,10 @@ pub enum ErrorCode {
     /// rows. The frame that commits the flush was never queued, and the
     /// server drops the rows it holds for the flush when the sender is
     /// closed. So [`in_doubt`](Error::in_doubt) is `false`: flushing the same
-    /// buffer through a new sender stores no row twice. With `sf_dir` the
+    /// buffer through a new sender stores no row twice. With `sf_dir` a
+    /// [`close_drain`](crate::ingress::Sender::close_drain) that waits (a
+    /// `close_flush_timeout` above 0) and succeeds leaves the slot empty, and
+    /// so does the pool when its wait for the sender succeeds. Otherwise the
     /// frames of the flush stay in the slot, and the sender that opens the
     /// slot next removes them and sends nothing of the flush.
     ///

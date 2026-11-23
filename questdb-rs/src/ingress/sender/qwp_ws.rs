@@ -669,6 +669,53 @@ enum RunnerColdEffect {
     CompletedThrough { fsn: u64, wire_seq: u64 },
 }
 
+/// What a test runs on the network thread of a sender in background progress
+/// mode each time that thread has stored a confirmation of the server in the
+/// queue and not yet written it to the watermark of the slot, which waits for
+/// the store lock. It gets the confirmed position that the queue holds.
+#[cfg(test)]
+pub(crate) type ConfirmationStoredHook = Arc<dyn Fn(Option<u64>) + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    /// The hook of the senders started on this thread, which their network
+    /// threads take over: see [`ConfirmationStoredHookGuard`].
+    static CONFIRMATION_STORED_HOOK: std::cell::RefCell<Option<ConfirmationStoredHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Gives the senders started on this thread while it lives a
+/// [`ConfirmationStoredHook`], and restores the one before when dropped.
+#[cfg(test)]
+pub(crate) struct ConfirmationStoredHookGuard(Option<ConfirmationStoredHook>);
+
+#[cfg(test)]
+impl ConfirmationStoredHookGuard {
+    pub(crate) fn new(hook: ConfirmationStoredHook) -> Self {
+        Self(set_confirmation_stored_hook(Some(hook)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConfirmationStoredHookGuard {
+    fn drop(&mut self) {
+        set_confirmation_stored_hook(self.0.take());
+    }
+}
+
+/// Sets the hook of this thread, and gives the one it replaces.
+#[cfg(test)]
+fn set_confirmation_stored_hook(
+    hook: Option<ConfirmationStoredHook>,
+) -> Option<ConfirmationStoredHook> {
+    CONFIRMATION_STORED_HOOK.with(|current| current.replace(hook))
+}
+
+#[cfg(test)]
+fn confirmation_stored_hook() -> Option<ConfirmationStoredHook> {
+    CONFIRMATION_STORED_HOOK.with(|current| current.borrow().clone())
+}
+
 #[derive(Debug)]
 struct BackpressureNotifier {
     lock: Mutex<()>,
@@ -731,7 +778,11 @@ where
         let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
+        #[cfg(test)]
+        let thread_confirmation_stored_hook = confirmation_stored_hook();
         let thread = thread::spawn(move || {
+            #[cfg(test)]
+            set_confirmation_stored_hook(thread_confirmation_stored_hook);
             let mut core = SyncQwpWsRunnerCore {
                 send_core,
                 progress,
@@ -788,7 +839,11 @@ where
         let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
+        #[cfg(test)]
+        let thread_confirmation_stored_hook = confirmation_stored_hook();
         let thread = thread::spawn(move || {
+            #[cfg(test)]
+            set_confirmation_stored_hook(thread_confirmation_stored_hook);
             let mut core = SyncQwpWsPendingRunnerCore {
                 connected: None,
                 pending_connect,
@@ -1052,6 +1107,11 @@ where
         self.lifecycle.is_terminal()
     }
 
+    /// Whether a flush failed part way: see [`Self::abort_flush`].
+    fn has_aborted_flush(&self) -> bool {
+        self.aborted_flush.is_some()
+    }
+
     fn sender_errors_dropped_total(&self) -> crate::Result<u64> {
         let store = self.lock_shared()?;
         Ok(store.sender_errors_dropped_total())
@@ -1090,7 +1150,8 @@ where
     ///
     /// After a flush that failed part way ([`Self::abort_flush`]) the wait
     /// is for the frames before that flush: its own frames are never
-    /// confirmed, and go with the queue.
+    /// confirmed, and go with the queue: see
+    /// [`Self::close_after_aborted_flush`].
     fn drain_to_deadline(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
         // No publication can pass the Closing lifecycle latch. Release the
         // detached producer's active-segment mapping before queue.close()
@@ -1122,6 +1183,10 @@ where
                         .storage_maintenance_in_flight()
                         .map_err(driver_error_to_error_without_state)?
                     {
+                        if self.aborted_flush.is_some() {
+                            drop(store);
+                            return self.close_after_aborted_flush();
+                        }
                         store
                             .close_queue()
                             .map_err(driver_error_to_error_without_state)?;
@@ -1139,6 +1204,67 @@ where
                 ));
             }
         }
+    }
+
+    /// Closes the queue after a flush that failed part way, once the frames
+    /// before it are confirmed. The network thread is stopped first: that
+    /// ends the connection, so the server drops the rows that it holds of
+    /// the flush, and the thread can neither send from the slot nor store a
+    /// confirmation any more. The queue then closes as fully drained: it
+    /// writes the confirmed position, which may be ahead of the watermark
+    /// that the thread wrote, gives up the frames of the flush, and removes
+    /// the files of the slot, the symbol file too. The slot is given up only
+    /// then. If the thread does not stop in time, nothing is closed.
+    ///
+    /// A terminal error that the thread recorded after the frames before the
+    /// flush were confirmed does not stop the close: it can only be of the
+    /// frames of the flush or of the end of the connection, and nothing of
+    /// the flush is committed either way.
+    fn close_after_aborted_flush(&mut self) -> crate::Result<()> {
+        self.stop_network_thread()?;
+        let mut store = self.lock_shared()?;
+        // The thread finishes a storage task within one step, so none is in
+        // flight once it is gone.
+        if store
+            .storage_maintenance_in_flight()
+            .map_err(driver_error_to_error_without_state)?
+        {
+            return Err(error::fmt!(
+                SocketError,
+                "QWP/WebSocket runner stopped with storage maintenance in flight"
+            ));
+        }
+        store
+            .close_queue_abandoning_unresolved()
+            .map_err(driver_error_to_error_without_state)
+    }
+
+    /// Stops the network thread and waits, as long as [`Drop`] does, until
+    /// it is gone.
+    fn stop_network_thread(&mut self) -> crate::Result<()> {
+        self.stop.store(true, Ordering::Release);
+        if let Err(err) = self.traffic_gate.shutdown() {
+            log::warn!("could not shut down QWP/WebSocket runner traffic: {err}");
+        }
+        let Some(thread) = self.thread.as_ref() else {
+            return Ok(());
+        };
+        if !wait_for_runner_exit(thread, self.shutdown_timeout) {
+            return Err(error::fmt!(
+                SocketError,
+                "QWP/WebSocket runner did not stop within {:?}",
+                self.shutdown_timeout
+            ));
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            return Err(error::fmt!(
+                SocketError,
+                "QWP/WebSocket runner thread panicked"
+            ));
+        }
+        Ok(())
     }
 
     fn lock_shared(&self) -> crate::Result<std::sync::MutexGuard<'_, QwpWsPublicationStore<Q>>> {
@@ -1713,6 +1839,15 @@ where
             update_atomic_max(&self.ok_completed_upper, fsn.saturating_add(1));
         }
         self.enqueue_hot_response_events(progress.events);
+        #[cfg(test)]
+        if let Some(hook) = confirmation_stored_hook()
+            && self
+                .cold_effects
+                .iter()
+                .any(|effect| matches!(effect, RunnerColdEffect::CompletedThrough { .. }))
+        {
+            hook(self.progress.completed_fsn());
+        }
         if self.flush_cold_effects(shared) == RunnerStep::Stop {
             return RunnerStep::Stop;
         }
@@ -4935,6 +5070,10 @@ pub(crate) fn qwp_ws_is_terminal_background(state: &SyncQwpWsHandlerState) -> bo
     state.runner.lifecycle_is_terminal()
 }
 
+pub(crate) fn qwp_ws_has_aborted_flush_background(state: &SyncQwpWsHandlerState) -> bool {
+    state.runner.has_aborted_flush()
+}
+
 pub(crate) fn qwp_ws_is_terminal_manual(state: &ManualQwpWsHandlerState) -> bool {
     state.store.is_terminal()
 }
@@ -5003,14 +5142,18 @@ pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> 
     let deadline = Instant::now().checked_add(state.close_drain_timeout);
     loop {
         // The frames of a flush that failed part way are never confirmed:
-        // the wait ends at the frame before them, and they go with the queue.
+        // the wait ends at the frame before them, and they go with the queue,
+        // which closes as fully drained and leaves an empty slot. Nothing
+        // sends from the queue once it is closed, so the connection may stay
+        // until the sender is dropped: the server holds the rows of the flush
+        // for a frame that never comes, and drops them then.
         if let Some(flush) = &state.aborted_flush
             && !state.store.is_terminal()
             && state.store.completed_fsn() >= flush.published_before
         {
             return state
                 .send_core
-                .close_publication_queue(&mut state.store)
+                .close_publication_queue_abandoning_unresolved(&mut state.store)
                 .map_err(driver_error_to_error_without_state);
         }
         match state.send_core.close_drain_ready_once(&mut state.store) {

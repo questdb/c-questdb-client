@@ -40,12 +40,12 @@ use crate::ingress::sender::effective_hard_frame_cap;
 use crate::ingress::sender::qwp_ws::{
     QwpWsFlushError, SyncQwpWsHandlerState, flush_qwp_ws_pooled, publish_qwp_ws_payload_background,
     qwp_ws_acked_fsn_background, qwp_ws_begin_close_background, qwp_ws_check_error_background,
-    qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_not_in_frames_hint,
-    qwp_ws_ok_fsn_background, qwp_ws_poll_sender_error_background,
-    qwp_ws_poll_sender_error_notification_background, qwp_ws_progress_generation_background,
-    qwp_ws_published_fsn_background, qwp_ws_reconnect_failure_background,
-    qwp_ws_sender_errors_dropped_background, qwp_ws_wait_for_progress_background,
-    sfa_has_deferred_commit_slot,
+    qwp_ws_drain_to_deadline_background, qwp_ws_has_aborted_flush_background,
+    qwp_ws_is_terminal_background, qwp_ws_not_in_frames_hint, qwp_ws_ok_fsn_background,
+    qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
+    qwp_ws_progress_generation_background, qwp_ws_published_fsn_background,
+    qwp_ws_reconnect_failure_background, qwp_ws_sender_errors_dropped_background,
+    qwp_ws_wait_for_progress_background, sfa_has_deferred_commit_slot,
 };
 use crate::ingress::sender::qwp_ws_publisher::QwpWsFlushEncoder;
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
@@ -525,6 +525,16 @@ impl PooledSenderCore {
             qwp_ws_ok_fsn_background(&sfa.state)
         };
         matches!(watermark, Ok(Some(w)) if w >= published)
+    }
+
+    /// `true` once a flush of this sender failed part way, while the sender
+    /// is not terminal. The frames of that flush are never confirmed, and
+    /// [`Self::sfa_fully_delivered`] does not count them: the pool closes
+    /// such a sender through [`Self::drain_to_deadline`] all the same, which
+    /// gives them up and empties the slot.
+    pub(crate) fn has_aborted_flush(&self) -> bool {
+        let state = &self.backend.state;
+        !qwp_ws_is_terminal_background(state) && qwp_ws_has_aborted_flush_background(state)
     }
 
     /// Publish a committing frame if a split left a deferred group open.

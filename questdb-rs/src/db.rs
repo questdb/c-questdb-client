@@ -3103,14 +3103,17 @@ fn commit_in_flight_on_drop(ack: AckLevel, sender: &mut DirectSenderCore) {
 /// keeps delivering, but dropping it stops the runner, so we give the queue a
 /// bounded window (the configured `close_flush_timeout`) to finish. On timeout
 /// or a terminal transport the undelivered frames are discarded with a warning,
-/// mirroring [`commit_in_flight_on_drop`] for the direct backend.
+/// mirroring [`commit_in_flight_on_drop`] for the direct backend. A sender whose
+/// flush failed part way is drained even when the frames before that flush are
+/// all delivered: the drain is what gives up the frames of the flush and
+/// empties the slot.
 fn drain_sfa_before_drop(inner: &DbInner, sender: &mut PooledSenderCore) {
     let timeout = inner.connector.close_flush_timeout();
     if timeout.is_zero() {
         return;
     }
     let durable = inner.connector.request_durable_ack().is_enabled();
-    if sender.sfa_fully_delivered(durable) {
+    if sender.sfa_fully_delivered(durable) && !sender.has_aborted_flush() {
         return;
     }
     // Before begin_close stops accepting publications: a split that failed
@@ -3149,7 +3152,7 @@ fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [PooledSenderCore]) 
         sender.begin_close();
     }
     for sender in senders.iter_mut() {
-        if sender.sfa_fully_delivered(durable) {
+        if sender.sfa_fully_delivered(durable) && !sender.has_aborted_flush() {
             continue;
         }
         if let Err(err) = sender.drain_to_deadline(deadline) {

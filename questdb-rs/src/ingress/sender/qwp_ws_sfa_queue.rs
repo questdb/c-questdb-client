@@ -494,6 +494,19 @@ pub(crate) struct SfaProgressView {
     engine: Arc<SfaEngine>,
 }
 
+/// What a close does with the frames that the server has not confirmed.
+#[derive(Debug, Clone, Copy)]
+enum UnresolvedAtClose {
+    /// They stay in the slot, for the next sender on it to send.
+    Keep,
+    /// They are given up: the close is that of a fully drained queue, which
+    /// writes the confirmed position and removes every file of the slot. For
+    /// the frames of a flush that stopped part way, once the network thread
+    /// that could send them is gone and the frames before them are
+    /// confirmed.
+    Abandon,
+}
+
 #[derive(Debug)]
 struct SfaEngine {
     slot_dir: Option<PathBuf>,
@@ -1231,7 +1244,16 @@ impl SfaFrameQueue {
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
         self.producer.take();
-        self.engine.close(&mut self.ack_watermark)
+        self.engine
+            .close(&mut self.ack_watermark, UnresolvedAtClose::Keep)
+    }
+
+    /// Closes the queue as fully drained, giving up the frames that the
+    /// server has not confirmed: see [`UnresolvedAtClose::Abandon`].
+    pub(crate) fn close_abandoning_unresolved(&mut self) -> Result<(), SfaQueueError> {
+        self.producer.take();
+        self.engine
+            .close(&mut self.ack_watermark, UnresolvedAtClose::Abandon)
     }
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
@@ -1883,7 +1905,11 @@ impl SfaEngine {
         })
     }
 
-    fn close(&self, ack_watermark: &mut Option<SfaAckWatermark>) -> Result<(), SfaQueueError> {
+    fn close(
+        &self,
+        ack_watermark: &mut Option<SfaAckWatermark>,
+        unresolved: UnresolvedAtClose,
+    ) -> Result<(), SfaQueueError> {
         let mut state = self.lock_state()?;
         if state.closed {
             return Ok(());
@@ -1891,11 +1917,26 @@ impl SfaEngine {
         if state.storage_maintenance_in_flight || state.topology_io_in_flight {
             return Err(SfaQueueError::StorageMaintenanceInFlight);
         }
-        let fully_drained = self.all_published_frames_resolved();
+        let fully_drained = match unresolved {
+            UnresolvedAtClose::Keep => self.all_published_frames_resolved(),
+            UnresolvedAtClose::Abandon => true,
+        };
         if !fully_drained && self.periodic_sync_interval.is_some() {
             for segment in state.sealed_segments.iter().chain(state.active.iter()) {
                 segment.sync_published()?;
             }
+        }
+        // The network thread stores a confirmation here at once and writes
+        // it to the watermark later, when it gets the store lock. A close in
+        // between writes it, so that the next open sends nothing confirmed
+        // again.
+        if !fully_drained
+            && let Some(watermark) = ack_watermark.as_mut()
+            && let Some(completed_fsn) = self.completed_fsn()
+        {
+            let completed_fsn =
+                i64::try_from(completed_fsn).map_err(|_| QueueError::SequenceOverflow)?;
+            watermark.write(completed_fsn)?;
         }
         if fully_drained
             && let Some(slot_dir) = self.slot_dir.as_deref()
@@ -2675,6 +2716,10 @@ impl PublicationLog for SfaFrameQueue {
 
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(SfaFrameQueue::close(self)?)
+    }
+
+    fn close_abandoning_unresolved(&mut self) -> Result<(), DriverError> {
+        Ok(SfaFrameQueue::close_abandoning_unresolved(self)?)
     }
 
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -4137,7 +4182,7 @@ mod tests {
                 );
                 assert!(engine.storage_maintenance_in_flight().unwrap());
                 assert!(matches!(
-                    engine.close(&mut None),
+                    engine.close(&mut None, UnresolvedAtClose::Keep),
                     Err(SfaQueueError::StorageMaintenanceInFlight)
                 ));
                 seen.store(true, Ordering::Release);
@@ -5278,6 +5323,71 @@ mod tests {
         assert_eq!(sfa_file_count(dir.path()), 0);
         assert!(!ack_watermark_path(dir.path()).exists());
         // The side-file is slot state too: a fully-drained close leaves nothing.
+        assert!(!symbol_dict.exists());
+    }
+
+    /// The network thread of a sender stores a confirmation in the queue at
+    /// once, and writes it to the watermark later, when it gets the store
+    /// lock: a close that comes first writes it, drained or not.
+    #[test]
+    fn close_of_a_queue_that_is_not_drained_writes_the_confirmation_that_it_holds() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut queue = open(&dir);
+            queue.try_submit(b"first").unwrap();
+            queue.try_submit(b"second").unwrap();
+            assert!(queue.progress_view().complete_through_fsn(0).unwrap());
+            queue.close().unwrap();
+        }
+
+        let recovered = open(&dir);
+        assert_eq!(recovered.completed_fsn(), Some(0));
+        assert_eq!(recovered.oldest_unresolved_fsn(), Some(1));
+        assert_eq!(
+            recovered.payload_vec_for_fsn(1).as_deref(),
+            Some(&b"second"[..])
+        );
+    }
+
+    /// The frames after the confirmed ones are given up: the close writes
+    /// the confirmed position as a close of a drained queue does, and removes
+    /// every file of the slot, the symbol file too.
+    #[test]
+    fn close_abandoning_unresolved_frames_empties_the_slot_as_a_drained_close_does() {
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 152)).unwrap();
+        queue.try_submit(b"one").unwrap();
+        queue.try_submit(b"two").unwrap();
+        queue.try_submit(b"tri").unwrap();
+        // Stored in the queue only, as by the network thread.
+        assert!(queue.progress_view().complete_through_fsn(0).unwrap());
+        assert!(symbol_dict.exists());
+        take_sfa_barriers();
+
+        queue.close_abandoning_unresolved().unwrap();
+
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                SfaBarrierEvent::CloseWatermarkWritten,
+                SfaBarrierEvent::CloseWatermarkSynced,
+                SfaBarrierEvent::CloseDirectorySynced,
+                SfaBarrierEvent::CloseHandlesReleased,
+                SfaBarrierEvent::CleanupEnumerationComplete,
+                SfaBarrierEvent::CleanupManifestCollapsed,
+                SfaBarrierEvent::CleanupSegmentUnlinked("sf-0000000000000000.sfa".to_string()),
+                SfaBarrierEvent::CleanupSegmentUnlinked("sf-0000000000000001.sfa".to_string()),
+                SfaBarrierEvent::CleanupSegmentUnlinked("sf-0000000000000002.sfa".to_string()),
+                SfaBarrierEvent::CleanupDirectorySynced,
+                SfaBarrierEvent::CleanupWatermarkRemoved,
+                SfaBarrierEvent::CleanupManifestRemoved,
+            ]
+        );
+        assert_eq!(sfa_file_count(dir.path()), 0);
+        assert!(!ack_watermark_path(dir.path()).exists());
         assert!(!symbol_dict.exists());
     }
 

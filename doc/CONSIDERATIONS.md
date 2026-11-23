@@ -206,7 +206,10 @@ flushes and reports `must_close`, but it still delivers the flushes before the
 failed one. To lose none of them, call `close_drain` and check that it
 succeeded; then close the sender, create a new one and flush the buffer again.
 The holder of a pooled sender calls `wait` instead and returns the sender,
-which the pool closes instead of lending it again.
+which the pool closes instead of lending it again. With `sf_dir` a
+`close_drain` that waits (a `close_flush_timeout` above 0) and succeeds leaves
+the sender's slot empty, nothing of the failed flush and no symbols, and so
+does the pool when its wait for the sender succeeds.
 
 A frame that the server rejects takes the whole flush with it: the server
 drops the rows it holds for the connection and commits nothing of the flush.
@@ -227,7 +230,8 @@ end:
   confirmed it. When the server committed it and the confirmation was lost, it
   is committed again (at least once).
 - **A flush without its last frame** is removed. The process was killed inside
-  `flush`, or the flush failed with `flush_aborted`. Nothing of it was
+  `flush`, or the flush failed with `flush_aborted` and the sender was closed
+  without a `close_drain` that waited and succeeded. Nothing of it was
   committed (below the server's row limit, see above) and nothing of it is
   sent, so flush the buffer again. The flushes before it are sent as usual.
 

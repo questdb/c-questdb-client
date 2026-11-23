@@ -330,9 +330,12 @@ typedef enum line_sender_error_code
      *
      *  Nothing of the flush is committed, and the buffer still holds its
      *  rows: `line_sender_error_in_doubt` is false, and flushing the same
-     *  buffer through a new sender stores no row twice. With `sf_dir` the
-     *  frames of the flush stay in the slot, and the sender that opens the
-     *  slot next removes them and sends nothing of the flush.
+     *  buffer through a new sender stores no row twice. With `sf_dir` a
+     *  `line_sender_qwpws_close_drain` that waits (a `close_flush_timeout`
+     *  above 0) and succeeds leaves the slot empty, and so does the pool when
+     *  its wait for the sender succeeds. Otherwise the frames of the flush
+     *  stay in the slot, and the sender that opens the slot next removes them
+     *  and sends nothing of the flush.
      *
      *  This holds for a flush with no more rows of one table than the
      *  server's `qwp.max.uncommitted.rows` (1,000,000 by default). Above

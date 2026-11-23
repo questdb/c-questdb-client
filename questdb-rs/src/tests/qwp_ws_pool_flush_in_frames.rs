@@ -44,11 +44,12 @@
 //! - the pool closes such a sender when it is returned. It waits for the
 //!   answers to the flushes before the failed one and for nothing else, it
 //!   sends nothing more, and nothing of the failed flush is committed;
-//! - with `sf_dir`, the frames of the failed flush stay in the slot of that
-//!   sender. Whoever opens the slot next removes them and delivers the
-//!   flushes before them that the server has not confirmed: the next sender
-//!   of the pool in that place, a new pool on the folder, or the sender of
-//!   a smaller pool that drains a slot beyond its own;
+//! - with `sf_dir`, that close leaves the slot of the sender empty. A pool
+//!   that waits for nothing when it closes a sender leaves the frames of the
+//!   failed flush in the slot. Whoever opens the slot next removes them and
+//!   delivers the flushes before them that the server has not confirmed: the
+//!   next sender of the pool in that place, a new pool on the folder, or the
+//!   sender of a smaller pool that drains a slot beyond its own;
 //! - any other buffer that is too large for one frame gets the refusal that
 //!   a pooled sender gave before.
 //!
@@ -98,13 +99,30 @@ fn on_disk(test: fn()) {
     SF_DIR.with(|sf_dir| sf_dir.borrow_mut().take());
 }
 
-/// What a new sender has published when it takes the place of a sender of
-/// its pool that had published one frame and then a flush that stopped part
-/// way. With the queues in memory, nothing: the queue went with that sender.
-/// With the queues on disk the new sender has the slot of that sender, which
-/// holds the one frame and nothing of the flush that stopped.
-fn published_in_the_place_of_a_sender_whose_flush_stopped() -> Option<u64> {
-    SF_DIR.with(|sf_dir| sf_dir.borrow().is_some()).then_some(0)
+/// The files in the slots of the pools of the test, as `<slot>/<file>`, but
+/// their lock files, which stay for the next sender. None with the queues in
+/// memory.
+fn files_in_the_slots() -> Vec<String> {
+    SF_DIR.with(|sf_dir| {
+        let sf_dir = sf_dir.borrow();
+        let Some((dir, _)) = sf_dir.as_ref() else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        for slot in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            if !slot.path().is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(slot.path()).unwrap().flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if !name.starts_with(".lock") {
+                    files.push(format!("{}/{name}", slot.file_name().to_string_lossy()));
+                }
+            }
+        }
+        files.sort();
+        files
+    })
 }
 
 /// A pool whose senders connect to the server on `port`, the first of them
@@ -681,18 +699,17 @@ fn a_pooled_flush_that_fails_part_way_is_aborted_and_its_connection_is_not_hande
 
     // The pool closes the connection of a sender that must be closed, and
     // the rows that the server held go with it. It has nothing to wait for.
-    // The next sender has a new connection, through which every row of the
-    // buffer is committed once.
+    // With the queues on disk it leaves the slot of the sender empty: nothing
+    // of the failed flush, and no symbol. The next sender has a new
+    // connection, through which every row of the buffer is committed once.
     let started = Instant::now();
     drop(sender);
     assert_did_not_wait_for_close_flush_timeout(started.elapsed());
+    assert_eq!(files_in_the_slots(), Vec::<String>::new());
     wait_for_no_connection(&server);
     let mut sender = db.borrow_sender().unwrap();
     assert!(!sender.must_close_for_test());
-    assert_eq!(
-        sender.published_fsn().unwrap(),
-        published_in_the_place_of_a_sender_whose_flush_stopped()
-    );
+    assert_eq!(sender.published_fsn().unwrap(), None);
     sender
         .flush_buffer_and_wait(&mut large, AckLevel::Ok)
         .unwrap();
@@ -730,7 +747,9 @@ fn the_pool_closes_a_sender_whose_flush_failed_part_way_when_the_flush_before_it
 
     // The connection is closed, and the rows that the server held go with
     // it. The pool has sent nothing more: no frame that would commit them.
+    // With the queues on disk the slot of the sender is empty.
     wait_for_no_connection(&server);
+    assert_eq!(files_in_the_slots(), Vec::<String>::new());
     assert_eq!(server.frames_taken(), 1 + queued);
     assert_table_holds(&server, TABLE, 1, &[&before]);
     // The pool keeps nothing of the sender: none that is idle, none to reap.
@@ -741,10 +760,7 @@ fn the_pool_closes_a_sender_whose_flush_failed_part_way_when_the_flush_before_it
     // which every row of the buffer is committed once.
     let mut sender = db.borrow_sender().unwrap();
     assert!(!sender.must_close_for_test());
-    assert_eq!(
-        sender.published_fsn().unwrap(),
-        published_in_the_place_of_a_sender_whose_flush_stopped()
-    );
+    assert_eq!(sender.published_fsn().unwrap(), None);
     sender.flush_buffer_and_keep(&large).unwrap();
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     assert_table_holds(&server, TABLE, 2, &[&before, &large]);

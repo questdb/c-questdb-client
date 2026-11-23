@@ -28,9 +28,10 @@
 //! when all of this holds: the server has told its frame limit, the buffer
 //! is within `max_buf_size`, each of its rows fits a frame and none of its
 //! values is one that cannot be sent. The sender may keep its queue in
-//! memory or in a slot of its `sf_dir`. With `sf_dir` the frames of a flush
-//! that stopped part way stay in the slot, and the next sender on the slot
-//! removes them when it starts: it sends the flushes before that one, and
+//! memory or in a slot of its `sf_dir`. With `sf_dir` a `close_drain` after a
+//! flush that stopped part way leaves the slot empty. A sender dropped without
+//! it leaves the frames of that flush in the slot, and the next sender on the
+//! slot removes them when it starts: it sends the flushes before that one, and
 //! nothing of it. A sender that could not make the symbol file of its slot
 //! sends every buffer as one frame.
 //! The sender may make its progress in the background or be driven by its
@@ -72,12 +73,15 @@
 //! of a flush were flagged. A test can make it keep its answers to itself, so
 //! that what was flushed stays in the queue of the sender.
 
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
-use crate::ingress::sender::fail_sync_after_for_test;
 use crate::ingress::sender::qwp_ws_sfa_manifest::fail_manifest_sync_after_for_test;
+use crate::ingress::sender::{
+    ConfirmationStoredHook, ConfirmationStoredHookGuard, fail_sync_after_for_test,
+};
 use crate::ingress::{
     AckLevel, Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, Sender, SenderBuilder,
     SymbolGlobalDict, TimestampMicros, TimestampNanos, decode_qwp_varint,
@@ -2707,6 +2711,231 @@ fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_co
     server.finish();
 }
 
+/// The files in the slot of [`slot_settings`], but the lock files, which
+/// stay for the next sender.
+fn files_in_the_slot(sf_dir: &tempfile::TempDir) -> Vec<String> {
+    let mut files: Vec<String> = std::fs::read_dir(sf_dir.path().join("large"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with(".lock"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// A flush before, of one frame, and a buffer whose flush in frames stops at
+/// a middle frame, for a sender that has flushed the one before: the frames
+/// queued when it stops, and the size of the dictionary that is full then.
+fn a_flush_before_and_one_that_stops_part_way() -> (Buffer, Buffer, usize, usize) {
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before, false, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    assert!(frames.len() > 40, "{} frames", frames.len());
+    let failing = frames.len() / 2;
+    let symbols = symbols_held_before(&frames[failing]);
+    (before, large, failing, symbols)
+}
+
+/// With `sf_dir`: once the flush before the failed one is confirmed,
+/// `close_drain` closes the slot as after a complete drain. Nothing of the
+/// failed flush is left in it, and no symbol: the next sender on the slot
+/// sends nothing, and starts with an empty dictionary.
+fn a_close_drain_after_a_flush_that_failed_part_way_leaves_an_empty_slot(progress: Progress) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let settings = slot_settings(&sf_dir);
+    let (before, mut large, failing, symbols) = a_flush_before_and_one_that_stops_part_way();
+    // Every sender of the test has a dictionary of this size.
+    let _cap = crate::ingress::TestDictCapGuard::new(symbols);
+    let mut sender = sender_with(server.port, progress, &settings);
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    let err = sender.flush(&mut large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    wait_for_frames_sent(&mut sender, progress, &server, 1 + failing);
+    assert!(segment_files(&sf_dir) > 0);
+    server.let_answers_go();
+    sender.close_drain().unwrap();
+    assert_eq!(files_in_the_slot(&sf_dir), Vec::<String>::new());
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    drop(sender);
+    wait_for_no_connection(&server);
+
+    // With a dictionary of the same size, the next sender takes as many
+    // symbols that are new to it.
+    let taken = server.frames_taken();
+    let mut sender = sender_with(server.port, progress, &settings);
+    assert_eq!(sender.published_fsn().unwrap(), None);
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let new_symbols = buffer_of_symbols(TABLE, 5000..5000 + symbols as i64);
+    let frames = frames_of_a_sender(&new_symbols, FRAME_LIMIT, &mut SymbolGlobalDict::new());
+    sender.flush_and_keep(&new_symbols).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), taken + frames.len());
+    assert_table_holds(&server, TABLE, 2, &[&before, &new_symbols]);
+    drop(sender);
+    server.finish();
+}
+
+/// Parks the network thread of a sender once at its
+/// [`ConfirmationStoredHook`], with the confirmation stored in the queue and
+/// not yet written to the watermark, until the test lets it go.
+#[derive(Default)]
+struct ConfirmationHold {
+    state: Mutex<ConfirmationHoldState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct ConfirmationHoldState {
+    armed: bool,
+    /// The confirmed position that the queue held when the thread parked.
+    parked_at: Option<Option<u64>>,
+    released: bool,
+}
+
+impl ConfirmationHold {
+    fn hook(self: &Arc<Self>) -> ConfirmationStoredHook {
+        let hold = Arc::clone(self);
+        Arc::new(move |completed_fsn| hold.park(completed_fsn))
+    }
+
+    fn park(&self, completed_fsn: Option<u64>) {
+        let mut state = self.state.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        state.armed = false;
+        state.parked_at = Some(completed_fsn);
+        self.changed.notify_all();
+        let deadline = Instant::now() + WAIT;
+        while !state.released {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            state = self.changed.wait_timeout(state, deadline - now).unwrap().0;
+        }
+    }
+
+    /// The next confirmation that the thread stores parks it.
+    fn arm(&self) {
+        self.state.lock().unwrap().armed = true;
+    }
+
+    /// Waits until the thread has parked, and gives the confirmed position
+    /// that the queue held then.
+    fn wait_until_parked(&self) -> Option<u64> {
+        let deadline = Instant::now() + WAIT;
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(parked_at) = state.parked_at {
+                return parked_at;
+            }
+            let now = Instant::now();
+            assert!(now < deadline, "the network thread did not park");
+            state = self.changed.wait_timeout(state, deadline - now).unwrap().0;
+        }
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
+}
+
+/// The confirmation of the flush before the failed one comes as
+/// `close_drain` starts: the network thread has stored it in the queue and
+/// not yet written it to the watermark of the slot. The close keeps it, and
+/// the next sender on the slot sends nothing again.
+#[test]
+fn a_confirmation_that_comes_as_close_drain_starts_after_a_flush_that_failed_part_way_is_kept() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let settings = slot_settings(&sf_dir);
+    let (before, mut large, failing, symbols) = a_flush_before_and_one_that_stops_part_way();
+    let hold = Arc::new(ConfirmationHold::default());
+    let _hook = ConfirmationStoredHookGuard::new(hold.hook());
+    let mut sender = {
+        let _cap = crate::ingress::TestDictCapGuard::new(symbols);
+        sender_with(server.port, Progress::Background, &settings)
+    };
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    let err = sender.flush(&mut large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    wait_for_frames_taken(&server, 1 + failing);
+    hold.arm();
+    server.let_answers_go();
+    assert_eq!(hold.wait_until_parked(), Some(0));
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(200));
+            hold.release();
+        });
+        sender.close_drain().unwrap();
+    });
+    drop(sender);
+    wait_for_no_connection(&server);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+
+    let taken = server.frames_taken();
+    let mut sender = sender_with(server.port, Progress::Background, &settings);
+    assert_eq!(sender.published_fsn().unwrap(), None);
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    // Time for a frame sent again to reach the server.
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(server.frames_taken(), taken);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    drop(sender);
+    server.finish();
+}
+
+/// `close_drain` after a flush that failed part way stops the network thread
+/// of the sender, and with it the connection, before it gives the slot up. A
+/// second sender on the slot, opened while the first one is still there, is
+/// the only one that sends.
+#[test]
+fn a_second_sender_on_the_slot_of_a_sender_closed_after_a_flush_that_failed_part_way_sends_alone() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let settings = slot_settings(&sf_dir);
+    let mut large = buffer_of_symbols(TABLE, 10..1210);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut SymbolGlobalDict::new());
+    let failing = frames.len() / 2;
+    let symbols = symbols_held_before(&frames[failing]);
+    let mut first = {
+        let _cap = crate::ingress::TestDictCapGuard::new(symbols);
+        sender_with(server.port, Progress::Background, &settings)
+    };
+
+    let err = first.flush(&mut large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&first, &err, symbols);
+    // There is nothing before the failed flush to wait for, and the network
+    // thread may still be sending the frames of the failed one.
+    first.close_drain().unwrap();
+    // The connection has ended, and with it the rows that the server held.
+    wait_for_no_connection(&server);
+    let taken = server.frames_taken();
+    assert!(taken <= failing, "{taken} frames");
+
+    let mut second = sender_with(server.port, Progress::Background, &settings);
+    assert_eq!(second.published_fsn().unwrap(), None);
+    second.flush(&mut large).unwrap();
+    second.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), taken + frames.len());
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    assert_table_holds(&server, TABLE, 1, &[&large]);
+    drop(first);
+    drop(second);
+    server.finish();
+}
+
 /// What a server answers a frame whose columns disagree with the table. A
 /// sender that gets it stops for good.
 const SCHEMA_MISMATCH: u8 = 0x03;
@@ -3187,6 +3416,7 @@ in_both_progress_modes! {
     a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
     a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
+    a_close_drain_after_a_flush_that_failed_part_way_leaves_an_empty_slot
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
     a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
     a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good

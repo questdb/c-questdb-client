@@ -805,6 +805,11 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.close()
     }
 
+    /// See [`PublicationLog::close_abandoning_unresolved`].
+    pub(crate) fn close_queue_abandoning_unresolved(&mut self) -> Result<(), DriverError> {
+        self.queue.close_abandoning_unresolved()
+    }
+
     pub(crate) fn record_protocol_violation(
         &mut self,
         close_code: Option<u16>,
@@ -1342,6 +1347,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         // drain.
         self.send_cursor.release_sfa_cursor();
         store.close_queue()
+    }
+
+    /// As [`Self::close_publication_queue`], giving up the frames that the
+    /// server has not confirmed: see
+    /// [`PublicationLog::close_abandoning_unresolved`].
+    pub(crate) fn close_publication_queue_abandoning_unresolved<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+    ) -> Result<(), DriverError> {
+        self.send_cursor.release_sfa_cursor();
+        store.close_queue_abandoning_unresolved()
     }
 
     pub(crate) fn next_outbound_sfa_frame(
@@ -3040,6 +3056,11 @@ pub(crate) trait PublicationLog {
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(())
     }
+    /// Closes the log as fully drained, giving up the frames that the server
+    /// has not confirmed: the frames of a flush that stopped part way, once
+    /// the frames before them are confirmed and nothing can send them any
+    /// more.
+    fn close_abandoning_unresolved(&mut self) -> Result<(), DriverError>;
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus;
     fn published_fsn(&self) -> Option<u64>;
     fn completed_fsn(&self) -> Option<u64>;
