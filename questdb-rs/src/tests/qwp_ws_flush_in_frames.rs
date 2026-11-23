@@ -32,7 +32,8 @@
 //! flush that stopped part way leaves the slot empty. A sender dropped without
 //! it leaves the frames of that flush in the slot, and the next sender on the
 //! slot removes them when it starts: it sends the flushes before that one, and
-//! nothing of it. A sender that could not make the symbol file of its slot
+//! nothing of it. It keeps the symbols of the slot, so a flush that a full
+//! dictionary stopped stops the same way once more. A sender that could not make the symbol file of its slot
 //! sends every buffer as one frame.
 //! The sender may make its progress in the background or be driven by its
 //! caller (`qwp_ws_progress=manual`): every test of a sender runs with both.
@@ -3198,6 +3199,139 @@ fn a_second_sender_on_the_slot_of_a_sender_closed_after_a_flush_that_failed_part
     server.finish();
 }
 
+/// A flush of symbols, and a buffer whose flush in frames after it stops at
+/// frame `which(frame count)` because the dictionary of the sender is full:
+/// the size of that dictionary. A dictionary of that size takes the symbols
+/// of the buffer alone, and not those of both: a slot whose dictionary grew
+/// over earlier flushes.
+fn a_flush_of_symbols_and_one_that_fills_the_dictionary_after_it(
+    which: fn(usize) -> usize,
+) -> (Buffer, Buffer, usize) {
+    let prior = buffer_of_symbols(TABLE, 100_000..102_000);
+    let large = buffer_of_symbols(TABLE, 10..1210);
+    let mut symbols_of_large = SymbolGlobalDict::new();
+    frames_of_a_sender(&large, FRAME_LIMIT, &mut symbols_of_large);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frames_of_a_sender(&prior, FRAME_LIMIT, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    assert!(frames.len() > 40, "{} frames", frames.len());
+    let failing = which(frames.len());
+    assert!((1..frames.len()).contains(&failing));
+    let symbols = symbols_held_before(&frames[failing]);
+    assert!(
+        symbols_of_large.len() as usize <= symbols,
+        "{} symbols of the buffer alone, a dictionary of {symbols}",
+        symbols_of_large.len()
+    );
+    (prior, large, symbols)
+}
+
+/// Flushes `prior` through `sender` and waits until the server confirms it,
+/// then flushes `large`, which stops part way because the dictionary of the
+/// sender is full with `symbols` symbols.
+fn flush_until_the_dictionary_is_full(
+    sender: &mut Sender,
+    prior: &Buffer,
+    large: &mut Buffer,
+    symbols: usize,
+) {
+    let (rows, len) = (large.row_count(), large.len());
+    sender.flush_and_keep(prior).unwrap();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let err = sender.flush(large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(sender, &err, symbols);
+    assert_eq!(
+        (large.row_count(), large.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+}
+
+/// With `sf_dir`: a flush in frames brings symbols to a slot that holds
+/// those of a confirmed flush before it, and stops part way because the
+/// dictionary is full. Once `close_drain` succeeded, a new sender on the
+/// slot, whose dictionary takes as many symbols, flushes the same buffer.
+/// The server holds each flush once.
+fn a_new_sender_on_the_slot_flushes_a_buffer_that_a_full_dictionary_stopped_after_close_drain(
+    progress: Progress,
+) {
+    for which in [|_| 1, |frames| frames / 2, |frames| frames - 1] {
+        let server = QwpWsModelServer::start(FRAME_LIMIT);
+        let sf_dir = tempfile::TempDir::new().unwrap();
+        let settings = slot_settings(&sf_dir);
+        let (prior, mut large, symbols) =
+            a_flush_of_symbols_and_one_that_fills_the_dictionary_after_it(which);
+        // Every sender of the test has a dictionary of this size, as every
+        // sender has the same cap.
+        let _cap = crate::ingress::TestDictCapGuard::new(symbols);
+        let mut sender = sender_with(server.port, progress, &settings);
+        flush_until_the_dictionary_is_full(&mut sender, &prior, &mut large, symbols);
+        sender.close_drain().unwrap();
+        drop(sender);
+        assert_table_holds(&server, TABLE, 1, &[&prior]);
+
+        let mut sender = sender_with(server.port, progress, &settings);
+        let flushed = sender.flush(&mut large);
+        assert!(
+            flushed.is_ok(),
+            "{:?}",
+            flushed.map_err(|err| err.msg().to_string())
+        );
+        assert!(large.is_empty());
+        sender.wait(AckLevel::Ok, WAIT).unwrap();
+        let large = buffer_of_symbols(TABLE, 10..1210);
+        assert_table_holds(&server, TABLE, 2, &[&prior, &large]);
+        assert!(!sender.must_close());
+        sender.close_drain().unwrap();
+        drop(sender);
+        server.finish();
+    }
+}
+
+/// With `sf_dir`: the same flush stops part way, and its sender is dropped
+/// without a `close_drain` that waits, as when the process dies. The next
+/// sender on the slot starts with the symbols of the slot, so its flush of
+/// the same buffer stops the same way, and commits nothing. Its
+/// `close_drain` empties the slot, and the sender after it flushes the
+/// buffer.
+fn a_full_dictionary_stops_the_flush_once_more_on_the_slot_of_a_sender_dropped_without_close_drain(
+    progress: Progress,
+) {
+    for which in [|_| 1, |frames| frames / 2, |frames| frames - 1] {
+        let server = QwpWsModelServer::start(FRAME_LIMIT);
+        let sf_dir = tempfile::TempDir::new().unwrap();
+        let settings = slot_settings(&sf_dir);
+        let dropped = format!("{settings}{NO_WAIT_AT_THE_END}");
+        let (prior, mut large, symbols) =
+            a_flush_of_symbols_and_one_that_fills_the_dictionary_after_it(which);
+        // Every sender of the test has a dictionary of this size, as every
+        // sender has the same cap.
+        let _cap = crate::ingress::TestDictCapGuard::new(symbols);
+        let mut sender = sender_with(server.port, progress, &dropped);
+        flush_until_the_dictionary_is_full(&mut sender, &prior, &mut large, symbols);
+        drop(sender);
+        assert!(segment_files(&sf_dir) > 0);
+
+        let mut sender = sender_with(server.port, progress, &settings);
+        let err = sender.flush(&mut large).unwrap_err();
+        assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+        sender.close_drain().unwrap();
+        assert_eq!(files_in_the_slot(&sf_dir), Vec::<String>::new());
+        drop(sender);
+        assert_table_holds(&server, TABLE, 1, &[&prior]);
+
+        let mut sender = sender_with(server.port, progress, &settings);
+        sender.flush(&mut large).unwrap();
+        assert!(large.is_empty());
+        sender.wait(AckLevel::Ok, WAIT).unwrap();
+        let large = buffer_of_symbols(TABLE, 10..1210);
+        assert_table_holds(&server, TABLE, 2, &[&prior, &large]);
+        sender.close_drain().unwrap();
+        drop(sender);
+        server.finish();
+    }
+}
+
 /// What a server answers a frame whose columns disagree with the table. A
 /// sender that gets it stops for good.
 const SCHEMA_MISMATCH: u8 = 0x03;
@@ -3682,6 +3816,8 @@ in_both_progress_modes! {
     a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
     a_close_drain_after_a_flush_that_failed_part_way_leaves_an_empty_slot
+    a_new_sender_on_the_slot_flushes_a_buffer_that_a_full_dictionary_stopped_after_close_drain
+    a_full_dictionary_stops_the_flush_once_more_on_the_slot_of_a_sender_dropped_without_close_drain
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
     a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
     a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good

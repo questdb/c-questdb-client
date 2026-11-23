@@ -217,7 +217,10 @@ The holder of a pooled sender calls `wait` instead and returns the sender,
 which the pool closes instead of lending it again. With `sf_dir` a
 `close_drain` that waits (a `close_flush_timeout` above 0) and succeeds leaves
 the sender's slot empty, nothing of the failed flush and no symbols, and so
-does the pool when its wait for the sender succeeds.
+does the pool when its wait for the sender succeeds. Otherwise the sender that
+opens the slot next keeps the slot's symbols, so a flush that stopped because
+the connection had no room for more symbols can stop the same way once more; a
+`close_drain` of that sender that waits and succeeds empties the slot.
 
 A frame that the server rejects takes the whole flush with it: the server
 drops the rows it holds for the connection and commits nothing of the flush.

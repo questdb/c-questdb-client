@@ -349,7 +349,10 @@ pub enum ErrorCode {
     /// `close_flush_timeout` above 0) and succeeds leaves the slot empty, and
     /// so does the pool when its wait for the sender succeeds. Otherwise the
     /// frames of the flush stay in the slot, and the sender that opens the
-    /// slot next removes them and sends nothing of the flush.
+    /// slot next removes them and sends nothing of the flush. It keeps the
+    /// symbols of the slot, so a flush that stopped because the symbol
+    /// dictionary was full can stop the same way once more; a `close_drain`
+    /// of that sender that waits and succeeds empties the slot.
     ///
     /// This holds for a flush with no more rows of one table than the
     /// server's `qwp.max.uncommitted.rows` (1,000,000 by default). Above that
