@@ -8646,13 +8646,13 @@ mod tests {
         // removal that was not stopped ends.
         let slots: &[(&[bool], usize, usize)] = &[
             // The frames, how many stay, and the least number of steps: two
-            // for each frame, one for the sync of each segment, and three
-            // for each segment that is given up.
-            (&[C, D, D], 1, 5),
-            (&[C, C, C, D, D], 3, 5),
-            (&[C, C, D, D, D], 2, 11),
-            (&[C, D, D, D, D, D, D, D], 1, 23),
-            (&[D, D, D, D], 0, 13),
+            // for each frame, two for the syncs of each segment that is cut,
+            // and three for each segment that is given up.
+            (&[C, D, D], 1, 6),
+            (&[C, C, C, D, D], 3, 6),
+            (&[C, C, D, D, D], 2, 13),
+            (&[C, D, D, D, D, D, D, D], 1, 26),
+            (&[D, D, D, D], 0, 15),
         ];
         for (frames, kept, least_steps) in slots {
             let original = write_flush_slot(frames);
@@ -8740,7 +8740,7 @@ mod tests {
             }
             step += 1;
         }
-        assert!(step >= 11, "{step} steps");
+        assert!(step >= 15, "{step} steps");
     }
 
     #[test]
@@ -9185,10 +9185,10 @@ mod tests {
         let mut slots = Vec::new();
         // The slot, the frames that stay, and the least number of steps.
         for (frames, kept, least_steps) in [
-            (&[C, C, C, D, D][..], 3, 8),
-            (&[D, D, C, D, D, D, D, D, D, D][..], 3, 26),
-            (&[D][..], 0, 5),
-            (&[D, D, D, D][..], 0, 15),
+            (&[C, C, C, D, D][..], 3, 9),
+            (&[D, D, C, D, D, D, D, D, D, D][..], 3, 29),
+            (&[D][..], 0, 6),
+            (&[D, D, D, D][..], 0, 17),
         ] {
             let kept = flush_frames(frames)[..kept].to_vec();
             slots.push((

@@ -46,6 +46,8 @@ pub(crate) const VERSION: u8 = 1;
 pub(crate) const MANIFEST_REQUIRED_FLAG: u8 = 1;
 pub(crate) const HEADER_SIZE: usize = 24;
 pub(crate) const FRAME_HEADER_SIZE: usize = 8;
+/// The checksum that a frame header begins with, in front of the length.
+const FRAME_CHECKSUM_SIZE: usize = 4;
 pub(crate) const INITIAL_SEGMENT_FILE_NAME: &str = "sf-initial.sfa";
 
 // The header of a QWP message, as far as a segment reads its frames' payloads:
@@ -125,6 +127,45 @@ pub(crate) fn removal_step_for_test() -> io::Result<()> {
         }
         None => Ok(()),
     })
+}
+
+/// What recovery does to the bytes of a segment, as a test that models a
+/// power loss replays it: see [`record_disk_events_for_test`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiskEvent {
+    /// The bytes from `offset` on, `len` of them, were zeroed in memory.
+    Zeroed { offset: usize, len: usize },
+    /// Every byte written before is on disk.
+    Synced,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DISK_EVENTS: std::cell::RefCell<Option<Vec<DiskEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Starts recording, on this thread, the zeroing and the syncs of the torn
+/// tail cleanup and of the removal of frames.
+#[cfg(test)]
+pub(crate) fn record_disk_events_for_test() {
+    DISK_EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops the recording of [`record_disk_events_for_test`], and returns it.
+#[cfg(test)]
+pub(crate) fn take_disk_events_for_test() -> Vec<DiskEvent> {
+    DISK_EVENTS.with(|events| events.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
+fn record_disk_event(event: DiskEvent) {
+    DISK_EVENTS.with(|events| {
+        if let Some(events) = events.borrow_mut().as_mut() {
+            events.push(event);
+        }
+    });
 }
 
 // Keep the payloads in these errors: recovery reports them through Debug today,
@@ -576,12 +617,31 @@ impl SfaSegment {
                 size: self.size_bytes,
             }
         })?;
-        self.mapping.zero_range(offset, len);
+        // What stands behind the header of the torn frame goes first, and
+        // that header once the rest is on disk. A power loss may write the
+        // pages of the tail in any order: a zeroed header with whole frames
+        // behind it would be the clean end of the segment, and a later frame
+        // that ends where one of them begins would make the next scan run on
+        // into them. While the header stands, the tail stays torn, and the
+        // next open cleans it again.
+        let header_len = FRAME_HEADER_SIZE.min(len);
+        self.mapping
+            .zero_range(offset + header_len, len - header_len);
+        self.sync_range(offset, len)?;
+        self.mapping.zero_range(offset, header_len);
+        self.sync_range(offset, len)?;
+        self.torn_tail_bytes = 0;
+        Ok(())
+    }
+
+    /// Writes the bytes from `offset` on, `len` of them, to disk.
+    fn sync_range(&self, offset: usize, len: usize) -> Result<(), SfaSegmentError> {
         self.mapping.flush_range(offset, len)?;
         if let Some(file) = self.file.as_ref() {
             file.sync_data()?;
         }
-        self.torn_tail_bytes = 0;
+        #[cfg(test)]
+        record_disk_event(DiskEvent::Synced);
         Ok(())
     }
 
@@ -589,15 +649,25 @@ impl SfaSegment {
     /// segment. For recovery, which owns the segment alone: see
     /// `remove_unfinished_flush` in `qwp_ws_sfa_queue`.
     ///
-    /// The frames go from the end backwards, and of each one the payload
-    /// before its header. A process that dies on the way leaves the frames
-    /// it had not reached whole and at most one frame behind them whose
-    /// header stands and whose checksum fails, which the next open cleans up
-    /// as a torn tail ([`Self::sanitize_torn_tail`]). The other order would
-    /// leave whole frames behind a zeroed header: a frame has no number of
-    /// its own, the scan takes zeroes for the clean end of the segment, and
-    /// a later frame of the same length as the one that stood there would
-    /// make the next scan run on into them.
+    /// No frame may stay whole behind a zeroed header, on disk or in memory:
+    /// a frame has no number of its own, the scan takes zeroes for the clean
+    /// end of the segment, and a later frame of the same length as the one
+    /// that stood there would make the next scan run on into it. So the
+    /// removal goes in two steps, each synced:
+    ///
+    /// 1. the checksum of every frame to remove, the last frame's first. A
+    ///    frame with a zeroed checksum is never whole again;
+    /// 2. the rest of those frames, the last frame's first.
+    ///
+    /// A process that dies on the way leaves the frames it had not reached
+    /// whole and, behind them, a frame whose header stands and whose
+    /// checksum fails, which the next open cleans up as a torn tail
+    /// ([`Self::sanitize_torn_tail`]). A power loss may write the pages of
+    /// a step in any order: in the first, the frames behind the first one
+    /// with a zeroed checksum are a torn tail too; in the second, no frame
+    /// to remove is whole on disk any more. Zeroing frame by frame with one
+    /// sync at the end could put the zeroed header of the first frame on
+    /// disk ahead of the frames behind it.
     pub(crate) fn cut_back_to(&mut self, keep_frames: u64) -> Result<(), SfaSegmentError> {
         if keep_frames >= self.frame_count {
             return Ok(());
@@ -617,34 +687,42 @@ impl SfaSegment {
         bounds.push(pos);
         let to_usize =
             |offset: u64| usize::try_from(offset).map_err(|_| SfaSegmentError::OffsetOverflow);
-        for frame in bounds.windows(2).rev() {
-            let (start, end) = (to_usize(frame[0])?, to_usize(frame[1])?);
-            let payload_start = start + FRAME_HEADER_SIZE;
-            #[cfg(test)]
-            removal_step_for_test()?;
-            self.mapping.zero_range(payload_start, end - payload_start);
-            #[cfg(test)]
-            removal_step_for_test()?;
-            self.mapping.zero_range(start, FRAME_HEADER_SIZE);
-        }
         let (cut, end) = (to_usize(bounds[0])?, to_usize(pos)?);
+        for frame in bounds.windows(2).rev() {
+            #[cfg(test)]
+            removal_step_for_test()?;
+            self.mapping
+                .zero_range(to_usize(frame[0])?, FRAME_CHECKSUM_SIZE);
+        }
+        self.sync_cut(cut, end)?;
+        for frame in bounds.windows(2).rev() {
+            let (start, frame_end) = (
+                to_usize(frame[0])? + FRAME_CHECKSUM_SIZE,
+                to_usize(frame[1])?,
+            );
+            #[cfg(test)]
+            removal_step_for_test()?;
+            self.mapping.zero_range(start, frame_end - start);
+        }
+        self.sync_cut(cut, end)?;
+        self.append_offset = bounds[0];
+        self.frame_count = keep_frames;
+        self.committed_frame_count = self.committed_frame_count.min(keep_frames);
+        self.torn_tail_bytes = 0;
+        Ok(())
+    }
+
+    /// One sync of [`Self::cut_back_to`], of the frames from `cut` to `end`.
+    fn sync_cut(&self, cut: usize, end: usize) -> Result<(), SfaSegmentError> {
         #[cfg(test)]
         removal_step_for_test()?;
-        self.mapping.flush_range(cut, end - cut)?;
         #[cfg(test)]
         if should_fail_sync_for_test() {
             return Err(SfaSegmentError::Io(io::Error::other(
                 "injected sync failure of a cut segment",
             )));
         }
-        if let Some(file) = self.file.as_ref() {
-            file.sync_data()?;
-        }
-        self.append_offset = bounds[0];
-        self.frame_count = keep_frames;
-        self.committed_frame_count = self.committed_frame_count.min(keep_frames);
-        self.torn_tail_bytes = 0;
-        Ok(())
+        self.sync_range(cut, end - cut)
     }
 
     /// `start` is a known `(fsn, offset)` frame boundary in this segment to scan from.
@@ -818,6 +896,8 @@ impl SfaSegmentMapping {
         unsafe {
             ptr::write_bytes(self.base.add(offset), 0, len);
         }
+        #[cfg(test)]
+        record_disk_event(DiskEvent::Zeroed { offset, len });
     }
 
     fn redirty_pages(&self, offset: usize, end: usize, page_size: usize) {
@@ -1891,6 +1971,189 @@ mod tests {
             "java-two-frame-torn-tail.sfa.hex:\n{}",
             format_hex_fixture(&bytes)
         );
+    }
+
+    // ---- What a power loss leaves of the removal of frames and of the torn tail cleanup ----
+
+    /// What a disk writes whole, as the model of a power loss takes it.
+    const PAGE: usize = 4096;
+
+    /// The payload lengths of the frames of [`segment_across_pages`]: the
+    /// first stays, and the others span three pages of [`PAGE`] bytes.
+    const ACROSS_PAGES: [usize; 5] = [4000, 4100, 100, 3000, 100];
+
+    /// A segment of four pages with the frames of [`ACROSS_PAGES`], each
+    /// payload filled with its own byte. Returns its path and where each
+    /// frame begins.
+    fn segment_across_pages(dir: &TempDir) -> (PathBuf, Vec<usize>) {
+        let path = dir.path().join("across-pages.sfa");
+        let mut segment = SfaSegment::create(&path, 0, 4 * PAGE as u64, 0).unwrap();
+        let offsets = ACROSS_PAGES
+            .iter()
+            .enumerate()
+            .map(|(tag, len)| {
+                let payload = vec![0xA0 + tag as u8; *len];
+                segment.try_append(&payload).unwrap().unwrap() as usize
+            })
+            .collect();
+        segment.sync_header().unwrap();
+        (path, offsets)
+    }
+
+    /// Whether `image` holds a whole frame at `offset`: one whose checksum
+    /// matches its length and payload.
+    fn is_whole_frame(image: &[u8], offset: usize) -> bool {
+        let Some(header) = image.get(offset..offset + FRAME_HEADER_SIZE) else {
+            return false;
+        };
+        let Ok(len) = usize::try_from(read_i32(header, 4)) else {
+            return false;
+        };
+        let Some(payload) = image.get(offset + FRAME_HEADER_SIZE..offset + FRAME_HEADER_SIZE + len)
+        else {
+            return false;
+        };
+        crc32c_update(crc32c_update(0, &header[4..8]), payload) == read_u32(header, 0)
+    }
+
+    /// Calls `check` with every image of a segment that a power loss can
+    /// leave at any point of `events`, for a segment that held `before` when
+    /// they began, and with the number of the events before the loss. What
+    /// the last sync wrote stays. Each page written since is on disk as it
+    /// was at that sync, or as any write since left it, whatever the others
+    /// are.
+    fn each_image_a_power_loss_leaves(
+        before: &[u8],
+        events: &[DiskEvent],
+        mut check: impl FnMut(&[u8], usize),
+    ) {
+        let mut durable = before.to_vec();
+        let mut memory = before.to_vec();
+        // The pages written since the last sync, with what each write left.
+        let mut written: std::collections::BTreeMap<usize, Vec<Vec<u8>>> = Default::default();
+        for lost_at in 0..=events.len() {
+            let pages: Vec<(&usize, &Vec<Vec<u8>>)> = written.iter().collect();
+            // One choice of each page: 0 for the page at the last sync, `n`
+            // for the page as write `n` since left it.
+            let mut choice = vec![0usize; pages.len()];
+            loop {
+                let mut image = durable.clone();
+                for ((page, versions), chosen) in pages.iter().zip(&choice) {
+                    if *chosen > 0 {
+                        let start = **page * PAGE;
+                        image[start..start + versions[chosen - 1].len()]
+                            .copy_from_slice(&versions[chosen - 1]);
+                    }
+                }
+                check(&image, lost_at);
+                let Some(next) = (0..pages.len()).find(|&i| choice[i] < pages[i].1.len()) else {
+                    break;
+                };
+                choice[next] += 1;
+                choice[..next].fill(0);
+            }
+            match events.get(lost_at) {
+                Some(DiskEvent::Zeroed { offset, len }) if *len > 0 => {
+                    memory[*offset..*offset + *len].fill(0);
+                    for page in *offset / PAGE..=(*offset + *len - 1) / PAGE {
+                        let range = page * PAGE..((page + 1) * PAGE).min(memory.len());
+                        written
+                            .entry(page)
+                            .or_default()
+                            .push(memory[range].to_vec());
+                    }
+                }
+                Some(DiskEvent::Zeroed { .. }) => {}
+                Some(DiskEvent::Synced) => {
+                    durable.clone_from(&memory);
+                    written.clear();
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Panics when the open of `image` would take a frame of `removed` for
+    /// the clean end, or for a frame, and keep a whole frame of them behind
+    /// it. A torn tail there is cleaned up by the open
+    /// ([`SfaSegment::sanitize_torn_tail`]), whose own power loss
+    /// [`a_power_loss_while_a_torn_tail_is_cleaned_up_leaves_no_whole_frame_behind_its_end`]
+    /// covers.
+    fn assert_no_whole_frame_behind_the_end(image: &[u8], removed: &[usize], case: &str) {
+        let scan = scan_segment_metadata_bytes(image).unwrap();
+        assert!(
+            scan.frame_count >= 1,
+            "{case}: the frame that stays is gone"
+        );
+        if scan.torn_tail_bytes > 0 {
+            return;
+        }
+        for offset in removed {
+            assert!(
+                (*offset as u64) < scan.append_offset || !is_whole_frame(image, *offset),
+                "{case}: a whole frame at {offset} behind the end of the segment at {}",
+                scan.append_offset
+            );
+        }
+    }
+
+    #[test]
+    fn a_power_loss_during_the_removal_of_frames_leaves_no_whole_frame_behind_its_end() {
+        let dir = TempDir::new().unwrap();
+        let (path, offsets) = segment_across_pages(&dir);
+        let before = fs::read(&path).unwrap();
+        let mut segment = SfaSegment::open_existing(&path).unwrap();
+        record_disk_events_for_test();
+        segment.cut_back_to(1).unwrap();
+        let events = take_disk_events_for_test();
+        drop(segment);
+        assert!(
+            events
+                .iter()
+                .filter(|event| **event == DiskEvent::Synced)
+                .count()
+                >= 2,
+            "{events:?}"
+        );
+        let after = fs::read(&path).unwrap();
+        assert_eq!(after[..offsets[1]], before[..offsets[1]]);
+        assert!(after[offsets[1]..].iter().all(|byte| *byte == 0));
+
+        each_image_a_power_loss_leaves(&before, &events, |image, lost_at| {
+            assert_no_whole_frame_behind_the_end(
+                image,
+                &offsets[1..],
+                &format!("a power loss after {lost_at} of {events:?}"),
+            );
+        });
+    }
+
+    #[test]
+    fn a_power_loss_while_a_torn_tail_is_cleaned_up_leaves_no_whole_frame_behind_its_end() {
+        // The second frame is torn, and the frames behind it are whole: what
+        // a power loss can leave of frames that were not synced.
+        let dir = TempDir::new().unwrap();
+        let (path, offsets) = segment_across_pages(&dir);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[offsets[1] + FRAME_HEADER_SIZE + 10] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        let mut segment = SfaSegment::open_existing(&path).unwrap();
+        assert_eq!(segment.frame_count(), 1);
+        assert!(segment.torn_tail_bytes() > 0);
+        record_disk_events_for_test();
+        segment.sanitize_torn_tail().unwrap();
+        let events = take_disk_events_for_test();
+        drop(segment);
+        let after = fs::read(&path).unwrap();
+        assert!(after[offsets[1]..].iter().all(|byte| *byte == 0));
+
+        each_image_a_power_loss_leaves(&bytes, &events, |image, lost_at| {
+            assert_no_whole_frame_behind_the_end(
+                image,
+                &offsets[1..],
+                &format!("a power loss after {lost_at} of {events:?}"),
+            );
+        });
     }
 
     fn payloads(scan: &SfaSegmentScan) -> Vec<Vec<u8>> {
