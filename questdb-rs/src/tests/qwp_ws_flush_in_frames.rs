@@ -61,9 +61,10 @@
 //! buffer is published, and it keeps its rows.
 //! A flush in frames that stops after its first frame was published fails
 //! with `ErrorCode::FlushAborted`. Nothing of it is committed and the buffer
-//! keeps its rows. The sender takes no more flushes, each of which gets the
-//! same error, and goes on delivering the flushes before the failed one:
-//! `wait` and `close_drain` return once those are confirmed.
+//! keeps its rows. The sender queues nothing more: each later flush that
+//! gets as far as the queue fails with the same error. It goes on delivering
+//! the flushes before the failed one: `wait` and `close_drain` return once
+//! those are confirmed.
 //! A frame of a flush that the server rejects leaves nothing of the flush
 //! committed. A rejection for good stops the sender, which reports it at
 //! `wait` and at `close_drain`. After any other the sender connects again

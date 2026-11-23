@@ -501,12 +501,19 @@ pub enum line_sender_error_code {
     /// part stays, and flushing the buffer again stores it twice unless the
     /// table has `DEDUP` keys.
     ///
-    /// The sender takes no more flushes: each one fails with this code, and
-    /// `line_sender_must_close` returns true. It still delivers the flushes
-    /// before the failed one. To lose none of them, call
-    /// `line_sender_qwpws_close_drain` and check that it succeeded: it waits
-    /// for the flushes before the failed one only. Then `line_sender_close`,
-    /// create a new sender and flush the buffer again.
+    /// The sender queues nothing more, and `line_sender_must_close` returns
+    /// true. A later flush fails with this code, unless its buffer is
+    /// refused first for a reason of its own, which keeps its code: for
+    /// example `line_sender_error_symbol_dict_full`, for a symbol that the
+    /// full dictionary cannot take. A flush of an empty buffer queues
+    /// nothing and succeeds. The sender still delivers the flushes before
+    /// the failed one. To lose none of them, call
+    /// `line_sender_qwpws_close_drain` with a `close_flush_timeout_millis`
+    /// above 0, the default, and check that it succeeded: it waits for the
+    /// flushes before the failed one only. With 0 or less it does not wait,
+    /// and without `sf_dir` the flushes that the server has not confirmed
+    /// go with the sender. Then `line_sender_close`, create a new sender and
+    /// flush the buffer again.
     ///
     /// A sender borrowed from a pool (`questdb_db_borrow_sender`) is not
     /// closed by its holder. To lose none of the flushes before the failed

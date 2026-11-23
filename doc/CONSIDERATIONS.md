@@ -216,7 +216,8 @@ example because the connection has no room for more symbols, fails with
 of the flush is committed (below the server's row limit, see above), the
 buffer keeps its rows, and the error is not in doubt. The sender takes no more
 flushes and reports `must_close`, but it still delivers the flushes before the
-failed one. To lose none of them, call `close_drain` and check that it
+failed one. To lose none of them, call `close_drain` with a
+`close_flush_timeout` above 0 (the default is 5 seconds) and check that it
 succeeded; then close the sender, create a new one and flush the buffer again.
 The holder of a pooled sender calls `wait` instead and returns the sender,
 which the pool closes instead of lending it again. With `sf_dir` a

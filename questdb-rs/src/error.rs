@@ -360,13 +360,21 @@ pub enum ErrorCode {
     /// stays, and flushing the buffer again stores it twice unless the table
     /// has `DEDUP` keys.
     ///
-    /// The sender takes no more flushes: each one fails with this error, and
-    /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. It
-    /// still delivers the flushes before the failed one. To lose none of
-    /// them, call [`close_drain`](crate::ingress::Sender::close_drain) and
-    /// check that it succeeded: it waits for the flushes before the failed
-    /// one only, as [`wait`](crate::ingress::Sender::wait) does. Then drop
-    /// the sender, create a new one and flush the buffer again.
+    /// The sender queues nothing more, and
+    /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. A
+    /// later flush fails with this error, unless its buffer is refused first
+    /// for a reason of its own, which keeps its code: for example
+    /// [`SymbolDictFull`](Self::SymbolDictFull), for a symbol that the full
+    /// dictionary cannot take. A flush of an empty buffer queues nothing and
+    /// returns `Ok`. The sender still delivers the flushes before the failed
+    /// one. To lose none of them, call
+    /// [`close_drain`](crate::ingress::Sender::close_drain) with a
+    /// `close_flush_timeout` above 0, the default, and check that it
+    /// succeeded: it waits for the flushes before the failed one only, as
+    /// [`wait`](crate::ingress::Sender::wait) does. With 0 or less it does
+    /// not wait, and without `sf_dir` the flushes that the server has not
+    /// confirmed go with the sender. Then drop the sender, create a new one
+    /// and flush the buffer again.
     ///
     /// A sender borrowed from the pool of a `QuestDb` is not closed by its
     /// holder. To lose none of the flushes before the failed one, call its
