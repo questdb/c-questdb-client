@@ -385,6 +385,36 @@ fn a_pooled_sender_refuses_a_buffer_above_max_buf_size_for_its_size() {
     server.finish();
 }
 
+/// A symbol cell takes three bytes of the size of a buffer and one of its
+/// frame: a buffer of symbols above `max_buf_size` can still fit one frame,
+/// and goes out as one frame.
+#[test]
+fn a_pooled_sender_sends_a_buffer_of_symbols_above_max_buf_size_as_one_frame_when_it_fits() {
+    const MAX_BUF_SIZE: usize = 1024 * 1024;
+    let server = QwpWsModelServer::start(2 * MAX_BUF_SIZE);
+    let db = pool_with(server.port, "max_buf_size=1048576;");
+    let mut sender = db.borrow_sender().unwrap();
+    assert_eq!(sender.effective_frame_cap_for_test(), (MAX_BUF_SIZE, true));
+    let mut buffer = Buffer::new_qwp_ws();
+    for _ in 0..400_000 {
+        buffer.table(TABLE).unwrap().symbol("s", "a").unwrap();
+        buffer.at_now().unwrap();
+    }
+    let frame = frame_of_a_sender(&buffer, false, &mut SymbolGlobalDict::new());
+    assert!(buffer.len() > MAX_BUF_SIZE && frame.len() <= MAX_BUF_SIZE);
+
+    assert_eq!(
+        sender.flush_buffer_and_keep_and_get_fsn(&buffer).unwrap(),
+        Some(0)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), 1);
+    assert_table_holds(&server, TABLE, 1, &[&buffer]);
+    drop(sender);
+    db.close();
+    server.finish();
+}
+
 #[test]
 fn a_pooled_sender_names_the_row_that_fits_no_frame() {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
@@ -1290,6 +1320,7 @@ on_disk! {
     the_frames_of_a_pooled_flush_bring_the_symbols_that_the_connection_does_not_know
     a_pooled_flush_in_frames_shares_its_symbols_with_the_flushes_of_columns
     a_pooled_sender_refuses_a_buffer_above_max_buf_size_for_its_size
+    a_pooled_sender_sends_a_buffer_of_symbols_above_max_buf_size_as_one_frame_when_it_fits
     a_pooled_sender_names_the_row_that_fits_no_frame
     a_pooled_flush_that_the_queue_can_never_hold_is_refused_and_one_without_room_waits
     a_pooled_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent

@@ -137,8 +137,9 @@ This is about row buffers. A chunk of the column sender that is too large for
 one frame is split as well, and with `sf_dir` each of its frames still commits
 by itself.
 
-A buffer above the cap is refused with `batch_too_large`, nothing of it is
-sent and it keeps its rows, when:
+A buffer whose frame fits the cap is never refused for its size. One that does
+not is refused with `batch_too_large`, nothing of it is sent and it keeps its
+rows, when:
 
 - the server did not advertise a frame limit, because it is too old to commit
   several frames together, or the sender has not connected yet;
@@ -150,6 +151,13 @@ sent and it keeps its rows, when:
 - the queue (`sf_max_total_bytes`, by default 128 MiB in memory and 10 GiB
   with `sf_dir`) can never hold the frames of the flush together. The error
   names the value that would.
+
+The last two go by the buffer's `len()` and the frame sizes planned from it,
+which count more than the frames take for symbols: each symbol value at the
+widest symbol id, and the text of every symbol, also of one that the
+connection already knows. So a buffer that needs several frames is held
+against `max_buf_size` by its `len()`, and against `sf_max_total_bytes` by
+those planned sizes.
 
 Before its first frame, a flush in several frames waits until the queue has
 room for all of them, for up to `sf_append_deadline_millis`. When the room

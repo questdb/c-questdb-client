@@ -225,19 +225,20 @@ typedef enum line_sender_error_code
      *  `line_sender_qwpws_effective_frame_cap`). Chunk publication splits
      *  oversize inputs into smaller frames automatically, so there this only
      *  surfaces for an irreducible unit (the table schema plus a single row
-     *  block). A sender on a connection that advertised
-     *  `X-QWP-Max-Batch-Size` also sends a row buffer above the cap in several
-     *  frames, in either progress mode, with its queue in memory and with
-     *  `sf_dir`. It fails a flush with this code, and publishes nothing, when
-     *  the buffer is larger than `max_buf_size`, when one of its rows fits no
-     *  frame, and when the queue (`sf_max_total_bytes`) can never hold the
-     *  frames of the flush together. A sender whose server advertised no cap,
-     *  and one that could not write the symbol file of its `sf_dir` slot,
-     *  publishes a row buffer as one frame and never splits it, so flushing
-     *  one whose encoded frame exceeds the cap fails with this code and
-     *  publishes nothing. Distinct from
-     *  `line_sender_error_invalid_api_call` so callers can recognise it without
-     *  matching on the error message text. */
+     *  block). A sender on a connection that advertised `X-QWP-Max-Batch-Size`
+     *  also sends a row buffer above the cap in several frames, in either
+     *  progress mode, with its queue in memory and with `sf_dir`. A buffer
+     *  that fits one frame is never refused for its size. One that does not
+     *  fails the flush with this code, and publishes nothing, when the buffer
+     *  is larger than `max_buf_size` by `line_sender_buffer_size()`, when one
+     *  of its rows fits no frame, and when the queue (`sf_max_total_bytes`)
+     *  can never hold the frames of the flush together. A sender whose server
+     *  advertised no cap, and one that could not write the symbol file of its
+     *  `sf_dir` slot, publishes a row buffer as one frame and never splits it,
+     *  so flushing one whose encoded frame exceeds the cap fails with this
+     *  code and publishes nothing. Distinct from
+     *  `line_sender_error_invalid_api_call` so callers can recognise it
+     *  without matching on the error message text. */
     line_sender_error_batch_too_large = 35,
 
     /** The QWP/WebSocket store-and-forward persisted symbol dictionary is
@@ -1929,10 +1930,13 @@ bool line_sender_opts_tls_roots_password(
  * Set the maximum buffered size that the client will flush to the server.
  * The default is 100 MiB.
  *
- * For ILP this applies to the exact pending byte length.
- * For QWP/UDP this applies to the buffer size hint returned by
- * `line_sender_buffer_size()`. For QWP/WebSocket it caps the exact encoded
- * replay frame.
+ * For ILP this applies to the exact pending byte length. For QWP/UDP this
+ * applies to the buffer size hint returned by `line_sender_buffer_size()`. For
+ * QWP/WebSocket it caps the exact encoded replay frame: a buffer whose frame
+ * fits is never refused for its size. A buffer that needs several frames,
+ * which a sender whose server advertised its frame limit sends, is held
+ * against it by `line_sender_buffer_size()`, which counts more than the frames
+ * take for symbols.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_max_buf_size(

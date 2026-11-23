@@ -233,18 +233,19 @@ pub enum ErrorCode {
     /// only surfaces for an irreducible unit (the table schema plus a single
     /// row block). A sender on a connection that advertised
     /// `X-QWP-Max-Batch-Size` also sends a row
-    /// [`Buffer`](crate::ingress::Buffer) above the cap in several frames,
-    /// in either progress mode, with its queue in memory and with `sf_dir`.
-    /// It fails a flush with this code, and publishes nothing, when the
-    /// buffer is larger than `max_buf_size`, when one of its rows fits no
-    /// frame, and when the queue (`sf_max_total_bytes`) can never hold the
-    /// frames of the flush together. A sender whose server advertised no
-    /// cap, and one that could not write the symbol file of its `sf_dir`
-    /// slot, publishes a row buffer as one frame and never splits it, so
-    /// flushing one whose encoded frame exceeds the cap fails with this code
-    /// and publishes nothing. Distinct from
-    /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
-    /// without matching on the error message text.
+    /// [`Buffer`](crate::ingress::Buffer) above the cap in several frames, in
+    /// either progress mode, with its queue in memory and with `sf_dir`. A
+    /// buffer that fits one frame is never refused for its size. One that does
+    /// not fails the flush with this code, and publishes nothing, when the
+    /// buffer is larger than `max_buf_size` by
+    /// [`Buffer::len`](crate::ingress::Buffer::len), when one of its rows fits
+    /// no frame, and when the queue (`sf_max_total_bytes`) can never hold the
+    /// frames of the flush together. A sender whose server advertised no cap,
+    /// and one that could not write the symbol file of its `sf_dir` slot,
+    /// publishes a row buffer as one frame and never splits it, so flushing one
+    /// whose encoded frame exceeds the cap fails with this code and publishes
+    /// nothing. Distinct from [`InvalidApiCall`](Self::InvalidApiCall) so
+    /// callers can recognise it without matching on the error message text.
     BatchTooLarge,
 
     /// The QWP/WebSocket store-and-forward persisted symbol dictionary is

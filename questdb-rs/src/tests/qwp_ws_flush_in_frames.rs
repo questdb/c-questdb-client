@@ -46,7 +46,9 @@
 //! Such a sender refuses a buffer above `max_buf_size` with an error that
 //! names `max_buf_size` and the size of the buffer, and a buffer whose frames
 //! the queue can never hold together with one that names
-//! `sf_max_total_bytes` and the value that would do.
+//! `sf_max_total_bytes` and the value that would do. Both go by size bounds
+//! that take more than the frame for symbols: such a buffer is sent as one
+//! frame when that frame fits, and refused only when it does not.
 //! Any other flush goes out as one frame, as before: a buffer that is too
 //! large for one frame is refused. When a row that fits no frame is why the
 //! buffer was not cut into several, the refusal names the table of the row,
@@ -1743,26 +1745,39 @@ fn a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refus
     server.finish();
 }
 
-fn a_buffer_above_max_buf_size_is_refused_for_its_size_whatever_else_it_holds(progress: Progress) {
+fn a_buffer_above_max_buf_size_is_refused_for_its_size_or_for_a_value_that_cannot_be_sent(
+    progress: Progress,
+) {
     const MAX_BUF_SIZE: usize = 8192;
+    const TWO_DIGITS: &str = "cannot rescale decimal from scale 2 to 1 without precision loss";
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let mut sender = sender_with(server.port, progress, "max_buf_size=8192;");
 
-    // Each buffer has one more thing in the way of its flush: a decimal that
-    // the encoder refuses, and a row that fits no frame.
+    // A buffer above `max_buf_size` goes the way of one frame, whose encoder
+    // names a decimal that it refuses.
     let mut with_a_value = buffer_of_decimals(0..2000, Some(1500));
+    assert!(with_a_value.len() > MAX_BUF_SIZE);
+    let (rows, len) = (with_a_value.row_count(), with_a_value.len());
+    let err = sender.flush(&mut with_a_value).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{}", err.msg());
+    assert_eq!(err.msg(), TWO_DIGITS);
+    assert_eq!(sender.published_fsn().unwrap(), None);
+    assert_eq!((with_a_value.row_count(), with_a_value.len()), (rows, len));
+
+    // The buffer with a row that fits no frame is too large for one frame:
+    // it is refused for its size.
     let mut with_a_row = buffer_of(TABLE, 0..2000);
     add_row(&mut with_a_row, 2000, &"x".repeat(FRAME_LIMIT));
-    for buffer in [&mut with_a_value, &mut with_a_row] {
-        assert!(buffer.len() > MAX_BUF_SIZE);
-        assert_refused_for_max_buf_size(&mut sender, buffer, MAX_BUF_SIZE);
-    }
+    assert!(with_a_row.len() > MAX_BUF_SIZE);
+    assert_refused_for_max_buf_size(&mut sender, &mut with_a_row, MAX_BUF_SIZE);
     assert!(server.model.table(TABLE).is_none());
     drop(sender);
     server.finish();
 }
 
-fn a_max_buf_size_below_the_frame_limit_is_held_against_the_size_of_the_buffer(progress: Progress) {
+fn a_max_buf_size_below_the_frame_limit_is_held_against_the_frame_of_the_buffer(
+    progress: Progress,
+) {
     const MAX_BUF_SIZE: usize = 2000;
     let server = QwpWsModelServer::start(LIMIT_ABOVE_TARGET);
     let mut sender = sender_with(server.port, progress, "max_buf_size=2000;");
@@ -1770,21 +1785,268 @@ fn a_max_buf_size_below_the_frame_limit_is_held_against_the_size_of_the_buffer(p
     assert_eq!(sender.effective_frame_cap().unwrap(), (MAX_BUF_SIZE, true));
     let at_max = buffer_of_len(0, MAX_BUF_SIZE);
     // The frame of this buffer takes two bytes less than the size that the
-    // buffer gives, which is within the frame cap: what is above
-    // `max_buf_size` is the buffer.
-    let mut above_max = buffer_of_len(1000, MAX_BUF_SIZE + 1);
+    // buffer gives, which is within the frame cap: the buffer is above
+    // `max_buf_size`, and goes out as one frame all the same.
+    let above_max = buffer_of_len(1000, MAX_BUF_SIZE + 1);
     assert_eq!(
         frame_of_a_whole_buffer(&above_max, false).len(),
         MAX_BUF_SIZE - 1
     );
+    // Rows with symbols, whose frame is above `max_buf_size`.
+    let mut too_large = buffer_of_symbols(FIRST, 0..200);
+    assert!(
+        frame_of_a_sender(&too_large, false, &mut SymbolGlobalDict::new()).len() > MAX_BUF_SIZE
+    );
 
     assert_eq!(sender.flush_and_keep_and_get_fsn(&at_max).unwrap(), Some(0));
-    assert_refused_for_max_buf_size(&mut sender, &mut above_max, MAX_BUF_SIZE);
+    assert_sent_as_one_frame(&server, &mut sender, &above_max, TABLE);
+    assert_refused_for_max_buf_size(&mut sender, &mut too_large, MAX_BUF_SIZE);
 
-    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    // The sender goes on. The symbols of the refused buffer are not taken
+    // as sent: the frame of a later buffer brings those it uses.
+    let after = buffer_of_symbols(FIRST, 0..10);
+    assert_sent_as_one_frame(&server, &mut sender, &after, FIRST);
     let table = server.model.table(TABLE).unwrap();
-    assert_eq!((table.commits, table.blocks.len()), (1, 1));
-    assert_eq!(table.rows_as_text(), rows_of(TABLE, &at_max));
+    assert_eq!((table.commits, table.blocks.len()), (2, 2));
+    assert_eq!(table.rows_as_text(), rows_of_all(&[&at_max, &above_max]));
+    assert_table_holds(&server, FIRST, 1, &[&after]);
+    drop(sender);
+    server.finish();
+}
+
+/// The frame limit that a QuestDB server tells by default.
+const SERVER_DEFAULT_FRAME_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Flushes `buffer`, of one `table`, whose size bound holds it back from
+/// frames while its frame fits the frame cap: it goes out as one frame,
+/// which the server commits once.
+fn assert_sent_as_one_frame(
+    server: &QwpWsModelServer,
+    sender: &mut Sender,
+    buffer: &Buffer,
+    table: &str,
+) {
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let frames = server.frames_taken();
+    let commits = server.model.table(table).map_or(0, |held| held.commits);
+    let fsn = sender.published_fsn().unwrap().map_or(0, |fsn| fsn + 1);
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(buffer).unwrap(),
+        Some(fsn)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), frames + 1, "one frame");
+    let held = server.model.table(table).unwrap();
+    assert_eq!(held.commits, commits + 1);
+    let rows: Vec<String> = held
+        .blocks
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
+    assert_eq!(rows, rows_of(table, buffer));
+}
+
+/// Rows of one symbol column whose symbols are all `a`, at the time of the
+/// flush. A cell takes three bytes of the size of the buffer and one of its
+/// frame.
+fn buffer_of_one_symbol(table: &str, rows: usize) -> Buffer {
+    let mut buffer = Buffer::new_qwp_ws();
+    for _ in 0..rows {
+        buffer.table(table).unwrap().symbol("s", "a").unwrap();
+        buffer.at_now().unwrap();
+    }
+    buffer
+}
+
+/// Rows of trades, as many as make the buffer just larger than `len`: a
+/// timestamp, a symbol of eight values and two doubles.
+fn buffer_of_trades_above(table: &str, len: usize) -> Buffer {
+    let mut buffer = Buffer::new_qwp_ws();
+    let mut row = 0;
+    while buffer.len() <= len {
+        buffer
+            .table(table)
+            .unwrap()
+            .symbol("sym", format!("s{}", row % 8))
+            .unwrap()
+            .column_f64("price", 100.0 + row as f64)
+            .unwrap()
+            .column_f64("qty", 1.5 * row as f64)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + row))
+            .unwrap();
+        row += 1;
+    }
+    buffer
+}
+
+/// Rows of `columns` symbol columns, each holding `a`, at the time of the
+/// flush.
+fn buffer_of_symbol_columns(table: &str, rows: usize, columns: usize) -> Buffer {
+    let mut buffer = Buffer::new_qwp_ws();
+    for _ in 0..rows {
+        buffer.table(table).unwrap();
+        for column in 0..columns {
+            buffer.symbol(format!("s{column}").as_str(), "a").unwrap();
+        }
+        buffer.at_now().unwrap();
+    }
+    buffer
+}
+
+/// The size of a buffer takes more for a symbol than its frame does: two
+/// bytes more for each symbol cell. With `max_buf_size` at or below the
+/// server's frame limit, which makes it the frame cap, a buffer of symbols
+/// above `max_buf_size` can still fit one frame. It goes out as one frame.
+fn a_buffer_of_symbols_above_max_buf_size_whose_frame_fits_is_one_frame(progress: Progress) {
+    const MAX_BUF_SIZE: usize = 1024 * 1024;
+    let server = QwpWsModelServer::start(SERVER_DEFAULT_FRAME_LIMIT);
+    let mut sender = sender_with(server.port, progress, "max_buf_size=1048576;");
+    assert_eq!(sender.effective_frame_cap().unwrap(), (MAX_BUF_SIZE, true));
+    let fits_one_frame = |buffer: &Buffer, max_buf_size: usize| {
+        let frame = frame_of_a_sender(buffer, false, &mut SymbolGlobalDict::new());
+        assert!(buffer.len() > max_buf_size && frame.len() <= max_buf_size);
+    };
+
+    // A symbol column with one value.
+    let one_symbol = buffer_of_one_symbol("one_symbol_rows", 400_000);
+    fits_one_frame(&one_symbol, MAX_BUF_SIZE);
+    assert_sent_as_one_frame(&server, &mut sender, &one_symbol, "one_symbol_rows");
+
+    // Trades, just above `max_buf_size`.
+    let trades = buffer_of_trades_above("trades", MAX_BUF_SIZE);
+    fits_one_frame(&trades, MAX_BUF_SIZE);
+    assert_sent_as_one_frame(&server, &mut sender, &trades, "trades");
+    drop(sender);
+
+    // Eight symbol columns, the frame a third of the buffer.
+    let mut sender = sender_with(server.port, progress, "max_buf_size=2000;");
+    assert_eq!(sender.effective_frame_cap().unwrap(), (2000, true));
+    let symbol_columns = buffer_of_symbol_columns("symbol_columns", 200, 8);
+    fits_one_frame(&symbol_columns, 2000);
+    assert!(symbol_columns.len() > 2 * 2000);
+    assert_sent_as_one_frame(&server, &mut sender, &symbol_columns, "symbol_columns");
+    drop(sender);
+    server.finish();
+}
+
+/// The size of a buffer takes the text of a symbol for each of its columns
+/// and for every symbol that the connection knows, which its frame brings
+/// once and not again. A buffer above `max_buf_size` for such symbols goes
+/// out as one frame when that frame fits, also with `max_buf_size` above
+/// the frame cap.
+fn a_buffer_above_max_buf_size_for_symbols_that_its_frame_brings_once_is_one_frame(
+    progress: Progress,
+) {
+    const MAX_BUF_SIZE: usize = 8192;
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, progress, "max_buf_size=8192;");
+    assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
+    let symbol = |id: usize| format!("{id:0>100}");
+
+    // One row with a symbol of 100 bytes in each of 105 columns.
+    let mut in_many_columns = Buffer::new_qwp_ws();
+    in_many_columns.table("many_columns").unwrap();
+    for column in 0..105 {
+        in_many_columns
+            .symbol(format!("s{column}").as_str(), symbol(0).as_str())
+            .unwrap();
+    }
+    in_many_columns.at_now().unwrap();
+    let frame = frame_of_a_sender(&in_many_columns, false, &mut SymbolGlobalDict::new());
+    assert!(in_many_columns.len() > MAX_BUF_SIZE && frame.len() <= FRAME_LIMIT);
+    assert_sent_as_one_frame(&server, &mut sender, &in_many_columns, "many_columns");
+
+    // Rows of symbols of 100 bytes that the connection knows: two flushes
+    // in frames bring them first.
+    let known_symbols = |ids: std::ops::Range<usize>| {
+        let mut buffer = Buffer::new_qwp_ws();
+        for id in ids {
+            buffer
+                .table("known_symbols")
+                .unwrap()
+                .symbol("k", symbol(id).as_str())
+                .unwrap();
+            buffer.at_now().unwrap();
+        }
+        buffer
+    };
+    let mut symbols = SymbolGlobalDict::new();
+    for ids in [0..50, 50..100] {
+        let learning = known_symbols(ids);
+        assert!(learning.len() > FRAME_LIMIT && learning.len() <= MAX_BUF_SIZE);
+        sender.flush_and_keep(&learning).unwrap();
+        frame_of_a_sender(&learning, false, &mut symbols);
+    }
+    let known = known_symbols(0..100);
+    let frame = frame_of_a_sender(&known, false, &mut symbols);
+    assert!(known.len() > MAX_BUF_SIZE && frame.len() <= FRAME_LIMIT);
+    assert_sent_as_one_frame(&server, &mut sender, &known, "known_symbols");
+    assert_eq!(server.model.table("known_symbols").unwrap().commits, 3);
+    drop(sender);
+    server.finish();
+}
+
+/// The frames of a flush in frames, planned by their size bound, take more
+/// than the frame of a buffer with symbols. A buffer whose frames the queue
+/// could never hold together goes out as one frame when that frame fits.
+/// When it does not, the buffer is refused for the queue, and its symbols
+/// are not taken as sent.
+fn a_buffer_whose_frames_the_queue_cannot_hold_is_one_frame_when_its_frame_fits(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(SERVER_DEFAULT_FRAME_LIMIT);
+    // A queue of the least two segments of 1,024 bytes. The frame cap is
+    // what a segment holds, 992 bytes, and a flush is cut for frames of 492
+    // bytes, two a segment.
+    const TWO_SEGMENTS: &str = "sf_max_segment_bytes=1024;sf_max_total_bytes=2048;";
+    let mut sender = sender_with(server.port, progress, TWO_SEGMENTS);
+    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
+    let symbol_columns = buffer_of_symbol_columns("symbol_columns", 100, 8);
+    let frames = frames_of_a_sender(&symbol_columns, 492, &mut SymbolGlobalDict::new()).len();
+    assert!(queue_bytes_for(frames) > 2048, "{frames} frames");
+    let frame = frame_of_a_sender(&symbol_columns, false, &mut SymbolGlobalDict::new());
+    assert!(frame.len() <= 992, "{}", frame.len());
+    assert_sent_as_one_frame(&server, &mut sender, &symbol_columns, "symbol_columns");
+
+    // Rows whose frame is above the frame cap.
+    let mut too_large = buffer_of_symbols(FIRST, 0..400);
+    let frames = frames_of_a_sender(&too_large, 492, &mut SymbolGlobalDict::new()).len();
+    assert_refused_for_the_queue(
+        &mut sender,
+        &mut too_large,
+        frames,
+        queue_bytes_for(frames),
+        2048,
+    );
+    let after = buffer_of_symbols(FIRST, 0..10);
+    assert_sent_as_one_frame(&server, &mut sender, &after, FIRST);
+    drop(sender);
+
+    // Segments of 1 MiB, in a queue of two: rows of a symbol, a long and a
+    // timestamp, a little above what a segment holds.
+    let settings = "sf_max_segment_bytes=1048576;sf_max_total_bytes=2097152;";
+    let mut sender = sender_with(server.port, progress, settings);
+    let (cap, _) = sender.effective_frame_cap().unwrap();
+    let mut trades = Buffer::new_qwp_ws();
+    for id in 0..58_000 {
+        trades
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "a")
+            .unwrap()
+            .column_i64("qty", id)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + id))
+            .unwrap();
+    }
+    let frame = frame_of_a_sender(&trades, false, &mut SymbolGlobalDict::new());
+    assert!(trades.len() > cap && frame.len() <= cap);
+    assert_sent_as_one_frame(&server, &mut sender, &trades, "trades");
     drop(sender);
     server.finish();
 }
@@ -3399,8 +3661,11 @@ in_both_progress_modes! {
     a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two
     a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone
     a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refused
-    a_buffer_above_max_buf_size_is_refused_for_its_size_whatever_else_it_holds
-    a_max_buf_size_below_the_frame_limit_is_held_against_the_size_of_the_buffer
+    a_buffer_above_max_buf_size_is_refused_for_its_size_or_for_a_value_that_cannot_be_sent
+    a_max_buf_size_below_the_frame_limit_is_held_against_the_frame_of_the_buffer
+    a_buffer_of_symbols_above_max_buf_size_whose_frame_fits_is_one_frame
+    a_buffer_above_max_buf_size_for_symbols_that_its_frame_brings_once_is_one_frame
+    a_buffer_whose_frames_the_queue_cannot_hold_is_one_frame_when_its_frame_fits
     a_buffer_with_a_row_that_fits_no_frame_is_refused_with_the_table_and_the_size_of_the_row
     a_row_whose_frame_is_exactly_the_frame_cap_travels_alone_and_one_byte_more_is_refused
     a_row_that_fits_no_frame_by_its_size_bound_is_sent_when_the_buffer_fits_one_frame
@@ -3442,6 +3707,8 @@ on_disk_in_both_progress_modes! {
     a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two
     a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone
     a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refused
+    a_buffer_of_symbols_above_max_buf_size_whose_frame_fits_is_one_frame
+    a_buffer_whose_frames_the_queue_cannot_hold_is_one_frame_when_its_frame_fits
     a_flush_that_the_queue_can_never_hold_is_refused_with_the_value_that_would_do
     a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds
     a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent

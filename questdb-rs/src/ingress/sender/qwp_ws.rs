@@ -4557,15 +4557,16 @@ pub(crate) const NO_SYMBOL_FILE: &str = " It is not sent in several frames, beca
 /// a delta, a buffer above `frame_cap` goes out in several frames that the
 /// server commits together instead. Such a flush waits until the queue
 /// has room for all its frames, as a flush of one frame waits for the room
-/// of its frame, and queues nothing before. It is refused before anything of
-/// it is encoded when the buffer is above `max_buf_size`, and when the queue
-/// can never have that room.
+/// of its frame, and queues nothing before.
 ///
 /// A buffer that cannot be cut into frames goes the way of one frame, whose
-/// encoder gives a value that cannot be sent the error of that value. A row
-/// that fits no frame by its size bound may fit one all the same: a buffer
-/// with such a row is sent when it fits one frame, and is refused with an
-/// error that names the row when it does not.
+/// encoder gives a value that cannot be sent the error of that value. The
+/// size bound of a buffer takes more than its frame for symbols, so what
+/// the bound keeps from frames may fit one frame all the same: a buffer
+/// above `max_buf_size`, a buffer whose frames the queue can never hold
+/// together, and a buffer with a row that fits no frame by its bound. Such a
+/// buffer is sent when it fits one frame. When it does not, it is refused
+/// with an error that names `max_buf_size`, the queue, or the row.
 fn flush_qwp_ws_through(
     encoder: &mut impl QwpWsFlushEncoder,
     publisher: &mut impl QwpWsFlushPublisher,
@@ -4574,18 +4575,16 @@ fn flush_qwp_ws_through(
     max_buf_size: usize,
     split_target: Option<usize>,
 ) -> Result<Option<u64>, QwpWsFlushError> {
-    // The row that keeps the buffer from being cut into frames, when one
-    // does: its table and the size of its frame.
-    let mut row_above_cap = None;
+    // What keeps the buffer from being cut into frames by its size bound,
+    // when one thing does.
+    let mut not_in_frames = None;
     if let Some(split_target) = split_target.filter(|_| encoder.delta_dict_enabled()) {
         let len = buffer.len();
-        if len > frame_cap {
-            if len > max_buf_size {
-                return Err(QwpWsFlushError::Refused(buffer_exceeds_max_buf_size_error(
-                    len,
-                    max_buf_size,
-                )));
-            }
+        if len > frame_cap && len > max_buf_size {
+            // A buffer that needs several frames is held against
+            // `max_buf_size` by its size.
+            not_in_frames = Some(QwpWsNotInFrames::AboveMaxBufSize { len, max_buf_size });
+        } else if len > frame_cap {
             let target = frame_cap.min(split_target);
             match buffer.plan_frames(target, frame_cap) {
                 Ok(plan) => {
@@ -4596,28 +4595,36 @@ fn flush_qwp_ws_through(
                         let frame_sizes = plan.frame_sizes();
                         let max_total_bytes = producer.max_total_bytes();
                         if min_total_bytes > max_total_bytes {
-                            return Err(QwpWsFlushError::Refused(flush_exceeds_queue_error(
-                                frame_sizes.len(),
+                            not_in_frames = Some(QwpWsNotInFrames::AboveQueue {
+                                frame_count: frame_sizes.len(),
                                 min_total_bytes,
                                 max_total_bytes,
-                            )));
+                            });
+                        } else {
+                            // The queue can hold the frames together, so the
+                            // room comes once the server has confirmed what
+                            // the queue holds now.
+                            return publisher
+                                .await_room(frame_sizes)
+                                .and_then(|()| {
+                                    publish_qwp_ws_frames(
+                                        encoder, publisher, buffer, &plan, frame_cap,
+                                    )
+                                })
+                                .map_err(QwpWsFlushError::Failed);
                         }
-                        // The queue can hold the frames together, so the room
-                        // comes once the server has confirmed what the queue
-                        // holds now.
-                        return publisher
-                            .await_room(frame_sizes)
-                            .and_then(|()| {
-                                publish_qwp_ws_frames(encoder, publisher, buffer, &plan, frame_cap)
-                            })
-                            .map_err(QwpWsFlushError::Failed);
                     }
                 }
                 Err(QwpWsNoFramePlan::RowAboveCap {
                     table_idx,
                     frame_size,
                     ..
-                }) => row_above_cap = Some((table_idx, frame_size)),
+                }) => {
+                    not_in_frames = Some(QwpWsNotInFrames::RowAboveCap {
+                        table_idx,
+                        frame_size,
+                    })
+                }
                 Err(
                     QwpWsNoFramePlan::UnsendableValue
                     | QwpWsNoFramePlan::NoRows
@@ -4629,15 +4636,62 @@ fn flush_qwp_ws_through(
     publish_qwp_ws_buffer(encoder, buffer, frame_cap, |payload| {
         publisher.publish(payload)
     })
-    .map_err(|err| match row_above_cap {
-        // The buffer is too large for one frame, and this row is why it was
-        // not cut into several.
-        Some((table_idx, frame_size)) if err.code() == crate::ErrorCode::BatchTooLarge => {
-            row_exceeds_frame_cap_error(&buffer.table_name(table_idx), frame_size, frame_cap)
+    .map_err(|err| match not_in_frames {
+        // The buffer is too large for one frame too: the error names what
+        // kept it from going out in several.
+        Some(not_in_frames) if err.code() == crate::ErrorCode::BatchTooLarge => {
+            not_in_frames.error(buffer, frame_cap)
         }
-        _ => err,
+        _ => QwpWsFlushError::Failed(err),
     })
-    .map_err(QwpWsFlushError::Failed)
+}
+
+/// What keeps a buffer above the frame cap from being cut into frames, by
+/// the size bound of the buffer or of its frames. The bound takes more than
+/// the encoded frame for symbols, so such a buffer goes out as one frame
+/// when that frame fits, and gets the error of what kept it from frames
+/// when it does not.
+enum QwpWsNotInFrames {
+    /// The buffer is larger than `max_buf_size`.
+    AboveMaxBufSize { len: usize, max_buf_size: usize },
+    /// The queue can never hold the `frame_count` frames of the plan
+    /// together: they need `min_total_bytes`.
+    AboveQueue {
+        frame_count: usize,
+        min_total_bytes: u64,
+        max_total_bytes: u64,
+    },
+    /// A row of table `table_idx` fits no frame: a frame that holds it alone
+    /// takes `frame_size` bytes.
+    RowAboveCap { table_idx: usize, frame_size: usize },
+}
+
+impl QwpWsNotInFrames {
+    /// The error of a buffer that is too large for one frame too.
+    fn error(self, buffer: &QwpWsColumnarBuffer, frame_cap: usize) -> QwpWsFlushError {
+        match self {
+            Self::AboveMaxBufSize { len, max_buf_size } => {
+                QwpWsFlushError::Refused(buffer_exceeds_max_buf_size_error(len, max_buf_size))
+            }
+            Self::AboveQueue {
+                frame_count,
+                min_total_bytes,
+                max_total_bytes,
+            } => QwpWsFlushError::Refused(flush_exceeds_queue_error(
+                frame_count,
+                min_total_bytes,
+                max_total_bytes,
+            )),
+            Self::RowAboveCap {
+                table_idx,
+                frame_size,
+            } => QwpWsFlushError::Failed(row_exceeds_frame_cap_error(
+                &buffer.table_name(table_idx),
+                frame_size,
+                frame_cap,
+            )),
+        }
+    }
 }
 
 /// What ends the refusal of a buffer above the frame cap, when one thing
@@ -4664,8 +4718,8 @@ pub(crate) fn qwp_ws_not_in_frames_hint(
 /// Why [`flush_qwp_ws`] or [`flush_qwp_ws_manual`] did not publish a buffer.
 #[derive(Debug)]
 pub(crate) enum QwpWsFlushError {
-    /// The buffer is refused before anything of it is encoded, with an error
-    /// that names the limit in the way and what to do about it.
+    /// The buffer is refused with an error that names the limit in the way
+    /// and what to do about it, which is not the frame cap.
     Refused(crate::Error),
     /// Any other error. Among these are the two that name the frame cap, to
     /// which `Sender` adds what sets it: the size error of a buffer that goes

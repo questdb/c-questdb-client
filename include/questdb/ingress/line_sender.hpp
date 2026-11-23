@@ -1662,10 +1662,14 @@ public:
      * The maximum buffered size that the client will flush to the server.
      * The default is 100 MiB.
      *
-     * For ILP this applies to the exact pending byte length.
-     * For QWP/UDP this applies to the buffer size hint returned by
+     * For ILP this applies to the exact pending byte length. For QWP/UDP this
+     * applies to the buffer size hint returned by
      * `line_sender_buffer::size()`. For QWP/WebSocket it caps the exact
-     * encoded replay frame.
+     * encoded replay frame: a buffer whose frame fits is never refused for its
+     * size. A buffer that needs several frames, which a sender whose server
+     * advertised its frame limit sends, is held against it by
+     * `line_sender_buffer::size()`, which counts more than the frames take for
+     * symbols.
      */
     opts& max_buf_size(size_t max_buf_size)
     {
