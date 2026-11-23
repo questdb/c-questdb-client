@@ -210,9 +210,10 @@ impl SfManifest {
     /// Names an earlier segment as the active one, which [`Self::update`]
     /// never does. Only for recovery, when it removes an unfinished flush
     /// from the end of the slot (`remove_unfinished_flush` in
-    /// `qwp_ws_sfa_queue`): the segment that was active must hold no frame
-    /// by then, durably, because a segment with frames beyond the active one
-    /// refuses the slot.
+    /// `qwp_ws_sfa_queue`), or an empty segment in use that is smaller than
+    /// the segments of the sender (`fit_empty_active_to_segment_size`): the
+    /// segment that was active must hold no frame by then, durably, because
+    /// a segment with frames beyond the active one refuses the slot.
     pub(crate) fn move_active_back(&mut self, new_active_base: u64) -> io::Result<()> {
         if new_active_base < self.head_base || new_active_base >= self.active_base {
             return Err(invalid_data("invalid earlier SF manifest active boundary"));

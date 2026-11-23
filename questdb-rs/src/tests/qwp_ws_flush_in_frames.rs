@@ -32,9 +32,11 @@
 //! flush that stopped part way leaves the slot empty. A sender dropped without
 //! it leaves the frames of that flush in the slot, and the next sender on the
 //! slot removes them when it starts: it sends the flushes before that one, and
-//! nothing of it. It keeps the symbols of the slot, so a flush that a full
-//! dictionary stopped stops the same way once more. A sender that could not make the symbol file of its slot
-//! sends every buffer as one frame.
+//! nothing of it, also when its segments are larger than those of the slot
+//! and its frames do not fit them. It keeps the symbols of the slot, so a
+//! flush that a full dictionary stopped stops the same way once more. A sender
+//! that could not make the symbol file of its slot sends every buffer as one
+//! frame.
 //! The sender may make its progress in the background or be driven by its
 //! caller (`qwp_ws_progress=manual`): every test of a sender runs with both.
 //! A sender that is driven by its caller only queues the frames, and drives
@@ -3160,6 +3162,100 @@ fn a_flush_on_a_slot_reopened_with_smaller_segments_that_fits_the_segment_in_use
     server.finish();
 }
 
+/// A flush in frames stops part way on a slot of segments of 512 bytes, and
+/// its sender is dropped. Its first frame began a segment: the first of the
+/// slot, or the one after the segment of a flush before it. The next sender
+/// on the slot removes the frames of the stopped flush, which leaves that
+/// segment empty. That sender has segments of 4,096 bytes, and sends the
+/// buffer of the stopped flush in frames that a segment of 512 bytes cannot
+/// hold, and then a buffer of one such frame. The server commits each of
+/// them once, and nothing of the stopped flush.
+fn assert_a_slot_reopened_with_larger_segments_takes_larger_frames_after_a_flush_that_stopped(
+    progress: Progress,
+    with_a_flush_before: bool,
+) {
+    // What a segment of 512 bytes holds: a header of 24 bytes, and one of
+    // 8 for the frame.
+    const OLD_CAPACITY: usize = 512 - 24 - 8;
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let before = buffer_of(TABLE, 0..12);
+    let mut large = buffer_of(TABLE, 100..400);
+    let (rows, len) = (large.row_count(), large.len());
+    {
+        let settings = reopened_slot_settings(&sf_dir, 512, "");
+        let mut sender = sender_with(server.port, progress, &settings);
+        let mut held = Vec::new();
+        if with_a_flush_before {
+            held.push(frame_of_a_whole_buffer(&before, false).len());
+            assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+            wait_for_frames_sent(&mut sender, progress, &server, 1);
+        }
+        // Segments of 512 bytes are cut for two frames of 236 bytes each.
+        let frames = frames_of_a_flush(&large, 236);
+        let taking = frames_that_take_a_new_segment(512, &held, &frames);
+        // The first frame of the flush begins a segment, and the flush stops
+        // at the next frame that needs a new segment.
+        let new_segments_before = usize::from(with_a_flush_before);
+        assert_eq!(taking[0] == 0, with_a_flush_before, "{taking:?}");
+        assert!(taking[new_segments_before] > 0, "{taking:?}");
+        fail_manifest_sync_after_for_test(new_segments_before);
+        let err = sender.flush(&mut large).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+        assert_eq!(
+            sender.published_fsn().unwrap(),
+            with_a_flush_before.then_some(0)
+        );
+        assert_eq!((large.row_count(), large.len()), (rows, len));
+    }
+    server.let_answers_go();
+
+    let settings = reopened_slot_settings(&sf_dir, 4096, "");
+    let mut sender = sender_with(server.port, progress, &settings);
+    assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
+    let frames = frames_of_a_flush(&large, FRAME_LIMIT);
+    assert!(frames.len() > 1 && frames[0].len() > OLD_CAPACITY);
+    let one_frame = buffer_of(TABLE, 400..420);
+    let one_frame_len = frame_of_a_whole_buffer(&one_frame, false).len();
+    assert!(
+        one_frame_len > OLD_CAPACITY && one_frame_len <= FRAME_LIMIT,
+        "{one_frame_len}"
+    );
+    let first_fsn = u64::from(with_a_flush_before);
+    let last_fsn = first_fsn + frames.len() as u64 - 1;
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(last_fsn)
+    );
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&one_frame).unwrap(),
+        Some(last_fsn + 1)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    if with_a_flush_before {
+        // The server committed the flush before on the first connection,
+        // and again when the reopened slot sent it.
+        assert_table_holds(&server, TABLE, 4, &[&before, &before, &large, &one_frame]);
+    } else {
+        assert_table_holds(&server, TABLE, 2, &[&large, &one_frame]);
+    }
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+fn a_slot_reopened_with_larger_segments_takes_larger_frames_after_a_flush_that_stopped(
+    progress: Progress,
+) {
+    for with_a_flush_before in [false, true] {
+        assert_a_slot_reopened_with_larger_segments_takes_larger_frames_after_a_flush_that_stopped(
+            progress,
+            with_a_flush_before,
+        );
+    }
+}
+
 fn a_sender_that_was_closed_refuses_a_buffer_above_the_frame_cap(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let mut sender = sender_with(server.port, progress, "");
@@ -4391,6 +4487,7 @@ in_both_progress_modes! {
     a_flush_on_a_slot_reopened_with_larger_segments_counts_the_segment_in_use_at_its_size
     a_flush_on_a_slot_reopened_with_smaller_segments_is_refused_for_the_segment_in_use
     a_flush_on_a_slot_reopened_with_smaller_segments_that_fits_the_segment_in_use_is_sent
+    a_slot_reopened_with_larger_segments_takes_larger_frames_after_a_flush_that_stopped
     a_sender_that_was_closed_refuses_a_buffer_above_the_frame_cap
     a_flush_that_fails_at_its_second_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered

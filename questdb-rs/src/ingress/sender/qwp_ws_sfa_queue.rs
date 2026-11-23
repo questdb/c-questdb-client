@@ -555,10 +555,18 @@ impl SfaFrameQueue {
         fs::create_dir_all(&options.slot_dir)?;
 
         let RecoveredState {
-            segments: recovered_segments,
+            segments: mut recovered_segments,
             mut manifest,
-            diagnostics: recovery_diagnostics,
+            diagnostics: mut recovery_diagnostics,
         } = recover_segments(&options)?;
+        if let Some(segments) = recovered_segments.as_mut() {
+            fit_empty_active_to_segment_size(
+                &options,
+                segments,
+                manifest.as_mut(),
+                &mut recovery_diagnostics,
+            )?;
+        }
         let had_recovered_segments = recovered_segments.is_some();
         // Open the slot's persisted symbol dictionary aligned with segment
         // recovery: a fresh slot (no recovered segments) clears any stale side-file
@@ -3275,6 +3283,121 @@ fn remove_unfinished_flush(
                 error: err.to_string(),
             });
         }
+    }
+    Ok(())
+}
+
+/// Takes an empty segment in use out of use when it is smaller than the
+/// segments of the sender that opens the slot (`sf_max_segment_bytes`).
+///
+/// A slot reopened with larger segments goes on with the segment it had in
+/// use, and a frame that does not fit that segment starts a new one. An
+/// empty segment cannot be left that way, because a segment without frames
+/// is never sealed: a frame that fits the new segments but not that one
+/// would fail. The removal of an unfinished flush leaves such a segment when
+/// the flush began with it ([`remove_unfinished_flush`]), and so does a
+/// process that died between a rotation and the first frame of the new
+/// segment.
+///
+/// - When a segment comes before it, that one is the segment in use again,
+///   as the removal makes it, and the empty file is deleted. The empty
+///   segment is synced first: the manifest may name an earlier segment as
+///   the one in use only once the later one is on disk without frames. When
+///   a process dies after the manifest is written, the next open finds the
+///   empty file as an extra and deletes it.
+/// - When it is the only segment, a new empty segment of the size of the
+///   sender, with the same first frame number, takes its place. A process
+///   that dies in between leaves two empty segments with that number: the
+///   next open keeps one and deletes the other, and replaces the one it
+///   kept if that is the old one. When the byte budget
+///   (`sf_max_total_bytes`) has no room for the new segment, or it cannot be
+///   made, the old one stays.
+///
+/// A drainer appends no frame, so only the open of a sender does this.
+fn fit_empty_active_to_segment_size(
+    options: &SfaQueueOptions,
+    segments: &mut RecoveredSegments,
+    manifest: Option<&mut SfManifest>,
+    diagnostics: &mut Vec<SfaRecoveryDiagnostic>,
+) -> Result<(), SfaQueueError> {
+    let empty_size = segments.active.size_bytes();
+    if segments.active.frame_count() != 0 || empty_size >= options.segment_size_bytes {
+        return Ok(());
+    }
+    // A recovered slot on disk always has its manifest.
+    let (Some(empty_path), Some(manifest)) =
+        (segments.active.path().map(Path::to_path_buf), manifest)
+    else {
+        return Ok(());
+    };
+    let slot_dir = options.slot_dir.as_path();
+    let other_segment_bytes = segments.allocated_segment_bytes.saturating_sub(empty_size);
+
+    let allocated_segment_bytes = if let Some(previous) = segments.sealed_segments.back() {
+        let previous_base = previous.header().base_seq;
+        segments.active.sync_file()?;
+        manifest.move_active_back(previous_base)?;
+        let previous = segments.sealed_segments.pop_back().unwrap();
+        drop(std::mem::replace(&mut segments.active, previous));
+        other_segment_bytes
+    } else {
+        let allocated_segment_bytes = other_segment_bytes
+            .checked_add(options.segment_size_bytes)
+            .ok_or(QueueError::SequenceOverflow)?;
+        if allocated_segment_bytes > options.max_bytes as u64 {
+            return Ok(());
+        }
+        #[cfg(test)]
+        super::qwp_ws_sfa_segment::removal_step_for_test()?;
+        let base_seq = segments.active.header().base_seq;
+        let path = next_segment_path(slot_dir, &mut segments.next_generation)?;
+        let replacement = match create_manifested_segment(
+            &path,
+            base_seq,
+            options.segment_size_bytes,
+            unix_time_micros(),
+            slot_dir,
+        ) {
+            Ok(replacement) => replacement,
+            Err(err) => {
+                log::warn!(
+                    "QWP/WebSocket store-and-forward slot {}: could not replace its empty segment \
+                     of {empty_size} bytes with one of {} bytes, so a frame larger than the \
+                     empty segment holds cannot be queued until a smaller frame goes into \
+                     it: {err:?}",
+                    slot_dir.display(),
+                    options.segment_size_bytes
+                );
+                return Ok(());
+            }
+        };
+        drop(std::mem::replace(&mut segments.active, replacement));
+        allocated_segment_bytes
+    };
+    debug_assert_eq!(
+        segments
+            .active
+            .last_fsn()
+            .map_or(segments.active.header().base_seq, |fsn| fsn + 1),
+        segments.next_fsn
+    );
+    segments.allocated_segment_bytes = allocated_segment_bytes;
+
+    // The mapping and the handle went first: an open file cannot be deleted
+    // everywhere.
+    #[cfg(test)]
+    super::qwp_ws_sfa_segment::removal_step_for_test()?;
+    if let Err(err) = remove_file_if_exists(&empty_path) {
+        diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+            path: empty_path,
+            error: err.to_string(),
+        });
+    }
+    if let Err(err) = sync_directory(slot_dir) {
+        diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+            path: slot_dir.to_path_buf(),
+            error: err.to_string(),
+        });
     }
     Ok(())
 }
@@ -8909,6 +9032,207 @@ mod tests {
                     assert_eq!(fs::read(&damaged).unwrap(), bytes, "{case}");
                 }
             }
+        }
+    }
+
+    // ---- A sender with larger segments on a slot whose segment in use is empty ----
+
+    /// Segments of [`larger_options`]: four times those of [`flush_options`].
+    const LARGER_SEGMENT: u64 = 4 * FLUSH_SEGMENT;
+
+    fn larger_options(dir: &Path) -> SfaQueueOptions {
+        SfaQueueOptions {
+            slot_dir: dir.to_path_buf(),
+            segment_size_bytes: LARGER_SEGMENT,
+            max_bytes: 16 * LARGER_SEGMENT as usize,
+            periodic_sync_interval: None,
+        }
+    }
+
+    /// A frame that commits and is one byte larger than a segment of
+    /// [`flush_options`] holds.
+    fn frame_above_a_flush_segment(tag: u8) -> Vec<u8> {
+        let mut payload = flush_frame(C, tag);
+        payload.resize(segment_payload_capacity(FLUSH_SEGMENT) + 1, tag);
+        payload
+    }
+
+    /// The size of the segment in use of `queue`, and how many frames it holds.
+    fn segment_in_use(queue: &SfaFrameQueue) -> (u64, u64) {
+        let producer = queue.producer.as_ref().unwrap();
+        (producer.active.size_bytes(), producer.active_frame_count)
+    }
+
+    /// The sizes of the segment files of a slot that hold no frame.
+    fn empty_segment_sizes(slot: &Path) -> Vec<u64> {
+        let mut sizes: Vec<u64> = fs::read_dir(slot)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| is_sfa_file(path) && scan_file(path).unwrap().frames.is_empty())
+            .map(|path| fs::metadata(path).unwrap().len())
+            .collect();
+        sizes.sort();
+        sizes
+    }
+
+    /// A sender with the segments of [`larger_options`] opens `slot` and
+    /// finds the frames `kept`. It takes a frame that a segment of
+    /// [`flush_options`] cannot hold, and a second open finds that frame
+    /// behind them.
+    fn assert_a_sender_with_larger_segments_takes_a_larger_frame(
+        slot: &Path,
+        kept: &[Vec<u8>],
+        case: &str,
+    ) {
+        let mut queue = SfaFrameQueue::open(larger_options(slot)).unwrap();
+        assert_eq!(frames_held(&queue), kept, "{case}");
+        let (size, frames) = segment_in_use(&queue);
+        assert!(
+            frames > 0 || size == LARGER_SEGMENT,
+            "{case}: {frames} frames in a segment in use of {size} bytes"
+        );
+        let empty = empty_segment_sizes(slot);
+        assert!(
+            empty.iter().all(|size| *size == LARGER_SEGMENT),
+            "{case}: empty segments of {empty:?} bytes"
+        );
+        let larger = frame_above_a_flush_segment(0xEE);
+        let receipt = submit_with_storage_maintenance(&mut queue, &larger);
+        assert_eq!(receipt.fsn, kept.len() as u64, "{case}");
+        drop(queue);
+
+        let mut expected = kept.to_vec();
+        expected.push(larger);
+        let queue = SfaFrameQueue::open(larger_options(slot)).unwrap();
+        assert_eq!(frames_held(&queue), expected, "{case}");
+        assert_eq!(queue.published_fsn(), Some(kept.len() as u64), "{case}");
+        drop(queue);
+        let on_disk: Vec<Vec<u8>> = frames_on_disk(slot)
+            .into_iter()
+            .flat_map(|(_, frames)| frames)
+            .collect();
+        assert_eq!(on_disk, expected, "{case}");
+    }
+
+    #[test]
+    fn a_sender_with_larger_segments_takes_a_larger_frame_after_the_removal_of_an_unfinished_flush()
+    {
+        // When the flush began with the segment in use, the removal leaves
+        // that segment empty, at its old size. A segment without frames is
+        // never sealed, so a frame that does not fit it would fail.
+        for (frames, kept) in UNFINISHED_FLUSHES {
+            let slot = write_flush_slot(frames);
+            let kept = flush_frames(frames)[..*kept].to_vec();
+            assert_a_sender_with_larger_segments_takes_a_larger_frame(
+                slot.path(),
+                &kept,
+                &format!("{frames:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_sender_with_larger_segments_takes_a_larger_frame_after_a_rotation_without_a_frame() {
+        // A process that died between a rotation and the first frame of the
+        // new segment, with segments before it and without.
+        for segments in [&[3, 0][..], &[0][..]] {
+            let (slot, frames) = write_slot_of_a_process_that_died(segments);
+            assert_a_sender_with_larger_segments_takes_a_larger_frame(
+                slot.path(),
+                &frames,
+                &format!("segments of {segments:?} frames"),
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_segment_in_use_that_is_not_smaller_than_the_segments_of_the_sender_stays() {
+        for segment_size_bytes in [FLUSH_SEGMENT, FLUSH_SEGMENT / 2] {
+            let slot = write_flush_slot(&[C, C, C, D, D]);
+            let options = SfaQueueOptions {
+                segment_size_bytes,
+                ..flush_options(slot.path())
+            };
+            let queue = SfaFrameQueue::open(options).unwrap();
+            assert_eq!(frames_held(&queue), flush_frames(&[C, C, C]));
+            assert_eq!(
+                segment_in_use(&queue),
+                (FLUSH_SEGMENT, 0),
+                "segments of {segment_size_bytes} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_segment_in_use_alone_stays_when_the_budget_has_no_room_for_a_larger_one() {
+        let slot = write_flush_slot(&[D]);
+        let options = SfaQueueOptions {
+            max_bytes: LARGER_SEGMENT as usize - 1,
+            ..larger_options(slot.path())
+        };
+        let queue = SfaFrameQueue::open(options).unwrap();
+        assert_eq!(segment_in_use(&queue), (FLUSH_SEGMENT, 0));
+        drop(queue);
+        assert_eq!(empty_segment_sizes(slot.path()), [FLUSH_SEGMENT]);
+    }
+
+    #[test]
+    fn a_sender_with_larger_segments_ends_in_the_same_slot_wherever_its_open_is_stopped() {
+        // Every write, sync, delete and new segment of the removal, and of
+        // what the open then does with the empty segment in use, is a step.
+        // A process that dies at a step leaves what the steps before it
+        // wrote, and the next open goes on from there.
+        let mut slots = Vec::new();
+        // The slot, the frames that stay, and the least number of steps.
+        for (frames, kept, least_steps) in [
+            (&[C, C, C, D, D][..], 3, 8),
+            (&[D, D, C, D, D, D, D, D, D, D][..], 3, 26),
+            (&[D][..], 0, 5),
+            (&[D, D, D, D][..], 0, 15),
+        ] {
+            let kept = flush_frames(frames)[..kept].to_vec();
+            slots.push((
+                write_flush_slot(frames),
+                kept,
+                least_steps,
+                format!("{frames:?}"),
+            ));
+        }
+        for (segments, least_steps) in [(&[3, 0][..], 3), (&[0][..], 2)] {
+            let (slot, frames) = write_slot_of_a_process_that_died(segments);
+            let case = format!("segments of {segments:?} frames");
+            slots.push((slot, frames, least_steps, case));
+        }
+
+        for (original, kept, least_steps, case) in slots {
+            let mut step = 0;
+            loop {
+                let slot = copy_of_slot(original.path());
+                stop_removal_after_for_test(step);
+                let opened = SfaFrameQueue::open(larger_options(slot.path()));
+                if clear_removal_stop_for_test() {
+                    // The open ran through before it came to this step.
+                    drop(opened.unwrap());
+                    assert_a_sender_with_larger_segments_takes_a_larger_frame(
+                        slot.path(),
+                        &kept,
+                        &case,
+                    );
+                    break;
+                }
+                let err = opened.unwrap_err();
+                assert!(
+                    format!("{err:?}").contains("injected stop of the removal"),
+                    "{case}, step {step}: {err:?}"
+                );
+                assert_a_sender_with_larger_segments_takes_a_larger_frame(
+                    slot.path(),
+                    &kept,
+                    &format!("{case}, step {step}"),
+                );
+                step += 1;
+            }
+            assert!(step >= least_steps, "{case}: {step} steps");
         }
     }
 }

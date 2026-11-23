@@ -91,9 +91,10 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Makes the removal of an unfinished flush at the open of a slot stop with
-/// an error at its step number `steps`, counted from zero, as a process that
-/// dies there would: what the steps before wrote stays written.
+/// Makes the removal of an unfinished flush at the open of a slot, and what
+/// follows it (see [`removal_step_for_test`]), stop with an error at its
+/// step number `steps`, counted from zero, as a process that dies there
+/// would: what the steps before wrote stays written.
 #[cfg(test)]
 pub(crate) fn stop_removal_after_for_test(steps: usize) {
     REMOVAL_STOP_COUNTDOWN.with(|countdown| countdown.set(Some(steps)));
@@ -106,8 +107,11 @@ pub(crate) fn clear_removal_stop_for_test() -> bool {
     REMOVAL_STOP_COUNTDOWN.with(|countdown| countdown.take().is_some())
 }
 
-/// One step of the removal of an unfinished flush: a write, a sync or a
-/// delete follows. See [`stop_removal_after_for_test`].
+/// One step of the removal of an unfinished flush, or of what the open of a
+/// sender then does with an empty segment in use that is too small
+/// (`fit_empty_active_to_segment_size` in `qwp_ws_sfa_queue`): a write, a
+/// sync, a delete or a new segment follows. See
+/// [`stop_removal_after_for_test`].
 #[cfg(test)]
 pub(crate) fn removal_step_for_test() -> io::Result<()> {
     REMOVAL_STOP_COUNTDOWN.with(|countdown| match countdown.get() {
@@ -480,6 +484,17 @@ impl SfaSegment {
         };
         self.mapping.flush_range(0, HEADER_SIZE)?;
         file.sync_all()?;
+        Ok(())
+    }
+
+    /// Syncs every byte of the segment: those written through its mapping,
+    /// and those that an earlier process wrote and the disk may not hold yet.
+    pub(crate) fn sync_file(&self) -> Result<(), SfaSegmentError> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        self.mapping.flush_range(0, self.mapping.len)?;
+        file.sync_data()?;
         Ok(())
     }
 
