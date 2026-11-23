@@ -164,7 +164,9 @@ those planned sizes.
 
 Before its first frame, a flush in several frames waits until the queue has
 room for all of them, for up to `sf_append_deadline_millis`. When the room
-does not come, the flush fails and nothing of it was sent.
+does not come, the flush fails and nothing of it was sent. When the queue has
+no room for them now, a buffer whose one frame fits the frame cap goes out as
+that frame instead, and waits only for the room of that frame.
 
 ### What one flush guarantees
 

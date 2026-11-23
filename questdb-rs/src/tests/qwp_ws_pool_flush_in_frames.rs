@@ -63,10 +63,12 @@ use crate::ingress::column_sender::Chunk;
 use crate::ingress::{AckLevel, Buffer, SymbolGlobalDict, TestDictCapGuard};
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
 use crate::tests::qwp_ws_flush_in_frames::{
-    EIGHT_SEGMENTS, FIRST, FRAME_LIMIT, NO_FRAME_LIMIT_TOLD, NO_WAIT_AT_THE_END, RECONNECT_SOON,
-    SECOND, TABLE, WAIT, add_symbol_row, allocated_after_a_flush_of, assert_table_holds,
-    assert_timed_out_waiting_for_room, buffer_of_len, buffer_of_symbols, queue_bytes_for,
-    slot_settings, stopped_by_a_full_dictionary, symbols_held_before,
+    EIGHT_SEGMENTS, EIGHT_SEGMENTS_SHORT_WAIT, FIRST, FOUR_SEGMENTS, FRAME_LIMIT,
+    NO_FRAME_LIMIT_TOLD, NO_WAIT_AT_THE_END, RECONNECT_SOON, SECOND, TABLE, WAIT,
+    a_frame_that_fits_by_the_symbols_its_connection_holds,
+    a_frame_that_fits_where_its_frames_do_not, add_symbol_row, allocated_after_a_flush_of,
+    assert_table_holds, assert_timed_out_waiting_for_room, buffer_of_len, buffer_of_symbols,
+    queue_bytes_for, slot_settings, stopped_by_a_full_dictionary, symbols_held_before,
     two_flushes_for_a_queue_that_holds_one, wait_for_frames_taken, wait_for_no_connection,
 };
 use crate::tests::qwp_ws_server_model::{
@@ -575,6 +577,74 @@ fn a_pooled_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
     assert_eq!(last_fsn, Some((first_frames + second_frames) as u64 - 1));
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     assert_table_holds(&server, TABLE, 2, &[&first, &second]);
+    drop(sender);
+    db.close();
+    server.finish();
+}
+
+/// A pooled sender sends a buffer whose one frame fits the frame cap as that
+/// frame when the queue has room for it and not for the frames that the
+/// size bound of the buffer cuts it into, as a `Sender` does.
+#[test]
+fn a_pooled_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_no_room_for_its_frames() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let db = pool_with(server.port, FOUR_SEGMENTS);
+    let mut sender = db.borrow_sender().unwrap();
+    assert_eq!(sender.effective_frame_cap_for_test(), (992, true));
+    let (filler, symbol_columns) = a_frame_that_fits_where_its_frames_do_not();
+    assert_eq!(
+        sender.flush_buffer_and_keep_and_get_fsn(&filler).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        sender.flush_buffer_and_keep_and_get_fsn(&filler).unwrap(),
+        Some(1)
+    );
+
+    assert_eq!(
+        sender
+            .flush_buffer_and_keep_and_get_fsn(&symbol_columns)
+            .unwrap(),
+        Some(2)
+    );
+    server.let_answers_go();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), 3);
+    assert_table_holds(&server, TABLE, 2, &[&filler, &filler]);
+    assert_table_holds(&server, "symbol_columns", 1, &[&symbol_columns]);
+    assert!(!sender.must_close_for_test());
+    drop(sender);
+    db.close();
+    server.finish();
+}
+
+/// The same for a buffer whose frame fits the cap because it does not bring
+/// the symbols that the connection holds, which the dictionary that the row
+/// and column flushes of a pooled sender share tells.
+#[test]
+fn a_pooled_buffer_whose_frame_fits_by_the_symbols_its_connection_holds_is_one_frame_without_room_for_its_frames()
+ {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let db = pool_with(server.port, EIGHT_SEGMENTS_SHORT_WAIT);
+    let mut sender = db.borrow_sender().unwrap();
+    let (before, long_symbol) = a_frame_that_fits_by_the_symbols_its_connection_holds();
+    for buffer in &before {
+        sender.flush_buffer_and_keep_and_get_fsn(buffer).unwrap();
+    }
+
+    assert_eq!(
+        sender
+            .flush_buffer_and_keep_and_get_fsn(&long_symbol)
+            .unwrap(),
+        Some(before.len() as u64)
+    );
+    server.let_answers_go();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), before.len() + 1);
+    assert_table_holds(&server, "long_symbol", 2, &[&before[0], &long_symbol]);
+    assert!(!sender.must_close_for_test());
     drop(sender);
     db.close();
     server.finish();
@@ -1324,6 +1394,8 @@ on_disk! {
     a_pooled_sender_names_the_row_that_fits_no_frame
     a_pooled_flush_that_the_queue_can_never_hold_is_refused_and_one_without_room_waits
     a_pooled_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
+    a_pooled_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_no_room_for_its_frames
+    a_pooled_buffer_whose_frame_fits_by_the_symbols_its_connection_holds_is_one_frame_without_room_for_its_frames
     a_pooled_flush_that_fails_part_way_is_aborted_and_its_connection_is_not_handed_out_again
     the_pool_closes_a_sender_whose_flush_failed_part_way_when_the_flush_before_it_is_confirmed
     the_pool_closes_a_sender_whose_first_flush_failed_part_way_without_waiting

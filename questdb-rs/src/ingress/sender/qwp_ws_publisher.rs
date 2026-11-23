@@ -64,6 +64,10 @@ pub(crate) trait QwpWsFlushEncoder {
     /// store-and-forward slot has no usable symbol file sends every symbol
     /// with every frame instead.
     fn delta_dict_enabled(&self) -> bool;
+
+    /// At least what the symbols that the connection holds take in a frame:
+    /// see [`SymbolGlobalDict::max_encoded_len`].
+    fn known_symbols_max_encoded_len(&self) -> usize;
 }
 
 pub(crate) struct QwpWsReplayEncoder {
@@ -361,6 +365,10 @@ impl QwpWsFlushEncoder for QwpWsReplayEncoder {
 
     fn delta_dict_enabled(&self) -> bool {
         self.delta_dict_enabled
+    }
+
+    fn known_symbols_max_encoded_len(&self) -> usize {
+        self.global_dict.max_encoded_len()
     }
 }
 

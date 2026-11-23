@@ -4581,7 +4581,9 @@ pub(crate) const NO_SYMBOL_FILE: &str = " It is not sent in several frames, beca
 /// a delta, a buffer above `frame_cap` goes out in several frames that the
 /// server commits together instead. Such a flush waits until the queue
 /// has room for all its frames, as a flush of one frame waits for the room
-/// of its frame, and queues nothing before.
+/// of its frame, and queues nothing before. When the queue has no room for
+/// them now, a buffer whose one frame fits `frame_cap` goes out as that
+/// frame instead, and waits for its room only.
 ///
 /// A buffer that cannot be cut into frames goes the way of one frame, whose
 /// encoder gives a value that cannot be sent the error of that value. The
@@ -4625,17 +4627,39 @@ fn flush_qwp_ws_through(
                                 max_total_bytes,
                             });
                         } else {
-                            // The queue can hold the frames together, so the
-                            // room comes once the server has confirmed what
-                            // the queue holds now.
-                            return publisher
-                                .await_room(frame_sizes)
-                                .and_then(|()| {
-                                    publish_qwp_ws_frames(
-                                        encoder, publisher, buffer, &plan, frame_cap,
-                                    )
-                                })
-                                .map_err(QwpWsFlushError::Failed);
+                            // Room that the queue has now stays until the
+                            // frames are queued, so they need no wait then.
+                            if !producer.has_room_for(frame_sizes) {
+                                // The bound takes more than the frame for
+                                // symbols: a buffer whose one frame fits the
+                                // cap goes out as that frame, which waits for
+                                // its own room only.
+                                let known = encoder.known_symbols_max_encoded_len();
+                                if buffer.one_frame_min_len(known) <= frame_cap {
+                                    match publish_qwp_ws_buffer(
+                                        encoder,
+                                        buffer,
+                                        frame_cap,
+                                        |payload| publisher.publish(payload),
+                                    ) {
+                                        Err(err)
+                                            if err.code() == crate::ErrorCode::BatchTooLarge => {}
+                                        published => {
+                                            return published.map_err(QwpWsFlushError::Failed);
+                                        }
+                                    }
+                                }
+                                // The queue can hold the frames together, so
+                                // the room comes once the server has
+                                // confirmed what the queue holds now.
+                                publisher
+                                    .await_room(frame_sizes)
+                                    .map_err(QwpWsFlushError::Failed)?;
+                            }
+                            return publish_qwp_ws_frames(
+                                encoder, publisher, buffer, &plan, frame_cap,
+                            )
+                            .map_err(QwpWsFlushError::Failed);
                         }
                     }
                 }

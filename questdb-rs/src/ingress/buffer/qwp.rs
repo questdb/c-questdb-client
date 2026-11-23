@@ -3069,6 +3069,42 @@ impl QwpWsColumnarBuffer {
             .len(&self.tables)
     }
 
+    /// At most the size of the one frame of the buffer, on a connection whose
+    /// symbols take at most `known_symbols_len` bytes in a frame: see
+    /// [`SymbolGlobalDict::max_encoded_len`].
+    ///
+    /// [`Self::len`] charges three bytes for each symbol cell and for the id
+    /// that the frame's symbols start at, where the frame writes one at
+    /// least; the count of all symbols of the buffer, where the frame writes
+    /// that of the new ones; and the text of each symbol once for each column
+    /// that holds it. The frame brings once each symbol that the connection
+    /// does not hold: at least the text of the column with the most of it,
+    /// less what the connection holds.
+    pub(crate) fn one_frame_min_len(&self, known_symbols_len: usize) -> usize {
+        let mut symbol_cells = 0usize;
+        let mut symbol_count = 0usize;
+        let mut symbols_len = 0usize;
+        let mut column_symbols_max_len = 0usize;
+        for table in self.tables.iter().filter(|table| table.row_count > 0) {
+            for column in &table.columns {
+                if let QwpWsColumnValues::Symbol { dict, .. } = &column.values {
+                    symbol_cells += column.symbol_cells_encoded_len / QWP_WS_SYMBOL_ID_MAX_LEN;
+                    symbol_count += dict.len();
+                    symbols_len += column.symbol_dict_encoded_len;
+                    column_symbols_max_len =
+                        column_symbols_max_len.max(column.symbol_dict_encoded_len);
+                }
+            }
+        }
+        let new_symbols_min_len = column_symbols_max_len.saturating_sub(known_symbols_len);
+        self.len().saturating_sub(
+            symbol_cells * (QWP_WS_SYMBOL_ID_MAX_LEN - 1)
+                + (QWP_WS_SYMBOL_ID_MAX_LEN - 1)
+                + (qwp_varint_size(symbol_count as u64) - 1)
+                + (symbols_len - new_symbols_min_len),
+        )
+    }
+
     #[cfg(test)]
     fn recompute_len_slow(&self) -> usize {
         let mut total = QWP_MESSAGE_HEADER_SIZE;
@@ -6548,6 +6584,12 @@ impl SymbolGlobalDict {
     /// prefix.
     pub(crate) fn next_id(&self) -> u64 {
         self.next_id
+    }
+
+    /// At least what the symbols of the dictionary take in a frame, each
+    /// with its length prefix: no symbol is longer than all of them together.
+    pub(crate) fn max_encoded_len(&self) -> usize {
+        self.heap_bytes + self.entries.len() * qwp_varint_size(self.heap_bytes as u64)
     }
 
     pub(crate) fn mark(&self) -> SymbolGlobalDictMark {
@@ -11567,6 +11609,97 @@ mod tests {
             buf.rewind_to_marker().unwrap();
             assert_eq!(buf.len(), before_marker);
             assert_covers(&buf, &mut global_dict, warm, "after a rewind");
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_one_frame_min_len_is_at_most_the_frame_on_a_new_and_a_known_connection() {
+        // Rows of `columns` symbol columns, whose cell `column` of row `row`
+        // holds `symbol(row, column)`, a double and a timestamp.
+        fn rows(
+            rows: usize,
+            columns: usize,
+            symbol: impl Fn(usize, usize) -> String,
+        ) -> QwpWsColumnarBuffer {
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            for row in 0..rows {
+                buf.table("t").unwrap();
+                for column in 0..columns {
+                    buf.symbol(format!("s{column}").as_str(), symbol(row, column).as_str())
+                        .unwrap();
+                }
+                buf.column_f64("price", row as f64 * 1.5).unwrap();
+                buf.at(TimestampNanos::new(1_700_000_000_000_000_000 + row as i64))
+                    .unwrap();
+            }
+            buf
+        }
+
+        fn frame_len(buf: &QwpWsColumnarBuffer, global_dict: &mut SymbolGlobalDict) -> usize {
+            let mut out = Vec::new();
+            buf.encode_ws_replay_message_with_defer(
+                &mut out,
+                &mut QwpWsEncodeScratch::new(),
+                global_dict,
+                QWP_VERSION_1,
+                false,
+                true,
+            )
+            .unwrap();
+            out.len()
+        }
+
+        // Each buffer, and whether its symbols take ids below 128, which a
+        // frame writes in one byte as the bound counts them.
+        let buffers = [
+            ("no symbols", rows(10_000, 0, |_, _| String::new()), true),
+            (
+                "10 symbols",
+                rows(10_000, 1, |row, _| format!("S{}", row % 10)),
+                true,
+            ),
+            (
+                "5,000 symbols",
+                rows(10_000, 1, |row, _| format!("S{}", row % 5_000)),
+                false,
+            ),
+            (
+                "8 columns of one symbol",
+                rows(100, 8, |_, _| "a".into()),
+                true,
+            ),
+            (
+                "a symbol of 600 bytes",
+                rows(100, 1, |_, _| "x".repeat(600)),
+                true,
+            ),
+            (
+                "10,000 symbols of 50 bytes",
+                rows(10_000, 1, |row, _| format!("{row:050}")),
+                false,
+            ),
+            (
+                "4 columns of 1,000 symbols",
+                rows(10_000, 4, |row, column| {
+                    format!("{:020}", (row * 7 + column) % 1_000)
+                }),
+                false,
+            ),
+        ];
+        for (what, buf, one_byte_ids) in &buffers {
+            let mut global_dict = SymbolGlobalDict::new();
+            for connection in ["a new connection", "a connection that knows the symbols"] {
+                let min_len = buf.one_frame_min_len(global_dict.max_encoded_len());
+                let frame_len = frame_len(buf, &mut global_dict);
+                assert!(
+                    min_len <= frame_len,
+                    "{what} on {connection}: {min_len} above the frame of {frame_len}"
+                );
+                if *one_byte_ids {
+                    assert_eq!(min_len, frame_len, "{what} on {connection}");
+                }
+            }
         }
     }
 

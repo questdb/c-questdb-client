@@ -43,7 +43,9 @@
 //! them once. Each frame brings the symbols that its rows are the first to
 //! use on the connection. The flush waits until the queue has room for all
 //! its frames, as long as `sf_append_deadline_millis` allows, and publishes
-//! none of them before.
+//! none of them before. When the queue has no room for them, a buffer whose
+//! one frame fits the frame cap goes out as that frame, which waits only for
+//! its own room.
 //! Such a sender refuses a buffer above `max_buf_size` with an error that
 //! names `max_buf_size` and the size of the buffer, and a buffer whose frames
 //! the queue can never hold together with one that names
@@ -1950,7 +1952,7 @@ fn buffer_of_trades_above(table: &str, len: usize) -> Buffer {
 
 /// Rows of `columns` symbol columns, each holding `a`, at the time of the
 /// flush.
-fn buffer_of_symbol_columns(table: &str, rows: usize, columns: usize) -> Buffer {
+pub(super) fn buffer_of_symbol_columns(table: &str, rows: usize, columns: usize) -> Buffer {
     let mut buffer = Buffer::new_qwp_ws();
     for _ in 0..rows {
         buffer.table(table).unwrap();
@@ -2711,6 +2713,211 @@ fn a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_f
         "the buffer keeps its rows"
     );
     assert!(sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+/// The settings of a sender whose queue is four segments of 1,024 bytes, and
+/// which waits 300 ms for room in it.
+pub(super) const FOUR_SEGMENTS: &str =
+    "sf_max_segment_bytes=1024;sf_max_total_bytes=4096;sf_append_deadline_millis=300;";
+
+/// A buffer of rows of [`TABLE`] whose one frame fills a segment, and a
+/// buffer of the table `symbol_columns` whose size bound cuts it into six
+/// frames, which take three segments, while its one frame fits one. With
+/// two flushes of the first in the queue of [`FOUR_SEGMENTS`] and not
+/// confirmed, the queue has room for that frame and not for the six.
+pub(super) fn a_frame_that_fits_where_its_frames_do_not() -> (Buffer, Buffer) {
+    let filler = buffer_of_len(0, 900);
+    let symbol_columns = buffer_of_symbol_columns("symbol_columns", 100, 8);
+    let frame = frame_of_a_sender(&symbol_columns, false, &mut SymbolGlobalDict::new());
+    assert!(
+        symbol_columns.len() > 992 && frame.len() <= 992,
+        "len {}, frame {}",
+        symbol_columns.len(),
+        frame.len()
+    );
+    let frames = frames_of_a_sender(&symbol_columns, 492, &mut SymbolGlobalDict::new()).len();
+    assert_eq!(frames, 6);
+    assert_eq!(queue_bytes_for(frames), 4096);
+    (filler, symbol_columns)
+}
+
+/// The size bound of a buffer of symbols cuts it into frames while its one
+/// frame fits the frame cap. When the queue has room for that frame and not
+/// for the frames, the buffer goes out as that frame at once, as a buffer
+/// within the cap does, and the server commits it once.
+fn a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_no_room_for_its_frames(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let mut sender = sender_with(server.port, progress, FOUR_SEGMENTS);
+    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
+    let (filler, symbol_columns) = a_frame_that_fits_where_its_frames_do_not();
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&filler).unwrap(), Some(0));
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&filler).unwrap(), Some(1));
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&symbol_columns).unwrap(),
+        Some(2)
+    );
+    server.let_answers_go();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), 3);
+    assert_table_holds(&server, TABLE, 2, &[&filler, &filler]);
+    assert_table_holds(&server, "symbol_columns", 1, &[&symbol_columns]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+/// The settings of a sender whose queue is eight segments of 1,024 bytes, and
+/// which waits 300 ms for room in it.
+pub(super) const EIGHT_SEGMENTS_SHORT_WAIT: &str =
+    "sf_max_segment_bytes=1024;sf_max_total_bytes=8192;sf_append_deadline_millis=300;";
+
+/// Rows of the table `long_symbol` whose symbol is the same text of 300
+/// bytes.
+fn buffer_of_a_long_symbol(rows: usize) -> Buffer {
+    let mut buffer = Buffer::new_qwp_ws();
+    for _ in 0..rows {
+        buffer
+            .table("long_symbol")
+            .unwrap()
+            .symbol("s", "x".repeat(300))
+            .unwrap()
+            .at_now()
+            .unwrap();
+    }
+    buffer
+}
+
+/// Flushes for the queue of [`EIGHT_SEGMENTS_SHORT_WAIT`], to be flushed in
+/// their order and not confirmed: a row of [`buffer_of_a_long_symbol`], and
+/// five buffers of rows of [`TABLE`] whose frames fill a segment each. Then a
+/// buffer of rows of that symbol whose size bound cuts it into frames for
+/// which the queue has no room, while its one frame fits the frame cap and
+/// the room the queue has. Only the text of the symbol, which the connection
+/// holds then, keeps that frame from being above the cap.
+pub(super) fn a_frame_that_fits_by_the_symbols_its_connection_holds() -> (Vec<Buffer>, Buffer) {
+    let mut before = vec![buffer_of_a_long_symbol(1)];
+    before.extend((0..5).map(|_| buffer_of_len(0, 900)));
+    let long_symbol = buffer_of_a_long_symbol(800);
+    let frames = frames_of_a_sender(&long_symbol, 492, &mut SymbolGlobalDict::new()).len();
+    assert!(
+        frames.div_ceil(2) > 2 && queue_bytes_for(frames) <= 8192,
+        "{frames} frames"
+    );
+    let mut symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before[0], false, &mut symbols);
+    let rows = long_symbol.as_qwp_ws().unwrap();
+    let least_on_a_new_connection = rows.one_frame_min_len(0);
+    let least = rows.one_frame_min_len(symbols.max_encoded_len());
+    let frame = frame_of_a_sender(&long_symbol, false, &mut symbols);
+    assert!(
+        least <= frame.len() && frame.len() <= 992 && least_on_a_new_connection > 992,
+        "{least}, {}, {least_on_a_new_connection}",
+        frame.len()
+    );
+    (before, long_symbol)
+}
+
+/// As [`a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_no_room_for_its_frames`],
+/// for a buffer whose frame fits the cap because it does not bring the
+/// symbols that its connection holds.
+fn a_buffer_whose_frame_fits_by_the_symbols_its_connection_holds_is_one_frame_without_room_for_its_frames(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let mut sender = sender_with(server.port, progress, EIGHT_SEGMENTS_SHORT_WAIT);
+    let (before, long_symbol) = a_frame_that_fits_by_the_symbols_its_connection_holds();
+    for buffer in &before {
+        sender.flush_and_keep(buffer).unwrap();
+    }
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&long_symbol).unwrap(),
+        Some(before.len() as u64)
+    );
+    server.let_answers_go();
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), before.len() + 1);
+    assert_table_holds(&server, "long_symbol", 2, &[&before[0], &long_symbol]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+/// The least that the one frame of a buffer can take counts a byte for each
+/// symbol cell, which takes two once the connection holds 128 symbols. When
+/// the queue has no room for the frames of such a buffer, it is tried as one
+/// frame, which is above the frame cap. It then waits for the room of its
+/// frames, and goes out in them as one commit.
+fn a_buffer_whose_frame_is_above_the_cap_by_its_symbol_ids_waits_for_the_room_of_its_frames(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let mut sender = sender_with(server.port, progress, EIGHT_SEGMENTS);
+    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
+    // Two flushes of one frame each bring 150 symbols to the connection, and
+    // five more fill a segment each.
+    let mut symbols = SymbolGlobalDict::new();
+    let mut known = Vec::new();
+    for ids in [0..75, 75..150] {
+        let mut buffer = Buffer::new_qwp_ws();
+        for id in ids {
+            buffer
+                .table("known")
+                .unwrap()
+                .symbol("k", format!("k{id}"))
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        assert!(buffer.len() <= 992);
+        frame_of_a_sender(&buffer, false, &mut symbols);
+        known.push(buffer);
+    }
+    let filler = buffer_of_len(0, 900);
+    let symbol_columns = buffer_of_symbol_columns("symbol_columns", 100, 8);
+    let frames = frames_of_a_sender(&symbol_columns, 492, &mut SymbolGlobalDict::new()).len();
+    let least = symbol_columns
+        .as_qwp_ws()
+        .unwrap()
+        .one_frame_min_len(symbols.max_encoded_len());
+    let frame = frame_of_a_sender(&symbol_columns, false, &mut symbols);
+    assert!(
+        least <= 992 && frame.len() > 992,
+        "{least}, {}",
+        frame.len()
+    );
+    for buffer in known.iter().chain([&filler; 5]) {
+        sender.flush_and_keep(buffer).unwrap();
+    }
+    let before = 7;
+    assert_eq!(sender.published_fsn().unwrap(), Some(before - 1));
+
+    let last_fsn = thread::scope(|scope| {
+        let flush = scope.spawn(|| sender.flush_and_keep_and_get_fsn(&symbol_columns));
+        wait_for_frames_taken(&server, before as usize);
+        thread::sleep(Duration::from_millis(200));
+        assert!(!flush.is_finished(), "the flush did not wait for room");
+        assert_eq!(
+            server.frames_taken(),
+            before as usize,
+            "no frame of the flush is sent before all of them have room"
+        );
+        server.let_answers_go();
+        flush.join().unwrap().unwrap()
+    });
+    assert_eq!(last_fsn, Some(before + frames as u64 - 1));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), before as usize + frames);
+    assert_table_holds(&server, "symbol_columns", 1, &[&symbol_columns]);
+    assert!(!sender.must_close());
     drop(sender);
     server.finish();
 }
@@ -4178,6 +4385,9 @@ in_both_progress_modes! {
     a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds
     a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
     a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails
+    a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_no_room_for_its_frames
+    a_buffer_whose_frame_fits_by_the_symbols_its_connection_holds_is_one_frame_without_room_for_its_frames
+    a_buffer_whose_frame_is_above_the_cap_by_its_symbol_ids_waits_for_the_room_of_its_frames
     a_flush_on_a_slot_reopened_with_larger_segments_counts_the_segment_in_use_at_its_size
     a_flush_on_a_slot_reopened_with_smaller_segments_is_refused_for_the_segment_in_use
     a_flush_on_a_slot_reopened_with_smaller_segments_that_fits_the_segment_in_use_is_sent
@@ -4222,6 +4432,9 @@ on_disk_in_both_progress_modes! {
     a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds
     a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
     a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails
+    a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_no_room_for_its_frames
+    a_buffer_whose_frame_fits_by_the_symbols_its_connection_holds_is_one_frame_without_room_for_its_frames
+    a_buffer_whose_frame_is_above_the_cap_by_its_symbol_ids_waits_for_the_room_of_its_frames
     a_flush_that_fails_at_its_second_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered

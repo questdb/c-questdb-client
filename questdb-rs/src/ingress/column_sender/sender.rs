@@ -377,6 +377,10 @@ impl QwpWsFlushEncoder for SfaBufferEncoder<'_> {
     fn delta_dict_enabled(&self) -> bool {
         self.foreground.delta_enabled()
     }
+
+    fn known_symbols_max_encoded_len(&self) -> usize {
+        self.foreground.known_symbols_max_encoded_len()
+    }
 }
 
 impl Debug for PooledSenderCore {
