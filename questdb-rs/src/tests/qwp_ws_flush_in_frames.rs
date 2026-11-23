@@ -3638,12 +3638,20 @@ fn a_flush_whose_every_connection_the_server_closes_stops_the_sender_at_the_four
 }
 
 /// What `close_drain` says when its time is up before the server has
-/// confirmed `frames` of the frames that the sender published.
+/// confirmed `frames` of the frames that the sender published: with
+/// `sf_dir` ([`on_disk`]) those frames stay in the slot.
 fn close_drain_timed_out(frames: usize) -> String {
+    let what_to_do = if SF_DIR.with(|sf_dir| sf_dir.borrow().is_some()) {
+        "They stay in the slot under sf_dir and the next sender on the slot sends them: to \
+         deliver them with this sender, call wait before closing or raise \
+         close_flush_timeout_millis."
+    } else {
+        "Without sf_dir they are dropped with the sender: call wait before closing, raise \
+         close_flush_timeout_millis, or use sf_dir."
+    };
     format!(
         "QWP/WebSocket close drain timed out before all published frames were acknowledged: \
-         {frames} of them are not confirmed. Without sf_dir they are dropped with the sender: \
-         call wait before closing, raise close_flush_timeout_millis, or use sf_dir."
+         {frames} of them are not confirmed. {what_to_do}"
     )
 }
 

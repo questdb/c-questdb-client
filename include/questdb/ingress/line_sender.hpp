@@ -2298,8 +2298,9 @@ public:
      * than or equal to 0 configure a zero-timeout fast close. Throws on
      * timeout or terminal failure. The timeout error says how many published
      * frames are not confirmed. Without `sf_dir` they are dropped with the
-     * sender: call `wait()` before closing, raise
-     * `close_flush_timeout_millis`, or use `sf_dir`.
+     * sender: call `wait()` before closing, raise `close_flush_timeout_millis`,
+     * or use `sf_dir`. With `sf_dir` they stay in the slot and the next sender
+     * on the slot sends them.
      */
     void close_drain()
     {

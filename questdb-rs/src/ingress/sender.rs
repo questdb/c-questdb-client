@@ -1173,12 +1173,13 @@ impl Sender {
     /// The wait is bounded by the QWP/WebSocket `close_flush_timeout_millis`
     /// setting. Its default is 5000 ms, matching the Java sender. Values less
     /// than or equal to zero skip the wait. When the deadline passes, the
-    /// error says how many published frames are not confirmed. Without
-    /// `sf_dir` they are dropped with the sender: call [`Self::wait`] before
-    /// closing, raise `close_flush_timeout_millis`, or use `sf_dir`. If the
-    /// deadline passes while the sender is disconnected and reconnecting
-    /// keeps failing, in either progress mode, the error names that failure
-    /// and carries its OIDC detail (`Error::oidc_error`).
+    /// error says how many published frames are not confirmed. Without `sf_dir`
+    /// they are dropped with the sender: call [`Self::wait`] before closing,
+    /// raise `close_flush_timeout_millis`, or use `sf_dir`. With `sf_dir` they
+    /// stay in the slot and the next sender on the slot sends them. If the
+    /// deadline passes while the sender is disconnected and reconnecting keeps
+    /// failing, in either progress mode, the error names that failure and
+    /// carries its OIDC detail (`Error::oidc_error`).
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn close_drain(&mut self) -> Result<()> {
         let result = match &mut self.handler {

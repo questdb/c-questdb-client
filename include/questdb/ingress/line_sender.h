@@ -2340,7 +2340,8 @@ bool line_sender_qwpws_effective_frame_cap(
  * terminal failure are reported through `err_out`. The timeout error says how
  * many published frames are not confirmed. Without `sf_dir` they are dropped
  * with the sender: call `line_sender_qwpws_wait` before closing, raise
- * `close_flush_timeout_millis`, or use `sf_dir`. A timeout while the sender
+ * `close_flush_timeout_millis`, or use `sf_dir`. With `sf_dir` they stay in the
+ * slot and the next sender on the slot sends them. A timeout while the sender
  * is disconnected and reconnecting keeps failing names that failure, in either
  * progress mode, as `line_sender_qwpws_wait` does.
  */

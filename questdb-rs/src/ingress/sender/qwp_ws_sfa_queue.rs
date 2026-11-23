@@ -3233,7 +3233,8 @@ fn remove_unfinished_flush(
         return Ok(());
     }
     log::warn!(
-        "QWP/WebSocket store-and-forward slot {}: removing {} frame(s) of a flush that was cut          off before its last frame; nothing of that flush is committed.",
+        "QWP/WebSocket store-and-forward slot {}: removing {} frame(s) of a flush that was cut \
+         off before its last frame; nothing of that flush is committed.",
         slot_dir.display(),
         chain_end - cut
     );

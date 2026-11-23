@@ -541,6 +541,9 @@ pub(crate) struct ManualQwpWsHandlerState {
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
+    /// Whether the queue is a slot under `sf_dir`, where the frames that a
+    /// close drain leaves unconfirmed stay for the next sender on the slot.
+    has_sf_dir: bool,
 }
 
 impl ManualQwpWsHandlerState {
@@ -558,6 +561,9 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     /// The flush that left the sender closed for publications, if one did:
     /// see [`Self::abort_flush`].
     aborted_flush: Option<AbortedFlush>,
+    /// As [`ManualQwpWsHandlerState::has_sf_dir`]; `false` until the sender
+    /// that opens the runner sets it.
+    has_sf_dir: bool,
     backpressure: Arc<BackpressureNotifier>,
     ok_completed_upper: Arc<AtomicU64>,
     append_deadline: Duration,
@@ -806,6 +812,7 @@ where
             producer,
             lifecycle,
             aborted_flush: None,
+            has_sf_dir: false,
             backpressure,
             ok_completed_upper,
             append_deadline,
@@ -867,6 +874,7 @@ where
             producer,
             lifecycle,
             aborted_flush: None,
+            has_sf_dir: false,
             backpressure,
             ok_completed_upper,
             append_deadline,
@@ -1201,6 +1209,7 @@ where
                 return Err(close_drain_timeout_error(
                     unconfirmed,
                     self.reconnect_failure().as_ref(),
+                    self.has_sf_dir,
                 ));
             }
         }
@@ -4048,7 +4057,7 @@ pub(crate) fn connect_qwp_ws_background_state(
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
     let traffic_gate = Arc::new(TrafficGate::default());
     let (
-        runner,
+        mut runner,
         encoder,
         delta_dict_enabled,
         recovered_dict_entries,
@@ -4175,6 +4184,7 @@ pub(crate) fn connect_qwp_ws_background_state(
             parts.persisted_symbol_dict,
         )
     };
+    runner.has_sf_dir = qwp_ws.sf_dir.is_some();
     let orphan_candidates = orphan_candidates(qwp_ws);
     let orphan_pool = OrphanDrainerPool::start(
         orphan_candidates,
@@ -4290,6 +4300,7 @@ pub(crate) fn open_manual_qwp_ws(
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
+        has_sf_dir: qwp_ws.sf_dir.is_some(),
     })
 }
 
@@ -5344,6 +5355,7 @@ fn qwp_ws_manual_close_timeout_error(state: &ManualQwpWsHandlerState) -> crate::
     close_drain_timeout_error(
         unconfirmed_at_close(&state.store, state.aborted_flush.as_ref()),
         state.store.reconnect_failure(),
+        state.has_sf_dir,
     )
 }
 
@@ -5363,22 +5375,30 @@ fn unconfirmed_at_close<Q: PublicationLog>(
 /// The error of a close drain, in either progress mode, whose deadline passed
 /// before every published frame was acknowledged. It says how many frames
 /// are not confirmed, names the latest reconnect failure if there is one,
-/// and says what a caller can do. As for an ACK-wait timeout, the failure's
-/// diagnostics are kept except a server-rejection diagnostic, which marks a
-/// terminal error.
+/// says where those frames go, which depends on `has_sf_dir`, and says what
+/// a caller can do. As for an ACK-wait timeout, the failure's diagnostics are
+/// kept except a server-rejection diagnostic, which marks a terminal error.
 fn close_drain_timeout_error(
     unconfirmed: u64,
     reconnect_failure: Option<&crate::Error>,
+    has_sf_dir: bool,
 ) -> crate::Error {
     let not_confirmed = match unconfirmed {
         1 => "1 of them is not confirmed".to_string(),
         frames => format!("{frames} of them are not confirmed"),
     };
+    let what_to_do = if has_sf_dir {
+        "They stay in the slot under sf_dir and the next sender on the slot sends them: to \
+         deliver them with this sender, call wait before closing or raise \
+         close_flush_timeout_millis."
+    } else {
+        "Without sf_dir they are dropped with the sender: call wait before closing, raise \
+         close_flush_timeout_millis, or use sf_dir."
+    };
     let msg = |cause: &str| {
         format!(
             "QWP/WebSocket close drain timed out before all published frames were \
-             acknowledged: {not_confirmed}{cause}. Without sf_dir they are dropped with the \
-             sender: call wait before closing, raise close_flush_timeout_millis, or use sf_dir."
+             acknowledged: {not_confirmed}{cause}. {what_to_do}"
         )
     };
     match reconnect_failure {
@@ -5578,7 +5598,7 @@ mod tests {
         // the structured rejection that marks one (`line_sender_error_qwpws_get_view`).
         let cause = retriable_server_rejection("write failed");
 
-        let err = close_drain_timeout_error(3, Some(&cause));
+        let err = close_drain_timeout_error(3, Some(&cause), false);
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert_eq!(
             err.msg(),
@@ -5589,13 +5609,24 @@ mod tests {
         );
         assert!(err.qwp_ws_rejection().is_none());
 
-        let err = close_drain_timeout_error(1, None);
+        let err = close_drain_timeout_error(1, None, false);
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert_eq!(
             err.msg(),
             "QWP/WebSocket close drain timed out before all published frames were \
              acknowledged: 1 of them is not confirmed. Without sf_dir they are dropped with \
              the sender: call wait before closing, raise close_flush_timeout_millis, or use sf_dir."
+        );
+        assert!(err.qwp_ws_rejection().is_none());
+
+        let err = close_drain_timeout_error(2, None, true);
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            err.msg(),
+            "QWP/WebSocket close drain timed out before all published frames were \
+             acknowledged: 2 of them are not confirmed. They stay in the slot under sf_dir and \
+             the next sender on the slot sends them: to deliver them with this sender, call \
+             wait before closing or raise close_flush_timeout_millis."
         );
         assert!(err.qwp_ws_rejection().is_none());
     }
