@@ -785,7 +785,10 @@ impl Sender {
     /// After a flush that failed with
     /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) this is
     /// the last frame published before that flush, or `None` if there was
-    /// none: the frames of the failed flush are never confirmed.
+    /// none: the frames of the failed flush are never reported as confirmed.
+    /// [`Self::acked_fsn`] and [`Self::completed_fsn`] stay at or below it,
+    /// also when the server commits a part of that flush by itself (more
+    /// rows of one table than its `qwp.max.uncommitted.rows`).
     ///
     /// This is a sender-stream watermark, not a process-global receipt.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1237,6 +1240,22 @@ impl Sender {
             _ => {}
         }
         false
+    }
+
+    /// Test-only: the position that the queue of a QWP/WebSocket sender has
+    /// confirmed, frames of a flush that failed part way included, which
+    /// [`Self::acked_fsn`] does not report.
+    #[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+    pub(crate) fn qwp_ws_queue_completed_fsn(&self) -> Option<u64> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => {
+                qwp_ws_queue_completed_fsn_for_test_background(state).unwrap()
+            }
+            SyncProtocolHandler::ManualQwpWs(state) => {
+                qwp_ws_queue_completed_fsn_for_test_manual(state)
+            }
+            _ => None,
+        }
     }
 
     /// Test-only non-blocking view of whether a background QWP/WebSocket

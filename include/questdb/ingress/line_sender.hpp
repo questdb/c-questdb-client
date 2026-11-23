@@ -2180,7 +2180,10 @@ public:
      * or `std::nullopt` if no frame has been published. After a flush that
      * failed with `line_sender_error_code::flush_aborted` this is the last
      * frame published before that flush, or `std::nullopt` if there was none:
-     * the frames of the failed flush are never confirmed.
+     * the frames of the failed flush are never reported as confirmed.
+     * `acked_fsn()` stays at or below it, also when the server commits a part
+     * of that flush by itself (more rows of one table than its
+     * `qwp.max.uncommitted.rows`).
      */
     std::optional<uint64_t> published_fsn() const
     {

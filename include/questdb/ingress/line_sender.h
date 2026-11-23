@@ -2184,7 +2184,9 @@ bool line_sender_qwpws_drive_once(
  * no value if no frame has been published. After a flush that failed with
  * `line_sender_error_flush_aborted` this is the last frame published before
  * that flush, or no value if there was none: the frames of the failed flush
- * are never confirmed.
+ * are never reported as confirmed. `line_sender_qwpws_acked_fsn` stays at or
+ * below it, also when the server commits a part of that flush by itself
+ * (more rows of one table than its `qwp.max.uncommitted.rows`).
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_published_fsn(

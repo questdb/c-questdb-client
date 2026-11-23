@@ -4403,7 +4403,9 @@ pub unsafe extern "C" fn qwp_sender_effective_frame_cap(
 /// been published. After a flush that failed with
 /// `line_sender_error_flush_aborted` this is the last frame published before
 /// that flush, or no value if there was none: the frames of the failed flush
-/// are never confirmed.
+/// are never reported as confirmed. `qwp_sender_acked_fsn` stays at or below
+/// it, also when the server commits a part of that flush by itself (more rows
+/// of one table than its `qwp.max.uncommitted.rows`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_sender_published_fsn(
     sender: *const qwp_sender,

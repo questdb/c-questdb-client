@@ -93,7 +93,10 @@ use crate::ingress::{
     AckLevel, Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, Sender, SenderBuilder,
     SymbolGlobalDict, TimestampMicros, TimestampNanos, decode_qwp_varint,
 };
-use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
+use crate::tests::qwp_ws::{
+    read_frame, spawn_max_batch_size_upgrade_only_server, upgrade_mock_stream_with_max_batch_size,
+    write_server_binary_frame, write_server_frame,
+};
 use crate::tests::qwp_ws_server_model::{
     ModelTable, QwpWsModelServer, QwpWsServerModel, add_rows, buffer_of, frame_of_a_sender,
     frame_of_a_whole_buffer, frames_of_a_flush, frames_of_a_sender, rows_of,
@@ -3493,6 +3496,107 @@ fn a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait
     server.finish();
 }
 
+/// A server of one connection that answers each frame without the defer
+/// flag with an OK, and frame `deferred_answered` too, which has the flag:
+/// as a QuestDB server answers the frame that brings a table to its
+/// `qwp.max.uncommitted.rows`, when it commits the table by itself. The
+/// model of a server refuses that commit, so this one stands in for it.
+/// Returns its port, and the sequences of the frames it has answered.
+fn start_server_that_answers_a_deferred_frame(
+    deferred_answered: u64,
+) -> (u16, Arc<Mutex<Vec<u64>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let answered = Arc::new(Mutex::new(Vec::new()));
+    thread::spawn({
+        let answered = Arc::clone(&answered);
+        move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            upgrade_mock_stream_with_max_batch_size(&mut stream, Some(FRAME_LIMIT));
+            let (mut sequence, mut commits) = (0u64, 0i64);
+            while let Ok((_, opcode, payload)) = read_frame(&mut stream) {
+                match opcode {
+                    0x2 => {
+                        if payload[5] & 0x01 == 0 || sequence == deferred_answered {
+                            commits += 1;
+                            // An OK: the status, the sequence, and the table
+                            // with the number of its commit.
+                            let mut ok = vec![0u8];
+                            ok.extend_from_slice(&sequence.to_le_bytes());
+                            ok.extend_from_slice(&1u16.to_le_bytes());
+                            ok.extend_from_slice(&(TABLE.len() as u16).to_le_bytes());
+                            ok.extend_from_slice(TABLE.as_bytes());
+                            ok.extend_from_slice(&commits.to_le_bytes());
+                            if write_server_binary_frame(&mut stream, &ok).is_err() {
+                                break;
+                            }
+                            answered.lock().unwrap().push(sequence);
+                        }
+                        sequence += 1;
+                    }
+                    0x9 => {
+                        let _ = write_server_frame(&mut stream, 0xA, &payload, false);
+                    }
+                    0x8 => break,
+                    _ => {}
+                }
+            }
+        }
+    });
+    (port, answered)
+}
+
+/// A flush in frames fails part way, and the server confirms one of the
+/// frames of it that were sent, as it does when it commits a part of a
+/// flush with more rows of one table than its `qwp.max.uncommitted.rows`.
+/// The sender reports no confirmed position above the last frame before the
+/// failed flush, which is where `published_fsn` stays: `published_fsn`
+/// less a confirmed position is never below zero.
+fn a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirmed(
+    progress: Progress,
+) {
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let mut large = buffer_of_symbols(TABLE, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before, false, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    let failing = frames.len() / 2;
+    assert!(failing >= 2, "{} frames", frames.len());
+    // The frame before the failing one, which has the defer flag. The
+    // sequences of the connection are the frame numbers: the flush before
+    // is frame 0, and frame `i` of the flush is frame `1 + i`.
+    let confirmed = failing as u64;
+    let (port, answered) = start_server_that_answers_a_deferred_frame(confirmed);
+    let mut sender = {
+        let _cap = crate::ingress::TestDictCapGuard::new(symbols_held_before(&frames[failing]));
+        sender_with(port, progress, NO_WAIT_AT_THE_END)
+    };
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let err = sender.flush(&mut large).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+    // The queue takes the answer of the frame.
+    let deadline = Instant::now() + WAIT;
+    while sender.qwp_ws_queue_completed_fsn() != Some(confirmed) {
+        assert!(
+            Instant::now() < deadline,
+            "the server answered {:?}, the queue confirmed {:?}",
+            answered.lock().unwrap(),
+            sender.qwp_ws_queue_completed_fsn()
+        );
+        let_it_work(&mut sender, progress);
+    }
+    assert_eq!(*answered.lock().unwrap(), [0, confirmed]);
+
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+    assert_eq!(sender.acked_fsn().unwrap(), Some(0));
+    assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert!(sender.must_close());
+    drop(sender);
+}
+
 fn a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let large = buffer_of_symbols(TABLE, 10..160);
@@ -4493,6 +4597,7 @@ in_both_progress_modes! {
     a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
+    a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirmed
     a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
     a_close_drain_after_a_flush_that_failed_part_way_leaves_an_empty_slot
@@ -4536,6 +4641,7 @@ on_disk_in_both_progress_modes! {
     a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
+    a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirmed
     a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing

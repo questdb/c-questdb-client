@@ -605,6 +605,20 @@ impl AbortedFlush {
     }
 }
 
+/// A confirmed position `fsn` as callers see it: after a flush that failed
+/// part way, no higher than the last frame published before it, which
+/// callers see as the last one published. A server that commits a part of
+/// that flush by itself (more rows of one table than its
+/// `qwp.max.uncommitted.rows`) confirms frames of it, which are not
+/// reported.
+fn confirmed_as_reported(aborted_flush: Option<&AbortedFlush>, fsn: Option<u64>) -> Option<u64> {
+    match aborted_flush {
+        // `None` orders below every `Some`.
+        Some(flush) => fsn.min(flush.published_before),
+        None => fsn,
+    }
+}
+
 /// What a flush publishes through: the runner of a sender in background
 /// progress mode, or the store and the connection of a sender in manual
 /// progress mode ([`ManualQwpWsPublisher`]).
@@ -1061,12 +1075,22 @@ where
         Ok(store.published_fsn())
     }
 
+    /// The confirmed position, after a flush that failed part way no higher
+    /// than [`Self::published_fsn`]: see [`confirmed_as_reported`].
     fn acked_fsn(&self) -> crate::Result<Option<u64>> {
         self.check_error()?;
+        Ok(confirmed_as_reported(
+            self.aborted_flush.as_ref(),
+            self.queue_completed_fsn()?,
+        ))
+    }
+
+    /// The position that the queue has confirmed, frames of a flush that
+    /// failed part way included.
+    fn queue_completed_fsn(&self) -> crate::Result<Option<u64>> {
         if let Some(producer) = self.producer.as_ref() {
             return Ok(producer.completed_fsn());
         }
-
         let store = self.lock_shared()?;
         check_store_error(&store)?;
         Ok(store.completed_fsn())
@@ -1087,7 +1111,10 @@ where
             .ok_completed_upper
             .load(Ordering::Acquire)
             .max(completed_upper);
-        Ok(upper.checked_sub(1))
+        Ok(confirmed_as_reported(
+            self.aborted_flush.as_ref(),
+            upper.checked_sub(1),
+        ))
     }
 
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
@@ -5109,11 +5136,32 @@ pub(crate) fn qwp_ws_published_fsn_manual(
     })
 }
 
+/// The position that the queue of a sender has confirmed, frames of a flush
+/// that failed part way included: what [`confirmed_as_reported`] bounds.
+#[cfg(test)]
+pub(crate) fn qwp_ws_queue_completed_fsn_for_test_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    state.runner.queue_completed_fsn()
+}
+
+/// [`qwp_ws_queue_completed_fsn_for_test_background`] in manual progress
+/// mode.
+#[cfg(test)]
+pub(crate) fn qwp_ws_queue_completed_fsn_for_test_manual(
+    state: &ManualQwpWsHandlerState,
+) -> Option<u64> {
+    state.store.completed_fsn()
+}
+
 pub(crate) fn qwp_ws_acked_fsn_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
     check_manual_driver_error(state)?;
-    Ok(state.store.completed_fsn())
+    Ok(confirmed_as_reported(
+        state.aborted_flush.as_ref(),
+        state.store.completed_fsn(),
+    ))
 }
 
 /// Manual-mode OK watermark. Manual progress keeps no separate OK tracker,
@@ -5121,7 +5169,10 @@ pub(crate) fn qwp_ws_acked_fsn_manual(
 /// on the durable ACK the sender trims on, not on the server's ordinary OK.
 pub(crate) fn qwp_ws_ok_fsn_manual(state: &ManualQwpWsHandlerState) -> crate::Result<Option<u64>> {
     check_manual_driver_error(state)?;
-    Ok(state.store.completed_fsn())
+    Ok(confirmed_as_reported(
+        state.aborted_flush.as_ref(),
+        state.store.completed_fsn(),
+    ))
 }
 
 pub(crate) fn qwp_ws_check_error_background(state: &SyncQwpWsHandlerState) -> crate::Result<()> {
