@@ -1043,6 +1043,69 @@ fn a_buffer_with_a_decimal_that_cannot_be_written_is_refused_before_its_first_fr
     server.finish();
 }
 
+/// A DECIMAL64 value without digits after the point, behind the first frame
+/// in a column of one such digit, is multiplied by ten when it is written.
+/// The largest that stays within DECIMAL64 is sent in frames, of either sign;
+/// the next one is refused before the first frame, nothing is sent and the
+/// sender stays usable.
+#[test]
+fn a_flush_in_frames_takes_a_rescaled_decimal_up_to_the_limit_of_decimal64() {
+    const PAST_THE_LIMIT: &str = "decimal value does not fit DECIMAL64 wire width";
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, Progress::Background, "");
+    let buffer_ending_with = |value: &str| {
+        let mut buffer = buffer_of_decimals(0..2000, None);
+        buffer
+            .table(TABLE)
+            .unwrap()
+            .column_i64("id", 2000)
+            .unwrap()
+            .column_dec64("price", value)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + 2000))
+            .unwrap();
+        buffer
+    };
+
+    for value in ["922337203685477581", "-922337203685477581"] {
+        let mut refused = buffer_ending_with(value);
+        assert!(refused.len() > FRAME_LIMIT);
+        let (rows, len) = (refused.row_count(), refused.len());
+        let err = sender.flush(&mut refused).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{}", err.msg());
+        assert_eq!(err.msg(), PAST_THE_LIMIT, "{value}");
+        assert_eq!(sender.published_fsn().unwrap(), None, "{value}");
+        assert_eq!((refused.row_count(), refused.len()), (rows, len));
+        assert!(!sender.must_close());
+    }
+
+    let largest = buffer_ending_with("922337203685477580");
+    let smallest = buffer_ending_with("-922337203685477580");
+    let frame_count = frames_of_a_flush(&largest, FRAME_LIMIT).len() as u64;
+    assert!(frame_count > 40, "{frame_count} frames");
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&largest).unwrap(),
+        Some(frame_count - 1)
+    );
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&smallest).unwrap(),
+        Some(2 * frame_count - 1)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_table_holds(&server, TABLE, 2, &[&largest, &smallest]);
+    let held = server.model.table(TABLE).unwrap().rows_as_text();
+    // 9223372036854775800 and its negative, of scale 1.
+    for (row, unscaled) in [
+        (2000, "[127, 255, 255, 255, 255, 255, 255, 248]"),
+        (4001, "[128, 0, 0, 0, 0, 0, 0, 8]"),
+    ] {
+        let decimal = format!("Decimal {{ scale: 1, unscaled_be: {unscaled} }}");
+        assert!(held[row].contains(&decimal), "{}", held[row]);
+    }
+    drop(sender);
+    server.finish();
+}
+
 /// A sender in manual progress mode queues the frames of a flush and sends
 /// none of them. The server gets them when the caller drives the sender, a
 /// frame a call at most, and commits them when it has the last one.

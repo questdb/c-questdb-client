@@ -226,6 +226,47 @@ impl StoredQwpDecimal {
         )
     }
 
+    /// Whether the value, brought to `target_scale`, fits a signed integer of
+    /// `width` bytes, from the bit lengths of its magnitude and of the power
+    /// of ten that the rescale multiplies it by: what
+    /// [`Self::wire_bytes_with_scale`] and, for a width below DECIMAL256,
+    /// [`narrow_decimal_le_fits`] say of it. `None` when the bit lengths do
+    /// not decide, which happens only for a value next to the limit, and for
+    /// a value of `target_scale`, which the rescale does not multiply.
+    ///
+    /// A magnitude `m` of `b` bits and `10^d` of `p` bits give
+    /// `2^(b + p - 2) < m * 10^d < 2^(b + p)` for `m > 0` and `d > 0`: the
+    /// lower bound is strict because `10^d` is no power of two. So a value
+    /// with `b + p` at most `width * 8 - 1` fits either sign, and one with
+    /// `b + p` above `width * 8` is too large for both, also for a negative
+    /// value, whose limit is `2^(width * 8 - 1)`.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn fits_with_scale_by_bit_length(&self, target_scale: u8, width: usize) -> Option<bool> {
+        if target_scale < self.scale {
+            return Some(false);
+        }
+        if target_scale == self.scale {
+            return None;
+        }
+        let magnitude_bits = mag_bit_len(&self.magnitude);
+        if magnitude_bits == 0 {
+            return Some(true);
+        }
+        // A power of ten above the largest scale is above 2^255.
+        let Some(&power_bits) = POW10_BIT_LEN.get(usize::from(target_scale - self.scale)) else {
+            return Some(false);
+        };
+        let product_bits = magnitude_bits + power_bits;
+        let positive_bits = width as u32 * 8 - 1;
+        if product_bits <= positive_bits {
+            Some(true)
+        } else if product_bits > positive_bits + 1 {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     fn write_magnitude_to(&self, out: &mut Vec<u8>) {
         for limb in self.magnitude {
             out.extend_from_slice(&limb.to_le_bytes());
@@ -240,6 +281,45 @@ fn invalid_decimal_error(msg: impl Into<String>) -> crate::Error {
 fn mag_is_zero(magnitude: &[u64; QWP_DECIMAL_MAG_LIMBS]) -> bool {
     magnitude.iter().all(|&limb| limb == 0)
 }
+
+/// The number of bits of `magnitude` below and with its highest set bit; 0
+/// for zero.
+#[cfg(feature = "_sender-qwp-ws")]
+const fn mag_bit_len(magnitude: &[u64; QWP_DECIMAL_MAG_LIMBS]) -> u32 {
+    let mut idx = QWP_DECIMAL_MAG_LIMBS;
+    while idx > 0 {
+        idx -= 1;
+        if magnitude[idx] != 0 {
+            return idx as u32 * 64 + 64 - magnitude[idx].leading_zeros();
+        }
+    }
+    0
+}
+
+/// `POW10_BIT_LEN[d]` is the bit length of `10^d`, for every scale
+/// difference up to [`QWP_DECIMAL_MAX_SCALE`].
+#[cfg(feature = "_sender-qwp-ws")]
+const POW10_BIT_LEN: [u32; QWP_DECIMAL_MAX_SCALE as usize + 1] = {
+    let mut bit_lens = [0; QWP_DECIMAL_MAX_SCALE as usize + 1];
+    let mut power = [0u64; QWP_DECIMAL_MAG_LIMBS];
+    power[0] = 1;
+    let mut exponent = 0;
+    while exponent < bit_lens.len() {
+        bit_lens[exponent] = mag_bit_len(&power);
+        let mut carry = 0u128;
+        let mut idx = 0;
+        while idx < QWP_DECIMAL_MAG_LIMBS {
+            let product = power[idx] as u128 * 10 + carry;
+            power[idx] = product as u64;
+            carry = product >> 64;
+            idx += 1;
+        }
+        // Up to 10^77, the product after the last, every power fits.
+        assert!(carry == 0);
+        exponent += 1;
+    }
+    bit_lens
+};
 
 fn add_mag_small(
     magnitude: &mut [u64; QWP_DECIMAL_MAG_LIMBS],
@@ -5584,7 +5664,9 @@ impl QwpWsColumnValues {
     /// decimal can be refused: one that cannot be brought to the scale of
     /// its column, which the first value sets, without losing digits, or
     /// that is too large for the width of the column at that scale. A value
-    /// is not checked for that when it is added.
+    /// is not checked for that when it is added. Bit lengths decide for
+    /// nearly every value that the encoder rescales; only one next to the
+    /// limit of the width is rescaled here.
     fn decimals_can_be_encoded(&self) -> bool {
         let (cells, scale, width) = match self {
             Self::Decimal {
@@ -5616,6 +5698,9 @@ impl QwpWsColumnValues {
                             "QWP decimal value exceeds signed DECIMAL256 range",
                         )
                         .is_ok();
+                }
+                if let Some(fits) = value.fits_with_scale_by_bit_length(scale, width) {
+                    return fits;
                 }
                 value.wire_bytes_with_scale(scale).is_ok_and(|bytes| {
                     width == QWP_DECIMAL_MAG_BYTES
@@ -15229,6 +15314,158 @@ mod tests {
             let plan = buf.plan_frames(target, target).unwrap();
             assert_eq!(plan.frames().map(<[_]>::len).collect::<Vec<_>>(), [3]);
         }
+    }
+
+    /// Whether the encoder writes `value` in a column of `scale` whose values
+    /// are `width` bytes wide.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn encoder_writes_decimal(value: &StoredQwpDecimal, scale: u8, width: usize) -> bool {
+        value.wire_bytes_with_scale(scale).is_ok_and(|bytes| {
+            width == QWP_DECIMAL_MAG_BYTES || narrow_decimal_le_fits(&bytes, width).is_some()
+        })
+    }
+
+    /// A decimal column of `scale` whose values are `width` bytes wide: a
+    /// null, then `value`.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn decimal_column_values(
+        width: usize,
+        scale: u8,
+        value: StoredQwpDecimal,
+    ) -> QwpWsColumnValues {
+        let cells = vec![
+            QwpWsDecimalCell {
+                row_idx: 0,
+                value: None,
+            },
+            QwpWsDecimalCell {
+                row_idx: 1,
+                value: Some(value),
+            },
+        ];
+        match width {
+            8 => QwpWsColumnValues::Decimal64 {
+                cells,
+                decimal_scale: scale,
+            },
+            16 => QwpWsColumnValues::Decimal128 {
+                cells,
+                decimal_scale: scale,
+            },
+            _ => QwpWsColumnValues::Decimal {
+                cells,
+                decimal_scale: scale,
+            },
+        }
+    }
+
+    /// A whole number in a decimal column of scale `d`, for every `d` that
+    /// leaves it a digit: the largest that `10^d` takes to at most the limit
+    /// of the width is written, the next one is not, of either sign (the
+    /// limits of the two signs differ in the last digit, which the rescale
+    /// makes 0), and neither is ten times the next one; 1 is written. Bit
+    /// lengths decide some of these values; the others the check rescales.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_decimal_check_takes_a_rescaled_value_up_to_the_limit_of_its_width() {
+        for (width, max) in [
+            (8, "9223372036854775807"),
+            (16, "170141183460469231731687303715884105727"),
+            (QWP_DECIMAL_MAG_BYTES, DECIMAL256_MAX),
+        ] {
+            let mut bound_answers = std::collections::BTreeSet::new();
+            for scale in 1..max.len() as u8 {
+                let digits = &max[..max.len() - usize::from(scale)];
+                let at = parse_decimal_text(digits).unwrap().unwrap();
+                assert_eq!(at.scale, 0);
+                let mut past = at;
+                add_mag_small(&mut past.magnitude, 1, "").unwrap();
+                let mut ten_times_past = past;
+                mul_mag_small(&mut ten_times_past.magnitude, 10, "").unwrap();
+                let one = parse_decimal_text("1").unwrap().unwrap();
+                for negative in [false, true] {
+                    for (value, writes) in [
+                        (one, true),
+                        (at, true),
+                        (past, false),
+                        (ten_times_past, false),
+                    ] {
+                        let value = StoredQwpDecimal { negative, ..value };
+                        let case = format!("width {width}, scale {scale}: {value:?}");
+                        assert_eq!(
+                            encoder_writes_decimal(&value, scale, width),
+                            writes,
+                            "{case}"
+                        );
+                        assert_eq!(
+                            decimal_column_values(width, scale, value).decimals_can_be_encoded(),
+                            writes,
+                            "{case}"
+                        );
+                        let bound = value.fits_with_scale_by_bit_length(scale, width);
+                        assert!(bound.is_none_or(|fits| fits == writes), "{case}");
+                        bound_answers.insert(bound);
+                    }
+                }
+            }
+            assert_eq!(
+                bound_answers.into_iter().collect::<Vec<_>>(),
+                [None, Some(false), Some(true)],
+                "width {width}"
+            );
+        }
+    }
+
+    /// Where bit lengths decide whether a rescaled decimal fits its width,
+    /// they say what the rescale says: for zero, the largest magnitude and
+    /// those next to each power of two, of either sign, for every scale
+    /// difference up to the largest scale, and for a value with more digits
+    /// after the point than its column.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_decimal_bit_length_bound_agrees_with_the_rescale() {
+        let mut magnitudes = vec![
+            [0u64; QWP_DECIMAL_MAG_LIMBS],
+            [u64::MAX; QWP_DECIMAL_MAG_LIMBS],
+        ];
+        for bit in 0..QWP_DECIMAL_MAG_BYTES * 8 {
+            let mut power = [0u64; QWP_DECIMAL_MAG_LIMBS];
+            power[bit / 64] = 1 << (bit % 64);
+            let mut below = [0u64; QWP_DECIMAL_MAG_LIMBS];
+            below[..bit / 64].fill(u64::MAX);
+            below[bit / 64] = (1 << (bit % 64)) - 1;
+            let mut above = power;
+            add_mag_small(&mut above, 1, "").unwrap();
+            magnitudes.extend([below, power, above]);
+        }
+        let (mut decided, mut undecided) = (0, 0);
+        for magnitude in magnitudes {
+            for negative in [false, true] {
+                for (value_scale, scales) in [(0, 0..=QWP_DECIMAL_MAX_SCALE), (5, 0..=4)] {
+                    let value = StoredQwpDecimal {
+                        scale: value_scale,
+                        negative,
+                        magnitude,
+                    };
+                    for scale in scales {
+                        for width in [8, 16, QWP_DECIMAL_MAG_BYTES] {
+                            match value.fits_with_scale_by_bit_length(scale, width) {
+                                Some(fits) => {
+                                    decided += 1;
+                                    assert_eq!(
+                                        fits,
+                                        encoder_writes_decimal(&value, scale, width),
+                                        "width {width}, scale {scale}: {value:?}"
+                                    );
+                                }
+                                None => undecided += 1,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(decided > 0 && undecided > 0, "{decided} {undecided}");
     }
 
     /// Of a value that cannot be sent and a row above the cap, the planner
