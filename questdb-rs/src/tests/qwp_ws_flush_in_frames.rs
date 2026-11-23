@@ -2715,6 +2715,244 @@ fn a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_f
     server.finish();
 }
 
+/// The settings of a sender whose queue is the slot `reopened` of `sf_dir`,
+/// in segments of `segment_size_bytes`, and `more`. Its drop does not wait
+/// for the server, so that the next sender on the slot can come at once.
+fn reopened_slot_settings(
+    sf_dir: &tempfile::TempDir,
+    segment_size_bytes: u64,
+    more: &str,
+) -> String {
+    format!(
+        "sf_dir={};sender_id=reopened;sf_max_segment_bytes={segment_size_bytes};\
+         close_flush_timeout_millis=0;{more}",
+        sf_dir.path().display()
+    )
+}
+
+/// The sizes of the segment files in the slot of [`reopened_slot_settings`].
+fn reopened_segment_sizes(sf_dir: &tempfile::TempDir) -> Vec<u64> {
+    let mut sizes: Vec<u64> = std::fs::read_dir(sf_dir.path().join("reopened"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".sfa"))
+        .map(|entry| entry.metadata().unwrap().len())
+        .collect();
+    sizes.sort();
+    sizes
+}
+
+/// A slot made with segments of 1,024 bytes is reopened with segments of
+/// 2,048 bytes, and goes on with the segment it had in use. The flush in
+/// frames that comes then waits for room, which is counted for the segment
+/// in use at its own size: with the server silent it waits in vain and
+/// sends nothing, and it goes through once the server answers.
+fn a_flush_on_a_slot_reopened_with_larger_segments_counts_the_segment_in_use_at_its_size(
+    progress: Progress,
+) {
+    const DEADLINE: Duration = Duration::from_millis(400);
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    // Three flushes of one frame of over 600 bytes: each takes a segment of
+    // 1,024 bytes.
+    let earlier = [
+        buffer_of(TABLE, 0..22),
+        buffer_of(TABLE, 100..121),
+        buffer_of(TABLE, 200..221),
+    ];
+    for buffer in &earlier {
+        assert!(frame_of_a_whole_buffer(buffer, false).len() > 600);
+    }
+    {
+        let settings = reopened_slot_settings(&sf_dir, 1024, "sf_max_total_bytes=8192;");
+        let mut sender = sender_with(server.port, progress, &settings);
+        for (fsn, buffer) in earlier.iter().enumerate() {
+            assert_eq!(
+                sender.flush_and_keep_and_get_fsn(buffer).unwrap(),
+                Some(fsn as u64)
+            );
+        }
+        wait_for_frames_sent(&mut sender, progress, &server, 3);
+    }
+    // The three segments of the frames, and the spare.
+    assert_eq!(reopened_segment_sizes(&sf_dir), [1024; 4]);
+
+    // Next to the three segments of 1,024 bytes and a new spare of 2,048,
+    // the budget has no room for another segment: the flush has the spare.
+    // Its frames take 999, 999 and 327 bytes by their size bounds. The
+    // first does not fit the segment in use, the third does not fit the
+    // spare after the first two: the flush needs two new segments.
+    let settings = reopened_slot_settings(
+        &sf_dir,
+        2048,
+        "sf_max_total_bytes=6144;sf_append_deadline_millis=400;",
+    );
+    let mut sender = sender_with(server.port, progress, &settings);
+    wait_for_frames_sent(&mut sender, progress, &server, 6);
+    let mut large = buffer_of(TABLE, 1000..1078);
+    let frames = frames_of_a_flush(&large, 1004).len();
+    assert_eq!(frames, 3);
+    let (rows, len) = (large.row_count(), large.len());
+
+    let started = Instant::now();
+    let err = sender.flush(&mut large).unwrap_err();
+    let waited = started.elapsed();
+    assert_eq!(err.code(), ErrorCode::SocketError, "{}", err.msg());
+    assert!(
+        err.msg().starts_with(
+            "QWP/WebSocket Store-and-Forward append timed out waiting for ACK-driven segment \
+             trim; increase sf_max_total_bytes or drive pending acknowledgements \
+             [segment_size_bytes=2048, "
+        ),
+        "{}",
+        err.msg()
+    );
+    assert!(waited >= DEADLINE && waited < WAIT, "waited {waited:?}");
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        Some(2),
+        "nothing is published"
+    );
+    assert_eq!((large.row_count(), large.len()), (rows, len));
+    for _ in 0..50 {
+        let_it_work(&mut sender, progress);
+    }
+    assert_eq!(server.frames_taken(), 6, "nothing is sent");
+
+    server.let_answers_go();
+    let retry_until = Instant::now() + WAIT;
+    let last_fsn = loop {
+        match sender.flush_and_keep_and_get_fsn(&large) {
+            Ok(fsn) => break fsn,
+            Err(err) => assert!(Instant::now() < retry_until, "{}", err.msg()),
+        }
+    };
+    assert_eq!(last_fsn, Some(2 + frames as u64));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    // The server committed the earlier flushes on the first connection, and
+    // again when the reopened slot sent them.
+    let [first, second, third] = &earlier;
+    assert_table_holds(
+        &server,
+        TABLE,
+        7,
+        &[first, second, third, first, second, third, &large],
+    );
+    drop(sender);
+    server.finish();
+}
+
+/// A slot made with segments of 2,048 bytes is reopened with segments of
+/// 1,024 bytes, and goes on with the larger segment it had in use. A flush
+/// in frames that the queue can hold next to a segment of 1,024 bytes, and
+/// not next to that one, is refused at once with the budget it needs.
+fn a_flush_on_a_slot_reopened_with_smaller_segments_is_refused_for_the_segment_in_use(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    // Two flushes of one frame of over 800 bytes fill the first segment
+    // so far that no frame of the flush below fits it.
+    let earlier = [buffer_of(TABLE, 0..30), buffer_of(TABLE, 100..128)];
+    for buffer in &earlier {
+        assert!(frame_of_a_whole_buffer(buffer, false).len() > 800);
+    }
+    {
+        let settings = reopened_slot_settings(&sf_dir, 2048, "");
+        let mut sender = sender_with(server.port, progress, &settings);
+        for (fsn, buffer) in earlier.iter().enumerate() {
+            assert_eq!(
+                sender.flush_and_keep_and_get_fsn(buffer).unwrap(),
+                Some(fsn as u64)
+            );
+        }
+        wait_for_frames_sent(&mut sender, progress, &server, 2);
+    }
+    server.let_answers_go();
+
+    // Next to a segment in use of 1,024 bytes, the frames fit the budget
+    // that the error of a flush on a fresh slot names.
+    let mut too_large = buffer_of(TABLE, 300..700);
+    let frames = frames_of_a_flush(&too_large, 492).len();
+    let max_total_bytes = queue_bytes_for(frames);
+    let settings = reopened_slot_settings(
+        &sf_dir,
+        1024,
+        &format!("sf_max_total_bytes={max_total_bytes};sf_append_deadline_millis=400;"),
+    );
+    let mut sender = sender_with(server.port, progress, &settings);
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    let started = Instant::now();
+    assert_refused_for_the_queue(
+        &mut sender,
+        &mut too_large,
+        frames,
+        max_total_bytes + 1024,
+        max_total_bytes,
+    );
+    assert!(started.elapsed() < Duration::from_millis(400));
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        Some(1),
+        "nothing is published"
+    );
+
+    // The sender goes on.
+    let after = buffer_of(TABLE, 700..703);
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&after).unwrap(), Some(2));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let [first, second] = &earlier;
+    assert_table_holds(&server, TABLE, 5, &[first, second, first, second, &after]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+/// A slot made with segments of 2,048 bytes is reopened with segments of
+/// 1,024 bytes, and goes on with the larger segment it had in use, which
+/// holds one small frame. A flush in frames that fits the rest of that
+/// segment needs no more of the budget, and goes through.
+fn a_flush_on_a_slot_reopened_with_smaller_segments_that_fits_the_segment_in_use_is_sent(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let before = buffer_of(TABLE, 0..3);
+    {
+        let settings = reopened_slot_settings(&sf_dir, 2048, "");
+        let mut sender = sender_with(server.port, progress, &settings);
+        assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+        wait_for_frames_sent(&mut sender, progress, &server, 1);
+    }
+    server.let_answers_go();
+
+    // Three frames of 1,192 bytes in all fit the segment in use. On a fresh
+    // slot of segments of 1,024 bytes they need a queue of 3,072 bytes.
+    let large = buffer_of(TABLE, 3..43);
+    let frames = frames_of_a_flush(&large, 492).len();
+    assert_eq!(frames, 3);
+    let settings = reopened_slot_settings(&sf_dir, 1024, "sf_max_total_bytes=3072;");
+    let mut sender = sender_with(server.port, progress, &settings);
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frames as u64)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), 2 + frames);
+    // The server committed the earlier flush on the first connection, and
+    // again when the reopened slot sent it.
+    assert_table_holds(&server, TABLE, 3, &[&before, &before, &large]);
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
 fn a_sender_that_was_closed_refuses_a_buffer_above_the_frame_cap(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let mut sender = sender_with(server.port, progress, "");
@@ -3879,6 +4117,9 @@ in_both_progress_modes! {
     a_flush_without_room_waits_until_the_server_confirms_what_the_queue_holds
     a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
     a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails
+    a_flush_on_a_slot_reopened_with_larger_segments_counts_the_segment_in_use_at_its_size
+    a_flush_on_a_slot_reopened_with_smaller_segments_is_refused_for_the_segment_in_use
+    a_flush_on_a_slot_reopened_with_smaller_segments_that_fits_the_segment_in_use_is_sent
     a_sender_that_was_closed_refuses_a_buffer_above_the_frame_cap
     a_flush_that_fails_at_its_second_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered

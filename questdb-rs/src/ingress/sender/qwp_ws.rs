@@ -4574,7 +4574,7 @@ pub(crate) const NO_SYMBOL_FILE: &str = " It is not sent in several frames, beca
 /// encoder gives a value that cannot be sent the error of that value. The
 /// size bound of a buffer takes more than its frame for symbols, so what
 /// the bound keeps from frames may fit one frame all the same: a buffer
-/// above `max_buf_size`, a buffer whose frames the queue can never hold
+/// above `max_buf_size`, a buffer whose frames the queue cannot hold
 /// together, and a buffer with a row that fits no frame by its bound. Such a
 /// buffer is sent when it fits one frame. When it does not, it is refused
 /// with an error that names `max_buf_size`, the queue, or the row.
@@ -4665,8 +4665,8 @@ fn flush_qwp_ws_through(
 enum QwpWsNotInFrames {
     /// The buffer is larger than `max_buf_size`.
     AboveMaxBufSize { len: usize, max_buf_size: usize },
-    /// The queue can never hold the `frame_count` frames of the plan
-    /// together: they need `min_total_bytes`.
+    /// The queue cannot hold the `frame_count` frames of the plan together,
+    /// whatever the server confirms: they need `min_total_bytes`.
     AboveQueue {
         frame_count: usize,
         min_total_bytes: u64,
@@ -4758,8 +4758,8 @@ fn row_exceeds_frame_cap_error(table: &str, frame_size: usize, frame_cap: usize)
     )
 }
 
-/// The refusal of a flush whose frames the queue can never hold together,
-/// whatever the server confirms.
+/// The refusal of a flush whose frames the queue cannot hold together,
+/// whatever the server confirms: see [`SfaProducer::min_total_bytes_for`].
 fn flush_exceeds_queue_error(
     frame_count: usize,
     min_total_bytes: u64,

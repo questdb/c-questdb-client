@@ -150,7 +150,10 @@ rows, when:
   or
 - the queue (`sf_max_total_bytes`, by default 128 MiB in memory and 10 GiB
   with `sf_dir`) can never hold the frames of the flush together. The error
-  names the value that would.
+  names the value that would. A slot reopened with a smaller
+  `sf_max_segment_bytes` fills the larger segment it had first, and until
+  then a flush in several frames needs room for that segment and for the
+  segments that its frames fill beyond what is left of it.
 
 The last two go by the buffer's `len()` and the frame sizes planned from it,
 which count more than the frames take for symbols: each symbol value at the

@@ -3800,24 +3800,28 @@ pub(crate) fn two_frame_segment_payload_capacity(segment_size_bytes: u64) -> usi
 }
 
 /// How many new segments frames with payloads of `payload_lens` bytes take
-/// when they are appended one after another to a segment that is filled up to
-/// `append_offset`: a frame that does not fit the segment starts a new one.
-/// `None` when a frame fits no segment.
+/// when they are appended one after another to a segment of
+/// `active_size_bytes` that is filled up to `append_offset`: a frame that
+/// does not fit the segment starts a new one, of `segment_size_bytes`.
+/// `None` when a frame fits no new segment.
 fn new_segments_for_frames(
+    active_size_bytes: u64,
     segment_size_bytes: u64,
     mut append_offset: u64,
     payload_lens: &[usize],
 ) -> Option<u64> {
     let payload_capacity = segment_payload_capacity(segment_size_bytes);
+    let mut size_bytes = active_size_bytes;
     let mut new_segments = 0;
     for &payload_len in payload_lens {
         if payload_len > payload_capacity {
             return None;
         }
         let frame_len = (FRAME_HEADER_SIZE + payload_len) as u64;
-        if append_offset + frame_len > segment_size_bytes {
+        if append_offset + frame_len > size_bytes {
             new_segments += 1;
             append_offset = HEADER_SIZE as u64;
+            size_bytes = segment_size_bytes;
         }
         append_offset += frame_len;
     }
@@ -3834,11 +3838,18 @@ impl SfaProducer {
     /// installs a spare out of the free budget and the next rotation uses it.
     /// A no does not count the segments of confirmed frames that the runner
     /// has yet to free.
+    ///
+    /// The segment in use may have another size than the new ones: a slot
+    /// reopened with another `sf_max_segment_bytes` goes on with the segment
+    /// it had.
     pub(crate) fn has_room_for(&self, payload_lens: &[usize]) -> bool {
         let segment_size_bytes = self.engine.segment_size_bytes;
-        let Some(new_segments) =
-            new_segments_for_frames(segment_size_bytes, self.active_append_offset, payload_lens)
-        else {
+        let Some(new_segments) = new_segments_for_frames(
+            self.active.size_bytes(),
+            segment_size_bytes,
+            self.active_append_offset,
+            payload_lens,
+        ) else {
             return false;
         };
         self.engine.with_state(|state| {
@@ -3849,10 +3860,9 @@ impl SfaProducer {
         })
     }
 
-    /// The least byte budget (`sf_max_total_bytes`) with which a queue of
-    /// segments like this one's takes frames with payloads of `payload_lens`
-    /// bytes as one flush, whatever it took before. `None` when a frame fits
-    /// no segment.
+    /// The least byte budget (`sf_max_total_bytes`) with which this queue
+    /// takes frames with payloads of `payload_lens` bytes as one flush. `None`
+    /// when a frame fits no segment.
     ///
     /// The frames of a flush are confirmed together, so the queue holds them
     /// all at once. It holds them next to the segment in use, which keeps its
@@ -3862,11 +3872,34 @@ impl SfaProducer {
     /// stands, once every frame before them is confirmed and the runner has
     /// freed their segments. With a segment less they have room only when
     /// the first of them fits the segment in use.
+    ///
+    /// A slot reopened with a smaller `sf_max_segment_bytes` goes on with a
+    /// larger segment in use. While the producer is in it, the budget is that
+    /// segment and the segments that the frames fill from where the producer
+    /// stands, as [`Self::has_room_for`] counts them. Only the appends of this
+    /// producer move it, so a wait for room ends, once every frame before the
+    /// flush is confirmed, exactly when the queue has this budget.
     pub(crate) fn min_total_bytes_for(&self, payload_lens: &[usize]) -> Option<u64> {
         let segment_size_bytes = self.engine.segment_size_bytes;
-        let segments =
-            new_segments_for_frames(segment_size_bytes, segment_size_bytes, payload_lens)?;
-        Some((segments + 1).saturating_mul(segment_size_bytes))
+        let active_size_bytes = self.active.size_bytes();
+        let (segment_in_use_bytes, segments) = if active_size_bytes > segment_size_bytes {
+            let segments = new_segments_for_frames(
+                active_size_bytes,
+                segment_size_bytes,
+                self.active_append_offset,
+                payload_lens,
+            )?;
+            (active_size_bytes, segments)
+        } else {
+            let segments = new_segments_for_frames(
+                segment_size_bytes,
+                segment_size_bytes,
+                segment_size_bytes,
+                payload_lens,
+            )?;
+            (segment_size_bytes, segments)
+        };
+        Some(segment_in_use_bytes.saturating_add(segments.saturating_mul(segment_size_bytes)))
     }
 
     /// The byte budget of the queue (`sf_max_total_bytes`).
@@ -7723,8 +7756,12 @@ mod tests {
             let frames = numbers.between(1, 24);
             let lens = numbers.payload_lens(frames, segment_size_bytes);
 
-            let counted =
-                new_segments_for_frames(segment_size_bytes, producer.active_append_offset, &lens);
+            let counted = new_segments_for_frames(
+                segment_size_bytes,
+                segment_size_bytes,
+                producer.active_append_offset,
+                &lens,
+            );
             let sealed_before = queue.sealed_segment_count();
             for len in &lens {
                 producer.try_submit(&payload[..*len]).unwrap();
@@ -7740,18 +7777,34 @@ mod tests {
     fn new_segments_for_frames_follows_the_fit_rule_of_a_segment_to_the_byte() {
         // A segment of 100 bytes: a header of 24, then frames of their
         // payload and 8 bytes each.
-        assert_eq!(new_segments_for_frames(100, 24, &[68]), Some(0));
-        assert_eq!(new_segments_for_frames(100, 24, &[69]), None);
-        assert_eq!(new_segments_for_frames(100, 24, &[30, 30]), Some(0));
-        assert_eq!(new_segments_for_frames(100, 24, &[30, 31]), Some(1));
-        assert_eq!(new_segments_for_frames(100, 62, &[30]), Some(0));
-        assert_eq!(new_segments_for_frames(100, 63, &[30]), Some(1));
+        assert_eq!(new_segments_for_frames(100, 100, 24, &[68]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 100, 24, &[69]), None);
+        assert_eq!(new_segments_for_frames(100, 100, 24, &[30, 30]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 100, 24, &[30, 31]), Some(1));
+        assert_eq!(new_segments_for_frames(100, 100, 62, &[30]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 100, 63, &[30]), Some(1));
         // In the new segment the frame starts after the header again.
-        assert_eq!(new_segments_for_frames(100, 63, &[30, 30]), Some(1));
-        assert_eq!(new_segments_for_frames(100, 63, &[30, 31]), Some(2));
-        assert_eq!(new_segments_for_frames(100, 100, &[68, 68, 68]), Some(3));
-        assert_eq!(new_segments_for_frames(100, 24, &[]), Some(0));
-        assert_eq!(new_segments_for_frames(100, 24, &[1, 69, 1]), None);
+        assert_eq!(new_segments_for_frames(100, 100, 63, &[30, 30]), Some(1));
+        assert_eq!(new_segments_for_frames(100, 100, 63, &[30, 31]), Some(2));
+        assert_eq!(
+            new_segments_for_frames(100, 100, 100, &[68, 68, 68]),
+            Some(3)
+        );
+        assert_eq!(new_segments_for_frames(100, 100, 24, &[]), Some(0));
+        assert_eq!(new_segments_for_frames(100, 100, 24, &[1, 69, 1]), None);
+        // The segment in use may be smaller or larger than a new one: only
+        // the frames that it holds count at its size.
+        assert_eq!(new_segments_for_frames(80, 200, 24, &[48]), Some(0));
+        assert_eq!(new_segments_for_frames(80, 200, 24, &[49]), Some(1));
+        assert_eq!(new_segments_for_frames(80, 200, 24, &[49, 111]), Some(1));
+        assert_eq!(new_segments_for_frames(80, 200, 24, &[49, 112]), Some(2));
+        assert_eq!(new_segments_for_frames(200, 100, 24, &[60, 60]), Some(0));
+        assert_eq!(
+            new_segments_for_frames(200, 100, 24, &[60, 60, 60]),
+            Some(1)
+        );
+        // A frame that only the segment in use could hold fits no new one.
+        assert_eq!(new_segments_for_frames(200, 100, 24, &[69]), None);
     }
 
     /// The room for a flush is counted right when the count says whether
@@ -7936,6 +7989,95 @@ mod tests {
             producer.try_submit(&[0x5a; 30]).unwrap();
         }
         assert_eq!(queue.allocated_segment_bytes(), 400);
+    }
+
+    /// A slot made with segments of `in_use_bytes`, left with one frame of
+    /// 30 bytes that is not confirmed, and reopened with segments of
+    /// `segment_size_bytes` and a budget of `max_bytes`. It goes on with the
+    /// segment it had, filled up to 62 bytes.
+    fn reopened_with_other_segments(
+        dir: &TempDir,
+        in_use_bytes: u64,
+        segment_size_bytes: u64,
+        max_bytes: usize,
+    ) -> (SfaFrameQueue, SfaProducer) {
+        {
+            let mut queue =
+                SfaFrameQueue::open(options_with(dir, in_use_bytes, 4 * in_use_bytes as usize))
+                    .unwrap();
+            let mut producer = queue.take_producer().unwrap();
+            producer.try_submit(&[0x5a; 30]).unwrap();
+        }
+        let mut queue =
+            SfaFrameQueue::open(options_with(dir, segment_size_bytes, max_bytes)).unwrap();
+        let producer = queue.take_producer().unwrap();
+        assert_eq!(
+            (producer.active.size_bytes(), producer.active_append_offset),
+            (in_use_bytes, 62)
+        );
+        (queue, producer)
+    }
+
+    #[test]
+    fn has_room_for_counts_the_segment_in_use_at_its_own_size() {
+        // A segment in use of 100 bytes, new ones of 200, and room for one:
+        // the spare. 30 bytes fit the segment in use, 31 do not.
+        let dir = TempDir::new().unwrap();
+        let (queue, mut producer) = reopened_with_other_segments(&dir, 100, 200, 300);
+        assert!(queue.hot_spare_installed());
+        assert!(!producer.has_room_for(&[31, 150]));
+        assert!(producer.has_room_for(&[30, 150]));
+        producer.try_submit(&[0x5a; 30]).unwrap();
+        producer.try_submit(&[0x5a; 150]).unwrap();
+        drop((producer, queue));
+
+        let dir = TempDir::new().unwrap();
+        let (_queue, mut producer) = reopened_with_other_segments(&dir, 100, 200, 300);
+        producer.try_submit(&[0x5a; 31]).unwrap();
+        assert!(matches!(
+            producer.try_submit(&[0x5a; 150]),
+            Err(SfaQueueError::Queue(
+                QueueError::StorageSegmentCapFull { .. }
+            ))
+        ));
+
+        // A segment in use of 200 bytes, new ones of 100, and no room for a
+        // new one.
+        let dir = TempDir::new().unwrap();
+        let (queue, mut producer) = reopened_with_other_segments(&dir, 200, 100, 200);
+        assert!(!queue.hot_spare_installed());
+        assert!(producer.has_room_for(&[60, 60]));
+        assert!(!producer.has_room_for(&[60, 60, 60]));
+        producer.try_submit(&[0x5a; 60]).unwrap();
+        producer.try_submit(&[0x5a; 60]).unwrap();
+    }
+
+    #[test]
+    fn min_total_bytes_for_counts_a_larger_segment_in_use_until_the_producer_leaves_it() {
+        // Segments of 100 bytes take one frame of 68 bytes, so three such
+        // frames fill three new segments.
+        let lens = [68, 68, 68];
+        let dir = TempDir::new().unwrap();
+        let (_queue, producer) = reopened_with_other_segments(&dir, 80, 100, 1000);
+        assert_eq!(producer.min_total_bytes_for(&lens), Some(400));
+
+        let dir = TempDir::new().unwrap();
+        let (_queue, mut producer) = reopened_with_other_segments(&dir, 300, 100, 1000);
+        // In the segment of 300 bytes, filled up to 62, the bound counts the
+        // frames from there: all three fit it, then two, then none.
+        assert_eq!(producer.min_total_bytes_for(&lens), Some(300));
+        producer.try_submit(&[0x5a; 60]).unwrap();
+        assert_eq!(producer.min_total_bytes_for(&lens), Some(400));
+        // Three frames of 60 bytes fill the 300 bytes up to 266, and a
+        // fourth starts a segment of 100 bytes.
+        for _ in 0..2 {
+            producer.try_submit(&[0x5a; 60]).unwrap();
+        }
+        assert_eq!(producer.active.size_bytes(), 300);
+        assert_eq!(producer.min_total_bytes_for(&lens), Some(600));
+        producer.try_submit(&[0x5a; 60]).unwrap();
+        assert_eq!(producer.active.size_bytes(), 100);
+        assert_eq!(producer.min_total_bytes_for(&lens), Some(400));
     }
 
     #[test]
