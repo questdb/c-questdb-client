@@ -1193,7 +1193,7 @@ where
                     {
                         if self.aborted_flush.is_some() {
                             drop(store);
-                            return self.close_after_aborted_flush();
+                            return self.close_after_aborted_flush(deadline);
                         }
                         store
                             .close_queue()
@@ -1223,14 +1223,31 @@ where
     /// writes the confirmed position, which may be ahead of the watermark
     /// that the thread wrote, gives up the frames of the flush, and removes
     /// the files of the slot, the symbol file too. The slot is given up only
-    /// then. If the thread does not stop in time, nothing is closed.
+    /// then. If the thread is not gone by `deadline`, or within the bound of
+    /// [`Drop`] when that comes first, nothing is closed: the drop of the
+    /// sender waits for the thread again.
     ///
     /// A terminal error that the thread recorded after the frames before the
     /// flush were confirmed does not stop the close: it can only be of the
     /// frames of the flush or of the end of the connection, and nothing of
     /// the flush is committed either way.
-    fn close_after_aborted_flush(&mut self) -> crate::Result<()> {
-        self.stop_network_thread()?;
+    fn close_after_aborted_flush(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
+        let wait = deadline.map_or(self.shutdown_timeout, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(self.shutdown_timeout)
+        });
+        if !self.stop_network_thread(wait)? {
+            return Err(if wait < self.shutdown_timeout {
+                close_drain_timeout_after_aborted_flush_error(self.has_sf_dir)
+            } else {
+                error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket runner did not stop within {:?}",
+                    self.shutdown_timeout
+                )
+            });
+        }
         let mut store = self.lock_shared()?;
         // The thread finishes a storage task within one step, so none is in
         // flight once it is gone.
@@ -1248,22 +1265,18 @@ where
             .map_err(driver_error_to_error_without_state)
     }
 
-    /// Stops the network thread and waits, as long as [`Drop`] does, until
-    /// it is gone.
-    fn stop_network_thread(&mut self) -> crate::Result<()> {
+    /// Stops the network thread and waits up to `wait` until it is gone.
+    /// Whether it is gone.
+    fn stop_network_thread(&mut self, wait: Duration) -> crate::Result<bool> {
         self.stop.store(true, Ordering::Release);
         if let Err(err) = self.traffic_gate.shutdown() {
             log::warn!("could not shut down QWP/WebSocket runner traffic: {err}");
         }
         let Some(thread) = self.thread.as_ref() else {
-            return Ok(());
+            return Ok(true);
         };
-        if !wait_for_runner_exit(thread, self.shutdown_timeout) {
-            return Err(error::fmt!(
-                SocketError,
-                "QWP/WebSocket runner did not stop within {:?}",
-                self.shutdown_timeout
-            ));
+        if !wait_for_runner_exit(thread, wait) {
+            return Ok(false);
         }
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
@@ -1273,7 +1286,7 @@ where
                 "QWP/WebSocket runner thread panicked"
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     fn lock_shared(&self) -> crate::Result<std::sync::MutexGuard<'_, QwpWsPublicationStore<Q>>> {
@@ -5410,6 +5423,25 @@ fn close_drain_timeout_error(
     }
 }
 
+/// The error of a close drain in background progress mode whose deadline
+/// passed while the network thread was stopping after a flush that failed
+/// part way, with the flushes before it confirmed. Nothing is closed, and
+/// where the frames of the failed flush go depends on `has_sf_dir`.
+fn close_drain_timeout_after_aborted_flush_error(has_sf_dir: bool) -> crate::Error {
+    let what_to_do = if has_sf_dir {
+        "Drop the sender: the next sender on the slot under sf_dir removes that flush."
+    } else {
+        "Drop the sender: the frames of that flush go with it."
+    };
+    error::fmt!(
+        SocketError,
+        "QWP/WebSocket close drain timed out while the sender was closing its connection after \
+         the flush that stopped part way. The flushes before it are confirmed, and nothing of \
+         that flush is committed: only a flush with more rows of one table than the server's \
+         qwp.max.uncommitted.rows may be committed in part. {what_to_do}"
+    )
+}
+
 fn double_duration(duration: Duration) -> Duration {
     duration.checked_mul(2).unwrap_or(Duration::MAX)
 }
@@ -8794,6 +8826,74 @@ mod tests {
         let mut rows = rows_of(FLUSH_TABLE, &before);
         rows.extend(rows_of(FLUSH_TABLE, &buffer));
         assert_eq!(table.rows_as_text(), rows);
+    }
+
+    /// After a flush that failed part way, the close drain stops the network
+    /// thread before it closes the queue. It waits for the thread until its
+    /// deadline, and never longer than the drop of the runner does: what ends
+    /// the wait first names the error. Here the thread is parked with the
+    /// confirmation of the flush before stored in the queue.
+    #[test]
+    fn a_close_drain_after_a_flush_that_failed_part_way_waits_for_the_thread_until_its_deadline_or_the_drop_bound()
+     {
+        const SHORT: Duration = Duration::from_millis(100);
+        let parked = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
+        let _hook = {
+            let (parked, held) = (Arc::clone(&parked), Arc::clone(&held));
+            ConfirmationStoredHookGuard::new(Arc::new(move |_| {
+                while held.load(Ordering::Acquire) {
+                    parked.store(true, Ordering::Release);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }))
+        };
+        let timed_out = "QWP/WebSocket close drain timed out while the sender was closing its \
+                         connection after the flush that stopped part way. The flushes before \
+                         it are confirmed, and nothing of that flush is committed: only a \
+                         flush with more rows of one table than the server's \
+                         qwp.max.uncommitted.rows may be committed in part. Drop the sender: \
+                         the frames of that flush go with it.";
+        for (shutdown_timeout, close_timeout, expected) in [
+            (Duration::from_secs(5), SHORT, timed_out),
+            (
+                SHORT,
+                Duration::from_secs(5),
+                "QWP/WebSocket runner did not stop within 100ms",
+            ),
+        ] {
+            let server = QwpWsServerModel::new();
+            let (mut runner, mut encoder, wire) =
+                runner_on_model(&server, small_segments(2), Duration::from_millis(50), None);
+            runner.shutdown_timeout = shutdown_timeout;
+            let before = buffer_of(FLUSH_TABLE, 0..3);
+            let buffer = buffer_of(FLUSH_TABLE, 3..403);
+            let plan = small_frames_plan(&buffer);
+            wire.answers_held.store(true, Ordering::Release);
+            assert_eq!(publish_as_one_frame(&mut encoder, &mut runner, &before), 0);
+            let err = publish_frames(&mut encoder, &mut runner, &buffer, &plan).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::FlushAborted);
+
+            parked.store(false, Ordering::Release);
+            held.store(true, Ordering::Release);
+            wire.answers_held.store(false, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !parked.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "the network thread did not park");
+                thread::sleep(Duration::from_millis(1));
+            }
+            let started = Instant::now();
+            let err = runner.close_drain(close_timeout).unwrap_err();
+            let took = started.elapsed();
+            held.store(false, Ordering::Release);
+            assert!(
+                took >= SHORT && took < SHORT + Duration::from_secs(2),
+                "close drain took {took:?}"
+            );
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert_eq!(err.msg(), expected);
+            drop(runner);
+        }
     }
 
     #[test]

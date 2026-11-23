@@ -2300,7 +2300,10 @@ public:
      * frames are not confirmed. Without `sf_dir` they are dropped with the
      * sender: call `wait()` before closing, raise `close_flush_timeout_millis`,
      * or use `sf_dir`. With `sf_dir` they stay in the slot and the next sender
-     * on the slot sends them.
+     * on the slot sends them. After a flush that failed with `flush_aborted`,
+     * in background progress mode, the error can instead say that the flushes
+     * before it are confirmed and the connection was still closing: destroy
+     * the sender then.
      */
     void close_drain()
     {

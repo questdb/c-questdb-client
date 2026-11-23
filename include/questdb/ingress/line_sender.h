@@ -2341,9 +2341,12 @@ bool line_sender_qwpws_effective_frame_cap(
  * many published frames are not confirmed. Without `sf_dir` they are dropped
  * with the sender: call `line_sender_qwpws_wait` before closing, raise
  * `close_flush_timeout_millis`, or use `sf_dir`. With `sf_dir` they stay in the
- * slot and the next sender on the slot sends them. A timeout while the sender
- * is disconnected and reconnecting keeps failing names that failure, in either
- * progress mode, as `line_sender_qwpws_wait` does.
+ * slot and the next sender on the slot sends them. After a flush that failed
+ * with `line_sender_error_flush_aborted`, in background progress mode, the
+ * error can instead say that the flushes before it are confirmed and the
+ * connection was still closing: close the sender then. A timeout while the
+ * sender is disconnected and reconnecting keeps failing names that failure, in
+ * either progress mode, as `line_sender_qwpws_wait` does.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_close_drain(

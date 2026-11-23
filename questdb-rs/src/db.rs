@@ -3122,12 +3122,20 @@ fn drain_sfa_before_drop(inner: &DbInner, sender: &mut PooledSenderCore) {
     sender.close_open_deferred_group();
     sender.begin_close();
     if let Err(err) = sender.drain_to_deadline(Instant::now().checked_add(timeout)) {
-        log::warn!(
-            "store-and-forward sender dropped with frame(s) that could \
-             not be delivered within close_flush_timeout; their data is \
-             discarded. Call wait() before closing the pool, or set sf_dir for \
-             crash-durable persistence. Cause: {err}"
-        );
+        if sender.has_aborted_flush() && sender.sfa_fully_delivered(durable) {
+            log::warn!(
+                "store-and-forward sender whose flush stopped part way dropped while \
+                 its connection was still closing at close_flush_timeout; the flushes \
+                 before that flush are confirmed. Cause: {err}"
+            );
+        } else {
+            log::warn!(
+                "store-and-forward sender dropped with frame(s) that could \
+                 not be delivered within close_flush_timeout; their data is \
+                 discarded. Call wait() before closing the pool, or set sf_dir for \
+                 crash-durable persistence. Cause: {err}"
+            );
+        }
     }
 }
 
@@ -3156,12 +3164,21 @@ fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [PooledSenderCore]) 
             continue;
         }
         if let Err(err) = sender.drain_to_deadline(deadline) {
-            log::warn!(
-                "store-and-forward sender dropped on pool close with \
-                 frame(s) that could not be delivered within close_flush_timeout; \
-                 their data is discarded. Call wait() before close, or set \
-                 sf_dir for crash-durable persistence. Cause: {err}"
-            );
+            if sender.has_aborted_flush() && sender.sfa_fully_delivered(durable) {
+                log::warn!(
+                    "store-and-forward sender whose flush stopped part way dropped on \
+                     pool close while its connection was still closing at \
+                     close_flush_timeout; the flushes before that flush are confirmed. \
+                     Cause: {err}"
+                );
+            } else {
+                log::warn!(
+                    "store-and-forward sender dropped on pool close with \
+                     frame(s) that could not be delivered within close_flush_timeout; \
+                     their data is discarded. Call wait() before close, or set \
+                     sf_dir for crash-durable persistence. Cause: {err}"
+                );
+            }
         }
     }
 }

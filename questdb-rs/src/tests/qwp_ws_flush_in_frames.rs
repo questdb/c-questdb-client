@@ -3460,6 +3460,67 @@ fn a_confirmation_that_comes_as_close_drain_starts_after_a_flush_that_failed_par
     server.finish();
 }
 
+/// After a flush that failed part way, the network thread is slow to stop
+/// when `close_drain` comes: it is parked with the confirmation of the flush
+/// before stored in the queue. `close_drain` gives up at its timeout and
+/// closes nothing. The drop of the sender stops the thread, and the next
+/// sender on the slot commits nothing again.
+#[test]
+fn a_close_drain_after_a_flush_that_failed_part_way_gives_up_at_its_timeout_while_the_network_thread_stops()
+ {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let settings = format!("{}{CLOSE_FLUSH_TIMEOUT_SETTING}", slot_settings(&sf_dir));
+    let (before, mut large, failing, symbols) = a_flush_before_and_one_that_stops_part_way();
+    let hold = Arc::new(ConfirmationHold::default());
+    let _hook = ConfirmationStoredHookGuard::new(hold.hook());
+    let mut sender = {
+        let _cap = crate::ingress::TestDictCapGuard::new(symbols);
+        sender_with(server.port, Progress::Background, &settings)
+    };
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    let err = sender.flush(&mut large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    wait_for_frames_taken(&server, 1 + failing);
+    hold.arm();
+    server.let_answers_go();
+    assert_eq!(hold.wait_until_parked(), Some(0));
+    let started = Instant::now();
+    let err = sender.close_drain().unwrap_err();
+    let took = started.elapsed();
+    hold.release();
+    assert!(
+        took >= CLOSE_FLUSH_TIMEOUT && took < CLOSE_FLUSH_TIMEOUT + Duration::from_secs(2),
+        "close_drain took {took:?}"
+    );
+    assert_eq!(err.code(), ErrorCode::SocketError, "{}", err.msg());
+    assert_eq!(
+        err.msg(),
+        "QWP/WebSocket close drain timed out while the sender was closing its connection after \
+         the flush that stopped part way. The flushes before it are confirmed, and nothing of \
+         that flush is committed: only a flush with more rows of one table than the server's \
+         qwp.max.uncommitted.rows may be committed in part. Drop the sender: the next sender on \
+         the slot under sf_dir removes that flush."
+    );
+    assert!(segment_files(&sf_dir) > 0, "the slot is not closed");
+    drop(sender);
+    wait_for_no_connection(&server);
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+
+    // The next sender on the slot holds the flush before, confirmed, and
+    // nothing of the failed one. It sends neither again.
+    let mut sender = sender_with(server.port, Progress::Background, &settings);
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    // Time for a frame sent again to reach the server.
+    thread::sleep(Duration::from_millis(200));
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    drop(sender);
+    server.finish();
+}
+
 /// `close_drain` after a flush that failed part way stops the network thread
 /// of the sender, and with it the connection, before it gives the slot up. A
 /// second sender on the slot, opened while the first one is still there, is

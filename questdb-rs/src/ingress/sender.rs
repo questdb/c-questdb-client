@@ -1176,7 +1176,10 @@ impl Sender {
     /// error says how many published frames are not confirmed. Without `sf_dir`
     /// they are dropped with the sender: call [`Self::wait`] before closing,
     /// raise `close_flush_timeout_millis`, or use `sf_dir`. With `sf_dir` they
-    /// stay in the slot and the next sender on the slot sends them. If the
+    /// stay in the slot and the next sender on the slot sends them. After a
+    /// flush that failed with `FlushAborted`, in background progress mode, the
+    /// error can instead say that the flushes before it are confirmed and the
+    /// connection was still closing: drop the sender then. If the
     /// deadline passes while the sender is disconnected and reconnecting keeps
     /// failing, in either progress mode, the error names that failure and
     /// carries its OIDC detail (`Error::oidc_error`).

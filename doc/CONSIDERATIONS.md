@@ -285,7 +285,10 @@ advertises. Larger segments give disk space back in larger steps, and
   dropping a sender without it does not wait at all, and without `sf_dir` the
   frames that are not confirmed by then are dropped with the sender. The
   timeout error of `close_drain` says how many those are. Call `wait` before
-  closing, or raise `close_flush_timeout_millis`.
+  closing, or raise `close_flush_timeout_millis`. After a flush that stopped
+  part way, in background progress mode, the error can instead say that the
+  flushes before it are confirmed and the connection was still closing: drop
+  the sender then.
 - One flush must reach the server and be committed within the life of one
   connection: after a reconnect the sender sends it again from its first
   frame. When the server ends the connection with a WebSocket close frame
