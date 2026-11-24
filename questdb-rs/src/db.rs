@@ -1999,6 +1999,11 @@ impl<'a> BorrowedSender<'a> {
         self.0.inner_ref().must_close()
     }
 
+    #[cfg(test)]
+    pub(crate) fn poll_error_for_test(&self) -> Result<Option<crate::ingress::QwpWsSenderError>> {
+        self.0.inner_ref().poll_error()
+    }
+
     /// Always `true` for an SF handle (it wraps a store-and-forward backend).
     /// Retained for symmetry with [`BorrowedDirectColumnSender`] and test assertions.
     #[cfg(test)]

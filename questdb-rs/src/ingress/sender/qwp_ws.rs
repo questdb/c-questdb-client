@@ -577,7 +577,8 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
 struct AbortedFlush {
     /// The last frame published before the flush, if there was one.
     published_before: Option<u64>,
-    /// The error of the flush, which every later publication gets too.
+    /// The error that the flush returned, which every later publication
+    /// gets too.
     error: crate::Error,
 }
 
@@ -602,6 +603,49 @@ impl AbortedFlush {
                 .reclassified(crate::ErrorCode::FlushAborted, msg)
                 .with_in_doubt(false),
         }
+    }
+
+    /// Whether `err`, the error that stopped the sender, is about the frames
+    /// of this flush alone: the server's rejection of frames that all come
+    /// after the frames before the flush, once those are confirmed
+    /// (`completed`). The error of the flush already says that nothing of it
+    /// is committed, so the calls about the frames before it do not fail on
+    /// such a rejection, which stays readable as a sender error.
+    fn is_rejection_of_its_frames(&self, err: &crate::Error, completed: Option<u64>) -> bool {
+        // `None` orders below every `Some`.
+        completed >= self.published_before
+            && err
+                .qwp_ws_rejection()
+                .is_some_and(|rejection| Some(rejection.from_fsn) > self.published_before)
+    }
+}
+
+/// `Err(err)`, for `err` the error that stopped a sender, unless it is about
+/// the frames of the flush that failed part way alone: see
+/// [`AbortedFlush::is_rejection_of_its_frames`].
+fn stopping_error(
+    aborted_flush: Option<&AbortedFlush>,
+    err: crate::Error,
+    completed: Option<u64>,
+) -> crate::Result<()> {
+    match aborted_flush {
+        Some(flush) if flush.is_rejection_of_its_frames(&err, completed) => Ok(()),
+        _ => Err(err),
+    }
+}
+
+/// [`check_store_error`] for a sender whose flush may have failed part way:
+/// see [`stopping_error`].
+fn check_store_error_after(
+    store: &QwpWsPublicationStore<impl PublicationLog>,
+    aborted_flush: Option<&AbortedFlush>,
+) -> crate::Result<()> {
+    store
+        .check_durability()
+        .map_err(driver_error_to_error_without_state)?;
+    match check_store_terminal_error(store) {
+        Err(err) => stopping_error(aborted_flush, err, store.completed_fsn()),
+        ok => ok,
     }
 }
 
@@ -1078,10 +1122,17 @@ where
             }),
             PublicationState::Terminal => {
                 let store = self.lock_shared()?;
-                Err(driver_error_to_error_from_store(
-                    &store,
-                    DriverError::Terminal,
-                ))
+                let err = driver_error_to_error_from_store(&store, DriverError::Terminal);
+                // A rejection of the frames of the flush that failed part
+                // way does not replace the error of that flush.
+                Err(match &self.aborted_flush {
+                    Some(flush)
+                        if flush.is_rejection_of_its_frames(&err, store.completed_fsn()) =>
+                    {
+                        flush.error.clone()
+                    }
+                    _ => err,
+                })
             }
         }
     }
@@ -1105,11 +1156,14 @@ where
     /// A sender that has stopped for a reason of its own goes on reporting
     /// that reason, here and at every later call.
     fn abort_flush(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error {
-        let flush = AbortedFlush::new(first_fsn, cause);
+        let mut flush = AbortedFlush::new(first_fsn, cause);
+        if let Err(err) = self.check_publication_open() {
+            flush.error = err;
+        }
         let error = flush.error.clone();
         self.aborted_flush = Some(flush);
         self.lifecycle.begin_close();
-        self.check_publication_open().err().unwrap_or(error)
+        error
     }
 
     fn check_error(&self) -> crate::Result<()> {
@@ -1120,14 +1174,15 @@ where
                 .map_err(driver_error_to_error_without_state)?;
         } else {
             let store = self.lock_shared()?;
-            check_store_error(&store)?;
+            check_store_error_after(&store, self.aborted_flush.as_ref())?;
         }
         if self.lifecycle.is_terminal() {
             let store = self.lock_shared()?;
-            return Err(driver_error_to_error_from_store(
-                &store,
-                DriverError::Terminal,
-            ));
+            return stopping_error(
+                self.aborted_flush.as_ref(),
+                driver_error_to_error_from_store(&store, DriverError::Terminal),
+                store.completed_fsn(),
+            );
         }
         Ok(())
     }
@@ -1174,7 +1229,7 @@ where
             return Ok(producer.completed_fsn());
         }
         let store = self.lock_shared()?;
-        check_store_error(&store)?;
+        check_store_error_after(&store, self.aborted_flush.as_ref())?;
         Ok(store.completed_fsn())
     }
 
@@ -1186,7 +1241,7 @@ where
                 .map_or(0, |fsn| fsn.saturating_add(1))
         } else {
             let store = self.lock_shared()?;
-            check_store_error(&store)?;
+            check_store_error_after(&store, self.aborted_flush.as_ref())?;
             store.completed_fsn().map_or(0, |fsn| fsn.saturating_add(1))
         };
         let upper = self
@@ -1229,6 +1284,20 @@ where
         self.aborted_flush.is_some()
     }
 
+    /// Whether the sender stopped for a reason that is not about the frames
+    /// of a flush that failed part way alone: see [`stopping_error`].
+    fn stopped_for_good(&self) -> bool {
+        self.lifecycle.is_terminal()
+            && self.lock_shared().map_or(true, |store| {
+                stopping_error(
+                    self.aborted_flush.as_ref(),
+                    driver_error_to_error_from_store(&store, DriverError::Terminal),
+                    store.completed_fsn(),
+                )
+                .is_err()
+            })
+    }
+
     fn sender_errors_dropped_total(&self) -> crate::Result<u64> {
         let store = self.lock_shared()?;
         Ok(store.sender_errors_dropped_total())
@@ -1268,7 +1337,8 @@ where
     /// After a flush that failed part way ([`Self::abort_flush`]) the wait
     /// is for the frames before that flush: its own frames are never
     /// confirmed, and go with the queue: see
-    /// [`Self::close_after_aborted_flush`].
+    /// [`Self::close_after_aborted_flush`]. The server's rejection of its
+    /// own frames does not fail the wait: see [`stopping_error`].
     fn drain_to_deadline(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
         // No publication can pass the Closing lifecycle latch. Release the
         // detached producer's active-segment mapping before queue.close()
@@ -1283,7 +1353,9 @@ where
                 // covering sync before tearing down an undrained queue. Do
                 // not let the public durability latch prevent close from
                 // reaching either recovery path.
-                check_store_terminal_error(&store)?;
+                if let Err(err) = check_store_terminal_error(&store) {
+                    stopping_error(self.aborted_flush.as_ref(), err, store.completed_fsn())?;
+                }
                 // The frames of a flush that failed part way are never
                 // confirmed: the wait ends at the frame before them.
                 let drained = match &self.aborted_flush {
@@ -1336,10 +1408,13 @@ where
     /// [`Drop`] when that comes first, nothing is closed: the drop of the
     /// sender waits for the thread again.
     ///
-    /// A terminal error that the thread recorded after the frames before the
-    /// flush were confirmed does not stop the close: it can only be of the
-    /// frames of the flush or of the end of the connection, and nothing of
-    /// the flush is committed either way.
+    /// The server's rejection of frames of the flush does not stop the close,
+    /// whenever the thread recorded it: [`Self::drain_to_deadline`] lets it
+    /// pass once the frames before the flush are confirmed (see
+    /// [`stopping_error`]). Neither does another terminal error that the
+    /// thread records once the drain found those frames confirmed, which
+    /// this does not look at: it can only be of the end of the connection,
+    /// and nothing of the flush is committed either way.
     fn close_after_aborted_flush(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
         let wait = deadline.map_or(self.shutdown_timeout, |deadline| {
             deadline
@@ -5018,7 +5093,17 @@ impl ManualQwpWsPublisher<'_> {
     fn error_of(&self, err: DriverError) -> crate::Error {
         match (err, &*self.aborted_flush) {
             (DriverError::Closing, Some(flush)) => flush.error.clone(),
-            (err, _) => driver_error_to_error_from_store(self.store, err),
+            (err, Some(flush)) => {
+                let err = driver_error_to_error_from_store(self.store, err);
+                // A rejection of the frames of that flush does not replace
+                // its error.
+                if flush.is_rejection_of_its_frames(&err, self.store.completed_fsn()) {
+                    flush.error.clone()
+                } else {
+                    err
+                }
+            }
+            (err, None) => driver_error_to_error_from_store(self.store, err),
         }
     }
 }
@@ -5151,7 +5236,9 @@ pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::R
     let outcome = state.send_core.drive_once(&mut state.store);
     let foreground_progress = match outcome {
         Ok(DriveOutcome::Idle) => Ok(false),
-        Ok(DriveOutcome::Terminal) => qwp_ws_manual_terminal_error(state),
+        Ok(DriveOutcome::Terminal) | Err(DriverError::Terminal) => {
+            qwp_ws_manual_stopping_error(state).map(|()| false)
+        }
         Ok(DriveOutcome::ReconnectDelay {
             sleep_for,
             deadline,
@@ -5329,6 +5416,13 @@ pub(crate) fn qwp_ws_has_aborted_flush_background(state: &SyncQwpWsHandlerState)
     state.runner.has_aborted_flush()
 }
 
+/// Whether a sender in background progress mode stopped for a reason that is
+/// not about the frames of a flush that failed part way alone: see
+/// [`stopping_error`].
+pub(crate) fn qwp_ws_stopped_for_good_background(state: &SyncQwpWsHandlerState) -> bool {
+    state.runner.stopped_for_good()
+}
+
 pub(crate) fn qwp_ws_is_terminal_manual(state: &ManualQwpWsHandlerState) -> bool {
     state.store.is_terminal()
 }
@@ -5389,6 +5483,18 @@ pub(crate) fn qwp_ws_drain_to_deadline_background(
     result
 }
 
+/// Closes the queue of a sender in manual progress mode whose flush failed
+/// part way, once the frames before that flush are confirmed: the frames of
+/// the flush go with the queue, which closes as fully drained.
+fn qwp_ws_close_manual_after_aborted_flush(
+    state: &mut ManualQwpWsHandlerState,
+) -> crate::Result<()> {
+    state
+        .send_core
+        .close_publication_queue_abandoning_unresolved(&mut state.store)
+        .map_err(driver_error_to_error_without_state)
+}
+
 pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> crate::Result<()> {
     if state.close_drain_timeout.is_zero() {
         state.store.set_closing();
@@ -5406,14 +5512,17 @@ pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> 
             && !state.store.is_terminal()
             && state.store.completed_fsn() >= flush.published_before
         {
-            return state
-                .send_core
-                .close_publication_queue_abandoning_unresolved(&mut state.store)
-                .map_err(driver_error_to_error_without_state);
+            return qwp_ws_close_manual_after_aborted_flush(state);
         }
         match state.send_core.close_drain_ready_once(&mut state.store) {
             Ok(CloseOutcome::Drained) => return Ok(()),
-            Ok(CloseOutcome::Terminal) => return qwp_ws_manual_terminal_error(state),
+            // The server's rejection of frames of that flush, once the
+            // frames before it are confirmed, closes as above: see
+            // [`stopping_error`].
+            Ok(CloseOutcome::Terminal) => {
+                qwp_ws_manual_stopping_error(state)?;
+                return qwp_ws_close_manual_after_aborted_flush(state);
+            }
             Ok(CloseOutcome::Waiting {
                 sleep_for,
                 deadline: reconnect_deadline,
@@ -5520,25 +5629,17 @@ fn sleep_before_manual_reconnect(
 }
 
 fn check_manual_driver_error(state: &ManualQwpWsHandlerState) -> crate::Result<()> {
-    state
-        .store
-        .check_durability()
-        .map_err(driver_error_to_error_without_state)?;
-    if let Some(err) = state.store.terminal_error() {
-        return Err(err.clone());
-    }
-    if state.store.is_terminal() {
-        return Err(error::fmt!(SocketError, "QWP/WebSocket sender is terminal"));
-    }
-    Ok(())
+    check_store_error_after(&state.store, state.aborted_flush.as_ref())
 }
 
-fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Result<T> {
-    Err(state
-        .store
-        .terminal_error()
-        .cloned()
-        .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")))
+/// The error that stopped a sender in manual progress mode, as its calls
+/// report it: see [`stopping_error`].
+fn qwp_ws_manual_stopping_error(state: &ManualQwpWsHandlerState) -> crate::Result<()> {
+    stopping_error(
+        state.aborted_flush.as_ref(),
+        driver_error_to_error_from_store(&state.store, DriverError::Terminal),
+        state.store.completed_fsn(),
+    )
 }
 
 fn qwp_ws_manual_close_timeout_error(state: &ManualQwpWsHandlerState) -> crate::Error {
@@ -5799,6 +5900,49 @@ mod tests {
                 to_fsn: 0,
             },
         )
+    }
+
+    /// A sender error that names the frames `from_fsn..=to_fsn`.
+    fn rejection_of(from_fsn: u64, to_fsn: u64) -> crate::Error {
+        crate::Error::new(crate::ErrorCode::ServerRejection, "schema mismatch")
+            .with_qwp_ws_rejection(crate::ingress::QwpWsSenderError {
+                category: crate::ingress::QwpWsErrorCategory::SchemaMismatch,
+                applied_policy: crate::ingress::QwpWsErrorPolicy::Terminal,
+                status: Some(0x03),
+                message: Some("schema mismatch".to_string()),
+                message_sequence: Some(from_fsn),
+                from_fsn,
+                to_fsn,
+            })
+    }
+
+    /// After a flush that failed part way at frame 5, calls do not fail on a
+    /// rejection of frames of that flush once frames 0 to 4 are confirmed.
+    /// They fail on any other error that stopped the sender, and on that
+    /// rejection too while frames before the flush are not confirmed, as with
+    /// durable acknowledgement the confirmation can come after the server
+    /// answered them.
+    #[test]
+    fn only_a_rejection_of_the_frames_of_a_failed_flush_does_not_fail_the_calls_about_the_frames_before()
+     {
+        let cause = crate::Error::new(crate::ErrorCode::SymbolDictFull, "dictionary full");
+        let flush = AbortedFlush::new(5, cause.clone());
+        let after = |completed| stopping_error(Some(&flush), rejection_of(6, 6), completed);
+        assert!(after(Some(4)).is_ok());
+        assert!(after(Some(7)).is_ok());
+        assert!(after(Some(3)).is_err());
+        assert!(after(None).is_err());
+        // Frames of the flush before it, or a range that starts there.
+        assert!(stopping_error(Some(&flush), rejection_of(4, 6), Some(4)).is_err());
+        assert!(stopping_error(Some(&flush), rejection_of(5, 5), Some(4)).is_ok());
+        // An error that names no frames.
+        let transport = crate::Error::new(crate::ErrorCode::SocketError, "connection lost");
+        assert!(stopping_error(Some(&flush), transport, Some(4)).is_err());
+        // No failed flush.
+        assert!(stopping_error(None, rejection_of(6, 6), Some(4)).is_err());
+        // A failed flush that was the first of its sender.
+        let first = AbortedFlush::new(0, cause);
+        assert!(stopping_error(Some(&first), rejection_of(0, 0), None).is_ok());
     }
 
     #[test]
@@ -8614,6 +8758,9 @@ mod tests {
         wire: Arc<ModelWire>,
         /// The frame at which the connection fails for good.
         fails_at_fsn: Option<u64>,
+        /// The frame that the server rejects for good, as one whose columns
+        /// disagree with the table. It takes no frame after it.
+        rejects_at_fsn: Option<u64>,
     }
 
     impl QwpWsCoreTransport for ServerModelTransport {
@@ -8630,7 +8777,13 @@ mod tests {
                         wire_seq: sequence,
                     }))
                 }
-                _ => panic!("the server model answers with an OK"),
+                Ok(codec::PipelinedResponse::Error(error)) => {
+                    Ok(TransportPoll::Response(TransportResponse::Reject {
+                        wire_seq: error.sequence,
+                        error: crate::ingress::sender::qwp_ws_driver::QwpServerError::from(error),
+                    }))
+                }
+                _ => panic!("the server model answers with an OK or an error"),
             }
         }
 
@@ -8652,6 +8805,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((frame.sent_frame(), defer_commit));
+            if self.rejects_at_fsn == Some(frame.fsn) {
+                self.answers.push_back(self.connection.reject(0x03));
+                return Ok(TransportSendResult::NoResponse);
+            }
             // The model panics at a frame it does not take: that stops the
             // sender, so the test fails at its next call instead of waiting.
             let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -8686,12 +8843,29 @@ mod tests {
         QwpWsReplayEncoder,
         Arc<ModelWire>,
     ) {
+        runner_on_model_rejecting(server, queue, append_deadline, fails_at_fsn, None)
+    }
+
+    /// [`runner_on_model`] whose server rejects frame `rejects_at_fsn` for
+    /// good.
+    fn runner_on_model_rejecting(
+        server: &QwpWsServerModel,
+        queue: SfaMemoryQueueOptions,
+        append_deadline: Duration,
+        fails_at_fsn: Option<u64>,
+        rejects_at_fsn: Option<u64>,
+    ) -> (
+        SyncQwpWsRunner<SfaFrameQueue>,
+        QwpWsReplayEncoder,
+        Arc<ModelWire>,
+    ) {
         let wire = Arc::new(ModelWire::default());
         let transport = ServerModelTransport {
             connection: server.connect(),
             answers: VecDeque::new(),
             wire: Arc::clone(&wire),
             fails_at_fsn,
+            rejects_at_fsn,
         };
         let driver =
             QwpWsCoreTestHarness::from_queue(SfaFrameQueue::open_memory(queue).unwrap(), transport);
@@ -9089,6 +9263,47 @@ mod tests {
         assert!(runner.lifecycle_is_terminal());
         let refused = runner.publish_replay_payload(b"more").unwrap_err();
         assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+    }
+
+    /// The server rejects a frame of a flush in frames while the flush still
+    /// queues its frames, so the sender stops for that rejection before the
+    /// flush gives up: the flush and every later publication get the
+    /// rejection itself. The flush before it is confirmed: the calls about
+    /// it do not fail, and the close drain succeeds.
+    #[test]
+    fn a_flush_that_the_server_rejects_while_it_is_queued_fails_with_the_rejection() {
+        let server = QwpWsServerModel::new();
+        // The flush cannot queue all its frames at once and waits for room,
+        // as above. The server rejects its second frame, frame 2.
+        let (mut runner, mut encoder, _wire) = runner_on_model_rejecting(
+            &server,
+            small_segments(2),
+            Duration::from_secs(5),
+            None,
+            Some(2),
+        );
+        let before = buffer_of(FLUSH_TABLE, 0..3);
+        assert_eq!(publish_as_one_frame(&mut encoder, &mut runner, &before), 0);
+        wait_for_ack(&runner, 0);
+        let buffer = buffer_of(FLUSH_TABLE, 3..403);
+        let plan = small_frames_plan(&buffer);
+
+        let err = publish_frames(&mut encoder, &mut runner, &buffer, &plan).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::ServerRejection,
+            "{}",
+            err.msg()
+        );
+        let rejection = err.qwp_ws_rejection().unwrap();
+        assert_eq!((rejection.from_fsn, rejection.to_fsn), (2, 2));
+        assert!(runner.lifecycle_is_terminal());
+        let refused = runner.publish_replay_payload(b"more").unwrap_err();
+        assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+        assert_eq!(runner.published_fsn().unwrap(), Some(0));
+        assert_eq!(runner.acked_fsn().unwrap(), Some(0));
+        runner.close_drain(Duration::from_secs(5)).unwrap();
+        assert_eq!(server.table(FLUSH_TABLE).unwrap().commits, 1);
     }
 
     #[test]

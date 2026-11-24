@@ -60,11 +60,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ingress::column_sender::Chunk;
-use crate::ingress::{AckLevel, Buffer, SymbolGlobalDict, TestDictCapGuard};
+use crate::ingress::{AckLevel, Buffer, QwpWsErrorPolicy, SymbolGlobalDict, TestDictCapGuard};
 use crate::tests::qwp_ws::spawn_max_batch_size_upgrade_only_server;
 use crate::tests::qwp_ws_flush_in_frames::{
     EIGHT_SEGMENTS, EIGHT_SEGMENTS_SHORT_WAIT, FIRST, FOUR_SEGMENTS, FRAME_LIMIT,
-    NO_FRAME_LIMIT_TOLD, NO_WAIT_AT_THE_END, RECONNECT_SOON, SECOND, TABLE, WAIT,
+    NO_FRAME_LIMIT_TOLD, NO_WAIT_AT_THE_END, RECONNECT_SOON, SCHEMA_MISMATCH, SECOND, TABLE, WAIT,
     a_frame_that_fits_by_the_symbols_its_connection_holds,
     a_frame_that_fits_where_its_frames_do_not, add_symbol_row, allocated_after_a_flush_of,
     assert_table_holds, assert_timed_out_waiting_for_room, buffer_of_len, buffer_of_symbols,
@@ -869,6 +869,51 @@ fn the_pool_closes_a_sender_whose_flush_failed_part_way_when_the_flush_before_it
     server.finish();
 }
 
+/// The server rejects for good a frame of the failed flush that the sender
+/// had queued. The rejection is about that flush, whose error already says
+/// that nothing of it is committed: the holder's wait for the flush before
+/// succeeds, and the pool closes the sender when it comes back, without
+/// waiting for `close_flush_timeout`, and empties its slot.
+#[test]
+fn the_pool_closes_a_sender_whose_failed_flush_has_a_frame_that_the_server_rejects() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.hold_answers();
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let (large, queued, symbols) = a_buffer_whose_flush_stops_part_way(Some(&before));
+    let cap = TestDictCapGuard::new(symbols);
+    let settings = format!("sender_pool_max=1;{LONG_CLOSE_FLUSH}");
+    let db = pool_with(server.port, &settings);
+    let mut sender = db.borrow_sender().unwrap();
+    drop(cap);
+    // The server takes the flush before as its first frame, and rejects
+    // the second frame of the failed flush, frame 2 of the sender.
+    server.reject_frame(3, SCHEMA_MISMATCH);
+    stop_a_flush_part_way(&mut sender, &server, Some(&before), &large, queued);
+    server.let_answers_go();
+    let deadline = Instant::now() + WAIT;
+    let rejection = loop {
+        if let Some(rejection) = sender.poll_error_for_test().unwrap() {
+            break rejection;
+        }
+        assert!(Instant::now() < deadline, "the sender read no error");
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!((rejection.from_fsn, rejection.to_fsn), (2, 2));
+    assert_eq!(rejection.applied_policy, QwpWsErrorPolicy::Terminal);
+
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+    let started = Instant::now();
+    drop(sender);
+    assert_did_not_wait_for_close_flush_timeout(started.elapsed());
+    wait_for_no_connection(&server);
+    assert_eq!(files_in_the_slots(), Vec::<String>::new());
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    assert_eq!((db.free_count(), db.in_use_count()), (0, 0));
+    db.close();
+    server.finish();
+}
+
 /// Nothing of the sender is left that the server would answer: the failed
 /// flush was its first.
 #[test]
@@ -1398,6 +1443,7 @@ on_disk! {
     a_pooled_buffer_whose_frame_fits_by_the_symbols_its_connection_holds_is_one_frame_without_room_for_its_frames
     a_pooled_flush_that_fails_part_way_is_aborted_and_its_connection_is_not_handed_out_again
     the_pool_closes_a_sender_whose_flush_failed_part_way_when_the_flush_before_it_is_confirmed
+    the_pool_closes_a_sender_whose_failed_flush_has_a_frame_that_the_server_rejects
     the_pool_closes_a_sender_whose_first_flush_failed_part_way_without_waiting
     a_pool_that_waits_for_nothing_at_close_gives_up_a_sender_whose_flush_failed_part_way_at_once
     #[cfg(feature = "ffi-support")]

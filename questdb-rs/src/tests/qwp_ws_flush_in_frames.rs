@@ -95,8 +95,8 @@ use crate::ingress::sender::{
     before_hot_spare_creation_for_test, fail_sync_after_for_test,
 };
 use crate::ingress::{
-    AckLevel, Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, Sender, SenderBuilder,
-    SymbolGlobalDict, TimestampMicros, TimestampNanos, decode_qwp_varint,
+    AckLevel, Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError, Sender,
+    SenderBuilder, SymbolGlobalDict, TimestampMicros, TimestampNanos, decode_qwp_varint,
 };
 use crate::tests::qwp_ws::{
     read_frame, spawn_max_batch_size_upgrade_only_server, upgrade_mock_stream_with_max_batch_size,
@@ -3779,6 +3779,31 @@ fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_co
 
 /// The files in the slot of [`slot_settings`], but the lock files, which
 /// stay for the next sender.
+/// The files in the slots of the senders that [`on_disk`] gives a slot, as
+/// `<slot>/<file>`, but their lock files. None with the queues in memory.
+fn files_in_the_slots() -> Vec<String> {
+    SF_DIR.with(|sf_dir| {
+        let sf_dir = sf_dir.borrow();
+        let Some((dir, _)) = sf_dir.as_ref() else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        for slot in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            if !slot.path().is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(slot.path()).unwrap().flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if !name.starts_with(".lock") {
+                    files.push(format!("{}/{name}", slot.file_name().to_string_lossy()));
+                }
+            }
+        }
+        files.sort();
+        files
+    })
+}
+
 fn files_in_the_slot(sf_dir: &tempfile::TempDir) -> Vec<String> {
     let mut files: Vec<String> = std::fs::read_dir(sf_dir.path().join("large"))
         .unwrap()
@@ -4198,7 +4223,7 @@ fn a_full_dictionary_stops_the_flush_once_more_on_the_slot_of_a_sender_dropped_w
 
 /// What a server answers a frame whose columns disagree with the table. A
 /// sender that gets it stops for good.
-const SCHEMA_MISMATCH: u8 = 0x03;
+pub(super) const SCHEMA_MISMATCH: u8 = 0x03;
 /// What a server answers a frame that it could not write. A sender that gets
 /// it connects again and sends every frame that is not confirmed.
 const WRITE_ERROR: u8 = 0x09;
@@ -4207,27 +4232,35 @@ const WRITE_ERROR: u8 = 0x09;
 /// and sends every frame that is not confirmed.
 const NOT_WRITABLE: u8 = 0x0C;
 
-/// The error that stopped `sender` for good, once it has read the answer of
-/// the server that did so.
-fn the_error_that_stops(sender: &mut Sender, progress: Progress) -> crate::Error {
+/// The first error of a server that `sender` reads, once it has read it.
+fn the_server_error_read_by(sender: &mut Sender, progress: Progress) -> QwpWsSenderError {
     let deadline = Instant::now() + WAIT;
     loop {
         match progress {
             Progress::Background => thread::sleep(Duration::from_millis(1)),
-            // What it reads may be what stops it.
-            Progress::Manual => drop(sender.drive_once()),
+            Progress::Manual => {
+                sender.drive_once().unwrap();
+            }
         }
-        if let Err(err) = sender.completed_fsn(AckLevel::Ok) {
-            return err;
+        if let Some(rejection) = sender.poll_qwp_ws_error().unwrap() {
+            return rejection;
         }
-        assert!(Instant::now() < deadline, "the sender did not stop");
+        assert!(Instant::now() < deadline, "the sender read no error");
     }
 }
 
 /// Checks that `err` is the rejection for good of frame `fsn` of the sender.
 fn assert_rejected_for_good(err: &crate::Error, fsn: u64) {
     assert_eq!(err.code(), ErrorCode::ServerRejection, "{}", err.msg());
-    let rejection = err.qwp_ws_rejection().expect("what the server rejected");
+    assert_rejection_for_good(
+        err.qwp_ws_rejection().expect("what the server rejected"),
+        fsn,
+    );
+}
+
+/// Checks that `rejection` is the rejection for good of frame `fsn` of the
+/// sender.
+fn assert_rejection_for_good(rejection: &QwpWsSenderError, fsn: u64) {
     assert_eq!(rejection.category, QwpWsErrorCategory::SchemaMismatch);
     assert_eq!(rejection.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(rejection.status, Some(SCHEMA_MISMATCH));
@@ -4389,10 +4422,13 @@ fn a_flush_with_a_frame_that_a_demoted_server_rejects_is_sent_again_whole(progre
 }
 
 /// A sender whose flush failed part way sends the frames of that flush that
-/// it had queued, and the server rejects one of them for good. The sender
-/// has then nothing to wait for, since the flush before is confirmed, and
-/// still reports the rejection when it is closed.
-fn a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good(
+/// it had queued, and the server rejects one of them for good. The rejection
+/// is about the failed flush, whose error already says that nothing of it is
+/// committed. So the calls about the flush before it, which is confirmed, do
+/// not fail on it, and a later flush still gets the error of the failed
+/// flush. The sender reports the rejection as an error of the server, and a
+/// close drain empties its slot.
+fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_before_it_confirmed(
     progress: Progress,
 ) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
@@ -4418,12 +4454,16 @@ fn a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_
     wait_for_frames_sent(&mut sender, progress, &server, 1 + failing);
     server.let_answers_go();
 
-    assert_rejected_for_good(&the_error_that_stops(&mut sender, progress), 2);
-    // Its position is the error too, not the frame before the failed flush.
-    assert_rejected_for_good(&sender.published_fsn().unwrap_err(), 2);
-    assert_rejected_for_good(&sender.wait(AckLevel::Ok, WAIT).unwrap_err(), 2);
-    assert_rejected_for_good(&sender.close_drain().unwrap_err(), 2);
-    assert!(sender.must_close());
+    assert_rejection_for_good(&the_server_error_read_by(&mut sender, progress), 2);
+    assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+    assert_eq!(sender.acked_fsn().unwrap(), Some(0));
+    assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let err = sender.flush_and_keep(&before).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    sender.close_drain().unwrap();
+    assert_eq!(files_in_the_slots(), Vec::<String>::new());
     assert_table_holds(&server, TABLE, 1, &[&before]);
     drop(sender);
     server.finish();
@@ -5175,7 +5215,7 @@ in_both_progress_modes! {
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
     a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
     a_flush_with_a_frame_that_a_demoted_server_rejects_is_sent_again_whole
-    a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good
+    a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_before_it_confirmed
     a_flush_is_committed_once_wherever_its_connection_is_lost_before_the_commit
     a_flush_whose_connection_is_lost_after_the_commit_and_before_its_answer_is_committed_again
     a_flush_whose_every_connection_the_server_closes_stops_the_sender_at_the_fourth_close
@@ -5219,7 +5259,7 @@ on_disk_in_both_progress_modes! {
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
     a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
     a_flush_with_a_frame_that_a_demoted_server_rejects_is_sent_again_whole
-    a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good
+    a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_before_it_confirmed
     a_flush_is_committed_once_wherever_its_connection_is_lost_before_the_commit
     a_flush_whose_connection_is_lost_after_the_commit_and_before_its_answer_is_committed_again
     a_close_drain_after_a_flush_in_frames_that_is_not_confirmed_in_time_fails

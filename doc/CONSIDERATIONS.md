@@ -239,7 +239,13 @@ The rejection usually arrives while `flush` is still queuing frames, and
 `flush` then fails with it while the buffer keeps its rows. Otherwise the next
 `wait`, `flush` or `close_drain` reports it. A rejection names a range of frame
 numbers; it belongs to the flush whose returned frame number is the first at
-or above the end of that range.
+or above the end of that range. After a flush that failed with
+`flush_aborted`, the server may still reject one of the frames of that flush
+that the sender had queued. The rejection is about that flush, of which nothing
+is committed: `wait`, `close_drain` and the frame numbers still report the
+flushes before it, a later flush still fails with `flush_aborted`, and the
+rejection is read as a server error (`poll_qwp_ws_error` in Rust,
+`line_sender_qwpws_poll_error` in C) or by the error handler.
 
 ### With `sf_dir`
 
