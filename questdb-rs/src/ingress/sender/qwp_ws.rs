@@ -1154,7 +1154,9 @@ where
     /// that reason, here and at every later call: a rejection of a frame of
     /// this flush that the network thread read before the frames were given
     /// up is such a reason. The store lock orders the two: the network thread
-    /// holds it while it reads an answer.
+    /// holds it while it reads an answer. The flush fails with that reason,
+    /// which is in doubt as the flush's own error would be: when a frame of
+    /// the flush may have been sent.
     fn abort_flush(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error {
         // Abandoning reads nothing that a panic of the network thread can
         // have left half done, so a poisoned lock does not stop it.
@@ -1166,7 +1168,8 @@ where
             .abandon_from(first_fsn);
         let mut flush = AbortedFlush::new(first_fsn, cause, sent);
         if let Err(err) = self.check_publication_open() {
-            flush.error = err;
+            let in_doubt = err.in_doubt() || sent;
+            flush.error = err.with_in_doubt(in_doubt);
         }
         let error = flush.error.clone();
         self.aborted_flush = Some(flush);

@@ -1766,10 +1766,8 @@ impl SfaBackend {
             QwpWsFlushError::Failed(err)
                 if !not_in_frames_hint.is_empty() && err.code() == ErrorCode::BatchTooLarge =>
             {
-                crate::Error::new(
-                    ErrorCode::BatchTooLarge,
-                    format!("{}{}", err.msg(), not_in_frames_hint),
-                )
+                let msg = format!("{}{}", err.msg(), not_in_frames_hint);
+                err.reclassified(ErrorCode::BatchTooLarge, msg)
             }
             QwpWsFlushError::Refused(err) | QwpWsFlushError::Failed(err) => err,
         });

@@ -678,6 +678,13 @@ impl QwpWsModelServer {
         self.shared.open.load(Ordering::SeqCst)
     }
 
+    /// [`Self::open_connections`] for code that cannot borrow the server,
+    /// such as a hook of the sender.
+    pub(crate) fn open_connections_reader(&self) -> impl Fn() -> usize + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || shared.open.load(Ordering::SeqCst)
+    }
+
     /// How many frames the server has taken so far, over all connections.
     pub(crate) fn frames_taken(&self) -> usize {
         self.shared.frames.load(Ordering::SeqCst)

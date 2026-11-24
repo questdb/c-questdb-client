@@ -455,15 +455,13 @@ impl Sender {
                     server_max,
                     sfa_frame_payload_cap,
                 );
-                crate::Error::new(
-                    crate::ErrorCode::BatchTooLarge,
-                    format!(
-                        "{} The cap is set by {}.{}",
-                        err.msg(),
-                        source,
-                        not_in_frames_hint
-                    ),
-                )
+                let msg = format!(
+                    "{} The cap is set by {}.{}",
+                    err.msg(),
+                    source,
+                    not_in_frames_hint
+                );
+                err.reclassified(crate::ErrorCode::BatchTooLarge, msg)
             } else {
                 err
             }

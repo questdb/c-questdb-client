@@ -31,9 +31,10 @@ use std::sync::Arc;
 
 use super::{
     ConfirmationHold, ConfirmationStoredHookGuard, FIRST, FRAME_LIMIT, LaterFrameHookGuard,
-    Progress, QwpWsModelServer, RECONNECT_SOON, TABLE, WAIT, assert_table_holds, buffer_of_symbols,
-    frame_of_a_sender, frames_of_a_sender, let_it_work, on_disk, rows_of, sender_with,
-    stopped_by_a_full_dictionary, symbols_held_before, wait_for_no_connection, wait_until,
+    Progress, QwpWsModelServer, RECONNECT_SOON, SCHEMA_MISMATCH, TABLE, WAIT,
+    assert_rejected_for_good, assert_table_holds, buffer_of_symbols, frame_of_a_sender,
+    frames_of_a_sender, let_it_work, on_disk, rows_of, sender_with, stopped_by_a_full_dictionary,
+    symbols_held_before, wait_for_no_connection, wait_until,
 };
 use crate::ErrorCode;
 use crate::ingress::{AckLevel, Sender, SymbolGlobalDict, TestDictCapGuard};
@@ -206,6 +207,61 @@ fn a_flush_that_fails_part_way_after_its_frames_are_sent_is_in_doubt_and_none_is
     server.finish();
 }
 
+/// A flush before, and a flush in frames of a table of its own whose frames
+/// before the one that fails part way the server has all taken, more rows of
+/// its table than its row limit, so it has committed a part of them by
+/// itself. The server rejects the last of those frames for good, and the
+/// sender stops for that reason before the flush cuts the frame that fails.
+/// The flush fails with that rejection, which is in doubt: frames of the
+/// flush were sent.
+fn a_flush_that_fails_part_way_after_the_sender_stopped_for_a_frame_of_it_is_in_doubt(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    server.model.commit_by_itself_at(ROW_LIMIT);
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let large = buffer_of_symbols(FIRST, 10..1210);
+    let mut sender_symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&before, false, &mut sender_symbols);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut sender_symbols);
+    let failing = frames.len() / 2;
+    let symbols = symbols_held_before(&frames[failing]);
+    let mut sender = sender_of(&server, progress, symbols, None);
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    // The last frame of the flush published before the one that fails:
+    // frame `failing` of the sender, the server's frame `failing + 1`.
+    server.reject_frame(failing + 1, SCHEMA_MISMATCH);
+    let err = {
+        let published = 1 + failing;
+        let frames_taken = server.frames_taken_reader();
+        let open_connections = server.open_connections_reader();
+        let mut later_frames = 0;
+        let _hook = LaterFrameHookGuard::new(Box::new(move || {
+            later_frames += 1;
+            if later_frames == failing {
+                wait_until(WAIT, || frames_taken() >= published);
+                // A sender that stops ends its connection once it has
+                // stopped; the error below tells that the rejection is why.
+                wait_until(WAIT, || open_connections() == 0);
+            }
+        }));
+        sender.flush_and_keep(&large).unwrap_err()
+    };
+    assert_rejected_for_good(&err, failing as u64);
+    assert!(err.in_doubt());
+    let committed = server.model.table(FIRST).unwrap().rows_as_text();
+    assert!(
+        committed.len() >= ROW_LIMIT,
+        "{} rows committed",
+        committed.len()
+    );
+    assert_eq!(committed, rows_of(FIRST, &large)[..committed.len()]);
+    drop(sender);
+    server.finish();
+}
+
 mod a_flush_that_fails_part_way_before_its_frames_are_sent_is_not_in_doubt_and_none_is_sent_after {
     use super::a_flush_that_fails_part_way_before_its_frames_are_sent_is_not_in_doubt_and_none_is_sent_after as test;
     use super::{Progress, on_disk};
@@ -235,6 +291,23 @@ mod a_flush_that_fails_part_way_before_its_frames_are_sent_is_not_in_doubt_and_n
 /// room in its queue.
 mod a_flush_that_fails_part_way_after_its_frames_are_sent_is_in_doubt_and_none_is_sent_again {
     use super::a_flush_that_fails_part_way_after_its_frames_are_sent_is_in_doubt_and_none_is_sent_again as test;
+    use super::{Progress, on_disk};
+
+    #[test]
+    fn background() {
+        test(Progress::Background);
+    }
+
+    #[test]
+    fn on_disk_background() {
+        on_disk(test, Progress::Background);
+    }
+}
+
+/// Only a sender in background progress mode sends during a flush that has
+/// room in its queue.
+mod a_flush_that_fails_part_way_after_the_sender_stopped_for_a_frame_of_it_is_in_doubt {
+    use super::a_flush_that_fails_part_way_after_the_sender_stopped_for_a_frame_of_it_is_in_doubt as test;
     use super::{Progress, on_disk};
 
     #[test]
