@@ -151,9 +151,12 @@ of it. A flush that stops after some of its frames were queued fails with
 its rows, and the sender must be replaced. With `sf_dir`, a sender that opens
 a slot removes a flush whose last frame was never written: after a process
 was killed inside a flush nothing of that flush is sent, so flush the buffer
-again. The memory such a flush needs, the server's row limit, the timeouts to
-mind, what a large flush costs with `sf_dir` and what an older client does
-with such a slot are in the section "Row buffers larger than one frame" of the
+again. A flush with more rows of one table than the server's
+`qwp.max.uncommitted.rows` may have had a part committed, which flushing again
+stores twice unless the table has `DEDUP` keys. The memory such a flush needs,
+the server's row limit, the timeouts to mind, what a large flush costs with
+`sf_dir` and what an older client does with such a slot are in the section
+"Row buffers larger than one frame" of the
 [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md#row-buffers-larger-than-one-frame).
 
 Configure `sf_dir` to recover the local publication log after reconnects and

@@ -3223,6 +3223,39 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
     })
 }
 
+/// The warning of [`remove_unfinished_flush`] for the slot at `slot_dir`,
+/// whose chain ends at `chain_end`: the flush begins at `committed_end`, and
+/// the server confirmed frames up to `confirmed_end`. The frames of the flush
+/// below `confirmed_end` stay, the others go. A server commits a part of a
+/// flush by itself only at its `qwp.max.uncommitted.rows`, and may have done
+/// so without the slot knowing.
+fn unfinished_flush_removal_warning(
+    slot_dir: &Path,
+    committed_end: u64,
+    confirmed_end: u64,
+    chain_end: u64,
+) -> String {
+    let removed = chain_end - committed_end.max(confirmed_end);
+    let confirmed = confirmed_end.saturating_sub(committed_end);
+    let removing = format!(
+        "QWP/WebSocket store-and-forward slot {}: removing {removed} frame(s) of a flush that \
+         was cut off before its last frame",
+        slot_dir.display()
+    );
+    if confirmed == 0 {
+        format!(
+            "{removing}; nothing of that flush is committed, unless it had more rows of one \
+             table than the server's qwp.max.uncommitted.rows."
+        )
+    } else {
+        format!(
+            "{removing}. The server confirmed the first {confirmed} frame(s) of that flush, \
+             which it committed by itself at its qwp.max.uncommitted.rows: their rows stay, \
+             and flushing the buffer again stores them twice unless the table has DEDUP keys."
+        )
+    }
+}
+
 /// Removes a flush that has no last frame from the end of a recovered chain.
 ///
 /// A flush of several frames asks the server, in every frame but its last,
@@ -3297,10 +3330,8 @@ fn remove_unfinished_flush(
         return Ok(());
     }
     log::warn!(
-        "QWP/WebSocket store-and-forward slot {}: removing {} frame(s) of a flush that was cut \
-         off before its last frame; nothing of that flush is committed.",
-        slot_dir.display(),
-        chain_end - cut
+        "{}",
+        unfinished_flush_removal_warning(slot_dir, committed_end, confirmed_end, chain_end)
     );
 
     while let Some(active) = opened.last_mut() {
@@ -8868,6 +8899,25 @@ mod tests {
             drop(queue);
             assert_eq!(recovered_ack_watermark_fsn(slot.path()), Some(confirmed));
         }
+    }
+
+    #[test]
+    fn the_warning_of_a_removal_says_which_part_of_the_flush_the_server_committed() {
+        let slot = Path::new("slot");
+        assert_eq!(
+            unfinished_flush_removal_warning(slot, 1, 0, 7),
+            "QWP/WebSocket store-and-forward slot slot: removing 6 frame(s) of a flush that was \
+             cut off before its last frame; nothing of that flush is committed, unless it had \
+             more rows of one table than the server's qwp.max.uncommitted.rows."
+        );
+        assert_eq!(
+            unfinished_flush_removal_warning(slot, 1, 3, 7),
+            "QWP/WebSocket store-and-forward slot slot: removing 4 frame(s) of a flush that was \
+             cut off before its last frame. The server confirmed the first 2 frame(s) of that \
+             flush, which it committed by itself at its qwp.max.uncommitted.rows: their rows \
+             stay, and flushing the buffer again stores them twice unless the table has DEDUP \
+             keys."
+        );
     }
 
     #[test]

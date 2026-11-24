@@ -585,7 +585,8 @@ struct AbortedFlush {
 impl AbortedFlush {
     /// A flush that queued its frames from `first_fsn` on and could not
     /// queue the rest, because of `cause`. Its error keeps what the cause
-    /// carried, and is never in doubt: nothing of the flush is committed.
+    /// carried, and is never in doubt: nothing of the flush is committed,
+    /// below the server's `qwp.max.uncommitted.rows`, which the message says.
     fn new(first_fsn: u64, cause: crate::Error) -> Self {
         let msg = format!(
             "Could not flush buffer: the flush stopped part way: {}. Nothing of this flush is \
