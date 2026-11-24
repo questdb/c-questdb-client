@@ -292,7 +292,10 @@ mod a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_befo
 ///
 /// Only a sender in background progress mode can have sent a frame of the
 /// flush before the flush failed: the flush cuts its failing frame once the
-/// server has taken the rejected one.
+/// server has taken the rejected one and the one after it. The server never
+/// answers that one, so the sender keeps reading its connection: without
+/// durable acks it reads only while a frame waits for an answer, and would
+/// not answer the ping although it stayed.
 fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_changes_nothing_else(
     progress: Progress,
     (status, category, policy): (u8, QwpWsErrorCategory, QwpWsErrorPolicy),
@@ -317,7 +320,7 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_change
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     server.reject_frame(3, status);
     server.hold_answers();
-    let err = flush_that_fails_part_way(&mut sender, progress, &server, &large, failing, 3);
+    let err = flush_that_fails_part_way(&mut sender, progress, &server, &large, failing, 4);
     server.let_answers_go();
 
     let rejection = the_server_error_read_by(&mut sender, progress);

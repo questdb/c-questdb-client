@@ -924,6 +924,10 @@ impl QwpWsModelServer {
     /// given, and waits until a client answers with a pong. A client reads
     /// in order, so once it has answered, it has read on that connection
     /// everything the server sent it before.
+    ///
+    /// A client reads its connection only while a frame of it waits for an
+    /// answer or while it requests durable acks: any other client does not
+    /// answer, although it is still connected.
     pub(crate) fn ping_and_wait_for_a_pong(&self) {
         let pongs = self.shared.pongs.load(Ordering::SeqCst);
         let pinged = {
