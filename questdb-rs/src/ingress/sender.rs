@@ -709,7 +709,8 @@ impl Sender {
     /// for a reason of its own while a flush still queues its frames, such as
     /// a transport failure or a server rejection of a frame, fails that flush
     /// with the code of that reason instead: that is the sender's usual
-    /// terminal error. Either way the buffer keeps its rows.
+    /// terminal error, in doubt when a frame of the flush may have been sent.
+    /// Either way the buffer keeps its rows.
     ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.

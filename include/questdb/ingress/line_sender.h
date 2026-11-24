@@ -333,9 +333,9 @@ typedef enum line_sender_error_code
      *  Check `line_sender_error_in_doubt` before you flush the buffer again:
      *  - false: no frame of the flush was sent. Nothing of it is committed,
      *    and flushing the same buffer through a new sender stores no row twice.
-     *  - true: some of its frames were sent. The server holds their rows and
-     *    drops them when the sender is closed, so nothing of the flush is
-     *    committed, unless one table had more rows in the flush than the
+     *  - true: some of its frames may have been sent. The server holds their
+     *    rows and drops them when the sender is closed, so nothing of the flush
+     *    is committed, unless one table had more rows in the flush than the
      *    server's `qwp.max.uncommitted.rows` (1,000,000 by default). Then the
      *    server may have committed a part of that table's rows by itself, and
      *    flushing the buffer again stores that part twice unless the table has
@@ -347,11 +347,12 @@ typedef enum line_sender_error_code
      *  error handler (`line_sender_opts_qwpws_error_handler`).
      *
      *  The sender takes no more flushes, and `line_sender_must_close` returns
-     *  true. A later flush fails with this code, unless its buffer is refused
-     *  first for a reason of its own, which keeps its code: for example
-     *  `line_sender_error_symbol_dict_full`, for a symbol that the full
-     *  dictionary cannot take. A flush of an empty buffer queues nothing and
-     *  succeeds.
+     *  true. A later flush fails with this code, or with the code of the
+     *  sender's terminal error once the sender has stopped for a reason of its
+     *  own since, unless its buffer is refused first for a reason of its own,
+     *  which keeps its code: for example `line_sender_error_symbol_dict_full`,
+     *  for a symbol that the full dictionary cannot take. A flush of an
+     *  empty buffer queues nothing and succeeds.
      *
      *  The sender still delivers the flushes before the failed one.
      *  `line_sender_qwpws_wait` covers them and succeeds once they reach the
@@ -386,7 +387,8 @@ typedef enum line_sender_error_code
      *  its frames, such as a transport failure, a server rejection of a frame,
      *  or the network thread failing to make a segment file, fails that flush
      *  with the code of that reason, not with this one: that is the sender's
-     *  usual terminal error.
+     *  usual terminal error. Its `line_sender_error_in_doubt` follows the rule
+     *  above: true when a frame of the flush may have been sent.
      *
      *  Distinct from `line_sender_error_socket_error`, so that callers can
      *  tell by code a flush that stopped part way from a failure of the
@@ -560,9 +562,9 @@ const char* questdb_error_msg(const questdb_error*, size_t* len_out);
  *
  * For a low-level flush, this does not track earlier independent flushes.
  * For `line_sender_error_flush_aborted`, true means that some frames of the
- * flush were sent; the server commits a part of them by itself only for a
- * table with more rows in the flush than its `qwp.max.uncommitted.rows`: see
- * `line_sender_error_flush_aborted`.
+ * flush may have been sent; the server commits a part of them by itself only
+ * for a table with more rows in the flush than its `qwp.max.uncommitted.rows`:
+ * see `line_sender_error_flush_aborted`.
  *
  * NULL-safe: a NULL input returns false.
  */
@@ -606,9 +608,9 @@ const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
  * harmless. NULL-safe: passing NULL returns `false`.
  *
  * For `line_sender_error_flush_aborted`, `true` means that some frames of the
- * flush were sent; the server commits a part of them by itself only for a
- * table with more rows in the flush than its `qwp.max.uncommitted.rows`: see
- * `line_sender_error_flush_aborted`.
+ * flush may have been sent; the server commits a part of them by itself only
+ * for a table with more rows in the flush than its `qwp.max.uncommitted.rows`:
+ * see `line_sender_error_flush_aborted`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_error_in_doubt(const line_sender_error*);

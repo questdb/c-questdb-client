@@ -592,10 +592,10 @@ impl AbortedFlush {
     /// has more rows than its `qwp.max.uncommitted.rows`.
     fn new(first_fsn: u64, cause: crate::Error, sent: bool) -> Self {
         let what_was_sent = if sent {
-            "Some of its frames were sent: the server commits none of their rows unless one \
-             table had more rows than its qwp.max.uncommitted.rows, and then may have committed \
-             a part of them by itself, which flushing the buffer again stores twice unless the \
-             table has DEDUP keys. The buffer still holds its rows."
+            "Some of its frames may have been sent: the server commits none of their rows \
+             unless one table had more rows than its qwp.max.uncommitted.rows, and then may \
+             have committed a part of them by itself, which flushing the buffer again stores \
+             twice unless the table has DEDUP keys. The buffer still holds its rows."
         } else {
             "None of its frames reached the server, nothing of it is committed, and the buffer \
              still holds its rows."
@@ -1144,11 +1144,11 @@ where
     /// server holds the rows of the frames of this flush that were sent for
     /// a frame that commits them, and drops them when the connection ends,
     /// unless it commits a part by itself (`qwp.max.uncommitted.rows`): the
-    /// error is in doubt when a frame was sent. The server's answers about
-    /// those frames are reported as sender errors and change nothing else.
-    /// So callers are told that the sender has published what it had before
-    /// this flush, and wait for nothing more: see [`Self::published_fsn`]
-    /// and [`Self::drain_to_deadline`].
+    /// error is in doubt when a frame may have been sent. The server's
+    /// answers about those frames are reported as sender errors and change
+    /// nothing else. So callers are told that the sender has published what
+    /// it had before this flush, and wait for nothing more: see
+    /// [`Self::published_fsn`] and [`Self::drain_to_deadline`].
     ///
     /// A sender that has stopped for a reason of its own goes on reporting
     /// that reason, here and at every later call: a rejection of a frame of
@@ -9069,8 +9069,8 @@ mod tests {
         for part in [
             "Could not flush buffer: the flush stopped part way: ",
             "timed out waiting for ACK-driven segment trim",
-            "Some of its frames were sent: the server commits none of their rows unless one \
-             table had more rows than its qwp.max.uncommitted.rows",
+            "Some of its frames may have been sent: the server commits none of their rows \
+             unless one table had more rows than its qwp.max.uncommitted.rows",
             "This sender takes no more flushes and still delivers the flushes before this one: \
              once they are confirmed, close it or return it to its pool, and flush the buffer \
              again through a new sender.",

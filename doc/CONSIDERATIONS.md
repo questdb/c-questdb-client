@@ -228,11 +228,11 @@ Check whether the error is in doubt (`in_doubt()` in Rust and C++,
 - **Not in doubt:** no frame of the flush was sent. Nothing of it is
   committed, and flushing the buffer again through a new sender stores no row
   twice.
-- **In doubt:** some of its frames were sent. Nothing of the flush is
-  committed, unless one table had more rows in it than the server's row limit
-  (see above): then the server may have committed a part of that table's rows
-  by itself, and flushing the buffer again stores that part twice unless the
-  table has `DEDUP` keys.
+- **In doubt:** some of its frames may have been sent. Nothing of the flush
+  is committed, unless one table had more rows in it than the server's row
+  limit (see above): then the server may have committed a part of that
+  table's rows by itself, and flushing the buffer again stores that part
+  twice unless the table has `DEDUP` keys.
 
 The server may still answer about the frames that were sent, and may reject
 one of them. Such an answer fails no call: a rejection is only reported as a
@@ -240,9 +240,11 @@ server error (`poll_qwp_ws_error` in Rust, `line_sender_qwpws_poll_error` in
 C) and to the error handler.
 
 The sender takes no more flushes and reports `must_close`. A later flush fails
-with `flush_aborted` too, unless its buffer is refused first for a reason of
-its own, which keeps its code (a symbol that the full dictionary cannot take
-fails with `symbol_dict_full`); a flush of an empty buffer succeeds.
+with `flush_aborted` too, or with the sender's terminal error once the sender
+has stopped for a reason of its own since, unless its buffer is refused first
+for a reason of its own, which keeps its code (a symbol that the full
+dictionary cannot take fails with `symbol_dict_full`); a flush of an empty
+buffer succeeds.
 
 The sender still delivers the flushes before the failed one. `wait` covers
 them and succeeds once they reach the level it asks for, durable levels
@@ -265,13 +267,17 @@ A sender that stops for a reason of its own while a flush still queues its
 frames fails that flush with the code of that reason, not with
 `flush_aborted`: a transport failure, a server rejection of one of its frames,
 or the sender's network thread failing to make a segment file. That is the
-sender's usual terminal error, and the buffer keeps its rows.
+sender's usual terminal error, and the buffer keeps its rows. Whether it is in
+doubt follows the same rule: in doubt when a frame of the flush may have been
+sent.
 
 A frame that the server rejects takes the whole flush with it: the server
 drops the rows it holds for the connection and commits nothing more of the
 flush. The rejection usually arrives while `flush` is still queuing frames,
 and `flush` then fails with it while the buffer keeps its rows. Otherwise the
-next `wait`, `flush` or `close_drain` reports it. A rejection names a range of
+next `wait`, `flush` or `close_drain` reports it, except a rejection of a frame
+of a flush that already failed with `flush_aborted`: that one is only reported
+as a server error, as said above. A rejection names a range of
 frame numbers; it belongs to the flush whose returned frame number is the
 first at or above the end of that range.
 

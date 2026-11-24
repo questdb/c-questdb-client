@@ -3385,10 +3385,10 @@ fn sender_with_a_dictionary_of(port: u16, progress: Progress, symbols: usize) ->
 /// which is when the error is in doubt.
 pub(super) fn stopped_by_a_full_dictionary(symbols: usize, sent: bool) -> String {
     let what_was_sent = if sent {
-        "Some of its frames were sent: the server commits none of their rows unless one table \
-         had more rows than its qwp.max.uncommitted.rows, and then may have committed a part of \
-         them by itself, which flushing the buffer again stores twice unless the table has DEDUP \
-         keys. The buffer still holds its rows."
+        "Some of its frames may have been sent: the server commits none of their rows unless \
+         one table had more rows than its qwp.max.uncommitted.rows, and then may have committed \
+         a part of them by itself, which flushing the buffer again stores twice unless the table \
+         has DEDUP keys. The buffer still holds its rows."
     } else {
         "None of its frames reached the server, nothing of it is committed, and the buffer still \
          holds its rows."

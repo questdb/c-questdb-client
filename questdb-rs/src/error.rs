@@ -346,8 +346,8 @@ pub enum ErrorCode {
     /// - `false`: no frame of the flush was sent. Nothing of it is committed,
     ///   and flushing the same buffer through a new sender stores no row
     ///   twice.
-    /// - `true`: some of its frames were sent. The server holds their rows
-    ///   and drops them when the sender is closed, so nothing of the flush is
+    /// - `true`: some of its frames may have been sent. The server holds
+    ///   their rows and drops them when the sender is closed, so nothing of the flush is
     ///   committed, unless one table had more rows in the flush than the
     ///   server's `qwp.max.uncommitted.rows` (1,000,000 by default). Then the
     ///   server may have committed a part of that table's rows by itself, and
@@ -363,10 +363,11 @@ pub enum ErrorCode {
     ///
     /// The sender takes no more flushes, and
     /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. A
-    /// later flush fails with this error, unless its buffer is refused first
-    /// for a reason of its own, which keeps its code: for example
-    /// [`SymbolDictFull`](Self::SymbolDictFull), for a symbol that the full
-    /// dictionary cannot take. A flush of an empty buffer queues nothing and
+    /// later flush fails with this error, or with the sender's terminal error
+    /// once the sender has stopped for a reason of its own since, unless its
+    /// buffer is refused first for a reason of its own, which keeps its code:
+    /// for example [`SymbolDictFull`](Self::SymbolDictFull), for a symbol that
+    /// the full dictionary cannot take. A flush of an empty buffer queues nothing and
     /// returns `Ok`.
     ///
     /// The sender still delivers the flushes before the failed one.
@@ -403,7 +404,8 @@ pub enum ErrorCode {
     /// queues its frames, such as a transport failure, a server rejection of
     /// a frame, or the network thread failing to make a segment file, fails
     /// that flush with the code of that reason, not with this one: that is
-    /// the sender's usual terminal error.
+    /// the sender's usual terminal error. Its `in_doubt` follows the rule
+    /// above: `true` when a frame of the flush may have been sent.
     ///
     /// Distinct from [`SocketError`](Self::SocketError), so that callers can
     /// tell **by code** a flush that stopped part way from a failure of the
@@ -690,7 +692,7 @@ impl Error {
     /// make duplicates harmless.
     ///
     /// For [`ErrorCode::FlushAborted`], `true` means that some frames of the
-    /// flush were sent; the server commits a part of them by itself only for
+    /// flush may have been sent; the server commits a part of them by itself only for
     /// a table with more rows in the flush than its
     /// `qwp.max.uncommitted.rows`: see [`ErrorCode::FlushAborted`].
     #[must_use]
