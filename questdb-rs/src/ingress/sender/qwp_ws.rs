@@ -635,6 +635,14 @@ trait QwpWsFlushPublisher {
     /// Queues one frame, and returns its number.
     fn publish(&mut self, payload: &[u8]) -> crate::Result<u64>;
 
+    /// [`Self::publish`] for a frame after the first of a flush in frames,
+    /// which has had its room. With `sf_dir` the queue may still refuse the
+    /// frame while storage work of the network thread is in flight, which
+    /// ends by itself: the frame waits for it beyond the append deadline.
+    /// In manual progress mode that work runs on the flushing thread, so
+    /// none is in flight here and this is `publish`.
+    fn publish_later_frame(&mut self, payload: &[u8]) -> crate::Result<u64>;
+
     /// Leaves a flush that queued its frames from `first_fsn` on and could
     /// not queue the rest, because of `cause`: the sender takes no more
     /// publications. Returns the error of that flush.
@@ -746,6 +754,10 @@ struct BackpressureNotifier {
 #[cfg(test)]
 const DEFAULT_APPEND_DEADLINE: Duration = Duration::from_secs(30);
 const BACKPRESSURE_PARK: Duration = Duration::from_micros(50);
+/// How long a later frame of a flush in frames waits for storage work of
+/// the network thread before it looks again: see
+/// [`SyncQwpWsRunner::wait_for_storage_work`].
+const STORAGE_WORK_POLL: Duration = Duration::from_millis(100);
 
 impl<Q> SyncQwpWsRunner<Q>
 where
@@ -900,6 +912,13 @@ where
     }
 
     fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<u64> {
+        self.publish_frame(payload, false)
+    }
+
+    /// [`Self::publish_replay_payload`], or, with `later_frame`, the
+    /// publication of a frame after the first of a flush in frames: see
+    /// [`QwpWsFlushPublisher::publish_later_frame`].
+    fn publish_frame(&mut self, payload: &[u8], later_frame: bool) -> crate::Result<u64> {
         self.check_publication_open()?;
         if let Some(producer) = self.producer.as_mut()
             && let Some(receipt) = producer
@@ -922,9 +941,12 @@ where
                         let err: DriverError = err.into();
                         let backpressure = driver_error_backpressure_queue(&err);
                         if backpressure.is_some() {
-                            if !self
-                                .wait_for_publication_capacity(backpressure_generation, deadline)
-                            {
+                            if !self.wait_after_refusal(
+                                backpressure,
+                                backpressure_generation,
+                                deadline,
+                                later_frame,
+                            )? {
                                 return Err(submit_timeout_error(
                                     backpressure,
                                     self.reconnect_failure().as_ref(),
@@ -945,9 +967,15 @@ where
             match submit_result {
                 Ok(receipt) => return Ok(receipt.fsn),
                 Err(err) if driver_error_is_backpressure(&err) => {
-                    if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
+                    let backpressure = driver_error_backpressure_queue(&err);
+                    if !self.wait_after_refusal(
+                        backpressure,
+                        backpressure_generation,
+                        deadline,
+                        later_frame,
+                    )? {
                         return Err(submit_timeout_error(
-                            driver_error_backpressure_queue(&err),
+                            backpressure,
                             self.reconnect_failure().as_ref(),
                         ));
                     }
@@ -955,6 +983,60 @@ where
                 Err(err) => return Err(driver_error_to_error_without_state(err)),
             }
         }
+    }
+
+    /// Waits after the queue refused a frame for `backpressure`, and returns
+    /// whether to try the frame again: whether the back-pressure changed
+    /// after `generation` before `deadline`.
+    ///
+    /// A `later_frame` of a flush in frames that storage work of the network
+    /// thread keeps out (`StorageSpareNotReady`) waits for that work without
+    /// the deadline: it returns `true` after each wait, with or without a
+    /// change, and fails once that thread has stopped. See
+    /// [`Self::wait_for_storage_work`].
+    fn wait_after_refusal(
+        &self,
+        backpressure: Option<super::qwp_ws_queue::QueueError>,
+        generation: u64,
+        deadline: Option<Instant>,
+        later_frame: bool,
+    ) -> crate::Result<bool> {
+        use super::qwp_ws_queue::QueueError;
+        if later_frame && matches!(backpressure, Some(QueueError::StorageSpareNotReady { .. })) {
+            self.wait_for_storage_work(generation)?;
+            return Ok(true);
+        }
+        Ok(self.wait_for_publication_capacity(generation, deadline))
+    }
+
+    /// Waits up to [`STORAGE_WORK_POLL`] for the back-pressure to change
+    /// after `generation`, for a frame that storage work of the network
+    /// thread in flight keeps out of the queue: a spare segment that it
+    /// makes, the manifest write of a trim, or a periodic sync. That work
+    /// ends by itself, so the caller tries the frame again either way, with
+    /// no deadline.
+    ///
+    /// Fails once the network thread has ended: a thread that panicked
+    /// leaves the sender open and its storage work marked as in flight, and
+    /// notifies nobody.
+    fn wait_for_storage_work(&self, generation: u64) -> crate::Result<()> {
+        // A slice that ends without a change is tried again too: a storage
+        // step can clear its flag without a task that notifies, as a trim
+        // whose manifest write failed does.
+        let slice_end = Instant::now() + STORAGE_WORK_POLL;
+        if !self.wait_for_publication_capacity(generation, Some(slice_end))
+            && self
+                .thread
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished)
+        {
+            return Err(error::fmt!(
+                SocketError,
+                "QWP/WebSocket Store-and-Forward append failed: the network thread of the \
+                 sender has stopped"
+            ));
+        }
+        Ok(())
     }
 
     /// Waits until the queue has room for frames with payloads of
@@ -4655,7 +4737,10 @@ fn flush_qwp_ws_through(
                             });
                         } else {
                             // Room that the queue has now stays until the
-                            // frames are queued, so they need no wait then.
+                            // frames are queued, so they wait for no room
+                            // then. With `sf_dir` a later frame may still
+                            // wait for storage work of the network thread,
+                            // which ends by itself.
                             if !producer.has_room_for(frame_sizes) {
                                 // The bound takes more than the frame for
                                 // symbols: a buffer whose one frame fits the
@@ -4959,6 +5044,10 @@ impl QwpWsFlushPublisher for ManualQwpWsPublisher<'_> {
             .map_err(|err| self.error_of(err))
     }
 
+    fn publish_later_frame(&mut self, payload: &[u8]) -> crate::Result<u64> {
+        self.publish(payload)
+    }
+
     fn abort(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error {
         let flush = AbortedFlush::new(first_fsn, cause);
         let error = flush.error.clone();
@@ -4988,6 +5077,10 @@ where
 
     fn publish(&mut self, payload: &[u8]) -> crate::Result<u64> {
         self.publish_replay_payload(payload)
+    }
+
+    fn publish_later_frame(&mut self, payload: &[u8]) -> crate::Result<u64> {
+        self.publish_frame(payload, true)
     }
 
     fn abort(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error {
@@ -5031,7 +5124,10 @@ fn publish_qwp_ws_frames(
         let defer_commit = frames.peek().is_some();
         let published =
             encoder.encode_and_publish_frame(buffer, blocks, defer_commit, frame_cap, |payload| {
-                publisher.publish(payload)
+                match first_fsn {
+                    None => publisher.publish(payload),
+                    Some(_) => publisher.publish_later_frame(payload),
+                }
             });
         match (published, first_fsn) {
             (Ok(fsn), _) => {

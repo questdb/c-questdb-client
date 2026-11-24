@@ -47,7 +47,10 @@
 //! its frames, as long as `sf_append_deadline_millis` allows, and publishes
 //! none of them before. When the queue has no room for them, a buffer whose
 //! one frame fits the frame cap goes out as that frame, which waits only for
-//! its own room.
+//! its own room. With `sf_dir` a frame after the first waits, beyond
+//! `sf_append_deadline_millis`, for a spare segment file that the network
+//! thread is making: the flush fails then when the file cannot be made or
+//! that thread stops.
 //! Such a sender refuses a buffer above `max_buf_size` with an error that
 //! names `max_buf_size` and the size of the buffer, and a buffer whose frames
 //! the queue can never hold together with one that names
@@ -88,7 +91,8 @@ use std::time::{Duration, Instant};
 use crate::ErrorCode;
 use crate::ingress::sender::qwp_ws_sfa_manifest::fail_manifest_sync_after_for_test;
 use crate::ingress::sender::{
-    ConfirmationStoredHook, ConfirmationStoredHookGuard, fail_sync_after_for_test,
+    ConfirmationStoredHook, ConfirmationStoredHookGuard, HotSpareCreationHookGuard,
+    before_hot_spare_creation_for_test, fail_sync_after_for_test,
 };
 use crate::ingress::{
     AckLevel, Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, Sender, SenderBuilder,
@@ -4556,6 +4560,430 @@ fn a_close_drain_that_times_out_after_a_failed_flush_counts_the_frames_before_it
         close_drain_timed_out(before_frames)
     );
     drop(sender);
+    server.finish();
+}
+
+/// How long the network thread of a sender takes to make each spare segment
+/// file after its first one, with [`HeldSpares`]: far longer than an append
+/// deadline of 1 millisecond.
+const SPARE_DELAY: Duration = Duration::from_millis(100);
+
+/// How a creation of a spare segment file ends once [`HeldSpares`] lets it
+/// go.
+#[derive(Clone, Copy, Default)]
+enum SpareEnd {
+    #[default]
+    Made,
+    /// It fails as one that the disk refuses.
+    Failed,
+    /// The thread that makes it panics.
+    Panicked,
+}
+
+/// The spare segment files that the network thread of a sender makes for
+/// the slots under an `sf_dir`, as a test holds them back: not the one that
+/// a slot makes when it is opened. Each one after the first takes
+/// [`SPARE_DELAY`]. A creation of a held one then waits until the test lets
+/// it go.
+///
+/// The test holds them by their numbers: a new slot numbers its segment
+/// files in the order that it makes them, 0 for the first one in use and 1
+/// for the spare that it makes when it is opened. A frame that needs a new
+/// segment while no spare is being made makes that segment itself, so the
+/// network thread may make none of some numbers.
+#[derive(Default)]
+struct HeldSpares {
+    state: Mutex<HeldSparesState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct HeldSparesState {
+    begun: usize,
+    /// The number of the first spare segment file that is held: those from
+    /// it on wait for the test to let them go.
+    held_from: u64,
+    /// The number that `held_from` becomes when the test next lets the held
+    /// ones go, if any: see [`HeldSpares::hold_again_from`].
+    held_again_from: Option<u64>,
+    /// How many creations wait for the test to let them go.
+    waiting: usize,
+    end: SpareEnd,
+}
+
+impl HeldSpares {
+    /// Holds the spare segment files made under `sf_dir` from the first on,
+    /// as long as the guard lives.
+    fn hold(sf_dir: &tempfile::TempDir) -> (Arc<Self>, HotSpareCreationHookGuard) {
+        let spares = Arc::new(Self::default());
+        let making = Arc::clone(&spares);
+        let guard = before_hot_spare_creation_for_test(
+            sf_dir.path(),
+            Arc::new(move |path: &std::path::Path| making.make(segment_number(path))),
+        );
+        (spares, guard)
+    }
+
+    /// Makes the spare segment file numbered `number`.
+    fn make(&self, number: u64) -> std::io::Result<()> {
+        let delayed = {
+            let mut state = self.state.lock().unwrap();
+            state.begun += 1;
+            state.begun > 1
+        };
+        if delayed {
+            thread::sleep(SPARE_DELAY);
+        }
+        let mut state = self.state.lock().unwrap();
+        if number >= state.held_from {
+            state.waiting += 1;
+            self.changed.notify_all();
+            // A test that fails to let it go must not hang.
+            let deadline = Instant::now() + WAIT;
+            while number >= state.held_from && Instant::now() < deadline {
+                let wait_for = deadline.saturating_duration_since(Instant::now());
+                state = self.changed.wait_timeout(state, wait_for).unwrap().0;
+            }
+            state.waiting -= 1;
+        }
+        let end = state.end;
+        drop(state);
+        match end {
+            SpareEnd::Made => Ok(()),
+            SpareEnd::Failed => Err(std::io::Error::other(
+                "injected failure of a spare segment file",
+            )),
+            SpareEnd::Panicked => panic!("injected panic while making a spare segment file"),
+        }
+    }
+
+    /// Has the next [`Self::let_go`] go on holding the spare segment files
+    /// numbered from `number` on: the one after it lets them go.
+    fn hold_again_from(&self, number: u64) {
+        self.state.lock().unwrap().held_again_from = Some(number);
+    }
+
+    /// Waits until a creation waits for the test to let it go: the network
+    /// thread is making a spare, and the queue has none.
+    fn wait_for_a_held_spare(&self) {
+        let deadline = Instant::now() + WAIT;
+        let mut state = self.state.lock().unwrap();
+        while state.waiting == 0 {
+            assert!(Instant::now() < deadline, "no spare segment file is made");
+            state = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(10))
+                .unwrap()
+                .0;
+        }
+    }
+
+    /// Lets every creation go, now and from now on, to end as `end` says:
+    /// after [`Self::hold_again_from`], every one but those of the numbers
+    /// that it holds.
+    fn let_go(&self, end: SpareEnd) {
+        let mut state = self.state.lock().unwrap();
+        state.held_from = state.held_again_from.take().unwrap_or(u64::MAX);
+        state.end = end;
+        self.changed.notify_all();
+    }
+}
+
+/// The number of the segment file of a slot at `path`, from its name:
+/// `sf-<the number in 16 hex digits>.sfa`.
+fn segment_number(path: &std::path::Path) -> u64 {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("sf-")?.strip_suffix(".sfa"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .unwrap_or_else(|| panic!("not a segment file of a slot: {}", path.display()))
+}
+
+/// The settings of a sender whose queue is a slot of `sf_dir` in segments of
+/// 1,024 bytes, which hold two frames each of a flush that is cut for them,
+/// with an append deadline that is over long before the network thread has
+/// made a spare segment file.
+fn held_spares_settings(sf_dir: &tempfile::TempDir, durability: &str) -> String {
+    format!(
+        "sf_dir={};sender_id=spares;sf_max_segment_bytes=1024;sf_append_deadline_millis=1;\
+         {durability}",
+        sf_dir.path().display()
+    )
+}
+
+const MEMORY_DURABILITY: &str = "sf_durability=memory;";
+/// Periodic durability whose cadence never comes in a test: a segment is
+/// synced when a frame leaves it for a new one.
+const PERIODIC_DURABILITY: &str = "sf_durability=periodic;sf_sync_interval_millis=3600000;";
+
+/// The first flush of a sender with [`HeldSpares`]: three frames, the last
+/// of which takes the spare that the slot made when it was opened, and
+/// leaves room in that segment for a frame of the next flush.
+fn buffer_that_takes_the_spare_of_the_open() -> Buffer {
+    buffer_of(TABLE, 0..40)
+}
+
+/// Flushes [`buffer_that_takes_the_spare_of_the_open`], and then `buffer` on
+/// another thread while the network thread makes the next spare, which
+/// `spares` holds. Once a frame of `buffer` after its first one has waited
+/// for that spare, lets the spare go, to end as `end` says, and returns what
+/// the flush of `buffer` returns.
+fn flush_while_a_spare_is_held(
+    sender: &mut Sender,
+    spares: &HeldSpares,
+    buffer: &mut Buffer,
+    end: SpareEnd,
+) -> crate::Result<Option<u64>> {
+    let before = buffer_that_takes_the_spare_of_the_open();
+    let before_frames = frames_of_a_flush(&before, 492);
+    let frames = [before_frames.clone(), frames_of_a_flush(buffer, 492)].concat();
+    let taking = frames_that_take_a_new_segment(1024, &[], &frames);
+    assert!(
+        taking[0] == before_frames.len() - 1 && taking[1] > before_frames.len(),
+        "{taking:?}"
+    );
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&before).unwrap(),
+        Some(before_frames.len() as u64 - 1)
+    );
+    spares.wait_for_a_held_spare();
+    thread::scope(|scope| {
+        let flush = scope.spawn(|| sender.flush_and_get_fsn(buffer));
+        // The network thread sends nothing while it makes the spare: give
+        // the flush the time to get to the frame that waits, and that frame
+        // far more than the deadline.
+        thread::sleep(SPARE_DELAY);
+        spares.let_go(end);
+        flush.join().unwrap()
+    })
+}
+
+/// Checks that the server holds no row of the flush after
+/// [`buffer_that_takes_the_spare_of_the_open`]. It may hold the rows of that
+/// one: its last frame may still be unsent when the network thread stops
+/// while it makes the spare.
+fn assert_nothing_committed_after_the_spare_of_the_open(server: &QwpWsModelServer) {
+    let held = server.model.table(TABLE).unwrap_or_default();
+    let before = rows_of(TABLE, &buffer_that_takes_the_spare_of_the_open());
+    assert!(
+        (held.commits, held.rows_as_text()) == (0, Vec::new())
+            || (held.commits, held.rows_as_text()) == (1, before),
+        "{} commits: {:?}",
+        held.commits,
+        held.rows_as_text()
+    );
+}
+
+/// A flush in frames whose later frames need spare segment files that the
+/// network thread makes long after `sf_append_deadline_millis`: they wait
+/// for them, and the flush is one commit. With `sf_durability=memory` such a
+/// frame waits while the spare is being made; with `periodic` while any
+/// storage work of the network thread is under way.
+///
+/// The first frame of a flush still waits only up to the deadline: a flush
+/// whose first frame needs a spare that is being made fails with nothing
+/// queued, and goes through once the spare is there.
+fn a_flush_in_frames_waits_for_the_spares_of_its_later_frames_beyond_the_append_deadline(
+    durability: &str,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let (spares, _hook) = HeldSpares::hold(&sf_dir);
+    let mut sender = sender_with(
+        server.port,
+        Progress::Background,
+        &held_spares_settings(&sf_dir, durability),
+    );
+    assert_eq!(sender.effective_frame_cap().unwrap(), (992, true));
+    let before = buffer_that_takes_the_spare_of_the_open();
+    let first = buffer_of(TABLE, 40..205);
+    let mut second = buffer_of(TABLE, 205..355);
+    let before_frames = frames_of_a_flush(&before, 492);
+    let first_end = before_frames.len() + frames_of_a_flush(&first, 492).len();
+    let second_end = first_end + frames_of_a_flush(&second, 492).len();
+    let taking = frames_that_take_a_new_segment(
+        1024,
+        &[],
+        &[
+            before_frames,
+            frames_of_a_flush(&first, 492),
+            frames_of_a_flush(&second, 492),
+        ]
+        .concat(),
+    );
+    // The first flush takes several new segments, and the first frame of the
+    // second one does not fit the segment that the first one leaves.
+    assert!(
+        taking.iter().filter(|frame| **frame < first_end).count() >= 4
+            && taking.contains(&first_end),
+        "{taking:?}"
+    );
+    // The frame `taking[i]` takes the segment numbered `i + 1`. The spare
+    // that the first frame of the second flush needs stays held after the
+    // first flush, however late this thread is to look at it.
+    let spare_of_the_second = taking.iter().position(|frame| *frame == first_end).unwrap() + 1;
+    spares.hold_again_from(spare_of_the_second as u64);
+
+    let mut flushed = first.clone();
+    let last_fsn =
+        flush_while_a_spare_is_held(&mut sender, &spares, &mut flushed, SpareEnd::Made).unwrap();
+    assert_eq!(last_fsn, Some(first_end as u64 - 1));
+    assert!(flushed.is_empty());
+
+    // The network thread is making the next spare, which the first frame of
+    // the second flush needs.
+    spares.wait_for_a_held_spare();
+    let (rows, len) = (second.row_count(), second.len());
+    let err = sender.flush(&mut second).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError, "{}", err.msg());
+    assert!(
+        err.msg()
+            .contains("timed out waiting for a prepared segment spare"),
+        "{}",
+        err.msg()
+    );
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        Some(first_end as u64 - 1),
+        "nothing is published"
+    );
+    assert_eq!(
+        (second.row_count(), second.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    // As after any flush that waited out its deadline: the sender says that
+    // it must be closed, and goes on working all the same.
+    assert!(sender.must_close());
+
+    spares.let_go(SpareEnd::Made);
+    let retry_until = Instant::now() + WAIT;
+    let last_fsn = loop {
+        match sender.flush_and_get_fsn(&mut second) {
+            Ok(fsn) => break fsn,
+            Err(err) => {
+                assert!(
+                    err.msg()
+                        .contains("timed out waiting for a prepared segment spare")
+                        && Instant::now() < retry_until,
+                    "{}",
+                    err.msg()
+                );
+            }
+        }
+    };
+    assert_eq!(last_fsn, Some(second_end as u64 - 1));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let second = buffer_of(TABLE, 205..355);
+    assert_table_holds(&server, TABLE, 3, &[&before, &first, &second]);
+    drop(sender);
+    server.finish();
+}
+
+mod a_flush_in_frames_waits_for_the_spares_of_its_later_frames_beyond_the_append_deadline {
+    #[test]
+    fn memory() {
+        super::a_flush_in_frames_waits_for_the_spares_of_its_later_frames_beyond_the_append_deadline(
+            super::MEMORY_DURABILITY,
+        );
+    }
+
+    #[test]
+    fn periodic() {
+        super::a_flush_in_frames_waits_for_the_spares_of_its_later_frames_beyond_the_append_deadline(
+            super::PERIODIC_DURABILITY,
+        );
+    }
+}
+
+/// A spare segment file that cannot be made while a later frame of a flush
+/// in frames waits for it stops the sender: the flush fails within moments
+/// with the error of the sender, and nothing of it is committed.
+#[test]
+fn a_flush_in_frames_whose_spare_cannot_be_made_stops_the_sender_and_commits_nothing() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let (spares, _hook) = HeldSpares::hold(&sf_dir);
+    let mut sender = sender_with(
+        server.port,
+        Progress::Background,
+        &held_spares_settings(&sf_dir, MEMORY_DURABILITY),
+    );
+    let mut large = buffer_of(TABLE, 40..205);
+    let (rows, len) = (large.row_count(), large.len());
+
+    let started = Instant::now();
+    let err = flush_while_a_spare_is_held(&mut sender, &spares, &mut large, SpareEnd::Failed)
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "failed after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(err.code(), ErrorCode::SocketError, "{}", err.msg());
+    assert!(
+        err.msg()
+            .starts_with("QWP/WebSocket store-and-forward queue error: ")
+            && err
+                .msg()
+                .contains("injected failure of a spare segment file"),
+        "{}",
+        err.msg()
+    );
+    assert!(sender.must_close());
+    assert_eq!(
+        (large.row_count(), large.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    drop(sender);
+    assert_nothing_committed_after_the_spare_of_the_open(&server);
+    server.finish();
+}
+
+/// The network thread of a sender that panics while a later frame of a
+/// flush in frames waits for the spare that it makes: the flush fails
+/// within moments, nothing of it is committed, and the sender can be
+/// dropped. The message of the panic shows in the output of the test.
+#[test]
+fn a_flush_in_frames_whose_network_thread_dies_while_a_frame_waits_for_a_spare_fails() {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let (spares, _hook) = HeldSpares::hold(&sf_dir);
+    let mut sender = sender_with(
+        server.port,
+        Progress::Background,
+        &held_spares_settings(&sf_dir, MEMORY_DURABILITY),
+    );
+    let mut large = buffer_of(TABLE, 40..205);
+    let (rows, len) = (large.row_count(), large.len());
+
+    let started = Instant::now();
+    let err = flush_while_a_spare_is_held(&mut sender, &spares, &mut large, SpareEnd::Panicked)
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "failed after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+    assert!(
+        err.msg().starts_with(
+            "Could not flush buffer: the flush stopped part way: QWP/WebSocket \
+             Store-and-Forward append failed: the network thread of the sender has stopped. \
+             Nothing of this flush is committed"
+        ),
+        "{}",
+        err.msg()
+    );
+    assert!(sender.must_close());
+    assert_eq!(
+        (large.row_count(), large.len()),
+        (rows, len),
+        "the buffer keeps its rows"
+    );
+    drop(sender);
+    assert_nothing_committed_after_the_spare_of_the_open(&server);
     server.finish();
 }
 

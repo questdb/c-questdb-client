@@ -166,7 +166,12 @@ Before its first frame, a flush in several frames waits until the queue has
 room for all of them, for up to `sf_append_deadline_millis`. When the room
 does not come, the flush fails and nothing of it was sent. When the queue has
 no room for them now, a buffer whose one frame fits the frame cap goes out as
-that frame instead, and waits only for the room of that frame.
+that frame instead, and waits only for the room of that frame. Once its first
+frame is queued, the other frames do not wait for room. With `sf_dir` they
+may still wait while the sender writes its segment files, for example the
+next one it makes. `sf_append_deadline_millis` does not cut that wait short,
+so a short deadline does not stop a flush part way when it needs several
+new segment files.
 
 ### What one flush guarantees
 

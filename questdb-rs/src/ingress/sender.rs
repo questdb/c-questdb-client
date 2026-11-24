@@ -98,6 +98,8 @@ pub(crate) mod qwp_ws_sfa_manifest;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_queue;
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use qwp_ws_sfa_queue::{HotSpareCreationHookGuard, before_hot_spare_creation_for_test};
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_slot;

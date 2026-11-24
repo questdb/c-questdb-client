@@ -128,6 +128,60 @@ fn run_rotation_sync_hook() {
     }
 }
 
+/// What a test runs before a storage step makes a spare segment file of a
+/// slot ([`SfaStorageStep::CreateHotSpare`]), on the thread that runs the
+/// step: it gets the path of the file. An error fails the creation as one of
+/// the disk would.
+#[cfg(test)]
+pub(crate) type HotSpareCreationHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+
+/// The hooks of [`before_hot_spare_creation_for_test`], each with the folder
+/// whose slots it is for. Not a thread-local: the network thread of a sender
+/// makes its spares.
+#[cfg(test)]
+static HOT_SPARE_CREATION_HOOKS: Mutex<Vec<(PathBuf, HotSpareCreationHook)>> =
+    Mutex::new(Vec::new());
+
+/// Runs `hook` before each spare segment file made in a slot under `dir`,
+/// as long as the returned guard lives: see [`SfaStorageStep::perform`].
+#[cfg(test)]
+pub(crate) fn before_hot_spare_creation_for_test(
+    dir: &Path,
+    hook: HotSpareCreationHook,
+) -> HotSpareCreationHookGuard {
+    hot_spare_creation_hooks().push((dir.to_path_buf(), hook));
+    HotSpareCreationHookGuard(dir.to_path_buf())
+}
+
+/// Removes the hook of [`before_hot_spare_creation_for_test`] when dropped.
+#[cfg(test)]
+pub(crate) struct HotSpareCreationHookGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for HotSpareCreationHookGuard {
+    fn drop(&mut self) {
+        hot_spare_creation_hooks().retain(|(dir, _)| *dir != self.0);
+    }
+}
+
+#[cfg(test)]
+fn hot_spare_creation_hooks() -> std::sync::MutexGuard<'static, Vec<(PathBuf, HotSpareCreationHook)>>
+{
+    HOT_SPARE_CREATION_HOOKS.lock().unwrap()
+}
+
+#[cfg(test)]
+fn run_hot_spare_creation_hook(path: &Path) -> io::Result<()> {
+    let hook = hot_spare_creation_hooks()
+        .iter()
+        .find(|(dir, _)| path.starts_with(dir))
+        .map(|(_, hook)| Arc::clone(hook));
+    match hook {
+        Some(hook) => hook(path),
+        None => Ok(()),
+    }
+}
+
 /// Runs `open` with the recovery of a release that does not know
 /// [`remove_unfinished_flush`].
 #[cfg(test)]
@@ -314,6 +368,8 @@ impl SfaStorageStep {
             } => {
                 let segment = match path {
                     Some(path) => {
+                        #[cfg(test)]
+                        run_hot_spare_creation_hook(&path)?;
                         let slot_dir = path.parent().ok_or(SfaQueueError::InvalidSfDir)?;
                         create_manifested_segment(
                             &path, base_seq, size_bytes, created_us, slot_dir,
@@ -3961,6 +4017,12 @@ impl SfaProducer {
     /// installs a spare out of the free budget and the next rotation uses it.
     /// A no does not count the segments of confirmed frames that the runner
     /// has yet to free.
+    ///
+    /// A yes is about room only: with a slot under `sf_dir` a rotation still
+    /// waits while the runner makes the spare or writes the manifest of a
+    /// trim, and with periodic durability a rotation that must sync its
+    /// segment waits while any storage task of the runner is in flight. That
+    /// work ends by itself.
     ///
     /// The segment in use may have another size than the new ones: a slot
     /// reopened with another `sf_max_segment_bytes` goes on with the segment
