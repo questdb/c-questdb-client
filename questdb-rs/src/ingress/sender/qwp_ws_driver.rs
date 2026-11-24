@@ -10802,6 +10802,130 @@ mod tests {
         assert!(callback_ran.load(Ordering::Acquire));
     }
 
+    /// Brings a sender to a new connection after a flush stopped part way:
+    /// frame 0 confirmed or not, frames 1 and 2 given up (`abandon_from(1)`),
+    /// and nothing sent on the new connection, so a reject the server sends
+    /// now (of a symbol-dictionary catch-up, say) names no frame of it.
+    fn reconnected_after_an_abandoned_flush(
+        confirm_frame_0: bool,
+        max_frame_rejections: usize,
+    ) -> FakeDriver {
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
+            memory_queue(options(8, 1024)),
+            FakeOrderedServer::scripted([if confirm_frame_0 {
+                FakeSendResult::AckSent
+            } else {
+                FakeSendResult::NoResponse
+            }]),
+            max_frame_rejections,
+            Duration::ZERO,
+        );
+        driver.try_submit(b"before").unwrap();
+        driver.drive_once().unwrap();
+        assert_eq!(driver.acked_fsn(), confirm_frame_0.then_some(0));
+        driver.try_submit(b"abandoned-1").unwrap();
+        driver.try_submit(b"abandoned-2").unwrap();
+        assert!(!driver.store.progress_view().abandon_from(1));
+        assert_eq!(
+            driver.send_core.apply_transport_failure(
+                &mut driver.store,
+                TransportFailure::Disconnect(fake_transport_error("dropped after the abort")),
+            ),
+            Ok(DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect
+            })
+        );
+        assert_eq!(driver.send_core.transport.sent_frames().len(), 1);
+        assert_eq!(driver.counters().total_reconnect_attempts, 1);
+        driver
+    }
+
+    #[test]
+    fn a_presend_reject_when_every_unconfirmed_frame_is_abandoned_is_only_reported() {
+        for error in [
+            schema_mismatch_error("pre-send schema mismatch"),
+            write_error("pre-send write failure"),
+            not_writable_error("pre-send not writable"),
+        ] {
+            let status = error.status;
+            // A rejection limit of one: a single poison strike would stop the
+            // sender for good.
+            let mut driver = reconnected_after_an_abandoned_flush(true, 1);
+            driver
+                .send_core
+                .transport
+                .push_response(TransportResponse::Reject {
+                    wire_seq: 42,
+                    error,
+                });
+
+            // A response was read: the receive step reports progress, not a
+            // reconnect or a stop.
+            assert_eq!(
+                driver.drive_receive_once(),
+                Ok(DriveOutcome::Progress),
+                "status {status}"
+            );
+
+            assert!(!driver.is_terminal(), "status {status}");
+            assert_eq!(driver.terminal_sender_error(), None, "status {status}");
+            assert!(
+                driver.send_core.pending_reconnect.is_none(),
+                "status {status}"
+            );
+            assert_eq!(
+                driver.counters().total_reconnect_attempts,
+                1,
+                "status {status}"
+            );
+            assert_eq!(
+                driver.send_core.poison_tracker.strikes(),
+                0,
+                "status {status}"
+            );
+            assert_eq!(
+                driver.last_server_error().map(|error| error.status),
+                Some(status)
+            );
+            let error = driver.poll_sender_error().unwrap();
+            assert_eq!(error.status, Some(status));
+            assert_eq!(error.message_sequence, Some(42));
+            assert_eq!(error.from_fsn, 1);
+            assert_eq!(error.to_fsn, 2);
+            assert_eq!(driver.poll_sender_error(), None);
+            assert_eq!(driver.acked_fsn(), Some(0));
+            assert_eq!(driver.published_fsn(), Some(2));
+
+            assert_eq!(driver.drive_once(), Ok(DriveOutcome::Idle));
+            assert_eq!(driver.send_core.transport.sent_frames().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_presend_reject_with_an_unconfirmed_frame_before_the_abandoned_ones_stops_the_sender() {
+        let mut driver = reconnected_after_an_abandoned_flush(false, 1);
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 42,
+                error: schema_mismatch_error("pre-send schema mismatch"),
+            });
+
+        assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Terminal));
+
+        assert_eq!(
+            driver.receipt_status(QwpReceipt { fsn: 0 }),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(terminal_error.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
+        assert_eq!(terminal_error.message_sequence, Some(42));
+        assert_eq!(terminal_error.from_fsn, 0);
+        assert_eq!(terminal_error.to_fsn, 2);
+    }
+
     #[test]
     fn event_ring_overflow_drops_old_events_without_corrupting_receipt_status() {
         let mut driver = driver_with_event_capacity(FakeOrderedServer::ack_each_send(), 2);

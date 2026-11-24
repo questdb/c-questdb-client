@@ -285,7 +285,10 @@ mod a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_befo
 ///
 /// With `durable_acks`, the durable ack of the flush before comes after the
 /// rejection, on the same connection: the sender reads it, which it could
-/// not have done had the rejection made it stop or connect again.
+/// not have done had the rejection made it stop or connect again. Without,
+/// a ping after the rejection does the same: a sender that connects again
+/// after a rejection waits first, and does not read the connection it
+/// leaves, so it answers the ping only if it stayed.
 ///
 /// Only a sender in background progress mode can have sent a frame of the
 /// flush before the flush failed: the flush cuts its failing frame once the
@@ -328,6 +331,8 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_change
     );
     assert_eq!((rejection.from_fsn, rejection.to_fsn), (2, 2));
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
+    server.ping_and_wait_for_a_pong();
+    assert_eq!(server.connections_taken(), 1);
     if let Some(durable_acks) = durable_acks {
         server.send_durable_ack(&[(TABLE, 1)]);
         sender.wait(durable_acks.level(), WAIT).unwrap();

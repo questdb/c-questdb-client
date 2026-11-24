@@ -541,6 +541,9 @@ struct ServerShared {
     /// The durable acks that the upgrade of every later connection grants:
     /// see [`QwpWsModelServer::grant_durable_acks`].
     durable_acks: Mutex<Option<MockDurableTier>>,
+    /// The pongs taken so far, over all connections: see
+    /// [`QwpWsModelServer::ping_and_wait_for_a_pong`].
+    pongs: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -613,6 +616,7 @@ impl QwpWsModelServer {
             rejection: Mutex::default(),
             answers: Mutex::default(),
             durable_acks: Mutex::default(),
+            pongs: AtomicUsize::new(0),
         });
 
         let acceptor = thread::spawn({
@@ -846,7 +850,10 @@ fn serve_connection(
                 let _answers = shared.answers.lock().unwrap();
                 write_server_frame(&mut stream, WS_OPCODE_PONG, &payload, false)
             }
-            WS_OPCODE_PONG => Ok(()),
+            WS_OPCODE_PONG => {
+                shared.pongs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
             WS_OPCODE_CLOSE => break,
             other => panic!("the server model does not take WebSocket opcode {other:#x}"),
         };
@@ -904,6 +911,37 @@ impl QwpWsModelServer {
     /// again.
     pub(crate) fn connections_taken(&self) -> usize {
         self.shared.streams.lock().unwrap().len()
+    }
+
+    /// Pings every connection that has not ended, after the answers it was
+    /// given, and waits until a client answers with a pong. A client reads
+    /// in order, so once it has answered, it has read on that connection
+    /// everything the server sent it before.
+    pub(crate) fn ping_and_wait_for_a_pong(&self) {
+        let pongs = self.shared.pongs.load(Ordering::SeqCst);
+        let pinged = {
+            let _answers = self.shared.answers.lock().unwrap();
+            let streams = self.shared.streams.lock().unwrap();
+            let mut pinged = 0;
+            for stream in streams.iter() {
+                let mut stream = stream.try_clone().unwrap();
+                // A connection that has ended takes no more writes.
+                if write_server_frame(&mut stream, WS_OPCODE_PING, b"barrier", false).is_ok() {
+                    pinged += 1;
+                }
+            }
+            pinged
+        };
+        // Asserted once the locks are released, which the server needs to stop.
+        assert!(pinged > 0, "no connection took the ping");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.shared.pongs.load(Ordering::SeqCst) == pongs {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no client answered the ping"
+            );
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
