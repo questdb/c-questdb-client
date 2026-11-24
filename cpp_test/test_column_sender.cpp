@@ -816,6 +816,10 @@ TEST_CASE(
     const size_t symbols = 2'000'000;
     auto mock = spawn_ingress_mock(frame_limit);
     questdb::pool db{ingress_conf_for(mock->addr())};
+    // Whether the error says that a frame of the failed flush may have been
+    // sent: the network thread sends frames while the flush still cuts them,
+    // so that depends on timing.
+    bool in_doubt = false;
     auto large = [&] {
         auto rs = db.borrow_sender();
         auto buffer = rs.new_buffer();
@@ -848,7 +852,11 @@ TEST_CASE(
             catch (const qdb::line_sender_error& e)
             {
                 CHECK(e.code() == qdb::line_sender_error_code::flush_aborted);
-                CHECK_FALSE(e.in_doubt());
+                // A later flush gets the error of the failed one.
+                if (flushed == &buffer)
+                    in_doubt = e.in_doubt();
+                else
+                    CHECK(e.in_doubt() == in_doubt);
                 CHECK(
                     std::string{e.what()}.find("the flush stopped part way") !=
                     std::string::npos);
@@ -866,12 +874,14 @@ TEST_CASE(
 
     // The guard is gone: the pool closed the sender instead of keeping it.
     // The server took the flush before, and of the failed flush only frames
-    // with the defer flag: never the frame that commits it.
+    // with the defer flag, never the frame that commits it, and any only if
+    // the error said that some may have been sent.
     REQUIRE(mock->wait_for_ingress_closed(1));
     const auto frames = mock->ingress_frames();
-    REQUIRE(frames.size() > 2);
+    REQUIRE(frames.size() >= 1);
     for (size_t i = 0; i < frames.size(); ++i)
         CHECK(frames[i].deferred == (i > 0));
+    CHECK((frames.size() == 1 || in_doubt));
 
     // The next borrower gets a new connection, which takes a flush.
     auto rs = db.borrow_sender();
