@@ -345,13 +345,38 @@ pub(crate) struct SfaSegment {
 #[derive(Debug)]
 struct SfaSegmentFile {
     file: File,
-    /// A second mapping of the whole file, made with the segment's mapping
-    /// and kept for the segment's life, through which only the re-dirty
-    /// after a failed sync writes ([`SfaSegment::redirty_pages`]). Made up
-    /// front so that the re-dirty cannot fail: a mapping made when a sync
-    /// fails can itself fail then, and leave the pages clean. The mutex
-    /// keeps two re-dirties of the segment apart.
-    redirty_view: Mutex<MmapMut>,
+    /// A second mapping of the whole file, through which only the re-dirty
+    /// after a failed sync writes ([`SfaSegment::redirty_pages`]).
+    /// [`SfaSegment::sync_published_range`] makes it before its first sync
+    /// ([`Self::map_for_redirty`]), and it stays for the segment's life: the
+    /// re-dirty then cannot fail, as a mapping made when a sync fails could,
+    /// leaving the pages clean. Only periodic durability syncs published
+    /// bytes, so under any other the file is mapped once. The mutex keeps two
+    /// re-dirties of the segment apart.
+    redirty_view: Mutex<Option<MmapMut>>,
+}
+
+impl SfaSegmentFile {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            redirty_view: Mutex::new(None),
+        }
+    }
+
+    /// Makes [`Self::redirty_view`], `size_bytes` long, unless it is made.
+    fn map_for_redirty(&self, size_bytes: u64) -> Result<(), SfaSegmentError> {
+        // A panic while the lock was held left nothing half done: the view
+        // is made whole or not at all.
+        let mut view = self
+            .redirty_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if view.is_none() {
+            *view = Some(map_file_for_redirty(&self.file, size_bytes)?);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct SfaMappedPayload {
@@ -472,12 +497,8 @@ impl SfaSegment {
             }
             return Err(err);
         }
-        let mapped = map_file_mut(&file, size_bytes).and_then(|mapping| {
-            let redirty_view = map_file_for_redirty(&file, size_bytes)?;
-            Ok((mapping, redirty_view))
-        });
-        let (mapping, redirty_view) = match mapped {
-            Ok(mapped) => mapped,
+        let mapping = match map_file_mut(&file, size_bytes) {
+            Ok(mapping) => mapping,
             Err(err) => {
                 if create_new {
                     let _ = fs::remove_file(path);
@@ -492,10 +513,7 @@ impl SfaSegment {
         mapping.copy_from(0, &encode_header(header, manifest_required));
 
         Ok(Self {
-            file: Some(SfaSegmentFile {
-                file,
-                redirty_view: Mutex::new(redirty_view),
-            }),
+            file: Some(SfaSegmentFile::new(file)),
             mapping,
             path: Some(path.to_path_buf()),
             size_bytes,
@@ -526,12 +544,8 @@ impl SfaSegment {
         // are already allocated.
         reserve_segment_blocks(&file, size_bytes)?;
         let mapping = map_file_mut(&file, size_bytes)?;
-        let redirty_view = map_file_for_redirty(&file, size_bytes)?;
         Ok(Self {
-            file: Some(SfaSegmentFile {
-                file,
-                redirty_view: Mutex::new(redirty_view),
-            }),
+            file: Some(SfaSegmentFile::new(file)),
             mapping,
             path: Some(path.to_path_buf()),
             size_bytes,
@@ -655,6 +669,10 @@ impl SfaSegment {
         if published > self.mapping.len {
             return Err(SfaSegmentError::OffsetOverflow);
         }
+        // Before anything is written back, so that a failure to map leaves
+        // the pages as they are, and the re-dirty after a failed sync has its
+        // mapping.
+        segment_file.map_for_redirty(self.size_bytes)?;
 
         let page_size = system_page_size();
         let durable = usize::try_from(durable_offset).map_err(|_| {
@@ -727,6 +745,15 @@ impl SfaSegment {
             .redirty_view
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // The sync that failed made the view before it synced, and nothing
+        // takes it away: `map_for_redirty` is its only writer.
+        debug_assert!(
+            view.is_some(),
+            "a segment re-dirtied before its view was made"
+        );
+        let Some(view) = view.as_mut() else {
+            return;
+        };
         let base = view.as_mut_ptr();
         let mut cursor = offset;
         while cursor < end {
@@ -1763,12 +1790,17 @@ mod tests {
     }
 
     /// A failed sync re-dirties its pages even when no mapping can be made
-    /// any more: the one it stores through was made with the segment.
+    /// any more: the one it stores through was made by the first sync.
     #[test]
     fn a_failed_sync_redirties_when_no_mapping_can_be_made_any_more() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("periodic.sfa");
         let mut segment = SfaSegment::create(&path, 0, 4096, 1).unwrap();
+        segment.try_append(b"first").unwrap().unwrap();
+        let durable = segment.append_offset();
+        segment
+            .sync_published_range(HEADER_SIZE as u64, durable)
+            .unwrap();
         segment.try_append(b"payload").unwrap().unwrap();
         let published = segment.append_offset();
 
@@ -1776,7 +1808,7 @@ mod tests {
         fail_sync_after_for_test(0);
         fail_redirty_mapping_for_test(usize::MAX);
         let err = segment
-            .sync_published_range(HEADER_SIZE as u64, published)
+            .sync_published_range(durable, published)
             .unwrap_err();
         fail_redirty_mapping_for_test(0);
         assert!(
@@ -1790,48 +1822,96 @@ mod tests {
         );
         assert_eq!(segment.redirty_passes(), 1);
 
-        segment
-            .sync_published_range(HEADER_SIZE as u64, published)
-            .unwrap();
+        segment.sync_published_range(durable, published).unwrap();
         assert_eq!(segment.redirty_passes(), 1);
         assert_eq!(
             payloads(&scan_file(&path).unwrap()),
-            vec![b"payload".to_vec()]
+            vec![b"first".to_vec(), b"payload".to_vec()]
         );
     }
 
-    /// A segment file that cannot be mapped for the re-dirty of a failed
-    /// sync is not taken: neither a new one, which is removed, nor one that
-    /// is opened again.
+    /// A sync that cannot map the file for the re-dirty of its failure fails
+    /// before it writes anything back, and the next sync maps it. A segment
+    /// is made and opened without that mapping.
     #[test]
-    fn a_segment_whose_file_cannot_be_mapped_for_its_redirty_is_not_taken() {
+    fn a_sync_that_cannot_map_its_file_for_the_redirty_fails_before_it_syncs() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("new.sfa");
+        let path = dir.path().join("periodic.sfa");
         fail_redirty_mapping_for_test(1);
-        let err = SfaSegment::create_new(&path, 0, 4096, 1).unwrap_err();
-        fail_redirty_mapping_for_test(0);
-        assert!(
-            format!("{err:?}").contains("injected failure to map"),
-            "{err:?}"
-        );
-        assert!(!path.exists());
-
-        let path = dir.path().join("existing.sfa");
         let mut segment = SfaSegment::create_new(&path, 0, 4096, 1).unwrap();
         segment.try_append(b"payload").unwrap().unwrap();
-        segment.sync_file().unwrap();
-        drop(segment);
-        fail_redirty_mapping_for_test(1);
-        let err = SfaSegment::open_existing(&path).unwrap_err();
-        fail_redirty_mapping_for_test(0);
+        let published = segment.append_offset();
+
+        record_published_sync_events_for_test();
+        let err = segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap_err();
         assert!(
             format!("{err:?}").contains("injected failure to map"),
             "{err:?}"
         );
+        assert_eq!(take_published_sync_events_for_test(), []);
+
+        record_published_sync_events_for_test();
+        segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap();
+        assert_eq!(
+            take_published_sync_events_for_test(),
+            [PublishedSyncEvent::Synced]
+        );
+        drop(segment);
+        fail_redirty_mapping_for_test(1);
+        let segment = SfaSegment::open_existing(&path).unwrap();
+        fail_redirty_mapping_for_test(0);
         assert_eq!(
             payloads(&scan_file(&path).unwrap()),
             vec![b"payload".to_vec()]
         );
+        drop(segment);
+    }
+
+    /// The mappings of `path` in this process, as Linux lists them.
+    #[cfg(target_os = "linux")]
+    fn mappings_of(path: &Path) -> usize {
+        let path = fs::canonicalize(path).unwrap();
+        let path = path.to_str().unwrap();
+        fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .filter(|line| line.ends_with(path))
+            .count()
+    }
+
+    /// A segment is one mapping of its file, made or opened, until a sync of
+    /// published bytes, which only periodic durability makes, maps the file
+    /// once more for the re-dirty after a failed sync.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_segment_maps_its_file_for_the_redirty_at_its_first_sync() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("periodic.sfa");
+        let mut segment = SfaSegment::create_new(&path, 0, 4096, 1).unwrap();
+        assert_eq!(mappings_of(&path), 1);
+        segment.try_append(b"payload").unwrap().unwrap();
+        let published = segment.append_offset();
+        segment.sync_file().unwrap();
+        assert_eq!(mappings_of(&path), 1);
+        segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap();
+        assert_eq!(mappings_of(&path), 2);
+        segment.try_append(b"more").unwrap().unwrap();
+        segment
+            .sync_published_range(published, segment.append_offset())
+            .unwrap();
+        assert_eq!(mappings_of(&path), 2);
+        drop(segment);
+        assert_eq!(mappings_of(&path), 0);
+
+        let segment = SfaSegment::open_existing(&path).unwrap();
+        assert_eq!(mappings_of(&path), 1);
+        drop(segment);
     }
 
     #[test]
