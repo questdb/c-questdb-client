@@ -363,7 +363,8 @@ pub enum ErrorCode {
     ///
     /// The sender takes no more flushes, and
     /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. A
-    /// later flush fails with this error, or with the sender's terminal error
+    /// later flush fails with this code too, with `in_doubt` `false`, because
+    /// nothing of it is sent; or with the sender's terminal error
     /// once the sender has stopped for a reason of its own since, unless its
     /// buffer is refused first for a reason of its own, which keeps its code:
     /// for example [`SymbolDictFull`](Self::SymbolDictFull), for a symbol that

@@ -240,7 +240,8 @@ server error (`poll_qwp_ws_error` in Rust, `line_sender_qwpws_poll_error` in
 C) and to the error handler.
 
 The sender takes no more flushes and reports `must_close`. A later flush fails
-with `flush_aborted` too, or with the sender's terminal error once the sender
+with `flush_aborted` too, not in doubt, because nothing of it is sent; or with
+the sender's terminal error once the sender
 has stopped for a reason of its own since, unless its buffer is refused first
 for a reason of its own, which keeps its code (a symbol that the full
 dictionary cannot take fails with `symbol_dict_full`); a flush of an empty

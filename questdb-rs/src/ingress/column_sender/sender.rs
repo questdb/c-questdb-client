@@ -1697,7 +1697,7 @@ impl SfaBackend {
     ///
     /// The same for [`FlushAborted`](ErrorCode::FlushAborted), the error of a
     /// flush of a row buffer that stopped part way: the connection takes no
-    /// more publications, each of which gets that error.
+    /// more publications, each of which is refused with that code.
     fn latch_if_connection_is_spent(&mut self, err: &crate::Error) {
         if matches!(
             err.code(),

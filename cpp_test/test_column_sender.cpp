@@ -852,14 +852,23 @@ TEST_CASE(
             catch (const qdb::line_sender_error& e)
             {
                 CHECK(e.code() == qdb::line_sender_error_code::flush_aborted);
-                // A later flush gets the error of the failed one.
+                // A later flush fails with the code of the failed one, and
+                // is not in doubt: nothing of it is sent.
                 if (flushed == &buffer)
+                {
                     in_doubt = e.in_doubt();
+                    CHECK(
+                        std::string{e.what()}.find(
+                            "the flush stopped part way") != std::string::npos);
+                }
                 else
-                    CHECK(e.in_doubt() == in_doubt);
-                CHECK(
-                    std::string{e.what()}.find("the flush stopped part way") !=
-                    std::string::npos);
+                {
+                    CHECK_FALSE(e.in_doubt());
+                    CHECK(
+                        std::string{e.what()}.find(
+                            "Nothing of this flush was sent") !=
+                        std::string::npos);
+                }
             }
             CHECK(flushed->row_count() == rows);
             CHECK(rs.published_fsn() == before);

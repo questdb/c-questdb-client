@@ -69,10 +69,10 @@ use crate::tests::qwp_ws_flush_in_frames::{
     NO_FRAME_LIMIT_TOLD, NO_WAIT_AT_THE_END, RECONNECT_SOON, SCHEMA_MISMATCH, SECOND, TABLE, WAIT,
     a_frame_that_fits_by_the_symbols_its_connection_holds,
     a_frame_that_fits_where_its_frames_do_not, add_symbol_row, allocated_after_a_flush_of,
-    assert_table_holds, assert_timed_out_waiting_for_room, buffer_of_len, buffer_of_symbols,
-    queue_bytes_for, slot_settings, stopped_by_a_full_dictionary, symbols_held_before,
-    two_flushes_for_a_queue_that_holds_one, wait_for_frames_taken, wait_for_no_connection,
-    wait_until,
+    assert_refused_after_a_full_dictionary, assert_table_holds, assert_timed_out_waiting_for_room,
+    buffer_of_len, buffer_of_symbols, queue_bytes_for, slot_settings, stopped_by_a_full_dictionary,
+    symbols_held_before, two_flushes_for_a_queue_that_holds_one, wait_for_frames_taken,
+    wait_for_no_connection, wait_until,
 };
 use crate::tests::qwp_ws_server_model::{
     QwpWsModelServer, buffer_of, frame_of_a_sender, frames_of_a_flush, frames_of_a_sender,
@@ -779,20 +779,18 @@ fn a_pooled_flush_that_fails_part_way_is_aborted_and_its_connection_is_not_hande
     assert_eq!(sender.published_fsn().unwrap(), Some(0));
     wait_for_frames_taken(&server, 1);
 
-    // Every later flush gets the same error: of rows, in one frame and in
-    // frames, and of columns.
+    // Every later flush is refused, and is not in doubt, whether the failed
+    // flush is: of rows, in one frame and in frames, and of columns.
     for later in [&buffer_of(TABLE, 0..3), &large] {
         let refused = sender.flush_buffer_and_keep(later).unwrap_err();
-        assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
-        assert_eq!(refused.in_doubt(), err.in_doubt());
+        assert_refused_after_a_full_dictionary(&refused, symbols);
     }
     let (ids, ts) = ([1_i64], [1_i64]);
     let mut chunk = Chunk::new(TABLE);
     chunk.column_i64("id", &ids, None).unwrap();
     chunk.at_nanos(&ts).unwrap();
     let refused = sender.flush(&mut chunk).unwrap_err();
-    assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
-    assert_eq!(refused.in_doubt(), err.in_doubt());
+    assert_refused_after_a_full_dictionary(&refused, symbols);
     assert_eq!(sender.published_fsn().unwrap(), Some(0));
 
     // The sender waits for the answer to the flush before, and for nothing
@@ -1051,6 +1049,76 @@ fn a_closed_pool_closes_a_sender_whose_flush_failed_part_way_when_it_comes_back(
     wait_for_no_connection(&server);
     assert_taken_of_the_failed_flush(&err, server.frames_taken() - 1, queued);
     assert_table_holds(&server, TABLE, 1, &[&before]);
+    server.finish();
+}
+
+/// The network thread has sent frames of a flush when the flush stops part
+/// way, so its error is in doubt. Nothing of a later flush is sent, of rows
+/// or of an Arrow batch, so its error is not in doubt: the C API hands an
+/// Arrow batch back to its caller by that, through the sender that owns its
+/// place, which the C client holds.
+#[cfg(all(feature = "ffi-support", feature = "arrow-ingress"))]
+#[test]
+fn a_flush_after_one_that_failed_part_way_in_doubt_is_not_in_doubt() {
+    use crate::ingress::TableName;
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use std::sync::Arc;
+
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let before = buffer_of_symbols(TABLE, 0..10);
+    let (large, queued, symbols) = a_buffer_whose_flush_stops_part_way(Some(&before));
+    let cap = TestDictCapGuard::new(symbols);
+    let db = pool_with(server.port, LONG_CLOSE_FLUSH);
+    let mut owned = db.borrow_sender_owned().unwrap();
+    drop(cap);
+    let sender = owned.get_mut();
+    assert_eq!(
+        sender.flush_buffer_and_keep_and_get_fsn(&before).unwrap(),
+        Some(0)
+    );
+    // The server has taken every queued frame of the flush when the flush
+    // comes to the frame that fails.
+    let published = 1 + queued;
+    let err = {
+        let (frames_taken, mut later_frames) = (server.frames_taken_reader(), 0);
+        let _hook = LaterFrameHookGuard::new(Box::new(move || {
+            later_frames += 1;
+            if later_frames == queued {
+                wait_until(WAIT, || frames_taken() >= published);
+            }
+        }));
+        sender.flush_buffer_and_keep(&large).unwrap_err()
+    };
+    assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+    assert!(err.in_doubt());
+
+    let other = buffer_of(SECOND, 0..3);
+    let refused = sender.flush_buffer_and_keep(&other).unwrap_err();
+    assert_refused_after_a_full_dictionary(&refused, symbols);
+    let ids: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
+    let batch = RecordBatch::try_from_iter([("id", ids)]).unwrap();
+    let table = TableName::new(SECOND).unwrap();
+    let refused = sender
+        .flush_arrow_batch_at_now(table, &batch, &[])
+        .unwrap_err();
+    assert_refused_after_a_full_dictionary(&refused, symbols);
+    let refused = sender
+        .flush_arrow_batch_at_now_and_get_fsn(table, &batch, &[])
+        .unwrap_err();
+    assert_refused_after_a_full_dictionary(&refused, symbols);
+    let refused = sender
+        .flush_arrow_batch_at_now_and_wait_ffi(table, &batch, &[], AckLevel::Ok)
+        .unwrap_err();
+    assert!(refused.is_not_delivered());
+    assert_refused_after_a_full_dictionary(&refused.into_error(), symbols);
+
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+    drop(owned);
+    wait_for_no_connection(&server);
+    assert!(server.model.table(SECOND).is_none());
+    assert_table_holds(&server, TABLE, 1, &[&before]);
+    db.close();
     server.finish();
 }
 

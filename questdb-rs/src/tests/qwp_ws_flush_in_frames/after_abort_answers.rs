@@ -193,8 +193,7 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_befor
     assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
     assert_eq!(err.in_doubt(), matches!(progress, Progress::Background));
     let later = sender.flush_and_keep(&before).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, progress, &later, symbols);
-    assert_eq!(later.in_doubt(), err.in_doubt());
+    assert_refused_after_a_full_dictionary(&later, symbols);
     sender.close_drain().unwrap();
     assert_eq!(files_in_the_slots(), Vec::<String>::new());
     assert_table_holds(&server, TABLE, 1, &[&before]);
@@ -353,7 +352,7 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_change
         "{totals:?}"
     );
     let later = sender.flush_and_keep(&before).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, progress, &later, symbols);
+    assert_refused_after_a_full_dictionary(&later, symbols);
     assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
     assert!(err.in_doubt());
     sender.close_drain().unwrap();

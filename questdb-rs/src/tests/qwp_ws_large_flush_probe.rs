@@ -634,12 +634,14 @@ fn qwp_ws_real_server_large_flush_that_fails_part_way_commits_none_of_its_rows()
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    // A later flush gets the same error, and nothing of it is queued.
+    // A later flush is refused, not in doubt: nothing of it is queued.
     let refused = match sender.flush_and_keep(&small) {
         Err(refused) => refused,
         Ok(()) => panic!("the sender took a flush after the one that failed part way"),
     };
-    assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+    assert_eq!(refused.code(), ErrorCode::FlushAborted, "{}", refused.msg());
+    assert!(refused.msg().contains(&cause), "{}", refused.msg());
+    assert!(!refused.in_doubt());
     assert_eq!(sender.published_fsn()?, Some(0));
     let totals = sender.qwp_ws_totals()?;
     assert_eq!(

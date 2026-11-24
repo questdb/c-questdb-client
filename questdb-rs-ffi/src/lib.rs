@@ -501,7 +501,8 @@ pub enum line_sender_error_code {
     /// error handler (`line_sender_opts_qwpws_error_handler`).
     ///
     /// The sender takes no more flushes, and `line_sender_must_close` returns
-    /// true. A later flush fails with this code, or with the code of the
+    /// true. A later flush fails with this code too, not in doubt, because
+    /// nothing of it is sent; or with the code of the
     /// sender's terminal error once the sender has stopped for a reason of its
     /// own since, unless its buffer is refused first for a reason of its own,
     /// which keeps its code: for example `line_sender_error_symbol_dict_full`,

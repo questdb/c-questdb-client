@@ -1455,8 +1455,13 @@ TEST(test_flush_that_stops_part_way_fails_with_flush_aborted)
         !line_sender_flush(sender, small, &err),
         "the sender takes no more flushes");
     CHECK(
+        err != NULL && !line_sender_error_in_doubt(err),
+        "nothing of the later flush was sent: its error is not in doubt");
+    CHECK(
         error_is(
-            err, line_sender_error_flush_aborted, "the flush stopped part way"),
+            err,
+            line_sender_error_flush_aborted,
+            "an earlier flush stopped part way"),
         "a later flush fails with flush_aborted too");
     err = NULL;
     CHECK(

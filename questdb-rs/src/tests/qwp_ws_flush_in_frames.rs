@@ -67,7 +67,7 @@
 //! keeps its rows. The sender sends no frame of it from then on, and its
 //! error is in doubt when a frame of it was sent before. The sender queues
 //! nothing more: each later flush that gets as far as the queue fails with
-//! the same error. It goes on delivering the flushes before the failed one:
+//! the same code, not in doubt, as nothing of it is sent. It goes on delivering the flushes before the failed one:
 //! `wait` and `close_drain` return once those are confirmed.
 //! A frame of a flush that the server rejects leaves nothing of the flush
 //! committed. A rejection for good stops the sender, which reports it at
@@ -3403,6 +3403,26 @@ pub(super) fn stopped_by_a_full_dictionary(symbols: usize, sent: bool) -> String
     )
 }
 
+/// Checks the error of a flush on a sender whose earlier flush stopped part
+/// way because its dictionary was full with `symbols` symbols: the sender
+/// queues nothing of it, so the error is never in doubt, whatever the error
+/// of the earlier flush says.
+pub(super) fn assert_refused_after_a_full_dictionary(refused: &crate::Error, symbols: usize) {
+    assert_eq!(refused.code(), ErrorCode::FlushAborted, "{}", refused.msg());
+    assert_eq!(
+        refused.msg(),
+        format!(
+            "Could not flush: this sender takes no more flushes since an earlier flush stopped \
+             part way: QWP/WS connection-scoped symbol dictionary reached its {symbols}-entry \
+             cap; retire this connection and continue on a fresh one (returning it to a pool \
+             recycles its dictionary). Nothing of this flush was sent. The sender still \
+             delivers the flushes before the one that stopped: once they are confirmed, close \
+             it or return it to its pool, and flush again through a new sender."
+        )
+    );
+    assert!(!refused.in_doubt());
+}
+
 /// Checks the error of a flush that stopped part way because the dictionary
 /// of its sender was full with `symbols` symbols, and what the sender says
 /// of itself right after it. The error tells whether a frame of the flush
@@ -3514,11 +3534,11 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
     // It sends the flush before.
     wait_for_frames_sent(&mut sender, progress, &server, 1);
 
-    // Every later flush gets the same error, of one frame and in frames.
+    // Every later flush is refused, of one frame and in frames, and is not
+    // in doubt, whether the failed flush is.
     for later in [&buffer_of(TABLE, 0..3), &large] {
         let refused = sender.flush_and_keep(later).unwrap_err();
-        assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
-        assert_eq!(refused.in_doubt(), err.in_doubt());
+        assert_refused_after_a_full_dictionary(&refused, symbols);
     }
     // A buffer with a symbol that is new to the full dictionary cannot be
     // encoded, which the sender finds before it comes to its state.
@@ -3766,7 +3786,7 @@ fn a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirm
     drop(sender);
 }
 
-fn a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush(progress: Progress) {
+fn a_later_flush_without_room_in_the_queue_is_refused_at_once(progress: Progress) {
     let server = QwpWsModelServer::start(FRAME_LIMIT);
     let large = buffer_of_symbols(TABLE, 10..160);
     let frames = frames_of_a_sender(&large, 492, &mut SymbolGlobalDict::new());
@@ -3786,7 +3806,7 @@ fn a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush(pr
     // for as many again, and gets none: the server confirms none of them.
     // The sender does not wait for it.
     let refused = sender.flush_and_keep(&large).unwrap_err();
-    assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+    assert_refused_after_a_full_dictionary(&refused, symbols);
     assert_eq!(sender.published_fsn().unwrap(), None);
     sender.close_drain().unwrap();
     drop(sender);
@@ -3831,7 +3851,7 @@ fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_co
     let totals = sender.qwp_ws_totals().unwrap();
     assert_eq!(totals.reconnects_succeeded, 1);
     let refused = sender.flush_and_keep(&large).unwrap_err();
-    assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
+    assert_refused_after_a_full_dictionary(&refused, symbols);
     sender.close_drain().unwrap();
     assert_table_holds(&server, TABLE, 1, &[&before]);
     let held = server.model.table(FIRST).unwrap_or_default();
@@ -4509,7 +4529,7 @@ fn a_flush_with_a_frame_that_a_demoted_server_rejects_is_sent_again_whole(progre
 /// tells so after the flush has failed. The rejection is about the failed
 /// flush, whose error already says what of it may be committed. So the
 /// calls about the flush before it, which is confirmed, do not fail on it,
-/// and a later flush still gets the error of the failed flush. The sender
+/// and a later flush is still refused. The sender
 /// reports the rejection as an error of the server, and a close drain
 /// empties its slot.
 ///
@@ -4572,8 +4592,8 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_befor
     assert_eq!(sender.acked_fsn().unwrap(), Some(0));
     assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), Some(0));
     sender.wait(AckLevel::Ok, WAIT).unwrap();
-    let err = sender.flush_and_keep(&before).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
+    let refused = sender.flush_and_keep(&before).unwrap_err();
+    assert_refused_after_a_full_dictionary(&refused, symbols);
     sender.close_drain().unwrap();
     assert_eq!(files_in_the_slots(), Vec::<String>::new());
     assert_table_holds(&server, TABLE, 1, &[&before]);
@@ -5336,7 +5356,7 @@ in_both_progress_modes! {
     a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
-    a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
+    a_later_flush_without_room_in_the_queue_is_refused_at_once
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
     a_close_drain_after_a_flush_that_failed_part_way_leaves_an_empty_slot
     a_new_sender_on_the_slot_flushes_a_buffer_that_a_full_dictionary_stopped_after_close_drain
@@ -5382,7 +5402,7 @@ on_disk_in_both_progress_modes! {
     a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
-    a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
+    a_later_flush_without_room_in_the_queue_is_refused_at_once
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
     a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
