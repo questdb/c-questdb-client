@@ -5118,15 +5118,24 @@ impl QwpWsFlushPublisher for ManualQwpWsPublisher<'_> {
         self.publish(payload)
     }
 
-    /// As [`SyncQwpWsRunner::abort_flush`]. The flush drives the connection
-    /// itself only while a frame waits for room, on this thread, so no
-    /// answer is read between the abandoning and the check of the store.
+    /// As [`SyncQwpWsRunner::abort_flush`], but nothing can have stopped the
+    /// sender during the flush: the flush drives the connection only while
+    /// it waits for room before its first frame.
     fn abort(&mut self, first_fsn: u64, cause: crate::Error) -> crate::Error {
         let sent = self.store.progress_view().abandon_from(first_fsn);
-        let mut flush = AbortedFlush::new(first_fsn, cause, sent);
-        if self.store.is_terminal() {
-            flush.error = driver_error_to_error_from_store(self.store, DriverError::Terminal);
-        }
+        // A store stops for good only inside a drive, and nothing drives
+        // between two frames of a flush: `flush_qwp_ws_through` takes the
+        // room of every frame before the first (`has_room_for` of upper
+        // bounds of their sizes), and the storage work of a sender in manual
+        // progress mode runs inline, so a rotation without a spare makes its
+        // segment itself (`SfaProducer::rotate_active`). No later frame
+        // waits for room.
+        debug_assert!(
+            !self.store.is_terminal(),
+            "a sender in manual progress mode stopped between two frames of a flush, \
+             which drives the connection only before its first frame"
+        );
+        let flush = AbortedFlush::new(first_fsn, cause, sent);
         let error = flush.error.clone();
         *self.aborted_flush = Some(flush);
         self.store.set_closing();
