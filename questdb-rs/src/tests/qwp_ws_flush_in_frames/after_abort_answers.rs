@@ -275,12 +275,14 @@ mod a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_befo
     }
 }
 
-/// The server rejects with `status` a frame of a flush in frames that
-/// failed part way, and tells so once the flush has failed. The sender
-/// reports the rejection, which names the frame, as an error of the server,
-/// whatever the policy of `status`, and nothing else changes: it does not
-/// stop, does not connect again, confirms the flush before, and gives a
-/// later flush the error of the failed one. A close drain empties its slot.
+/// The server rejects with `status` frame `rejected` of the sender, a frame
+/// of a flush in frames that failed part way, and tells so once the flush
+/// has failed. The first frame of the flush, which brings the first block of
+/// a table, is where a schema mismatch shows. The sender reports the
+/// rejection, which names the frame, as an error of the server, whatever the
+/// policy of `status`, and nothing else changes: it does not stop, does not
+/// connect again, confirms the flush before, and refuses a later flush. A
+/// close drain empties its slot.
 ///
 /// With `durable_acks`, the durable ack of the flush before comes after the
 /// rejection, on the same connection: the sender reads it, which it could
@@ -298,6 +300,7 @@ mod a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_befo
 fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_changes_nothing_else(
     progress: Progress,
     (status, category, policy): (u8, QwpWsErrorCategory, QwpWsErrorPolicy),
+    rejected: u64,
     durable_acks: Option<DurableAcks>,
 ) {
     assert!(matches!(progress, Progress::Background));
@@ -306,6 +309,8 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_change
         server.grant_durable_acks(durable_acks.tier());
     }
     let (before, large, failing, symbols) = a_flush_before_and_one_that_fails_at_a_middle_frame();
+    // Frame 0 is the flush before, and the failing frame is not queued.
+    assert!((1..failing as u64).contains(&rejected));
     let mut sender = {
         let _cap = crate::ingress::TestDictCapGuard::new(symbols);
         sender_with(
@@ -317,9 +322,18 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_change
 
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
     sender.wait(AckLevel::Ok, WAIT).unwrap();
-    server.reject_frame(3, status);
+    // The server counts the frames it takes from 1.
+    let rejected_taken = rejected as usize + 1;
+    server.reject_frame(rejected_taken, status);
     server.hold_answers();
-    let err = flush_that_fails_part_way(&mut sender, progress, &server, &large, failing, 4);
+    let err = flush_that_fails_part_way(
+        &mut sender,
+        progress,
+        &server,
+        &large,
+        failing,
+        rejected_taken + 1,
+    );
     server.let_answers_go();
 
     let rejection = the_server_error_read_by(&mut sender, progress);
@@ -331,7 +345,7 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_change
         ),
         (category, policy, Some(status))
     );
-    assert_eq!((rejection.from_fsn, rejection.to_fsn), (2, 2));
+    assert_eq!((rejection.from_fsn, rejection.to_fsn), (rejected, rejected));
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
     server.ping_and_wait_for_a_pong();
     assert_eq!(server.connections_taken(), 1);
@@ -366,11 +380,11 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_change
 
 /// Makes the tests of
 /// [`a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_changes_nothing_else`]
-/// for a rejection: `<rejection>::background`, with durable acks
-/// `<rejection>::background_with_durable_acks`, and both once more with the
-/// queue on disk.
+/// for a rejection of a frame of the sender: `<rejection>::background`, with
+/// durable acks `<rejection>::background_with_durable_acks`, and both once
+/// more with the queue on disk.
 macro_rules! for_each_rejection {
-    ($($rejection:ident: $status:ident, $category:ident, $policy:ident;)*) => {$(
+    ($($rejection:ident: $status:ident, $category:ident, $policy:ident, frame $frame:literal;)*) => {$(
         mod $rejection {
             use super::super::{
                 DurableAcks, Progress, QwpWsErrorCategory, QwpWsErrorPolicy, on_disk,
@@ -381,11 +395,11 @@ macro_rules! for_each_rejection {
                 (super::super::$status, QwpWsErrorCategory::$category, QwpWsErrorPolicy::$policy);
 
             fn without_durable_acks(progress: Progress) {
-                test(progress, REJECTION, None);
+                test(progress, REJECTION, $frame, None);
             }
 
             fn with_durable_acks(progress: Progress) {
-                test(progress, REJECTION, Some(DurableAcks::On));
+                test(progress, REJECTION, $frame, Some(DurableAcks::On));
             }
 
             #[test]
@@ -413,8 +427,9 @@ macro_rules! for_each_rejection {
 
 mod a_rejection_of_a_frame_of_a_flush_that_failed_part_way_is_reported_and_changes_nothing_else {
     for_each_rejection! {
-        rejected_for_good: SCHEMA_MISMATCH, SchemaMismatch, Terminal;
-        rejected_as_not_written: WRITE_ERROR, WriteError, Retriable;
-        rejected_as_not_writable: NOT_WRITABLE, NotWritable, RetriableOther;
+        rejected_for_good: SCHEMA_MISMATCH, SchemaMismatch, Terminal, frame 2;
+        rejected_as_not_written: WRITE_ERROR, WriteError, Retriable, frame 2;
+        rejected_as_not_writable: NOT_WRITABLE, NotWritable, RetriableOther, frame 2;
+        first_frame_rejected_for_good: SCHEMA_MISMATCH, SchemaMismatch, Terminal, frame 1;
     }
 }
