@@ -656,6 +656,10 @@ public:
      * dedup/upsert keys make duplicate rows harmless.
      *
      * For a low-level flush, this does not track earlier independent flushes.
+     * For `error_code::flush_aborted`, `true` means that some frames of the
+     * flush were sent; the server commits a part of them by itself only for a
+     * table with more rows in the flush than its `qwp.max.uncommitted.rows`:
+     * see `line_sender_error_flush_aborted` in `line_sender.h`.
      */
     bool in_doubt() const noexcept
     {

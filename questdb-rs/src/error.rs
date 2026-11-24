@@ -338,53 +338,76 @@ pub enum ErrorCode {
     /// A [`Sender::flush`](crate::ingress::Sender::flush) of a row buffer
     /// that goes out in several frames stopped part way: some of its frames
     /// were queued, and a later one could not be. The message names the
-    /// cause.
+    /// cause. From then on no frame of the flush is sent, not even after a
+    /// reconnect, and the buffer still holds its rows.
     ///
-    /// **Nothing of the flush is committed**, and the buffer still holds its
-    /// rows. The frame that commits the flush was never queued, and the
-    /// server drops the rows it holds for the flush when the sender is
-    /// closed. So [`in_doubt`](Error::in_doubt) is `false`: flushing the same
-    /// buffer through a new sender stores no row twice. With `sf_dir` a
-    /// [`close_drain`](crate::ingress::Sender::close_drain) that waits (a
-    /// `close_flush_timeout` above 0) and succeeds leaves the slot empty, and
-    /// so does the pool when its wait for the sender succeeds. Otherwise the
-    /// frames of the flush stay in the slot, and the sender that opens the
-    /// slot next removes them and sends nothing of the flush. It keeps the
-    /// symbols of the slot, so a flush that stopped because the symbol
-    /// dictionary was full can stop the same way once more; a `close_drain`
-    /// of that sender that waits and succeeds empties the slot.
+    /// Check [`in_doubt`](Error::in_doubt) before you flush the buffer again:
     ///
-    /// This holds for a flush with no more rows of one table than the
-    /// server's `qwp.max.uncommitted.rows` (1,000,000 by default). Above that
-    /// the server commits a part of the table's rows by itself: that part
-    /// stays, and flushing the buffer again stores it twice unless the table
-    /// has `DEDUP` keys.
+    /// - `false`: no frame of the flush was sent. Nothing of it is committed,
+    ///   and flushing the same buffer through a new sender stores no row
+    ///   twice.
+    /// - `true`: some of its frames were sent. The server holds their rows
+    ///   and drops them when the sender is closed, so nothing of the flush is
+    ///   committed, unless one table had more rows in the flush than the
+    ///   server's `qwp.max.uncommitted.rows` (1,000,000 by default). Then the
+    ///   server may have committed a part of that table's rows by itself, and
+    ///   flushing the buffer again stores that part twice unless the table
+    ///   has `DEDUP` keys.
     ///
-    /// The sender queues nothing more, and
+    /// The server may still answer about the frames that were sent, and may
+    /// reject one of them. Such an answer fails no call: a rejection is only
+    /// reported as a server error, by
+    /// [`poll_qwp_ws_error`](crate::ingress::Sender::poll_qwp_ws_error) and
+    /// the
+    /// [`qwp_ws_error_handler`](crate::ingress::SenderBuilder::qwp_ws_error_handler).
+    ///
+    /// The sender takes no more flushes, and
     /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. A
     /// later flush fails with this error, unless its buffer is refused first
     /// for a reason of its own, which keeps its code: for example
     /// [`SymbolDictFull`](Self::SymbolDictFull), for a symbol that the full
     /// dictionary cannot take. A flush of an empty buffer queues nothing and
-    /// returns `Ok`. The sender still delivers the flushes before the failed
-    /// one. To lose none of them, call
+    /// returns `Ok`.
+    ///
+    /// The sender still delivers the flushes before the failed one.
+    /// [`wait`](crate::ingress::Sender::wait) covers them and succeeds once
+    /// they reach the level it asks for, durable levels included.
+    /// [`published_fsn`](crate::ingress::Sender::published_fsn) is the last
+    /// frame before the failed flush, and
+    /// [`acked_fsn`](crate::ingress::Sender::acked_fsn) and
+    /// [`completed_fsn`](crate::ingress::Sender::completed_fsn) never go
+    /// above it. To lose none of these flushes, call
     /// [`close_drain`](crate::ingress::Sender::close_drain) with a
     /// `close_flush_timeout` above 0, the default, and check that it
-    /// succeeded: it waits for the flushes before the failed one only, as
-    /// [`wait`](crate::ingress::Sender::wait) does. With 0 or less it does
-    /// not wait, and without `sf_dir` the flushes that the server has not
-    /// confirmed go with the sender. Then drop the sender, create a new one
-    /// and flush the buffer again.
+    /// succeeded: it waits for the flushes before the failed one only. With 0
+    /// or less it does not wait, and without `sf_dir` the flushes that the
+    /// server has not confirmed go with the sender. Then drop the sender,
+    /// create a new one and flush the buffer again, as `in_doubt` allows.
+    ///
+    /// With `sf_dir` a `close_drain` that waits and succeeds leaves the slot
+    /// empty, and so does the pool when its wait for the sender succeeds.
+    /// Otherwise the frames of the failed flush stay in the slot, and the
+    /// sender that opens the slot next removes them and sends nothing of the
+    /// flush. It keeps the symbols of the slot, so a flush that stopped
+    /// because the symbol dictionary was full can stop the same way once
+    /// more; a `close_drain` of that sender that waits and succeeds empties
+    /// the slot.
     ///
     /// A sender borrowed from the pool of a `QuestDb` is not closed by its
     /// holder. To lose none of the flushes before the failed one, call its
     /// `wait` and check that it succeeded. Then give the sender back: the
     /// pool closes it instead of lending it again. Borrow a new sender and
-    /// flush the buffer through it.
+    /// flush the buffer through it, as `in_doubt` allows.
+    ///
+    /// A sender that stops for a reason of its own while a flush still
+    /// queues its frames, such as a transport failure, a server rejection of
+    /// a frame, or the network thread failing to make a segment file, fails
+    /// that flush with the code of that reason, not with this one: that is
+    /// the sender's usual terminal error.
     ///
     /// Distinct from [`SocketError`](Self::SocketError), so that callers can
-    /// tell **by code** a flush that is safe to send again from a failure of
-    /// the connection.
+    /// tell **by code** a flush that stopped part way from a failure of the
+    /// connection.
     FlushAborted,
 }
 
@@ -665,6 +688,11 @@ impl Error {
     /// code to decide whether re-sending the same input is safe; when
     /// `in_doubt()` is `true`, only replay if table-level dedup/upsert keys
     /// make duplicates harmless.
+    ///
+    /// For [`ErrorCode::FlushAborted`], `true` means that some frames of the
+    /// flush were sent; the server commits a part of them by itself only for
+    /// a table with more rows in the flush than its
+    /// `qwp.max.uncommitted.rows`: see [`ErrorCode::FlushAborted`].
     #[must_use]
     pub fn in_doubt(&self) -> bool {
         self.0.in_doubt

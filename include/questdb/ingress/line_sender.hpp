@@ -2016,11 +2016,11 @@ public:
      * QWP/WebSocket diagnostic polling API. Such a failure can also fail a
      * flush that is still queuing its frames, for example when the server
      * rejects one of them: the flush throws with the code of that failure,
-     * nothing of it is committed, and the buffer keeps its rows. A flush in
-     * several frames that stops after some of them were published throws
-     * `line_sender_error_code::flush_aborted`: nothing of it is committed, the
-     * buffer keeps its rows, and the sender takes no more flushes while it
-     * still delivers the ones before.
+     * and the buffer keeps its rows. A flush in several frames that stops for
+     * any other reason after some of them were published throws
+     * `line_sender_error_code::flush_aborted`; the buffer keeps its rows. What
+     * of the flush may be committed and what to do next is told at
+     * `line_sender_error_flush_aborted` in `line_sender.h`.
      *
      * HTTP should be the first choice, but use TCP if you need to continuously
      * send data to the server at a high rate.
@@ -2295,18 +2295,19 @@ public:
      * Stop accepting new QWP/WebSocket publications and wait for already
      * published frames to resolve. After a flush that failed with
      * `line_sender_error_code::flush_aborted` these are the frames published
-     * before that flush: the frames of the failed flush are dropped, and
-     * nothing of it is committed. The timeout is configured with
-     * `close_flush_timeout_millis`; the default is 5000 ms, and values less
-     * than or equal to 0 configure a zero-timeout fast close. Throws on
-     * timeout or terminal failure. The timeout error says how many published
-     * frames are not confirmed. Without `sf_dir` they are dropped with the
-     * sender: call `wait()` before closing, raise `close_flush_timeout_millis`,
-     * or use `sf_dir`. With `sf_dir` they stay in the slot and the next sender
-     * on the slot sends them. After a flush that failed with `flush_aborted`,
-     * in background progress mode, the error can instead say that the flushes
-     * before it are confirmed and the connection was still closing: destroy
-     * the sender then.
+     * before that flush: the frames of the failed flush are dropped. What of
+     * the failed flush may still be committed, and how to flush its buffer
+     * again, is told at `line_sender_error_flush_aborted` in `line_sender.h`.
+     * The timeout is configured with `close_flush_timeout_millis`; the
+     * default is 5000 ms, and values less than or equal to 0 configure a
+     * zero-timeout fast close. Throws on timeout or terminal failure. The
+     * timeout error says how many published frames are not confirmed. Without
+     * `sf_dir` they are dropped with the sender: call `wait()` before closing,
+     * raise `close_flush_timeout_millis`, or use `sf_dir`. With `sf_dir` they
+     * stay in the slot and the next sender on the slot sends them. After a
+     * flush that failed with `flush_aborted`, in background progress mode, the
+     * error can instead say that the flushes before it are confirmed and the
+     * connection was still closing: destroy the sender then.
      */
     void close_drain()
     {

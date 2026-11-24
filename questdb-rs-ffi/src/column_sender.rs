@@ -3792,10 +3792,10 @@ unsafe fn acquire_qwp_sender(
 /// write the symbol file of its `sf_dir` slot, it fails with
 /// `line_sender_error_batch_too_large` and nothing is published. A flush in
 /// several frames that stops after some of them were published fails with
-/// `line_sender_error_flush_aborted`: nothing of it is committed, the Buffer
-/// keeps its rows, and the sender takes no more flushes while it still delivers
-/// the ones before. That code says what the holder of a pooled sender does
-/// next. The same holds for the other `qwp_sender_flush_buffer*` functions.
+/// `line_sender_error_flush_aborted`, and the Buffer keeps its rows. That code
+/// says what of the flush may be committed and what the holder of a pooled
+/// sender does next. The same holds for the other `qwp_sender_flush_buffer*`
+/// functions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_sender_flush_buffer(
     sender: *mut qwp_sender,

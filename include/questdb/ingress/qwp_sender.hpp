@@ -1248,12 +1248,16 @@ public:
      * symbol file of its `sf_dir` slot, it throws
      * `line_sender_error_code::batch_too_large` and nothing is published. A
      * flush in several frames that stops after some of them were published
-     * throws `line_sender_error_code::flush_aborted`: nothing of it is
-     * committed, the Buffer keeps its rows, and the sender takes no more
-     * flushes while it still delivers the ones before. To lose none of those,
-     * call `wait()` and let it return. Then let this guard go: the pool closes
-     * the sender instead of lending it again. Flush the Buffer through a newly
-     * borrowed sender. The same holds for the other Buffer flushes.
+     * throws `line_sender_error_code::flush_aborted`, and the Buffer keeps its
+     * rows. The sender takes no more flushes, and still delivers the ones
+     * before. To lose none of those, call `wait()` and let it return. Then let
+     * this guard go: the pool closes the sender instead of lending it again.
+     * Flush the Buffer through a newly borrowed sender when the error's
+     * `in_doubt()` is false. When it is true, some frames of the flush were
+     * sent, and a table with more rows in the flush than the server's
+     * `qwp.max.uncommitted.rows` may have a part of them committed already:
+     * see `line_sender_error_flush_aborted` in `line_sender.h`. The same
+     * holds for the other Buffer flushes.
      */
     void flush(line_sender_buffer& buffer)
     {

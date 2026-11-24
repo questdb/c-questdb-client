@@ -706,9 +706,12 @@ impl Sender {
     /// its OIDC detail (`Error::oidc_error`), as a `Sender::wait` timeout
     /// does. A flush in several frames that stops after some of them were
     /// published fails with
-    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted): nothing of
-    /// it is committed, the buffer keeps its rows, and the sender takes no
-    /// more flushes while it still delivers the ones before.
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted), which says
+    /// what of it may be committed and what to do next. A sender that stops
+    /// for a reason of its own while a flush still queues its frames, such as
+    /// a transport failure or a server rejection of a frame, fails that flush
+    /// with the code of that reason instead: that is the sender's usual
+    /// terminal error. Either way the buffer keeps its rows.
     ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.
@@ -1172,8 +1175,9 @@ impl Sender {
     /// published frames to complete. After a flush that failed with
     /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) these are
     /// the frames published before that flush: the frames of the failed flush
-    /// are dropped, and nothing of it is committed. With `sf_dir` a wait that
-    /// succeeds then leaves the slot empty.
+    /// are dropped. With `sf_dir` a wait that succeeds then leaves the slot
+    /// empty. What of the failed flush may still be committed, and how to
+    /// flush its buffer again, is told at `FlushAborted`.
     ///
     /// The wait is bounded by the QWP/WebSocket `close_flush_timeout_millis`
     /// setting. Its default is 5000 ms, matching the Java sender. Values less

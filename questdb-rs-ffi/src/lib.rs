@@ -481,49 +481,69 @@ pub enum line_sender_error_code {
 
     /// A flush of a row buffer that goes out in several frames stopped part
     /// way: some of its frames were queued, and a later one could not be. The
-    /// message names the cause.
+    /// message names the cause. From then on no frame of the flush is sent,
+    /// not even after a reconnect, and the buffer still holds its rows.
     ///
-    /// Nothing of the flush is committed, and the buffer still holds its
-    /// rows: `line_sender_error_in_doubt` is false, and flushing the same
-    /// buffer through a new sender stores no row twice. With `sf_dir` a
-    /// `line_sender_qwpws_close_drain` that waits (a `close_flush_timeout`
-    /// above 0) and succeeds leaves the slot empty, and so does the pool when
-    /// its wait for the sender succeeds. Otherwise the frames of the flush
-    /// stay in the slot, and the sender that opens the slot next removes them
-    /// and sends nothing of the flush. It keeps the symbols of the slot, so a
-    /// flush that stopped because the symbol dictionary was full can stop the
-    /// same way once more; a `line_sender_qwpws_close_drain` of that sender
-    /// that waits and succeeds empties the slot.
+    /// Check `line_sender_error_in_doubt` before you flush the buffer again:
+    /// - false: no frame of the flush was sent. Nothing of it is committed,
+    ///   and flushing the same buffer through a new sender stores no row twice.
+    /// - true: some of its frames were sent. The server holds their rows and
+    ///   drops them when the sender is closed, so nothing of the flush is
+    ///   committed, unless one table had more rows in the flush than the
+    ///   server's `qwp.max.uncommitted.rows` (1,000,000 by default). Then the
+    ///   server may have committed a part of that table's rows by itself, and
+    ///   flushing the buffer again stores that part twice unless the table has
+    ///   `DEDUP` keys.
     ///
-    /// This holds for a flush with no more rows of one table than the
-    /// server's `qwp.max.uncommitted.rows` (1,000,000 by default). Above
-    /// that the server commits a part of the table's rows by itself: that
-    /// part stays, and flushing the buffer again stores it twice unless the
-    /// table has `DEDUP` keys.
+    /// The server may still answer about the frames that were sent, and may
+    /// reject one of them. Such an answer fails no call: a rejection is only
+    /// reported as a server error, by `line_sender_qwpws_poll_error` and the
+    /// error handler (`line_sender_opts_qwpws_error_handler`).
     ///
-    /// The sender queues nothing more, and `line_sender_must_close` returns
-    /// true. A later flush fails with this code, unless its buffer is
-    /// refused first for a reason of its own, which keeps its code: for
-    /// example `line_sender_error_symbol_dict_full`, for a symbol that the
-    /// full dictionary cannot take. A flush of an empty buffer queues
-    /// nothing and succeeds. The sender still delivers the flushes before
-    /// the failed one. To lose none of them, call
-    /// `line_sender_qwpws_close_drain` with a `close_flush_timeout_millis`
-    /// above 0, the default, and check that it succeeded: it waits for the
-    /// flushes before the failed one only. With 0 or less it does not wait,
-    /// and without `sf_dir` the flushes that the server has not confirmed
-    /// go with the sender. Then `line_sender_close`, create a new sender and
-    /// flush the buffer again.
+    /// The sender takes no more flushes, and `line_sender_must_close` returns
+    /// true. A later flush fails with this code, unless its buffer is refused
+    /// first for a reason of its own, which keeps its code: for example
+    /// `line_sender_error_symbol_dict_full`, for a symbol that the full
+    /// dictionary cannot take. A flush of an empty buffer queues nothing and
+    /// succeeds.
+    ///
+    /// The sender still delivers the flushes before the failed one.
+    /// `line_sender_qwpws_wait` covers them and succeeds once they reach the
+    /// level it asks for, durable levels included.
+    /// `line_sender_qwpws_published_fsn` is the last frame before the failed
+    /// flush, and `line_sender_qwpws_acked_fsn` never goes above it. To lose
+    /// none of these flushes, call `line_sender_qwpws_close_drain` with a
+    /// `close_flush_timeout_millis` above 0, the default, and check that it
+    /// succeeded: it waits for the flushes before the failed one only. With 0
+    /// or less it does not wait, and without `sf_dir` the flushes that the
+    /// server has not confirmed go with the sender. Then `line_sender_close`,
+    /// create a new sender and flush the buffer again, as
+    /// `line_sender_error_in_doubt` allows.
+    ///
+    /// With `sf_dir` a `line_sender_qwpws_close_drain` that waits and succeeds
+    /// leaves the slot empty, and so does the pool when its wait for the
+    /// sender succeeds. Otherwise the frames of the failed flush stay in the
+    /// slot, and the sender that opens the slot next removes them and sends
+    /// nothing of the flush. It keeps the symbols of the slot, so a flush that
+    /// stopped because the symbol dictionary was full can stop the same way
+    /// once more; a `line_sender_qwpws_close_drain` of that sender that waits
+    /// and succeeds empties the slot.
     ///
     /// A sender borrowed from a pool (`questdb_db_borrow_sender`) is not
     /// closed by its holder. To lose none of the flushes before the failed
-    /// one, call `qwp_sender_wait` and check that it succeeded. Then give
-    /// the sender back with `questdb_db_return_sender`: the pool closes it
-    /// instead of lending it again. Borrow a new sender and flush the buffer
-    /// through it.
+    /// one, call `qwp_sender_wait` and check that it succeeded. Then give the
+    /// sender back with `questdb_db_return_sender`: the pool closes it instead
+    /// of lending it again. Borrow a new sender and flush the buffer through
+    /// it, as `line_sender_error_in_doubt` allows.
+    ///
+    /// A sender that stops for a reason of its own while a flush still queues
+    /// its frames, such as a transport failure, a server rejection of a frame,
+    /// or the network thread failing to make a segment file, fails that flush
+    /// with the code of that reason, not with this one: that is the sender's
+    /// usual terminal error.
     ///
     /// Distinct from `line_sender_error_socket_error`, so that callers can
-    /// tell by code a flush that is safe to send again from a failure of the
+    /// tell by code a flush that stopped part way from a failure of the
     /// connection.
     line_sender_error_flush_aborted = 39,
 }
@@ -823,6 +843,11 @@ pub unsafe extern "C" fn questdb_error_msg(
 /// may be replaced), yet that code alone does NOT mean the input is safe to
 /// resend. When this returns `true`, only replay the same input if table-level
 /// dedup/upsert keys make duplicate rows harmless.
+///
+/// For `line_sender_error_flush_aborted`, `true` means that some frames of the
+/// flush were sent; the server commits a part of them by itself only for a
+/// table with more rows in the flush than its `qwp.max.uncommitted.rows`: see
+/// `line_sender_error_flush_aborted`.
 ///
 /// NULL-safe: passing `NULL` returns `false`.
 #[unsafe(no_mangle)]

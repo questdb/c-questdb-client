@@ -217,35 +217,63 @@ symbol capacity to match.
 
 A flush that has queued some of its frames and cannot queue the rest, for
 example because the connection has no room for more symbols, fails with
-`flush_aborted`. The frame that commits the flush was never sent, so nothing
-of the flush is committed (below the server's row limit, see above), the
-buffer keeps its rows, and the error is not in doubt. The sender takes no more
-flushes and reports `must_close`, but it still delivers the flushes before the
-failed one. To lose none of them, call `close_drain` with a
-`close_flush_timeout` above 0 (the default is 5 seconds) and check that it
-succeeded; then close the sender, create a new one and flush the buffer again.
-The holder of a pooled sender calls `wait` instead and returns the sender,
-which the pool closes instead of lending it again. With `sf_dir` a
-`close_drain` that waits (a `close_flush_timeout` above 0) and succeeds leaves
-the sender's slot empty, nothing of the failed flush and no symbols, and so
-does the pool when its wait for the sender succeeds. Otherwise the sender that
-opens the slot next keeps the slot's symbols, so a flush that stopped because
-the connection had no room for more symbols can stop the same way once more; a
-`close_drain` of that sender that waits and succeeds empties the slot.
+`flush_aborted`. The buffer keeps its rows. Its frames stop going out at once:
+the sender sends no more of them, not even after a reconnect. The frame that
+commits the flush was never queued, and the server drops the rows it holds for
+the flush when the sender is closed.
+
+Check whether the error is in doubt (`in_doubt()` in Rust and C++,
+`line_sender_error_in_doubt` in C) before you flush the buffer again:
+
+- **Not in doubt:** no frame of the flush was sent. Nothing of it is
+  committed, and flushing the buffer again through a new sender stores no row
+  twice.
+- **In doubt:** some of its frames were sent. Nothing of the flush is
+  committed, unless one table had more rows in it than the server's row limit
+  (see above): then the server may have committed a part of that table's rows
+  by itself, and flushing the buffer again stores that part twice unless the
+  table has `DEDUP` keys.
+
+The server may still answer about the frames that were sent, and may reject
+one of them. Such an answer fails no call: a rejection is only reported as a
+server error (`poll_qwp_ws_error` in Rust, `line_sender_qwpws_poll_error` in
+C) and to the error handler.
+
+The sender takes no more flushes and reports `must_close`. A later flush fails
+with `flush_aborted` too, unless its buffer is refused first for a reason of
+its own, which keeps its code (a symbol that the full dictionary cannot take
+fails with `symbol_dict_full`); a flush of an empty buffer succeeds.
+
+The sender still delivers the flushes before the failed one. `wait` covers
+them and succeeds once they reach the level it asks for, durable levels
+included. The published frame number is the last frame before the failed
+flush, and the acknowledged one never goes above it. To lose none of these
+flushes, call `close_drain` with a `close_flush_timeout` above 0 (the default
+is 5 seconds) and check that it succeeded; then close the sender, create a new
+one and flush the buffer again if the error allows it (see above). The holder
+of a pooled sender calls `wait` instead and returns the sender, which the pool
+closes instead of lending it again. With `sf_dir` a `close_drain` that waits
+(a `close_flush_timeout` above 0) and succeeds leaves the sender's slot empty,
+nothing of the failed flush and no symbols, and so does the pool when its wait
+for the sender succeeds. Otherwise the sender that opens the slot next removes
+the frames of the failed flush and keeps the slot's symbols, so a flush that
+stopped because the connection had no room for more symbols can stop the same
+way once more; a `close_drain` of that sender that waits and succeeds empties
+the slot.
+
+A sender that stops for a reason of its own while a flush still queues its
+frames fails that flush with the code of that reason, not with
+`flush_aborted`: a transport failure, a server rejection of one of its frames,
+or the sender's network thread failing to make a segment file. That is the
+sender's usual terminal error, and the buffer keeps its rows.
 
 A frame that the server rejects takes the whole flush with it: the server
-drops the rows it holds for the connection and commits nothing of the flush.
-The rejection usually arrives while `flush` is still queuing frames, and
-`flush` then fails with it while the buffer keeps its rows. Otherwise the next
-`wait`, `flush` or `close_drain` reports it. A rejection names a range of frame
-numbers; it belongs to the flush whose returned frame number is the first at
-or above the end of that range. After a flush that failed with
-`flush_aborted`, the server may still reject one of the frames of that flush
-that the sender had queued. The rejection is about that flush, of which nothing
-is committed: `wait`, `close_drain` and the frame numbers still report the
-flushes before it, a later flush still fails with `flush_aborted`, and the
-rejection is read as a server error (`poll_qwp_ws_error` in Rust,
-`line_sender_qwpws_poll_error` in C) or by the error handler.
+drops the rows it holds for the connection and commits nothing more of the
+flush. The rejection usually arrives while `flush` is still queuing frames,
+and `flush` then fails with it while the buffer keeps its rows. Otherwise the
+next `wait`, `flush` or `close_drain` reports it. A rejection names a range of
+frame numbers; it belongs to the flush whose returned frame number is the
+first at or above the end of that range.
 
 ### With `sf_dir`
 
@@ -259,9 +287,11 @@ end:
   is committed again (at least once).
 - **A flush without its last frame** is removed. The process was killed inside
   `flush`, or the flush failed with `flush_aborted` and the sender was closed
-  without a `close_drain` that waited and succeeded. Nothing of it was
-  committed (below the server's row limit, see above) and nothing of it is
-  sent, so flush the buffer again. The flushes before it are sent as usual.
+  without a `close_drain` that waited and succeeded. Nothing of it is sent.
+  After a kill, nothing of it was committed (below the server's row limit,
+  see above), so flush the buffer again; after `flush_aborted`, the error
+  says whether you can (see the section above). The flushes before it are
+  sent as usual.
 
 A pool that opens a slot does the same, and so does the drainer of a slot that
 no sender owns. A segment file that the process was killed while creating is
