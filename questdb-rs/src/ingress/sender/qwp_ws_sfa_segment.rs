@@ -33,12 +33,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
-use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::OnceLock;
 #[cfg(unix)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use memmap2::{MmapMut, MmapOptions};
 
@@ -62,9 +61,6 @@ const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 #[cfg(unix)]
 static MLOCK_REFUSAL_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// `SfaSegment::redirty_owed_from` when no re-dirty is owed.
-const NO_REDIRTY_OWED: usize = usize::MAX;
-
 #[cfg(test)]
 thread_local! {
     static SYNC_FAILURE_COUNTDOWN: std::cell::Cell<Option<usize>> =
@@ -81,8 +77,8 @@ thread_local! {
     static REDIRTY_MAPPING_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Makes the next `failures` attempts, on this thread, to map the pages a
-/// failed sync re-dirties fail.
+/// Makes the next `failures` attempts, on this thread, to map a segment's
+/// file for the re-dirty of a failed sync fail.
 #[cfg(test)]
 fn fail_redirty_mapping_for_test(failures: usize) {
     REDIRTY_MAPPING_FAILURES.with(|remaining| remaining.set(failures));
@@ -327,10 +323,7 @@ pub(crate) struct SfaAppend {
 
 #[derive(Debug)]
 pub(crate) struct SfaSegment {
-    // Kept with file-backed segments so the segment owns the file handle
-    // alongside the writable mapping.
-    #[allow(dead_code)]
-    file: Option<File>,
+    file: Option<SfaSegmentFile>,
     mapping: Arc<SfaSegmentMapping>,
     path: Option<PathBuf>,
     size_bytes: u64,
@@ -343,15 +336,22 @@ pub(crate) struct SfaSegment {
     // metadata scan directly before opening the segment.
     #[allow(dead_code)]
     torn_tail_bytes: u64,
-    // The lowest offset of the published bytes whose re-dirty after a failed
-    // sync is owed, because the second mapping it goes through could not be
-    // made (`NO_REDIRTY_OWED` when none is). Owned by the segment: set by a
-    // failed `sync_published_range`, cleared by the next one once it has
-    // re-dirtied the pages, before it syncs. One offset: the owed pages are
-    // those from it to the published end, which only grows.
-    redirty_owed_from: AtomicUsize,
     #[cfg(test)]
     redirty_passes: std::sync::atomic::AtomicU64,
+}
+
+/// The file of a file-backed segment, which the segment owns alongside its
+/// writable mapping.
+#[derive(Debug)]
+struct SfaSegmentFile {
+    file: File,
+    /// A second mapping of the whole file, made with the segment's mapping
+    /// and kept for the segment's life, through which only the re-dirty
+    /// after a failed sync writes ([`SfaSegment::redirty_pages`]). Made up
+    /// front so that the re-dirty cannot fail: a mapping made when a sync
+    /// fails can itself fail then, and leave the pages clean. The mutex
+    /// keeps two re-dirties of the segment apart.
+    redirty_view: Mutex<MmapMut>,
 }
 
 pub(crate) struct SfaMappedPayload {
@@ -384,8 +384,8 @@ struct SfaSegmentMapping {
 // it. Every other write is made while no other thread can reach the segment:
 // the header at creation, at recovery and on a spare not yet shared, and the
 // zeroing of recovery. The re-dirty after a failed sync stores to the same
-// file pages through a mapping of its own (`SfaSegment::redirty_pages`), never
-// through `base`. All access uses raw-pointer provenance.
+// file pages through a mapping of its own (`SfaSegmentFile::redirty_view`),
+// never through `base`. All access uses raw-pointer provenance.
 unsafe impl Send for SfaSegmentMapping {}
 unsafe impl Sync for SfaSegmentMapping {}
 
@@ -442,7 +442,6 @@ impl SfaSegment {
             frame_count: 0,
             committed_frame_count: 0,
             torn_tail_bytes: 0,
-            redirty_owed_from: AtomicUsize::new(NO_REDIRTY_OWED),
             #[cfg(test)]
             redirty_passes: std::sync::atomic::AtomicU64::new(0),
         })
@@ -473,8 +472,12 @@ impl SfaSegment {
             }
             return Err(err);
         }
-        let mapping = match map_file_mut(&file, size_bytes) {
-            Ok(mapping) => mapping,
+        let mapped = map_file_mut(&file, size_bytes).and_then(|mapping| {
+            let redirty_view = map_file_for_redirty(&file, size_bytes)?;
+            Ok((mapping, redirty_view))
+        });
+        let (mapping, redirty_view) = match mapped {
+            Ok(mapped) => mapped,
             Err(err) => {
                 if create_new {
                     let _ = fs::remove_file(path);
@@ -489,7 +492,10 @@ impl SfaSegment {
         mapping.copy_from(0, &encode_header(header, manifest_required));
 
         Ok(Self {
-            file: Some(file),
+            file: Some(SfaSegmentFile {
+                file,
+                redirty_view: Mutex::new(redirty_view),
+            }),
             mapping,
             path: Some(path.to_path_buf()),
             size_bytes,
@@ -499,7 +505,6 @@ impl SfaSegment {
             frame_count: 0,
             committed_frame_count: 0,
             torn_tail_bytes: 0,
-            redirty_owed_from: AtomicUsize::new(NO_REDIRTY_OWED),
             #[cfg(test)]
             redirty_passes: std::sync::atomic::AtomicU64::new(0),
         })
@@ -521,8 +526,12 @@ impl SfaSegment {
         // are already allocated.
         reserve_segment_blocks(&file, size_bytes)?;
         let mapping = map_file_mut(&file, size_bytes)?;
+        let redirty_view = map_file_for_redirty(&file, size_bytes)?;
         Ok(Self {
-            file: Some(file),
+            file: Some(SfaSegmentFile {
+                file,
+                redirty_view: Mutex::new(redirty_view),
+            }),
             mapping,
             path: Some(path.to_path_buf()),
             size_bytes,
@@ -532,7 +541,6 @@ impl SfaSegment {
             frame_count: scan.frame_count,
             committed_frame_count: scan.committed_frame_count,
             torn_tail_bytes: scan.torn_tail_bytes,
-            redirty_owed_from: AtomicUsize::new(NO_REDIRTY_OWED),
             #[cfg(test)]
             redirty_passes: std::sync::atomic::AtomicU64::new(0),
         })
@@ -609,22 +617,22 @@ impl SfaSegment {
     }
 
     pub(crate) fn sync_header(&self) -> Result<(), SfaSegmentError> {
-        let Some(file) = self.file.as_ref() else {
+        let Some(segment_file) = self.file.as_ref() else {
             return Ok(());
         };
         self.mapping.flush_range(0, HEADER_SIZE)?;
-        file.sync_all()?;
+        segment_file.file.sync_all()?;
         Ok(())
     }
 
     /// Syncs every byte of the segment: those written through its mapping,
     /// and those that an earlier process wrote and the disk may not hold yet.
     pub(crate) fn sync_file(&self) -> Result<(), SfaSegmentError> {
-        let Some(file) = self.file.as_ref() else {
+        let Some(segment_file) = self.file.as_ref() else {
             return Ok(());
         };
         self.mapping.flush_range(0, self.mapping.len)?;
-        file.sync_data()?;
+        segment_file.file.sync_data()?;
         Ok(())
     }
 
@@ -633,7 +641,7 @@ impl SfaSegment {
         durable_offset: u64,
         published_offset: u64,
     ) -> Result<(), SfaSegmentError> {
-        let Some(file) = self.file.as_ref() else {
+        let Some(segment_file) = self.file.as_ref() else {
             return Ok(());
         };
         if published_offset <= durable_offset {
@@ -671,52 +679,20 @@ impl SfaSegment {
             locked
         };
 
-        let owed_from = self.redirty_owed_from.load(Ordering::Acquire);
-        let redirty_from = owed_from.min(lock_offset);
-        let mut result = Ok(());
-        if owed_from != NO_REDIRTY_OWED {
-            // A failed sync before this one could not re-dirty its pages: the
-            // kernel may hold them clean, and a sync would succeed without
-            // writing them.
-            result = self
-                .redirty_pages(file, redirty_from, published, page_size)
-                .map_err(SfaSegmentError::Io);
-            if result.is_ok() {
-                // Fails only when another failed sync owes from lower down,
-                // which then stays owed.
-                let _ = self.redirty_owed_from.compare_exchange(
-                    owed_from,
-                    NO_REDIRTY_OWED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+        let result = self.mapping.flush_range(0, published).and_then(|()| {
+            #[cfg(test)]
+            if should_fail_sync_for_test() {
+                return Err(SfaSegmentError::Io(io::Error::other(
+                    "injected periodic SF sync failure",
+                )));
             }
-        }
-        if result.is_ok() {
-            result = self.mapping.flush_range(0, published).and_then(|()| {
-                #[cfg(test)]
-                if should_fail_sync_for_test() {
-                    return Err(SfaSegmentError::Io(io::Error::other(
-                        "injected periodic SF sync failure",
-                    )));
-                }
-                file.sync_data().map_err(SfaSegmentError::Io)?;
-                #[cfg(test)]
-                record_published_sync_event(PublishedSyncEvent::Synced);
-                Ok(())
-            });
-            if result.is_err()
-                && let Err(err) = self.redirty_pages(file, redirty_from, published, page_size)
-            {
-                self.redirty_owed_from
-                    .fetch_min(redirty_from, Ordering::AcqRel);
-                log::warn!(
-                    "cannot re-dirty the pages of {} that a failed SF sync left clean; the next sync re-dirties them first: {err}",
-                    self.path
-                        .as_deref()
-                        .map_or_else(|| "<memory>".to_string(), |path| path.display().to_string())
-                );
-            }
+            segment_file.file.sync_data().map_err(SfaSegmentError::Io)?;
+            #[cfg(test)]
+            record_published_sync_event(PublishedSyncEvent::Synced);
+            Ok(())
+        });
+        if result.is_err() {
+            self.redirty_pages(segment_file, lock_offset, published, page_size);
         }
         #[cfg(unix)]
         if locked {
@@ -733,37 +709,30 @@ impl SfaSegment {
     /// stale from disk. A store of each page's first byte to itself marks the
     /// page dirty without changing it.
     ///
-    /// The stores go through a mapping of their own, made here and dropped at
-    /// the end. It maps the same page cache pages as the segment's mapping,
-    /// whose published bytes another thread may be reading at this moment: a
-    /// store through that mapping would race the read.
+    /// The stores go through the second mapping of the file
+    /// ([`SfaSegmentFile::redirty_view`]). It maps the same page cache pages
+    /// as the segment's mapping, whose published bytes another thread may be
+    /// reading at this moment: a store through that mapping would race the
+    /// read.
     fn redirty_pages(
         &self,
-        file: &File,
+        segment_file: &SfaSegmentFile,
         offset: usize,
         end: usize,
         page_size: usize,
-    ) -> io::Result<()> {
-        #[cfg(test)]
-        if should_fail_redirty_mapping_for_test() {
-            return Err(io::Error::other(
-                "injected failure to map pages to re-dirty",
-            ));
-        }
-        // SAFETY: SFA slot locking keeps other processes from changing the
-        // file while it is mapped, and nothing in this process reads or writes
-        // through this mapping but the loop below.
-        let mut pages = unsafe {
-            MmapOptions::new()
-                .offset(offset as u64)
-                .len(end - offset)
-                .map_mut(file)?
-        };
-        let base = pages.as_mut_ptr();
-        let mut cursor = 0;
-        while cursor < pages.len() {
-            // SAFETY: `cursor` is inside the mapping, which nothing else
-            // accesses. A volatile store is never elided.
+    ) {
+        // A panic while the lock was held left nothing half done: each store
+        // writes back the value it read.
+        let mut view = segment_file
+            .redirty_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let base = view.as_mut_ptr();
+        let mut cursor = offset;
+        while cursor < end {
+            // SAFETY: `cursor` is below `end`, the published offset, which is
+            // inside the file and so inside the view. Only this loop accesses
+            // the view, under its lock. A volatile store is never elided.
             unsafe {
                 let ptr = base.add(cursor);
                 ptr.write_volatile(ptr.read_volatile());
@@ -772,13 +741,14 @@ impl SfaSegment {
         }
         #[cfg(test)]
         {
-            let last = base as usize + (pages.len() - 1) / page_size * page_size;
+            let first = base as usize + offset;
+            let last = first + (end - offset - 1) / page_size * page_size;
             record_published_sync_event(PublishedSyncEvent::Redirtied {
-                stores: base as usize..=last,
+                stores: first..=last,
             });
-            self.redirty_passes.fetch_add(1, Ordering::AcqRel);
+            self.redirty_passes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
-        Ok(())
     }
 
     pub(crate) fn sanitize_torn_tail(&mut self) -> Result<(), SfaSegmentError> {
@@ -815,8 +785,8 @@ impl SfaSegment {
     /// Writes the bytes from `offset` on, `len` of them, to disk.
     fn sync_range(&self, offset: usize, len: usize) -> Result<(), SfaSegmentError> {
         self.mapping.flush_range(offset, len)?;
-        if let Some(file) = self.file.as_ref() {
-            file.sync_data()?;
+        if let Some(segment_file) = self.file.as_ref() {
+            segment_file.file.sync_data()?;
         }
         #[cfg(test)]
         record_disk_event(DiskEvent::Synced);
@@ -966,7 +936,8 @@ impl SfaSegment {
 
     #[cfg(test)]
     fn redirty_passes(&self) -> u64 {
-        self.redirty_passes.load(Ordering::Acquire)
+        self.redirty_passes
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn last_fsn(&self) -> Option<u64> {
@@ -1616,6 +1587,28 @@ fn map_file_mut(file: &File, size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, 
     }
 }
 
+/// Maps the whole of `file`, `size_bytes` of it, a second time: see
+/// [`SfaSegmentFile::redirty_view`].
+fn map_file_for_redirty(file: &File, size_bytes: u64) -> Result<MmapMut, SfaSegmentError> {
+    #[cfg(test)]
+    if should_fail_redirty_mapping_for_test() {
+        return Err(SfaSegmentError::Io(io::Error::other(
+            "injected failure to map a segment file for its re-dirty",
+        )));
+    }
+    let len = usize::try_from(size_bytes)
+        .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
+    // SAFETY: as in `map_file_mut`, SFA slot locking keeps other processes
+    // from changing the file while it is mapped. In this process only
+    // `SfaSegment::redirty_pages` accesses this mapping, under its lock.
+    unsafe {
+        MmapOptions::new()
+            .len(len)
+            .map_mut(file)
+            .map_err(SfaSegmentError::Io)
+    }
+}
+
 fn map_anon_mut(size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {
     let len = usize::try_from(size_bytes)
         .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
@@ -1769,11 +1762,10 @@ mod tests {
         );
     }
 
-    /// When the pages a failed sync left clean cannot be mapped to re-dirty
-    /// them, the next sync re-dirties them before it syncs, and fails without
-    /// syncing while it still cannot.
+    /// A failed sync re-dirties its pages even when no mapping can be made
+    /// any more: the one it stores through was made with the segment.
     #[test]
-    fn a_sync_after_one_that_could_not_redirty_redirties_first() {
+    fn a_failed_sync_redirties_when_no_mapping_can_be_made_any_more() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("periodic.sfa");
         let mut segment = SfaSegment::create(&path, 0, 4096, 1).unwrap();
@@ -1782,45 +1774,59 @@ mod tests {
 
         record_published_sync_events_for_test();
         fail_sync_after_for_test(0);
-        fail_redirty_mapping_for_test(2);
+        fail_redirty_mapping_for_test(usize::MAX);
         let err = segment
             .sync_published_range(HEADER_SIZE as u64, published)
             .unwrap_err();
+        fail_redirty_mapping_for_test(0);
         assert!(
             format!("{err:?}").contains("injected periodic SF sync failure"),
             "{err:?}"
         );
-        assert_eq!(segment.redirty_owed_from.load(Ordering::Acquire), 0);
-
-        let err = segment
-            .sync_published_range(HEADER_SIZE as u64, published)
-            .unwrap_err();
+        let events = take_published_sync_events_for_test();
         assert!(
-            format!("{err:?}").contains("injected failure to map pages to re-dirty"),
-            "{err:?}"
+            matches!(events.as_slice(), [PublishedSyncEvent::Redirtied { .. }]),
+            "{events:?}"
         );
-        assert_eq!(segment.redirty_owed_from.load(Ordering::Acquire), 0);
-        assert_eq!(take_published_sync_events_for_test(), vec![]);
-        assert_eq!(segment.redirty_passes(), 0);
+        assert_eq!(segment.redirty_passes(), 1);
 
-        record_published_sync_events_for_test();
         segment
             .sync_published_range(HEADER_SIZE as u64, published)
             .unwrap();
-        let events = take_published_sync_events_for_test();
-        assert!(
-            matches!(
-                events.as_slice(),
-                [
-                    PublishedSyncEvent::Redirtied { .. },
-                    PublishedSyncEvent::Synced
-                ]
-            ),
-            "{events:?}"
-        );
+        assert_eq!(segment.redirty_passes(), 1);
         assert_eq!(
-            segment.redirty_owed_from.load(Ordering::Acquire),
-            NO_REDIRTY_OWED
+            payloads(&scan_file(&path).unwrap()),
+            vec![b"payload".to_vec()]
+        );
+    }
+
+    /// A segment file that cannot be mapped for the re-dirty of a failed
+    /// sync is not taken: neither a new one, which is removed, nor one that
+    /// is opened again.
+    #[test]
+    fn a_segment_whose_file_cannot_be_mapped_for_its_redirty_is_not_taken() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("new.sfa");
+        fail_redirty_mapping_for_test(1);
+        let err = SfaSegment::create_new(&path, 0, 4096, 1).unwrap_err();
+        fail_redirty_mapping_for_test(0);
+        assert!(
+            format!("{err:?}").contains("injected failure to map"),
+            "{err:?}"
+        );
+        assert!(!path.exists());
+
+        let path = dir.path().join("existing.sfa");
+        let mut segment = SfaSegment::create_new(&path, 0, 4096, 1).unwrap();
+        segment.try_append(b"payload").unwrap().unwrap();
+        segment.sync_file().unwrap();
+        drop(segment);
+        fail_redirty_mapping_for_test(1);
+        let err = SfaSegment::open_existing(&path).unwrap_err();
+        fail_redirty_mapping_for_test(0);
+        assert!(
+            format!("{err:?}").contains("injected failure to map"),
+            "{err:?}"
         );
         assert_eq!(
             payloads(&scan_file(&path).unwrap()),
