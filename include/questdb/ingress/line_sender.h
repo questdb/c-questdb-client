@@ -335,11 +335,11 @@ typedef enum line_sender_error_code
      *    and flushing the same buffer through a new sender stores no row twice.
      *  - true: some of its frames may have been sent. The server holds their
      *    rows and drops them when the sender is closed, so nothing of the flush
-     *    is committed, unless one table had more rows in the flush than the
-     *    server's `qwp.max.uncommitted.rows` (1,000,000 by default). Then the
-     *    server may have committed a part of that table's rows by itself, and
-     *    flushing the buffer again stores that part twice unless the table has
-     *    `DEDUP` keys.
+     *    is committed, unless one table had at least as many rows in the flush
+     *    as the server's `qwp.max.uncommitted.rows` (1,000,000 by default).
+     *    Then the server may have committed a part of that table's rows by
+     *    itself, and flushing the buffer again stores that part twice unless
+     *    the table has `DEDUP` keys.
      *
      *  The server may still answer about the frames that were sent, and may
      *  reject one of them. Such an answer fails no call: a rejection is only
@@ -564,8 +564,8 @@ const char* questdb_error_msg(const questdb_error*, size_t* len_out);
  * For a low-level flush, this does not track earlier independent flushes.
  * For `line_sender_error_flush_aborted`, true means that some frames of the
  * flush may have been sent; the server commits a part of them by itself only
- * for a table with more rows in the flush than its `qwp.max.uncommitted.rows`:
- * see `line_sender_error_flush_aborted`.
+ * for a table with at least as many rows in the flush as its
+ * `qwp.max.uncommitted.rows`: see `line_sender_error_flush_aborted`.
  *
  * NULL-safe: a NULL input returns false.
  */
@@ -610,8 +610,8 @@ const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
  *
  * For `line_sender_error_flush_aborted`, `true` means that some frames of the
  * flush may have been sent; the server commits a part of them by itself only
- * for a table with more rows in the flush than its `qwp.max.uncommitted.rows`:
- * see `line_sender_error_flush_aborted`.
+ * for a table with at least as many rows in the flush as its
+ * `qwp.max.uncommitted.rows`: see `line_sender_error_flush_aborted`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_error_in_doubt(const line_sender_error*);
@@ -2225,7 +2225,7 @@ bool line_sender_qwpws_drive_once(
  * that flush, or no value if there was none: the frames of the failed flush
  * are never reported as confirmed. `line_sender_qwpws_acked_fsn` stays at or
  * below it, also when the server commits a part of that flush by itself
- * (more rows of one table than its `qwp.max.uncommitted.rows`).
+ * (at least as many rows of one table as its `qwp.max.uncommitted.rows`).
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_published_fsn(

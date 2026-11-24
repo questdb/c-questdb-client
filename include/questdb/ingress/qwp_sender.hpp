@@ -1254,8 +1254,9 @@ public:
      * this guard go: the pool closes the sender instead of lending it again.
      * Flush the Buffer through a newly borrowed sender when the error's
      * `in_doubt()` is false. When it is true, some frames of the flush were
-     * sent, and a table with more rows in the flush than the server's
-     * `qwp.max.uncommitted.rows` may have a part of them committed already:
+     * sent, and a table with at least as many rows in the flush as the
+     * server's `qwp.max.uncommitted.rows` may have a part of them committed
+     * already:
      * see `line_sender_error_flush_aborted` in `line_sender.h`. The same
      * holds for the other Buffer flushes.
      */

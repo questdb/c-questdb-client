@@ -791,8 +791,8 @@ impl Sender {
     /// the last frame published before that flush, or `None` if there was
     /// none: the frames of the failed flush are never reported as confirmed.
     /// [`Self::acked_fsn`] and [`Self::completed_fsn`] stay at or below it,
-    /// also when the server commits a part of that flush by itself (more
-    /// rows of one table than its `qwp.max.uncommitted.rows`).
+    /// also when the server commits a part of that flush by itself (at least
+    /// as many rows of one table as its `qwp.max.uncommitted.rows`).
     ///
     /// This is a sender-stream watermark, not a process-global receipt.
     #[cfg(feature = "sync-sender-qwp-ws")]

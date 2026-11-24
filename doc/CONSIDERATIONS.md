@@ -182,7 +182,7 @@ new segment files.
   its rows are stored twice unless the table has `DEDUP` keys.
 - **The server's row limit.** A server commits a table by itself once it holds
   `qwp.max.uncommitted.rows` uncommitted rows of it (1,000,000 by default).
-  One flush with more rows of one table than that is committed in parts:
+  One flush with at least that many rows of one table is committed in parts:
   2,500,000 rows are three transactions, with every row stored once. If such
   a flush fails after a part was committed, that part stays, and sending the
   buffer again stores it twice. A reconnect during such a flush stores
@@ -229,10 +229,10 @@ Check whether the error is in doubt (`in_doubt()` in Rust and C++,
   committed, and flushing the buffer again through a new sender stores no row
   twice.
 - **In doubt:** some of its frames may have been sent. Nothing of the flush
-  is committed, unless one table had more rows in it than the server's row
-  limit (see above): then the server may have committed a part of that
-  table's rows by itself, and flushing the buffer again stores that part
-  twice unless the table has `DEDUP` keys.
+  is committed, unless one table had at least as many rows in it as the
+  server's row limit (see above): then the server may have committed a part
+  of that table's rows by itself, and flushing the buffer again stores that
+  part twice unless the table has `DEDUP` keys.
 
 The server may still answer about the frames that were sent, and may reject
 one of them. Such an answer fails no call: a rejection is only reported as a

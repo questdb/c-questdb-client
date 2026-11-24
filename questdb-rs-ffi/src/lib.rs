@@ -489,11 +489,11 @@ pub enum line_sender_error_code {
     ///   and flushing the same buffer through a new sender stores no row twice.
     /// - true: some of its frames may have been sent. The server holds their
     ///   rows and drops them when the sender is closed, so nothing of the flush
-    ///   is committed, unless one table had more rows in the flush than the
-    ///   server's `qwp.max.uncommitted.rows` (1,000,000 by default). Then the
-    ///   server may have committed a part of that table's rows by itself, and
-    ///   flushing the buffer again stores that part twice unless the table has
-    ///   `DEDUP` keys.
+    ///   is committed, unless one table had at least as many rows in the flush
+    ///   as the server's `qwp.max.uncommitted.rows` (1,000,000 by default).
+    ///   Then the server may have committed a part of that table's rows by
+    ///   itself, and flushing the buffer again stores that part twice unless
+    ///   the table has `DEDUP` keys.
     ///
     /// The server may still answer about the frames that were sent, and may
     /// reject one of them. Such an answer fails no call: a rejection is only
@@ -849,8 +849,8 @@ pub unsafe extern "C" fn questdb_error_msg(
 ///
 /// For `line_sender_error_flush_aborted`, `true` means that some frames of the
 /// flush may have been sent; the server commits a part of them by itself only for a
-/// table with more rows in the flush than its `qwp.max.uncommitted.rows`: see
-/// `line_sender_error_flush_aborted`.
+/// table with at least as many rows in the flush as its
+/// `qwp.max.uncommitted.rows`: see `line_sender_error_flush_aborted`.
 ///
 /// NULL-safe: passing `NULL` returns `false`.
 #[unsafe(no_mangle)]

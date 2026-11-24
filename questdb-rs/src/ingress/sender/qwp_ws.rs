@@ -592,13 +592,13 @@ impl AbortedFlush {
     /// frames up ([`SfaProgressView::abandon_from`]). Its error keeps what
     /// the cause carried, and is in doubt exactly when a frame may have been
     /// sent: the server commits a part of a flush by itself when one table
-    /// has more rows than its `qwp.max.uncommitted.rows`.
+    /// has at least as many rows as its `qwp.max.uncommitted.rows`.
     fn new(first_fsn: u64, cause: crate::Error, sent: bool) -> Self {
         let what_was_sent = if sent {
             "Some of its frames may have been sent: the server commits none of their rows \
-             unless one table had more rows than its qwp.max.uncommitted.rows, and then may \
-             have committed a part of them by itself, which flushing the buffer again stores \
-             twice unless the table has DEDUP keys. The buffer still holds its rows."
+             unless one table had at least as many rows as its qwp.max.uncommitted.rows, and \
+             then may have committed a part of them by itself, which flushing the buffer again \
+             stores twice unless the table has DEDUP keys. The buffer still holds its rows."
         } else {
             "None of its frames reached the server, nothing of it is committed, and the buffer \
              still holds its rows."
@@ -632,7 +632,7 @@ impl AbortedFlush {
 /// A confirmed position `fsn` as callers see it: after a flush that failed
 /// part way, no higher than the last frame published before it, which
 /// callers see as the last one published. A server that commits a part of
-/// that flush by itself (more rows of one table than its
+/// that flush by itself (at least as many rows of one table as its
 /// `qwp.max.uncommitted.rows`) confirms frames of it, which are not
 /// reported.
 fn confirmed_as_reported(aborted_flush: Option<&AbortedFlush>, fsn: Option<u64>) -> Option<u64> {
@@ -5717,8 +5717,8 @@ fn close_drain_timeout_after_aborted_flush_error(has_sf_dir: bool) -> crate::Err
         SocketError,
         "QWP/WebSocket close drain timed out while the sender was closing its connection after \
          the flush that stopped part way. The flushes before it are confirmed, and nothing of \
-         that flush is committed: only a flush with more rows of one table than the server's \
-         qwp.max.uncommitted.rows may be committed in part. {what_to_do}"
+         that flush is committed: only a flush with at least as many rows of one table as the \
+         server's qwp.max.uncommitted.rows may be committed in part. {what_to_do}"
     )
 }
 
@@ -9085,7 +9085,7 @@ mod tests {
             "Could not flush buffer: the flush stopped part way: ",
             "timed out waiting for ACK-driven segment trim",
             "Some of its frames may have been sent: the server commits none of their rows \
-             unless one table had more rows than its qwp.max.uncommitted.rows",
+             unless one table had at least as many rows as its qwp.max.uncommitted.rows",
             "This sender takes no more flushes and still delivers the flushes before this one: \
              once they are confirmed, close it or return it to its pool, and flush the buffer \
              again through a new sender.",
@@ -9178,7 +9178,7 @@ mod tests {
         let timed_out = "QWP/WebSocket close drain timed out while the sender was closing its \
                          connection after the flush that stopped part way. The flushes before \
                          it are confirmed, and nothing of that flush is committed: only a \
-                         flush with more rows of one table than the server's \
+                         flush with at least as many rows of one table as the server's \
                          qwp.max.uncommitted.rows may be committed in part. Drop the sender: \
                          the frames of that flush go with it.";
         for (shutdown_timeout, close_timeout, expected) in [

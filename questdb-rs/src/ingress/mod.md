@@ -151,7 +151,7 @@ of it. A flush that stops after some of its frames were queued fails with
 its rows, and the sender must be replaced. With `sf_dir`, a sender that opens
 a slot removes a flush whose last frame was never written: after a process
 was killed inside a flush nothing of that flush is sent, so flush the buffer
-again. A flush with more rows of one table than the server's
+again. A flush with at least as many rows of one table as the server's
 `qwp.max.uncommitted.rows` may have had a part committed, which flushing again
 stores twice unless the table has `DEDUP` keys. The memory such a flush needs,
 the server's row limit, the timeouts to mind, what a large flush costs with
@@ -410,8 +410,8 @@ This call will refuse to flush a buffer if the flush wouldn't be transactional.
 With QWP/WebSocket, the rows that one `flush()` brings for a table are one
 commit, also when the buffer is larger than one frame and goes out in several
 (see [QWP/WebSocket](#qwpwebsocket) above). A flush with rows of several
-tables commits each table by itself, and one with more rows of a table than
-the server's `qwp.max.uncommitted.rows` is committed in parts.
+tables commits each table by itself, and one with at least as many rows of a
+table as the server's `qwp.max.uncommitted.rows` is committed in parts.
 
 ## When to Choose the TCP Transport?
 

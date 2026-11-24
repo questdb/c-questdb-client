@@ -3295,8 +3295,8 @@ fn unfinished_flush_removal_warning(
     );
     if confirmed == 0 {
         format!(
-            "{removing}; nothing of that flush is committed, unless it had more rows of one \
-             table than the server's qwp.max.uncommitted.rows."
+            "{removing}; nothing of that flush is committed, unless it had at least as many \
+             rows of one table as the server's qwp.max.uncommitted.rows."
         )
     } else {
         format!(
@@ -8959,7 +8959,7 @@ mod tests {
             unfinished_flush_removal_warning(slot, 1, 0, 7),
             "QWP/WebSocket store-and-forward slot slot: removing 6 frame(s) of a flush that was \
              cut off before its last frame; nothing of that flush is committed, unless it had \
-             more rows of one table than the server's qwp.max.uncommitted.rows."
+             at least as many rows of one table as the server's qwp.max.uncommitted.rows."
         );
         assert_eq!(
             unfinished_flush_removal_warning(slot, 1, 3, 7),

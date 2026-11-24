@@ -348,8 +348,8 @@ pub enum ErrorCode {
     ///   twice.
     /// - `true`: some of its frames may have been sent. The server holds
     ///   their rows and drops them when the sender is closed, so nothing of the flush is
-    ///   committed, unless one table had more rows in the flush than the
-    ///   server's `qwp.max.uncommitted.rows` (1,000,000 by default). Then the
+    ///   committed, unless one table had at least as many rows in the flush as
+    ///   the server's `qwp.max.uncommitted.rows` (1,000,000 by default). Then the
     ///   server may have committed a part of that table's rows by itself, and
     ///   flushing the buffer again stores that part twice unless the table
     ///   has `DEDUP` keys.
@@ -694,7 +694,7 @@ impl Error {
     ///
     /// For [`ErrorCode::FlushAborted`], `true` means that some frames of the
     /// flush may have been sent; the server commits a part of them by itself only for
-    /// a table with more rows in the flush than its
+    /// a table with at least as many rows in the flush as its
     /// `qwp.max.uncommitted.rows`: see [`ErrorCode::FlushAborted`].
     #[must_use]
     pub fn in_doubt(&self) -> bool {

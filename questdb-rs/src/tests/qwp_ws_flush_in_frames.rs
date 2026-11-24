@@ -3386,9 +3386,9 @@ fn sender_with_a_dictionary_of(port: u16, progress: Progress, symbols: usize) ->
 pub(super) fn stopped_by_a_full_dictionary(symbols: usize, sent: bool) -> String {
     let what_was_sent = if sent {
         "Some of its frames may have been sent: the server commits none of their rows unless \
-         one table had more rows than its qwp.max.uncommitted.rows, and then may have committed \
-         a part of them by itself, which flushing the buffer again stores twice unless the table \
-         has DEDUP keys. The buffer still holds its rows."
+         one table had at least as many rows as its qwp.max.uncommitted.rows, and then may have \
+         committed a part of them by itself, which flushing the buffer again stores twice unless \
+         the table has DEDUP keys. The buffer still holds its rows."
     } else {
         "None of its frames reached the server, nothing of it is committed, and the buffer still \
          holds its rows."
@@ -3720,7 +3720,8 @@ fn start_server_that_answers_a_deferred_frame(
 
 /// A flush in frames fails part way, and the server confirms one of the
 /// frames of it that were sent, as it does when it commits a part of a
-/// flush with more rows of one table than its `qwp.max.uncommitted.rows`.
+/// flush with at least as many rows of one table as its
+/// `qwp.max.uncommitted.rows`.
 /// The error is in doubt. The sender reports no confirmed position above
 /// the last frame before the failed flush, which is where `published_fsn`
 /// stays: `published_fsn` less a confirmed position is never below zero.
@@ -4124,9 +4125,9 @@ fn a_close_drain_after_a_flush_that_failed_part_way_gives_up_at_its_timeout_whil
         err.msg(),
         "QWP/WebSocket close drain timed out while the sender was closing its connection after \
          the flush that stopped part way. The flushes before it are confirmed, and nothing of \
-         that flush is committed: only a flush with more rows of one table than the server's \
-         qwp.max.uncommitted.rows may be committed in part. Drop the sender: the next sender on \
-         the slot under sf_dir removes that flush."
+         that flush is committed: only a flush with at least as many rows of one table as the \
+         server's qwp.max.uncommitted.rows may be committed in part. Drop the sender: the next \
+         sender on the slot under sf_dir removes that flush."
     );
     assert!(segment_files(&sf_dir) > 0, "the slot is not closed");
     drop(sender);
