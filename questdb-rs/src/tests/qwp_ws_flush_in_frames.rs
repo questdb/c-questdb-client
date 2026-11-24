@@ -4111,6 +4111,10 @@ const SCHEMA_MISMATCH: u8 = 0x03;
 /// What a server answers a frame that it could not write. A sender that gets
 /// it connects again and sends every frame that is not confirmed.
 const WRITE_ERROR: u8 = 0x09;
+/// What a primary answers once an in-place role switch has made it a
+/// replica. A sender that gets it connects again, to this server or another,
+/// and sends every frame that is not confirmed.
+const NOT_WRITABLE: u8 = 0x0C;
 
 /// The error that stopped `sender` for good, once it has read the answer of
 /// the server that did so.
@@ -4245,6 +4249,50 @@ fn a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole(progres
     sender.flush_and_keep(&after).unwrap();
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     assert_table_holds(&server, TABLE, 3, &[&before, &large, &after]);
+    drop(sender);
+    server.finish();
+}
+
+/// An in-place role switch makes the server a replica while it holds the
+/// rows of a flush in frames: it rejects a middle frame as not writable, and
+/// the rows it held are gone with the rejection. The sender takes that as a
+/// state of the server, not a fault of the frame: it connects again and
+/// sends the whole flush, which the server, a primary again, commits once.
+fn a_flush_with_a_frame_that_a_demoted_server_rejects_is_sent_again_whole(progress: Progress) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, progress, "");
+    let before = buffer_of(TABLE, 0..3);
+    let large = buffer_of(TABLE, 3..2003);
+    let frame_count = frames_of_a_flush(&large, FRAME_LIMIT).len() as u64;
+    assert!(frame_count > 40, "{frame_count} frames");
+    let rejected = frame_count / 2;
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    server.reject_frame(2 + rejected as usize, NOT_WRITABLE);
+    assert_eq!(
+        sender.flush_and_keep_and_get_fsn(&large).unwrap(),
+        Some(frame_count)
+    );
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+
+    let rejection = sender.poll_qwp_ws_error().unwrap().expect("the rejection");
+    assert_eq!(rejection.category, QwpWsErrorCategory::NotWritable);
+    assert_eq!(rejection.applied_policy, QwpWsErrorPolicy::RetriableOther);
+    assert_eq!(rejection.from_fsn, 1 + rejected);
+    assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
+    let totals = sender.qwp_ws_totals().unwrap();
+    assert_eq!(
+        (totals.server_errors, totals.reconnects_succeeded),
+        (1, 1),
+        "{totals:?}"
+    );
+    let table = server.model.table(TABLE).unwrap();
+    assert_eq!(table.commits, 2);
+    assert_eq!(table.blocks.len() as u64, 1 + frame_count);
+    assert_eq!(table.rows_as_text(), rows_of_all(&[&before, &large]));
+    assert!(!sender.must_close());
     drop(sender);
     server.finish();
 }
@@ -4609,6 +4657,7 @@ in_both_progress_modes! {
     a_full_dictionary_stops_the_flush_once_more_on_the_slot_of_a_sender_dropped_without_close_drain
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
     a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
+    a_flush_with_a_frame_that_a_demoted_server_rejects_is_sent_again_whole
     a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good
     a_flush_is_committed_once_wherever_its_connection_is_lost_before_the_commit
     a_flush_whose_connection_is_lost_after_the_commit_and_before_its_answer_is_committed_again
@@ -4650,6 +4699,7 @@ on_disk_in_both_progress_modes! {
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
     a_flush_with_a_frame_that_the_server_rejects_once_is_sent_again_whole
+    a_flush_with_a_frame_that_a_demoted_server_rejects_is_sent_again_whole
     a_sender_whose_flush_failed_part_way_reports_a_frame_that_the_server_rejects_for_good
     a_flush_is_committed_once_wherever_its_connection_is_lost_before_the_commit
     a_flush_whose_connection_is_lost_after_the_commit_and_before_its_answer_is_committed_again
