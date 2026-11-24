@@ -92,8 +92,9 @@ use crate::ingress::{
 };
 use crate::tests::qwp_decode::{DecodedTable, decode_ws_table_blocks};
 use crate::tests::qwp_ws::{
-    read_frame, upgrade_mock_stream_with_max_batch_size, write_server_binary_frame,
-    write_server_frame,
+    MockDurableTier, compute_accept, parse_header, read_frame, read_request_until_blank,
+    upgrade_mock_stream_with_max_batch_size, write_qwp_durable_ack_response_with_status,
+    write_server_binary_frame, write_server_frame,
 };
 
 const QWP_HEADER_SIZE: usize = 12;
@@ -455,6 +456,9 @@ struct ServerShared {
     /// Locked for every write to a client, so that an answer that was held
     /// back and one that is given at once never mix.
     answers: Mutex<Answers>,
+    /// The durable acks that the upgrade of every later connection grants:
+    /// see [`QwpWsModelServer::grant_durable_acks`].
+    durable_acks: Mutex<Option<MockDurableTier>>,
 }
 
 #[derive(Default)]
@@ -526,6 +530,7 @@ impl QwpWsModelServer {
             frames: AtomicUsize::new(0),
             rejection: Mutex::default(),
             answers: Mutex::default(),
+            durable_acks: Mutex::default(),
         });
 
         let acceptor = thread::spawn({
@@ -709,7 +714,13 @@ fn serve_connection(
     shared: &ServerShared,
 ) {
     let _close = CloseOnDrop(stream.try_clone().unwrap());
-    upgrade_mock_stream_with_max_batch_size(&mut stream, Some(max_batch_size));
+    let durable_acks = *shared.durable_acks.lock().unwrap();
+    match durable_acks {
+        None => {
+            upgrade_mock_stream_with_max_batch_size(&mut stream, Some(max_batch_size));
+        }
+        Some(tier) => upgrade_granting_durable_acks(&mut stream, max_batch_size, tier),
+    }
     let mut frames = 0;
     while wait_for_a_frame(&stream, shared) {
         // A read fails when the client went away or the server stops.
@@ -762,6 +773,87 @@ fn serve_connection(
             break;
         }
     }
+}
+
+/// Durable acks. The model commits and answers with OKs, as a server does
+/// whatever the durability; a test tells the server when to send a durable
+/// ack, as the storage that makes a commit durable is not modelled.
+impl QwpWsModelServer {
+    /// Every later connection whose client requests the durable acks of
+    /// `tier` is granted them by the upgrade.
+    pub(crate) fn grant_durable_acks(&self, tier: MockDurableTier) {
+        *self.shared.durable_acks.lock().unwrap() = Some(tier);
+    }
+
+    /// Sends, on every connection that has not ended, a durable ack of the
+    /// tier [`Self::grant_durable_acks`] granted, that names for each table
+    /// the last of its commits that is durable: `(table, commits)`, as the
+    /// OK of a commit names it.
+    pub(crate) fn send_durable_ack(&self, tables: &[(&str, i64)]) {
+        let tier = self
+            .shared
+            .durable_acks
+            .lock()
+            .unwrap()
+            .expect("the server grants no durable acks");
+        let sent = {
+            let _answers = self.shared.answers.lock().unwrap();
+            let streams = self.shared.streams.lock().unwrap();
+            let mut sent = 0;
+            for stream in streams.iter() {
+                let mut stream = stream.try_clone().unwrap();
+                // A connection that has ended takes no more writes.
+                if write_qwp_durable_ack_response_with_status(&mut stream, tier.ack_status, tables)
+                    .is_ok()
+                {
+                    sent += 1;
+                }
+            }
+            sent
+        };
+        // Asserted once the locks are released, which the server needs to stop.
+        assert!(sent > 0, "no connection took the durable ack");
+    }
+}
+
+impl QwpWsModelServer {
+    /// How many connections the server has taken so far, also those that
+    /// have ended: one more than the first tells that a client connected
+    /// again.
+    pub(crate) fn connections_taken(&self) -> usize {
+        self.shared.streams.lock().unwrap().len()
+    }
+}
+
+/// The upgrade answer of [`upgrade_mock_stream_with_max_batch_size`] that
+/// also grants the durable acks of `tier` when the client requests them.
+fn upgrade_granting_durable_acks(
+    stream: &mut TcpStream,
+    max_batch_size: usize,
+    tier: MockDurableTier,
+) {
+    use std::io::Write;
+    let request = read_request_until_blank(stream).unwrap();
+    let request = String::from_utf8_lossy(&request).to_string();
+    let key = parse_header(&request, "Sec-WebSocket-Key").expect("missing Sec-WebSocket-Key");
+    let accept = compute_accept(&key);
+    let durable_ack_header =
+        if parse_header(&request, "X-QWP-Request-Durable-Ack").as_deref() == Some(tier.request) {
+            format!("X-QWP-Durable-Ack: {}\r\n", tier.echo)
+        } else {
+            String::new()
+        };
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\
+         X-QWP-Version: 1\r\n\
+         X-QWP-Max-Batch-Size: {max_batch_size}\r\n\
+         {durable_ack_header}\
+         \r\n"
+    );
+    stream.write_all(response.as_bytes()).unwrap();
 }
 
 /// Ends the server's side of a connection after its close frame, and reads
