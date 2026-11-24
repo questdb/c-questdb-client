@@ -3528,10 +3528,13 @@ fn start_server_that_answers_a_deferred_frame(
                             ok.extend_from_slice(&(TABLE.len() as u16).to_le_bytes());
                             ok.extend_from_slice(TABLE.as_bytes());
                             ok.extend_from_slice(&commits.to_le_bytes());
+                            // Recorded before the answer goes out: the test
+                            // reads the record as soon as its sender has the
+                            // answer.
+                            answered.lock().unwrap().push(sequence);
                             if write_server_binary_frame(&mut stream, &ok).is_err() {
                                 break;
                             }
-                            answered.lock().unwrap().push(sequence);
                         }
                         sequence += 1;
                     }
