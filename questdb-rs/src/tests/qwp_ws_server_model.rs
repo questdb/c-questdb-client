@@ -60,7 +60,8 @@
 //! it does not know, two blocks of one table in a frame (which no flush
 //! sends), a frame above the frame limit, and the commit a server forces on
 //! a table that holds 1,000,000 uncommitted rows
-//! (`qwp.max.uncommitted.rows`). Of symbols it refuses: a frame whose
+//! (`qwp.max.uncommitted.rows`), unless a test lowers that limit
+//! ([`QwpWsServerModel::commit_by_itself_at`]). Of symbols it refuses: a frame whose
 //! symbols leave a gap after those the connection holds (a server rejects
 //! it), a held symbol that gets another text (a server takes the new text),
 //! a symbol in a row that the connection does not hold, and a frame without
@@ -263,6 +264,13 @@ impl ModelTable {
 #[derive(Clone, Default)]
 pub(crate) struct QwpWsServerModel {
     tables: Arc<Mutex<BTreeMap<String, ModelTable>>>,
+    /// The lowered `qwp.max.uncommitted.rows` of
+    /// [`Self::commit_by_itself_at`]. `None`: the model refuses to hold the
+    /// default limit.
+    row_limit: Arc<Mutex<Option<usize>>>,
+    /// Per table, how many frames with a block of it the server has taken,
+    /// over all connections: see [`Self::frames_with_rows_of`].
+    frames_of_table: Arc<Mutex<BTreeMap<String, usize>>>,
 }
 
 impl QwpWsServerModel {
@@ -337,6 +345,8 @@ impl QwpWsModelConnection {
         );
         let pos = self.take_symbols(sequence, message);
 
+        let row_limit = *self.server.row_limit.lock().unwrap();
+        let mut at_row_limit = Vec::new();
         let mut names = BTreeSet::new();
         for block in decode_ws_table_blocks(&message[pos..], block_count, &self.symbols) {
             assert!(
@@ -345,22 +355,28 @@ impl QwpWsModelConnection {
                  model reads one block of a table in a frame",
                 block.name
             );
+            let name = block.name.clone();
             let held = self.held.entry(block.name.clone()).or_default();
             held.push(block);
             let held_rows: usize = held.iter().map(|block| block.rows.len()).sum();
-            assert!(
-                held_rows < MAX_UNCOMMITTED_ROWS,
-                "frame {sequence}: a server commits a table by itself once it holds \
-                 {MAX_UNCOMMITTED_ROWS} uncommitted rows, which the server model does not do"
-            );
+            match row_limit {
+                None => assert!(
+                    held_rows < MAX_UNCOMMITTED_ROWS,
+                    "frame {sequence}: a server commits a table by itself once it holds \
+                     {MAX_UNCOMMITTED_ROWS} uncommitted rows, which the server model does not do"
+                ),
+                Some(limit) if held_rows >= limit => at_row_limit.push(name),
+                Some(_) => {}
+            }
         }
+        self.server.count_frames_of(&names);
 
         let mut tables = self.server.tables.lock().unwrap();
         for name in names {
             tables.entry(name).or_default();
         }
         if defer_commit {
-            return None;
+            return commit_by_itself(&mut self.held, sequence, at_row_limit, &mut tables);
         }
         // An OK: the status, the sequence, then each committed table with
         // the number of its commit.
@@ -425,6 +441,72 @@ impl QwpWsModelConnection {
         }
         pos
     }
+}
+
+// A server that commits a table by itself at its row limit, and counts the
+// frames of each table.
+
+impl QwpWsServerModel {
+    /// From now on the server commits a table by itself at the end of a
+    /// frame with the defer flag that brings the rows the connection holds
+    /// for it to `rows`: as a QuestDB server does at its
+    /// `qwp.max.uncommitted.rows`. It answers that frame with an OK that
+    /// names the tables it committed when the connection holds no other rows
+    /// then, and gives no answer when it does, which is what a real server
+    /// was seen to do.
+    pub(crate) fn commit_by_itself_at(&self, rows: usize) {
+        assert!(rows > 0, "a server holds at least one row");
+        *self.row_limit.lock().unwrap() = Some(rows);
+    }
+
+    /// How many frames with a block of `table` the server has taken, over
+    /// all its connections, also of those that went away and of a frame that
+    /// it committed nothing of. A frame that the server rejected is not
+    /// counted, nor any later frame of its connection: the server takes
+    /// nothing of them.
+    pub(crate) fn frames_with_rows_of(&self, table: &str) -> usize {
+        self.frames_of_table
+            .lock()
+            .unwrap()
+            .get(table)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn count_frames_of(&self, tables: &BTreeSet<String>) {
+        let mut frames_of_table = self.frames_of_table.lock().unwrap();
+        for table in tables {
+            *frames_of_table.entry(table.clone()).or_default() += 1;
+        }
+    }
+}
+
+/// Commits each of `tables`, which have come to the row limit of
+/// [`QwpWsServerModel::commit_by_itself_at`] at the end of frame `sequence`,
+/// with the defer flag: their rows go from `held`, the rows a connection
+/// holds, to `committed`. Returns the OK of that frame when the connection
+/// holds no other rows.
+fn commit_by_itself(
+    held: &mut BTreeMap<String, Vec<DecodedTable>>,
+    sequence: u64,
+    tables: Vec<String>,
+    committed: &mut BTreeMap<String, ModelTable>,
+) -> Option<Vec<u8>> {
+    if tables.is_empty() {
+        return None;
+    }
+    let mut ok = vec![QWP_STATUS_OK];
+    ok.extend_from_slice(&sequence.to_le_bytes());
+    ok.extend_from_slice(&(tables.len() as u16).to_le_bytes());
+    for name in tables {
+        let table = committed.get_mut(&name).unwrap();
+        table.commits += 1;
+        table.blocks.extend(held.remove(&name).unwrap());
+        ok.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        ok.extend_from_slice(name.as_bytes());
+        ok.extend_from_slice(&(table.commits as i64).to_le_bytes());
+    }
+    held.is_empty().then_some(ok)
 }
 
 /// A socket server that takes QWP/WebSocket connections and answers each as

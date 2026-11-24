@@ -1226,17 +1226,20 @@ TEST(test_one_sender_flushes_buffer_and_chunk)
     mock_return_close(mock, db, sender);
 }
 
-/* A standalone QWP/WebSocket sender, connected to a mock that takes ingress
- * frames as a server with a frame limit of `frame_limit` bytes does. Returns
- * NULL on any setup failure; populates *out_mock on success. */
-static line_sender* ingress_sender(qwp_mock_c** out_mock, size_t frame_limit)
+/* A standalone QWP/WebSocket sender with the extra `settings` of its
+ * configuration string, connected to a mock that takes ingress frames as a
+ * server with a frame limit of `frame_limit` bytes does. Returns NULL on any
+ * setup failure; populates *out_mock on success. */
+static line_sender* ingress_sender_with(
+    qwp_mock_c** out_mock, size_t frame_limit, const char* settings)
 {
     *out_mock = NULL;
     qwp_mock_c* mock = qwp_mock_c_start_ingress(frame_limit);
     if (mock == NULL)
         return NULL;
     char conf[128];
-    snprintf(conf, sizeof(conf), "ws::addr=%s;", qwp_mock_c_addr(mock));
+    snprintf(
+        conf, sizeof(conf), "ws::addr=%s;%s", qwp_mock_c_addr(mock), settings);
     line_sender_utf8 conf_utf8 = {strlen(conf), conf};
     line_sender_error* err = NULL;
     line_sender* sender = line_sender_from_conf(conf_utf8, &err);
@@ -1249,6 +1252,12 @@ static line_sender* ingress_sender(qwp_mock_c** out_mock, size_t frame_limit)
     }
     *out_mock = mock;
     return sender;
+}
+
+/* `ingress_sender_with` without extra settings. */
+static line_sender* ingress_sender(qwp_mock_c** out_mock, size_t frame_limit)
+{
+    return ingress_sender_with(out_mock, frame_limit, "");
 }
 
 /* True when `err` has `code` and its message contains `text`. Frees `err`. */
@@ -1360,7 +1369,9 @@ TEST(test_flush_above_the_frame_cap_goes_out_in_frames)
  * symbol dictionary of the connection is full (2,000,000 entries), fails
  * with `line_sender_error_flush_aborted`: nothing of it is committed, the
  * buffer keeps its rows, and the sender takes no more flushes while it still
- * delivers the flush before. */
+ * delivers the flush before. The sender is driven by its caller, so nothing
+ * sends a frame of the flush while it runs: the error is not in doubt, and
+ * the sender sends no frame of it afterwards either. */
 TEST(test_flush_that_stops_part_way_fails_with_flush_aborted)
 {
     const size_t frame_limit = 1024 * 1024;
@@ -1368,7 +1379,8 @@ TEST(test_flush_that_stops_part_way_fails_with_flush_aborted)
      * holds. */
     const size_t symbols = 2000000;
     qwp_mock_c* mock;
-    line_sender* sender = ingress_sender(&mock, frame_limit);
+    line_sender* sender =
+        ingress_sender_with(&mock, frame_limit, "qwp_ws_progress=manual;");
     CHECK(sender != NULL, "sender connected to the mock");
     if (sender == NULL)
         return;
@@ -1409,11 +1421,15 @@ TEST(test_flush_that_stops_part_way_fails_with_flush_aborted)
         "the flush that fills the dictionary fails");
     CHECK(
         err != NULL && !line_sender_error_in_doubt(err),
-        "nothing of the flush is committed: the error is not in doubt");
+        "no frame of the flush was sent: the error is not in doubt");
     CHECK(
         error_is(
-            err, line_sender_error_flush_aborted, "the flush stopped part way"),
-        "the flush fails with flush_aborted");
+            err,
+            line_sender_error_flush_aborted,
+            "None of its frames reached the server, nothing of it is "
+            "committed"),
+        "the flush fails with flush_aborted, which says nothing of it was "
+        "sent");
     err = NULL;
     CHECK(
         line_sender_buffer_row_count(buffer) == symbols,
@@ -1464,24 +1480,18 @@ TEST(test_flush_that_stops_part_way_fails_with_flush_aborted)
     line_sender_buffer_free(buffer);
     line_sender_close(sender);
 
-    /* The server took the flush before, and of the failed flush only frames
-     * with the defer flag: never the frame that commits it. */
+    /* The server took the flush before, and no frame of the failed flush. */
     CHECK(
         qwp_mock_c_wait_for_ingress_closed(mock, 1, 5000),
         "the connection ended");
-    const size_t frames = qwp_mock_c_ingress_frame_count(mock);
-    CHECK(frames > 2, "frames of the failed flush were sent");
-    for (size_t i = 0; i < frames; ++i)
-    {
-        size_t size = 0;
-        bool deferred = false;
-        CHECK(
-            qwp_mock_c_ingress_frame(mock, i, &size, &deferred),
-            "frame recorded");
-        CHECK(
-            deferred == (i > 0),
-            "only the flush before was sent to be committed");
-    }
+    CHECK(
+        qwp_mock_c_ingress_frame_count(mock) == 1,
+        "only the flush before was sent");
+    size_t size = 0;
+    bool deferred = true;
+    CHECK(
+        qwp_mock_c_ingress_frame(mock, 0, &size, &deferred) && !deferred,
+        "the flush before was sent to be committed");
     qwp_mock_c_stop(mock);
 }
 
