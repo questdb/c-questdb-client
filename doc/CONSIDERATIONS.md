@@ -125,7 +125,7 @@ A QWP/WebSocket frame cannot be larger than the per-frame cap: the smallest of
 one store-and-forward segment holds. `effective_frame_cap` returns it.
 
 A sender connected to a server that advertised its frame limit sends a row
-buffer above the cap in several frames. All but the last tell the server to
+buffer whose one frame would be above the cap in several frames. All but the last tell the server to
 hold their rows, and the last one commits them. So one flush is one commit per
 table, for a buffer of any size up to `max_buf_size` (100 MiB by default).
 This holds with the queue in memory and with `sf_dir`, for the row sender in
@@ -137,9 +137,11 @@ This is about row buffers. A chunk of the column sender that is too large for
 one frame is split as well, and with `sf_dir` each of its frames still commits
 by itself.
 
-A buffer whose frame fits the cap is never refused for its size. One that does
-not is refused with `batch_too_large`, nothing of it is sent and it keeps its
-rows, when:
+A buffer whose frame fits the cap goes out as that one frame, as from a sender
+that cuts no frames, and is never refused for its size. The encoded frame
+decides this, not the buffer's `len()`, which counts more for symbols. A buffer
+whose frame does not fit is refused with `batch_too_large`, nothing of it is
+sent and it keeps its rows, when:
 
 - the server did not advertise a frame limit, because it is too old to commit
   several frames together, or the sender has not connected yet;
@@ -164,9 +166,7 @@ those planned sizes.
 
 Before its first frame, a flush in several frames waits until the queue has
 room for all of them, for up to `sf_append_deadline_millis`. When the room
-does not come, the flush fails and nothing of it was sent. When the queue has
-no room for them now, a buffer whose one frame fits the frame cap goes out as
-that frame instead, and waits only for the room of that frame. Once its first
+does not come, the flush fails and nothing of it was sent. Once its first
 frame is queued, the other frames do not wait for room. With `sf_dir` they
 may still wait while the sender writes its segment files, for example the
 next one it makes. `sf_append_deadline_millis` does not cut that wait short,

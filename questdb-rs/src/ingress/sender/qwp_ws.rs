@@ -4687,16 +4687,21 @@ pub(crate) const NO_SYMBOL_FILE: &str = " It is not sent in several frames, beca
 /// A buffer goes out as one frame, which is refused when it is larger than
 /// `frame_cap`. When the server has told its frame limit (`split_target`,
 /// the size its frames are then cut for) and `encoder` sends its symbols as
-/// a delta, a buffer above `frame_cap` goes out in several frames that the
-/// server commits together instead. Such a flush waits until the queue
-/// has room for all its frames, as a flush of one frame waits for the room
-/// of its frame, and queues nothing before. When the queue has no room for
-/// them now, a buffer whose one frame fits `frame_cap` goes out as that
-/// frame instead, and waits for its room only.
+/// a delta, a buffer whose one frame is above `frame_cap` goes out in
+/// several frames that the server commits together instead. Such a flush
+/// waits until the queue has room for all its frames, as a flush of one
+/// frame waits for the room of its frame, and queues nothing before.
+///
+/// The encoded frame decides, not the size bound of the buffer
+/// ([`QwpWsColumnarBuffer::len`]), which takes more than the frame for
+/// symbols: a buffer whose frame fits `frame_cap` goes out as that one
+/// frame, as it would from a sender that cuts no frames, whatever its bound.
+/// Only a buffer whose bound is above `frame_cap` and whose frame may still
+/// fit, by [`QwpWsColumnarBuffer::one_frame_min_len`], is encoded as one
+/// frame first; that encoding is thrown away when the frame is too large.
 ///
 /// A buffer that cannot be cut into frames goes the way of one frame, whose
-/// encoder gives a value that cannot be sent the error of that value. The
-/// size bound of a buffer takes more than its frame for symbols, so what
+/// encoder gives a value that cannot be sent the error of that value. What
 /// the bound keeps from frames may fit one frame all the same: a buffer
 /// above `max_buf_size`, a buffer whose frames the queue cannot hold
 /// together, and a buffer with a row that fits no frame by its bound. Such a
@@ -4713,6 +4718,8 @@ fn flush_qwp_ws_through(
     // What keeps the buffer from being cut into frames by its size bound,
     // when one thing does.
     let mut not_in_frames = None;
+    // The error of the one frame, when it was tried and is too large.
+    let mut one_frame_too_large = None;
     if let Some(split_target) = split_target.filter(|_| encoder.delta_dict_enabled()) {
         let len = buffer.len();
         if len > frame_cap && len > max_buf_size {
@@ -4720,6 +4727,21 @@ fn flush_qwp_ws_through(
             // `max_buf_size` by its size.
             not_in_frames = Some(QwpWsNotInFrames::AboveMaxBufSize { len, max_buf_size });
         } else if len > frame_cap {
+            // The bound takes more than the frame for symbols: a buffer
+            // whose one frame may fit the cap goes out as that frame, with
+            // room in the queue or without, and is cut into frames only
+            // when that frame is too large.
+            let known = encoder.known_symbols_max_encoded_len();
+            if buffer.one_frame_min_len(known) <= frame_cap {
+                match publish_qwp_ws_buffer(encoder, buffer, frame_cap, |payload| {
+                    publisher.publish(payload)
+                }) {
+                    Err(err) if err.code() == crate::ErrorCode::BatchTooLarge => {
+                        one_frame_too_large = Some(err);
+                    }
+                    published => return published.map_err(QwpWsFlushError::Failed),
+                }
+            }
             let target = frame_cap.min(split_target);
             match buffer.plan_frames(target, frame_cap) {
                 Ok(plan) => {
@@ -4742,25 +4764,6 @@ fn flush_qwp_ws_through(
                             // wait for storage work of the network thread,
                             // which ends by itself.
                             if !producer.has_room_for(frame_sizes) {
-                                // The bound takes more than the frame for
-                                // symbols: a buffer whose one frame fits the
-                                // cap goes out as that frame, which waits for
-                                // its own room only.
-                                let known = encoder.known_symbols_max_encoded_len();
-                                if buffer.one_frame_min_len(known) <= frame_cap {
-                                    match publish_qwp_ws_buffer(
-                                        encoder,
-                                        buffer,
-                                        frame_cap,
-                                        |payload| publisher.publish(payload),
-                                    ) {
-                                        Err(err)
-                                            if err.code() == crate::ErrorCode::BatchTooLarge => {}
-                                        published => {
-                                            return published.map_err(QwpWsFlushError::Failed);
-                                        }
-                                    }
-                                }
                                 // The queue can hold the frames together, so
                                 // the room comes once the server has
                                 // confirmed what the queue holds now.
@@ -4793,9 +4796,12 @@ fn flush_qwp_ws_through(
             }
         }
     }
-    publish_qwp_ws_buffer(encoder, buffer, frame_cap, |payload| {
-        publisher.publish(payload)
-    })
+    match one_frame_too_large {
+        Some(err) => Err(err),
+        None => publish_qwp_ws_buffer(encoder, buffer, frame_cap, |payload| {
+            publisher.publish(payload)
+        }),
+    }
     .map_err(|err| match not_in_frames {
         // The buffer is too large for one frame too: the error names what
         // kept it from going out in several.

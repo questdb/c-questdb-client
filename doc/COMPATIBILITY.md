@@ -19,9 +19,10 @@ acknowledgements until the chunk commits, which first shipped in QuestDB
 QuestDB 9.4.1 through 9.4.3 accept the flag but acknowledge deferred frames,
 so a reconnect mid-chunk can silently drop the acknowledged prefix. Those
 releases are below the supported floor and must not be used with this client.
-A row buffer above the per-frame cap is sent in deferred-commit frames in the
-same way, with and without `sf_dir`, to a server that advertises its frame
-limit (`X-QWP-Max-Batch-Size`), and relies on the same server behaviour; see
+A row buffer whose one frame would be above the per-frame cap is sent in
+deferred-commit frames in the same way, with and without `sf_dir`, to a server
+that advertises its frame limit (`X-QWP-Max-Batch-Size`), and relies on the
+same server behaviour; see
 [Row buffers larger than one frame](CONSIDERATIONS.md#row-buffers-larger-than-one-frame).
 
 With `sf_dir`, a process that is killed inside such a flush leaves frames in

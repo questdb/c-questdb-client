@@ -1717,15 +1717,32 @@ const TWO_FRAME_TARGET: usize = 2028;
 /// 4,096 bytes holds: the frame cap of a sender with such segments.
 const LIMIT_ABOVE_TARGET: usize = 3000;
 
-fn a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two(progress: Progress) {
+/// Rows without symbols whose one frame, on a connection that holds fewer
+/// than 128 symbols, takes `frame_len` bytes. The size bound of the buffer
+/// takes two bytes more: it counts three for the id that the symbols of the
+/// frame start at, which such a frame writes in one.
+fn buffer_of_frame_len(first_id: i64, frame_len: usize) -> Buffer {
+    let buffer = buffer_of_len(first_id, frame_len + 2);
+    let frame = frame_of_a_sender(&buffer, false, &mut SymbolGlobalDict::new());
+    assert_eq!(frame.len(), frame_len);
+    buffer
+}
+
+/// The encoded frame decides whether a buffer is cut, not its size bound: a
+/// buffer whose frame is exactly the frame cap is one frame, though its
+/// bound is above the cap, and a frame one byte larger makes two.
+fn a_buffer_whose_frame_is_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two(
+    progress: Progress,
+) {
     let server = QwpWsModelServer::start(LIMIT_ABOVE_TARGET);
     let mut sender = sender_with(server.port, progress, "sf_max_segment_bytes=4096;");
     assert_eq!(
         sender.effective_frame_cap().unwrap(),
         (LIMIT_ABOVE_TARGET, true)
     );
-    let at_cap = buffer_of_len(0, LIMIT_ABOVE_TARGET);
-    let above_cap = buffer_of_len(1000, LIMIT_ABOVE_TARGET + 1);
+    let at_cap = buffer_of_frame_len(0, LIMIT_ABOVE_TARGET);
+    assert!(at_cap.len() > LIMIT_ABOVE_TARGET);
+    let above_cap = buffer_of_frame_len(1000, LIMIT_ABOVE_TARGET + 1);
 
     assert_eq!(sender.flush_and_keep_and_get_fsn(&at_cap).unwrap(), Some(0));
     sender.wait(AckLevel::Ok, WAIT).unwrap();
@@ -2778,6 +2795,76 @@ fn a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_no_room_for_its_fra
     assert_table_holds(&server, TABLE, 2, &[&filler, &filler]);
     assert_table_holds(&server, "symbol_columns", 1, &[&symbol_columns]);
     assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+/// The size bound of a buffer of symbols is more than twice the frame cap
+/// while its one frame fits: it goes out as that frame, as a buffer within
+/// the cap does, also when the queue has room for the frames that the bound
+/// would cut it into. The server commits it once.
+fn a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_room_for_its_frames(
+    progress: Progress,
+) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with(server.port, progress, "");
+    assert_eq!(sender.effective_frame_cap().unwrap(), (FRAME_LIMIT, true));
+    let symbol_columns = buffer_of_symbol_columns("symbol_columns", 100, 8);
+    let frame = frame_of_a_sender(&symbol_columns, false, &mut SymbolGlobalDict::new());
+    assert!(
+        symbol_columns.len() > 2 * FRAME_LIMIT && frame.len() <= FRAME_LIMIT,
+        "len {}, frame {}",
+        symbol_columns.len(),
+        frame.len()
+    );
+
+    assert_sent_as_one_frame(&server, &mut sender, &symbol_columns, "symbol_columns");
+    assert!(!sender.must_close());
+    drop(sender);
+    server.finish();
+}
+
+/// A buffer whose one frame fits the cap brings, in its last row, a symbol
+/// that the full dictionary of its connection cannot take. It is refused
+/// before anything of it is sent, as a buffer within the cap is: the sender
+/// stays open, and a flush of a known symbol goes on. Cut into frames by its
+/// size bound, the buffer would have brought that symbol in its last frame,
+/// and stopped part way.
+fn a_buffer_whose_frame_fits_is_refused_whole_by_a_full_dictionary(progress: Progress) {
+    let server = QwpWsModelServer::start(FRAME_LIMIT);
+    let mut sender = sender_with_a_dictionary_of(server.port, progress, 2);
+    let mut known = Buffer::new_qwp_ws();
+    known.table("known").unwrap().symbol("k", "k").unwrap();
+    known.at_now().unwrap();
+    // Rows of the symbol `a`, the second of the connection, and a last row
+    // that brings `z`, the third.
+    let mut large = buffer_of_symbol_columns("symbol_columns", 100, 8);
+    large.table("symbol_columns").unwrap();
+    for column in 0..8 {
+        let symbol = if column == 0 { "z" } else { "a" };
+        large.symbol(format!("s{column}").as_str(), symbol).unwrap();
+    }
+    large.at_now().unwrap();
+    let mut symbols = SymbolGlobalDict::new();
+    frame_of_a_sender(&known, false, &mut symbols);
+    let frame = frame_of_a_sender(&large, false, &mut SymbolGlobalDict::new());
+    assert!(large.len() > FRAME_LIMIT && frame.len() <= FRAME_LIMIT);
+    let frames = frames_of_a_sender(&large, FRAME_LIMIT, &mut symbols);
+    assert!(frames.len() > 1);
+    assert_eq!(symbols_brought_by(frames.last().unwrap()).1, ["z"]);
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&known).unwrap(), Some(0));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    let err = sender.flush_and_keep(&large).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SymbolDictFull, "{}", err.msg());
+    assert!(!sender.must_close());
+    assert_eq!(sender.published_fsn().unwrap(), Some(0));
+
+    assert_eq!(sender.flush_and_keep_and_get_fsn(&known).unwrap(), Some(1));
+    sender.wait(AckLevel::Ok, WAIT).unwrap();
+    assert_eq!(server.frames_taken(), 2);
+    assert_table_holds(&server, "known", 2, &[&known, &known]);
+    assert!(server.model.table("symbol_columns").is_none());
     drop(sender);
     server.finish();
 }
@@ -5049,7 +5136,7 @@ in_both_progress_modes! {
     a_flush_whose_first_frame_gets_no_segment_takes_its_symbols_out_of_the_symbol_file
     a_sender_whose_slot_has_no_symbol_file_refuses_a_buffer_above_the_frame_cap
     a_sender_whose_server_tells_no_frame_limit_refuses_a_buffer_above_the_frame_cap
-    a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two
+    a_buffer_whose_frame_is_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two
     a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone
     a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refused
     a_buffer_above_max_buf_size_is_refused_for_its_size_or_for_a_value_that_cannot_be_sent
@@ -5066,6 +5153,8 @@ in_both_progress_modes! {
     a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
     a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails
     a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_no_room_for_its_frames
+    a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_room_for_its_frames
+    a_buffer_whose_frame_fits_is_refused_whole_by_a_full_dictionary
     a_buffer_whose_frame_fits_by_the_symbols_its_connection_holds_is_one_frame_without_room_for_its_frames
     a_buffer_whose_frame_is_above_the_cap_by_its_symbol_ids_waits_for_the_room_of_its_frames
     a_flush_on_a_slot_reopened_with_larger_segments_counts_the_segment_in_use_at_its_size
@@ -5106,7 +5195,7 @@ on_disk_in_both_progress_modes! {
     a_flush_of_several_tables_above_the_frame_cap_is_one_commit_of_each_table
     a_flush_of_several_tables_that_loses_its_connection_part_way_is_sent_again_whole
     a_flush_with_a_column_of_every_kind_above_the_frame_cap_is_one_commit
-    a_buffer_of_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two
+    a_buffer_whose_frame_is_exactly_the_frame_cap_is_one_frame_and_one_byte_more_makes_two
     a_flush_is_cut_for_two_frames_a_segment_and_a_larger_row_travels_alone
     a_buffer_of_exactly_max_buf_size_is_sent_in_frames_and_one_byte_more_is_refused
     a_buffer_of_symbols_above_max_buf_size_whose_frame_fits_is_one_frame
@@ -5116,6 +5205,8 @@ on_disk_in_both_progress_modes! {
     a_flush_that_waits_for_room_until_the_deadline_fails_with_nothing_sent
     a_flush_that_waits_for_room_while_the_server_is_down_names_why_reconnecting_fails
     a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_no_room_for_its_frames
+    a_buffer_whose_frame_fits_is_one_frame_when_the_queue_has_room_for_its_frames
+    a_buffer_whose_frame_fits_is_refused_whole_by_a_full_dictionary
     a_buffer_whose_frame_fits_by_the_symbols_its_connection_holds_is_one_frame_without_room_for_its_frames
     a_buffer_whose_frame_is_above_the_cap_by_its_symbol_ids_waits_for_the_room_of_its_frames
     a_flush_that_fails_at_its_second_frame_is_aborted_and_the_flush_before_it_is_delivered
