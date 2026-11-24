@@ -575,6 +575,18 @@ struct SfaEngine {
     completed_upper: AtomicU64,
     sync_requested: AtomicBool,
     durability_failed: AtomicBool,
+    /// The first frame of a flush that stopped part way, `u64::MAX` while no
+    /// flush did: the driver hands no frame from it on to the transport. Set
+    /// once, by the abort of that flush ([`SfaProgressView::abandon_from`]),
+    /// and never cleared: the sender takes no publication after it, and a
+    /// new sender on the slot opens a new engine.
+    abandoned_from: AtomicU64,
+    /// One past the highest published frame that the driver has picked to
+    /// hand to the transport, on any connection; 0 while none. Only grows,
+    /// and stays at most `published_upper`. With `abandoned_from` it tells
+    /// the abort whether a frame of the flush may have been sent: see
+    /// [`SfaProgressView::next_outbound_frame`].
+    sent_upper: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -851,6 +863,8 @@ impl SfaFrameQueue {
             completed_upper: AtomicU64::new(recovered_completion.completed_upper),
             sync_requested: AtomicBool::new(false),
             durability_failed: AtomicBool::new(false),
+            abandoned_from: AtomicU64::new(u64::MAX),
+            sent_upper: AtomicU64::new(0),
         });
         let producer = Some(SfaProducer {
             engine: Arc::clone(&engine),
@@ -934,6 +948,8 @@ impl SfaFrameQueue {
             completed_upper: AtomicU64::new(next_fsn),
             sync_requested: AtomicBool::new(false),
             durability_failed: AtomicBool::new(false),
+            abandoned_from: AtomicU64::new(u64::MAX),
+            sent_upper: AtomicU64::new(0),
         });
         let producer = Some(SfaProducer {
             engine: Arc::clone(&engine),
@@ -1068,6 +1084,8 @@ impl SfaFrameQueue {
             completed_upper: AtomicU64::new(recovered_completion.completed_upper),
             sync_requested: AtomicBool::new(false),
             durability_failed: AtomicBool::new(false),
+            abandoned_from: AtomicU64::new(u64::MAX),
+            sent_upper: AtomicU64::new(0),
         });
 
         // MOVE the recovered region out of the handle rather than copying it. A
@@ -1485,6 +1503,14 @@ impl SfaProgressView {
         self.engine.has_deferred_commit_headroom()
     }
 
+    /// The next frame to hand to the transport, if one is published and is
+    /// not of a flush that stopped part way ([`Self::abandon_from`]).
+    ///
+    /// The frame is counted as sent before the abandoned position is read,
+    /// and the abort stores that position before it reads the count, both
+    /// sequentially consistent: either the frame is not sent, or the abort
+    /// counts it. A frame counted and then not sent only makes the error of
+    /// the flush say that a frame of it may have been sent.
     pub(crate) fn next_outbound_frame(
         &self,
         send_cursor: &mut SendCursor,
@@ -1494,6 +1520,15 @@ impl SfaProgressView {
         else {
             return Ok(None);
         };
+        if fsn >= self.engine.published_upper.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        self.engine
+            .sent_upper
+            .fetch_max(fsn.saturating_add(1), Ordering::SeqCst);
+        if fsn >= self.engine.abandoned_from.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let Some(payload) = self
             .next_cursor_payload_for_fsn(send_cursor.sfa_cursor_mut(), fsn)
             .map_err(DriverError::from)?
@@ -1509,6 +1544,22 @@ impl SfaProgressView {
 
     pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
         self.engine.oldest_unresolved_fsn()
+    }
+
+    /// Gives up the frames from `first_fsn` on, those of a flush that
+    /// stopped part way: the driver hands none of them to the transport any
+    /// more, on this connection or after a reconnect. Whether one of them may
+    /// have been handed to it before: see [`Self::next_outbound_frame`].
+    pub(crate) fn abandon_from(&self, first_fsn: u64) -> bool {
+        self.engine
+            .abandoned_from
+            .fetch_min(first_fsn, Ordering::SeqCst);
+        self.engine.sent_upper.load(Ordering::SeqCst) > first_fsn
+    }
+
+    /// The first frame given up by [`Self::abandon_from`], if one is.
+    pub(crate) fn abandoned_from(&self) -> Option<u64> {
+        Some(self.engine.abandoned_from.load(Ordering::SeqCst)).filter(|&fsn| fsn != u64::MAX)
     }
 
     pub(crate) fn completed_fsn(&self) -> Option<u64> {

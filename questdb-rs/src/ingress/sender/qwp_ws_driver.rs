@@ -1004,6 +1004,13 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                         defer_reconnect,
                     );
                 };
+                // A frame of a flush that stopped part way: the sender sends
+                // nothing of that flush any more, so the server's verdict on
+                // it is only reported, whatever its policy.
+                if is_abandoned(store, fsn) {
+                    store.record_reject_error(fsn, wire_seq, error, policy);
+                    return Ok(DriveOutcome::Idle);
+                }
                 if self.reject_target_already_accounted(store, fsn) {
                     store.record_reject_error(fsn, wire_seq, error, policy);
                     return Ok(DriveOutcome::Idle);
@@ -1138,6 +1145,13 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .max(from_fsn);
         let sender_error =
             sender_error_for_qwp_error_span(&error, wire_seq, from_fsn, to_fsn, policy);
+        // Every frame it may be about is of a flush that stopped part way:
+        // reported only, as a reject of such a frame in `apply_response`.
+        if is_abandoned(store, from_fsn) {
+            store.last_server_error = Some(error);
+            store.push_sender_error(sender_error);
+            return Ok(DriveOutcome::Idle);
+        }
         if policy == QwpWsErrorPolicy::Terminal {
             let terminal_error = server_rejection_error(error.error.clone(), sender_error.clone());
             store.record_terminal_sender_error(sender_error, terminal_error, Some(error));
@@ -3006,6 +3020,15 @@ pub(super) fn retry_budget_exhausted_error(
         }
         None => Error::new(ErrorCode::SocketError, msg),
     }
+}
+
+/// Whether frame `fsn` is of a flush that stopped part way, which the driver
+/// sends no more: see [`SfaProgressView::abandon_from`].
+fn is_abandoned<Q: PublicationLog>(store: &QwpWsPublicationStore<Q>, fsn: u64) -> bool {
+    store
+        .progress_view()
+        .abandoned_from()
+        .is_some_and(|abandoned_from| fsn >= abandoned_from)
 }
 
 pub(crate) trait PublicationLog {

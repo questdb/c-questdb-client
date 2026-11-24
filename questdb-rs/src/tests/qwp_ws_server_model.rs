@@ -592,6 +592,13 @@ impl QwpWsModelServer {
         self.shared.frames.load(Ordering::SeqCst)
     }
 
+    /// [`Self::frames_taken`] for code that cannot borrow the server, such
+    /// as a hook of the sender.
+    pub(crate) fn frames_taken_reader(&self) -> impl Fn() -> usize + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || shared.frames.load(Ordering::SeqCst)
+    }
+
     /// The server rejects one frame with `status`: the one that makes
     /// [`Self::frames_taken`] reach `frame`, so the first frame it ever
     /// takes is frame 1. It does to that frame's connection what

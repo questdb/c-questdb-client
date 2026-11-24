@@ -64,10 +64,11 @@
 //! buffer is published, and it keeps its rows.
 //! A flush in frames that stops after its first frame was published fails
 //! with `ErrorCode::FlushAborted`. Nothing of it is committed and the buffer
-//! keeps its rows. The sender queues nothing more: each later flush that
-//! gets as far as the queue fails with the same error. It goes on delivering
-//! the flushes before the failed one: `wait` and `close_drain` return once
-//! those are confirmed.
+//! keeps its rows. The sender sends no frame of it from then on, and its
+//! error is in doubt when a frame of it was sent before. The sender queues
+//! nothing more: each later flush that gets as far as the queue fails with
+//! the same error. It goes on delivering the flushes before the failed one:
+//! `wait` and `close_drain` return once those are confirmed.
 //! A frame of a flush that the server rejects leaves nothing of the flush
 //! committed. A rejection for good stops the sender, which reports it at
 //! `wait` and at `close_drain`. After any other the sender connects again
@@ -92,7 +93,7 @@ use crate::ErrorCode;
 use crate::ingress::sender::qwp_ws_sfa_manifest::fail_manifest_sync_after_for_test;
 use crate::ingress::sender::{
     ConfirmationStoredHook, ConfirmationStoredHookGuard, HotSpareCreationHookGuard,
-    before_hot_spare_creation_for_test, fail_sync_after_for_test,
+    LaterFrameHookGuard, before_hot_spare_creation_for_test, fail_sync_after_for_test,
 };
 use crate::ingress::{
     AckLevel, Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError, Sender,
@@ -2531,6 +2532,15 @@ pub(super) fn assert_timed_out_waiting_for_room(err: &crate::Error, allocated: &
     );
 }
 
+/// Waits until `done`, as long as `wait` allows.
+pub(super) fn wait_until(wait: Duration, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + wait;
+    while !done() {
+        assert!(Instant::now() < deadline, "waited {wait:?} in vain");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Waits until the server has taken `frames` frames from `sender`.
 fn wait_for_frames_sent(
     sender: &mut Sender,
@@ -3370,15 +3380,23 @@ fn sender_with_a_dictionary_of(port: u16, progress: Progress, symbols: usize) ->
 }
 
 /// The error of a flush in frames that stopped part way because the
-/// dictionary of its sender was full with `symbols` symbols.
-pub(super) fn stopped_by_a_full_dictionary(symbols: usize) -> String {
+/// dictionary of its sender was full with `symbols` symbols: `sent` when a
+/// frame of it may have been handed to the transport before it stopped,
+/// which is when the error is in doubt.
+pub(super) fn stopped_by_a_full_dictionary(symbols: usize, sent: bool) -> String {
+    let what_was_sent = if sent {
+        "Some of its frames were sent: the server commits none of their rows unless one table \
+         had more rows than its qwp.max.uncommitted.rows, and then may have committed a part of \
+         them by itself, which flushing the buffer again stores twice unless the table has DEDUP \
+         keys. The buffer still holds its rows."
+    } else {
+        "None of its frames reached the server, nothing of it is committed, and the buffer still \
+         holds its rows."
+    };
     format!(
         "Could not flush buffer: the flush stopped part way: QWP/WS connection-scoped symbol \
          dictionary reached its {symbols}-entry cap; retire this connection and continue on a \
-         fresh one (returning it to a pool recycles its dictionary). Nothing of this flush is \
-         committed and the buffer still holds its rows. Only a flush with more rows of one \
-         table than the server's qwp.max.uncommitted.rows may be committed in part, and \
-         flushing it again then stores that part twice unless the table has DEDUP keys. This \
+         fresh one (returning it to a pool recycles its dictionary). {what_was_sent} This \
          sender takes no more flushes and still delivers the flushes before this one: once \
          they are confirmed, close it or return it to its pool, and flush the buffer again \
          through a new sender."
@@ -3387,12 +3405,50 @@ pub(super) fn stopped_by_a_full_dictionary(symbols: usize) -> String {
 
 /// Checks the error of a flush that stopped part way because the dictionary
 /// of its sender was full with `symbols` symbols, and what the sender says
-/// of itself right after it.
-fn assert_stopped_by_a_full_dictionary(sender: &Sender, err: &crate::Error, symbols: usize) {
+/// of itself right after it. The error tells whether a frame of the flush
+/// may have been sent. A sender in manual progress mode drives nothing
+/// during a flush that has room, so none was.
+fn assert_stopped_by_a_full_dictionary(
+    sender: &Sender,
+    progress: Progress,
+    err: &crate::Error,
+    symbols: usize,
+) {
     assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
-    assert_eq!(err.msg(), stopped_by_a_full_dictionary(symbols));
-    assert!(!err.in_doubt());
+    assert_eq!(
+        err.msg(),
+        stopped_by_a_full_dictionary(symbols, err.in_doubt())
+    );
+    if matches!(progress, Progress::Manual) {
+        assert!(!err.in_doubt());
+    }
     assert!(sender.must_close());
+}
+
+/// Checks how many frames of a flush in frames that failed part way with
+/// `err` the server took: `taken` of the `queued` frames that the flush had
+/// queued, counted once the connection that took them has ended. The sender
+/// sends no frame of a flush after the flush has failed, so the server
+/// takes only frames handed to the transport before, and the error is in
+/// doubt then. A sender in manual progress mode drives nothing during a
+/// flush that has room, so the server takes none.
+fn assert_taken_of_the_failed_flush(
+    err: &crate::Error,
+    progress: Progress,
+    taken: usize,
+    queued: usize,
+) {
+    assert!(
+        taken <= queued,
+        "the server took {taken} of {queued} frames"
+    );
+    assert!(
+        taken == 0 || err.in_doubt(),
+        "the server took {taken} frames of a flush whose error is not in doubt"
+    );
+    if matches!(progress, Progress::Manual) {
+        assert_eq!(taken, 0);
+    }
 }
 
 /// How many symbols the connection of a sender holds when it comes to
@@ -3447,7 +3503,7 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
 
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
     let err = sender.flush(&mut large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
     assert_eq!(
         (large.row_count(), large.len()),
         (rows, len),
@@ -3455,14 +3511,14 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
     );
     // The sender has published the flush before, and says no more.
     assert_eq!(sender.published_fsn().unwrap(), Some(0));
-    // It sends the frames of the failed flush that it had queued.
-    wait_for_frames_sent(&mut sender, progress, &server, 1 + failing);
+    // It sends the flush before.
+    wait_for_frames_sent(&mut sender, progress, &server, 1);
 
     // Every later flush gets the same error, of one frame and in frames.
     for later in [&buffer_of(TABLE, 0..3), &large] {
         let refused = sender.flush_and_keep(later).unwrap_err();
         assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
-        assert!(!refused.in_doubt());
+        assert_eq!(refused.in_doubt(), err.in_doubt());
     }
     // A buffer with a symbol that is new to the full dictionary cannot be
     // encoded, which the sender finds before it comes to its state.
@@ -3490,9 +3546,8 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
             !waiting.is_finished(),
             "the sender did not wait for the flush before"
         );
-        assert_eq!(
-            server.frames_taken(),
-            1 + failing,
+        assert!(
+            server.frames_taken() <= 1 + failing,
             "no later flush is queued"
         );
         server.let_answers_go();
@@ -3505,8 +3560,8 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
     }
     assert!(sender.must_close());
     // The server has committed the flush before, and holds the rows of the
-    // failed flush for a frame that never comes.
-    assert_eq!(server.frames_taken(), 1 + failing);
+    // frames of the failed flush that were sent before it failed, for a
+    // frame that never comes.
     assert_table_holds(&server, TABLE, 1, &[&before]);
 
     // What the error says to do: close the sender, and flush the buffer
@@ -3514,6 +3569,7 @@ fn assert_a_flush_that_fails_part_way_leaves_the_flushes_before_it(
     // connection, and every row of the buffer is committed once.
     drop(sender);
     wait_for_no_connection(&server);
+    assert_taken_of_the_failed_flush(&err, progress, server.frames_taken() - 1, failing);
     let mut sender = sender_with(server.port, progress, "");
     sender.flush(&mut large).unwrap();
     assert!(large.is_empty());
@@ -3562,9 +3618,8 @@ fn a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait
     let mut sender = sender_with_a_dictionary_of(server.port, progress, symbols);
 
     let err = sender.flush_and_keep(&large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
     assert_eq!(sender.published_fsn().unwrap(), None);
-    wait_for_frames_sent(&mut sender, progress, &server, failing);
 
     // The server answers none of the frames it took, and the sender waits
     // for none of them.
@@ -3574,12 +3629,14 @@ fn a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait
     sender.close_drain().unwrap();
     let waited = started.elapsed();
     assert!(waited < Duration::from_secs(2), "waited {waited:?}");
-    assert_eq!(server.frames_taken(), failing);
-    // The server made the table when it took the first frame for it.
-    assert_table_holds(&server, TABLE, 0, &[]);
 
     drop(sender);
     wait_for_no_connection(&server);
+    assert_taken_of_the_failed_flush(&err, progress, server.frames_taken(), failing);
+    // The server made the table if it took a frame for it, and commits
+    // nothing of it.
+    let held = server.model.table(TABLE).unwrap_or_default();
+    assert_eq!((held.commits, held.row_count()), (0, 0));
     let mut sender = sender_with(server.port, progress, "");
     sender.flush_and_keep(&large).unwrap();
     sender.wait(AckLevel::Ok, WAIT).unwrap();
@@ -3644,9 +3701,14 @@ fn start_server_that_answers_a_deferred_frame(
 /// A flush in frames fails part way, and the server confirms one of the
 /// frames of it that were sent, as it does when it commits a part of a
 /// flush with more rows of one table than its `qwp.max.uncommitted.rows`.
-/// The sender reports no confirmed position above the last frame before the
-/// failed flush, which is where `published_fsn` stays: `published_fsn`
-/// less a confirmed position is never below zero.
+/// The error is in doubt. The sender reports no confirmed position above
+/// the last frame before the failed flush, which is where `published_fsn`
+/// stays: `published_fsn` less a confirmed position is never below zero.
+///
+/// The flush cuts its failing frame only once the server has answered the
+/// frame before it, which the network thread sent. A sender in manual
+/// progress mode sends nothing during a flush that has room, so only one in
+/// background progress mode can have a frame of the flush confirmed.
 fn a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirmed(
     progress: Progress,
 ) {
@@ -3662,15 +3724,27 @@ fn a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirm
     // is frame 0, and frame `i` of the flush is frame `1 + i`.
     let confirmed = failing as u64;
     let (port, answered) = start_server_that_answers_a_deferred_frame(confirmed);
+    let symbols = symbols_held_before(&frames[failing]);
     let mut sender = {
-        let _cap = crate::ingress::TestDictCapGuard::new(symbols_held_before(&frames[failing]));
+        let _cap = crate::ingress::TestDictCapGuard::new(symbols);
         sender_with(port, progress, NO_WAIT_AT_THE_END)
     };
 
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
     sender.wait(AckLevel::Ok, WAIT).unwrap();
-    let err = sender.flush(&mut large).unwrap_err();
+    let err = {
+        let (answered, mut later_frames) = (Arc::clone(&answered), 0);
+        let _hook = LaterFrameHookGuard::new(Box::new(move || {
+            later_frames += 1;
+            if later_frames == failing {
+                wait_until(WAIT, || answered.lock().unwrap().contains(&confirmed));
+            }
+        }));
+        sender.flush(&mut large).unwrap_err()
+    };
     assert_eq!(err.code(), ErrorCode::FlushAborted, "{}", err.msg());
+    assert!(err.in_doubt());
+    assert_eq!(err.msg(), stopped_by_a_full_dictionary(symbols, true));
     // The queue takes the answer of the frame.
     let deadline = Instant::now() + WAIT;
     while sender.qwp_ws_queue_completed_fsn() != Some(confirmed) {
@@ -3707,7 +3781,7 @@ fn a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush(pr
     };
 
     let err = sender.flush_and_keep(&large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
     // The frames of the failed flush stay in the queue, which has no room
     // for as many again, and gets none: the server confirms none of them.
     // The sender does not wait for it.
@@ -3742,12 +3816,12 @@ fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_co
         Some(last_before)
     );
     let err = sender.flush_and_keep(&large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
     assert_eq!(sender.published_fsn().unwrap(), Some(last_before));
 
-    // On its second connection the sender sends what its queue holds: the
-    // flush before, which the server commits and confirms, and the frames of
-    // the failed flush with their symbols, which it holds.
+    // On its second connection the sender sends the symbols it had sent and
+    // the flush before, which the server commits and confirms, and no frame
+    // of the failed flush that it had not sent before the flush failed.
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     assert_eq!(
         sender.completed_fsn(AckLevel::Ok).unwrap(),
@@ -3756,18 +3830,19 @@ fn a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_co
     assert_eq!(sender.published_fsn().unwrap(), Some(last_before));
     let totals = sender.qwp_ws_totals().unwrap();
     assert_eq!(totals.reconnects_succeeded, 1);
-    // On a new connection the symbols that the sender had sent come first,
-    // in one frame without rows or in several.
-    let sent = CUT_AFTER_FRAMES + 1 + before_frames + failing;
-    wait_for_frames_sent(&mut sender, progress, &server, sent);
     let refused = sender.flush_and_keep(&large).unwrap_err();
     assert_eq!((refused.code(), refused.msg()), (err.code(), err.msg()));
     sender.close_drain().unwrap();
     assert_table_holds(&server, TABLE, 1, &[&before]);
-    assert_table_holds(&server, FIRST, 0, &[]);
+    let held = server.model.table(FIRST).unwrap_or_default();
+    assert_eq!((held.commits, held.row_count()), (0, 0));
 
     drop(sender);
     wait_for_no_connection(&server);
+    // The rows of the failed flush are all of its table, which the server
+    // makes when it takes the first frame for it: it took a frame of the
+    // flush only if the error is in doubt.
+    assert!(server.model.table(FIRST).is_none() || err.in_doubt());
     let mut sender = sender_with(server.port, progress, "");
     sender.flush_and_keep(&large).unwrap();
     sender.wait(AckLevel::Ok, WAIT).unwrap();
@@ -3846,8 +3921,8 @@ fn a_close_drain_after_a_flush_that_failed_part_way_leaves_an_empty_slot(progres
 
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
     let err = sender.flush(&mut large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
-    wait_for_frames_sent(&mut sender, progress, &server, 1 + failing);
+    assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
+    wait_for_frames_sent(&mut sender, progress, &server, 1);
     assert!(segment_files(&sf_dir) > 0);
     server.let_answers_go();
     sender.close_drain().unwrap();
@@ -3855,6 +3930,7 @@ fn a_close_drain_after_a_flush_that_failed_part_way_leaves_an_empty_slot(progres
     assert_table_holds(&server, TABLE, 1, &[&before]);
     drop(sender);
     wait_for_no_connection(&server);
+    assert_taken_of_the_failed_flush(&err, progress, server.frames_taken() - 1, failing);
 
     // With a dictionary of the same size, the next sender takes as many
     // symbols that are new to it.
@@ -3959,8 +4035,8 @@ fn a_confirmation_that_comes_as_close_drain_starts_after_a_flush_that_failed_par
 
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
     let err = sender.flush(&mut large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
-    wait_for_frames_taken(&server, 1 + failing);
+    assert_stopped_by_a_full_dictionary(&sender, Progress::Background, &err, symbols);
+    wait_for_frames_taken(&server, 1);
     hold.arm();
     server.let_answers_go();
     assert_eq!(hold.wait_until_parked(), Some(0));
@@ -3974,8 +4050,9 @@ fn a_confirmation_that_comes_as_close_drain_starts_after_a_flush_that_failed_par
     drop(sender);
     wait_for_no_connection(&server);
     assert_table_holds(&server, TABLE, 1, &[&before]);
-
     let taken = server.frames_taken();
+    assert_taken_of_the_failed_flush(&err, Progress::Background, taken - 1, failing);
+
     let mut sender = sender_with(server.port, Progress::Background, &settings);
     assert_eq!(sender.published_fsn().unwrap(), None);
     sender.wait(AckLevel::Ok, WAIT).unwrap();
@@ -4008,9 +4085,9 @@ fn a_close_drain_after_a_flush_that_failed_part_way_gives_up_at_its_timeout_whil
     };
 
     assert_eq!(sender.flush_and_keep_and_get_fsn(&before).unwrap(), Some(0));
-    let err = sender.flush(&mut large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
-    wait_for_frames_taken(&server, 1 + failing);
+    let aborted = sender.flush(&mut large).unwrap_err();
+    assert_stopped_by_a_full_dictionary(&sender, Progress::Background, &aborted, symbols);
+    wait_for_frames_taken(&server, 1);
     hold.arm();
     server.let_answers_go();
     assert_eq!(hold.wait_until_parked(), Some(0));
@@ -4035,6 +4112,12 @@ fn a_close_drain_after_a_flush_that_failed_part_way_gives_up_at_its_timeout_whil
     drop(sender);
     wait_for_no_connection(&server);
     assert_table_holds(&server, TABLE, 1, &[&before]);
+    assert_taken_of_the_failed_flush(
+        &aborted,
+        Progress::Background,
+        server.frames_taken() - 1,
+        failing,
+    );
 
     // The next sender on the slot holds the flush before, confirmed, and
     // nothing of the failed one. It sends neither again.
@@ -4067,14 +4150,14 @@ fn a_second_sender_on_the_slot_of_a_sender_closed_after_a_flush_that_failed_part
     };
 
     let err = first.flush(&mut large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&first, &err, symbols);
+    assert_stopped_by_a_full_dictionary(&first, Progress::Background, &err, symbols);
     // There is nothing before the failed flush to wait for, and the network
     // thread may still be sending the frames of the failed one.
     first.close_drain().unwrap();
     // The connection has ended, and with it the rows that the server held.
     wait_for_no_connection(&server);
     let taken = server.frames_taken();
-    assert!(taken <= failing, "{taken} frames");
+    assert_taken_of_the_failed_flush(&err, Progress::Background, taken, failing);
 
     let mut second = sender_with(server.port, Progress::Background, &settings);
     assert_eq!(second.published_fsn().unwrap(), None);
@@ -4120,6 +4203,7 @@ fn a_flush_of_symbols_and_one_that_fills_the_dictionary_after_it(
 /// sender is full with `symbols` symbols.
 fn flush_until_the_dictionary_is_full(
     sender: &mut Sender,
+    progress: Progress,
     prior: &Buffer,
     large: &mut Buffer,
     symbols: usize,
@@ -4128,7 +4212,7 @@ fn flush_until_the_dictionary_is_full(
     sender.flush_and_keep(prior).unwrap();
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     let err = sender.flush(large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(sender, &err, symbols);
+    assert_stopped_by_a_full_dictionary(sender, progress, &err, symbols);
     assert_eq!(
         (large.row_count(), large.len()),
         (rows, len),
@@ -4154,7 +4238,7 @@ fn a_new_sender_on_the_slot_flushes_a_buffer_that_a_full_dictionary_stopped_afte
         // sender has the same cap.
         let _cap = crate::ingress::TestDictCapGuard::new(symbols);
         let mut sender = sender_with(server.port, progress, &settings);
-        flush_until_the_dictionary_is_full(&mut sender, &prior, &mut large, symbols);
+        flush_until_the_dictionary_is_full(&mut sender, progress, &prior, &mut large, symbols);
         sender.close_drain().unwrap();
         drop(sender);
         assert_table_holds(&server, TABLE, 1, &[&prior]);
@@ -4197,13 +4281,13 @@ fn a_full_dictionary_stops_the_flush_once_more_on_the_slot_of_a_sender_dropped_w
         // sender has the same cap.
         let _cap = crate::ingress::TestDictCapGuard::new(symbols);
         let mut sender = sender_with(server.port, progress, &dropped);
-        flush_until_the_dictionary_is_full(&mut sender, &prior, &mut large, symbols);
+        flush_until_the_dictionary_is_full(&mut sender, progress, &prior, &mut large, symbols);
         drop(sender);
         assert!(segment_files(&sf_dir) > 0);
 
         let mut sender = sender_with(server.port, progress, &settings);
         let err = sender.flush(&mut large).unwrap_err();
-        assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+        assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
         sender.close_drain().unwrap();
         assert_eq!(files_in_the_slot(&sf_dir), Vec::<String>::new());
         drop(sender);
@@ -4421,13 +4505,19 @@ fn a_flush_with_a_frame_that_a_demoted_server_rejects_is_sent_again_whole(progre
     server.finish();
 }
 
-/// A sender whose flush failed part way sends the frames of that flush that
-/// it had queued, and the server rejects one of them for good. The rejection
-/// is about the failed flush, whose error already says that nothing of it is
-/// committed. So the calls about the flush before it, which is confirmed, do
-/// not fail on it, and a later flush still gets the error of the failed
-/// flush. The sender reports the rejection as an error of the server, and a
-/// close drain empties its slot.
+/// The server rejects for good a frame of a flush that failed part way, and
+/// tells so after the flush has failed. The rejection is about the failed
+/// flush, whose error already says what of it may be committed. So the
+/// calls about the flush before it, which is confirmed, do not fail on it,
+/// and a later flush still gets the error of the failed flush. The sender
+/// reports the rejection as an error of the server, and a close drain
+/// empties its slot.
+///
+/// In background progress mode the flush cuts its failing frame only once
+/// the server has taken the rejected one: its error is in doubt. A sender in
+/// manual progress mode drives nothing during a flush that has room, and
+/// sends no frame of the flush once it has failed: the server takes none,
+/// and has nothing to reject.
 fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_before_it_confirmed(
     progress: Progress,
 ) {
@@ -4449,19 +4539,41 @@ fn a_rejection_of_a_frame_of_a_flush_that_failed_part_way_leaves_the_flush_befor
     // tells so when the flush has failed.
     server.reject_frame(3, SCHEMA_MISMATCH);
     server.hold_answers();
-    let err = sender.flush_and_keep(&large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
-    wait_for_frames_sent(&mut sender, progress, &server, 1 + failing);
+    let err = {
+        let (frames_taken, mut later_frames) = (server.frames_taken_reader(), 0);
+        let _hook = matches!(progress, Progress::Background).then(|| {
+            LaterFrameHookGuard::new(Box::new(move || {
+                later_frames += 1;
+                if later_frames == failing {
+                    wait_until(WAIT, || frames_taken() >= 3);
+                }
+            }))
+        });
+        sender.flush_and_keep(&large).unwrap_err()
+    };
+    assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
+    assert_eq!(err.in_doubt(), matches!(progress, Progress::Background));
     server.let_answers_go();
 
-    assert_rejection_for_good(&the_server_error_read_by(&mut sender, progress), 2);
-    assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
+    match progress {
+        Progress::Background => {
+            assert_rejection_for_good(&the_server_error_read_by(&mut sender, progress), 2);
+            assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
+        }
+        Progress::Manual => {
+            for _ in 0..10 {
+                sender.drive_once().unwrap();
+            }
+            assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
+            assert_eq!(server.frames_taken(), 1);
+        }
+    }
     assert_eq!(sender.published_fsn().unwrap(), Some(0));
     assert_eq!(sender.acked_fsn().unwrap(), Some(0));
     assert_eq!(sender.completed_fsn(AckLevel::Ok).unwrap(), Some(0));
     sender.wait(AckLevel::Ok, WAIT).unwrap();
     let err = sender.flush_and_keep(&before).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
     sender.close_drain().unwrap();
     assert_eq!(files_in_the_slots(), Vec::<String>::new());
     assert_table_holds(&server, TABLE, 1, &[&before]);
@@ -4681,7 +4793,7 @@ fn a_close_drain_that_times_out_after_a_failed_flush_counts_the_frames_before_it
         Some(before_frames as u64 - 1)
     );
     let err = sender.flush_and_keep(&large).unwrap_err();
-    assert_stopped_by_a_full_dictionary(&sender, &err, symbols);
+    assert_stopped_by_a_full_dictionary(&sender, progress, &err, symbols);
     assert_eq!(
         close_drain_that_times_out(&mut sender),
         close_drain_timed_out(before_frames)
@@ -5098,11 +5210,14 @@ fn a_flush_in_frames_whose_network_thread_dies_while_a_frame_waits_for_a_spare_f
         err.msg().starts_with(
             "Could not flush buffer: the flush stopped part way: QWP/WebSocket \
              Store-and-Forward append failed: the network thread of the sender has stopped. \
-             Nothing of this flush is committed"
+             None of its frames reached the server, nothing of it is committed"
         ),
         "{}",
         err.msg()
     );
+    // The network thread died while it made the spare, before it could
+    // take the first frame of the flush.
+    assert!(!err.in_doubt());
     assert!(sender.must_close());
     assert_eq!(
         (large.row_count(), large.len()),
@@ -5112,6 +5227,21 @@ fn a_flush_in_frames_whose_network_thread_dies_while_a_frame_waits_for_a_spare_f
     drop(sender);
     assert_nothing_committed_after_the_spare_of_the_open(&server);
     server.finish();
+}
+
+mod a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirmed {
+    use super::a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirmed as test;
+    use super::{Progress, on_disk};
+
+    #[test]
+    fn background() {
+        test(Progress::Background);
+    }
+
+    #[test]
+    fn on_disk_background() {
+        on_disk(test, Progress::Background);
+    }
 }
 
 /// Makes two tests of each test that takes the progress mode of its senders:
@@ -5206,7 +5336,6 @@ in_both_progress_modes! {
     a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
-    a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirmed
     a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
     a_close_drain_after_a_flush_that_failed_part_way_leaves_an_empty_slot
@@ -5253,7 +5382,6 @@ on_disk_in_both_progress_modes! {
     a_flush_that_fails_at_a_middle_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_at_its_last_frame_is_aborted_and_the_flush_before_it_is_delivered
     a_flush_that_fails_part_way_as_the_first_of_its_sender_leaves_nothing_to_wait_for
-    a_frame_of_a_failed_flush_that_the_server_confirms_is_not_reported_as_confirmed
     a_later_flush_without_room_in_the_queue_gets_the_error_of_the_failed_flush
     a_sender_whose_flush_failed_part_way_delivers_the_flush_before_it_on_a_new_connection
     a_flush_with_a_frame_that_the_server_rejects_for_good_stops_the_sender_and_commits_nothing
