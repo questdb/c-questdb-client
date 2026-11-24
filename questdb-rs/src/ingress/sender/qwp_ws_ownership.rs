@@ -49,7 +49,19 @@ pub enum QwpWsProgress {
 pub struct QwpWsSenderError {
     /// Server-distinguishable error category.
     pub category: QwpWsErrorCategory,
-    /// Policy the client applied after observing the error.
+    /// Policy the client applied after observing the error. A rejection
+    /// that the sender only reports carries the policy of its status, which
+    /// the sender does not apply: it neither stops nor reconnects for it.
+    /// Such are the rejections of a frame that the server had already
+    /// answered, and of a frame of a flush that stopped part way
+    /// ([`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted)), whose
+    /// frames the sender gives up. A retriable rejection of a frame that is not
+    /// in the queue, such as the symbol-dictionary frame that a reconnect sends
+    /// first, is reported as such also when the sender stops for it, after the
+    /// server has rejected it too often without progress. The sender then also
+    /// reports the stop, as a
+    /// [`ProtocolViolation`](QwpWsErrorCategory::ProtocolViolation) with the
+    /// [`Terminal`](QwpWsErrorPolicy::Terminal) policy.
     pub applied_policy: QwpWsErrorPolicy,
     /// Raw QWP status byte. `None` for WebSocket protocol violations, which do
     /// not carry a QWP status byte.

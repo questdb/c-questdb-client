@@ -237,7 +237,8 @@ Check whether the error is in doubt (`in_doubt()` in Rust and C++,
 The server may still answer about the frames that were sent, and may reject
 one of them. Such an answer fails no call: a rejection is only reported as a
 server error (`poll_qwp_ws_error` in Rust, `line_sender_qwpws_poll_error` in
-C) and to the error handler.
+C) and to the error handler, with the policy of its status, which the sender
+does not apply.
 
 The sender takes no more flushes and reports `must_close`. A later flush fails
 with `flush_aborted` too, not in doubt, because nothing of it is sent; or with

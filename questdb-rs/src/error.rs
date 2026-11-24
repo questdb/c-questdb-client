@@ -359,7 +359,9 @@ pub enum ErrorCode {
     /// reported as a server error, by
     /// [`poll_qwp_ws_error`](crate::ingress::Sender::poll_qwp_ws_error) and
     /// the
-    /// [`qwp_ws_error_handler`](crate::ingress::SenderBuilder::qwp_ws_error_handler).
+    /// [`qwp_ws_error_handler`](crate::ingress::SenderBuilder::qwp_ws_error_handler),
+    /// with the policy of its status, which the sender does not apply
+    /// ([`QwpWsSenderError::applied_policy`](crate::ingress::QwpWsSenderError::applied_policy)).
     ///
     /// The sender takes no more flushes, and
     /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. A

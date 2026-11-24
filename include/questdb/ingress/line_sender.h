@@ -344,7 +344,8 @@ typedef enum line_sender_error_code
      *  The server may still answer about the frames that were sent, and may
      *  reject one of them. Such an answer fails no call: a rejection is only
      *  reported as a server error, by `line_sender_qwpws_poll_error` and the
-     *  error handler (`line_sender_opts_qwpws_error_handler`).
+     *  error handler (`line_sender_opts_qwpws_error_handler`), with the policy
+     *  of its status, which the sender does not apply.
      *
      *  The sender takes no more flushes, and `line_sender_must_close` returns
      *  true. A later flush fails with this code too, not in doubt, because
@@ -1665,6 +1666,18 @@ typedef struct line_sender_qwpws_error line_sender_qwpws_error;
 typedef struct line_sender_qwpws_error_view
 {
     line_sender_qwpws_error_category category;
+    /** Policy the sender applied after observing the error. A rejection that
+     *  the sender only reports carries the policy of its status, which the
+     *  sender does not apply: it neither stops nor reconnects for it. Such are
+     *  the rejections of a frame that the server had already answered, and of
+     *  a frame of a flush that stopped part way
+     *  (`line_sender_error_flush_aborted`), whose frames the sender gives up.
+     *  A retriable rejection of a frame that is not in the queue, such as the
+     *  symbol-dictionary frame that a reconnect sends first, is reported as
+     *  such also when the sender stops for it, after the server has rejected it
+     *  too often without progress. The sender then also reports the stop, as a
+     *  protocol violation with the terminal policy.
+     */
     line_sender_qwpws_error_policy applied_policy;
     bool has_status;
     uint8_t status;
