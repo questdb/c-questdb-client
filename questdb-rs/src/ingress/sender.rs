@@ -761,7 +761,10 @@ impl Sender {
     /// and the store-and-forward segment payload capacity. On a connection
     /// that advertised `X-QWP-Max-Batch-Size` the sender sends a buffer above
     /// the cap in several frames, which the server commits together, in
-    /// either progress mode, with its queue in memory and with `sf_dir`. On
+    /// either progress mode, with its queue in memory and with `sf_dir`. The
+    /// exceptions are when `max_buf_size` sets the cap, and when the queue
+    /// cannot hold the frames: see
+    /// [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge). On
     /// any other connection, and with an `sf_dir` slot whose symbol file it
     /// could not write, it publishes a buffer as one frame: a flush whose
     /// encoded frame exceeds the cap fails with

@@ -1252,12 +1252,12 @@ public:
      * rows. The sender takes no more flushes, and still delivers the ones
      * before. To lose none of those, call `wait()` and let it return. Then let
      * this guard go: the pool closes the sender instead of lending it again.
-     * Flush the Buffer through a newly borrowed sender when the error's
-     * `in_doubt()` is false. When it is true, some frames of the flush were
-     * sent, and a table with at least as many rows in the flush as the
+     * Flush the Buffer through a newly borrowed sender as the error's
+     * `in_doubt()` allows. When it is true, some frames of the flush may have
+     * been sent, and a table with at least as many rows in the flush as the
      * server's `qwp.max.uncommitted.rows` may have a part of them committed
-     * already:
-     * see `line_sender_error_flush_aborted` in `line_sender.h`. The same
+     * already, which flushing again stores twice unless the table has `DEDUP`
+     * keys: see `line_sender_error_flush_aborted` in `line_sender.h`. The same
      * holds for the other Buffer flushes.
      */
     void flush(line_sender_buffer& buffer)

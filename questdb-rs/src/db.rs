@@ -1849,29 +1849,45 @@ impl<'a> BorrowedSender<'a> {
 
     /// Publish a caller-owned QWP/WebSocket [`Buffer`] into this sender's local
     /// store-and-forward queue and clear it after local acceptance.
+    ///
+    /// A buffer above the frame cap can go out in several frames that the
+    /// server commits together. If such a flush stops part way, it fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) and the
+    /// buffer keeps its rows. That code says what may be committed and what to
+    /// do next.
     pub fn flush_buffer(&mut self, buffer: &mut Buffer) -> Result<()> {
         self.0.inner_mut().flush_buffer(buffer)
     }
 
     /// Publish a caller-owned QWP/WebSocket [`Buffer`] without clearing it.
+    /// Like [`Self::flush_buffer`], a flush in several frames can fail with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted).
     pub fn flush_buffer_and_keep(&mut self, buffer: &Buffer) -> Result<()> {
         self.0.inner_mut().flush_buffer_and_keep(buffer)
     }
 
     /// Publish and clear a QWP/WebSocket [`Buffer`], returning its local frame
-    /// sequence number. Empty buffers publish no frame and return `None`.
+    /// sequence number. Empty buffers publish no frame and return `None`. A
+    /// buffer that goes out in several frames returns the number of its last
+    /// frame. Like [`Self::flush_buffer`], such a flush can fail with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted).
     pub fn flush_buffer_and_get_fsn(&mut self, buffer: &mut Buffer) -> Result<Option<u64>> {
         self.0.inner_mut().flush_buffer_and_get_fsn(buffer)
     }
 
     /// Publish a QWP/WebSocket [`Buffer`] without clearing it and return its
-    /// local frame sequence number. Empty buffers return `None`.
+    /// local frame sequence number. Empty buffers return `None`. A buffer that
+    /// goes out in several frames returns the number of its last frame. Like
+    /// [`Self::flush_buffer`], such a flush can fail with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted).
     pub fn flush_buffer_and_keep_and_get_fsn(&mut self, buffer: &Buffer) -> Result<Option<u64>> {
         self.0.inner_mut().flush_buffer_and_keep_and_get_fsn(buffer)
     }
 
     /// Publish and clear a QWP/WebSocket [`Buffer`], then wait for the requested
-    /// ACK boundary using the pool's configured request timeout.
+    /// ACK boundary using the pool's configured request timeout. Like
+    /// [`Self::flush_buffer`], a flush in several frames can fail with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted).
     pub fn flush_buffer_and_wait(
         &mut self,
         buffer: &mut Buffer,
@@ -1938,6 +1954,13 @@ impl<'a> BorrowedSender<'a> {
     /// Return the highest frame sequence number published locally by this
     /// sender, or `None` if no frame has been published.
     ///
+    /// After a flush fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted), this is
+    /// the last frame published before that flush, or `None` if there was
+    /// none. [`Self::acked_fsn`] then stays at or below it, even when the
+    /// server commits part of the failed flush on its own (a table with at
+    /// least `qwp.max.uncommitted.rows` rows).
+    ///
     /// This is a stream watermark for the currently borrowed sender, not a
     /// portable receipt to check through an arbitrary later pool borrow.
     pub fn published_fsn(&self) -> Result<Option<u64>> {
@@ -1953,6 +1976,9 @@ impl<'a> BorrowedSender<'a> {
     /// includes `replicated`. Use [`Self::wait`] when you need an explicit
     /// [`AckLevel::Ok`], [`AckLevel::LocalDurable`], or [`AckLevel::Durable`]
     /// barrier. Compare it only with FSNs produced by this same sender stream.
+    /// After a flush fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted), this stays
+    /// at or below [`Self::published_fsn`].
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         self.0.inner_ref().acked_fsn()
     }
@@ -1978,6 +2004,11 @@ impl<'a> BorrowedSender<'a> {
     /// Without `sf_dir`, an oversize chunk's split frames are acked only once
     /// its committing frame lands, so the watermark does not move mid-chunk;
     /// size `timeout` for the largest chunk flushed.
+    ///
+    /// After a flush fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted), this waits
+    /// only for the frames published before that flush, and succeeds once they
+    /// reach `ack_level`.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.0.inner_mut().wait(ack_level, timeout)
     }
