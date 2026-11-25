@@ -56,6 +56,49 @@ extern "C" qwp_mock_c* qwp_mock_c_start_frames(int slot_count, int frame_count)
     return start_mock(slot_count, frame_count);
 }
 
+extern "C" qwp_mock_c* qwp_mock_c_start_ingress(size_t max_batch_size)
+{
+    auto holder = new qwp_mock_c{};
+    try
+    {
+        holder->server = std::make_unique<qm::MockServer>(
+            std::vector<qm::Script>{{qm::ActionServeIngress{max_batch_size}}});
+        holder->addr_cached = holder->server->addr();
+    }
+    catch (...)
+    {
+        delete holder;
+        return nullptr;
+    }
+    return holder;
+}
+
+extern "C" size_t qwp_mock_c_ingress_frame_count(qwp_mock_c* mock)
+{
+    return mock == nullptr ? 0 : mock->server->ingress_frames().size();
+}
+
+extern "C" bool qwp_mock_c_ingress_frame(
+    qwp_mock_c* mock, size_t index, size_t* size_out, bool* deferred_out)
+{
+    if (mock == nullptr)
+        return false;
+    const auto frames = mock->server->ingress_frames();
+    if (index >= frames.size())
+        return false;
+    *size_out = frames[index].size;
+    *deferred_out = frames[index].deferred;
+    return true;
+}
+
+extern "C" bool qwp_mock_c_wait_for_ingress_closed(
+    qwp_mock_c* mock, int count, int timeout_millis)
+{
+    return mock != nullptr &&
+           mock->server->wait_for_ingress_closed(
+               count, std::chrono::milliseconds(timeout_millis));
+}
+
 extern "C" const char* qwp_mock_c_addr(qwp_mock_c* mock)
 {
     if (mock == nullptr)

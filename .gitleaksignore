@@ -1,0 +1,5 @@
+# The sample Sec-WebSocket-Key of RFC 6455 ("the sample nonce") in the upgrade request
+# that a test of the QWP/WebSocket server model sends. It is no secret.
+# This entry covers the PR's own commits, which hold the key without a comment; after the
+# squash merge the `// gitleaks:allow` on the key's line covers it.
+05fb413c3dea0f2eff0f0d946fa1a0a029f532bb:questdb-rs/src/tests/qwp_ws_server_model.rs:generic-api-key:708

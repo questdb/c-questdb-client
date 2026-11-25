@@ -107,6 +107,7 @@ enum class error_code : int
     store_resend_required = ::line_sender_error_store_resend_required,
     symbol_dict_full = ::line_sender_error_symbol_dict_full,
     query_timeout = ::line_sender_error_query_timeout,
+    flush_aborted = ::line_sender_error_flush_aborted,
 };
 // clang-format on
 
@@ -550,6 +551,18 @@ enum class qwp_ws_error_policy
 struct qwp_ws_error
 {
     qwp_ws_error_category category;
+    /** Policy the sender applied after observing the error. A rejection that
+     *  the sender only reports carries the policy of its status, which the
+     *  sender does not apply: it neither stops nor reconnects for it. Such are
+     *  the rejections of a frame that the server had already answered, and of
+     *  a frame of a flush that stopped part way
+     *  (`line_sender_error_code::flush_aborted`), whose frames the sender
+     *  gives up. A retriable rejection of a frame that is not in the queue,
+     *  such as the symbol-dictionary frame that a reconnect sends first, is
+     *  reported as such also when the sender stops for it, after the server has
+     *  rejected it too often without progress. The sender then also reports the
+     *  stop, as a protocol violation with the terminal policy.
+     */
     qwp_ws_error_policy applied_policy;
     std::optional<uint8_t> status;
     std::string message;
@@ -655,6 +668,11 @@ public:
      * dedup/upsert keys make duplicate rows harmless.
      *
      * For a low-level flush, this does not track earlier independent flushes.
+     * For `error_code::flush_aborted`, `true` means that some frames of the
+     * flush may have been sent; the server commits a part of them by itself
+     * only for a table with at least as many rows in the flush as its
+     * `qwp.max.uncommitted.rows`: see `line_sender_error_flush_aborted` in
+     * `line_sender.h`.
      */
     bool in_doubt() const noexcept
     {

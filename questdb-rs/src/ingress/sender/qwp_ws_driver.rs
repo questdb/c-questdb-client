@@ -573,6 +573,11 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.take_producer()
     }
 
+    /// See [`PublicationLog::producer`].
+    pub(crate) fn producer(&self) -> Option<&SfaProducer> {
+        self.queue.producer()
+    }
+
     pub(crate) fn progress_view(&self) -> SfaProgressView {
         self.queue.progress_view()
     }
@@ -788,8 +793,21 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.completed_fsn()
     }
 
+    /// How many of the frames up to `last` the server has not confirmed.
+    pub(crate) fn unconfirmed_through(&self, last: Option<u64>) -> u64 {
+        match (self.queue.oldest_unresolved_fsn(), last) {
+            (Some(oldest), Some(last)) if oldest <= last => last - oldest + 1,
+            _ => 0,
+        }
+    }
+
     pub(crate) fn close_queue(&mut self) -> Result<(), DriverError> {
         self.queue.close()
+    }
+
+    /// See [`PublicationLog::close_abandoning_unresolved`].
+    pub(crate) fn close_queue_abandoning_unresolved(&mut self) -> Result<(), DriverError> {
+        self.queue.close_abandoning_unresolved()
     }
 
     pub(crate) fn record_protocol_violation(
@@ -986,6 +1004,13 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                         defer_reconnect,
                     );
                 };
+                // A frame of a flush that stopped part way: the sender sends
+                // nothing of that flush any more, so the server's verdict on
+                // it is only reported, whatever its policy.
+                if is_abandoned(store, fsn) {
+                    store.record_reject_error(fsn, wire_seq, error, policy);
+                    return Ok(DriveOutcome::Idle);
+                }
                 if self.reject_target_already_accounted(store, fsn) {
                     store.record_reject_error(fsn, wire_seq, error, policy);
                     return Ok(DriveOutcome::Idle);
@@ -1120,6 +1145,13 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .max(from_fsn);
         let sender_error =
             sender_error_for_qwp_error_span(&error, wire_seq, from_fsn, to_fsn, policy);
+        // Every frame it may be about is of a flush that stopped part way:
+        // reported only, as a reject of such a frame in `apply_response`.
+        if is_abandoned(store, from_fsn) {
+            store.last_server_error = Some(error);
+            store.push_sender_error(sender_error);
+            return Ok(DriveOutcome::Idle);
+        }
         if policy == QwpWsErrorPolicy::Terminal {
             let terminal_error = server_rejection_error(error.error.clone(), sender_error.clone());
             store.record_terminal_sender_error(sender_error, terminal_error, Some(error));
@@ -1319,7 +1351,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         Ok(DriveOutcome::Acked { wire_seq })
     }
 
-    fn close_publication_queue<Q: PublicationLog>(
+    pub(crate) fn close_publication_queue<Q: PublicationLog>(
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
     ) -> Result<(), DriverError> {
@@ -1329,6 +1361,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         // drain.
         self.send_cursor.release_sfa_cursor();
         store.close_queue()
+    }
+
+    /// As [`Self::close_publication_queue`], giving up the frames that the
+    /// server has not confirmed: see
+    /// [`PublicationLog::close_abandoning_unresolved`].
+    pub(crate) fn close_publication_queue_abandoning_unresolved<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+    ) -> Result<(), DriverError> {
+        self.send_cursor.release_sfa_cursor();
+        store.close_queue_abandoning_unresolved()
     }
 
     pub(crate) fn next_outbound_sfa_frame(
@@ -2979,9 +3022,23 @@ pub(super) fn retry_budget_exhausted_error(
     }
 }
 
+/// Whether frame `fsn` is of a flush that stopped part way, which the driver
+/// sends no more: see [`SfaProgressView::abandon_from`].
+fn is_abandoned<Q: PublicationLog>(store: &QwpWsPublicationStore<Q>, fsn: u64) -> bool {
+    store
+        .progress_view()
+        .abandoned_from()
+        .is_some_and(|abandoned_from| fsn >= abandoned_from)
+}
+
 pub(crate) trait PublicationLog {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError>;
     fn take_producer(&mut self) -> Option<SfaProducer> {
+        None
+    }
+    /// The producer, while the log holds it: until [`Self::take_producer`]
+    /// or the close of the log.
+    fn producer(&self) -> Option<&SfaProducer> {
         None
     }
     fn progress_view(&self) -> SfaProgressView;
@@ -3022,6 +3079,11 @@ pub(crate) trait PublicationLog {
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(())
     }
+    /// Closes the log as fully drained, giving up the frames that the server
+    /// has not confirmed: the frames of a flush that stopped part way, once
+    /// the frames before them are confirmed and nothing can send them any
+    /// more.
+    fn close_abandoning_unresolved(&mut self) -> Result<(), DriverError>;
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus;
     fn published_fsn(&self) -> Option<u64>;
     fn completed_fsn(&self) -> Option<u64>;
@@ -10738,6 +10800,130 @@ mod tests {
         assert_eq!(terminal_error.from_fsn, 0);
         assert_eq!(terminal_error.to_fsn, 0);
         assert!(callback_ran.load(Ordering::Acquire));
+    }
+
+    /// Brings a sender to a new connection after a flush stopped part way:
+    /// frame 0 confirmed or not, frames 1 and 2 given up (`abandon_from(1)`),
+    /// and nothing sent on the new connection, so a reject the server sends
+    /// now (of a symbol-dictionary catch-up, say) names no frame of it.
+    fn reconnected_after_an_abandoned_flush(
+        confirm_frame_0: bool,
+        max_frame_rejections: usize,
+    ) -> FakeDriver {
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
+            memory_queue(options(8, 1024)),
+            FakeOrderedServer::scripted([if confirm_frame_0 {
+                FakeSendResult::AckSent
+            } else {
+                FakeSendResult::NoResponse
+            }]),
+            max_frame_rejections,
+            Duration::ZERO,
+        );
+        driver.try_submit(b"before").unwrap();
+        driver.drive_once().unwrap();
+        assert_eq!(driver.acked_fsn(), confirm_frame_0.then_some(0));
+        driver.try_submit(b"abandoned-1").unwrap();
+        driver.try_submit(b"abandoned-2").unwrap();
+        assert!(!driver.store.progress_view().abandon_from(1));
+        assert_eq!(
+            driver.send_core.apply_transport_failure(
+                &mut driver.store,
+                TransportFailure::Disconnect(fake_transport_error("dropped after the abort")),
+            ),
+            Ok(DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect
+            })
+        );
+        assert_eq!(driver.send_core.transport.sent_frames().len(), 1);
+        assert_eq!(driver.counters().total_reconnect_attempts, 1);
+        driver
+    }
+
+    #[test]
+    fn a_presend_reject_when_every_unconfirmed_frame_is_abandoned_is_only_reported() {
+        for error in [
+            schema_mismatch_error("pre-send schema mismatch"),
+            write_error("pre-send write failure"),
+            not_writable_error("pre-send not writable"),
+        ] {
+            let status = error.status;
+            // A rejection limit of one: a single poison strike would stop the
+            // sender for good.
+            let mut driver = reconnected_after_an_abandoned_flush(true, 1);
+            driver
+                .send_core
+                .transport
+                .push_response(TransportResponse::Reject {
+                    wire_seq: 42,
+                    error,
+                });
+
+            // A response was read: the receive step reports progress, not a
+            // reconnect or a stop.
+            assert_eq!(
+                driver.drive_receive_once(),
+                Ok(DriveOutcome::Progress),
+                "status {status}"
+            );
+
+            assert!(!driver.is_terminal(), "status {status}");
+            assert_eq!(driver.terminal_sender_error(), None, "status {status}");
+            assert!(
+                driver.send_core.pending_reconnect.is_none(),
+                "status {status}"
+            );
+            assert_eq!(
+                driver.counters().total_reconnect_attempts,
+                1,
+                "status {status}"
+            );
+            assert_eq!(
+                driver.send_core.poison_tracker.strikes(),
+                0,
+                "status {status}"
+            );
+            assert_eq!(
+                driver.last_server_error().map(|error| error.status),
+                Some(status)
+            );
+            let error = driver.poll_sender_error().unwrap();
+            assert_eq!(error.status, Some(status));
+            assert_eq!(error.message_sequence, Some(42));
+            assert_eq!(error.from_fsn, 1);
+            assert_eq!(error.to_fsn, 2);
+            assert_eq!(driver.poll_sender_error(), None);
+            assert_eq!(driver.acked_fsn(), Some(0));
+            assert_eq!(driver.published_fsn(), Some(2));
+
+            assert_eq!(driver.drive_once(), Ok(DriveOutcome::Idle));
+            assert_eq!(driver.send_core.transport.sent_frames().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_presend_reject_with_an_unconfirmed_frame_before_the_abandoned_ones_stops_the_sender() {
+        let mut driver = reconnected_after_an_abandoned_flush(false, 1);
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 42,
+                error: schema_mismatch_error("pre-send schema mismatch"),
+            });
+
+        assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Terminal));
+
+        assert_eq!(
+            driver.receipt_status(QwpReceipt { fsn: 0 }),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(terminal_error.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
+        assert_eq!(terminal_error.message_sequence, Some(42));
+        assert_eq!(terminal_error.from_fsn, 0);
+        assert_eq!(terminal_error.to_fsn, 2);
     }
 
     #[test]

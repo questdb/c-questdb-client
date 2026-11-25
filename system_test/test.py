@@ -1646,8 +1646,10 @@ class QwpWsTestSupport:
             for endpoint_host, endpoint_port in endpoints)
         conf = [
             f'{scheme}::addr={addr};',
-            f'sender_id={sender_id};',
-            f'sf_dir={sf_dir};']
+            f'sender_id={sender_id};']
+        # Without `sf_dir` the sender keeps its queue in memory.
+        if sf_dir is not None:
+            conf.append(f'sf_dir={sf_dir};')
         for key, value in settings.items():
             conf.append(f'{key}={value};')
         return ''.join(conf)
@@ -1876,6 +1878,140 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             expected_distinct_id=self.ROWS,
             expected_min_id=0,
             expected_max_id=self.ROWS - 1)
+
+    def test_flush_above_frame_cap_is_one_transaction(self):
+        # One flush of a row buffer of about four times the server's frame
+        # limit (2 MiB by default), through a sender that keeps its queue in
+        # memory: it goes out in several frames, and the server commits them
+        # together.
+        table_name = 'qwp_ws_large_flush_' + uuid.uuid4().hex[:8]
+        sender_id = 'large-' + self._variant_name() + '-' + uuid.uuid4().hex[:8]
+        rows = 8 * 1024
+        pad = 'x' * 1024
+
+        sender = self._connect_sender(self._sender_conf_for_variant(
+            sender_id,
+            None))
+        try:
+            for row_id in range(rows):
+                (sender
+                 .table(table_name)
+                 .column('id', row_id)
+                 .column('pad', pad)
+                 .at_micros(self.BASE_TS_US + row_id * self.TS_STEP_US))
+            self.assertGreater(len(sender._buffer), rows * len(pad))
+            fsn = sender.flush_and_get_fsn()
+            # The frames of the flush are the first of this sender, and it
+            # returns the number of its last frame.
+            self.assertGreaterEqual(
+                fsn, 3, 'the flush did not go out in several frames')
+            sender.wait(timeout_millis=30000)
+            self.assertEqual(sender.acked_fsn(), fsn)
+            sender.close_drain()
+        finally:
+            sender.close(False)
+
+        self._retry_assert_aggregates(
+            table_name,
+            expected_count=rows,
+            expected_distinct_id=rows,
+            expected_min_id=0,
+            expected_max_id=rows - 1)
+        resp = sql_query(
+            f"select sum(length(pad)) from '{table_name}'")
+        self.assertEqual(int(resp['dataset'][0][0]), rows * len(pad))
+        # The server answers the frame that commits after the commit, so the
+        # count is exact by now.
+        resp = sql_query(
+            f"select count() from wal_transactions('{table_name}')")
+        self.assertEqual(
+            int(resp['dataset'][0][0]),
+            1,
+            'the flush is one transaction of the table')
+
+    def _flush_of_two_tables_with_symbols_above_frame_cap(self, sf_dir):
+        # One flush of a row buffer of about four times the server's frame
+        # limit, whose rows alternate between two tables and carry a symbol.
+        # New symbols come all through the buffer, so each frame brings
+        # its own, and the two tables share some. The server commits the
+        # frames together: one transaction of each table.
+        suffix = uuid.uuid4().hex[:8]
+        table_names = (
+            'qwp_ws_large_flush_a_' + suffix,
+            'qwp_ws_large_flush_b_' + suffix)
+        # A new symbol every `rows_per_symbol` rows of each table.
+        rows_per_symbol = (4, 2)
+        sender_id = 'large-sym-' + self._variant_name() + '-' + suffix
+        rows = 4 * 1024
+        pad = 'x' * 1024
+
+        sender = self._connect_sender(self._sender_conf_for_variant(
+            sender_id,
+            sf_dir))
+        try:
+            for row_id in range(rows):
+                for table_name, per_symbol in zip(table_names, rows_per_symbol):
+                    (sender
+                     .table(table_name)
+                     .symbol('sym', f'sym_{row_id // per_symbol}')
+                     .column('id', row_id)
+                     .column('pad', pad)
+                     .at_micros(self.BASE_TS_US + row_id * self.TS_STEP_US))
+            self.assertGreater(len(sender._buffer), 2 * rows * len(pad))
+            fsn = sender.flush_and_get_fsn()
+            # The frames of the flush are the first of this sender, and it
+            # returns the number of its last frame.
+            self.assertGreaterEqual(
+                fsn, 3, 'the flush did not go out in several frames')
+            if sf_dir is not None:
+                # The frames went through the slot of the sender.
+                self.assertGreater(
+                    self._sfa_file_count(sf_dir, sender_id),
+                    0,
+                    'the sender keeps no SFA frame files in its slot')
+            sender.wait(timeout_millis=30000)
+            self.assertEqual(sender.acked_fsn(), fsn)
+            sender.close_drain()
+        finally:
+            sender.close(False)
+
+        if sf_dir is not None:
+            self.assertEqual(
+                self._sfa_file_count(sf_dir, sender_id),
+                0,
+                'the close-drained sender left SFA frame files behind')
+        for table_name, per_symbol in zip(table_names, rows_per_symbol):
+            self._retry_assert_aggregates(
+                table_name,
+                expected_count=rows,
+                expected_distinct_id=rows,
+                expected_min_id=0,
+                expected_max_id=rows - 1)
+            resp = sql_query(
+                f"select count_distinct(sym), sum(length(pad)) from '{table_name}'")
+            distinct_sym, pad_length = resp['dataset'][0]
+            self.assertEqual(int(distinct_sym), rows // per_symbol, table_name)
+            self.assertEqual(int(pad_length), rows * len(pad), table_name)
+            # Each row holds its own symbol, whichever frame brought it.
+            resp = sql_query(
+                f"select count() from '{table_name}' "
+                f"where sym != concat('sym_', id / {per_symbol})")
+            self.assertEqual(int(resp['dataset'][0][0]), 0, table_name)
+            # The server answers the frame that commits after the commit,
+            # so the count is exact by now.
+            resp = sql_query(
+                f"select count() from wal_transactions('{table_name}')")
+            self.assertEqual(
+                int(resp['dataset'][0][0]),
+                1,
+                f'the flush is one transaction of {table_name}')
+
+    def test_flush_of_two_tables_with_symbols_above_frame_cap_in_memory(self):
+        self._flush_of_two_tables_with_symbols_above_frame_cap(None)
+
+    def test_flush_of_two_tables_with_symbols_above_frame_cap_with_sf_dir(self):
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-large-flush-') as sf_dir:
+            self._flush_of_two_tables_with_symbols_above_frame_cap(sf_dir)
 
     def test_native_shared_pool_examples(self):
         if QWP_WS_SMOKE_TLS or getattr(QDB_FIXTURE, 'http_auth', False):

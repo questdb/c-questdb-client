@@ -1849,29 +1849,45 @@ impl<'a> BorrowedSender<'a> {
 
     /// Publish a caller-owned QWP/WebSocket [`Buffer`] into this sender's local
     /// store-and-forward queue and clear it after local acceptance.
+    ///
+    /// A buffer above the frame cap can go out in several frames that the
+    /// server commits together. If such a flush stops part way, it fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted) and the
+    /// buffer keeps its rows. That code says what may be committed and what to
+    /// do next.
     pub fn flush_buffer(&mut self, buffer: &mut Buffer) -> Result<()> {
         self.0.inner_mut().flush_buffer(buffer)
     }
 
     /// Publish a caller-owned QWP/WebSocket [`Buffer`] without clearing it.
+    /// Like [`Self::flush_buffer`], a flush in several frames can fail with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted).
     pub fn flush_buffer_and_keep(&mut self, buffer: &Buffer) -> Result<()> {
         self.0.inner_mut().flush_buffer_and_keep(buffer)
     }
 
     /// Publish and clear a QWP/WebSocket [`Buffer`], returning its local frame
-    /// sequence number. Empty buffers publish no frame and return `None`.
+    /// sequence number. Empty buffers publish no frame and return `None`. A
+    /// buffer that goes out in several frames returns the number of its last
+    /// frame. Like [`Self::flush_buffer`], such a flush can fail with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted).
     pub fn flush_buffer_and_get_fsn(&mut self, buffer: &mut Buffer) -> Result<Option<u64>> {
         self.0.inner_mut().flush_buffer_and_get_fsn(buffer)
     }
 
     /// Publish a QWP/WebSocket [`Buffer`] without clearing it and return its
-    /// local frame sequence number. Empty buffers return `None`.
+    /// local frame sequence number. Empty buffers return `None`. A buffer that
+    /// goes out in several frames returns the number of its last frame. Like
+    /// [`Self::flush_buffer`], such a flush can fail with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted).
     pub fn flush_buffer_and_keep_and_get_fsn(&mut self, buffer: &Buffer) -> Result<Option<u64>> {
         self.0.inner_mut().flush_buffer_and_keep_and_get_fsn(buffer)
     }
 
     /// Publish and clear a QWP/WebSocket [`Buffer`], then wait for the requested
-    /// ACK boundary using the pool's configured request timeout.
+    /// ACK boundary using the pool's configured request timeout. Like
+    /// [`Self::flush_buffer`], a flush in several frames can fail with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted).
     pub fn flush_buffer_and_wait(
         &mut self,
         buffer: &mut Buffer,
@@ -1938,6 +1954,13 @@ impl<'a> BorrowedSender<'a> {
     /// Return the highest frame sequence number published locally by this
     /// sender, or `None` if no frame has been published.
     ///
+    /// After a flush fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted), this is
+    /// the last frame published before that flush, or `None` if there was
+    /// none. [`Self::acked_fsn`] then stays at or below it, even when the
+    /// server commits part of the failed flush on its own (a table with at
+    /// least `qwp.max.uncommitted.rows` rows).
+    ///
     /// This is a stream watermark for the currently borrowed sender, not a
     /// portable receipt to check through an arbitrary later pool borrow.
     pub fn published_fsn(&self) -> Result<Option<u64>> {
@@ -1953,6 +1976,9 @@ impl<'a> BorrowedSender<'a> {
     /// includes `replicated`. Use [`Self::wait`] when you need an explicit
     /// [`AckLevel::Ok`], [`AckLevel::LocalDurable`], or [`AckLevel::Durable`]
     /// barrier. Compare it only with FSNs produced by this same sender stream.
+    /// After a flush fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted), this stays
+    /// at or below [`Self::published_fsn`].
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         self.0.inner_ref().acked_fsn()
     }
@@ -1978,6 +2004,11 @@ impl<'a> BorrowedSender<'a> {
     /// Without `sf_dir`, an oversize chunk's split frames are acked only once
     /// its committing frame lands, so the watermark does not move mid-chunk;
     /// size `timeout` for the largest chunk flushed.
+    ///
+    /// After a flush fails with
+    /// [`ErrorCode::FlushAborted`](crate::ErrorCode::FlushAborted), this waits
+    /// only for the frames published before that flush, and succeeds once they
+    /// reach `ack_level`.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.0.inner_mut().wait(ack_level, timeout)
     }
@@ -1997,6 +2028,11 @@ impl<'a> BorrowedSender<'a> {
     #[cfg(test)]
     pub(crate) fn must_close_for_test(&self) -> bool {
         self.0.inner_ref().must_close()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_error_for_test(&self) -> Result<Option<crate::ingress::QwpWsSenderError>> {
+        self.0.inner_ref().poll_error()
     }
 
     /// Always `true` for an SF handle (it wraps a store-and-forward backend).
@@ -3103,14 +3139,17 @@ fn commit_in_flight_on_drop(ack: AckLevel, sender: &mut DirectSenderCore) {
 /// keeps delivering, but dropping it stops the runner, so we give the queue a
 /// bounded window (the configured `close_flush_timeout`) to finish. On timeout
 /// or a terminal transport the undelivered frames are discarded with a warning,
-/// mirroring [`commit_in_flight_on_drop`] for the direct backend.
+/// mirroring [`commit_in_flight_on_drop`] for the direct backend. A sender whose
+/// flush failed part way is drained even when the frames before that flush are
+/// all delivered: the drain is what gives up the frames of the flush and
+/// empties the slot.
 fn drain_sfa_before_drop(inner: &DbInner, sender: &mut PooledSenderCore) {
     let timeout = inner.connector.close_flush_timeout();
     if timeout.is_zero() {
         return;
     }
     let durable = inner.connector.request_durable_ack().is_enabled();
-    if sender.sfa_fully_delivered(durable) {
+    if sender.sfa_fully_delivered(durable) && !sender.has_aborted_flush() {
         return;
     }
     // Before begin_close stops accepting publications: a split that failed
@@ -3119,12 +3158,20 @@ fn drain_sfa_before_drop(inner: &DbInner, sender: &mut PooledSenderCore) {
     sender.close_open_deferred_group();
     sender.begin_close();
     if let Err(err) = sender.drain_to_deadline(Instant::now().checked_add(timeout)) {
-        log::warn!(
-            "store-and-forward sender dropped with frame(s) that could \
-             not be delivered within close_flush_timeout; their data is \
-             discarded. Call wait() before closing the pool, or set sf_dir for \
-             crash-durable persistence. Cause: {err}"
-        );
+        if sender.has_aborted_flush() && sender.sfa_fully_delivered(durable) {
+            log::warn!(
+                "store-and-forward sender whose flush stopped part way dropped while \
+                 its connection was still closing at close_flush_timeout; the flushes \
+                 before that flush are confirmed. Cause: {err}"
+            );
+        } else {
+            log::warn!(
+                "store-and-forward sender dropped with frame(s) that could \
+                 not be delivered within close_flush_timeout; their data is \
+                 discarded. Call wait() before closing the pool, or set sf_dir for \
+                 crash-durable persistence. Cause: {err}"
+            );
+        }
     }
 }
 
@@ -3149,16 +3196,25 @@ fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [PooledSenderCore]) 
         sender.begin_close();
     }
     for sender in senders.iter_mut() {
-        if sender.sfa_fully_delivered(durable) {
+        if sender.sfa_fully_delivered(durable) && !sender.has_aborted_flush() {
             continue;
         }
         if let Err(err) = sender.drain_to_deadline(deadline) {
-            log::warn!(
-                "store-and-forward sender dropped on pool close with \
-                 frame(s) that could not be delivered within close_flush_timeout; \
-                 their data is discarded. Call wait() before close, or set \
-                 sf_dir for crash-durable persistence. Cause: {err}"
-            );
+            if sender.has_aborted_flush() && sender.sfa_fully_delivered(durable) {
+                log::warn!(
+                    "store-and-forward sender whose flush stopped part way dropped on \
+                     pool close while its connection was still closing at \
+                     close_flush_timeout; the flushes before that flush are confirmed. \
+                     Cause: {err}"
+                );
+            } else {
+                log::warn!(
+                    "store-and-forward sender dropped on pool close with \
+                     frame(s) that could not be delivered within close_flush_timeout; \
+                     their data is discarded. Call wait() before close, or set \
+                     sf_dir for crash-durable persistence. Cause: {err}"
+                );
+            }
         }
     }
 }

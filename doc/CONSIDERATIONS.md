@@ -73,8 +73,9 @@ power loss. Configure
 memory-map/file-sync checkpoints. The interval defaults to 5000 ms and is a
 target cadence, not a hard upper bound: sender scheduling and storage latency
 extend the actual recovery window. If a segment fills before its published
-data is durable, rotation waits for a requested checkpoint and publication
-sees the normal store-and-forward backpressure response.
+data is durable, the flush that needs the next segment syncs it first. While
+a checkpoint is already under way it waits for that one, and publication sees
+the normal store-and-forward backpressure response.
 
 In manual QWP progress mode, periodic checkpoints advance only when the
 application calls a progress-driving API such as `drive_once` or `wait`.
@@ -116,6 +117,238 @@ Pool limits (`sender_pool_max`, `query_pool_max`) bound concurrent connections.
 At capacity, borrow operations wait up to `acquire_timeout_ms` or fail
 immediately when it is zero. Keep borrows short and size these limits against
 both application concurrency and server connection capacity.
+
+## Row buffers larger than one frame
+
+A QWP/WebSocket frame cannot be larger than the per-frame cap: the smallest of
+`max_buf_size`, the limit the server advertises (2 MiB by default) and what
+one store-and-forward segment holds. `effective_frame_cap` returns it.
+
+A sender connected to a server that advertised its frame limit sends a row
+buffer whose one frame would be above the cap in several frames. All but the last tell the server to
+hold their rows, and the last one commits them. So one flush is one commit per
+table, for a buffer of any size up to `max_buf_size` (100 MiB by default).
+This holds with the queue in memory and with `sf_dir`, for the row sender in
+both progress modes and for a sender borrowed from the pool, in Rust, C and
+C++. The frame number that such a flush returns is the one of its last frame,
+and a `wait` covers the whole flush.
+
+This is about row buffers. A chunk of the column sender that is too large for
+one frame is split as well, and with `sf_dir` each of its frames still commits
+by itself.
+
+A buffer whose frame fits the cap goes out as that one frame, as from a sender
+that cuts no frames, and is never refused for its size. The encoded frame
+decides this, not the buffer's `len()`, which counts more for symbols. A buffer
+whose frame does not fit is refused with `batch_too_large`, nothing of it is
+sent and it keeps its rows, when:
+
+- the server did not advertise a frame limit, because it is too old to commit
+  several frames together, or the sender has not connected yet;
+- the sender could not write the symbol file of its `sf_dir` slot. The error
+  says so: flush smaller buffers, or close the sender, see to the disk of
+  `sf_dir` and create a new sender;
+- the buffer is larger than `max_buf_size`, or one of its rows fits no frame;
+  or
+- the queue (`sf_max_total_bytes`, by default 128 MiB in memory and 10 GiB
+  with `sf_dir`) can never hold the frames of the flush together. The error
+  names the value that would. A slot reopened with a smaller
+  `sf_max_segment_bytes` fills the larger segment it had first, and until
+  then a flush in several frames needs room for that segment and for the
+  segments that its frames fill beyond what is left of it.
+
+The last two go by the buffer's `len()` and the frame sizes planned from it,
+which count more than the frames take for symbols: each symbol value at the
+widest symbol id, and the text of every symbol, also of one that the
+connection already knows. So a buffer that needs several frames is held
+against `max_buf_size` by its `len()`, and against `sf_max_total_bytes` by
+those planned sizes.
+
+Before its first frame, a flush in several frames waits until the queue has
+room for all of them, for up to `sf_append_deadline_millis`. When the room
+does not come, the flush fails and nothing of it was sent. Once its first
+frame is queued, the other frames do not wait for room. With `sf_dir` they
+may still wait while the sender writes its segment files, for example the
+next one it makes. `sf_append_deadline_millis` does not cut that wait short,
+so a short deadline does not stop a flush part way when it needs several
+new segment files.
+
+### What one flush guarantees
+
+- **One commit per table, not one for the flush.** A flush with rows of
+  several tables commits each table by itself.
+- **At least once.** After a reconnect the sender sends again what the server
+  has not confirmed. A commit whose confirmation was lost is sent again, and
+  its rows are stored twice unless the table has `DEDUP` keys.
+- **The server's row limit.** A server commits a table by itself once it holds
+  `qwp.max.uncommitted.rows` uncommitted rows of it (1,000,000 by default).
+  One flush with at least that many rows of one table is committed in parts:
+  2,500,000 rows are three transactions, with every row stored once. If such
+  a flush fails after a part was committed, that part stays, and sending the
+  buffer again stores it twice. A reconnect during such a flush stores
+  nothing twice when the flush has rows of one table only: the server
+  confirms what it committed, and the sender sends the rest. With rows of
+  several tables the server confirms nothing before the end, the sender
+  sends the whole flush again, and the part that was committed is stored
+  twice. Keep the rows of a table in one flush below the limit, raise the
+  limit on the server, or use `DEDUP`. The client does not check the limit.
+- **Rows without a timestamp.** The server gives the rows added with
+  `at_now()` the time at which it takes their frame, so the rows of a flush in
+  several frames carry one timestamp per frame.
+
+### Memory
+
+A flush in several frames needs two to three times the buffer's length in
+memory. The buffer itself takes 1.2 to 2 times its `len()` for ordinary rows,
+and the queue holds every frame of the flush until the server has confirmed
+the last one. With a server on the same machine, one flush of 100 MiB peaked
+at 230 to 330 MiB of resident memory, depending on its rows, where the same
+rows flushed a frame at a time needed 20 to 75 MiB. The flush took no longer.
+
+A connection also keeps every symbol it has sent, about 200 bytes for a symbol
+of 40 to 50 bytes, and takes at most 2,000,000 symbols or 256 MiB of symbol
+text over its life. A
+server creates a symbol column with room for 256 symbols; when one flush
+brings hundreds of thousands of new symbols, the rows show in the table
+seconds later than their confirmation, unless the table was created with a
+symbol capacity to match.
+
+### A flush that stops part way
+
+A flush that has queued some of its frames and cannot queue the rest, for
+example because the connection has no room for more symbols, fails with
+`flush_aborted`. The buffer keeps its rows. Its frames stop going out at once:
+the sender sends no more of them, not even after a reconnect. The frame that
+commits the flush was never queued, and the server drops the rows it holds for
+the flush when the sender is closed.
+
+Check whether the error is in doubt (`in_doubt()` in Rust and C++,
+`line_sender_error_in_doubt` in C) before you flush the buffer again:
+
+- **Not in doubt:** no frame of the flush was sent. Nothing of it is
+  committed, and flushing the buffer again through a new sender stores no row
+  twice.
+- **In doubt:** some of its frames may have been sent. Nothing of the flush
+  is committed, unless one table had at least as many rows in it as the
+  server's row limit (see above): then the server may have committed a part
+  of that table's rows by itself, and flushing the buffer again stores that
+  part twice unless the table has `DEDUP` keys.
+
+The server may still answer about the frames that were sent, and may reject
+one of them. Such an answer fails no call: a rejection is only reported as a
+server error (`poll_qwp_ws_error` in Rust, `line_sender_qwpws_poll_error` in
+C) and to the error handler, with the policy of its status, which the sender
+does not apply.
+
+The sender takes no more flushes and reports `must_close`. A later flush fails
+with `flush_aborted` too, not in doubt, because nothing of it is sent; or with
+the sender's terminal error once the sender
+has stopped for a reason of its own since, unless its buffer is refused first
+for a reason of its own, which keeps its code (a symbol that the full
+dictionary cannot take fails with `symbol_dict_full`); a flush of an empty
+buffer succeeds.
+
+The sender still delivers the flushes before the failed one. `wait` covers
+them and succeeds once they reach the level it asks for, durable levels
+included. The published frame number is the last frame before the failed
+flush, and the acknowledged one never goes above it. To lose none of these
+flushes, call `close_drain` with a `close_flush_timeout` above 0 (the default
+is 5 seconds) and check that it succeeded; then close the sender, create a new
+one and flush the buffer again if the error allows it (see above). The holder
+of a pooled sender calls `wait` instead and returns the sender, which the pool
+closes instead of lending it again. With `sf_dir` a `close_drain` that waits
+(a `close_flush_timeout` above 0) and succeeds leaves the sender's slot empty,
+nothing of the failed flush and no symbols, and so does the pool when its wait
+for the sender succeeds. Otherwise the sender that opens the slot next removes
+the frames of the failed flush and keeps the slot's symbols, so a flush that
+stopped because the connection had no room for more symbols can stop the same
+way once more; a `close_drain` of that sender that waits and succeeds empties
+the slot.
+
+A sender that stops for a reason of its own while a flush still queues its
+frames fails that flush with the code of that reason, not with
+`flush_aborted`: a transport failure, a server rejection of one of its frames,
+or the sender's network thread failing to make a segment file. That is the
+sender's usual terminal error, and the buffer keeps its rows. Whether it is in
+doubt follows the same rule: in doubt when a frame of the flush may have been
+sent.
+
+A frame that the server rejects takes the whole flush with it: the server
+drops the rows it holds for the connection and commits nothing more of the
+flush. The rejection usually arrives while `flush` is still queuing frames,
+and `flush` then fails with it while the buffer keeps its rows. Otherwise the
+next `wait`, `flush` or `close_drain` reports it, except a rejection of a frame
+of a flush that already failed with `flush_aborted`: that one is only reported
+as a server error, as said above. A rejection names a range of
+frame numbers; it belongs to the flush whose returned frame number is the
+first at or above the end of that range.
+
+### With `sf_dir`
+
+The frames of a flush stay in the files of the sender's slot until the server
+has confirmed the flush. A sender that opens a slot again, after the process
+was killed or the sender before it was closed, finds one of two things at its
+end:
+
+- **A flush with its last frame** is sent whole, unless the server has
+  confirmed it. When the server committed it and the confirmation was lost, it
+  is committed again (at least once).
+- **A flush without its last frame** is removed. The process was killed inside
+  `flush`, or the flush failed with `flush_aborted` and the sender was closed
+  without a `close_drain` that waited and succeeded. Nothing of it is sent.
+  After a kill, nothing of it was committed (below the server's row limit,
+  see above), so flush the buffer again; after `flush_aborted`, the error
+  says whether you can (see the section above). The flushes before it are
+  sent as usual.
+
+A pool that opens a slot does the same, and so does the drainer of a slot that
+no sender owns. A segment file that the process was killed while creating is
+removed as well. Opening a slot that held 100 MiB took about 40 ms.
+
+**Older clients.** Releases 7.0.0 to 7.3.0 do not remove a flush without its
+last frame. One of them that opens such a slot sends the frames, and its next
+flush would commit their rows, a part of a flush. Before a slot goes back to
+one of these releases after a kill inside a flush or a `flush_aborted`, open
+it once with this release: build a sender with the same `sf_dir` and
+`sender_id`, or the pool, and close it. Or delete the slot's folder when its
+rows are not needed. The format of a slot is the same: one whose flushes all
+have their last frame is read by every release.
+
+**Speed.** With `sf_dir` a sender pays for every segment file it fills, not
+for the bytes: about 20 ms a file on an NVMe disk with ext4, and 26 ms with
+`sf_durability=periodic`. Small flushes pay the same for each file. With the
+default `sf_max_segment_bytes` of 4 MiB, one flush of 100 MiB returned after
+0.54 s (0.66 s with `periodic`), where a sender with its queue in memory took
+0.07 s. For large flushes raise `sf_max_segment_bytes`: with 64 MiB the same
+flush returned after 0.07 s (0.09 s). The per-frame cap stays what the server
+advertises. Larger segments give disk space back in larger steps, and
+`sf_max_total_bytes` must hold the segments that one flush fills and one more.
+
+### Waiting and closing
+
+- The `wait` timeout counts the time without a new confirmation, and the
+  server confirms a flush in several frames once, at its end. Pass a timeout
+  that covers sending and committing the whole flush, or zero to wait without
+  a limit. A timeout is not a failure: the frames stay queued, so call `wait`
+  again and do not flush the same rows again. `flush_buffer_and_wait` of a
+  pooled sender uses `request_timeout` in the same way.
+- "Flush, then close" can lose a large flush. `close_drain` waits for
+  `close_flush_timeout_millis` in total (5 seconds by default), closing or
+  dropping a sender without it does not wait at all, and without `sf_dir` the
+  frames that are not confirmed by then are dropped with the sender. The
+  timeout error of `close_drain` says how many those are. Call `wait` before
+  closing, or raise `close_flush_timeout_millis`. After a flush that stopped
+  part way, in background progress mode, the error can instead say that the
+  flushes before it are confirmed and the connection was still closing: drop
+  the sender then.
+- One flush must reach the server and be committed within the life of one
+  connection: after a reconnect the sender sends it again from its first
+  frame. When the server ends the connection with a WebSocket close frame
+  other than a normal or going-away close four times in a row
+  (`max_frame_rejections`) without confirming anything in between, and
+  `poison_min_escalation_window_millis` has passed, the sender stops for good.
+  A connection that just drops is never counted. Raise the two settings for
+  flushes that take long.
 
 ## Data types and validation
 

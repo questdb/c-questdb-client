@@ -9475,7 +9475,7 @@ fn spawn_max_batch_size_server(max_batch_size: Option<usize>) -> (u16, mpsc::Rec
     (port, rx)
 }
 
-fn spawn_max_batch_size_upgrade_only_server(max_batch_size: Option<usize>) -> u16 {
+pub(crate) fn spawn_max_batch_size_upgrade_only_server(max_batch_size: Option<usize>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
@@ -9505,6 +9505,19 @@ fn build_buffer_with_payload_bytes(target_encoded_len: usize) -> Buffer {
     buf
 }
 
+/// How a sender ends its refusal of a buffer that holds one row of table `t`
+/// and is too large for a frame of `cap` bytes, with a server that told its
+/// frame limit. In either progress mode it names the row that kept the
+/// buffer from going out in several frames: the frame of that row takes what
+/// the buffer says of its size.
+fn one_row_above_frame_cap_refusal(buf: &Buffer, cap: usize, set_by: &str) -> String {
+    format!(
+        "a row of table 't' needs a frame of {} bytes, and the per-frame cap is {cap} bytes. \
+         Make the row smaller, or raise the cap. The cap is set by {set_by}.",
+        buf.len()
+    )
+}
+
 #[test]
 fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
@@ -9531,10 +9544,11 @@ fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes
             progress.name()
         );
         assert!(
-            err.msg().contains(
-                "exceeds the per-frame cap of 512 bytes. \
-                 The cap is set by the server's advertised X-QWP-Max-Batch-Size."
-            ),
+            err.msg().ends_with(&one_row_above_frame_cap_refusal(
+                &buf,
+                server_cap,
+                "the server's advertised X-QWP-Max-Batch-Size"
+            )),
             "mode={}: got: {}",
             progress.name(),
             err.msg()
@@ -9576,9 +9590,10 @@ fn segment_payload_capacity_clamps_flush_below_server_cap_in_all_progress_modes(
             progress.name()
         );
         assert!(
-            err.msg().contains(&format!(
-                "exceeds the per-frame cap of {cap} bytes. \
-                 The cap is set by the sf_max_segment_bytes segment payload capacity."
+            err.msg().ends_with(&one_row_above_frame_cap_refusal(
+                &buf,
+                cap,
+                "the sf_max_segment_bytes segment payload capacity"
             )),
             "mode={}: got: {}",
             progress.name(),
@@ -9719,11 +9734,16 @@ fn configured_max_wins_when_smaller_than_server_cap_in_all_progress_modes() {
             "mode={}",
             progress.name()
         );
+        // With a server that told its frame limit, a sender holds
+        // `max_buf_size` against the size of the buffer, in either progress
+        // mode.
+        let refusal = format!(
+            "its size is {len} bytes, and max_buf_size is {configured_max} bytes. \
+             Set max_buf_size to at least {len}, or flush more often.",
+            len = buf.len()
+        );
         assert!(
-            err.msg().contains(&format!(
-                "exceeds the per-frame cap of {configured_max} bytes. \
-                 The cap is set by max_buf_size."
-            )),
+            err.msg().ends_with(&refusal),
             "mode={}: error should reference configured max {configured_max}, got: {}",
             progress.name(),
             err.msg()
@@ -9833,9 +9853,10 @@ fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
             progress.name()
         );
         assert!(
-            err.msg().contains(&format!(
-                "exceeds the per-frame cap of {server_cap} bytes. \
-                 The cap is set by the server's advertised X-QWP-Max-Batch-Size."
+            err.msg().ends_with(&one_row_above_frame_cap_refusal(
+                &buf,
+                server_cap,
+                "the server's advertised X-QWP-Max-Batch-Size"
             )),
             "mode={}: error should reference server cap {server_cap}, got: {}",
             progress.name(),
@@ -10068,6 +10089,324 @@ fn qwp_ws_in_callback_wait_rejects_only_the_blocked_sibling() {
 
     b.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
         .expect("the blocked sibling's frame must drain after the callback returns");
+}
+
+// ---------- a flush in frames with durable acknowledgements ----------
+
+/// A server answers only the last frame of a flush in frames, and its
+/// durable acknowledgement names the transactions of that answer. So the
+/// flush is confirmed once, whole, at that acknowledgement.
+#[test]
+fn qwp_ws_flush_in_frames_is_durable_at_the_durable_ack_of_its_last_frame() {
+    use crate::ingress::AckLevel;
+    use crate::tests::qwp_ws_server_model::buffer_of;
+
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (allow_ack_tx, allow_ack_rx) = mpsc::channel();
+        let (frames_tx, frames_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            // The server tells its frame limit and grants durable
+            // acknowledgements.
+            let request = read_request_until_blank(&mut stream).unwrap();
+            let request = String::from_utf8_lossy(&request).to_string();
+            assert_eq!(
+                parse_header(&request, "X-QWP-Request-Durable-Ack").as_deref(),
+                Some("true")
+            );
+            let accept = compute_accept(&parse_header(&request, "Sec-WebSocket-Key").unwrap());
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n\
+                 X-QWP-Version: 1\r\n\
+                 X-QWP-Max-Batch-Size: 1024\r\n\
+                 X-QWP-Durable-Ack: enabled\r\n\
+                 \r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+
+            // Every frame but the last asks the server to hold its rows,
+            // and gets no answer.
+            let mut frames = 0u64;
+            loop {
+                let (_, opcode, payload) = read_frame(&mut stream).unwrap();
+                assert_eq!(opcode, 0x2);
+                assert_eq!(&payload[0..4], b"QWP1");
+                frames += 1;
+                if payload[5] & 0x01 == 0 {
+                    break;
+                }
+            }
+            frames_tx.send(frames).unwrap();
+            write_qwp_ok_response_with_table_entries(
+                &mut stream,
+                FIRST_WIRE_SEQUENCE + frames - 1,
+                &[("durable_rows", 10)],
+            )
+            .unwrap();
+            allow_ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            write_qwp_durable_ack_response(&mut stream, &[("durable_rows", 10)]).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let sf_dir = tempfile::TempDir::new().unwrap();
+        let conf = format!(
+            "ws::addr=127.0.0.1:{port};qwp_ws_progress={};request_durable_ack=on;\
+             sf_dir={};sender_id=durable;",
+            progress.name(),
+            sf_dir.path().display()
+        );
+        let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+        let large = buffer_of("durable_rows", 0..600);
+        let last = sender.flush_and_keep_and_get_fsn(&large).unwrap().unwrap();
+        assert!(last > 10, "mode={}: {last}", progress.name());
+
+        // The server has taken the flush and answered its last frame, and
+        // the flush is not durable yet.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let frames = loop {
+            if let Ok(frames) = frames_rx.try_recv() {
+                break frames;
+            }
+            assert!(Instant::now() < deadline, "mode={}", progress.name());
+            if matches!(progress, ProgressCase::Manual) {
+                sender.drive_once().unwrap();
+            } else {
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        assert_eq!(frames, last + 1, "mode={}", progress.name());
+        let err = sender
+            .wait(AckLevel::Durable, Duration::from_millis(50))
+            .expect_err("the durable acknowledgement is held back");
+        assert!(
+            err.msg().contains("timed out"),
+            "mode={}: {}",
+            progress.name(),
+            err.msg()
+        );
+        assert_eq!(
+            sender.acked_fsn().unwrap(),
+            None,
+            "mode={}",
+            progress.name()
+        );
+
+        allow_ack_tx.send(()).unwrap();
+        sender
+            .wait(AckLevel::Durable, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            sender.acked_fsn().unwrap(),
+            Some(last),
+            "mode={}",
+            progress.name()
+        );
+        sender.close_drain().unwrap();
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+}
+
+// ---------- sf_durability=periodic: a new segment whatever the network thread does ----------
+
+/// Flushes `rows` `flushes` times. Each must be queued: a sender with a
+/// disk queue takes flushes whatever its server does.
+fn assert_every_flush_is_queued(
+    sender: &mut crate::ingress::Sender,
+    rows: &Buffer,
+    flushes: usize,
+    when: &str,
+) {
+    for flush in 0..flushes {
+        let started = Instant::now();
+        if let Err(err) = sender.flush_and_keep(rows) {
+            panic!(
+                "{when}: flush {flush} of {flushes} failed after {:?}: {err}",
+                started.elapsed()
+            );
+        }
+    }
+}
+
+fn sfa_files_of(slot: &Path) -> usize {
+    std::fs::read_dir(slot)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sfa"))
+        .count()
+}
+
+/// With `sf_durability=periodic` a segment of the disk queue is synced
+/// before the next one is taken. The sender does that itself where it
+/// appends, so it does not depend on its network thread, which is busy
+/// with reconnecting here.
+#[test]
+fn periodic_sf_sender_takes_new_segments_while_its_server_is_down() {
+    use crate::tests::qwp_ws_server_model::{QwpWsModelServer, buffer_of};
+
+    for manual in [false, true] {
+        let when = if manual {
+            "driven by its caller"
+        } else {
+            "in the background"
+        };
+        let server = QwpWsModelServer::start(1024);
+        let sf_dir = tempfile::TempDir::new().unwrap();
+        let mode = if manual {
+            "qwp_ws_progress=manual;"
+        } else {
+            ""
+        };
+        // A segment holds three flushes.
+        let mut sender = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{};{mode}sf_dir={};sender_id=periodic;\
+             sf_durability=periodic;sf_max_segment_bytes=1024;sf_max_total_bytes=1048576;\
+             sf_append_deadline_millis=2000;\
+             reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;",
+            server.port,
+            sf_dir.path().display()
+        ))
+        .unwrap()
+        .build()
+        .unwrap();
+        let rows = buffer_of("periodic_rows", 0..10);
+        sender.flush_and_keep(&rows).unwrap();
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+            .unwrap();
+
+        server.go_down();
+        // Something to send, so that the sender finds its connection gone.
+        sender.flush_and_keep(&rows).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                if manual {
+                    let _ = sender.drive_once();
+                }
+                sender.qwp_ws_totals().unwrap().reconnect_attempts >= 2
+            }),
+            "{when}: the sender did not try to reconnect"
+        );
+
+        assert_every_flush_is_queued(&mut sender, &rows, 30, when);
+        let segments = sfa_files_of(&sf_dir.path().join("periodic"));
+        assert!(
+            segments >= 10,
+            "{when}: 32 flushes took {segments} segment files: the test rotated too little"
+        );
+        drop(sender);
+        drop(server);
+    }
+}
+
+/// With a server that answers, the sender and its network thread both work
+/// on the files of the queue: the one syncs a segment and takes the next,
+/// the other syncs when its time comes, frees the segments of confirmed
+/// frames and makes spare ones.
+#[test]
+fn periodic_sf_sender_takes_new_segments_while_its_network_thread_tends_the_queue() {
+    use crate::tests::qwp_ws_server_model::{QwpWsModelServer, buffer_of};
+
+    const FLUSHES: usize = 90;
+    for manual in [false, true] {
+        let when = if manual {
+            "driven by its caller"
+        } else {
+            "in the background"
+        };
+        let server = QwpWsModelServer::start(1024);
+        let sf_dir = tempfile::TempDir::new().unwrap();
+        let mode = if manual {
+            "qwp_ws_progress=manual;"
+        } else {
+            ""
+        };
+        // A segment holds three flushes.
+        let mut sender = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{};{mode}sf_dir={};sender_id=periodic;\
+             sf_durability=periodic;sf_sync_interval_millis=1;\
+             sf_max_segment_bytes=1024;sf_max_total_bytes=1048576;",
+            server.port,
+            sf_dir.path().display()
+        ))
+        .unwrap()
+        .build()
+        .unwrap();
+        let rows = buffer_of("periodic_rows", 0..10);
+
+        assert_every_flush_is_queued(&mut sender, &rows, FLUSHES, when);
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(30))
+            .unwrap_or_else(|err| panic!("{when}: {err}"));
+        assert_eq!(
+            server.model.table("periodic_rows").unwrap().row_count(),
+            10 * FLUSHES,
+            "{when}"
+        );
+        sender.close_drain().unwrap();
+        server.finish();
+    }
+}
+
+/// The same while the network thread sits in a write to a server that has
+/// stopped reading.
+#[test]
+fn periodic_sf_sender_takes_new_segments_while_its_server_does_not_read() {
+    const FLUSHES: usize = 60;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (stop, stopped) = mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        upgrade_mock_stream_with_max_batch_size(&mut stream, Some(1024 * 1024));
+        // Reads nothing more, and keeps the connection.
+        let _ = stopped.recv_timeout(Duration::from_secs(120));
+    });
+
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    // A segment holds two flushes.
+    let mut sender = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:{port};sf_dir={};sender_id=periodic;sf_durability=periodic;\
+         sf_max_segment_bytes=1048576;sf_max_total_bytes=1073741824;\
+         sf_append_deadline_millis=2000;",
+        sf_dir.path().display()
+    ))
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut rows = sender.new_buffer();
+    rows.table("periodic_rows")
+        .unwrap()
+        .column_str("v", "x".repeat(400 * 1024))
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    assert_every_flush_is_queued(&mut sender, &rows, FLUSHES, "server not reading");
+    let sent = sender.qwp_ws_totals().unwrap().frames_sent;
+    assert!(
+        (sent as usize) < FLUSHES,
+        "the server read nothing and took all {sent} frames: the network thread was never \
+         held in a write, so the test proved nothing"
+    );
+
+    let _ = stop.send(());
+    server.join().unwrap();
+    drop(sender);
 }
 
 #[cfg(feature = "_oidc")]

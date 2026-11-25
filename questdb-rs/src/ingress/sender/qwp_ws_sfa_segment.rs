@@ -33,11 +33,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
-use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::OnceLock;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use memmap2::{MmapMut, MmapOptions};
 
@@ -46,7 +46,17 @@ pub(crate) const VERSION: u8 = 1;
 pub(crate) const MANIFEST_REQUIRED_FLAG: u8 = 1;
 pub(crate) const HEADER_SIZE: usize = 24;
 pub(crate) const FRAME_HEADER_SIZE: usize = 8;
+/// The checksum that a frame header begins with, in front of the length.
+const FRAME_CHECKSUM_SIZE: usize = 4;
 pub(crate) const INITIAL_SEGMENT_FILE_NAME: &str = "sf-initial.sfa";
+
+// The header of a QWP message, as far as a segment reads its frames' payloads:
+// see `payload_defers_commit`. Duplicated from the wire encoders, as in
+// `qwp_ws_sfa_catchup`.
+const QWP_HEADER_SIZE: usize = 12;
+const QWP_MAGIC: [u8; 4] = *b"QWP1";
+const QWP_FLAGS_OFFSET: usize = 5;
+const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 
 #[cfg(unix)]
 static MLOCK_REFUSAL_WARNED: AtomicBool = AtomicBool::new(false);
@@ -63,6 +73,70 @@ pub(crate) fn fail_sync_after_for_test(successful_calls: usize) {
 }
 
 #[cfg(test)]
+thread_local! {
+    static REDIRTY_MAPPING_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Makes the next `failures` attempts, on this thread, to map a segment's
+/// file for the re-dirty of a failed sync fail.
+#[cfg(test)]
+fn fail_redirty_mapping_for_test(failures: usize) {
+    REDIRTY_MAPPING_FAILURES.with(|remaining| remaining.set(failures));
+}
+
+#[cfg(test)]
+fn should_fail_redirty_mapping_for_test() -> bool {
+    REDIRTY_MAPPING_FAILURES.with(|remaining| {
+        let failures = remaining.get();
+        remaining.set(failures.saturating_sub(1));
+        failures > 0
+    })
+}
+
+/// What a sync of published bytes does, as a test records it: see
+/// [`record_published_sync_events_for_test`].
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublishedSyncEvent {
+    /// A re-dirty pass stored to the addresses from the first to the last of
+    /// `stores`.
+    Redirtied {
+        stores: std::ops::RangeInclusive<usize>,
+    },
+    /// The published bytes were written to disk.
+    Synced,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLISHED_SYNC_EVENTS: std::cell::RefCell<Option<Vec<PublishedSyncEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Starts recording, on this thread, the re-dirty passes and the syncs of
+/// [`SfaSegment::sync_published_range`].
+#[cfg(test)]
+fn record_published_sync_events_for_test() {
+    PUBLISHED_SYNC_EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops the recording of [`record_published_sync_events_for_test`], and
+/// returns it.
+#[cfg(test)]
+fn take_published_sync_events_for_test() -> Vec<PublishedSyncEvent> {
+    PUBLISHED_SYNC_EVENTS.with(|events| events.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
+fn record_published_sync_event(event: PublishedSyncEvent) {
+    PUBLISHED_SYNC_EVENTS.with(|events| {
+        if let Some(events) = events.borrow_mut().as_mut() {
+            events.push(event);
+        }
+    });
+}
+
+#[cfg(test)]
 fn should_fail_sync_for_test() -> bool {
     SYNC_FAILURE_COUNTDOWN.with(|countdown| match countdown.get() {
         Some(0) => {
@@ -75,6 +149,87 @@ fn should_fail_sync_for_test() -> bool {
         }
         None => false,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static REMOVAL_STOP_COUNTDOWN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes the removal of an unfinished flush at the open of a slot, and what
+/// follows it (see [`removal_step_for_test`]), stop with an error at its
+/// step number `steps`, counted from zero, as a process that dies there
+/// would: what the steps before wrote stays written.
+#[cfg(test)]
+pub(crate) fn stop_removal_after_for_test(steps: usize) {
+    REMOVAL_STOP_COUNTDOWN.with(|countdown| countdown.set(Some(steps)));
+}
+
+/// Takes the stop of [`stop_removal_after_for_test`] back. Returns whether
+/// it was still armed: whether the removal ended before it got that far.
+#[cfg(test)]
+pub(crate) fn clear_removal_stop_for_test() -> bool {
+    REMOVAL_STOP_COUNTDOWN.with(|countdown| countdown.take().is_some())
+}
+
+/// One step of the removal of an unfinished flush, or of what the open of a
+/// sender then does with an empty segment in use that is too small
+/// (`fit_empty_active_to_segment_size` in `qwp_ws_sfa_queue`): a write, a
+/// sync, a delete or a new segment follows. See
+/// [`stop_removal_after_for_test`].
+#[cfg(test)]
+pub(crate) fn removal_step_for_test() -> io::Result<()> {
+    REMOVAL_STOP_COUNTDOWN.with(|countdown| match countdown.get() {
+        Some(0) => {
+            countdown.set(None);
+            Err(io::Error::other("injected stop of the removal"))
+        }
+        Some(remaining) => {
+            countdown.set(Some(remaining - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    })
+}
+
+/// What recovery does to the bytes of a segment, as a test that models a
+/// power loss replays it: see [`record_disk_events_for_test`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiskEvent {
+    /// The bytes from `offset` on, `len` of them, were zeroed in memory.
+    Zeroed { offset: usize, len: usize },
+    /// Every byte written before is on disk.
+    Synced,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DISK_EVENTS: std::cell::RefCell<Option<Vec<DiskEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Starts recording, on this thread, the zeroing and the syncs of the torn
+/// tail cleanup and of the removal of frames.
+#[cfg(test)]
+pub(crate) fn record_disk_events_for_test() {
+    DISK_EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops the recording of [`record_disk_events_for_test`], and returns it.
+#[cfg(test)]
+pub(crate) fn take_disk_events_for_test() -> Vec<DiskEvent> {
+    DISK_EVENTS.with(|events| events.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
+fn record_disk_event(event: DiskEvent) {
+    DISK_EVENTS.with(|events| {
+        if let Some(events) = events.borrow_mut().as_mut() {
+            events.push(event);
+        }
+    });
 }
 
 // Keep the payloads in these errors: recovery reports them through Debug today,
@@ -144,6 +299,8 @@ pub(crate) struct SfaSegmentMetadataScan {
     pub(crate) header: SfaSegmentHeader,
     pub(crate) manifest_required: bool,
     pub(crate) frame_count: u64,
+    /// See [`SfaSegment::committed_frame_count`].
+    pub(crate) committed_frame_count: u64,
     pub(crate) append_offset: u64,
     pub(crate) torn_tail_bytes: u64,
     pub(crate) first_empty_payload_fsn: Option<u64>,
@@ -166,10 +323,7 @@ pub(crate) struct SfaAppend {
 
 #[derive(Debug)]
 pub(crate) struct SfaSegment {
-    // Kept with file-backed segments so the segment owns the file handle
-    // alongside the writable mapping.
-    #[allow(dead_code)]
-    file: Option<File>,
+    file: Option<SfaSegmentFile>,
     mapping: Arc<SfaSegmentMapping>,
     path: Option<PathBuf>,
     size_bytes: u64,
@@ -177,10 +331,52 @@ pub(crate) struct SfaSegment {
     manifest_required: bool,
     append_offset: u64,
     frame_count: u64,
+    committed_frame_count: u64,
     // Recovery records this on opened segments; queue recovery also reports the
     // metadata scan directly before opening the segment.
     #[allow(dead_code)]
     torn_tail_bytes: u64,
+    #[cfg(test)]
+    redirty_passes: std::sync::atomic::AtomicU64,
+}
+
+/// The file of a file-backed segment, which the segment owns alongside its
+/// writable mapping.
+#[derive(Debug)]
+struct SfaSegmentFile {
+    file: File,
+    /// A second mapping of the whole file, through which only the re-dirty
+    /// after a failed sync writes ([`SfaSegment::redirty_pages`]).
+    /// [`SfaSegment::sync_published_range`] makes it before its first sync
+    /// ([`Self::map_for_redirty`]), and it stays for the segment's life: the
+    /// re-dirty then cannot fail, as a mapping made when a sync fails could,
+    /// leaving the pages clean. Only periodic durability syncs published
+    /// bytes, so under any other the file is mapped once. The mutex keeps two
+    /// re-dirties of the segment apart.
+    redirty_view: Mutex<Option<MmapMut>>,
+}
+
+impl SfaSegmentFile {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            redirty_view: Mutex::new(None),
+        }
+    }
+
+    /// Makes [`Self::redirty_view`], `size_bytes` long, unless it is made.
+    fn map_for_redirty(&self, size_bytes: u64) -> Result<(), SfaSegmentError> {
+        // A panic while the lock was held left nothing half done: the view
+        // is made whole or not at all.
+        let mut view = self
+            .redirty_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if view.is_none() {
+            *view = Some(map_file_for_redirty(&self.file, size_bytes)?);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct SfaMappedPayload {
@@ -204,14 +400,17 @@ struct SfaSegmentMapping {
     _mmap: MmapMut,
     base: *mut u8,
     len: usize,
-    #[cfg(test)]
-    redirty_passes: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: `MmapMut` is itself `Send + Sync`. Concurrent access through `base`
-// is coordinated by callers: the publisher only writes ranges past the segment
-// append offset, while readers only read ranges below the published offset, so
-// the bytes touched are disjoint and use raw-pointer provenance.
+// is coordinated by callers, and no write through it is concurrent with a read
+// of the same bytes: the appender writes only past the segment's append
+// offset, and readers read only below the published offset, which never passes
+// it. Every other write is made while no other thread can reach the segment:
+// the header at creation, at recovery and on a spare not yet shared, and the
+// zeroing of recovery. The re-dirty after a failed sync stores to the same
+// file pages through a mapping of its own (`SfaSegmentFile::redirty_view`),
+// never through `base`. All access uses raw-pointer provenance.
 unsafe impl Send for SfaSegmentMapping {}
 unsafe impl Sync for SfaSegmentMapping {}
 
@@ -266,7 +465,10 @@ impl SfaSegment {
             manifest_required: false,
             append_offset: HEADER_SIZE as u64,
             frame_count: 0,
+            committed_frame_count: 0,
             torn_tail_bytes: 0,
+            #[cfg(test)]
+            redirty_passes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -311,7 +513,7 @@ impl SfaSegment {
         mapping.copy_from(0, &encode_header(header, manifest_required));
 
         Ok(Self {
-            file: Some(file),
+            file: Some(SfaSegmentFile::new(file)),
             mapping,
             path: Some(path.to_path_buf()),
             size_bytes,
@@ -319,7 +521,10 @@ impl SfaSegment {
             manifest_required,
             append_offset: HEADER_SIZE as u64,
             frame_count: 0,
+            committed_frame_count: 0,
             torn_tail_bytes: 0,
+            #[cfg(test)]
+            redirty_passes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -340,7 +545,7 @@ impl SfaSegment {
         reserve_segment_blocks(&file, size_bytes)?;
         let mapping = map_file_mut(&file, size_bytes)?;
         Ok(Self {
-            file: Some(file),
+            file: Some(SfaSegmentFile::new(file)),
             mapping,
             path: Some(path.to_path_buf()),
             size_bytes,
@@ -348,7 +553,10 @@ impl SfaSegment {
             manifest_required: scan.manifest_required,
             append_offset: scan.append_offset,
             frame_count: scan.frame_count,
+            committed_frame_count: scan.committed_frame_count,
             torn_tail_bytes: scan.torn_tail_bytes,
+            #[cfg(test)]
+            redirty_passes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -423,11 +631,22 @@ impl SfaSegment {
     }
 
     pub(crate) fn sync_header(&self) -> Result<(), SfaSegmentError> {
-        let Some(file) = self.file.as_ref() else {
+        let Some(segment_file) = self.file.as_ref() else {
             return Ok(());
         };
         self.mapping.flush_range(0, HEADER_SIZE)?;
-        file.sync_all()?;
+        segment_file.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Syncs every byte of the segment: those written through its mapping,
+    /// and those that an earlier process wrote and the disk may not hold yet.
+    pub(crate) fn sync_file(&self) -> Result<(), SfaSegmentError> {
+        let Some(segment_file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        self.mapping.flush_range(0, self.mapping.len)?;
+        segment_file.file.sync_data()?;
         Ok(())
     }
 
@@ -436,7 +655,7 @@ impl SfaSegment {
         durable_offset: u64,
         published_offset: u64,
     ) -> Result<(), SfaSegmentError> {
-        let Some(file) = self.file.as_ref() else {
+        let Some(segment_file) = self.file.as_ref() else {
             return Ok(());
         };
         if published_offset <= durable_offset {
@@ -450,6 +669,10 @@ impl SfaSegment {
         if published > self.mapping.len {
             return Err(SfaSegmentError::OffsetOverflow);
         }
+        // Before anything is written back, so that a failure to map leaves
+        // the pages as they are, and the re-dirty after a failed sync has its
+        // mapping.
+        segment_file.map_for_redirty(self.size_bytes)?;
 
         let page_size = system_page_size();
         let durable = usize::try_from(durable_offset).map_err(|_| {
@@ -481,11 +704,13 @@ impl SfaSegment {
                     "injected periodic SF sync failure",
                 )));
             }
-            file.sync_data().map_err(SfaSegmentError::Io)
+            segment_file.file.sync_data().map_err(SfaSegmentError::Io)?;
+            #[cfg(test)]
+            record_published_sync_event(PublishedSyncEvent::Synced);
+            Ok(())
         });
         if result.is_err() {
-            self.mapping
-                .redirty_pages(lock_offset, published, page_size);
+            self.redirty_pages(segment_file, lock_offset, published, page_size);
         }
         #[cfg(unix)]
         if locked {
@@ -493,6 +718,64 @@ impl SfaSegment {
             let _ = unsafe { libc::munlock(addr.cast::<libc::c_void>(), lock_len) };
         }
         result
+    }
+
+    /// Marks the pages of the segment's file from `offset`, a page boundary,
+    /// to `end` dirty again, after a sync of them failed. Linux marks the
+    /// pages of a failed writeback clean: a retried sync would then succeed
+    /// without writing them, and a clean page can be dropped and read back
+    /// stale from disk. A store of each page's first byte to itself marks the
+    /// page dirty without changing it.
+    ///
+    /// The stores go through the second mapping of the file
+    /// ([`SfaSegmentFile::redirty_view`]). It maps the same page cache pages
+    /// as the segment's mapping, whose published bytes another thread may be
+    /// reading at this moment: a store through that mapping would race the
+    /// read.
+    fn redirty_pages(
+        &self,
+        segment_file: &SfaSegmentFile,
+        offset: usize,
+        end: usize,
+        page_size: usize,
+    ) {
+        // A panic while the lock was held left nothing half done: each store
+        // writes back the value it read.
+        let mut view = segment_file
+            .redirty_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // The sync that failed made the view before it synced, and nothing
+        // takes it away: `map_for_redirty` is its only writer.
+        debug_assert!(
+            view.is_some(),
+            "a segment re-dirtied before its view was made"
+        );
+        let Some(view) = view.as_mut() else {
+            return;
+        };
+        let base = view.as_mut_ptr();
+        let mut cursor = offset;
+        while cursor < end {
+            // SAFETY: `cursor` is below `end`, the published offset, which is
+            // inside the file and so inside the view. Only this loop accesses
+            // the view, under its lock. A volatile store is never elided.
+            unsafe {
+                let ptr = base.add(cursor);
+                ptr.write_volatile(ptr.read_volatile());
+            }
+            cursor = cursor.saturating_add(page_size);
+        }
+        #[cfg(test)]
+        {
+            let first = base as usize + offset;
+            let last = first + (end - offset - 1) / page_size * page_size;
+            record_published_sync_event(PublishedSyncEvent::Redirtied {
+                stores: first..=last,
+            });
+            self.redirty_passes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     pub(crate) fn sanitize_torn_tail(&mut self) -> Result<(), SfaSegmentError> {
@@ -509,13 +792,112 @@ impl SfaSegment {
                 size: self.size_bytes,
             }
         })?;
-        self.mapping.zero_range(offset, len);
-        self.mapping.flush_range(offset, len)?;
-        if let Some(file) = self.file.as_ref() {
-            file.sync_data()?;
-        }
+        // What stands behind the header of the torn frame goes first, and
+        // that header once the rest is on disk. A power loss may write the
+        // pages of the tail in any order: a zeroed header with whole frames
+        // behind it would be the clean end of the segment, and a later frame
+        // that ends where one of them begins would make the next scan run on
+        // into them. While the header stands, the tail stays torn, and the
+        // next open cleans it again.
+        let header_len = FRAME_HEADER_SIZE.min(len);
+        self.mapping
+            .zero_range(offset + header_len, len - header_len);
+        self.sync_range(offset, len)?;
+        self.mapping.zero_range(offset, header_len);
+        self.sync_range(offset, len)?;
         self.torn_tail_bytes = 0;
         Ok(())
+    }
+
+    /// Writes the bytes from `offset` on, `len` of them, to disk.
+    fn sync_range(&self, offset: usize, len: usize) -> Result<(), SfaSegmentError> {
+        self.mapping.flush_range(offset, len)?;
+        if let Some(segment_file) = self.file.as_ref() {
+            segment_file.file.sync_data()?;
+        }
+        #[cfg(test)]
+        record_disk_event(DiskEvent::Synced);
+        Ok(())
+    }
+
+    /// Removes every frame after the first `keep_frames` and syncs the
+    /// segment. For recovery, which owns the segment alone: see
+    /// `remove_unfinished_flush` in `qwp_ws_sfa_queue`.
+    ///
+    /// No frame may stay whole behind a zeroed header, on disk or in memory:
+    /// a frame has no number of its own, the scan takes zeroes for the clean
+    /// end of the segment, and a later frame of the same length as the one
+    /// that stood there would make the next scan run on into it. So the
+    /// removal goes in two steps, each synced:
+    ///
+    /// 1. the checksum of every frame to remove, the last frame's first. A
+    ///    frame with a zeroed checksum is never whole again;
+    /// 2. the rest of those frames, the last frame's first.
+    ///
+    /// A process that dies on the way leaves the frames it had not reached
+    /// whole and, behind them, a frame whose header stands and whose
+    /// checksum fails, which the next open cleans up as a torn tail
+    /// ([`Self::sanitize_torn_tail`]). A power loss may write the pages of
+    /// a step in any order: in the first, the frames behind the first one
+    /// with a zeroed checksum are a torn tail too; in the second, no frame
+    /// to remove is whole on disk any more. Zeroing frame by frame with one
+    /// sync at the end could put the zeroed header of the first frame on
+    /// disk ahead of the frames behind it.
+    pub(crate) fn cut_back_to(&mut self, keep_frames: u64) -> Result<(), SfaSegmentError> {
+        if keep_frames >= self.frame_count {
+            return Ok(());
+        }
+        // Where the frames to remove begin, in file order, and where the
+        // last of them ends.
+        let mut bounds = Vec::new();
+        let mut pos = HEADER_SIZE as u64;
+        for index in 0..self.frame_count {
+            if index >= keep_frames {
+                bounds.push(pos);
+            }
+            pos = self
+                .next_frame_offset_with_limit(pos, self.append_offset)
+                .ok_or(SfaSegmentError::OffsetOverflow)?;
+        }
+        bounds.push(pos);
+        let to_usize =
+            |offset: u64| usize::try_from(offset).map_err(|_| SfaSegmentError::OffsetOverflow);
+        let (cut, end) = (to_usize(bounds[0])?, to_usize(pos)?);
+        for frame in bounds.windows(2).rev() {
+            #[cfg(test)]
+            removal_step_for_test()?;
+            self.mapping
+                .zero_range(to_usize(frame[0])?, FRAME_CHECKSUM_SIZE);
+        }
+        self.sync_cut(cut, end)?;
+        for frame in bounds.windows(2).rev() {
+            let (start, frame_end) = (
+                to_usize(frame[0])? + FRAME_CHECKSUM_SIZE,
+                to_usize(frame[1])?,
+            );
+            #[cfg(test)]
+            removal_step_for_test()?;
+            self.mapping.zero_range(start, frame_end - start);
+        }
+        self.sync_cut(cut, end)?;
+        self.append_offset = bounds[0];
+        self.frame_count = keep_frames;
+        self.committed_frame_count = self.committed_frame_count.min(keep_frames);
+        self.torn_tail_bytes = 0;
+        Ok(())
+    }
+
+    /// One sync of [`Self::cut_back_to`], of the frames from `cut` to `end`.
+    fn sync_cut(&self, cut: usize, end: usize) -> Result<(), SfaSegmentError> {
+        #[cfg(test)]
+        removal_step_for_test()?;
+        #[cfg(test)]
+        if should_fail_sync_for_test() {
+            return Err(SfaSegmentError::Io(io::Error::other(
+                "injected sync failure of a cut segment",
+            )));
+        }
+        self.sync_range(cut, end - cut)
     }
 
     /// `start` is a known `(fsn, offset)` frame boundary in this segment to scan from.
@@ -567,14 +949,21 @@ impl SfaSegment {
         self.frame_count
     }
 
+    /// How many of the frames that the segment held when it was opened lie
+    /// at or before its last frame that commits: all of them when the last
+    /// frame commits, none when no frame does. A frame is one that commits
+    /// unless it defers its commit ([`payload_defers_commit`]).
+    pub(crate) fn committed_frame_count(&self) -> u64 {
+        self.committed_frame_count
+    }
+
     pub(crate) fn torn_tail_bytes(&self) -> u64 {
         self.torn_tail_bytes
     }
 
     #[cfg(test)]
     fn redirty_passes(&self) -> u64 {
-        self.mapping
-            .redirty_passes
+        self.redirty_passes
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -653,8 +1042,6 @@ impl SfaSegmentMapping {
             _mmap: mmap,
             base,
             len,
-            #[cfg(test)]
-            redirty_passes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -681,25 +1068,8 @@ impl SfaSegmentMapping {
         unsafe {
             ptr::write_bytes(self.base.add(offset), 0, len);
         }
-    }
-
-    fn redirty_pages(&self, offset: usize, end: usize, page_size: usize) {
         #[cfg(test)]
-        self.redirty_passes
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let mut cursor = offset;
-        while cursor < end {
-            // SAFETY: the checkpoint runs after transport use of the captured
-            // published prefix and the producer writes only beyond it. A
-            // same-value volatile store marks the page dirty without changing
-            // any segment byte, so a retry cannot vacuously succeed after a
-            // failed writeback consumed the kernel's error.
-            unsafe {
-                let ptr = self.base.add(cursor);
-                ptr.write_volatile(ptr.read_volatile());
-            }
-            cursor = cursor.saturating_add(page_size);
-        }
+        record_disk_event(DiskEvent::Zeroed { offset, len });
     }
 
     fn flush_range(&self, offset: usize, len: usize) -> Result<(), SfaSegmentError> {
@@ -782,6 +1152,7 @@ fn scan_segment_metadata_source<S: ReadAt + ?Sized>(
         header: raw.header,
         manifest_required: raw.manifest_required,
         frame_count: raw.frame_count,
+        committed_frame_count: raw.committed_frame_count,
         append_offset: raw.append_offset,
         torn_tail_bytes: raw.torn_tail_bytes,
         first_empty_payload_fsn: raw.first_empty_payload_fsn,
@@ -820,6 +1191,7 @@ struct RawSegmentScan {
     header: SfaSegmentHeader,
     manifest_required: bool,
     frame_count: u64,
+    committed_frame_count: u64,
     append_offset: u64,
     torn_tail_bytes: u64,
     first_empty_payload_fsn: Option<u64>,
@@ -874,6 +1246,7 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
 
     let mut chunk = vec![0u8; SCAN_CHUNK_BYTES];
     let mut frame_count = 0u64;
+    let mut committed_frame_count = 0u64;
     let mut first_empty_payload_fsn = None;
     let mut pos = HEADER_SIZE as u64;
     while pos + (FRAME_HEADER_SIZE as u64) <= source_len {
@@ -895,12 +1268,16 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
         // The CRC covers the length field and the payload; stream the payload
         // through the bounded chunk instead of materialising the frame.
         let mut crc_calc = crc32c_update(0, &frame_header[4..8]);
+        let mut defers_commit = false;
         let mut read_pos = payload_start;
         while read_pos < frame_end {
             let n = chunk
                 .len()
                 .min(usize::try_from(frame_end - read_pos).unwrap_or(chunk.len()));
             read_exact_at(source, &mut chunk[..n], read_pos)?;
+            if read_pos == payload_start {
+                defers_commit = payload_defers_commit(&chunk[..n]);
+            }
             crc_calc = crc32c_update(crc_calc, &chunk[..n]);
             read_pos += n as u64;
         }
@@ -919,6 +1296,9 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
         frame_count = frame_count
             .checked_add(1)
             .ok_or(SfaSegmentError::OffsetOverflow)?;
+        if !defers_commit {
+            committed_frame_count = frame_count;
+        }
         pos = frame_end;
     }
 
@@ -926,10 +1306,22 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
         header,
         manifest_required,
         frame_count,
+        committed_frame_count,
         append_offset: pos,
         torn_tail_bytes: detect_torn_tail(source, source_len, pos)?,
         first_empty_payload_fsn,
     })
+}
+
+/// Whether a frame whose payload begins with `head` asks the server to hold
+/// its rows until a later frame commits them: a QWP message with the
+/// defer-commit flag. The server answers such a frame only together with the
+/// frame that commits it. Any other payload counts as one that commits,
+/// whatever it is.
+fn payload_defers_commit(head: &[u8]) -> bool {
+    head.len() >= QWP_HEADER_SIZE
+        && head[..4] == QWP_MAGIC
+        && head[QWP_FLAGS_OFFSET] & QWP_FLAG_DEFER_COMMIT != 0
 }
 
 fn encode_header(header: SfaSegmentHeader, manifest_required: bool) -> [u8; HEADER_SIZE] {
@@ -1222,6 +1614,28 @@ fn map_file_mut(file: &File, size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, 
     }
 }
 
+/// Maps the whole of `file`, `size_bytes` of it, a second time: see
+/// [`SfaSegmentFile::redirty_view`].
+fn map_file_for_redirty(file: &File, size_bytes: u64) -> Result<MmapMut, SfaSegmentError> {
+    #[cfg(test)]
+    if should_fail_redirty_mapping_for_test() {
+        return Err(SfaSegmentError::Io(io::Error::other(
+            "injected failure to map a segment file for its re-dirty",
+        )));
+    }
+    let len = usize::try_from(size_bytes)
+        .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
+    // SAFETY: as in `map_file_mut`, SFA slot locking keeps other processes
+    // from changing the file while it is mapped. In this process only
+    // `SfaSegment::redirty_pages` accesses this mapping, under its lock.
+    unsafe {
+        MmapOptions::new()
+            .len(len)
+            .map_mut(file)
+            .map_err(SfaSegmentError::Io)
+    }
+}
+
 fn map_anon_mut(size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {
     let len = usize::try_from(size_bytes)
         .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
@@ -1320,6 +1734,184 @@ mod tests {
             1,
             "successful retry must not re-dirty again"
         );
+        assert_eq!(
+            payloads(&scan_file(&path).unwrap()),
+            vec![b"payload".to_vec()]
+        );
+    }
+
+    /// The network thread may be reading the published bytes through the
+    /// segment's mapping while another thread's sync of them fails: the
+    /// re-dirty must store through no address of that mapping.
+    #[test]
+    fn a_failed_sync_redirties_through_a_mapping_of_its_own() {
+        let page_size = system_page_size();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("periodic.sfa");
+        let mut segment = SfaSegment::create(&path, 0, 4 * page_size as u64, 1).unwrap();
+        segment
+            .try_append(&vec![7u8; 2 * page_size])
+            .unwrap()
+            .unwrap();
+        let published = segment.append_offset();
+
+        record_published_sync_events_for_test();
+        fail_sync_after_for_test(0);
+        segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap_err();
+        let events = take_published_sync_events_for_test();
+
+        let [PublishedSyncEvent::Redirtied { stores }] = events.as_slice() else {
+            panic!("one re-dirty pass and no sync expected: {events:?}");
+        };
+        let mapping_start = segment.mapping.base as usize;
+        let mapping_end = mapping_start + segment.mapping.len;
+        assert!(
+            *stores.end() < mapping_start || *stores.start() >= mapping_end,
+            "re-dirty stores {:#x}..={:#x} inside the segment's mapping {mapping_start:#x}..{mapping_end:#x}",
+            stores.start(),
+            stores.end()
+        );
+        let pages_published = (published as usize).div_ceil(page_size);
+        assert_eq!(
+            (stores.end() - stores.start()) / page_size + 1,
+            pages_published,
+            "one store per published page"
+        );
+
+        segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap();
+        assert_eq!(
+            payloads(&scan_file(&path).unwrap()),
+            vec![vec![7u8; 2 * page_size]]
+        );
+    }
+
+    /// A failed sync re-dirties its pages even when no mapping can be made
+    /// any more: the one it stores through was made by the first sync.
+    #[test]
+    fn a_failed_sync_redirties_when_no_mapping_can_be_made_any_more() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("periodic.sfa");
+        let mut segment = SfaSegment::create(&path, 0, 4096, 1).unwrap();
+        segment.try_append(b"first").unwrap().unwrap();
+        let durable = segment.append_offset();
+        segment
+            .sync_published_range(HEADER_SIZE as u64, durable)
+            .unwrap();
+        segment.try_append(b"payload").unwrap().unwrap();
+        let published = segment.append_offset();
+
+        record_published_sync_events_for_test();
+        fail_sync_after_for_test(0);
+        fail_redirty_mapping_for_test(usize::MAX);
+        let err = segment
+            .sync_published_range(durable, published)
+            .unwrap_err();
+        fail_redirty_mapping_for_test(0);
+        assert!(
+            format!("{err:?}").contains("injected periodic SF sync failure"),
+            "{err:?}"
+        );
+        let events = take_published_sync_events_for_test();
+        assert!(
+            matches!(events.as_slice(), [PublishedSyncEvent::Redirtied { .. }]),
+            "{events:?}"
+        );
+        assert_eq!(segment.redirty_passes(), 1);
+
+        segment.sync_published_range(durable, published).unwrap();
+        assert_eq!(segment.redirty_passes(), 1);
+        assert_eq!(
+            payloads(&scan_file(&path).unwrap()),
+            vec![b"first".to_vec(), b"payload".to_vec()]
+        );
+    }
+
+    /// A sync that cannot map the file for the re-dirty of its failure fails
+    /// before it writes anything back, and the next sync maps it. A segment
+    /// is made and opened without that mapping.
+    #[test]
+    fn a_sync_that_cannot_map_its_file_for_the_redirty_fails_before_it_syncs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("periodic.sfa");
+        fail_redirty_mapping_for_test(1);
+        let mut segment = SfaSegment::create_new(&path, 0, 4096, 1).unwrap();
+        segment.try_append(b"payload").unwrap().unwrap();
+        let published = segment.append_offset();
+
+        record_published_sync_events_for_test();
+        let err = segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("injected failure to map"),
+            "{err:?}"
+        );
+        assert_eq!(take_published_sync_events_for_test(), []);
+
+        record_published_sync_events_for_test();
+        segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap();
+        assert_eq!(
+            take_published_sync_events_for_test(),
+            [PublishedSyncEvent::Synced]
+        );
+        drop(segment);
+        fail_redirty_mapping_for_test(1);
+        let segment = SfaSegment::open_existing(&path).unwrap();
+        fail_redirty_mapping_for_test(0);
+        assert_eq!(
+            payloads(&scan_file(&path).unwrap()),
+            vec![b"payload".to_vec()]
+        );
+        drop(segment);
+    }
+
+    /// The mappings of `path` in this process, as Linux lists them.
+    #[cfg(target_os = "linux")]
+    fn mappings_of(path: &Path) -> usize {
+        let path = fs::canonicalize(path).unwrap();
+        let path = path.to_str().unwrap();
+        fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .filter(|line| line.ends_with(path))
+            .count()
+    }
+
+    /// A segment is one mapping of its file, made or opened, until a sync of
+    /// published bytes, which only periodic durability makes, maps the file
+    /// once more for the re-dirty after a failed sync.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_segment_maps_its_file_for_the_redirty_at_its_first_sync() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("periodic.sfa");
+        let mut segment = SfaSegment::create_new(&path, 0, 4096, 1).unwrap();
+        assert_eq!(mappings_of(&path), 1);
+        segment.try_append(b"payload").unwrap().unwrap();
+        let published = segment.append_offset();
+        segment.sync_file().unwrap();
+        assert_eq!(mappings_of(&path), 1);
+        segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap();
+        assert_eq!(mappings_of(&path), 2);
+        segment.try_append(b"more").unwrap().unwrap();
+        segment
+            .sync_published_range(published, segment.append_offset())
+            .unwrap();
+        assert_eq!(mappings_of(&path), 2);
+        drop(segment);
+        assert_eq!(mappings_of(&path), 0);
+
+        let segment = SfaSegment::open_existing(&path).unwrap();
+        assert_eq!(mappings_of(&path), 1);
+        drop(segment);
     }
 
     #[test]
@@ -1732,6 +2324,189 @@ mod tests {
             "java-two-frame-torn-tail.sfa.hex:\n{}",
             format_hex_fixture(&bytes)
         );
+    }
+
+    // ---- What a power loss leaves of the removal of frames and of the torn tail cleanup ----
+
+    /// What a disk writes whole, as the model of a power loss takes it.
+    const PAGE: usize = 4096;
+
+    /// The payload lengths of the frames of [`segment_across_pages`]: the
+    /// first stays, and the others span three pages of [`PAGE`] bytes.
+    const ACROSS_PAGES: [usize; 5] = [4000, 4100, 100, 3000, 100];
+
+    /// A segment of four pages with the frames of [`ACROSS_PAGES`], each
+    /// payload filled with its own byte. Returns its path and where each
+    /// frame begins.
+    fn segment_across_pages(dir: &TempDir) -> (PathBuf, Vec<usize>) {
+        let path = dir.path().join("across-pages.sfa");
+        let mut segment = SfaSegment::create(&path, 0, 4 * PAGE as u64, 0).unwrap();
+        let offsets = ACROSS_PAGES
+            .iter()
+            .enumerate()
+            .map(|(tag, len)| {
+                let payload = vec![0xA0 + tag as u8; *len];
+                segment.try_append(&payload).unwrap().unwrap() as usize
+            })
+            .collect();
+        segment.sync_header().unwrap();
+        (path, offsets)
+    }
+
+    /// Whether `image` holds a whole frame at `offset`: one whose checksum
+    /// matches its length and payload.
+    fn is_whole_frame(image: &[u8], offset: usize) -> bool {
+        let Some(header) = image.get(offset..offset + FRAME_HEADER_SIZE) else {
+            return false;
+        };
+        let Ok(len) = usize::try_from(read_i32(header, 4)) else {
+            return false;
+        };
+        let Some(payload) = image.get(offset + FRAME_HEADER_SIZE..offset + FRAME_HEADER_SIZE + len)
+        else {
+            return false;
+        };
+        crc32c_update(crc32c_update(0, &header[4..8]), payload) == read_u32(header, 0)
+    }
+
+    /// Calls `check` with every image of a segment that a power loss can
+    /// leave at any point of `events`, for a segment that held `before` when
+    /// they began, and with the number of the events before the loss. What
+    /// the last sync wrote stays. Each page written since is on disk as it
+    /// was at that sync, or as any write since left it, whatever the others
+    /// are.
+    fn each_image_a_power_loss_leaves(
+        before: &[u8],
+        events: &[DiskEvent],
+        mut check: impl FnMut(&[u8], usize),
+    ) {
+        let mut durable = before.to_vec();
+        let mut memory = before.to_vec();
+        // The pages written since the last sync, with what each write left.
+        let mut written: std::collections::BTreeMap<usize, Vec<Vec<u8>>> = Default::default();
+        for lost_at in 0..=events.len() {
+            let pages: Vec<(&usize, &Vec<Vec<u8>>)> = written.iter().collect();
+            // One choice of each page: 0 for the page at the last sync, `n`
+            // for the page as write `n` since left it.
+            let mut choice = vec![0usize; pages.len()];
+            loop {
+                let mut image = durable.clone();
+                for ((page, versions), chosen) in pages.iter().zip(&choice) {
+                    if *chosen > 0 {
+                        let start = **page * PAGE;
+                        image[start..start + versions[chosen - 1].len()]
+                            .copy_from_slice(&versions[chosen - 1]);
+                    }
+                }
+                check(&image, lost_at);
+                let Some(next) = (0..pages.len()).find(|&i| choice[i] < pages[i].1.len()) else {
+                    break;
+                };
+                choice[next] += 1;
+                choice[..next].fill(0);
+            }
+            match events.get(lost_at) {
+                Some(DiskEvent::Zeroed { offset, len }) if *len > 0 => {
+                    memory[*offset..*offset + *len].fill(0);
+                    for page in *offset / PAGE..=(*offset + *len - 1) / PAGE {
+                        let range = page * PAGE..((page + 1) * PAGE).min(memory.len());
+                        written
+                            .entry(page)
+                            .or_default()
+                            .push(memory[range].to_vec());
+                    }
+                }
+                Some(DiskEvent::Zeroed { .. }) => {}
+                Some(DiskEvent::Synced) => {
+                    durable.clone_from(&memory);
+                    written.clear();
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Panics when the open of `image` would take a frame of `removed` for
+    /// the clean end, or for a frame, and keep a whole frame of them behind
+    /// it. A torn tail there is cleaned up by the open
+    /// ([`SfaSegment::sanitize_torn_tail`]), whose own power loss
+    /// [`a_power_loss_while_a_torn_tail_is_cleaned_up_leaves_no_whole_frame_behind_its_end`]
+    /// covers.
+    fn assert_no_whole_frame_behind_the_end(image: &[u8], removed: &[usize], case: &str) {
+        let scan = scan_segment_metadata_bytes(image).unwrap();
+        assert!(
+            scan.frame_count >= 1,
+            "{case}: the frame that stays is gone"
+        );
+        if scan.torn_tail_bytes > 0 {
+            return;
+        }
+        for offset in removed {
+            assert!(
+                (*offset as u64) < scan.append_offset || !is_whole_frame(image, *offset),
+                "{case}: a whole frame at {offset} behind the end of the segment at {}",
+                scan.append_offset
+            );
+        }
+    }
+
+    #[test]
+    fn a_power_loss_during_the_removal_of_frames_leaves_no_whole_frame_behind_its_end() {
+        let dir = TempDir::new().unwrap();
+        let (path, offsets) = segment_across_pages(&dir);
+        let before = fs::read(&path).unwrap();
+        let mut segment = SfaSegment::open_existing(&path).unwrap();
+        record_disk_events_for_test();
+        segment.cut_back_to(1).unwrap();
+        let events = take_disk_events_for_test();
+        drop(segment);
+        assert!(
+            events
+                .iter()
+                .filter(|event| **event == DiskEvent::Synced)
+                .count()
+                >= 2,
+            "{events:?}"
+        );
+        let after = fs::read(&path).unwrap();
+        assert_eq!(after[..offsets[1]], before[..offsets[1]]);
+        assert!(after[offsets[1]..].iter().all(|byte| *byte == 0));
+
+        each_image_a_power_loss_leaves(&before, &events, |image, lost_at| {
+            assert_no_whole_frame_behind_the_end(
+                image,
+                &offsets[1..],
+                &format!("a power loss after {lost_at} of {events:?}"),
+            );
+        });
+    }
+
+    #[test]
+    fn a_power_loss_while_a_torn_tail_is_cleaned_up_leaves_no_whole_frame_behind_its_end() {
+        // The second frame is torn, and the frames behind it are whole: what
+        // a power loss can leave of frames that were not synced.
+        let dir = TempDir::new().unwrap();
+        let (path, offsets) = segment_across_pages(&dir);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[offsets[1] + FRAME_HEADER_SIZE + 10] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        let mut segment = SfaSegment::open_existing(&path).unwrap();
+        assert_eq!(segment.frame_count(), 1);
+        assert!(segment.torn_tail_bytes() > 0);
+        record_disk_events_for_test();
+        segment.sanitize_torn_tail().unwrap();
+        let events = take_disk_events_for_test();
+        drop(segment);
+        let after = fs::read(&path).unwrap();
+        assert!(after[offsets[1]..].iter().all(|byte| *byte == 0));
+
+        each_image_a_power_loss_leaves(&bytes, &events, |image, lost_at| {
+            assert_no_whole_frame_behind_the_end(
+                image,
+                &offsets[1..],
+                &format!("a power loss after {lost_at} of {events:?}"),
+            );
+        });
     }
 
     fn payloads(scan: &SfaSegmentScan) -> Vec<Vec<u8>> {

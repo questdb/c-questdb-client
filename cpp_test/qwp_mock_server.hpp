@@ -319,6 +319,18 @@ struct ActionServeLocalDurableAck
     std::string table;
 };
 
+// Takes ingress frames as a server that tells a frame limit does, until the
+// client closes. The handshake carries `X-QWP-Max-Batch-Size:
+// max_batch_size`, so a sender sends a row buffer above that size in several
+// frames. A data frame with the defer flag gets no answer; a frame without it
+// gets an OK that names its sequence, which confirms the frames before it
+// too. Each PING gets a PONG. Records every data frame, see
+// `MockServer::ingress_frames`. Must be the last action of its script.
+struct ActionServeIngress
+{
+    size_t max_batch_size;
+};
+
 using Action = std::variant<
     ActionSendServerInfo,
     ActionAwaitQueryRequest,
@@ -330,9 +342,20 @@ using Action = std::variant<
     ActionAwaitClientFrame,
     ActionHardDrop,
     ActionReject401,
-    ActionServeLocalDurableAck>;
+    ActionServeLocalDurableAck,
+    ActionServeIngress>;
 
 using Script = std::vector<Action>;
+
+// What `ActionServeIngress` records of a data frame.
+struct IngressFrame
+{
+    // The size of the QWP message in bytes, its header included.
+    size_t size;
+    // The frame has the defer flag: the server holds its rows and does not
+    // answer.
+    bool deferred;
+};
 
 // ---------------------------------------------------------------------------
 // MockServer — one TCP listener bound to 127.0.0.1:0, a script per accepted
@@ -366,6 +389,18 @@ public:
     // from the client, in arrival order. Each entry is the bare client→
     // server frame payload.
     std::vector<std::vector<uint8_t>> captured_requests() const;
+
+    // The data frames that `ActionServeIngress` has taken so far, over all
+    // connections, in arrival order.
+    std::vector<IngressFrame> ingress_frames() const;
+
+    // Block until `n` connections served by `ActionServeIngress` have ended,
+    // or `timeout` elapses; returns true if the count was reached. A
+    // connection has ended once the mock has read all the client sent on it,
+    // so `ingress_frames` then holds every frame of that connection.
+    bool wait_for_ingress_closed(
+        int n,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5)) const;
 
 private:
     struct Impl;

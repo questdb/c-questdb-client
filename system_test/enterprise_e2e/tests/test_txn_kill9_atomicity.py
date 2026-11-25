@@ -2,43 +2,41 @@
 Transactional-atomicity kill tests, ported from the Enterprise java-client
 suite (``questdb-ent/e2e/tests/test_txn_kill9_atomicity.py``).
 
-PORT STATUS: 1 of 4 scenarios portable today.
+PORT STATUS: 1 of 4 scenarios ported; 2 more can be expressed, not ported.
 
 The Java scenarios pivot on the sender's ``transaction=on`` mode: deferred
 publishes carry ``FLAG_DEFER_COMMIT``, only an explicit FLUSH commits, and
 a successor sender on the same slot must RETIRE (not replay) an orphan
-deferred tail. The Rust QWP/WS row sender does not implement that mode:
+deferred tail. The Rust QWP/WS row sender has no such mode, so a
+transaction never spans several FLUSH calls:
 
-  * ``questdb-rs/src/ingress/sender.rs:318-323`` -- transactional flushes
-    are explicitly rejected for QWP/WebSocket
-    ("Transactional flushes are not supported for QWP/WebSocket.").
-  * ``questdb-rs/src/ingress/conf.rs`` -- no ``transaction`` config key
-    (contrast ``request_durable_ack`` at conf.rs:209).
-  * ``questdb-rs/src/ingress/buffer/qwp.rs:3559`` -- the encoder CAN frame
-    deferred commits (``encode_ws_replay_message_with_defer``, flag applied
-    at qwp.rs:3654). The column sender's store-and-forward split now uses
-    it: an oversize chunk defers every frame but the last so the chunk
-    commits once. That is gated to MEMORY mode
-    (``SyncQwpWsHandlerState::sfa_split_deferral_enabled``, set from
-    ``sf_dir.is_none()``) precisely because of the next point -- so no
-    ``FLAG_DEFER_COMMIT`` frame ever reaches a persisted slot, and the
-    on-disk shapes these scenarios need cannot be produced by the client.
-  * No orphan-tail retirement in SF recovery (no retirement logic in
-    ``qwp_ws_sfa_slot.rs`` / ``qwp_ws_sfa_segment.rs``; the segment scan
-    handles torn frames only). ``FLAG_DEFER_COMMIT`` appears nowhere under
-    ``ingress/sender/``, so a recovered tail has no commit boundary to read:
-    the orphan drainer opens replay-only with no producer and can never
-    append the committing frame, while ``orphan_queue_drained`` is
-    ``completed >= published``, which such a tail never satisfies. The Java
-    client has the machinery to port -- ``RecoveredFrameAnalysis``
-    (``commitBoundaryFsn``) and
-    ``CursorSendEngine.retireRecoveredOrphanTailIfReady``, which retires the
-    tail by a local cumulative self-acknowledge rather than truncating.
+  * ``questdb-rs/src/ingress/sender.rs`` rejects transactional flushes for
+    QWP/WebSocket ("Transactional flushes are not supported for
+    QWP/WebSocket."), and ``questdb-rs/src/ingress/conf.rs`` has no
+    ``transaction`` config key.
+  * Deferred frames come only from a single FLUSH that is larger than the
+    server's frame limit: it goes out as several frames, every one but the
+    last with ``FLAG_DEFER_COMMIT``, and with ``sf_dir`` they are written to
+    the slot (``flush_qwp_ws_through`` in ``ingress/sender/qwp_ws.rs``). The
+    column sender's split of an oversize chunk defers too, in memory mode
+    only (``sfa_split_deferral_enabled``).
+  * A process killed inside such a FLUSH leaves deferred frames at the end
+    of its slot. Every open of the slot, by a sender or an orphan drainer,
+    removes the frames after the last one that commits
+    (``remove_unfinished_flush`` in ``ingress/sender/qwp_ws_sfa_queue.rs``):
+    they are cut off the slot, not retired by a local self-acknowledge as
+    the Java client's ``CursorSendEngine.retireRecoveredOrphanTailIfReady``
+    does. The client's own test of it kills a client inside a large FLUSH
+    against a real server (``questdb-rs/src/tests/qwp_ws_large_flush_kill_probe.rs``).
 
-Blocked until the client grows ``transaction=on`` + tail retirement:
+Can be expressed with a SIGKILL inside one large FLUSH, instead of between
+deferred auto-flushes; not ported:
 
   - test_kill9_mid_txn_uncommitted_rows_never_appear
   - test_kill9_whole_log_deferred_fast_path_retirement
+
+Blocked until the client grows ``transaction=on``:
+
   - test_kill9_between_deferred_flushes_deterministic (also needs a
     FLUSH_DEFER sidecar verb, which has no client API to bind to today)
 

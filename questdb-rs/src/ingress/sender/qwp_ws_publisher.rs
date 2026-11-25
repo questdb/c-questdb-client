@@ -27,8 +27,48 @@
 use super::qwp_ws_sfa_symbol_dict::{PersistedSymbolDict, PersistedSymbolDictMark};
 use crate::error;
 use crate::ingress::buffer::{
-    QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict, SymbolGlobalDictMark,
+    QwpWsColumnarBuffer, QwpWsEncodeScratch, QwpWsFrameBlock, SymbolGlobalDict,
+    SymbolGlobalDictMark,
 };
+
+/// What a flush encodes its frames with: the encoder of a sender, or the one
+/// that the row and column flushes of a pooled sender share. Either takes
+/// the symbols of a frame that was not published out of its dictionary
+/// again.
+pub(crate) trait QwpWsFlushEncoder {
+    /// Encodes `buffer` as one frame, refuses it when it is larger than
+    /// `max_buf_size`, and hands it to `publish`.
+    fn encode_and_publish(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        max_buf_size: usize,
+        publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
+    ) -> crate::Result<u64>;
+
+    /// Encodes one frame of a plan, refuses it when it is larger than
+    /// `frame_cap`, and hands it to `publish`. The frames of a flush come in
+    /// the order of the plan. Only for an encoder that
+    /// [sends its symbols as a delta](Self::delta_dict_enabled).
+    fn encode_and_publish_frame(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        blocks: &[QwpWsFrameBlock],
+        defer_commit: bool,
+        frame_cap: usize,
+        publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
+    ) -> crate::Result<u64>;
+
+    /// Whether a frame brings only the symbols that its connection does not
+    /// hold yet. The frames of a plan are sized and encoded that way, so a
+    /// flush is cut into frames only while this holds. An encoder whose
+    /// store-and-forward slot has no usable symbol file sends every symbol
+    /// with every frame instead.
+    fn delta_dict_enabled(&self) -> bool;
+
+    /// At least what the symbols that the connection holds take in a frame:
+    /// see [`SymbolGlobalDict::max_encoded_len`].
+    fn known_symbols_max_encoded_len(&self) -> usize;
+}
 
 pub(crate) struct QwpWsReplayEncoder {
     payload: Vec<u8>,
@@ -239,7 +279,9 @@ impl QwpWsReplayEncoder {
         self.encode_and_persist(buffer, max_buf_size)?;
         Ok(&self.payload)
     }
+}
 
+impl QwpWsFlushEncoder for QwpWsReplayEncoder {
     /// Encodes `buffer`, write-aheads its new symbols, then hands the payload to
     /// `publish`. **If `publish` fails, the connection dict and side-file are
     /// rolled back** so the aborted frame's symbol ids are freed and reused by the
@@ -253,7 +295,7 @@ impl QwpWsReplayEncoder {
     /// `delta_start` would outrun the mirror and the torn-dict guard would mark
     /// the whole slot terminal, losing all queued data. Mirrors the column
     /// backend's `SfaColumnBackend::publish_chunk_sfa`.
-    pub(crate) fn encode_and_publish(
+    fn encode_and_publish(
         &mut self,
         buffer: &QwpWsColumnarBuffer,
         max_buf_size: usize,
@@ -267,6 +309,66 @@ impl QwpWsReplayEncoder {
                 Err(err)
             }
         }
+    }
+
+    /// Encodes one frame of a plan into the scratch message, refuses it when
+    /// it is larger than `frame_cap`, and hands it to `publish`. The frames
+    /// of a flush come in the order of the plan.
+    ///
+    /// The frame brings the symbols that its blocks use first, which enter
+    /// the connection dictionary. **When the frame is not published, they
+    /// are taken out again**, as [`Self::encode_and_publish`] does it and
+    /// for its reason: a flush whose first frame finds no room leaves the
+    /// sender open, and its dictionary must not be ahead of what was sent.
+    ///
+    /// With a side-file, the symbols are written to it before the frame is
+    /// published and taken out of it with the dictionary's, as
+    /// [`Self::encode_and_persist`] does it: a slot that is opened again
+    /// finds the symbols of every frame it holds.
+    ///
+    /// Only for a sender in delta mode, whose frames start their dictionary
+    /// section at the connection dictionary's size.
+    fn encode_and_publish_frame(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        blocks: &[QwpWsFrameBlock],
+        defer_commit: bool,
+        frame_cap: usize,
+        publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
+    ) -> crate::Result<u64> {
+        debug_assert!(self.delta_dict_enabled);
+        let global_dict_mark = self.global_dict.mark();
+        let frame_base_id = self.global_dict.next_id();
+        let pd_mark = self.persisted_symbol_dict.as_ref().map(|pd| pd.mark());
+        let published = buffer
+            .encode_ws_frame(
+                blocks,
+                &mut self.payload,
+                &mut self.scratch,
+                &mut self.global_dict,
+                self.version,
+                defer_commit,
+            )
+            .and_then(|()| {
+                let encoded_len = self.payload.len();
+                if encoded_len > frame_cap {
+                    return Err(qwp_ws_encoded_message_size_error(encoded_len, frame_cap));
+                }
+                self.persist_new_symbols(frame_base_id)?;
+                publish(&self.payload)
+            });
+        if published.is_err() {
+            self.rollback_frame(global_dict_mark, pd_mark);
+        }
+        published
+    }
+
+    fn delta_dict_enabled(&self) -> bool {
+        self.delta_dict_enabled
+    }
+
+    fn known_symbols_max_encoded_len(&self) -> usize {
+        self.global_dict.max_encoded_len()
     }
 }
 
@@ -477,6 +579,163 @@ mod tests {
             encoder.global_dict.len(),
             0,
             "the dormant encoder's seeded dictionary must be freed"
+        );
+    }
+
+    /// Encodes a frame of a plan as a flush does, and takes it in place of
+    /// the queue.
+    fn encode_frame(
+        encoder: &mut QwpWsReplayEncoder,
+        buffer: &QwpWsColumnarBuffer,
+        blocks: &[QwpWsFrameBlock],
+        defer_commit: bool,
+        frame_cap: usize,
+    ) -> crate::Result<Vec<u8>> {
+        let mut frame = Vec::new();
+        encoder.encode_and_publish_frame(buffer, blocks, defer_commit, frame_cap, |payload| {
+            frame = payload.to_vec();
+            Ok(0)
+        })?;
+        Ok(frame)
+    }
+
+    /// Rows without symbols, enough of them for several small frames.
+    fn rows_without_symbols() -> QwpWsColumnarBuffer {
+        let mut buffer = QwpWsColumnarBuffer::new(127);
+        for id in 0..40 {
+            buffer
+                .table("readings")
+                .unwrap()
+                .column_i64("id", id)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        buffer
+    }
+
+    #[test]
+    fn encode_frame_writes_a_frame_of_the_plan_for_its_connection() {
+        // A connection of version 3 that has registered one symbol.
+        let mut encoder = QwpWsReplayEncoder::new(3);
+        encoder.set_delta_dict_enabled(true);
+        encoder.encode(&one_symbol_buffer("a")).unwrap();
+
+        let buffer = rows_without_symbols();
+        let plan = buffer.plan_frames(128, 128).unwrap();
+        assert!(plan.frames().count() > 2);
+        let mut expected = Vec::new();
+        let mut scratch = QwpWsEncodeScratch::new();
+        for defer_commit in [true, false] {
+            for blocks in plan.frames() {
+                // The same frame for a connection of version 1 without symbols.
+                buffer
+                    .encode_ws_frame(
+                        blocks,
+                        &mut expected,
+                        &mut scratch,
+                        &mut SymbolGlobalDict::new(),
+                        1,
+                        defer_commit,
+                    )
+                    .unwrap();
+                let frame =
+                    encode_frame(&mut encoder, &buffer, blocks, defer_commit, usize::MAX).unwrap();
+                assert_eq!(frame[..4], expected[..4]);
+                assert_eq!((frame[4], expected[4]), (3, 1), "the version");
+                assert_eq!(
+                    frame[5..12],
+                    expected[5..12],
+                    "the flags, the table count and the payload length"
+                );
+                assert_eq!(
+                    (&frame[12..14], &expected[12..14]),
+                    (&[1, 0][..], &[0, 0][..]),
+                    "the dictionary section: where it starts, and no new symbol"
+                );
+                assert_eq!(frame[14..], expected[14..], "the table blocks");
+            }
+        }
+    }
+
+    /// Rows with a new symbol each, enough of them for several small frames.
+    fn rows_with_symbols() -> QwpWsColumnarBuffer {
+        let mut buffer = QwpWsColumnarBuffer::new(127);
+        for id in 0..40 {
+            buffer
+                .table("readings")
+                .unwrap()
+                .symbol("sym", format!("s{id}").as_str())
+                .unwrap()
+                .column_i64("id", id)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        buffer
+    }
+
+    #[test]
+    fn a_frame_that_is_not_published_gives_its_symbols_back() {
+        // A connection that has registered one symbol.
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        encoder.encode(&one_symbol_buffer("known")).unwrap();
+        let buffer = rows_with_symbols();
+        let plan = buffer.plan_frames(128, 128).unwrap();
+        let frames: Vec<&[QwpWsFrameBlock]> = plan.frames().collect();
+        assert!(frames.len() > 2);
+
+        // The queue does not take the frame.
+        let err = encoder
+            .encode_and_publish_frame(&buffer, frames[0], true, usize::MAX, |_payload| {
+                Err(error::fmt!(SocketError, "no room"))
+            })
+            .unwrap_err();
+        assert_eq!((err.code(), err.msg()), (ErrorCode::SocketError, "no room"));
+        assert_eq!(encoder.global_dict.len(), 1);
+        // The frame is above the cap.
+        let err = encode_frame(&mut encoder, &buffer, frames[0], true, 20).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+        assert_eq!(encoder.global_dict.len(), 1);
+
+        // A frame that is published keeps its symbols, and the next one
+        // starts behind them.
+        let first = encode_frame(&mut encoder, &buffer, frames[0], true, usize::MAX).unwrap();
+        let brought = encoder.global_dict.len() - 1;
+        assert!(brought > 0);
+        assert_eq!((first[12], u64::from(first[13])), (1, brought));
+        let second = encode_frame(&mut encoder, &buffer, frames[1], true, usize::MAX).unwrap();
+        assert_eq!(u64::from(second[12]), 1 + brought);
+        assert!(second[13] > 0);
+        assert_eq!(
+            encoder.global_dict.len(),
+            1 + brought + u64::from(second[13])
+        );
+    }
+
+    #[test]
+    fn encode_frame_refuses_a_frame_above_the_cap() {
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        let buffer = rows_without_symbols();
+        let plan = buffer.plan_frames(128, 128).unwrap();
+        let blocks = plan.frames().next().unwrap();
+        let len = encode_frame(&mut encoder, &buffer, blocks, true, usize::MAX)
+            .unwrap()
+            .len();
+
+        let at_the_cap = encode_frame(&mut encoder, &buffer, blocks, true, len).unwrap();
+        assert_eq!(at_the_cap.len(), len);
+        let err = encode_frame(&mut encoder, &buffer, blocks, true, len - 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+        assert_eq!(
+            err.msg(),
+            format!(
+                "Could not flush buffer: QWP/WebSocket encoded message size of {len} bytes \
+                 exceeds the per-frame cap of {} bytes.",
+                len - 1
+            )
         );
     }
 }

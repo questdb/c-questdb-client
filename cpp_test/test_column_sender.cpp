@@ -750,6 +750,163 @@ TEST_CASE("borrowed_sender::wait completes on a local durable ACK")
     rs.drop_on_return();
 }
 
+namespace
+{
+
+// A mock that takes ingress frames as a server with a frame limit of
+// `frame_limit` bytes does, on every connection.
+std::unique_ptr<qm::MockServer> spawn_ingress_mock(size_t frame_limit)
+{
+    return std::make_unique<qm::MockServer>(
+        std::vector<qm::Script>{{qm::ActionServeIngress{frame_limit}}});
+}
+
+// A pool that keeps its queue in memory and is connected when it is built, so
+// that a borrowed sender knows the frame limit of its server. The mock
+// serves no queries.
+std::string ingress_conf_for(const std::string& addr)
+{
+    return "ws::addr=" + addr + ";query_pool_min=0;";
+}
+
+} // namespace
+
+TEST_CASE("borrowed_sender sends a Buffer above the frame cap in frames")
+{
+    const size_t frame_limit = 64 * 1024;
+    auto mock = spawn_ingress_mock(frame_limit);
+    questdb::pool db{ingress_conf_for(mock->addr())};
+    auto rs = db.borrow_sender();
+
+    auto buffer = rs.new_buffer();
+    for (int64_t i = 0; i < 20000; ++i)
+        buffer.table("cpp_large_flush")
+            .column("id", i)
+            .at(qdb::timestamp_nanos{1'700'000'000'000'000'000LL + i});
+    REQUIRE(buffer.size() > 4 * frame_limit);
+
+    const auto fsn = rs.flush_and_get_fsn(buffer);
+    REQUIRE(fsn.has_value());
+    CHECK(buffer.row_count() == 0);
+    rs.wait(qdb::qwpws_ack_level::ok, std::chrono::seconds{5});
+    const auto acked = rs.acked_fsn();
+    REQUIRE(acked.has_value());
+    CHECK(*acked == *fsn);
+
+    // The server answered the last frame, so it has counted them all: every
+    // frame but the last has the defer flag, and the flush returns the number
+    // of its last frame.
+    const auto frames = mock->ingress_frames();
+    REQUIRE(frames.size() > 4);
+    CHECK(*fsn + 1 == frames.size());
+    for (size_t i = 0; i < frames.size(); ++i)
+    {
+        CHECK(frames[i].size <= frame_limit);
+        CHECK(frames[i].deferred == (i + 1 < frames.size()));
+    }
+}
+
+TEST_CASE(
+    "borrowed_sender whose Buffer flush stops part way throws "
+    "flush_aborted and is closed by the pool")
+{
+    const size_t frame_limit = 1024 * 1024;
+    // With the symbol of the first flush, one more than the symbol dictionary
+    // of a connection holds (2,000,000 entries).
+    const size_t symbols = 2'000'000;
+    auto mock = spawn_ingress_mock(frame_limit);
+    questdb::pool db{ingress_conf_for(mock->addr())};
+    // Whether the error says that a frame of the failed flush may have been
+    // sent: the network thread sends frames while the flush still cuts them,
+    // so that depends on timing.
+    bool in_doubt = false;
+    auto large = [&] {
+        auto rs = db.borrow_sender();
+        auto buffer = rs.new_buffer();
+        buffer.table("cpp_aborted_flush")
+            .symbol("sym", "first")
+            .at(qdb::timestamp_nanos{1'700'000'000'000'000'000LL});
+        const auto before = rs.flush_and_get_fsn(buffer);
+        REQUIRE(before.has_value());
+
+        for (size_t i = 0; i < symbols; ++i)
+            buffer.table("cpp_aborted_flush")
+                .symbol("sym", std::to_string(i))
+                .at(qdb::timestamp_nanos{
+                    1'700'000'000'000'000'000LL + int64_t(i)});
+
+        // The sender takes no more flushes either: not of that Buffer, and not
+        // of a row whose symbol the dictionary holds, which would fit.
+        auto small = rs.new_buffer();
+        small.table("cpp_aborted_flush")
+            .symbol("sym", "first")
+            .at(qdb::timestamp_nanos{1'700'000'000'000'000'000LL});
+        for (auto* flushed : {&buffer, &small})
+        {
+            const size_t rows = flushed->row_count();
+            try
+            {
+                rs.flush(*flushed);
+                FAIL("the flush must throw");
+            }
+            catch (const qdb::line_sender_error& e)
+            {
+                CHECK(e.code() == qdb::line_sender_error_code::flush_aborted);
+                // A later flush fails with the code of the failed one, and
+                // is not in doubt: nothing of it is sent.
+                if (flushed == &buffer)
+                {
+                    in_doubt = e.in_doubt();
+                    CHECK(
+                        std::string{e.what()}.find(
+                            "the flush stopped part way") != std::string::npos);
+                }
+                else
+                {
+                    CHECK_FALSE(e.in_doubt());
+                    CHECK(
+                        std::string{e.what()}.find(
+                            "Nothing of this flush was sent") !=
+                        std::string::npos);
+                }
+            }
+            CHECK(flushed->row_count() == rows);
+            CHECK(rs.published_fsn() == before);
+        }
+        CHECK(buffer.row_count() == symbols);
+
+        // The sender still delivers the flush before the failed one.
+        rs.wait(qdb::qwpws_ack_level::ok, std::chrono::seconds{5});
+        CHECK(rs.acked_fsn() == before);
+        return buffer;
+    }();
+
+    // The guard is gone: the pool closed the sender instead of keeping it.
+    // The server took the flush before, and of the failed flush only frames
+    // with the defer flag, never the frame that commits it, and any only if
+    // the error said that some may have been sent.
+    REQUIRE(mock->wait_for_ingress_closed(1));
+    const auto frames = mock->ingress_frames();
+    REQUIRE(frames.size() >= 1);
+    for (size_t i = 0; i < frames.size(); ++i)
+        CHECK(frames[i].deferred == (i > 0));
+    CHECK((frames.size() == 1 || in_doubt));
+
+    // The next borrower gets a new connection, which takes a flush.
+    auto rs = db.borrow_sender();
+    CHECK(mock->accepts() == 2);
+    auto buffer = rs.new_buffer();
+    buffer.table("cpp_aborted_flush")
+        .symbol("sym", "first")
+        .at(qdb::timestamp_nanos{1'700'000'000'000'000'000LL});
+    rs.flush(buffer);
+    rs.wait(qdb::qwpws_ack_level::ok, std::chrono::seconds{5});
+    const auto later = mock->ingress_frames();
+    REQUIRE(later.size() == frames.size() + 1);
+    CHECK_FALSE(later.back().deferred);
+    CHECK(large.row_count() == symbols);
+}
+
 TEST_CASE("flush rejects oversized table name")
 {
     auto mock = spawn_mock(1);

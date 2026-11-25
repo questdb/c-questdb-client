@@ -166,6 +166,17 @@ impl SfaForegroundPublisher {
         }
     }
 
+    /// Whether a frame brings only the symbols that its connection does not
+    /// hold yet: see `QwpWsFlushEncoder::delta_dict_enabled`.
+    pub(crate) fn delta_enabled(&self) -> bool {
+        self.symbols.delta_enabled
+    }
+
+    /// See `QwpWsFlushEncoder::known_symbols_max_encoded_len`.
+    pub(crate) fn known_symbols_max_encoded_len(&self) -> usize {
+        self.symbols.global.max_encoded_len()
+    }
+
     /// Seeds the foreground namespace from a recovered side-file. The driver's
     /// mirror is seeded from the same byte region and count during connect.
     pub(crate) fn seed(&mut self, entries: &[u8], count: u32) -> Result<()> {

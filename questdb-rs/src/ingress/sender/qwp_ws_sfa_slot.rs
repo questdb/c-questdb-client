@@ -136,6 +136,16 @@ impl SfaSlotQueue {
         result
     }
 
+    /// As [`Self::close`], giving up the frames that the server has not
+    /// confirmed: see [`SfaFrameQueue::close_abandoning_unresolved`].
+    pub(crate) fn close_abandoning_unresolved(&mut self) -> Result<(), SfaQueueError> {
+        let result = self.queue.close_abandoning_unresolved();
+        if result.is_ok() {
+            drop(self.lock.take());
+        }
+        result
+    }
+
     pub(crate) fn slot_dir(&self) -> Option<&Path> {
         self.lock.as_ref().map(SlotLock::slot_dir)
     }
@@ -170,6 +180,10 @@ impl PublicationLog for SfaSlotQueue {
 
     fn take_producer(&mut self) -> Option<SfaProducer> {
         self.queue.take_producer()
+    }
+
+    fn producer(&self) -> Option<&SfaProducer> {
+        PublicationLog::producer(&self.queue)
     }
 
     fn progress_view(&self) -> super::qwp_ws_sfa_queue::SfaProgressView {
@@ -223,6 +237,10 @@ impl PublicationLog for SfaSlotQueue {
 
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(SfaSlotQueue::close(self)?)
+    }
+
+    fn close_abandoning_unresolved(&mut self) -> Result<(), DriverError> {
+        Ok(SfaSlotQueue::close_abandoning_unresolved(self)?)
     }
 
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -528,6 +546,57 @@ mod tests {
 
         first.close().unwrap();
         SfaSlotQueue::open(slot_options).unwrap();
+    }
+
+    /// How many times this process maps each segment file of `slot_dir`, as
+    /// Linux lists the mappings.
+    #[cfg(target_os = "linux")]
+    fn mappings_per_segment_file(slot_dir: &Path) -> std::collections::BTreeMap<String, usize> {
+        let slot = format!("{}/", std::fs::canonicalize(slot_dir).unwrap().display());
+        let mut mappings = std::collections::BTreeMap::new();
+        for line in std::fs::read_to_string("/proc/self/maps").unwrap().lines() {
+            if let Some(at) = line.find(&slot) {
+                *mappings
+                    .entry(line[at + slot.len()..].to_owned())
+                    .or_insert(0) += 1;
+            }
+        }
+        mappings
+    }
+
+    /// A slot maps each of its segment files once, also after it is opened
+    /// again, unless its durability is periodic: a sync of published bytes
+    /// maps a file once more, for the re-dirty after a failed sync.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_slot_maps_each_segment_file_once_unless_its_durability_is_periodic() {
+        for periodic in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let sf_dir = temp.path().join("sf-root");
+            let mut slot_options = options(&sf_dir, "slot");
+            slot_options.periodic_sync_interval = periodic.then(|| Duration::from_secs(3600));
+            let slot_dir = sf_dir.join("slot");
+            let mut queue = SfaSlotQueue::open(slot_options.clone()).unwrap();
+            // Four frames fill a segment of 256 bytes.
+            for frame in 0..10u8 {
+                queue.queue.maintain_storage().unwrap();
+                queue.queue.try_submit(&[frame; 40]).unwrap();
+            }
+            for reopened in [false, true] {
+                if reopened {
+                    drop(queue);
+                    queue = SfaSlotQueue::open(slot_options.clone()).unwrap();
+                }
+                let mappings = mappings_per_segment_file(&slot_dir);
+                assert!(mappings.len() >= 3, "{mappings:?}");
+                assert_eq!(
+                    mappings.values().max(),
+                    Some(&if periodic { 2 } else { 1 }),
+                    "periodic={periodic} reopened={reopened}: {mappings:?}"
+                );
+            }
+            drop(queue);
+        }
     }
 
     #[cfg(any(unix, windows))]

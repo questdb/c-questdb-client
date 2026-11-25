@@ -231,11 +231,21 @@ pub enum ErrorCode {
     /// the store-and-forward segment payload capacity). Chunk publication
     /// splits oversize inputs into smaller frames automatically, so there this
     /// only surfaces for an irreducible unit (the table schema plus a single
-    /// row block). A row [`Buffer`](crate::ingress::Buffer) is published as one
-    /// frame and is never split, so flushing one whose encoded frame exceeds
-    /// the cap fails with this code and publishes nothing. Distinct from
-    /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
-    /// without matching on the error message text.
+    /// row block). A sender on a connection that advertised
+    /// `X-QWP-Max-Batch-Size` also sends a row
+    /// [`Buffer`](crate::ingress::Buffer) above the cap in several frames, in
+    /// either progress mode, with its queue in memory and with `sf_dir`. A
+    /// buffer that fits one frame is never refused for its size. One that does
+    /// not fails the flush with this code, and publishes nothing, when the
+    /// buffer is larger than `max_buf_size` by
+    /// [`Buffer::len`](crate::ingress::Buffer::len), when one of its rows fits
+    /// no frame, and when the queue (`sf_max_total_bytes`) can never hold the
+    /// frames of the flush together. A sender whose server advertised no cap,
+    /// and one that could not write the symbol file of its `sf_dir` slot,
+    /// publishes a row buffer as one frame and never splits it, so flushing one
+    /// whose encoded frame exceeds the cap fails with this code and publishes
+    /// nothing. Distinct from [`InvalidApiCall`](Self::InvalidApiCall) so
+    /// callers can recognise it without matching on the error message text.
     BatchTooLarge,
 
     /// The QWP/WebSocket store-and-forward persisted symbol dictionary is
@@ -324,6 +334,86 @@ pub enum ErrorCode {
     /// **by code** and take that specific action, without matching on the error
     /// message text.
     SymbolDictFull,
+
+    /// A [`Sender::flush`](crate::ingress::Sender::flush) of a row buffer
+    /// that goes out in several frames stopped part way: some of its frames
+    /// were queued, and a later one could not be. The message names the
+    /// cause. From then on no frame of the flush is sent, not even after a
+    /// reconnect, and the buffer still holds its rows.
+    ///
+    /// Check [`in_doubt`](Error::in_doubt) before you flush the buffer again:
+    ///
+    /// - `false`: no frame of the flush was sent. Nothing of it is committed,
+    ///   and flushing the same buffer through a new sender stores no row
+    ///   twice.
+    /// - `true`: some of its frames may have been sent. The server holds
+    ///   their rows and drops them when the sender is closed, so nothing of the flush is
+    ///   committed, unless one table had at least as many rows in the flush as
+    ///   the server's `qwp.max.uncommitted.rows` (1,000,000 by default). Then the
+    ///   server may have committed a part of that table's rows by itself, and
+    ///   flushing the buffer again stores that part twice unless the table
+    ///   has `DEDUP` keys.
+    ///
+    /// The server may still answer about the frames that were sent, and may
+    /// reject one of them. Such an answer fails no call: a rejection is only
+    /// reported as a server error, by
+    /// [`poll_qwp_ws_error`](crate::ingress::Sender::poll_qwp_ws_error) and
+    /// the
+    /// [`qwp_ws_error_handler`](crate::ingress::SenderBuilder::qwp_ws_error_handler),
+    /// with the policy of its status, which the sender does not apply
+    /// ([`QwpWsSenderError::applied_policy`](crate::ingress::QwpWsSenderError::applied_policy)).
+    ///
+    /// The sender takes no more flushes, and
+    /// [`must_close`](crate::ingress::Sender::must_close) returns `true`. A
+    /// later flush fails with this code too, with `in_doubt` `false`, because
+    /// nothing of it is sent; or with the sender's terminal error
+    /// once the sender has stopped for a reason of its own since, unless its
+    /// buffer is refused first for a reason of its own, which keeps its code:
+    /// for example [`SymbolDictFull`](Self::SymbolDictFull), for a symbol that
+    /// the full dictionary cannot take. A flush of an empty buffer queues nothing and
+    /// returns `Ok`.
+    ///
+    /// The sender still delivers the flushes before the failed one.
+    /// [`wait`](crate::ingress::Sender::wait) covers them and succeeds once
+    /// they reach the level it asks for, durable levels included.
+    /// [`published_fsn`](crate::ingress::Sender::published_fsn) is the last
+    /// frame before the failed flush, and
+    /// [`acked_fsn`](crate::ingress::Sender::acked_fsn) and
+    /// [`completed_fsn`](crate::ingress::Sender::completed_fsn) never go
+    /// above it. To lose none of these flushes, call
+    /// [`close_drain`](crate::ingress::Sender::close_drain) with a
+    /// `close_flush_timeout` above 0, the default, and check that it
+    /// succeeded: it waits for the flushes before the failed one only. With 0
+    /// or less it does not wait, and without `sf_dir` the flushes that the
+    /// server has not confirmed go with the sender. Then drop the sender,
+    /// create a new one and flush the buffer again, as `in_doubt` allows.
+    ///
+    /// With `sf_dir` a `close_drain` that waits and succeeds leaves the slot
+    /// empty, and so does the pool when its wait for the sender succeeds.
+    /// Otherwise the frames of the failed flush stay in the slot, and the
+    /// sender that opens the slot next removes them and sends nothing of the
+    /// flush. It keeps the symbols of the slot, so a flush that stopped
+    /// because the symbol dictionary was full can stop the same way once
+    /// more; a `close_drain` of that sender that waits and succeeds empties
+    /// the slot.
+    ///
+    /// A sender borrowed from the pool of a `QuestDb` is not closed by its
+    /// holder. To lose none of the flushes before the failed one, call its
+    /// `wait` and check that it succeeded. Then give the sender back: the
+    /// pool closes it instead of lending it again. Borrow a new sender and
+    /// flush the buffer through it, as `in_doubt` allows.
+    ///
+    /// A sender that stops for a reason of its own while a flush still
+    /// queues its frames, such as a transport failure, a server rejection of
+    /// a frame, or the network thread failing to make a segment file, fails
+    /// that flush with the code of that reason, not with this one: that is
+    /// the sender's usual terminal error. Its `in_doubt` follows the rule
+    /// above: `true` when a frame of the flush may have been sent.
+    ///
+    /// Distinct from [`SocketError`](Self::SocketError), so that callers can
+    /// tell **by code** a flush that stopped part way from a failure of the
+    /// connection.
+    FlushAborted,
 }
 
 /// How a token source or token provider classified a failure to supply a
@@ -603,6 +693,11 @@ impl Error {
     /// code to decide whether re-sending the same input is safe; when
     /// `in_doubt()` is `true`, only replay if table-level dedup/upsert keys
     /// make duplicates harmless.
+    ///
+    /// For [`ErrorCode::FlushAborted`], `true` means that some frames of the
+    /// flush may have been sent; the server commits a part of them by itself only for
+    /// a table with at least as many rows in the flush as its
+    /// `qwp.max.uncommitted.rows`: see [`ErrorCode::FlushAborted`].
     #[must_use]
     pub fn in_doubt(&self) -> bool {
         self.0.in_doubt
@@ -957,6 +1052,7 @@ mod tests {
                 ErrorCode::BatchTooLarge => {}
                 ErrorCode::StoreResendRequired => {}
                 ErrorCode::SymbolDictFull => {}
+                ErrorCode::FlushAborted => {}
             }
         }
         let _ = _exhaustive;
