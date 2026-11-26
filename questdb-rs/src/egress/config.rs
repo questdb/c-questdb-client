@@ -598,6 +598,8 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "drain_orphans",
     "max_background_drainers",
     "error_inbox_capacity",
+    // QWP-WS owner of the tables and columns the sender auto-creates
+    "owned_by",
     // Connection-pool knobs owned by `questdb_db` (the column-sender
     // pool). The reader doesn't pool itself — `questdb_db` pools
     // readers on the reader's behalf — but a Client that holds both

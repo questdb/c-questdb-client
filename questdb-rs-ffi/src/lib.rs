@@ -2903,6 +2903,29 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
     unsafe { upd_opts!(opts, err_out, token_y, token_y.as_str()) }
 }
 
+/// Name the owner of the tables and columns the sender auto-creates, the way
+/// `OWNED BY` does in SQL: the server grants them to this user, group or
+/// service account instead of the authenticated principal. An external user,
+/// such as one authenticated with an OIDC token, must name one of its groups
+/// to have tables and columns auto-created at all. Requires QuestDB Enterprise
+/// with access control.
+///
+/// The owner is sent on the WebSocket upgrade of every connection. A server
+/// that refuses it fails the connection with `line_sender_error_auth_error`,
+/// naming its reason, and one that does not confirm it, as a server without
+/// the feature does, with `line_sender_error_protocol_version_error`.
+///
+/// Equivalent to the `owned_by` connect-string key. QWP/WebSocket only: other
+/// protocols, and an empty or blank owner, return a config error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_opts_owned_by(
+    opts: *mut line_sender_opts,
+    owner: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe { upd_opts!(opts, err_out, owned_by, owner.as_str()) }
+}
+
 /// Sets the ingestion protocol version.
 /// - HTTP transport automatically negotiates the protocol version by default(unset, **Strong Recommended**).
 ///   You can explicitly configure the protocol version to avoid the slight latency cost at connection time.
@@ -7353,6 +7376,49 @@ mod tests {
             );
 
             free_err(&mut err);
+            line_sender_opts_free(opts);
+        }
+    }
+
+    #[test]
+    fn owned_by_opts_accept_only_a_websocket_owner() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let opts = line_sender_opts_new(
+                line_sender_protocol::line_sender_protocol_ws,
+                utf8(b"127.0.0.1"),
+                9000,
+            );
+            assert!(!opts.is_null());
+            assert!(line_sender_opts_owned_by(
+                opts,
+                utf8("caf\u{e9} team".as_bytes()),
+                &mut err
+            ));
+            assert!(err.is_null());
+            // Naming another owner, or a blank one, is refused.
+            for owner in [&b"team_b"[..], b"", b" "] {
+                assert!(!line_sender_opts_owned_by(opts, utf8(owner), &mut err));
+                assert_client_error_contains(
+                    &mut err,
+                    questdb_error_code::line_sender_error_config_error,
+                    "owned_by",
+                );
+            }
+            line_sender_opts_free(opts);
+
+            let opts = line_sender_opts_new(
+                line_sender_protocol::line_sender_protocol_tcp,
+                utf8(b"127.0.0.1"),
+                9009,
+            );
+            assert!(!opts.is_null());
+            assert!(!line_sender_opts_owned_by(opts, utf8(b"team_a"), &mut err));
+            assert_client_error_contains(
+                &mut err,
+                questdb_error_code::line_sender_error_config_error,
+                "The \"owned_by\" setting is only supported for QWP/WebSocket.",
+            );
             line_sender_opts_free(opts);
         }
     }

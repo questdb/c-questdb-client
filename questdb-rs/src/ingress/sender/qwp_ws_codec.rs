@@ -30,6 +30,7 @@
 use crate::error;
 use crate::ingress::QwpWsRoleReject;
 use crate::ingress::conf::DurableAckTiers;
+use crate::token_provider::redaction::sanitize_error_text;
 use crate::ws::frame::{self, Opcode};
 
 pub(super) const WS_PATH: &str = "/api/v4/write";
@@ -70,8 +71,9 @@ pub(super) fn qwp_extra_headers(
     max_version: u32,
     client_id: Option<&str>,
     request_durable_ack: DurableAckTiers,
+    owned_by: Option<&str>,
 ) -> Vec<(&'static str, String)> {
-    let mut extras = Vec::with_capacity(4);
+    let mut extras = Vec::with_capacity(5);
     extras.push(("X-QWP-Max-Version", max_version.to_string()));
     if let Some(cid) = client_id {
         extras.push(("X-QWP-Client-Id", cid.to_owned()));
@@ -79,10 +81,72 @@ pub(super) fn qwp_extra_headers(
     if let Some(value) = request_durable_ack.request_header_value() {
         extras.push(("X-QWP-Request-Durable-Ack", value.to_owned()));
     }
+    if let Some(owner) = owned_by {
+        extras.push((OWNED_BY_HEADER, encode_owned_by(owner)));
+    }
     if let Some(auth) = auth_header {
         extras.push(("Authorization", auth.to_owned()));
     }
     extras
+}
+
+/// Names the owner of the tables and columns a connection auto-creates, in
+/// the request, and confirms it in the 101 response.
+const OWNED_BY_HEADER: &str = "X-QWP-Owned-By";
+
+/// The `X-QWP-Owned-By` encoding of an owner name: its UTF-8 bytes, the RFC
+/// 3986 unreserved characters as they are and every other byte as `%XX`, in
+/// upper-case hex. That keeps a name outside ASCII intact through proxies,
+/// and it is the canonical form the server echoes an accepted owner in, so the
+/// echo can be compared with what was sent.
+fn encode_owned_by(owner: &str) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(owner.len());
+    for byte in owner.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX_DIGITS[usize::from(byte & 0xF)]));
+        }
+    }
+    encoded
+}
+
+/// Fail a 101 response that does not confirm the owner the request named in
+/// `X-QWP-Owned-By`. A server that predates the header ignores it, and the
+/// tables it auto-created would not get the owner, so the missing echo is a
+/// capability gap like a missing durable-ACK echo, and is classified the same
+/// way. `host` and `port` name the endpoint, since a client walking several
+/// may meet the gap on any of them.
+pub(super) fn validate_owned_by_echo(
+    headers: &crate::ws::handshake::Headers,
+    owned_by: Option<&str>,
+    host: &str,
+    port: &str,
+) -> crate::Result<()> {
+    let Some(owner) = owned_by else {
+        return Ok(());
+    };
+    // Every value, joined: a response that repeats the header confirms no
+    // single owner.
+    let echo = headers.join_all_ci(OWNED_BY_HEADER);
+    if echo.as_deref() == Some(encode_owned_by(owner).as_str()) {
+        return Ok(());
+    }
+    Err(error::fmt!(
+        ProtocolVersionError,
+        "WebSocket upgrade failed: server did not confirm owned_by, it cannot set the owner \
+         of auto-created tables and columns [host={}, port={}, owned_by={}, echoed={}]",
+        host,
+        port,
+        owner,
+        echo.as_deref().map_or_else(
+            || "<no X-QWP-Owned-By header>".to_owned(),
+            sanitize_error_text
+        )
+    ))
 }
 
 // ---------- HTTP response validation (post-shared-handshake) ----------
@@ -167,11 +231,48 @@ fn extract_server_max_batch_size(headers: &crate::ws::handshake::Headers) -> usi
         .unwrap_or(0)
 }
 
+/// Cap on the body bytes of a rejected upgrade read for its reason, before the
+/// reason itself is capped for display.
+const MAX_REJECT_REASON_BYTES: usize = 4096;
+
+/// The plain-text body of a rejected upgrade, sanitized for display, or `None`
+/// when the response carried none. QuestDB explains some refusals there: a
+/// 403 for an `owned_by` the principal may not name, for instance, which would
+/// otherwise read like a rejected credential. Only a `text/plain` body that
+/// arrived whole, as its `Content-Length` declares it, counts.
+fn upgrade_reject_reason(reject: &crate::ws::handshake::HttpReject) -> Option<String> {
+    let content_type = reject.headers.find_ci("content-type")?;
+    if !content_type
+        .as_bytes()
+        .get(..b"text/plain".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"text/plain"))
+    {
+        return None;
+    }
+    let length = reject
+        .headers
+        .find_ci("content-length")?
+        .parse::<usize>()
+        .ok()?;
+    let body = reject.body.get(..length)?;
+    let body = &body[..body.len().min(MAX_REJECT_REASON_BYTES)];
+    let reason = sanitize_error_text(String::from_utf8_lossy(body).trim());
+    let reason = reason.trim();
+    (!reason.is_empty()).then(|| reason.to_owned())
+}
+
+/// The ` [reason=...]` suffix of a rejected upgrade's error, empty when the
+/// response carried no reason, see [`upgrade_reject_reason`].
+fn upgrade_reject_reason_detail(reject: &crate::ws::handshake::HttpReject) -> String {
+    upgrade_reject_reason(reject).map_or_else(String::new, |reason| format!(" [reason={reason}]"))
+}
+
 /// Map a non-101 HTTP response (from
 /// [`crate::ws::handshake::HandshakeError::HttpStatus`]) to the matching
 /// ingress error code. Handles QWP-specific 421 role rejection (carries
 /// X-QuestDB-Role / X-QuestDB-Zone hints), 401/403 auth failure, and
-/// falls back to a generic SocketError for everything else.
+/// falls back to a generic SocketError for everything else. The two latter
+/// name the server's reason when the response carried one.
 pub(super) fn classify_qwp_handshake_reject(
     reject: crate::ws::handshake::HttpReject,
 ) -> crate::Error {
@@ -186,9 +287,10 @@ pub(super) fn classify_qwp_handshake_reject(
             .map_or_else(String::new, |error| format!(" [error={error}]"));
         return error::fmt!(
             AuthError,
-            "WebSocket upgrade authentication failed: HTTP status {}{}",
+            "WebSocket upgrade authentication failed: HTTP status {}{}{}",
             reject.status,
-            detail
+            detail,
+            upgrade_reject_reason_detail(&reject)
         )
         .with_ws_http_status(reject.status)
         .with_bearer_challenge_error(bearer_error);
@@ -221,8 +323,9 @@ pub(super) fn classify_qwp_handshake_reject(
     }
     error::fmt!(
         SocketError,
-        "WebSocket upgrade failed: HTTP status {}",
-        reject.status
+        "WebSocket upgrade failed: HTTP status {}{}",
+        reject.status,
+        upgrade_reject_reason_detail(&reject)
     )
     .with_ws_http_status(reject.status)
 }
@@ -524,7 +627,7 @@ mod tests {
 
     #[test]
     fn qwp_extra_headers_includes_durable_ack_when_requested() {
-        let extras = qwp_extra_headers(None, 1, None, DurableAckTiers::LegacyReplicated);
+        let extras = qwp_extra_headers(None, 1, None, DurableAckTiers::LegacyReplicated, None);
         assert!(
             extras
                 .iter()
@@ -541,7 +644,7 @@ mod tests {
             (DurableAckTiers::Replicated, "replicated"),
             (DurableAckTiers::LocalAndReplicated, "local,replicated"),
         ] {
-            let extras = qwp_extra_headers(None, 1, None, tiers);
+            let extras = qwp_extra_headers(None, 1, None, tiers, None);
             assert!(extras.iter().any(|(name, value)| {
                 *name == "X-QWP-Request-Durable-Ack" && value == expected
             }));
@@ -550,7 +653,7 @@ mod tests {
 
     #[test]
     fn qwp_extra_headers_omits_durable_ack_by_default() {
-        let extras = qwp_extra_headers(None, 1, None, DurableAckTiers::Off);
+        let extras = qwp_extra_headers(None, 1, None, DurableAckTiers::Off, None);
         assert!(
             !extras
                 .iter()
@@ -562,7 +665,13 @@ mod tests {
 
     #[test]
     fn qwp_extra_headers_includes_authorization_when_provided() {
-        let extras = qwp_extra_headers(Some("Basic dXNlcjpwYXNz"), 1, None, DurableAckTiers::Off);
+        let extras = qwp_extra_headers(
+            Some("Basic dXNlcjpwYXNz"),
+            1,
+            None,
+            DurableAckTiers::Off,
+            None,
+        );
         assert!(
             extras
                 .iter()
@@ -570,6 +679,297 @@ mod tests {
             "{:?}",
             extras
         );
+    }
+
+    const OWNER: &str = "caf\u{e9} team";
+    const OWNER_ENCODED: &str = "caf%C3%A9%20team";
+    const NO_OWNED_BY_ECHO: &str = "<no X-QWP-Owned-By header>";
+
+    #[test]
+    fn encode_owned_by_keeps_unreserved_characters_and_percent_encodes_the_rest() {
+        assert_eq!(encode_owned_by(OWNER), OWNER_ENCODED);
+        // RFC 3986 unreserved characters stay as they are.
+        assert_eq!(encode_owned_by("Team-A_1.x~"), "Team-A_1.x~");
+        // Everything else is percent-encoded UTF-8 with upper-case hex digits,
+        // '%' and '+' included.
+        assert_eq!(
+            encode_owned_by("a b+c%d/\u{e9}\u{8868}"),
+            "a%20b%2Bc%25d%2F%C3%A9%E8%A1%A8"
+        );
+        // The server re-encodes the owner it echoes, so both sides must draw
+        // the line at the same characters: the ends of the unreserved ranges
+        // stay, the characters just outside them do not.
+        assert_eq!(encode_owned_by("AZaz09"), "AZaz09");
+        assert_eq!(encode_owned_by("@[`{/:"), "%40%5B%60%7B%2F%3A");
+        assert_eq!(encode_owned_by("\u{7f}\u{80}"), "%7F%C2%80");
+    }
+
+    #[test]
+    fn qwp_extra_headers_include_the_encoded_owner() {
+        let extras = qwp_extra_headers(
+            Some("Bearer t"),
+            1,
+            None,
+            DurableAckTiers::Local,
+            Some(OWNER),
+        );
+        let names: Vec<&str> = extras.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            [
+                "X-QWP-Max-Version",
+                "X-QWP-Request-Durable-Ack",
+                "X-QWP-Owned-By",
+                "Authorization"
+            ]
+        );
+        assert!(
+            extras
+                .iter()
+                .any(|(name, value)| *name == "X-QWP-Owned-By" && value == OWNER_ENCODED),
+            "{extras:?}"
+        );
+
+        let extras = qwp_extra_headers(None, 1, None, DurableAckTiers::Off, None);
+        assert!(
+            !extras.iter().any(|(name, _)| *name == "X-QWP-Owned-By"),
+            "{extras:?}"
+        );
+    }
+
+    #[test]
+    fn validate_owned_by_echo_accepts_the_canonical_echo() {
+        let headers =
+            Headers::from_pairs([("X-QWP-Version", "1"), ("x-qwp-owned-by", OWNER_ENCODED)]);
+        validate_owned_by_echo(&headers, Some(OWNER), "h", "9000").unwrap();
+        // Without an owner nothing is checked, whatever the server sent.
+        validate_owned_by_echo(&Headers::default(), None, "h", "9000").unwrap();
+        validate_owned_by_echo(&headers, None, "h", "9000").unwrap();
+    }
+
+    fn unconfirmed_owner_message(echo: &str) -> String {
+        format!(
+            "WebSocket upgrade failed: server did not confirm owned_by, it cannot set the owner \
+             of auto-created tables and columns [host=h, port=9000, owned_by={OWNER}, \
+             echoed={echo}]"
+        )
+    }
+
+    #[test]
+    fn validate_owned_by_echo_fails_without_the_echo() {
+        // A server that predates the header ignores it and leaves the echo out.
+        let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
+        let err = validate_owned_by_echo(&headers, Some(OWNER), "h", "9000").unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
+        assert_eq!(err.msg(), unconfirmed_owner_message(NO_OWNED_BY_ECHO));
+        assert_eq!(err.ws_http_status(), None);
+        assert!(err.qwp_ws_role_reject().is_none());
+    }
+
+    #[test]
+    fn validate_owned_by_echo_fails_on_another_owner() {
+        for echo in [
+            "other",
+            // The raw name, or lower-case hex digits, is not the canonical
+            // encoding the server echoes an owner it accepted in.
+            OWNER,
+            "caf%c3%a9%20team",
+            "",
+        ] {
+            let headers = Headers::from_pairs([("X-QWP-Owned-By", echo)]);
+            let err = validate_owned_by_echo(&headers, Some(OWNER), "h", "9000").unwrap_err();
+            assert_eq!(
+                err.code(),
+                crate::ErrorCode::ProtocolVersionError,
+                "{echo:?}"
+            );
+            assert_eq!(err.msg(), unconfirmed_owner_message(echo), "{echo:?}");
+        }
+        // A repeated header confirms no single owner, even when it repeats the
+        // right one.
+        let headers = Headers::from_pairs([
+            ("X-QWP-Owned-By", OWNER_ENCODED),
+            ("X-QWP-Owned-By", OWNER_ENCODED),
+        ]);
+        let err = validate_owned_by_echo(&headers, Some(OWNER), "h", "9000").unwrap_err();
+        assert_eq!(
+            err.msg(),
+            unconfirmed_owner_message(&format!("{OWNER_ENCODED}, {OWNER_ENCODED}"))
+        );
+    }
+
+    #[test]
+    fn validate_owned_by_echo_sanitizes_the_echo_it_reports() {
+        let headers = Headers::from_pairs([("X-QWP-Owned-By", "ev\u{7}il\u{202e}")]);
+        let err = validate_owned_by_echo(&headers, Some(OWNER), "h", "9000").unwrap_err();
+        assert_eq!(err.msg(), unconfirmed_owner_message("evil"));
+    }
+
+    fn rejected_upgrade(status: u16, headers: &[(&str, &str)], body: &[u8]) -> crate::Error {
+        classify_qwp_handshake_reject(HttpReject {
+            status,
+            headers: Headers::from_pairs(headers.iter().copied()),
+            body: body.to_vec(),
+        })
+    }
+
+    /// A rejection whose body is the plain-text `reason`, described by its own
+    /// headers.
+    fn rejected_upgrade_with_reason(status: u16, reason: &str) -> crate::Error {
+        let length = reason.len().to_string();
+        rejected_upgrade(
+            status,
+            &[
+                ("Content-Type", "text/plain"),
+                ("Content-Length", length.as_str()),
+            ],
+            reason.as_bytes(),
+        )
+    }
+
+    #[test]
+    fn classify_qwp_handshake_reject_names_the_reason_of_a_refused_owner() {
+        // The server refuses an owner the principal may not name with a 403
+        // and the reason, which tells it apart from a rejected credential.
+        let err = rejected_upgrade_with_reason(403, "owned_by refused: bob is not in group team");
+        assert_eq!(err.code(), crate::ErrorCode::AuthError);
+        assert_eq!(err.ws_http_status(), Some(403));
+        assert_eq!(
+            err.msg(),
+            "WebSocket upgrade authentication failed: HTTP status 403 \
+             [reason=owned_by refused: bob is not in group team]"
+        );
+
+        // A malformed owner is answered with 400.
+        let err = rejected_upgrade_with_reason(
+            400,
+            "Invalid X-QWP-Owned-By (must be a non-empty, percent-encoded UTF-8 name)",
+        );
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(err.ws_http_status(), Some(400));
+        assert_eq!(
+            err.msg(),
+            "WebSocket upgrade failed: HTTP status 400 [reason=Invalid X-QWP-Owned-By \
+             (must be a non-empty, percent-encoded UTF-8 name)]"
+        );
+    }
+
+    #[test]
+    fn classify_qwp_handshake_reject_names_the_reason_after_the_bearer_error() {
+        let err = rejected_upgrade(
+            401,
+            &[
+                ("WWW-Authenticate", "Bearer error=\"invalid_token\""),
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", "13"),
+            ],
+            b"token expired",
+        );
+        assert_eq!(
+            err.msg(),
+            "WebSocket upgrade authentication failed: HTTP status 401 \
+             [error=invalid_token] [reason=token expired]"
+        );
+        assert!(err.upgrade_401_allows_token_refresh());
+    }
+
+    /// The headers of a rejected upgrade, and the body that follows them.
+    type RejectResponse = (&'static [(&'static str, &'static str)], &'static [u8]);
+
+    #[test]
+    fn classify_qwp_handshake_reject_reads_only_a_whole_plain_text_body() {
+        let cases: [RejectResponse; 9] = [
+            // No body at all.
+            (&[("Content-Length", "0")], b""),
+            // Another content type, or none.
+            (
+                &[("Content-Type", "text/html"), ("Content-Length", "8")],
+                b"<p>x</p>",
+            ),
+            (&[("Content-Length", "8")], b"refused!"),
+            // No usable Content-Length.
+            (&[("Content-Type", "text/plain")], b"refused!"),
+            (
+                &[("Content-Type", "text/plain"), ("Content-Length", "x")],
+                b"refused!",
+            ),
+            (
+                &[("Content-Type", "text/plain"), ("Content-Length", "-1")],
+                b"refused!",
+            ),
+            // A body cut short of its Content-Length.
+            (
+                &[("Content-Type", "text/plain"), ("Content-Length", "9")],
+                b"refused!",
+            ),
+            // Nothing to display.
+            (
+                &[("Content-Type", "text/plain"), ("Content-Length", "5")],
+                b" \r\n\t ",
+            ),
+            (
+                &[("Content-Type", "text/plain"), ("Content-Length", "2")],
+                b"\x07\x1b",
+            ),
+        ];
+        for (headers, body) in cases {
+            let err = rejected_upgrade(403, headers, body);
+            assert_eq!(
+                err.msg(),
+                "WebSocket upgrade authentication failed: HTTP status 403",
+                "{headers:?}"
+            );
+        }
+        // Bytes past the Content-Length are not part of the reason.
+        let err = rejected_upgrade(
+            503,
+            &[("Content-Type", "TEXT/PLAIN"), ("Content-Length", "4")],
+            b"busyHTTP/1.1",
+        );
+        assert_eq!(
+            err.msg(),
+            "WebSocket upgrade failed: HTTP status 503 [reason=busy]"
+        );
+    }
+
+    #[test]
+    fn classify_qwp_handshake_reject_sanitizes_and_caps_the_reason() {
+        // Whatever answers the upgrade, a proxy included, writes the reason,
+        // so it reaches errors and logs only as display-safe text.
+        let err = rejected_upgrade_with_reason(
+            403,
+            "owned_by refused:\r\n\u{7}bob\u{202e} is\u{200b} not in group caf\u{e9}",
+        );
+        assert_eq!(
+            err.msg(),
+            "WebSocket upgrade authentication failed: HTTP status 403 \
+             [reason=owned_by refused:bob is not in group caf\u{e9}]"
+        );
+
+        let long = "x".repeat(5000);
+        let err = rejected_upgrade_with_reason(400, &long);
+        assert_eq!(
+            err.msg(),
+            format!(
+                "WebSocket upgrade failed: HTTP status 400 [reason={}...]",
+                "x".repeat(253)
+            )
+        );
+    }
+
+    #[test]
+    fn classify_qwp_handshake_reject_keeps_the_role_reject_message() {
+        let err = rejected_upgrade(
+            421,
+            &[
+                ("X-QuestDB-Role", "REPLICA"),
+                ("Content-Type", "text/plain"),
+                ("Content-Length", "7"),
+            ],
+            b"replica",
+        );
+        assert_eq!(err.code(), crate::ErrorCode::RoleMismatch);
+        assert_eq!(err.msg(), "QWP/WebSocket upgrade rejected by role=REPLICA");
     }
 
     #[test]

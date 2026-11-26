@@ -1586,6 +1586,35 @@ public:
     }
 
     /**
+     * Name the owner of the tables and columns the sender auto-creates, the
+     * way `OWNED BY` does in SQL: the server grants them to this user, group
+     * or service account instead of the authenticated principal. The
+     * principal may name itself or one of its groups, and the built-in admin
+     * any existing entity. An external user, such as one authenticated with an
+     * OIDC token, cannot own anything itself, so it must name one of its
+     * groups to have tables and columns auto-created at all. Requires QuestDB
+     * Enterprise with access control.
+     *
+     * The owner is sent on the WebSocket upgrade of every connection,
+     * reconnects and orphan drainers included, and checked there. A server
+     * that refuses it fails the connection with `error_code::auth_error`,
+     * whose message carries the server's reason. A server that does not
+     * confirm it, as one that predates the feature does, fails it with
+     * `error_code::protocol_version_error` instead of letting it create tables
+     * without the owner.
+     *
+     * Equivalent to the `owned_by` connect-string key. This setting is only
+     * supported for `protocol::ws` and `protocol::wss`: other protocols, and
+     * an empty or blank owner, throw.
+     */
+    opts& owned_by(utf8_view owner)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_owned_by, _impl, owner._impl);
+        return *this;
+    }
+
+    /**
      * Configure how long to wait for messages from the QuestDB server during
      * the TLS handshake and authentication process.
      * The value is in milliseconds, and the default is 15 seconds.

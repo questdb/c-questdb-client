@@ -32,6 +32,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -834,4 +835,160 @@ TEST_CASE("pool reap_idle is callable")
         (void)conn;
     }
     [[maybe_unused]] size_t closed = db.reap_idle();
+}
+
+namespace
+{
+// An owner name outside ASCII, and its `X-QWP-Owned-By` encoding.
+const std::string owned_by_owner = "caf\xc3\xa9 team";
+const std::string owned_by_encoded = "caf%C3%A9%20team";
+
+using owned_by_requests = std::vector<std::optional<std::string>>;
+
+// Acks the first frame, then keeps the connection until the client closes it.
+qm::Script ack_one_frame_then_wait()
+{
+    return {
+        qm::ActionAwaitClientFrame{0x51},
+        qm::ActionSendRaw{qm::ingress_ok_frame()},
+        qm::ActionAwaitClientFrame{0x51}};
+}
+
+// The error that building a standalone sender with `owner` throws.
+qdb::line_sender_error owned_by_connect_error(
+    const qm::MockServer& mock, const std::string& owner)
+{
+    auto opts = qdb::opts::from_conf("ws::addr=" + mock.addr() + ";");
+    opts.owned_by(owner);
+    try
+    {
+        qdb::line_sender sender{opts};
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        return e;
+    }
+    FAIL("the sender connected where the owner was not confirmed");
+    return qdb::line_sender_error{
+        qdb::line_sender_error_code::invalid_api_call, ""};
+}
+} // namespace
+
+TEST_CASE("line_sender names its owner percent-encoded and accepts the echo")
+{
+    qm::MockServer mock{std::vector<qm::Script>{ack_one_frame_then_wait()}};
+    auto opts = qdb::opts::from_conf("ws::addr=" + mock.addr() + ";");
+    opts.owned_by(owned_by_owner);
+    {
+        // Connects, which takes an upgrade that confirms the owner.
+        qdb::line_sender sender{opts};
+        CHECK_FALSE(sender.must_close());
+    }
+    CHECK(mock.captured_owned_by() == owned_by_requests{owned_by_encoded});
+}
+
+TEST_CASE("owned_by in the connect string reaches the upgrade")
+{
+    qm::MockServer mock{std::vector<qm::Script>{ack_one_frame_then_wait()}};
+    {
+        qdb::line_sender sender{qdb::opts::from_conf(
+            "ws::addr=" + mock.addr() + ";owned_by=team_a;")};
+    }
+    {
+        // No owner, no header.
+        qdb::line_sender sender{
+            qdb::opts::from_conf("ws::addr=" + mock.addr() + ";")};
+    }
+    CHECK(
+        mock.captured_owned_by() ==
+        owned_by_requests{std::string{"team_a"}, std::nullopt});
+}
+
+TEST_CASE("line_sender fails to connect where its owner is not confirmed")
+{
+    // A server that predates `owned_by` ignores the header; the tables it
+    // auto-created would not get the owner.
+    qm::MockServer mock{std::vector<qm::Script>{
+        {qm::ActionIgnoreOwnedBy{}, qm::ActionAwaitClientFrame{0x51}}}};
+    const auto e = owned_by_connect_error(mock, owned_by_owner);
+    CHECK(e.code() == qdb::line_sender_error_code::protocol_version_error);
+    CHECK(
+        std::string{e.what()} ==
+        "WebSocket upgrade failed: server did not confirm owned_by, it cannot "
+        "set the owner of auto-created tables and columns [host=127.0.0.1, "
+        "port=" +
+            mock.addr().substr(mock.addr().find(':') + 1) + ", owned_by=" +
+            owned_by_owner + ", echoed=<no X-QWP-Owned-By header>]");
+    CHECK(mock.captured_owned_by() == owned_by_requests{owned_by_encoded});
+}
+
+TEST_CASE("line_sender reports the reason the server refused its owner")
+{
+    qm::MockServer mock{std::vector<qm::Script>{{qm::ActionRefuseOwnedBy{
+        "owned_by refused: bob is not part of group team"}}}};
+    const auto e = owned_by_connect_error(mock, "team");
+    CHECK(e.code() == qdb::line_sender_error_code::auth_error);
+    CHECK(
+        std::string{e.what()} ==
+        "WebSocket upgrade authentication failed: HTTP status 403 "
+        "[reason=owned_by refused: bob is not part of group team]");
+}
+
+TEST_CASE("owned_by is supported for QWP/WebSocket only")
+{
+    for (const auto protocol :
+         {qdb::protocol::tcp, qdb::protocol::http, qdb::protocol::udp})
+    {
+        qdb::opts opts{protocol, "127.0.0.1", 9009};
+        CHECK_THROWS_WITH_AS(
+            opts.owned_by("team_a"),
+            "The \"owned_by\" setting is only supported for QWP/WebSocket.",
+            qdb::line_sender_error);
+    }
+    CHECK_THROWS_WITH_AS(
+        qdb::opts::from_conf("http::addr=127.0.0.1:9000;owned_by=team_a;"),
+        "The \"owned_by\" setting is only supported for QWP/WebSocket.",
+        qdb::line_sender_error);
+    qdb::opts ws{qdb::protocol::ws, "127.0.0.1", 9000};
+    CHECK_THROWS_WITH_AS(
+        ws.owned_by(" "),
+        "\"owned_by\" cannot be empty or blank.",
+        qdb::line_sender_error);
+}
+
+TEST_CASE("line_sender_opts_owned_by reports errors through err_out")
+{
+    line_sender_utf8 host{};
+    REQUIRE(::line_sender_utf8_init(&host, 9, "127.0.0.1", nullptr));
+    line_sender_utf8 owner{};
+    REQUIRE(::line_sender_utf8_init(&owner, 6, "team_a", nullptr));
+
+    ::line_sender_opts* ws =
+        ::line_sender_opts_new(::line_sender_protocol_ws, host, 9000);
+    REQUIRE(ws != nullptr);
+    line_sender_error* err = nullptr;
+    CHECK(::line_sender_opts_owned_by(ws, owner, &err));
+    CHECK(err == nullptr);
+    ::line_sender_opts_free(ws);
+
+    ::line_sender_opts* tcp =
+        ::line_sender_opts_new(::line_sender_protocol_tcp, host, 9009);
+    REQUIRE(tcp != nullptr);
+    CHECK_FALSE(::line_sender_opts_owned_by(tcp, owner, &err));
+    REQUIRE(err != nullptr);
+    CHECK(::line_sender_error_get_code(err) == line_sender_error_config_error);
+    ::line_sender_error_free(err);
+    ::line_sender_opts_free(tcp);
+}
+
+TEST_CASE("pool names the owner on its sender connections")
+{
+    qm::MockServer mock{std::vector<qm::Script>{ack_one_frame_then_wait()}};
+    questdb::pool db{conf_for(mock.addr(), "owned_by=team_a;")};
+    auto sender = db.borrow_sender();
+    auto buf = sender.new_buffer();
+    buf.table("trades").column("qty", int64_t{7}).at_now();
+    sender.flush_and_wait(buf);
+    CHECK(mock.captured_owned_by() == owned_by_requests{std::string{"team_a"}});
+    sender.drop_on_return();
 }
