@@ -33,6 +33,15 @@ them.
 `cairo.commit.mode=adaptive`. QuestDB Enterprise runs a replicating primary in
 nosync mode unless `cairo.commit.mode` is set, so set it explicitly.
 
+`owned_by`, which names the owner of the tables and columns a QWP/WebSocket
+sender auto-creates, needs QuestDB Enterprise with access control, on a server
+that confirms the owner in its `X-QWP-Owned-By` upgrade response
+([questdb#8504](https://github.com/questdb/questdb/pull/8504)). With that
+support, QuestDB Open Source and Enterprise with access control disabled refuse
+every owner with HTTP 403 (`auth_error`). A server without it ignores the
+owner, so the client fails the connection with `protocol_version_error` rather
+than let it create tables without the owner.
+
 Before the server release is published, QWP/WebSocket release qualification
 must include a full system-test pass against the approved QuestDB 10.0
 release-candidate SHA as well as the current QuestDB development branch. Rerun

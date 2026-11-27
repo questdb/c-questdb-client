@@ -118,7 +118,8 @@ drainers included, and the server checks it there:
 - A server that predates `owned_by` ignores it. The client then fails the
   connection itself, with a `protocol_version_error`, rather than let the
   server create tables that the owner does not own, as it does with a server
-  that does not grant `request_durable_ack`.
+  that does not grant `request_durable_ack`. The
+  [compatibility matrix](COMPATIBILITY.md) records which servers support it.
 
 The server checks the owner again before it creates each table or column: if
 the principal may no longer name it, the write is rejected with a security

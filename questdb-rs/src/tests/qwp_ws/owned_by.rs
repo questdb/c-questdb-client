@@ -252,6 +252,36 @@ fn unconfirmed_owner_message(port: u16, echo: &str) -> String {
     )
 }
 
+/// The connect string of a manually driven sender that adopts the orphan slot
+/// `seed_orphan_slot` left in `sf_dir`.
+fn orphan_drain_conf(port: u16, sf_dir: &Path) -> String {
+    format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;owned_by={OWNER};\
+         sf_dir={};sender_id=primary;drain_orphans=on;max_background_drainers=1;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;",
+        sf_dir.display()
+    )
+}
+
+/// The orphan slot keeps its frames for the next session, is not quarantined,
+/// and names the unconfirmed owner as the reason they were not delivered.
+fn assert_orphan_slot_kept(orphan_slot: &Path, port: u16) {
+    assert!(
+        slot_has_sfa_file(orphan_slot),
+        "the orphan frames were dropped"
+    );
+    assert!(
+        !orphan_slot.join(".failed").exists(),
+        "the orphan slot was quarantined"
+    );
+    let last_error = std::fs::read_to_string(orphan_slot.join(".last_error")).unwrap_or_default();
+    assert!(
+        last_error.contains(&unconfirmed_owner_message(port, NO_ECHO)),
+        "{last_error:?}"
+    );
+}
+
 #[test]
 fn owned_by_is_sent_percent_encoded_and_confirmed_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
@@ -445,14 +475,10 @@ fn an_orphan_drainer_names_the_owner() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
     let server = OwnedByServer::spawn(&[(Answer::Confirm, Then::AckAll)]);
-    let conf = format!(
-        "ws::addr=127.0.0.1:{};qwp_ws_progress=manual;owned_by={OWNER};\
-         sf_dir={};sender_id=primary;drain_orphans=on;max_background_drainers=1;\
-         sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
-        server.port,
-        sf_dir.path().display()
-    );
-    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+    let mut sender = SenderBuilder::from_conf(orphan_drain_conf(server.port, sf_dir.path()))
+        .unwrap()
+        .build()
+        .unwrap();
     let orphan_slot = sf_dir.path().join("orphan");
     assert!(
         wait_until(Duration::from_secs(10), || {
@@ -473,9 +499,85 @@ fn an_orphan_drainer_names_the_owner() {
 }
 
 #[test]
+fn an_orphan_drainer_retries_a_server_that_does_not_confirm_the_owner() {
+    // As after any failed connect, the drainer keeps the slot and dials again
+    // later: the server may yet be upgraded to one that confirms the owner.
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+    let server = OwnedByServer::spawn(&[
+        (Answer::Confirm, Then::AckAll),
+        (Answer::Ignore, Then::AckAll),
+    ]);
+    let mut sender = SenderBuilder::from_conf(orphan_drain_conf(server.port, sf_dir.path()))
+        .unwrap()
+        .build()
+        .unwrap();
+    // The foreground sender's upgrade, then three of the drainer's.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let _ = sender.drive_once().unwrap();
+            server.owned_by_requests().len() >= 4
+        }),
+        "the drainer did not dial again: {:?}",
+        server.owned_by_requests()
+    );
+    assert!(!sender.must_close());
+    assert_orphan_slot_kept(&sf_dir.path().join("orphan"), server.port);
+}
+
+#[test]
+fn an_orphan_drainer_retires_its_slot_when_a_reconnect_does_not_confirm_the_owner() {
+    // As for the foreground sender, losing the owner on a reconnect is
+    // terminal: the drainer gives the slot up for this session instead of
+    // dialling again, and leaves its frames for the next session.
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+    let server = OwnedByServer::spawn(&[
+        (Answer::Confirm, Then::AckAll),
+        (Answer::Confirm, Then::DropAfterFirstFrame),
+        (Answer::Ignore, Then::AckAll),
+    ]);
+    let mut sender = SenderBuilder::from_conf(orphan_drain_conf(server.port, sf_dir.path()))
+        .unwrap()
+        .build()
+        .unwrap();
+    let orphan_slot = sf_dir.path().join("orphan");
+    let last_error = orphan_slot.join(".last_error");
+    // Until the reconnect has failed and the slot was retired, quarantined or
+    // dialled again.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let _ = sender.drive_once().unwrap();
+            server.owned_by_requests().len() > 3
+                || orphan_slot.join(".failed").exists()
+                || std::fs::read_to_string(&last_error)
+                    .is_ok_and(|reason| reason.contains("did not confirm owned_by"))
+        }),
+        "the drainer's reconnect did not fail: {:?}",
+        server.owned_by_requests()
+    );
+    // Driven on for ten times its reconnect backoff, a retired drainer does
+    // not dial again.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(200) {
+        let _ = sender.drive_once().unwrap();
+        thread::sleep(Duration::from_millis(1));
+    }
+    // The foreground sender's upgrade, the drainer's, and its reconnect's.
+    assert_eq!(
+        server.owned_by_requests().len(),
+        3,
+        "the drainer dialled again"
+    );
+    assert!(!sender.must_close());
+    assert_orphan_slot_kept(&orphan_slot, server.port);
+}
+
+#[test]
 fn a_pool_names_the_owner_on_its_sender_connections() {
     let server = OwnedByServer::spawn(&[(Answer::Confirm, Then::AckAll)]);
-    // The reader side of the pool accepts the key too, as one it does not use.
+    // No reader warms up (`query_pool_min=0`): this mock serves ingestion only.
+    // `egress_silently_accepts_owned_by` covers the reader side of the string.
     let db = QuestDb::connect(&format!(
         "ws::addr=127.0.0.1:{};owned_by={OWNER};sender_pool_min=1;sender_pool_max=1;\
          query_pool_min=0;pool_reap=manual;",

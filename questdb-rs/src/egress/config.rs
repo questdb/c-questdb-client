@@ -2590,6 +2590,17 @@ mod tests {
     }
 
     #[test]
+    fn egress_silently_accepts_owned_by() {
+        // A sender names the owner of the tables it auto-creates with
+        // `owned_by`. A reader creates none, so it ignores the key, and a
+        // `QuestDb` pool's connect string still opens readers. Pinned on its
+        // own: the test above walks `INGRESS_ONLY_CONFIG_KEYS`, so it cannot
+        // notice the key dropping out of that list.
+        let c = ReaderConfig::from_conf("ws::addr=h:9000;owned_by=team_a;target=primary").unwrap();
+        assert_eq!(c.target, Target::Primary);
+    }
+
+    #[test]
     fn egress_rejects_removed_in_flight_keys() {
         // `in_flight_window` and `max_in_flight` are not configuration keys
         // anywhere in the client, so the cross-role tolerance above does not

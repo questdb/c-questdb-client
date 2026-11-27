@@ -7396,16 +7396,36 @@ mod tests {
                 &mut err
             ));
             assert!(err.is_null());
-            // Naming another owner, or a blank one, is refused.
-            for owner in [&b"team_b"[..], b"", b" "] {
-                assert!(!line_sender_opts_owned_by(opts, utf8(owner), &mut err));
+            // Naming another owner is refused.
+            assert!(!line_sender_opts_owned_by(opts, utf8(b"team_b"), &mut err));
+            assert_client_error_contains(
+                &mut err,
+                questdb_error_code::line_sender_error_config_error,
+                "\"owned_by\" is already specified",
+            );
+            line_sender_opts_free(opts);
+
+            // So is a blank owner, a NULL one included, on opts that name none
+            // yet.
+            let null_owner = line_sender_utf8 {
+                len: 0,
+                buf: ptr::null(),
+            };
+            for owner in [utf8(b""), utf8(b" "), null_owner] {
+                let opts = line_sender_opts_new(
+                    line_sender_protocol::line_sender_protocol_ws,
+                    utf8(b"127.0.0.1"),
+                    9000,
+                );
+                assert!(!opts.is_null());
+                assert!(!line_sender_opts_owned_by(opts, owner, &mut err));
                 assert_client_error_contains(
                     &mut err,
                     questdb_error_code::line_sender_error_config_error,
-                    "owned_by",
+                    "\"owned_by\" cannot be empty or blank.",
                 );
+                line_sender_opts_free(opts);
             }
-            line_sender_opts_free(opts);
 
             let opts = line_sender_opts_new(
                 line_sender_protocol::line_sender_protocol_tcp,
