@@ -16,10 +16,24 @@
 # release CLIENT_PROFILE is cleared, leaving the Maven options untouched.
 # Reading the version (rather than hard-coding the profile) keeps every
 # questdb-building job working whichever way questdb master flips next.
+parameters:
+  - name: revision
+    type: string
+    default: ''
+
 steps:
   - script: |
       git clone --depth 1 https://github.com/questdb/questdb.git
     displayName: git clone questdb
+  - ${{ if ne(parameters.revision, '') }}:
+    - bash: |
+        set -eu
+        git -C questdb fetch --depth 1 origin "$QUESTDB_REVISION"
+        git -C questdb checkout --detach FETCH_HEAD
+        test "$(git -C questdb rev-parse HEAD)" = "$QUESTDB_REVISION"
+      displayName: "Pin QuestDB diagnostic revision"
+      env:
+        QUESTDB_REVISION: ${{ parameters.revision }}
   - bash: |
       # No `pipefail`: the version extraction is `sed ... | head -1`, and
       # core/pom.xml carries the property on more than one line, so head can
