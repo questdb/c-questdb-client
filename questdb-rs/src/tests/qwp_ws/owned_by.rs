@@ -363,6 +363,20 @@ fn an_unconfirmed_owner_fails_the_initial_connect() {
 }
 
 #[test]
+fn an_unconfirmed_owner_and_a_replica_report_role_mismatch() {
+    let old = OwnedByServer::spawn(&[(Answer::Ignore, Then::AckAll)]);
+    let (replica, worker) = spawn_role_reject_upgrade_server(1, "REPLICA");
+    let conf = format!(
+        "ws::addr=127.0.0.1:{},127.0.0.1:{replica};owned_by={OWNER};",
+        old.port
+    );
+    let err = SenderBuilder::from_conf(conf).unwrap().build().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::RoleMismatch);
+    assert_eq!(old.owned_by_requests(), [Some(OWNER_ENCODED.to_owned())]);
+    assert_eq!(worker.join().unwrap(), 1);
+}
+
+#[test]
 fn an_unconfirmed_owner_is_not_retried_by_a_sync_initial_connect() {
     // A sync initial connect retries a failed connect within its budget, but
     // not a server without the capability: that is the caller's to see now.

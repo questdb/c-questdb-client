@@ -2121,21 +2121,21 @@ impl SenderBuilder {
     /// way the `OWNED BY` clause of `CREATE TABLE` and `ALTER TABLE ... ADD
     /// COLUMN` does in SQL: the server grants them to this user, group or
     /// service account instead of the authenticated principal. The principal
-    /// may name itself or one of its groups, and the built-in admin any
-    /// existing entity. An external user, such as one that authenticates with
-    /// an OIDC token, cannot own anything itself, so it must name one of its
-    /// groups for the server to auto-create tables and columns for it at all.
+    /// may name itself or one of its groups. The built-in admin may name any
+    /// existing user, group or service account except an external user. An
+    /// external user authenticated with OIDC cannot own tables or columns and
+    /// must name one of its groups for auto-creation.
     ///
     /// The owner is sent on the WebSocket upgrade of every connection,
     /// reconnects, failovers and orphan drainers included, and checked
     /// there. A server that refuses it rejects the upgrade with HTTP 403: an
     /// [`AuthError`](crate::ErrorCode::AuthError) whose message carries the
-    /// server's reason. A server that does not confirm it, as one that
-    /// predates the feature does, fails the connection with a
-    /// [`ProtocolVersionError`](crate::ErrorCode::ProtocolVersionError), the
-    /// way a missing durable-ACK confirmation does, rather than let it
-    /// create tables without the owner. Requires QuestDB Enterprise with
-    /// access control.
+    /// server's reason. If a server does not confirm the owner, the client
+    /// rejects that upgrade with a
+    /// [`ProtocolVersionError`](crate::ErrorCode::ProtocolVersionError) rather
+    /// than write without the owner. A failed multi-host round can instead
+    /// report a retryable role or transport error from another endpoint.
+    /// Requires QuestDB Enterprise with access control.
     ///
     /// Connect-string key: `owned_by`. Only supported for QWP/WebSocket.
     pub fn owned_by(self, owner: &str) -> Result<Self> {

@@ -772,15 +772,6 @@ bool ws_handshake(
             return false;
     }
 
-    if (reject_401)
-    {
-        const char resp[] =
-            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n"
-            "Connection: close\r\n\r\n";
-        send_all(fd, reinterpret_cast<const uint8_t*>(resp), sizeof(resp) - 1);
-        return false;
-    }
-
     std::string key;
     std::string requested_durable_ack;
     std::optional<std::string> requested_owned_by;
@@ -832,9 +823,17 @@ bool ws_handshake(
             }
         }
     }
+    on_owned_by(requested_owned_by);
+    if (reject_401)
+    {
+        const char resp[] =
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
+        send_all(fd, reinterpret_cast<const uint8_t*>(resp), sizeof(resp) - 1);
+        return false;
+    }
     if (key.empty())
         return false;
-    on_owned_by(requested_owned_by);
 
     if (owned_by.refuse_reason)
     {

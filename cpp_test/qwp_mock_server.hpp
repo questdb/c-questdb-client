@@ -381,8 +381,8 @@ public:
     // server frame payload.
     std::vector<std::vector<uint8_t>> captured_requests() const;
 
-    // The `X-QWP-Owned-By` value of every upgrade request, in arrival order;
-    // `std::nullopt` for a request that named no owner.
+    // One entry per complete upgrade request, including scripted rejections,
+    // in capture order: `X-QWP-Owned-By`, or `std::nullopt` if absent.
     std::vector<std::optional<std::string>> captured_owned_by() const;
 
 private:

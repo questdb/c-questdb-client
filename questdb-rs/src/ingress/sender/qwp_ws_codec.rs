@@ -242,11 +242,8 @@ const MAX_REJECT_REASON_BYTES: usize = 4096;
 /// arrived whole, as its `Content-Length` declares it, counts.
 fn upgrade_reject_reason(reject: &crate::ws::handshake::HttpReject) -> Option<String> {
     let content_type = reject.headers.find_ci("content-type")?;
-    if !content_type
-        .as_bytes()
-        .get(..b"text/plain".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"text/plain"))
-    {
+    let media_type = content_type.split(';').next()?.trim_matches([' ', '\t']);
+    if !media_type.eq_ignore_ascii_case("text/plain") {
         return None;
     }
     let length = reject
@@ -878,13 +875,20 @@ mod tests {
 
     #[test]
     fn classify_qwp_handshake_reject_reads_only_a_whole_plain_text_body() {
-        let cases: [RejectResponse; 9] = [
+        let cases: [RejectResponse; 10] = [
             // No body at all.
             (&[("Content-Length", "0")], b""),
             // Another content type, or none.
             (
                 &[("Content-Type", "text/html"), ("Content-Length", "8")],
                 b"<p>x</p>",
+            ),
+            (
+                &[
+                    ("Content-Type", "text/plain-custom"),
+                    ("Content-Length", "8"),
+                ],
+                b"refused!",
             ),
             (&[("Content-Length", "8")], b"refused!"),
             // No usable Content-Length.
@@ -923,7 +927,10 @@ mod tests {
         // Bytes past the Content-Length are not part of the reason.
         let err = rejected_upgrade(
             503,
-            &[("Content-Type", "TEXT/PLAIN"), ("Content-Length", "4")],
+            &[
+                ("Content-Type", "TEXT/PLAIN \t; charset=UTF-8"),
+                ("Content-Length", "4"),
+            ],
             b"busyHTTP/1.1",
         );
         assert_eq!(

@@ -922,6 +922,14 @@ TEST_CASE("line_sender fails to connect where its owner is not confirmed")
     CHECK(mock.captured_owned_by() == owned_by_requests{owned_by_encoded});
 }
 
+TEST_CASE("a 401 upgrade still captures the requested owner")
+{
+    qm::MockServer mock{std::vector<qm::Script>{{qm::ActionReject401{}}}};
+    const auto e = owned_by_connect_error(mock, owned_by_owner);
+    CHECK(e.code() == qdb::line_sender_error_code::auth_error);
+    CHECK(mock.captured_owned_by() == owned_by_requests{owned_by_encoded});
+}
+
 TEST_CASE("line_sender reports the reason the server refused its owner")
 {
     qm::MockServer mock{std::vector<qm::Script>{{qm::ActionRefuseOwnedBy{

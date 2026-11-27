@@ -95,10 +95,10 @@ QWP/WebSocket ingestion creates the tables and columns a sender writes that
 do not exist yet, and QuestDB Enterprise grants the owner permissions on them
 to the principal that created them. `owned_by` names another user, group or
 service account to receive them, the way `OWNED BY` does in SQL. The
-principal may name itself or one of its groups, and the built-in admin any
-existing entity. An external user, one authenticated with an OIDC token such
-as an Entra ID managed identity, cannot hold permissions itself, so it must
-name one of its groups to have tables and columns auto-created at all:
+principal may name itself or one of its groups. The built-in admin may name
+any existing user, group or service account except an external user. External
+users, such as Entra ID managed identities authenticated with OIDC, cannot
+hold permissions themselves and must name one of their groups for auto-creation:
 
 ```text
 wss::addr=db.example.com:9000;owned_by=fxIngest;
@@ -115,11 +115,10 @@ drainers included, and the server checks it there:
   `owned_by refused: fxIngest does not exist`. QuestDB Open Source, and
   Enterprise with access control disabled, cannot set an owner, so they
   refuse every owner the same way.
-- A server that predates `owned_by` ignores it. The client then fails the
-  connection itself, with a `protocol_version_error`, rather than let the
-  server create tables that the owner does not own, as it does with a server
-  that does not grant `request_durable_ack`. The
-  [compatibility matrix](COMPATIBILITY.md) records which servers support it.
+- A server that predates `owned_by` ignores it. The client rejects that
+  upgrade with `protocol_version_error` rather than write without the owner.
+  A failed multi-host round can instead report a retryable role or transport
+  error from another endpoint. See the [compatibility matrix](COMPATIBILITY.md).
 
 The server checks the owner again before it creates each table or column: if
 the principal may no longer name it, the write is rejected with a security

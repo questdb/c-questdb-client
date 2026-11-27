@@ -1982,6 +1982,9 @@ TEST_CASE(
         (code == questdb_error_auth_error ||
          code == questdb_error_handshake_error));
     questdb_error_free(err);
+    const auto owners = srv.captured_owned_by();
+    REQUIRE(owners.size() == 1);
+    CHECK_FALSE(owners.front().has_value());
 }
 
 // ---------------------------------------------------------------------------

@@ -3073,7 +3073,7 @@ impl QwpWsHostHealthTracker {
         self.attempted_this_round.iter().all(|attempted| *attempted)
     }
 
-    pub(super) fn pick_next(&self) -> Option<usize> {
+    fn pick_next(&self, tried_in_walk: &[bool]) -> Option<usize> {
         const STATE_ORDER: [QwpWsHostState; 5] = [
             QwpWsHostState::Healthy,
             QwpWsHostState::HealthUnknown,
@@ -3090,6 +3090,7 @@ impl QwpWsHostHealthTracker {
             for zone in ZONE_ORDER {
                 for idx in 0..self.states.len() {
                     if !self.attempted_this_round[idx]
+                        && tried_in_walk.get(idx) != Some(&true)
                         && self.states[idx] == state
                         && self.zone_tiers[idx] == zone
                     {
@@ -3099,31 +3100,6 @@ impl QwpWsHostHealthTracker {
             }
         }
         None
-    }
-
-    /// Like [`Self::pick_next`] but also marks the chosen endpoint
-    /// `attempted_this_round` before returning. The pool drives the connect
-    /// round through [`QwpWsHealthAccess`], releasing the health lock during
-    /// the blocking `establish_connection`; claiming the endpoint while the
-    /// lock is still held means concurrent borrows rotate to a *different*
-    /// peer instead of piling onto the same slow / black-holed endpoint. The
-    /// real outcome is still recorded by the matching `record_*` call once the
-    /// attempt finishes (those also set `attempted_this_round`, so the early
-    /// claim is idempotent).
-    pub(super) fn pick_next_and_claim(&mut self) -> Option<usize> {
-        let idx = self.pick_next()?;
-        self.attempted_this_round[idx] = true;
-        Some(idx)
-    }
-
-    pub(super) fn pick_next_and_claim_connect_round(
-        &mut self,
-        reset_if_exhausted: bool,
-    ) -> Option<usize> {
-        if reset_if_exhausted && self.is_round_exhausted() {
-            self.begin_round(true);
-        }
-        self.pick_next_and_claim()
     }
 
     pub(super) fn record_success(&mut self, idx: usize) {
@@ -3162,6 +3138,30 @@ impl QwpWsHostHealthTracker {
     pub(super) fn record_zone(&mut self, _idx: usize, _zone: Option<&str>) {
         // Rust is still client-zone-blind, which matches the spec's zone-unset
         // path: every endpoint remains in the Same tier.
+    }
+}
+
+/// A single caller's endpoint walk. Pool borrowers share health and claims,
+/// but a borrow must not count the same endpoint twice if a peer resets them.
+#[derive(Default)]
+struct QwpWsEndpointWalk {
+    previous: Option<usize>,
+    tried: Vec<bool>,
+}
+
+impl QwpWsEndpointWalk {
+    fn claim_next(&mut self, health: &mut QwpWsHostHealthTracker) -> Option<usize> {
+        if let Some(idx) = self.previous {
+            // A successful first dial needs no per-walk allocation.
+            self.tried.resize(health.states.len(), false);
+            self.tried[idx] = true;
+        } else if health.is_round_exhausted() {
+            health.begin_round(true);
+        }
+        let idx = health.pick_next(&self.tried)?;
+        health.attempted_this_round[idx] = true;
+        self.previous = Some(idx);
+        Some(idx)
     }
 }
 
@@ -3511,13 +3511,11 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // re-acquire only to record the outcome. The lock is never held across
     // `establish_connection`.
     //
-    // Reset and claim under one tracker lock. Otherwise a single-endpoint
-    // contender can claim the just-reset round before this caller does.
-    // Do this only for the first pick so failed attempts terminate normally.
-    let mut first_pick = true;
+    // Reset (if needed) and claim under one tracker lock so a concurrent
+    // borrower cannot take the just-reset round before this walk's first pick.
+    let mut walk = QwpWsEndpointWalk::default();
     let mut auth_rotation_retry_used = false;
-    while let Some(idx) = health.with_tracker(|t| t.pick_next_and_claim_connect_round(first_pick)) {
-        first_pick = false;
+    while let Some(idx) = health.with_tracker(|t| walk.claim_next(t)) {
         let endpoint = &endpoints[idx];
         let mut connected = establish_connection(
             &endpoint.host,
@@ -5010,11 +5008,11 @@ mod tests {
         tracker.zone_tiers[1] = QwpWsZoneTier::Same;
         tracker.zone_tiers[2] = QwpWsZoneTier::Unknown;
 
-        assert_eq!(tracker.pick_next(), Some(1));
+        assert_eq!(tracker.pick_next(&[]), Some(1));
         tracker.record_transport_error(1);
-        assert_eq!(tracker.pick_next(), Some(2));
+        assert_eq!(tracker.pick_next(&[]), Some(2));
         tracker.record_transport_error(2);
-        assert_eq!(tracker.pick_next(), Some(0));
+        assert_eq!(tracker.pick_next(&[]), Some(0));
     }
 
     #[test]
@@ -5027,7 +5025,7 @@ mod tests {
 
         assert_eq!(tracker.states[0], QwpWsHostState::FailedThisRound);
         assert!(!tracker.attempted_this_round[0]);
-        assert_eq!(tracker.pick_next(), Some(1));
+        assert_eq!(tracker.pick_next(&[]), Some(1));
     }
 
     #[test]
@@ -5040,7 +5038,7 @@ mod tests {
 
         assert_eq!(tracker.states[0], QwpWsHostState::RoleRejected);
         assert!(!tracker.attempted_this_round[0]);
-        assert_eq!(tracker.pick_next(), Some(1));
+        assert_eq!(tracker.pick_next(&[]), Some(1));
     }
 
     #[test]
@@ -5058,7 +5056,7 @@ mod tests {
         assert_eq!(tracker.states[1], QwpWsHostState::HealthUnknown);
         assert_eq!(tracker.states[2], QwpWsHostState::Healthy);
         assert_eq!(tracker.states[3], QwpWsHostState::HealthUnknown);
-        assert_eq!(tracker.pick_next(), Some(2));
+        assert_eq!(tracker.pick_next(&[]), Some(2));
     }
 
     #[test]
@@ -5073,7 +5071,9 @@ mod tests {
         let mutex = std::sync::Mutex::new(QwpWsHostHealthTracker::new(2));
         let mut access = LockedQwpWsHealth::new(&mutex);
 
-        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+        let idx = access
+            .with_tracker(|t| QwpWsEndpointWalk::default().claim_next(t))
+            .unwrap();
         assert!(
             mutex.try_lock().is_ok(),
             "health lock must be released after pick+claim, not held across the connect"
@@ -5094,7 +5094,9 @@ mod tests {
         let mutex = Arc::new(std::sync::Mutex::new(QwpWsHostHealthTracker::new(2)));
         let mut access = LockedQwpWsHealth::new(&mutex);
 
-        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+        let idx = access
+            .with_tracker(|t| QwpWsEndpointWalk::default().claim_next(t))
+            .unwrap();
 
         // Simulates the gap during which `establish_connection` blocks: no
         // health lock is held here, so another thread grabs it freely.
@@ -5112,20 +5114,27 @@ mod tests {
     }
 
     #[test]
-    fn pick_next_and_claim_rotates_concurrent_picks_off_the_same_endpoint() {
-        // Claiming the endpoint *while the lock is still held* means a second
-        // borrow that picks before the first has recorded its outcome rotates
-        // to a different peer instead of piling onto the same slow endpoint.
+    fn concurrent_walks_claim_distinct_endpoints_even_across_a_shared_reset() {
         let mut tracker = QwpWsHostHealthTracker::new(2);
-        let a = tracker.pick_next_and_claim().unwrap();
-        let b = tracker.pick_next_and_claim().unwrap();
-        assert_ne!(a, b, "concurrent claims must target distinct endpoints");
-        assert!(tracker.is_round_exhausted());
-        assert_eq!(tracker.pick_next_and_claim(), None);
-
-        // A fresh round re-probes from scratch.
-        tracker.begin_round(true);
-        assert!(tracker.pick_next_and_claim().is_some());
+        let mut borrower = QwpWsEndpointWalk::default();
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(0)
+        );
+        assert_eq!(borrower.claim_next(&mut tracker), Some(1));
+        // Endpoint 1 omitted the owner echo. Before this borrower picks again,
+        // a new borrower resets the exhausted shared round and claims endpoint 0.
+        tracker.record_transport_error(1);
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(0)
+        );
+        assert_eq!(borrower.claim_next(&mut tracker), None);
+        // Endpoint 1 was excluded only from the walk that saw the rejection.
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(1)
+        );
     }
 
     #[test]
@@ -5134,13 +5143,16 @@ mod tests {
         tracker.record_success(0);
         assert!(tracker.is_round_exhausted());
 
-        assert_eq!(tracker.pick_next_and_claim(), None);
-        assert_eq!(tracker.pick_next_and_claim_connect_round(true), Some(0));
+        let mut walk = QwpWsEndpointWalk::default();
+        assert_eq!(walk.claim_next(&mut tracker), Some(0));
         assert!(tracker.is_round_exhausted());
 
         tracker.record_transport_error(0);
-        assert_eq!(tracker.pick_next_and_claim_connect_round(false), None);
-        assert_eq!(tracker.pick_next_and_claim_connect_round(true), Some(0));
+        assert_eq!(walk.claim_next(&mut tracker), None);
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(0)
+        );
     }
 
     #[test]

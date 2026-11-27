@@ -1788,19 +1788,19 @@ bool line_sender_opts_token_y(
  * Name the owner of the tables and columns the sender auto-creates, the way
  * `OWNED BY` does in SQL: the server grants them to this user, group or
  * service account instead of the authenticated principal. The principal may
- * name itself or one of its groups, and the built-in admin any existing
- * entity. An external user, such as one authenticated with an OIDC token,
- * cannot own anything itself, so it must name one of its groups to have
- * tables and columns auto-created at all. Requires QuestDB Enterprise with
- * access control.
+ * name itself or one of its groups. The built-in admin may name any existing
+ * user, group or service account except an external user. An external user
+ * authenticated with OIDC cannot own tables or columns and must name one of
+ * its groups for auto-creation. Requires QuestDB Enterprise with access
+ * control.
  *
  * The owner is sent on the WebSocket upgrade of every connection, reconnects
  * and orphan drainers included, and checked there. A server that refuses it
  * fails the connection with `line_sender_error_auth_error`, whose message
- * carries the server's reason. A server that does not confirm it, as one
- * that predates the feature does, fails it with
- * `line_sender_error_protocol_version_error` instead of letting it create
- * tables without the owner.
+ * carries the server's reason. If a server does not confirm the owner, the
+ * client rejects that upgrade with `line_sender_error_protocol_version_error`
+ * rather than write without the owner. A failed multi-host round can instead
+ * report a retryable role or transport error from another endpoint.
  *
  * Equivalent to the `owned_by` connect-string key. This setting is only
  * supported for `line_sender_protocol_ws` and `line_sender_protocol_wss`;
