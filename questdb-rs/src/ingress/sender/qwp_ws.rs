@@ -5156,6 +5156,27 @@ mod tests {
     }
 
     #[test]
+    fn a_later_claim_does_not_reset_an_exhausted_round() {
+        // Connected to endpoint 0, which then failed mid-stream. Its claim
+        // holds for the rest of the round, so the reconnect walk starts on 1.
+        let mut tracker = QwpWsHostHealthTracker::new(2);
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(0)
+        );
+        tracker.record_success(0);
+        tracker.record_mid_stream_failure(0, Some(ReconnectReason::RetryableFailure));
+        let mut reconnect = QwpWsEndpointWalk::default();
+        assert_eq!(reconnect.claim_next(&mut tracker), Some(1));
+        tracker.record_transport_error(1);
+        // Exhausting the round ends the walk, and endpoint 0 waits for the next
+        // round, after the reconnect backoff. A reset here would also clear the
+        // claims of a pool's concurrent borrows.
+        assert_eq!(reconnect.claim_next(&mut tracker), None);
+        assert!(tracker.is_round_exhausted());
+    }
+
+    #[test]
     fn role_reject_helpers_use_structured_error_not_message_prefix() {
         let string_only = crate::Error::new(
             crate::ErrorCode::SocketError,
