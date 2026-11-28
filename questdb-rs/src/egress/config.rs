@@ -598,6 +598,8 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "drain_orphans",
     "max_background_drainers",
     "error_inbox_capacity",
+    // QWP-WS owner of the tables and columns the sender auto-creates
+    "owned_by",
     // Connection-pool knobs owned by `questdb_db` (the column-sender
     // pool). The reader doesn't pool itself — `questdb_db` pools
     // readers on the reader's behalf — but a Client that holds both
@@ -2585,6 +2587,17 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn egress_silently_accepts_owned_by() {
+        // A sender names the owner of the tables it auto-creates with
+        // `owned_by`. A reader creates none, so it ignores the key, and a
+        // `QuestDb` pool's connect string still opens readers. Pinned on its
+        // own: the test above walks `INGRESS_ONLY_CONFIG_KEYS`, so it cannot
+        // notice the key dropping out of that list.
+        let c = ReaderConfig::from_conf("ws::addr=h:9000;owned_by=team_a;target=primary").unwrap();
+        assert_eq!(c.target, Target::Primary);
     }
 
     #[test]

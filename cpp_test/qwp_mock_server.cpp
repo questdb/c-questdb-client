@@ -736,12 +736,26 @@ bool recv_all(socket_t fd, uint8_t* data, size_t len)
     return true;
 }
 
+// How the handshake answers an upgrade that names an owner in
+// `X-QWP-Owned-By`, see `ActionIgnoreOwnedBy` and `ActionRefuseOwnedBy`.
+struct OwnedByPolicy
+{
+    bool ignore = false;
+    std::optional<std::string> refuse_reason;
+};
+
 // Read the HTTP request, find Sec-WebSocket-Key, write the upgrade
 // response with X-QWP-Version: 1. A non-empty `grant_durable_ack` is echoed
-// as `X-QWP-Durable-Ack` when the request asks for exactly that tier.
+// as `X-QWP-Durable-Ack` when the request asks for exactly that tier. The
+// request's `X-QWP-Owned-By` value, if any, goes to `on_owned_by` once the
+// whole request has arrived, and is echoed or refused as `owned_by` says.
 // Returns true on success.
 bool ws_handshake(
-    socket_t fd, bool reject_401, const std::string& grant_durable_ack)
+    socket_t fd,
+    bool reject_401,
+    const std::string& grant_durable_ack,
+    const OwnedByPolicy& owned_by,
+    const std::function<void(const std::optional<std::string>&)>& on_owned_by)
 {
     std::string buf;
     buf.reserve(1024);
@@ -758,17 +772,9 @@ bool ws_handshake(
             return false;
     }
 
-    if (reject_401)
-    {
-        const char resp[] =
-            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n"
-            "Connection: close\r\n\r\n";
-        send_all(fd, reinterpret_cast<const uint8_t*>(resp), sizeof(resp) - 1);
-        return false;
-    }
-
     std::string key;
     std::string requested_durable_ack;
+    std::optional<std::string> requested_owned_by;
     int client_max_version = 2;
     {
         size_t p = 0;
@@ -801,6 +807,10 @@ bool ws_handshake(
             {
                 requested_durable_ack = value;
             }
+            else if (name == "x-qwp-owned-by")
+            {
+                requested_owned_by = value;
+            }
             else if (name == "x-qwp-max-version")
             {
                 try
@@ -813,8 +823,29 @@ bool ws_handshake(
             }
         }
     }
+    on_owned_by(requested_owned_by);
+    if (reject_401)
+    {
+        const char resp[] =
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
+        send_all(fd, reinterpret_cast<const uint8_t*>(resp), sizeof(resp) - 1);
+        return false;
+    }
     if (key.empty())
         return false;
+
+    if (owned_by.refuse_reason)
+    {
+        const std::string& reason = *owned_by.refuse_reason;
+        const std::string resp =
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
+            "Content-Length: " +
+            std::to_string(reason.size()) + "\r\n\r\n" + reason;
+        send_all(
+            fd, reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
+        return false;
+    }
 
     int negotiated = client_max_version < 2 ? client_max_version : 2;
     if (negotiated < 1)
@@ -831,6 +862,8 @@ bool ws_handshake(
     if (!grant_durable_ack.empty() &&
         requested_durable_ack == grant_durable_ack)
         resp += "X-QWP-Durable-Ack: " + grant_durable_ack + "\r\n";
+    if (requested_owned_by && !owned_by.ignore)
+        resp += "X-QWP-Owned-By: " + *requested_owned_by + "\r\n";
     resp += "\r\n";
     return send_all(
         fd, reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
@@ -1041,6 +1074,7 @@ struct MockServer::Impl
     std::vector<std::thread> workers;
     std::mutex workers_mtx;
     std::vector<std::vector<uint8_t>> captured;
+    std::vector<std::optional<std::string>> captured_owned_by;
     mutable std::mutex captured_mtx;
 
 #ifdef _WIN32
@@ -1135,14 +1169,29 @@ struct MockServer::Impl
     {
         bool reject = false;
         std::string grant_durable_ack;
+        OwnedByPolicy owned_by_policy;
         for (const auto& a : script)
         {
             if (std::holds_alternative<ActionReject401>(a))
                 reject = true;
             else if (std::holds_alternative<ActionServeLocalDurableAck>(a))
                 grant_durable_ack = "local";
+            else if (std::holds_alternative<ActionIgnoreOwnedBy>(a))
+                owned_by_policy.ignore = true;
+            else if (auto* refuse = std::get_if<ActionRefuseOwnedBy>(&a))
+                owned_by_policy.refuse_reason = refuse->reason;
         }
-        if (!ws_handshake(fd, reject, grant_durable_ack))
+        const auto record_owned_by =
+            [this](const std::optional<std::string>& owned_by) {
+                std::lock_guard<std::mutex> g(captured_mtx);
+                captured_owned_by.push_back(owned_by);
+            };
+        if (!ws_handshake(
+                fd,
+                reject,
+                grant_durable_ack,
+                owned_by_policy,
+                record_owned_by))
         {
             close_socket(fd);
             return;
@@ -1385,6 +1434,12 @@ std::vector<std::vector<uint8_t>> MockServer::captured_requests() const
 {
     std::lock_guard<std::mutex> g(_impl->captured_mtx);
     return _impl->captured;
+}
+
+std::vector<std::optional<std::string>> MockServer::captured_owned_by() const
+{
+    std::lock_guard<std::mutex> g(_impl->captured_mtx);
+    return _impl->captured_owned_by;
 }
 
 } // namespace qwp_mock

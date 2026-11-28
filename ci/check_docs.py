@@ -296,6 +296,10 @@ def check_compatibility(errors):
                 "`local,replicated` needs both: QuestDB Enterprise and",
                 "combined durable ACK server requirements",
             ),
+            (
+                "sender auto-creates, needs QuestDB Enterprise with access control",
+                "owned_by edition qualifier",
+            ),
             ("`windows-2022` and `windows-2025`", "Windows CI image coverage"),
         ),
         ROOT / "doc" / "CONSIDERATIONS.md": (

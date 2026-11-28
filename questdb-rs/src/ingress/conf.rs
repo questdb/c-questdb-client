@@ -380,6 +380,10 @@ pub(crate) struct QwpWsConfig {
     pub(crate) client_id: ConfigSetting<Option<String>>,
     pub(crate) max_protocol_version: ConfigSetting<u32>,
     pub(crate) request_durable_ack: ConfigSetting<DurableAckTiers>,
+    /// Owner of the tables and columns the sender auto-creates (`owned_by`):
+    /// sent as `X-QWP-Owned-By` on every upgrade, which fails unless the
+    /// server echoes it back.
+    pub(crate) owned_by: ConfigSetting<Option<String>>,
     pub(crate) durable_ack_keepalive_interval: ConfigSetting<std::time::Duration>,
     /// Per-outage wall-clock budget for the reconnect loop.
     pub(crate) reconnect_max_duration: ConfigSetting<std::time::Duration>,
@@ -455,6 +459,7 @@ impl Default for QwpWsConfig {
             client_id: ConfigSetting::new_default(None),
             max_protocol_version: ConfigSetting::new_default(1),
             request_durable_ack: ConfigSetting::new_default(DurableAckTiers::Off),
+            owned_by: ConfigSetting::new_default(None),
             durable_ack_keepalive_interval: ConfigSetting::new_default(
                 std::time::Duration::from_millis(200),
             ),

@@ -318,6 +318,18 @@ struct ActionServeLocalDurableAck
 {
     std::string table;
 };
+// The handshake echoes the `X-QWP-Owned-By` owner a request names, as a server
+// that accepts it does. With this action it leaves the echo out instead, as a
+// server that predates `owned_by` does.
+struct ActionIgnoreOwnedBy
+{
+};
+// Refuse the upgrade with a 403 whose plain-text body is `reason`, as a server
+// does with an owner the principal may not name.
+struct ActionRefuseOwnedBy
+{
+    std::string reason;
+};
 
 using Action = std::variant<
     ActionSendServerInfo,
@@ -330,7 +342,9 @@ using Action = std::variant<
     ActionAwaitClientFrame,
     ActionHardDrop,
     ActionReject401,
-    ActionServeLocalDurableAck>;
+    ActionServeLocalDurableAck,
+    ActionIgnoreOwnedBy,
+    ActionRefuseOwnedBy>;
 
 using Script = std::vector<Action>;
 
@@ -366,6 +380,10 @@ public:
     // from the client, in arrival order. Each entry is the bare client→
     // server frame payload.
     std::vector<std::vector<uint8_t>> captured_requests() const;
+
+    // One entry per complete upgrade request, including scripted rejections,
+    // in capture order: `X-QWP-Owned-By`, or `std::nullopt` if absent.
+    std::vector<std::optional<std::string>> captured_owned_by() const;
 
 private:
     struct Impl;

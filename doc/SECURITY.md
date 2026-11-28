@@ -89,6 +89,43 @@ the OIDC device flow, [`oidc.h`](../include/questdb/oidc.h),
 behaviour follows the cross-language dynamic-credential specification
 (`design/qwp-token-provider-spec.md` in the Java client).
 
+## Owner of auto-created tables
+
+QWP/WebSocket ingestion creates the tables and columns a sender writes that
+do not exist yet, and QuestDB Enterprise grants the owner permissions on them
+to the principal that created them. `owned_by` names another user, group or
+service account to receive them, the way `OWNED BY` does in SQL. The
+principal may name itself or one of its groups. The built-in admin may name
+any existing user, group or service account except an external user. External
+users, such as Entra ID managed identities authenticated with OIDC, cannot
+hold permissions themselves and must name one of their groups for auto-creation:
+
+```text
+wss::addr=db.example.com:9000;owned_by=fxIngest;
+```
+
+Set it in the connection string, which covers a pool too, or with
+`SenderBuilder::owned_by` in Rust, `line_sender_opts_owned_by` in C, or
+`opts::owned_by` in C++. The client names the owner on the WebSocket upgrade
+of every connection, reconnects, failovers and orphan store-and-forward
+drainers included, and the server checks it there:
+
+- An owner the principal may not name fails the connection with HTTP 403: an
+  `auth_error` whose message carries the server's reason, such as
+  `owned_by refused: fxIngest does not exist`. QuestDB Open Source, and
+  Enterprise with access control disabled, cannot set an owner, so they
+  refuse every owner the same way.
+- A server that predates `owned_by` ignores it. The client rejects that
+  upgrade with `protocol_version_error` rather than write without the owner.
+  A failed multi-host round can instead report a retryable role or transport
+  error from another endpoint. See the [compatibility matrix](COMPATIBILITY.md).
+
+The server checks the owner again before it creates each table or column: if
+the principal may no longer name it, the write is rejected with a security
+error and nothing is created. Writing to existing tables and columns needs no
+owner. Other transports reject `owned_by`, and the query reader ignores it, so
+one connection string serves both directions.
+
 ## TLS
 
 The secure schemes are:

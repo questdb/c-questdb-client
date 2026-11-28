@@ -1220,6 +1220,10 @@ impl SenderBuilder {
                 "close_flush_timeout_millis" => builder.close_flush_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "request_durable_ack" => builder.request_durable_ack(val)?,
+                // Not feature-gated: a build without QWP/WebSocket must still
+                // refuse it rather than ignore it like an unknown ILP key, or
+                // the tables would be created without the owner asked for.
+                "owned_by" => builder.owned_by(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "durable_ack_keepalive_interval_millis" => {
                     builder.durable_ack_keepalive_interval_millis(val)?
@@ -2111,6 +2115,60 @@ impl SenderBuilder {
         };
         qwp_ws.progress.set_specified("qwp_ws_progress", progress)?;
         Ok(self)
+    }
+
+    /// Name the owner of the tables and columns this sender auto-creates, the
+    /// way the `OWNED BY` clause of `CREATE TABLE` and `ALTER TABLE ... ADD
+    /// COLUMN` does in SQL: the server grants them to this user, group or
+    /// service account instead of the authenticated principal. The principal
+    /// may name itself or one of its groups. The built-in admin may name any
+    /// existing user, group or service account except an external user. An
+    /// external user authenticated with OIDC cannot own tables or columns and
+    /// must name one of its groups for auto-creation.
+    ///
+    /// The owner is sent on the WebSocket upgrade of every connection,
+    /// reconnects, failovers and orphan drainers included, and checked
+    /// there. A server that refuses it rejects the upgrade with HTTP 403: an
+    /// [`AuthError`](crate::ErrorCode::AuthError) whose message carries the
+    /// server's reason. If a server does not confirm the owner, the client
+    /// rejects that upgrade with a
+    /// [`ProtocolVersionError`](crate::ErrorCode::ProtocolVersionError) rather
+    /// than write without the owner. A failed multi-host round can instead
+    /// report a retryable role or transport error from another endpoint.
+    /// Requires QuestDB Enterprise with access control.
+    ///
+    /// Connect-string key: `owned_by`. Only supported for QWP/WebSocket.
+    pub fn owned_by(self, owner: &str) -> Result<Self> {
+        #[cfg(feature = "_sender-qwp-ws")]
+        {
+            let mut builder = self;
+            let Some(qwp_ws) = &mut builder.qwp_ws else {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "The \"owned_by\" setting is only supported for QWP/WebSocket."
+                ));
+            };
+            let owner = validate_value(owner)?;
+            if owner.trim().is_empty() {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "\"owned_by\" cannot be empty or blank."
+                ));
+            }
+            qwp_ws
+                .owned_by
+                .set_specified("owned_by", Some(owner.to_owned()))?;
+            Ok(builder)
+        }
+
+        #[cfg(not(feature = "_sender-qwp-ws"))]
+        {
+            let _ = (self, owner);
+            Err(error::fmt!(
+                ConfigError,
+                "The \"owned_by\" setting is only supported for QWP/WebSocket."
+            ))
+        }
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

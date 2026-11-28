@@ -2836,7 +2836,13 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
     client_id: Option<&str>,
     request_durable_ack: DurableAckTiers,
 ) -> crate::Result<(u8, Vec<u8>)> {
-    let extras = codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
+    let extras = codec::qwp_extra_headers(
+        auth_header,
+        max_version,
+        client_id,
+        request_durable_ack,
+        None,
+    );
     let handshake = crate::ws::handshake::upgrade(stream, host_header, codec::WS_PATH, &extras)
         .map_err(codec::handshake_error_to_ingress)?;
     let result = codec::validate_qwp_handshake_headers(
@@ -3067,7 +3073,7 @@ impl QwpWsHostHealthTracker {
         self.attempted_this_round.iter().all(|attempted| *attempted)
     }
 
-    pub(super) fn pick_next(&self) -> Option<usize> {
+    fn pick_next(&self, tried_in_walk: &[bool]) -> Option<usize> {
         const STATE_ORDER: [QwpWsHostState; 5] = [
             QwpWsHostState::Healthy,
             QwpWsHostState::HealthUnknown,
@@ -3084,6 +3090,7 @@ impl QwpWsHostHealthTracker {
             for zone in ZONE_ORDER {
                 for idx in 0..self.states.len() {
                     if !self.attempted_this_round[idx]
+                        && tried_in_walk.get(idx) != Some(&true)
                         && self.states[idx] == state
                         && self.zone_tiers[idx] == zone
                     {
@@ -3093,31 +3100,6 @@ impl QwpWsHostHealthTracker {
             }
         }
         None
-    }
-
-    /// Like [`Self::pick_next`] but also marks the chosen endpoint
-    /// `attempted_this_round` before returning. The pool drives the connect
-    /// round through [`QwpWsHealthAccess`], releasing the health lock during
-    /// the blocking `establish_connection`; claiming the endpoint while the
-    /// lock is still held means concurrent borrows rotate to a *different*
-    /// peer instead of piling onto the same slow / black-holed endpoint. The
-    /// real outcome is still recorded by the matching `record_*` call once the
-    /// attempt finishes (those also set `attempted_this_round`, so the early
-    /// claim is idempotent).
-    pub(super) fn pick_next_and_claim(&mut self) -> Option<usize> {
-        let idx = self.pick_next()?;
-        self.attempted_this_round[idx] = true;
-        Some(idx)
-    }
-
-    pub(super) fn pick_next_and_claim_connect_round(
-        &mut self,
-        reset_if_exhausted: bool,
-    ) -> Option<usize> {
-        if reset_if_exhausted && self.is_round_exhausted() {
-            self.begin_round(true);
-        }
-        self.pick_next_and_claim()
     }
 
     pub(super) fn record_success(&mut self, idx: usize) {
@@ -3156,6 +3138,30 @@ impl QwpWsHostHealthTracker {
     pub(super) fn record_zone(&mut self, _idx: usize, _zone: Option<&str>) {
         // Rust is still client-zone-blind, which matches the spec's zone-unset
         // path: every endpoint remains in the Same tier.
+    }
+}
+
+/// A single caller's endpoint walk. Pool borrowers share health and claims,
+/// but a borrow must not count the same endpoint twice if a peer resets them.
+#[derive(Default)]
+struct QwpWsEndpointWalk {
+    previous: Option<usize>,
+    tried: Vec<bool>,
+}
+
+impl QwpWsEndpointWalk {
+    fn claim_next(&mut self, health: &mut QwpWsHostHealthTracker) -> Option<usize> {
+        if let Some(idx) = self.previous {
+            // A successful first dial needs no per-walk allocation.
+            self.tried.resize(health.states.len(), false);
+            self.tried[idx] = true;
+        } else if health.is_round_exhausted() {
+            health.begin_round(true);
+        }
+        let idx = health.pick_next(&self.tried)?;
+        health.attempted_this_round[idx] = true;
+        self.previous = Some(idx);
+        Some(idx)
     }
 }
 
@@ -3303,6 +3309,7 @@ pub(crate) fn establish_connection(
     let max_version = *qwp_ws.max_protocol_version;
     let client_id = qwp_ws.client_id.as_deref();
     let request_durable_ack = *qwp_ws.request_durable_ack;
+    let owned_by = qwp_ws.owned_by.as_deref();
 
     let (stream, handshake_result, leftover) = if use_tls {
         let tls = tls_settings.ok_or_else(|| {
@@ -3329,8 +3336,13 @@ pub(crate) fn establish_connection(
         // first: the write happens immediately (doesn't depend on
         // read_timeout), and the response read is what auth_timeout bounds.
         tcp.tcp().set_read_timeout(Some(auth_timeout)).ok();
-        let extras =
-            codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
+        let extras = codec::qwp_extra_headers(
+            auth_header,
+            max_version,
+            client_id,
+            request_durable_ack,
+            owned_by,
+        );
         let mut tls_stream = rustls::Stream::new(&mut conn, &mut tcp);
         let handshake =
             crate::ws::handshake::upgrade(&mut tls_stream, &host_header, codec::WS_PATH, &extras)
@@ -3340,6 +3352,7 @@ pub(crate) fn establish_connection(
             max_version,
             request_durable_ack,
         )?;
+        codec::validate_owned_by_echo(&handshake.headers, owned_by, host, port)?;
         let leftover = handshake.leftover;
         (
             WsStream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))),
@@ -3348,8 +3361,13 @@ pub(crate) fn establish_connection(
         )
     } else {
         tcp.tcp().set_read_timeout(Some(auth_timeout)).ok();
-        let extras =
-            codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
+        let extras = codec::qwp_extra_headers(
+            auth_header,
+            max_version,
+            client_id,
+            request_durable_ack,
+            owned_by,
+        );
         let handshake =
             crate::ws::handshake::upgrade(&mut tcp, &host_header, codec::WS_PATH, &extras)
                 .map_err(codec::handshake_error_to_ingress)?;
@@ -3358,6 +3376,7 @@ pub(crate) fn establish_connection(
             max_version,
             request_durable_ack,
         )?;
+        codec::validate_owned_by_echo(&handshake.headers, owned_by, host, port)?;
         let leftover = handshake.leftover;
         (WsStream::Plain(tcp), handshake_result, leftover)
     };
@@ -3492,13 +3511,11 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // re-acquire only to record the outcome. The lock is never held across
     // `establish_connection`.
     //
-    // Reset and claim under one tracker lock. Otherwise a single-endpoint
-    // contender can claim the just-reset round before this caller does.
-    // Do this only for the first pick so failed attempts terminate normally.
-    let mut first_pick = true;
+    // Reset (if needed) and claim under one tracker lock so a concurrent
+    // borrower cannot take the just-reset round before this walk's first pick.
+    let mut walk = QwpWsEndpointWalk::default();
     let mut auth_rotation_retry_used = false;
-    while let Some(idx) = health.with_tracker(|t| t.pick_next_and_claim_connect_round(first_pick)) {
-        first_pick = false;
+    while let Some(idx) = health.with_tracker(|t| walk.claim_next(t)) {
         let endpoint = &endpoints[idx];
         let mut connected = establish_connection(
             &endpoint.host,
@@ -4991,11 +5008,11 @@ mod tests {
         tracker.zone_tiers[1] = QwpWsZoneTier::Same;
         tracker.zone_tiers[2] = QwpWsZoneTier::Unknown;
 
-        assert_eq!(tracker.pick_next(), Some(1));
+        assert_eq!(tracker.pick_next(&[]), Some(1));
         tracker.record_transport_error(1);
-        assert_eq!(tracker.pick_next(), Some(2));
+        assert_eq!(tracker.pick_next(&[]), Some(2));
         tracker.record_transport_error(2);
-        assert_eq!(tracker.pick_next(), Some(0));
+        assert_eq!(tracker.pick_next(&[]), Some(0));
     }
 
     #[test]
@@ -5008,7 +5025,7 @@ mod tests {
 
         assert_eq!(tracker.states[0], QwpWsHostState::FailedThisRound);
         assert!(!tracker.attempted_this_round[0]);
-        assert_eq!(tracker.pick_next(), Some(1));
+        assert_eq!(tracker.pick_next(&[]), Some(1));
     }
 
     #[test]
@@ -5021,7 +5038,7 @@ mod tests {
 
         assert_eq!(tracker.states[0], QwpWsHostState::RoleRejected);
         assert!(!tracker.attempted_this_round[0]);
-        assert_eq!(tracker.pick_next(), Some(1));
+        assert_eq!(tracker.pick_next(&[]), Some(1));
     }
 
     #[test]
@@ -5039,7 +5056,7 @@ mod tests {
         assert_eq!(tracker.states[1], QwpWsHostState::HealthUnknown);
         assert_eq!(tracker.states[2], QwpWsHostState::Healthy);
         assert_eq!(tracker.states[3], QwpWsHostState::HealthUnknown);
-        assert_eq!(tracker.pick_next(), Some(2));
+        assert_eq!(tracker.pick_next(&[]), Some(2));
     }
 
     #[test]
@@ -5054,7 +5071,9 @@ mod tests {
         let mutex = std::sync::Mutex::new(QwpWsHostHealthTracker::new(2));
         let mut access = LockedQwpWsHealth::new(&mutex);
 
-        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+        let idx = access
+            .with_tracker(|t| QwpWsEndpointWalk::default().claim_next(t))
+            .unwrap();
         assert!(
             mutex.try_lock().is_ok(),
             "health lock must be released after pick+claim, not held across the connect"
@@ -5075,7 +5094,9 @@ mod tests {
         let mutex = Arc::new(std::sync::Mutex::new(QwpWsHostHealthTracker::new(2)));
         let mut access = LockedQwpWsHealth::new(&mutex);
 
-        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+        let idx = access
+            .with_tracker(|t| QwpWsEndpointWalk::default().claim_next(t))
+            .unwrap();
 
         // Simulates the gap during which `establish_connection` blocks: no
         // health lock is held here, so another thread grabs it freely.
@@ -5093,20 +5114,27 @@ mod tests {
     }
 
     #[test]
-    fn pick_next_and_claim_rotates_concurrent_picks_off_the_same_endpoint() {
-        // Claiming the endpoint *while the lock is still held* means a second
-        // borrow that picks before the first has recorded its outcome rotates
-        // to a different peer instead of piling onto the same slow endpoint.
+    fn concurrent_walks_claim_distinct_endpoints_even_across_a_shared_reset() {
         let mut tracker = QwpWsHostHealthTracker::new(2);
-        let a = tracker.pick_next_and_claim().unwrap();
-        let b = tracker.pick_next_and_claim().unwrap();
-        assert_ne!(a, b, "concurrent claims must target distinct endpoints");
-        assert!(tracker.is_round_exhausted());
-        assert_eq!(tracker.pick_next_and_claim(), None);
-
-        // A fresh round re-probes from scratch.
-        tracker.begin_round(true);
-        assert!(tracker.pick_next_and_claim().is_some());
+        let mut borrower = QwpWsEndpointWalk::default();
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(0)
+        );
+        assert_eq!(borrower.claim_next(&mut tracker), Some(1));
+        // Endpoint 1 omitted the owner echo. Before this borrower picks again,
+        // a new borrower resets the exhausted shared round and claims endpoint 0.
+        tracker.record_transport_error(1);
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(0)
+        );
+        assert_eq!(borrower.claim_next(&mut tracker), None);
+        // Endpoint 1 was excluded only from the walk that saw the rejection.
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(1)
+        );
     }
 
     #[test]
@@ -5115,13 +5143,37 @@ mod tests {
         tracker.record_success(0);
         assert!(tracker.is_round_exhausted());
 
-        assert_eq!(tracker.pick_next_and_claim(), None);
-        assert_eq!(tracker.pick_next_and_claim_connect_round(true), Some(0));
+        let mut walk = QwpWsEndpointWalk::default();
+        assert_eq!(walk.claim_next(&mut tracker), Some(0));
         assert!(tracker.is_round_exhausted());
 
         tracker.record_transport_error(0);
-        assert_eq!(tracker.pick_next_and_claim_connect_round(false), None);
-        assert_eq!(tracker.pick_next_and_claim_connect_round(true), Some(0));
+        assert_eq!(walk.claim_next(&mut tracker), None);
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_later_claim_does_not_reset_an_exhausted_round() {
+        // Connected to endpoint 0, which then failed mid-stream. Its claim
+        // holds for the rest of the round, so the reconnect walk starts on 1.
+        let mut tracker = QwpWsHostHealthTracker::new(2);
+        assert_eq!(
+            QwpWsEndpointWalk::default().claim_next(&mut tracker),
+            Some(0)
+        );
+        tracker.record_success(0);
+        tracker.record_mid_stream_failure(0, Some(ReconnectReason::RetryableFailure));
+        let mut reconnect = QwpWsEndpointWalk::default();
+        assert_eq!(reconnect.claim_next(&mut tracker), Some(1));
+        tracker.record_transport_error(1);
+        // Exhausting the round ends the walk, and endpoint 0 waits for the next
+        // round, after the reconnect backoff. A reset here would also clear the
+        // claims of a pool's concurrent borrows.
+        assert_eq!(reconnect.claim_next(&mut tracker), None);
+        assert!(tracker.is_round_exhausted());
     }
 
     #[test]
@@ -5622,6 +5674,100 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// Completes the upgrade on `stream` with the `X-QWP-Owned-By` echo of
+    /// the owner the request named, or without it when `confirm` is false.
+    fn upgrade_with_owned_by_echo(stream: &mut (impl Read + Write), confirm: bool) {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 256];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "client closed before sending the upgrade request");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let request = String::from_utf8(request).unwrap();
+        let header = |name: &str| {
+            request.split("\r\n").find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_owned())
+            })
+        };
+        let accept = crate::ws::crypto::compute_accept(&header("Sec-WebSocket-Key").unwrap());
+        let owned_by = header("X-QWP-Owned-By").unwrap();
+        let echo = if confirm {
+            format!("X-QWP-Owned-By: {owned_by}\r\n")
+        } else {
+            String::new()
+        };
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             X-QWP-Version: 1\r\n\
+             {echo}\r\n"
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[test]
+    fn tls_upgrade_requires_the_owned_by_echo() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        for confirm in [true, false] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server_config = test_tls_server_config();
+            let server = std::thread::spawn(move || {
+                let (mut peer, _) = listener.accept().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut conn = rustls::ServerConnection::new(server_config).unwrap();
+                let mut tls_stream = rustls::Stream::new(&mut conn, &mut peer);
+                upgrade_with_owned_by_echo(&mut tls_stream, confirm);
+            });
+
+            let mut root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            root.pop();
+            root.push("tls_certs/server_rootCA.pem");
+            let builder = crate::ingress::SenderBuilder::from_conf(format!(
+                "wss::addr=localhost:{port};tls_roots={};owned_by=team_a;",
+                root.display()
+            ))
+            .unwrap();
+            let (use_tls, tls_settings, qwp_ws, auth_header) =
+                builder.resolve_qwp_ws_ingredients().unwrap();
+            let result = establish_connection(
+                "localhost",
+                &port.to_string(),
+                use_tls,
+                tls_settings,
+                QwpWsConnectKind::Foreground,
+                &qwp_ws,
+                auth_header.as_deref(),
+                None,
+            );
+            server.join().unwrap();
+
+            match result {
+                Ok(_) => assert!(confirm, "connected without the owned_by echo"),
+                Err(err) => {
+                    assert!(!confirm, "{err}");
+                    assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
+                    assert_eq!(
+                        err.msg(),
+                        format!(
+                            "WebSocket upgrade failed: server did not confirm owned_by, it \
+                             cannot set the owner of auto-created tables and columns \
+                             [host=localhost, port={port}, owned_by=team_a, \
+                             echoed=<no X-QWP-Owned-By header>]"
+                        )
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn connect_tcp_to_any_addr_falls_back_after_refused_ipv6() {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener};
@@ -5950,7 +6096,7 @@ mod tests {
         // consume them without losing the leading frame.
         let mut stream = UpgradeResponseWithFrame::new(b"\x02\x00");
 
-        let extras = codec::qwp_extra_headers(None, 1, None, DurableAckTiers::Off);
+        let extras = codec::qwp_extra_headers(None, 1, None, DurableAckTiers::Off, None);
         let handshake =
             crate::ws::handshake::upgrade(&mut stream, "localhost:9000", codec::WS_PATH, &extras)
                 .unwrap();

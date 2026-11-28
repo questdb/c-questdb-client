@@ -1849,6 +1849,30 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='qwp-ws-auth-') as sf_dir:
             self._assert_auth_failures_rejected(sender_id, sf_dir)
 
+    def test_owned_by_fails_where_the_owner_cannot_be_set(self):
+        # Only QuestDB Enterprise with access control can set the owner of
+        # auto-created tables. Open source refuses every owner with a 403 and
+        # its reason. A server that predates `owned_by` ignores the header,
+        # and the client fails the connection because the owner was not
+        # confirmed. Either way, nothing connects without the owner.
+        sender_id = 'owned-by-' + self._variant_name() + '-' + uuid.uuid4().hex[:8]
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-owned-by-') as sf_dir:
+            sender = qls.Sender.from_conf(
+                self._sender_conf_for_variant(sender_id, sf_dir)
+                + 'owned_by=team_a;')
+            try:
+                with self.assertRaises(qls.SenderError) as ctx:
+                    sender.connect()
+            finally:
+                sender.close(False)
+        native_error = ctx.exception.__cause__ or ctx.exception
+        skip_if_unsupported_qwp_ws_fixture(native_error, QDB_FIXTURE)
+        self.assertRegex(
+            str(native_error),
+            r'HTTP status 403 \[reason=owned_by refused: '
+            r'|server did not confirm owned_by.*owned_by=team_a, '
+            r'echoed=<no X-QWP-Owned-By header>')
+
     def test_single_batch_round_trip(self):
         table_name = 'qwp_ws_smoke_' + uuid.uuid4().hex[:8]
         self._create_qwp_ws_table(table_name)

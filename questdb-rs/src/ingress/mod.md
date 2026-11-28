@@ -316,6 +316,39 @@ accepted:
 
 * `auth_timeout_ms` (milliseconds, default 15 seconds)
 
+### Owner of Auto-Created Tables
+
+QWP/WebSocket ingestion creates the tables and columns a sender writes that
+do not exist yet, and QuestDB Enterprise grants the owner permissions on them
+to the principal that created them. `owned_by` names another user, group or
+service account to receive them, the way `OWNED BY` does in SQL. The
+principal may name itself or one of its groups. The built-in admin may name
+any existing user, group or service account except an external user. External
+users authenticated with OIDC cannot hold permissions themselves and must name
+one of their groups for auto-creation:
+
+```no_run
+# use questdb::{Result, ingress::Sender};
+# fn main() -> Result<()> {
+let mut sender = Sender::from_conf(
+    "wss::addr=localhost:9000;token=<OIDC token>;owned_by=fxIngest;"
+)?;
+# Ok(())
+# }
+```
+
+The builder equivalent is
+[`SenderBuilder::owned_by`](crate::ingress::SenderBuilder::owned_by). The
+owner is sent on the WebSocket upgrade of every connection, reconnects and
+orphan drainers included. A server that refuses it fails the connection with
+[`ErrorCode::AuthError`](crate::ErrorCode::AuthError), naming the server's
+reason: QuestDB Open Source refuses every owner, as it cannot set one. If a
+server does not confirm the owner, the client rejects that upgrade with
+[`ErrorCode::ProtocolVersionError`](crate::ErrorCode::ProtocolVersionError)
+rather than write without the owner. A failed multi-host round can instead
+report a retryable role or transport error from another endpoint. Other
+transports reject `owned_by`.
+
 ## Encryption on the Wire: TLS
 
 To enable TLS on the QuestDB Enterprise server, refer to the [QuestDB Enterprise

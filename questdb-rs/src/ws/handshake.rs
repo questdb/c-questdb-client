@@ -146,10 +146,9 @@ impl Headers {
 pub(crate) struct HttpReject {
     pub status: u16,
     pub headers: Headers,
-    /// Response body when `Content-Length` was honoured. Kept on the
-    /// struct so a future diagnostic path can surface the body without
-    /// breaking the type's layout, even if a particular caller doesn't
-    /// read it today.
+    /// Response body when `Content-Length` was honoured. The ingress sender
+    /// reports a plain-text one as the reason of the rejection; the egress
+    /// reader does not read it, so an egress-only build would warn.
     #[allow(dead_code)]
     pub body: Vec<u8>,
 }

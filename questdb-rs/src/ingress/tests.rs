@@ -682,6 +682,107 @@ fn qwpws_rejects_unknown_config_key_but_tolerates_egress_keys() {
     .unwrap();
 }
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_owned_by_from_conf_and_builder() {
+    let owner = |builder: &SenderBuilder| builder.qwp_ws.as_ref().unwrap().owned_by.clone();
+
+    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;").unwrap();
+    assert_defaulted_eq(&owner(&builder), None::<String>);
+
+    let builder =
+        SenderBuilder::from_conf("wss::addr=localhost:9000;owned_by=caf\u{e9} team;").unwrap();
+    assert_specified_eq(&owner(&builder), Some("caf\u{e9} team".to_owned()));
+
+    let builder = SenderBuilder::new(Protocol::Ws, "localhost", 9000)
+        .owned_by("team_a")
+        .unwrap();
+    assert_specified_eq(&owner(&builder), Some("team_a".to_owned()));
+    // Naming the same owner again is harmless; naming another one is not.
+    let builder = builder.owned_by("team_a").unwrap();
+    assert_conf_err(
+        builder.owned_by("team_b"),
+        "\"owned_by\" is already specified",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("ws::addr=localhost:9000;owned_by=team_a;")
+            .unwrap()
+            .owned_by("team_b"),
+        "\"owned_by\" is already specified",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_owned_by_rejects_a_blank_owner() {
+    for conf in [
+        "ws::addr=localhost:9000;owned_by=;",
+        "ws::addr=localhost:9000;owned_by=  ;",
+    ] {
+        assert_conf_err(
+            SenderBuilder::from_conf(conf),
+            "\"owned_by\" cannot be empty or blank.",
+        );
+    }
+    for owner in ["", " ", "\u{3000}"] {
+        assert_conf_err(
+            SenderBuilder::new(Protocol::Ws, "localhost", 9000).owned_by(owner),
+            "\"owned_by\" cannot be empty or blank.",
+        );
+    }
+    // As the connect string would, the builder refuses control characters.
+    assert_conf_err(
+        SenderBuilder::new(Protocol::Ws, "localhost", 9000).owned_by("team\na"),
+        "Invalid character '\\n' at position 4",
+    );
+}
+
+/// Ignored, `owned_by` would let the server auto-create tables without the
+/// owner asked for, so every other transport refuses it, also in a build
+/// without QWP/WebSocket.
+#[cfg(any(
+    feature = "sync-sender-tcp",
+    feature = "sync-sender-http",
+    feature = "sync-sender-qwp-udp"
+))]
+#[test]
+fn owned_by_is_websocket_only() {
+    const ERR: &str = "The \"owned_by\" setting is only supported for QWP/WebSocket.";
+    #[cfg(feature = "sync-sender-tcp")]
+    {
+        assert_conf_err(
+            SenderBuilder::from_conf("tcp::addr=localhost:9009;owned_by=team_a;"),
+            ERR,
+        );
+        assert_conf_err(
+            SenderBuilder::new(Protocol::Tcp, "localhost", 9009).owned_by("team_a"),
+            ERR,
+        );
+    }
+    #[cfg(feature = "sync-sender-http")]
+    {
+        assert_conf_err(
+            SenderBuilder::from_conf("https::addr=localhost:9000;owned_by=team_a;"),
+            ERR,
+        );
+        assert_conf_err(
+            SenderBuilder::new(Protocol::Http, "localhost", 9000).owned_by("team_a"),
+            ERR,
+        );
+    }
+    #[cfg(feature = "sync-sender-qwp-udp")]
+    {
+        assert_conf_err(
+            SenderBuilder::from_conf("udp::addr=localhost:9007;owned_by=team_a;"),
+            ERR,
+        );
+        assert_conf_err(
+            SenderBuilder::new(Protocol::Udp, "localhost", 9007).owned_by("team_a"),
+            ERR,
+        );
+    }
+}
+
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-tcp"))]
 #[test]
 fn qwpws_store_and_forward_config_is_websocket_only() {
